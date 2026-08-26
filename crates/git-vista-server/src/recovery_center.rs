@@ -767,9 +767,71 @@ pub(crate) struct HistoryEntry {
     pub recovery: RecoveryClass,
 }
 
+/// One history row whose payload this build cannot decode (#509): only the
+/// row's raw stored facts, plus a plain sentence saying why nothing more is
+/// claimed. A separate shape from [`HistoryEntry`] on purpose — that type's
+/// `operation`/`state` fields are typed claims, and pretending values for
+/// them would be inventing data the bytes don't hold.
+#[derive(Debug, Serialize)]
+pub(crate) struct IncompatibleHistoryEntry {
+    pub id: OperationId,
+    /// The stored `"op"` discriminant string, verbatim; `None` when even the
+    /// JSON envelope is unreadable.
+    pub op: Option<String>,
+    /// The `state` column verbatim — not an [`OperationState`], which this
+    /// row's spelling may predate or postdate.
+    pub state: String,
+    pub accepted_at: UnixSeconds,
+    pub ended_at: Option<UnixSeconds>,
+    pub status: Option<u16>,
+    pub message: Option<String>,
+    pub repository: String,
+    pub note: String,
+}
+
+/// The one place an [`IncompatibleHistoryEntry`]'s `note` is worded, so the
+/// sentence stays bound to what is actually known: the op kind is named when
+/// the bytes carry one, and nothing is blamed on version skew when they
+/// don't.
+fn incompatible_entry(record: crate::durable::IncompatibleRecord) -> IncompatibleHistoryEntry {
+    let note = match record.blame() {
+        crate::durable::Blame::UnknownOperation(kind) => format!(
+            "Written by a Git-Vista build that understood an operation \
+             ('{kind}') this build does not; only the row's stored facts are \
+             shown."
+        ),
+        crate::durable::Blame::UnreadableField(field) => format!(
+            "This build could not read this row's `{field}` — which build \
+             wrote it is unknown; only the row's stored facts are shown."
+        ),
+        crate::durable::Blame::Undecodable => {
+            "This row's stored operation can't be decoded by this build; \
+             only the row's stored facts are shown."
+                .to_string()
+        }
+    };
+    IncompatibleHistoryEntry {
+        id: record.id,
+        op: record.op_kind,
+        state: record.state_raw,
+        accepted_at: record.accepted_at,
+        ended_at: record.ended_at,
+        status: record.status,
+        message: record.message,
+        repository: record.repository_raw,
+        note,
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct HistoryPage {
     pub entries: Vec<HistoryEntry>,
+    /// Rows inside this page's scan window whose payload this build cannot
+    /// decode (#509) — surfaced with their stored facts rather than silently
+    /// omitted. A separate list so `entries` keeps its shape for existing
+    /// consumers; each element carries its own `accepted_at` for a client
+    /// that wants to interleave.
+    pub incompatible: Vec<IncompatibleHistoryEntry>,
     /// The opaque `?before=` value a client sends to fetch the next page;
     /// `None` means this was the last page.
     pub next_cursor: Option<String>,
@@ -820,12 +882,18 @@ fn clamp_limit(requested: Option<u32>) -> u32 {
 ///   decoded. The next page resumes past the full window, so an undecodable
 ///   row costs exactly itself, never its neighbours.
 ///
-/// The page returns the window's decodable rows; a `status: None` entry is
-/// already logged by the durable layer and appears nowhere else.
+/// The page returns the window's decodable rows plus its incompatible rows
+/// (#509), each in its own lane; only an `Unreadable` payload — already
+/// logged by the durable layer — appears nowhere else.
+#[allow(clippy::type_complexity)]
 fn split_page(
     mut scanned: Vec<crate::durable::ScannedOperation>,
     limit: u32,
-) -> (Vec<OperationStatus>, Option<HistoryCursor>) {
+) -> (
+    Vec<OperationStatus>,
+    Vec<crate::durable::IncompatibleRecord>,
+    Option<HistoryCursor>,
+) {
     let cursor = if scanned.len() as u32 > limit {
         scanned.truncate(limit as usize);
         scanned.last().map(|s| HistoryCursor {
@@ -835,8 +903,16 @@ fn split_page(
     } else {
         None
     };
-    let rows = scanned.into_iter().filter_map(|s| s.status).collect();
-    (rows, cursor)
+    let mut rows = Vec::new();
+    let mut incompatible = Vec::new();
+    for s in scanned {
+        match s.payload {
+            crate::durable::ScannedPayload::Decoded(status) => rows.push(*status),
+            crate::durable::ScannedPayload::Incompatible(record) => incompatible.push(*record),
+            crate::durable::ScannedPayload::Unreadable => {}
+        }
+    }
+    (rows, incompatible, cursor)
 }
 
 /// `GET /api/operations/history` — the Recovery Center's browsable list of this
@@ -871,13 +947,13 @@ pub async fn operation_history(
         )
     })?;
 
-    let (rows, next) = split_page(rows, limit);
+    let (rows, incompatible, next) = split_page(rows, limit);
     let mut entries = Vec::with_capacity(rows.len());
     for row in rows {
         let Some(ended_at) = row.ended_at else {
             // Unreachable while the query filters `ended_at IS NOT NULL`;
             // skipped rather than defaulted, on the same "a row that doesn't
-            // decode is dropped, never guessed at" rule `row_to_status` uses.
+            // decode is dropped, never guessed at" rule `row_to_loaded` uses.
             eprintln!("git-vista: a terminal history row had no end time; skipped");
             continue;
         };
@@ -909,6 +985,7 @@ pub async fn operation_history(
         no_store,
         Json(HistoryPage {
             entries,
+            incompatible: incompatible.into_iter().map(incompatible_entry).collect(),
             next_cursor: next.map(|c| c.encode()),
         }),
     ))
@@ -972,6 +1049,29 @@ fn state_permits_recovery_attempt(state: OperationState) -> bool {
     state.is_terminal()
 }
 
+/// The refusal `POST /api/operations/{id}/recover` gives for a row whose
+/// payload this build cannot decode (#509). Worded here, once, so the
+/// sentence stays bound to what is known: the stored op kind when the bytes
+/// carry one, and no claim about *which* build wrote it when they don't.
+fn incompatible_recover_refusal(blame: crate::durable::Blame) -> String {
+    match blame {
+        crate::durable::Blame::UnknownOperation(kind) => format!(
+            "This operation was written by a Git-Vista build that understood \
+             an operation ('{kind}') this build does not — it can't be \
+             replayed or recovered."
+        ),
+        crate::durable::Blame::UnreadableField(field) => format!(
+            "This build could not read this operation's `{field}` — it can't \
+             be replayed or recovered. Which build wrote the row is unknown."
+        ),
+        crate::durable::Blame::Undecodable => {
+            "This operation's stored record can't be decoded by this \
+             build — it can't be replayed or recovered."
+                .to_string()
+        }
+    }
+}
+
 /// `POST /api/operations/{id}/recover` — run the recovery this server itself
 /// establishes for one past operation.
 ///
@@ -1010,12 +1110,23 @@ pub async fn recover_operation(
 
     // 1. The durable row — never `crate::operations`'s in-memory registry,
     //    whose bound and TTL are exactly why this table is what the Recovery
-    //    Center reads.
-    let Some(row) = crate::durable::load_operation(&id).await else {
-        return (
-            StatusCode::NOT_FOUND,
-            "No operation with that id.".to_string(),
-        );
+    //    Center reads. A row this build can't decode (#509) is refused by
+    //    name, never dressed as "no such id": an operation whose semantics
+    //    this binary cannot know has no recovery it could honestly compute.
+    let row = match crate::durable::load_operation(&id).await {
+        crate::durable::DurableLookup::Found(row) => *row,
+        crate::durable::DurableLookup::Incompatible(record) => {
+            return (
+                StatusCode::CONFLICT,
+                incompatible_recover_refusal(record.blame()),
+            );
+        }
+        crate::durable::DurableLookup::Missing => {
+            return (
+                StatusCode::NOT_FOUND,
+                "No operation with that id.".to_string(),
+            );
+        }
     };
     if !state_permits_recovery_attempt(row.state) {
         return (
@@ -1125,17 +1236,42 @@ mod tests {
         crate::durable::ScannedOperation {
             accepted_at: UnixSeconds(accepted_at),
             id: OperationId::new(id).unwrap(),
-            status: Some(row(id, accepted_at)),
+            payload: crate::durable::ScannedPayload::Decoded(Box::new(row(id, accepted_at))),
         }
     }
 
-    /// A scanned key whose payload failed to decode — the `status: None` shape
-    /// the durable layer hands back for a corrupt row.
+    /// A scanned key whose payload the driver couldn't even read — the
+    /// `Unreadable` shape the durable layer hands back for a tampered row.
     fn scanned_undecodable(id: &str, accepted_at: i64) -> crate::durable::ScannedOperation {
         crate::durable::ScannedOperation {
             accepted_at: UnixSeconds(accepted_at),
             id: OperationId::new(id).unwrap(),
-            status: None,
+            payload: crate::durable::ScannedPayload::Unreadable,
+        }
+    }
+
+    /// A scanned row from a build that understood an operation this one does
+    /// not (#509) — the literal stranded shape from the issue: a persisted
+    /// `pop_stash` row after the variant's removal in #501.
+    fn scanned_incompatible(id: &str, accepted_at: i64) -> crate::durable::ScannedOperation {
+        crate::durable::ScannedOperation {
+            accepted_at: UnixSeconds(accepted_at),
+            id: OperationId::new(id).unwrap(),
+            payload: crate::durable::ScannedPayload::Incompatible(Box::new(
+                crate::durable::IncompatibleRecord {
+                    id: OperationId::new(id).unwrap(),
+                    key: IdempotencyKey::new(format!("rc-{id}")).unwrap(),
+                    op_kind: Some("pop_stash".to_string()),
+                    failure: crate::durable::DecodeFailure::UnknownOperation,
+                    state_raw: "failed".to_string(),
+                    repository_raw: "r".to_string(),
+                    worktree_raw: "w".to_string(),
+                    accepted_at: UnixSeconds(accepted_at),
+                    ended_at: Some(UnixSeconds(accepted_at + 1)),
+                    status: Some(500),
+                    message: None,
+                },
+            )),
         }
     }
 
@@ -1148,7 +1284,7 @@ mod tests {
     #[test]
     fn a_full_page_reports_the_cursor_of_its_last_returned_row() {
         let rows = vec![scanned("a", 300), scanned("b", 200), scanned("c", 100)];
-        let (page, cursor) = split_page(rows, 2);
+        let (page, _incompatible, cursor) = split_page(rows, 2);
         assert_eq!(
             page.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             vec!["a", "b"]
@@ -1168,7 +1304,7 @@ mod tests {
     #[test]
     fn an_exactly_full_last_page_reports_no_cursor() {
         let rows = vec![scanned("a", 300), scanned("b", 200)];
-        let (page, cursor) = split_page(rows, 2);
+        let (page, _incompatible, cursor) = split_page(rows, 2);
         assert_eq!(page.len(), 2);
         assert!(
             cursor.is_none(),
@@ -1178,7 +1314,7 @@ mod tests {
 
     #[test]
     fn an_empty_result_reports_no_cursor() {
-        let (page, cursor) = split_page(Vec::new(), 25);
+        let (page, _incompatible, cursor) = split_page(Vec::new(), 25);
         assert!(page.is_empty());
         assert!(cursor.is_none());
     }
@@ -1205,7 +1341,7 @@ mod tests {
             scanned_undecodable("b", 200),
             scanned("c", 100),
         ];
-        let (page, cursor) = split_page(rows, 2);
+        let (page, _incompatible, cursor) = split_page(rows, 2);
         assert_eq!(
             page.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             vec!["a"],
@@ -1232,11 +1368,87 @@ mod tests {
             scanned("b", 200),
             scanned_undecodable("c", 100),
         ];
-        let (page, cursor) = split_page(rows, 2);
+        let (page, _incompatible, cursor) = split_page(rows, 2);
         assert_eq!(page.len(), 2);
         let cursor = cursor.expect("three rows scanned at limit 2 means a next page exists");
         assert_eq!(cursor.id.as_str(), "b");
         assert_eq!(cursor.accepted_at, UnixSeconds(200));
+    }
+
+    /// #509: a row from a removed op variant is *surfaced*, not dropped — it
+    /// lands in the page's incompatible lane with its stored facts, and it
+    /// still occupies its place in the scan window like any other row.
+    ///
+    /// Goes red if `split_page` re-collapses `Incompatible` into the
+    /// dropped-silently path `Unreadable` takes — the lane comes back empty
+    /// and the row has vanished from the Recovery Center again.
+    #[test]
+    fn an_incompatible_row_lands_in_its_own_lane_and_still_counts() {
+        let rows = vec![
+            scanned("a", 300),
+            scanned_incompatible("b", 200),
+            scanned("c", 100),
+        ];
+        let (page, incompatible, cursor) = split_page(rows, 2);
+        assert_eq!(
+            page.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["a"],
+            "the incompatible row never masquerades as a decoded entry"
+        );
+        assert_eq!(incompatible.len(), 1);
+        assert_eq!(incompatible[0].id.as_str(), "b");
+        let cursor = cursor.expect("a lookahead row was scanned, so there is a next page");
+        assert_eq!(cursor.id.as_str(), "b");
+    }
+
+    /// #509: the wire entry says plainly what the bytes say — and no more.
+    /// The op string is named when the JSON envelope carried one; when it
+    /// didn't, the note stops claiming another build wrote the row at all.
+    #[test]
+    fn an_incompatible_entry_claims_only_what_the_bytes_say() {
+        let crate::durable::ScannedPayload::Incompatible(record) =
+            scanned_incompatible("op-b", 200).payload
+        else {
+            panic!("the helper builds an incompatible payload");
+        };
+        let mut unreadable_op = record.clone();
+
+        let entry = incompatible_entry(*record);
+        assert_eq!(entry.op.as_deref(), Some("pop_stash"));
+        assert_eq!(entry.state, "failed");
+        assert_eq!(entry.repository, "r");
+        assert_eq!(
+            entry.note,
+            "Written by a Git-Vista build that understood an operation ('pop_stash') this \
+             build does not; only the row's stored facts are shown."
+        );
+
+        unreadable_op.op_kind = None;
+        let entry = incompatible_entry(*unreadable_op);
+        assert_eq!(entry.op, None);
+        assert_eq!(
+            entry.note,
+            "This row's stored operation can't be decoded by this build; only the row's \
+             stored facts are shown."
+        );
+    }
+
+    /// #509: the recover endpoint's refusal for an incompatible row, bound to
+    /// the stored op string the same way the history note is.
+    #[test]
+    fn the_recover_refusal_names_the_stored_op_when_the_bytes_carry_one() {
+        assert_eq!(
+            incompatible_recover_refusal(crate::durable::Blame::UnknownOperation(
+                "pop_stash".to_string()
+            )),
+            "This operation was written by a Git-Vista build that understood an operation \
+             ('pop_stash') this build does not — it can't be replayed or recovered."
+        );
+        assert_eq!(
+            incompatible_recover_refusal(crate::durable::Blame::Undecodable),
+            "This operation's stored record can't be decoded by this build — it can't be \
+             replayed or recovered."
+        );
     }
 
     #[test]
