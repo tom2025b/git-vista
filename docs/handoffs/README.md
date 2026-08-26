@@ -108,6 +108,42 @@ Three things the previous batch proved necessary, in every one of the six:
 
 ---
 
+## A fresh clone's server suite fails by the hundreds until `gv-sandbox` is built
+
+This one bites **local clones on real hardware too**, not just cloud
+containers — codex hit it on this box on 2026-08-25, working #438 in its own
+clone on the SSD.
+
+`gv-sandbox` is a sibling binary target of the server crate
+(`crates/git-vista-server/src/bin/gv-sandbox/`). The sandboxed tests do not
+link it — they **exec `target/debug/gv-sandbox` at runtime**. A target
+selection like
+
+```
+cargo test -p git-vista-server --bin git-vista-server
+```
+
+builds only the named binary, so in a cold clone the helper does not exist and
+hundreds of sandboxed tests fail at spawn. That storm looks like a
+catastrophic regression; it is a missing build product.
+
+**The tell:** the first baseline in codex's #438 campaign reported 12/12 runs
+failed. It did not believe the number, dug, found the missing helper, built it
+explicitly, and discarded the invalid baseline. The honest baseline was 5/12.
+
+**The rule for any clone-based session:** before running server tests with a
+`--bin` selection, build the helper once —
+
+```
+cargo build -p git-vista-server --bin gv-sandbox
+```
+
+— or run one unfiltered `cargo test -p git-vista-server` first, which builds
+every target of the crate. Put this line in the handoff itself; a session that
+has not read this file will otherwise spend its first hour on a phantom.
+
+---
+
 ## Never tell a cloud session "`cargo test --workspace` must be green"
 
 **It cannot be.** Every handoff in the 25 August batch said it, and every one
