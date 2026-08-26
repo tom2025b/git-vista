@@ -154,6 +154,16 @@ pub struct ActivityEvent {
 /// exact defect class this codebase spent 2026-08-18 removing, so the storage
 /// format refuses to allow it in the first place.
 ///
+/// **Three conclusions, five variants (#485, #521).** The table above is about
+/// what a replay may *conclude*, and that has stayed at three answers.
+/// [`Self::InBatch`] and [`Self::Unknown`] are two further things a *line* can
+/// say — "the capture is on another line of this file" and "a capture is here
+/// that I cannot read" — and both are turned into one of the three
+/// conclusions by [`refs_at`], which is why every reader goes through it
+/// rather than matching on this enum. Keeping them as distinct variants on
+/// disk, rather than writing either as an absent field, is the same rule one
+/// level down: a distinction collapsed at rest cannot be recovered later.
+///
 /// **The same rule, one level down (#449).** The three-state honesty is a
 /// property of *every* field, not just of this enum. A new field must
 /// distinguish **not recorded** from **recorded as empty**, or it reintroduces
@@ -247,6 +257,36 @@ pub enum RefsAtEvent {
     /// *no information*, never an empty map. [`refs_at`] is what enforces
     /// that, and it is why a replayer must not match on this variant itself.
     InBatch { batch: String },
+    /// A capture **is** recorded on this line, in a shape this binary has no
+    /// reading for: a `status` written by a newer git-vista than the one
+    /// reading the file, or a corrupted one (#521, ADR 0085).
+    ///
+    /// **This variant exists so that a format change costs a line its capture
+    /// rather than costing the journal the line.** `RefsAtEvent` is internally
+    /// tagged, so before this variant existed an unrecognised `status` failed
+    /// the whole `ActivityEvent` — and `journal::read_all` parses a line at a
+    /// time, so one unreadable field discarded the event's time, kind, ref
+    /// name, summary and both tips along with it. That is exactly what a
+    /// binary built before #485 does with the `in_batch` this enum gained
+    /// then: a 100-ref fetch renders as one row instead of a hundred. Nothing
+    /// written here repairs *that* — old readers are binaries already built —
+    /// but from this commit forward the next variant is absorbed rather than
+    /// fatal. ADR 0085 states that split between the past and the future
+    /// plainly, because it is easy to blur.
+    ///
+    /// **It is a fifth answer, not a spelling of "nothing was recorded".** It
+    /// says "a capture is here and this binary cannot read it"; the field
+    /// being absent says none was attempted. They lead to the same conclusion
+    /// — *no information* — and are still kept apart on disk for ADR 0070's
+    /// reason: they are different claims about what was recorded, and a
+    /// distinction collapsed at rest cannot be recovered later.
+    ///
+    /// In memory they do collapse, on purpose: [`refs_at`] answers `None` for
+    /// this variant, exactly as it does for a referrer whose anchor is not in
+    /// the window, so nothing downstream — the wire included — has to grow a
+    /// reading for it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The refs as they stood at `event`, resolving a [`RefsAtEvent::InBatch`]
@@ -283,6 +323,10 @@ pub fn refs_at<'a>(
                 _ => None,
             })
         }
+        // A capture recorded in a shape this binary cannot read (#521,
+        // ADR 0085): *no information* — the same answer an unresolvable
+        // referrer and an absent field both get, and never an empty map.
+        RefsAtEvent::Unknown => None,
         own => Some(own),
     }
 }
@@ -636,10 +680,19 @@ pub fn assemble_feed(
     // Resolving before step 4 would copy it onto every line of the batch —
     // reinstating, in memory and on every feed read, exactly the duplication
     // #485 took out of the file.
+    //
+    // [`RefsAtEvent::Unknown`] goes through the same resolution (#521,
+    // ADR 0085). It is a capture *this binary* could not read, and a client
+    // has strictly less to read it with, so it must not go out either: the
+    // wire keeps exactly the three answers above.
     for event in &mut events {
-        if matches!(event.refs, Some(RefsAtEvent::InBatch { .. })) {
-            // `None` when the anchor is not in this window: no information,
-            // the same reading an absent field gets. Never an empty map.
+        if matches!(
+            event.refs,
+            Some(RefsAtEvent::InBatch { .. } | RefsAtEvent::Unknown)
+        ) {
+            // `None` when the anchor is not in this window, and always for
+            // `Unknown`: no information, the same reading an absent field
+            // gets. Never an empty map.
             event.refs = refs_at(event, &journal).cloned();
         }
     }
@@ -1958,6 +2011,76 @@ mod tests {
             };
             assert_eq!(branches.get("main").map(String::as_str), Some("cafe"));
         }
+    }
+
+    /// A `status` this binary has no reading for is a fifth answer on disk
+    /// (#521, ADR 0085), and it resolves to the same *no information* an
+    /// absent field and an unresolvable referrer both resolve to.
+    ///
+    /// The line matters more than the variant does. `RefsAtEvent` is
+    /// internally tagged, so before the catch-all existed an unrecognised
+    /// `status` failed the whole `ActivityEvent` — and the journal reader
+    /// parses one line at a time, so the event's time, kind, ref name, summary
+    /// and both tips went with it. Both halves are asserted here: the line
+    /// survives, and the capture claims nothing.
+    ///
+    /// MUTATION-a: delete the `#[serde(other)] Unknown` arm and the first
+    /// half goes red — the line stops parsing at all.
+    /// MUTATION-b: give `refs_at` `RefsAtEvent::Unknown => Some(own)` (the
+    /// natural-looking arm) and the second half goes red — an unreadable
+    /// capture starts leaving here as an answer.
+    #[test]
+    fn a_capture_this_binary_cannot_read_parses_and_resolves_to_no_information() {
+        let line = r#"{"time":1,"kind":"Commit","ref_name":"main","summary":"from the future",
+            "old_oid":"a","new_oid":"b","source":"App",
+            "refs":{"status":"replayed_from_pack","pack":"cafe"}}"#;
+        let event: ActivityEvent =
+            serde_json::from_str(line).expect("an unknown capture must not cost the line");
+        assert_eq!(event.summary, "from the future");
+        assert_eq!(event.old_oid.as_deref(), Some("a"));
+        assert_eq!(event.refs, Some(RefsAtEvent::Unknown));
+        assert!(
+            refs_at(&event, std::slice::from_ref(&event)).is_none(),
+            "an unreadable capture is no information — never an empty map"
+        );
+    }
+
+    /// **Nothing leaves the feed that this server could not read either.**
+    /// ADR 0080 D4 kept `in_batch` off the wire because a client has no
+    /// journal to resolve it with; `Unknown` goes the same way for a stronger
+    /// reason — a client has strictly *less* to read it with than the server
+    /// that already failed to. The wire keeps the three answers it has always
+    /// had: maps, a failure, or nothing.
+    ///
+    /// MUTATION: drop `RefsAtEvent::Unknown` from step 7's `matches!` and the
+    /// row ships `{"status":"unknown"}` — this goes red.
+    #[test]
+    fn the_feed_ships_nothing_for_a_capture_this_server_could_not_read() {
+        let journal = vec![
+            commit_event(1, "unreadable", Some(RefsAtEvent::Unknown)),
+            commit_event(2, "readable", Some(anchor(None, ("main", "cafe")))),
+        ];
+
+        let feed = assemble_feed(journal, Vec::new(), &HashMap::new(), &HashSet::new(), 50);
+
+        let unreadable = feed
+            .iter()
+            .find(|e| e.summary == "unreadable")
+            .expect("the row itself must still be in the feed");
+        assert_eq!(
+            unreadable.refs, None,
+            "an unreadable capture must leave as silence, not as a status a \
+             client has no reading for"
+        );
+        let readable = feed
+            .iter()
+            .find(|e| e.summary == "readable")
+            .expect("the ordinary row");
+        assert!(
+            matches!(readable.refs, Some(RefsAtEvent::Captured { .. })),
+            "and the rows beside it are untouched: {:?}",
+            readable.refs
+        );
     }
 
     /// The paired negative, and the one that must not be "fixed" into an

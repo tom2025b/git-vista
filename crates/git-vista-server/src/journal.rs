@@ -33,6 +33,28 @@ use git_vista_git::read_refs_at;
 /// append-only and unbounded; the feed shows nothing like this many events.
 const JOURNAL_READ_CAP: usize = 1_000;
 
+/// The journal format this binary **writes**, stamped on every line
+/// [`append_all`] appends (#521, ADR 0085).
+///
+/// **Version 1** is: one JSON object per line, the object being an
+/// [`ActivityEvent`]'s own fields plus this stamp, its `refs` carrying one of
+/// the five [`RefsAtEvent`] answers.
+///
+/// A line with **no** stamp is not version 0 — it is a line written before the
+/// stamp existed, which is every line on disk today. [`ReadLine::v`] keeps
+/// those apart for the same reason [`RefsAtEvent`] keeps "not recorded" apart
+/// from "recorded as empty".
+///
+/// **What this buys, stated honestly, because it is easy to overclaim.** It
+/// does nothing for a binary that is already built: a pre-#485 git-vista still
+/// drops every `in_batch` line whatever is stamped beside it, and no code here
+/// can change that. What it buys is the *next* format change — from this
+/// commit forward a reader can say "this line came from a writer newer than
+/// me" at read time instead of guessing from a serde error, and
+/// [`RefsAtEvent::Unknown`] means the line survives long enough for it to say
+/// so. ADR 0085 has the full split between the past and the future.
+const JOURNAL_FORMAT_VERSION: u32 = 1;
+
 /// The state directory, `.git/git-vista/`, if this repo has a real `.git`
 /// *directory*. (A linked worktree's `.git` is a file; journaling is quietly
 /// skipped there rather than guessed at.) Public because the test-repo seed
@@ -41,6 +63,49 @@ const JOURNAL_READ_CAP: usize = 1_000;
 pub fn state_dir(repo: &Path) -> Option<PathBuf> {
     let git = repo.join(".git");
     git.is_dir().then(|| git.join("git-vista"))
+}
+
+/// One journal line on the way **out**: the format stamp, then the event's own
+/// fields flattened beside it (#521, ADR 0085).
+///
+/// **The line is not the event; the line is a versioned envelope around one.**
+/// That distinction is the whole structural change, and it is why the stamp
+/// lives here rather than as a field on [`ActivityEvent`]: `ActivityEvent` is
+/// *also* the wire DTO of `/api/activity`, and the version of a file on disk
+/// means nothing to a browser — which has its own negotiation in
+/// `git_vista_protocol`. Putting it on the event would mean stamping it in the
+/// writer and stripping it in the handler, one fact in two places.
+///
+/// `v` is serialised first, so a line read by eye says what wrote it before
+/// anything else.
+#[derive(serde::Serialize)]
+struct WrittenLine<'a> {
+    v: u32,
+    #[serde(flatten)]
+    event: &'a ActivityEvent,
+}
+
+/// One journal line on the way **in**: whatever stamp it carries, if any, plus
+/// the event.
+///
+/// `v: None` is an unstamped line — pre-#521, i.e. everything already on disk
+/// — and is deliberately not `#[serde(default)]`-ed to `0`, which would be a
+/// claim the line never made.
+///
+/// The stamp is invisible to readers that do not know about it, which is what
+/// makes adding it safe: [`ActivityEvent`] does not set `deny_unknown_fields`,
+/// so `serde_json::from_str::<ActivityEvent>` — the line of code this reader
+/// used to be, and the line of code a *pre-#485* binary still is — parses a
+/// stamped line exactly as it parsed an unstamped one and ignores the `v`.
+/// [`tests::a_stamped_line_still_parses_through_the_bare_activity_event_path`]
+/// pins that against the bare path rather than this one, because that is the
+/// code whose behaviour is being claimed.
+#[derive(serde::Deserialize)]
+struct ReadLine {
+    #[serde(default)]
+    v: Option<u32>,
+    #[serde(flatten)]
+    event: ActivityEvent,
 }
 
 fn journal_path(repo: &Path) -> Option<PathBuf> {
@@ -126,9 +191,16 @@ pub fn capture_refs(repo: &Path) -> RefsAtEvent {
 /// own — the feed's synthesized external-deletion event needs to attach the
 /// map as it stood *before* the deletion it just noticed.
 ///
-/// A batch of one, and deliberately spelled as one: the single-event line this
-/// writes is byte-for-byte what it was before [`append_all`] existed, so the
-/// twenty-odd endpoints that record one event apiece are untouched by #485.
+/// A batch of one, and deliberately spelled as one: the twenty-odd endpoints
+/// that record one event apiece were untouched by #485 and are untouched by
+/// #521, because both changes land in [`append_all`] and this is `append_all`
+/// with one event.
+///
+/// The line itself is no longer byte-for-byte what #485 left — it gained the
+/// `"v"` stamp (#521, ADR 0085), which ADR 0080 D1's "byte-for-byte unchanged"
+/// sentence predates. What that sentence was promising — no call-site change,
+/// and a single-event line that still carries its own capture rather than a
+/// pointer — both still hold.
 pub fn append(repo: &Path, event: &ActivityEvent) {
     append_all(repo, std::slice::from_ref(event));
 }
@@ -272,7 +344,14 @@ pub fn append_all(repo: &Path, events: &[ActivityEvent]) {
                 &filled
             }
         };
-        let Ok(line) = serde_json::to_string(event) else {
+        // Every line this binary writes says which format wrote it (#521,
+        // ADR 0085). Costs `"v":1,` — seven bytes against a batched line's
+        // measured 225 — and is ignored outright by every reader that does
+        // not know the field.
+        let Ok(line) = serde_json::to_string(&WrittenLine {
+            v: JOURNAL_FORMAT_VERSION,
+            event,
+        }) else {
             continue;
         };
         lines.push_str(&line);
@@ -385,6 +464,14 @@ fn tail_window<R: Read + Seek>(source: &mut R, cap: usize) -> std::io::Result<St
 /// can no longer blank the feed. `read_to_string` refused the entire file over
 /// a single invalid byte anywhere in it, which contradicted this function's
 /// own rule about corrupt lines.
+///
+/// **Mixed-format files are the normal case, not an edge** (#521, ADR 0085).
+/// One journal can hold pre-#131 lines with no capture at all, #485 batch
+/// anchors and referrers, and #521-stamped lines, because the file is
+/// append-only and every binary that ever ran against this repository appended
+/// to it — including, after a rollback, an older one. Every kind is read here;
+/// [`parse_window`] is where that is decided, and where what could *not* be
+/// read is counted so this function can say it rather than leave it to a guess.
 pub fn read_all(repo: &Path) -> Vec<ActivityEvent> {
     let Some(path) = journal_path(repo) else {
         return Vec::new();
@@ -397,17 +484,100 @@ pub fn read_all(repo: &Path) -> Vec<ActivityEvent> {
     };
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(JOURNAL_READ_CAP);
-    lines[start..]
-        .iter()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| match serde_json::from_str::<ActivityEvent>(l) {
-            Ok(event) => Some(event),
-            Err(e) => {
-                eprintln!("git-vista: skipping an unreadable journal line: {e}");
-                None
+    let window = parse_window(&lines[start..]);
+    for notice in window.report.notices() {
+        eprintln!("{notice}");
+    }
+    window.events
+}
+
+/// What one window parse produced: the events, and what the reader could not
+/// read (#521, ADR 0085).
+struct Window {
+    events: Vec<ActivityEvent>,
+    report: WindowReport,
+}
+
+/// The reader's account of a window it could not fully read.
+///
+/// Kept as a value, and produced by a pure function, so the notices below are
+/// asserted directly by tests rather than through captured stderr — ADR 0082's
+/// lesson, that a mechanism which "should have run" is worth nothing until
+/// something exercises it.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct WindowReport {
+    /// One serde message per line that would not parse at all. Still reported
+    /// per line, not just counted: that is the pre-existing loud skip, and one
+    /// corrupt line must not hide the rest of the history.
+    unreadable: Vec<String>,
+    /// Lines stamped with a format version newer than [`JOURNAL_FORMAT_VERSION`].
+    from_newer: usize,
+    /// The highest such version seen — what to name in the notice.
+    newest_version: Option<u32>,
+    /// Events whose capture came back [`RefsAtEvent::Unknown`]: a capture is
+    /// recorded and this binary has no reading for its `status`.
+    unreadable_captures: usize,
+}
+
+impl WindowReport {
+    /// What this read has to say out loud, in the order it should be said.
+    fn notices(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .unreadable
+            .iter()
+            .map(|e| format!("git-vista: skipping an unreadable journal line: {e}"))
+            .collect();
+        if let (true, Some(newest)) = (self.from_newer > 0, self.newest_version) {
+            out.push(format!(
+                "git-vista: {} journal line(s) were written by journal format \
+                 v{newest}; this binary writes v{JOURNAL_FORMAT_VERSION}. They were \
+                 read as far as this binary understands them — a field or ref \
+                 capture it has no reading for is treated as \"not recorded\", \
+                 never as \"nothing was there\".",
+                self.from_newer
+            ));
+        }
+        if self.unreadable_captures > 0 {
+            out.push(format!(
+                "git-vista: {} journal line(s) carry a ref capture in a shape this \
+                 binary cannot read; those events are shown with no capture at all, \
+                 which is not a claim that the repository had no refs.",
+                self.unreadable_captures
+            ));
+        }
+        out
+    }
+}
+
+/// Parse an already-capped window of journal lines, keeping account of what
+/// could not be read.
+///
+/// **A line stamped newer than this binary writes is read, not refused.** The
+/// format is additive by construction — every field added since #131 is
+/// optional, and [`RefsAtEvent::Unknown`] makes the one enum tolerant — so a
+/// newer line is mostly readable, and refusing it would throw away the part
+/// this reader *can* use in order to be principled about the part it cannot.
+/// That is the #521 defect with a version number attached. It reads as far as
+/// it understands and says so instead.
+fn parse_window(lines: &[&str]) -> Window {
+    let mut events = Vec::new();
+    let mut report = WindowReport::default();
+    for line in lines.iter().filter(|l| !l.trim().is_empty()) {
+        match serde_json::from_str::<ReadLine>(line) {
+            Ok(ReadLine { v, event }) => {
+                if v.is_some_and(|v| v > JOURNAL_FORMAT_VERSION) {
+                    report.from_newer += 1;
+                    report.newest_version = report.newest_version.max(v);
+                }
+                if matches!(event.refs, Some(RefsAtEvent::Unknown)) {
+                    report.unreadable_captures += 1;
+                }
+                events.push(event);
             }
-        })
-        .collect()
+            Err(e) => report.unreadable.push(e.to_string()),
+        }
+    }
+    Window { events, report }
 }
 
 /// The branch → tip map as of the last snapshot, or `None` when no snapshot
@@ -633,6 +803,11 @@ mod tests {
                 "`capture_refs` reads refs; only `append_all` hands out batch \
                  references, and it got {batch}"
             ),
+            RefsAtEvent::Unknown => panic!(
+                "`capture_refs` builds this value in this process; `Unknown` is \
+                 what a *reader* produces for a capture written by some other \
+                 binary (#521), and cannot arrive from a fresh read"
+            ),
         }
     }
 
@@ -659,6 +834,11 @@ mod tests {
             RefsAtEvent::InBatch { batch } => panic!(
                 "`capture_refs` reads refs; only `append_all` hands out batch \
                  references, and it got {batch}"
+            ),
+            RefsAtEvent::Unknown => panic!(
+                "`capture_refs` builds this value in this process; `Unknown` is \
+                 what a *reader* produces for a capture written by some other \
+                 binary (#521), and cannot arrive from a fresh read"
             ),
         }
     }
@@ -729,6 +909,11 @@ mod tests {
             RefsAtEvent::InBatch { batch } => panic!(
                 "`capture_refs` reads refs; only `append_all` hands out batch \
                  references, and it got {batch}"
+            ),
+            RefsAtEvent::Unknown => panic!(
+                "`capture_refs` builds this value in this process; `Unknown` is \
+                 what a *reader* produces for a capture written by some other \
+                 binary (#521), and cannot arrive from a fresh read"
             ),
         }
     }
@@ -2019,5 +2204,337 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // #521 / ADR 0085 — the rollback story: what an older binary loses, and
+    // what a line now says about the format that wrote it.
+    // ---------------------------------------------------------------------
+
+    /// The defect #521 is about, demonstrated rather than asserted in prose.
+    ///
+    /// A binary built before #485 has a `RefsAtEvent` with two variants and no
+    /// catch-all. The types below are that enum and that event, copied from
+    /// `git show 6485a9f^:crates/git-vista-core/src/activity.rs` with their
+    /// serde attributes intact — a replica, because the real thing is a
+    /// shipped binary and cannot be linked here.
+    ///
+    /// What it shows is the part that is easy to get wrong when reasoning
+    /// about this from the field name: the loss is **not** confined to the
+    /// capture. `refs` is one field of a whole event and `read_all` parses a
+    /// line at a time, so an unreadable `status` discards the event's time,
+    /// kind, ref name, summary and both tips with it. That is why a 100-ref
+    /// fetch renders as one row on a rolled-back binary rather than as a
+    /// hundred rows with thin captures.
+    ///
+    /// Nothing in this change repairs that, and the test is written to say so:
+    /// it asserts the old reader **fails**, which is the cost ADR 0085 D1
+    /// accepts and writes down. What #521 adds is that the *next* variant is
+    /// absorbed instead — pinned by
+    /// [`a_capture_this_binary_cannot_read_costs_the_capture_not_the_line`],
+    /// whose subject is the same line shape read by a reader that has the
+    /// catch-all.
+    #[test]
+    fn a_pre_485_reader_drops_the_whole_line_not_just_its_capture() {
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(tag = "status", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum PreBatchRefs {
+            Captured {
+                branches: BTreeMap<String, String>,
+                #[serde(default)]
+                truncated_at: Option<usize>,
+            },
+            CaptureFailed {
+                reason: String,
+            },
+        }
+        #[derive(Debug, serde::Deserialize)]
+        #[allow(dead_code)]
+        struct PreBatchEvent {
+            time: i64,
+            summary: String,
+            #[serde(default)]
+            refs: Option<PreBatchRefs>,
+        }
+
+        let anchor = r#"{"time":1,"kind":"Commit","ref_name":"main","summary":"anchor","old_oid":"a","new_oid":"b","source":"App","refs":{"status":"captured","branches":{"main":"aaa"},"batch":"cafe-1-0"}}"#;
+        let referrer = r#"{"time":1,"kind":"Commit","ref_name":"other","summary":"referrer","old_oid":"a","new_oid":"b","source":"App","refs":{"status":"in_batch","batch":"cafe-1-0"}}"#;
+
+        // The anchor survives a rollback: `captured` is a status it has always
+        // known, and `batch` is an unknown *field*, which serde ignores.
+        let read = serde_json::from_str::<PreBatchEvent>(anchor)
+            .expect("a pre-#485 reader still reads the anchor line");
+        assert_eq!(read.summary, "anchor");
+
+        // The referrer does not, and the message names the mechanism.
+        let err = serde_json::from_str::<PreBatchEvent>(referrer)
+            .expect_err("a pre-#485 reader cannot read `in_batch` — this is #521");
+        assert!(
+            err.to_string().contains("unknown variant `in_batch`"),
+            "the loss is an unknown enum tag, not a missing field: {err}"
+        );
+
+        // And the same line read by THIS binary keeps everything.
+        let now: ActivityEvent =
+            serde_json::from_str(referrer).expect("the current reader reads it");
+        assert_eq!(now.summary, "referrer");
+    }
+
+    /// The mixed-line fixture ADR 0085 requires: one file holding a pre-#131
+    /// line with no capture, a #131-era line carrying its own, a #485
+    /// referrer and its anchor, and a #521-stamped line — all read, in order,
+    /// each meaning what it meant when it was written.
+    ///
+    /// **Mixed files are the normal case.** The journal is append-only and
+    /// every binary that ever ran against a repository appended to it,
+    /// including — after a rollback and a re-upgrade — an older one and then a
+    /// newer one again. A format change that only works on a file written
+    /// entirely by one version has not been tested against any real journal.
+    ///
+    /// The v1 line here is a **literal**, so what "v1 on disk" looks like is
+    /// pinned by a byte string rather than by re-running the writer.
+    ///
+    /// MUTATION: drop `#[serde(default)]` from `ReadLine::v` and the unstamped
+    /// lines stop parsing — this goes red on the first assertion.
+    #[test]
+    fn one_journal_file_holds_every_generation_of_line_and_reads_all_of_them() {
+        let dir = repo();
+        let path = dir.path().join(".git/git-vista/journal.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            concat!(
+                // Pre-#131: no capture field at all.
+                r#"{"time":1,"kind":"Commit","ref_name":"main","summary":"pre-131","old_oid":"a","new_oid":"b","source":"App"}"#,
+                "\n",
+                // #131/#449: its own capture, anchoring nothing.
+                r#"{"time":2,"kind":"Commit","ref_name":"main","summary":"own-capture","old_oid":"a","new_oid":"b","source":"App","refs":{"status":"captured","branches":{"main":"aaa"}}}"#,
+                "\n",
+                // #485: a referrer, written before its anchor (ADR 0080 D3).
+                r#"{"time":3,"kind":"Fetch","ref_name":"origin/x","summary":"referrer","old_oid":"a","new_oid":"b","source":"App","refs":{"status":"in_batch","batch":"cafe-1-0"}}"#,
+                "\n",
+                // #485: the anchor, carrying the batch's one capture.
+                r#"{"time":3,"kind":"Fetch","ref_name":"origin/y","summary":"anchor","old_oid":"a","new_oid":"b","source":"App","refs":{"status":"captured","branches":{"main":"bbb"},"batch":"cafe-1-0"}}"#,
+                "\n",
+                // #521: stamped, and otherwise exactly a #131-era line.
+                r#"{"v":1,"time":4,"kind":"Commit","ref_name":"main","summary":"stamped","old_oid":"a","new_oid":"b","source":"App","refs":{"status":"captured","branches":{"main":"ccc"}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let read = read_all(dir.path());
+        assert_eq!(
+            read.iter().map(|e| e.summary.as_str()).collect::<Vec<_>>(),
+            vec!["pre-131", "own-capture", "referrer", "anchor", "stamped"],
+            "every generation of line must survive, in file order"
+        );
+
+        // Each line still means what it meant when it was written.
+        assert!(
+            read[0].refs.is_none(),
+            "absent stays absent — no capture was attempted, not an empty one"
+        );
+        assert!(
+            git_vista_core::activity::refs_at(&read[0], &read).is_none(),
+            "and it resolves to no information"
+        );
+        let Some(RefsAtEvent::Captured { branches, .. }) =
+            git_vista_core::activity::refs_at(&read[1], &read)
+        else {
+            panic!("a #131-era line keeps its own capture: {:?}", read[1].refs);
+        };
+        assert_eq!(branches.get("main").map(String::as_str), Some("aaa"));
+
+        // The referrer resolves across the file to its anchor's maps — the
+        // whole point of #485, still working with a stamped line in the file.
+        let Some(RefsAtEvent::Captured { branches, .. }) =
+            git_vista_core::activity::refs_at(&read[2], &read)
+        else {
+            panic!("the referrer must resolve: {:?}", read[2].refs);
+        };
+        assert_eq!(
+            branches.get("main").map(String::as_str),
+            Some("bbb"),
+            "the referrer must resolve to ITS anchor, not to the line above it"
+        );
+
+        let Some(RefsAtEvent::Captured { branches, .. }) =
+            git_vista_core::activity::refs_at(&read[4], &read)
+        else {
+            panic!("the stamped line keeps its capture: {:?}", read[4].refs);
+        };
+        assert_eq!(branches.get("main").map(String::as_str), Some("ccc"));
+
+        // And a file of ordinary lines says nothing out loud: no corruption,
+        // nothing newer than this binary, no capture it could not read.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            parse_window(&lines).report,
+            WindowReport::default(),
+            "the normal case must be silent — a notice on every read is a \
+             notice nobody reads"
+        );
+    }
+
+    /// Every line this binary appends says which format wrote it, through both
+    /// writers — the single-event `append` and the batching `append_all`.
+    ///
+    /// The stamp is read back off disk as raw JSON rather than through
+    /// [`ReadLine`], so what is asserted is the bytes on the line and not this
+    /// module's own opinion of how to parse them.
+    ///
+    /// MUTATION: stamp `JOURNAL_FORMAT_VERSION + 1` in `append_all` — this
+    /// goes red on the version assertion below.
+    #[test]
+    fn every_line_this_binary_appends_carries_the_format_version_it_writes() {
+        let dir = repo();
+        commit(dir.path(), "main");
+        append(dir.path(), &event("single"));
+        append_all(dir.path(), &[event("batched-a"), event("batched-b")]);
+
+        let text = std::fs::read_to_string(dir.path().join(".git/git-vista/journal.jsonl"))
+            .expect("the journal exists");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "one line per event, as ever");
+        for line in &lines {
+            let raw: serde_json::Value = serde_json::from_str(line).expect("a line is JSON");
+            assert_eq!(
+                raw.get("v").and_then(serde_json::Value::as_u64),
+                Some(u64::from(JOURNAL_FORMAT_VERSION)),
+                "every appended line carries this binary's format version: {line}"
+            );
+            // The stamp is additive: the event's own fields are still there,
+            // at the top level, exactly where they have always been.
+            assert!(
+                raw.get("summary").is_some() && raw.get("source").is_some(),
+                "the stamp wraps the event, it does not nest it: {line}"
+            );
+        }
+    }
+
+    /// The compatibility pin ADR 0085 D2 turns on: adding `v` must cost every
+    /// reader that does not know about it **nothing**.
+    ///
+    /// Asserted through `serde_json::from_str::<ActivityEvent>` — the bare
+    /// path, not [`ReadLine`] — because that is literally the line of code
+    /// `read_all` used to be and that a pre-#485 binary still is. Reading a
+    /// stamped line through the envelope that writes the stamp would prove
+    /// only that this module agrees with itself.
+    #[test]
+    fn a_stamped_line_still_parses_through_the_bare_activity_event_path() {
+        let dir = repo();
+        commit(dir.path(), "main");
+        append(dir.path(), &event("stamped"));
+        let text = std::fs::read_to_string(dir.path().join(".git/git-vista/journal.jsonl"))
+            .expect("the journal exists");
+        let line = text.lines().next().expect("a line");
+        assert!(line.contains("\"v\":"), "precondition: the line is stamped");
+
+        let bare: ActivityEvent = serde_json::from_str(line)
+            .expect("a reader that has never heard of `v` must still read the line");
+        assert_eq!(bare.summary, "stamped");
+        assert_eq!(bare.source, ActivitySource::App);
+        assert!(
+            matches!(bare.refs, Some(RefsAtEvent::Captured { .. })),
+            "and its capture, unchanged: {:?}",
+            bare.refs
+        );
+    }
+
+    /// The change that makes the *next* format change survivable: a `status`
+    /// this binary has no reading for costs the line its **capture**, not the
+    /// line.
+    ///
+    /// The fixture line is what a future git-vista might write — an unknown
+    /// capture status on an otherwise ordinary event. Before #521 this line
+    /// failed `ActivityEvent` outright and `read_all` dropped it, taking the
+    /// time, kind, ref name, summary and both tips with it.
+    ///
+    /// The reading is `None` — *no information* — and never an empty map, so a
+    /// replayer concludes nothing rather than "every branch was deleted".
+    ///
+    /// MUTATION: delete the `#[serde(other)] Unknown` arm from `RefsAtEvent`
+    /// and this goes red on the first assertion — the line disappears again.
+    #[test]
+    fn a_capture_this_binary_cannot_read_costs_the_capture_not_the_line() {
+        let dir = repo();
+        let path = dir.path().join(".git/git-vista/journal.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"v":9,"time":7,"kind":"Commit","ref_name":"main","summary":"from the future","old_oid":"a","new_oid":"b","source":"App","refs":{"status":"replayed_from_pack","pack":"deadbeef"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let read = read_all(dir.path());
+        assert_eq!(
+            read.len(),
+            1,
+            "an unreadable capture must not take the whole event with it"
+        );
+        assert_eq!(
+            read[0].summary, "from the future",
+            "the fields this binary DOES understand are all still there"
+        );
+        assert_eq!(
+            read[0].refs,
+            Some(RefsAtEvent::Unknown),
+            "and the capture is recorded as one it cannot read — not as absent"
+        );
+        assert!(
+            git_vista_core::activity::refs_at(&read[0], &read).is_none(),
+            "which resolves to no information, never an empty observation"
+        );
+    }
+
+    /// The read-time answer ADR 0085 D2 buys, exercised rather than asserted:
+    /// a line stamped newer than this binary writes is **read**, and the
+    /// reader names the version instead of leaving an operator with a serde
+    /// error and a guess.
+    ///
+    /// Driven through [`parse_window`], whose report is a value, so what is
+    /// checked is the sentence itself and not that stderr was written to.
+    #[test]
+    fn a_line_from_a_newer_format_is_read_and_the_reader_says_which_version() {
+        let newer = JOURNAL_FORMAT_VERSION + 1;
+        let line = format!(
+            r#"{{"v":{newer},"time":7,"kind":"Commit","ref_name":"main","summary":"from the future","old_oid":"a","new_oid":"b","source":"App","refs":{{"status":"replayed_from_pack"}}}}"#
+        );
+        let window = parse_window(&[line.as_str(), "{not json}"]);
+
+        assert_eq!(
+            window.events.len(),
+            1,
+            "a newer line is read as far as it is understood, never refused"
+        );
+        assert_eq!(window.report.from_newer, 1);
+        assert_eq!(window.report.newest_version, Some(newer));
+        assert_eq!(window.report.unreadable_captures, 1);
+        assert_eq!(
+            window.report.unreadable.len(),
+            1,
+            "and a genuinely corrupt line is still skipped loudly, per line"
+        );
+
+        let said = window.report.notices().join("\n");
+        assert!(
+            said.contains(&format!("journal format v{newer}"))
+                && said.contains(&format!("this binary writes v{JOURNAL_FORMAT_VERSION}")),
+            "the notice must name both versions, or it is not an answer: {said}"
+        );
+        assert!(
+            said.contains("never as \"nothing was there\""),
+            "and must say what the missing capture does NOT mean: {said}"
+        );
+        assert!(
+            said.contains("skipping an unreadable journal line"),
+            "the pre-existing loud skip survives the rewrite: {said}"
+        );
     }
 }
