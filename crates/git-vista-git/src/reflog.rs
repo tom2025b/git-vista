@@ -15,7 +15,7 @@ use std::path::Path;
 
 use gix::refs::Category;
 
-use git_vista_core::activity::ReflogEntry;
+use git_vista_core::activity::{ReflogEntry, ReflogRefKind};
 
 use crate::RepoError;
 
@@ -38,7 +38,13 @@ pub fn read_reflogs(path: &Path, per_ref_limit: usize) -> Result<Vec<ReflogEntry
     // HEAD's own log: checkouts live only here, and commits/merges made on a
     // checked-out branch are mirrored here (the feed assembly de-duplicates).
     if let Ok(head) = repo.find_reference("HEAD") {
-        collect_ref_log(&head, "HEAD", per_ref_limit, &mut entries);
+        collect_ref_log(
+            &head,
+            "HEAD",
+            ReflogRefKind::Head,
+            per_ref_limit,
+            &mut entries,
+        );
     }
 
     // Same error posture as `read_refs`/`walk_history`: failing to open or
@@ -57,18 +63,18 @@ pub fn read_reflogs(path: &Path, per_ref_limit: usize) -> Result<Vec<ReflogEntry
                 continue;
             }
         };
-        let short = match reference.name().category_and_short_name() {
-            Some((Category::LocalBranch, short)) => short.to_string(),
+        let (short, ref_kind) = match reference.name().category_and_short_name() {
+            Some((Category::LocalBranch, short)) => (short.to_string(), ReflogRefKind::LocalBranch),
             Some((Category::RemoteBranch, short)) => {
                 let name = short.to_string();
                 if name.ends_with("/HEAD") {
                     continue; // the remote's symbolic default-branch pointer
                 }
-                name
+                (name, ReflogRefKind::RemoteBranch)
             }
             _ => continue, // tags and the rest move rarely and aren't "activity"
         };
-        collect_ref_log(&reference, &short, per_ref_limit, &mut entries);
+        collect_ref_log(&reference, &short, ref_kind, per_ref_limit, &mut entries);
     }
 
     Ok(entries)
@@ -80,6 +86,7 @@ pub fn read_reflogs(path: &Path, per_ref_limit: usize) -> Result<Vec<ReflogEntry
 fn collect_ref_log(
     reference: &gix::Reference<'_>,
     ref_name: &str,
+    ref_kind: ReflogRefKind,
     limit: usize,
     out: &mut Vec<ReflogEntry>,
 ) {
@@ -98,6 +105,7 @@ fn collect_ref_log(
         match line {
             Ok(line) => out.push(ReflogEntry {
                 ref_name: ref_name.to_string(),
+                ref_kind,
                 time: line.signature.time.seconds,
                 old_oid: line.previous_oid.to_string(),
                 new_oid: line.new_oid.to_string(),
@@ -199,6 +207,50 @@ mod tests {
         let origin = kinds_of(&entries, "origin/main");
         assert_eq!(origin.len(), 1, "origin/main: {origin:?}");
         assert_eq!(origin[0].0, ActivityKind::Push);
+    }
+
+    #[test]
+    fn colliding_local_and_remote_short_names_keep_their_ref_kinds() {
+        let dir = fixture();
+        let p = dir.path();
+        git(p, &["config", "core.logAllRefUpdates", "always"]);
+        git(
+            p,
+            &["update-ref", "-m", "push", "refs/heads/origin/main", "main"],
+        );
+        git(
+            p,
+            &[
+                "update-ref",
+                "-m",
+                "update by push",
+                "refs/remotes/origin/main",
+                "main",
+            ],
+        );
+
+        let entries = read_reflogs(p, 100).unwrap();
+        let colliding: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.ref_name == "origin/main")
+            .collect();
+        assert_eq!(
+            colliding.len(),
+            2,
+            "both namespaces must be read: {colliding:#?}"
+        );
+        assert!(
+            colliding
+                .iter()
+                .any(|entry| entry.ref_kind == ReflogRefKind::LocalBranch),
+            "the local branch category must survive shortening: {colliding:#?}"
+        );
+        assert!(
+            colliding
+                .iter()
+                .any(|entry| entry.ref_kind == ReflogRefKind::RemoteBranch),
+            "the remote-tracking category must survive shortening: {colliding:#?}"
+        );
     }
 
     #[test]

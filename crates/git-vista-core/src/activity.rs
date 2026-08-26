@@ -25,6 +25,7 @@
 //! can't reset a branch that has since moved.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Deref;
 
 use serde::{Deserialize, Serialize};
 
@@ -411,18 +412,118 @@ pub enum HeadAtEvent {
     Unreadable { reason: String },
 }
 
+/// The namespace that owned a reflog entry before its ref name was shortened
+/// for display. A local branch and a remote-tracking branch may have the same
+/// short name (`origin/main`), so this provenance cannot be reconstructed from
+/// [`ReflogEntry::ref_name`] or from the current branch map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReflogRefKind {
+    Head,
+    LocalBranch,
+    RemoteBranch,
+}
+
 /// One raw reflog line, as read natively by `git-vista-git` — ref name plus
-/// the entry's old/new oids, timestamp and message. Defined here (not in the
-/// git crate) so [`assemble_feed`] can take them without core depending on
+/// its namespace, old/new oids, timestamp and message. Defined here (not in
+/// the git crate) so [`assemble_feed`] can take it without core depending on
 /// anything platform-specific.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReflogEntry {
     /// Short ref name: `"HEAD"`, `"main"`, `"origin/main"`.
     pub ref_name: String,
+    /// The namespace observed by the reflog reader before shortening.
+    pub ref_kind: ReflogRefKind,
     pub time: i64,
     pub old_oid: String,
     pub new_oid: String,
     pub message: String,
+}
+
+impl ReflogEntry {
+    /// Reattach the namespace while fold classification is still pending.
+    fn qualified_ref_name(&self) -> String {
+        match self.ref_kind {
+            ReflogRefKind::Head => self.ref_name.clone(),
+            ReflogRefKind::LocalBranch => format!("refs/heads/{}", self.ref_name),
+            ReflogRefKind::RemoteBranch => format!("refs/remotes/{}", self.ref_name),
+        }
+    }
+}
+
+/// One event while feed-only reflog provenance is still needed.
+///
+/// `ActivityEvent` is both the journal and wire shape, so reflog namespace is
+/// deliberately not added to it. This private sidecar survives only through
+/// duplicate attribution and ref-update folding. Journal events always carry
+/// `None`: their names are user data and may legally begin with `refs/heads/`
+/// or `refs/remotes/`.
+#[derive(Debug, Clone)]
+struct FeedEvent {
+    event: ActivityEvent,
+    reflog_ref_kind: Option<ReflogRefKind>,
+}
+
+impl FeedEvent {
+    fn from_reflog(event: ActivityEvent, ref_kind: ReflogRefKind) -> Self {
+        Self {
+            event,
+            reflog_ref_kind: Some(ref_kind),
+        }
+    }
+
+    fn from_journal(event: ActivityEvent) -> Self {
+        Self {
+            event,
+            reflog_ref_kind: None,
+        }
+    }
+
+    /// Whether a journal name can identify this exact reflog namespace.
+    ///
+    /// Local writers store the branch's short name; remote-update writers
+    /// store the full `refs/remotes/...` name. A short local branch may itself
+    /// begin with `refs/`, so that ambiguous spelling is never used to absorb
+    /// a local reflog row: keeping a duplicate is safer than erasing an
+    /// independent movement. HEAD is its own singleton namespace.
+    fn matches_journal_ref(&self, journal_ref: Option<&str>) -> bool {
+        let Some(reflog_name) = self.event.ref_name.as_deref() else {
+            return false;
+        };
+        match self.reflog_ref_kind {
+            Some(ReflogRefKind::LocalBranch) => journal_ref.is_some_and(|journal_name| {
+                !journal_name.starts_with("refs/")
+                    && reflog_name.strip_prefix("refs/heads/") == Some(journal_name)
+            }),
+            Some(ReflogRefKind::RemoteBranch) => journal_ref == Some(reflog_name),
+            Some(ReflogRefKind::Head) => reflog_name == "HEAD",
+            None => false,
+        }
+    }
+
+    /// Restore a short display name only when the sidecar proves this event
+    /// came from the corresponding reflog namespace. A journal string that
+    /// merely resembles a qualified ref is returned byte-for-byte.
+    fn into_activity(mut self) -> ActivityEvent {
+        let prefix = match self.reflog_ref_kind {
+            Some(ReflogRefKind::LocalBranch) => Some("refs/heads/"),
+            Some(ReflogRefKind::RemoteBranch) => Some("refs/remotes/"),
+            Some(ReflogRefKind::Head) | None => None,
+        };
+        if let (Some(prefix), Some(name)) = (prefix, self.event.ref_name.as_mut()) {
+            if let Some(short) = name.strip_prefix(prefix) {
+                *name = short.to_string();
+            }
+        }
+        self.event
+    }
+}
+
+impl Deref for FeedEvent {
+    type Target = ActivityEvent;
+
+    fn deref(&self) -> &Self::Target {
+        &self.event
+    }
 }
 
 /// The conventional 7-char short id, for labels.
@@ -549,7 +650,7 @@ pub fn assemble_feed(
     // A rebase writes start/one-per-pick/finish lines back to back on the same
     // ref; entries arrive newest-first per ref, so a consecutive run of Rebase
     // entries on one ref is one user action: newest new_oid ← oldest old_oid.
-    let mut events: Vec<ActivityEvent> = Vec::with_capacity(reflog.len());
+    let mut events: Vec<FeedEvent> = Vec::with_capacity(reflog.len());
     let mut i = 0;
     while i < reflog.len() {
         let entry = &reflog[i];
@@ -563,7 +664,7 @@ pub fn assemble_feed(
             let mut span = i;
             while span + 1 < reflog.len() {
                 let next = &reflog[span + 1];
-                if next.ref_name != entry.ref_name {
+                if next.ref_kind != entry.ref_kind || next.ref_name != entry.ref_name {
                     break;
                 }
                 let (next_kind, _) = parse_reflog_message(&next.message);
@@ -573,37 +674,43 @@ pub fn assemble_feed(
                 span += 1;
             }
             let steps = span - i + 1;
-            events.push(ActivityEvent {
-                time: entry.time,
-                kind: ActivityKind::Rebase,
-                ref_name: Some(entry.ref_name.clone()),
-                summary: if steps > 1 {
-                    format!("rebase ({steps} steps)")
-                } else {
-                    summary
+            events.push(FeedEvent::from_reflog(
+                ActivityEvent {
+                    time: entry.time,
+                    kind: ActivityKind::Rebase,
+                    ref_name: Some(entry.qualified_ref_name()),
+                    summary: if steps > 1 {
+                        format!("rebase ({steps} steps)")
+                    } else {
+                        summary
+                    },
+                    old_oid: Some(reflog[span].old_oid.clone()),
+                    new_oid: Some(entry.new_oid.clone()),
+                    source: ActivitySource::External,
+                    undo: None,
+                    // Reflog-derived: no branch-tip capture exists for it (#131).
+                    refs: None,
                 },
-                old_oid: Some(reflog[span].old_oid.clone()),
+                entry.ref_kind,
+            ));
+            i = span + 1;
+            continue;
+        }
+        events.push(FeedEvent::from_reflog(
+            ActivityEvent {
+                time: entry.time,
+                kind,
+                ref_name: Some(entry.qualified_ref_name()),
+                summary,
+                old_oid: Some(entry.old_oid.clone()),
                 new_oid: Some(entry.new_oid.clone()),
                 source: ActivitySource::External,
                 undo: None,
                 // Reflog-derived: no branch-tip capture exists for it (#131).
                 refs: None,
-            });
-            i = span + 1;
-            continue;
-        }
-        events.push(ActivityEvent {
-            time: entry.time,
-            kind,
-            ref_name: Some(entry.ref_name.clone()),
-            summary,
-            old_oid: Some(entry.old_oid.clone()),
-            new_oid: Some(entry.new_oid.clone()),
-            source: ActivitySource::External,
-            undo: None,
-            // Reflog-derived: no branch-tip capture exists for it (#131).
-            refs: None,
-        });
+            },
+            entry.ref_kind,
+        ));
         i += 1;
     }
 
@@ -629,9 +736,11 @@ pub fn assemble_feed(
     });
 
     // -- 3. Attribute app events: a reflog entry matching a journal entry ----
-    // (same kind, same resulting oid, near-same moment) *is* that journal
-    // entry — keep the journal copy, which knows the source and has the
-    // richer summary.
+    // Same kind, resulting oid and near-same moment are not enough: a local
+    // branch and remote-tracking branch can land the same commit together.
+    // Require namespace-consistent ref identity too. The matching reflog row
+    // *is* that journal entry, so keep the journal copy, which knows the source
+    // and has the richer summary.
     events.retain(|e| {
         let Some(new_oid) = &e.new_oid else {
             return true;
@@ -640,6 +749,7 @@ pub fn assemble_feed(
             j.kind == e.kind
                 && j.new_oid.as_deref() == Some(new_oid)
                 && (e.time - j.time).abs() <= JOURNAL_MATCH_SLACK
+                && e.matches_journal_ref(j.ref_name.as_deref())
         })
     });
 
@@ -647,7 +757,7 @@ pub fn assemble_feed(
     // to resolve the batched captures (#485). Every event copied here is a
     // small one — the ref maps live on one line per batch, and that one is
     // cloned once.
-    events.extend(journal.iter().cloned());
+    events.extend(journal.iter().cloned().map(FeedEvent::from_journal));
 
     // -- 4. Fold a burst of remote-tracking ref updates into one row. --------
     // One `git fetch` is one user action with one outcome they care about
@@ -655,7 +765,10 @@ pub fn assemble_feed(
     // sources. #329: a fetch of 94 refs put 94 rows in the feed and buried the
     // revert the user was actually looking for. A pull floods the same way,
     // with one row that must survive — see [`fold_ref_update_bursts`].
-    let mut events = fold_ref_update_bursts(events, branches);
+    let mut events: Vec<ActivityEvent> = fold_ref_update_bursts(events, branches)
+        .into_iter()
+        .map(FeedEvent::into_activity)
+        .collect();
 
     // -- 5. Undo hints, computed against the repo's *current* state. ---------
     for event in &mut events {
@@ -702,35 +815,33 @@ pub fn assemble_feed(
 /// True when this event's ref is a *local branch* rather than a
 /// remote-tracking ref — the distinction [`fold_ref_update_bursts`] turns on.
 ///
-/// The two sources spell refs differently: the journal writes them in full
-/// (`refs/heads/main`, `refs/remotes/origin/main`) and reflog entries carry the
-/// short name (`main`, `origin/main`). A short name is ambiguous on its face —
-/// a local branch may legitimately be called `origin/main` — so it is resolved
-/// against the repo's *actual* branch list rather than by guessing at the
-/// slash.
-fn names_a_local_branch(ref_name: Option<&str>, branches: &HashMap<String, String>) -> bool {
-    let Some(name) = ref_name else {
+/// Reflog entries answer from the typed sidecar observed by the reader. A
+/// journal event has no such sidecar, so only an exact hit in the current local
+/// branch map can classify it. Its string is never treated as provenance:
+/// `refs/remotes/topic` is itself a legal short local branch name.
+fn names_a_local_branch(event: &FeedEvent, branches: &HashMap<String, String>) -> bool {
+    match event.reflog_ref_kind {
+        Some(ReflogRefKind::LocalBranch) => return true,
+        Some(ReflogRefKind::Head | ReflogRefKind::RemoteBranch) => return false,
+        None => {}
+    }
+    let Some(name) = event.ref_name.as_deref() else {
         return false;
     };
-    // A full ref path answers for itself, whether or not the branch still
-    // exists; only the short form needs the branch list to disambiguate.
-    if name.starts_with("refs/heads/") {
+    if branches.contains_key(name) {
         return true;
     }
-    if name.starts_with("refs/remotes/") {
-        return false;
-    }
-    branches.contains_key(name)
+    false
 }
 
-/// True for the one [`ActivityKind::Fetch`]/[`ActivityKind::Pull`] event that
-/// must never be folded into a count: the admission
-/// `planner::fetch::journal_unobserved` writes when `git fetch` succeeded and
-/// only the re-read of `refs/remotes/<remote>/*` failed.
+/// True for the foldable-kind events that must never be folded into a count:
+/// the admissions `planner::fetch::journal_unobserved` and
+/// `planner::push::journal_unobserved` write when the git command itself
+/// succeeded and only the re-read of `refs/remotes/<remote>/*` failed.
 ///
 /// **The discriminator is the whole shape, not any one field** (ADR 0081). No
-/// ref name *and* no old oid *and* no new oid is what that one writer produces
-/// and nothing else does:
+/// ref name *and* no old oid *and* no new oid is what those two writers
+/// produce and nothing else this fold looks at does:
 ///
 /// - Reflog-derived events are built in [`assemble_feed`]'s step 1 from a
 ///   [`ReflogEntry`], which carries a ref name and both oids by construction —
@@ -741,20 +852,28 @@ fn names_a_local_branch(ref_name: Option<&str>, branches: &HashMap<String, Strin
 ///   the `ref_name` is what separates those entries from this one.
 /// - Journalled pulls come from `planner::branch_exec`, which names the branch
 ///   the pull landed on.
-/// - The two other all-`None` journal writers — `planner::worktree_exec`'s two
-///   admissions and `planner::push`'s — carry `ActivityKind::Other` and
-///   `ActivityKind::Push`, kinds this fold never looks at.
+/// - `planner::worktree_exec`'s two all-`None` admissions carry
+///   `ActivityKind::Other`, a kind this fold never looks at.
+/// - `planner::push::journal_unobserved` is all-`None` too, and since #487 made
+///   `ActivityKind::Push` a fold candidate this test is what keeps it out —
+///   for precisely the reason it keeps fetch's out. The push succeeded, so git
+///   logged every ref it moved; the admission carries no `new_oid`, so it
+///   suppresses none of those reflog lines in attribution and would fold in
+///   with them, counting itself as a ref and deleting the one row that says
+///   what reached the remote is unknown. For a push that row matters more than
+///   for a fetch: what may have changed is not on this machine, and no later
+///   local read will reveal it.
 ///
 /// Keying on `ref_name` alone would be wider than that: it would also exclude
-/// any future Fetch/Pull event that names no ref but does know an oid, and such
-/// an event knows what it moved and belongs in the count.
+/// any future foldable-kind event that names no ref but does know an oid, and
+/// such an event knows what it moved and belongs in the count.
 fn admits_it_could_not_read_the_refs(event: &ActivityEvent) -> bool {
     event.ref_name.is_none() && event.old_oid.is_none() && event.new_oid.is_none()
 }
 
-/// Collapse each run of remote-tracking ref updates — [`ActivityKind::Fetch`]
-/// and [`ActivityKind::Pull`] — that happened within [`FETCH_BURST_GAP`] of one
-/// another into a single counted row.
+/// Collapse each run of remote-tracking ref updates — [`ActivityKind::Fetch`],
+/// [`ActivityKind::Pull`] and [`ActivityKind::Push`] — that happened within
+/// [`FETCH_BURST_GAP`] of one another into a single counted row.
 ///
 /// Deliberately here rather than at the write path: a fetch run from the
 /// terminal has reflog lines and no journal entry at all, so an operation id
@@ -769,6 +888,27 @@ fn admits_it_could_not_read_the_refs(event: &ActivityEvent) -> bool {
 /// the bookkeeping folds. (Git's own hint here is the capital letter on
 /// `Fast-forward`; keying on that would be far too fragile, so the local branch
 /// list decides — see [`names_a_local_branch`].)
+///
+/// **A push's local-branch movement is never folded either (#487).** Push
+/// carries the same asymmetry, and it is not hypothetical. Probed against real
+/// git on 2026-08-26 (`git push` between two local repositories, reflogs read
+/// on both sides): the *pushing* repository logs `update by push` on
+/// `refs/remotes/<remote>/<branch>`, and the *receiving* repository logs plain
+/// `push` on `refs/heads/<branch>`. Both parse to [`ActivityKind::Push`] — see
+/// [`parse_reflog_message`], which matches `update by push` and any message
+/// starting `push`. Only the first is bookkeeping. A repository that others
+/// push into watches its own branches move under that second message, and
+/// those rows *are* the event, exactly as a pull's branch move is. So the same
+/// [`names_a_local_branch`] exemption covers both, for the same reason.
+///
+/// **Why the gate opened before the flood (#487).** The push endpoint pushes
+/// one named branch, so N = 1 and no burst can reach here from production
+/// today; an unfolded Push row is what a user sees now, and it is the right
+/// row. The gate is opened ahead of the multi-ref push path — `--all`, a
+/// matching refspec, tags pushed alongside — so the day it lands it does not
+/// reproduce #329 under a different kind. The fold cannot know what the writer
+/// is currently able to emit, so the pins for it build the multi-ref burst
+/// directly; see `a_multi_ref_push_folds_into_one_counted_row`.
 ///
 /// A run of one is returned untouched — a single-ref fetch already says the
 /// useful thing ("fetched ‘origin/main’ from origin") and rewriting it as
@@ -834,33 +974,66 @@ fn admits_it_could_not_read_the_refs(event: &ActivityEvent) -> bool {
 /// drift *between entries of one batch*, which #485 did fix, not drift
 /// between the batch and the reflog, which it did not touch.
 ///
+/// **Push does not inherit even that relative half — reported, not fixed
+/// here (#487).** `planner::push::journal_updates` loops over the refs that
+/// moved calling `journal_app_event`, the *singular*, and that one delegates
+/// to `journal_app_events` with a batch of one. So each ref takes its own
+/// `now_secs()` reading and its own `journal::append_all` ref capture:
+/// exactly the writer shape #485 removed from fetch, still present in push —
+/// and it is drift *between entries of one operation*, the half batching does
+/// rule out for fetch. It cannot bite today, because that loop runs over the
+/// single ref a one-branch push moves and one entry cannot drift from itself;
+/// it would arrive **with** the multi-ref push path rather than after it.
+/// Batching push's writer is a change to `planner::push` with its own
+/// before/after measurement, not a rider on this gate. Nothing pins push's
+/// drift here because push cannot yet produce it; what is pinned is that the
+/// fold counts a push burst correctly when the entries do *not* drift.
+///
 /// **Safe for undo by construction, not by luck:** [`undo_hint`] has no arm for
-/// `Fetch` or `Pull`, so neither row has ever carried a hint and dropping the
-/// per-ref oids cannot take one away. The same fold would be *wrong* for, say,
-/// `BranchDeleted`, whose `old_oid` is precisely what its undo needs.
+/// `Fetch`, `Pull` or `Push`, so none of those rows has ever carried a hint and
+/// dropping the per-ref oids cannot take one away. The same fold would be
+/// *wrong* for, say, `BranchDeleted`, whose `old_oid` is precisely what its
+/// undo needs.
 fn fold_ref_update_bursts(
-    events: Vec<ActivityEvent>,
+    events: Vec<FeedEvent>,
     branches: &HashMap<String, String>,
-) -> Vec<ActivityEvent> {
-    let (candidates, mut out): (Vec<_>, Vec<_>) = events.into_iter().partition(|e| {
-        matches!(e.kind, ActivityKind::Fetch | ActivityKind::Pull)
-            && !names_a_local_branch(e.ref_name.as_deref(), branches)
+) -> Vec<FeedEvent> {
+    let (mut candidates, mut out): (Vec<_>, Vec<_>) = events.into_iter().partition(|e| {
+        FOLDABLE_KINDS.iter().any(|(kind, _)| *kind == e.kind)
+            && !names_a_local_branch(e, branches)
             && !admits_it_could_not_read_the_refs(e)
     });
 
-    // Fetch and Pull group separately: they are different actions, and a fetch
-    // immediately followed by a pull is two of them.
-    let (fetches, pulls): (Vec<_>, Vec<_>) = candidates
-        .into_iter()
-        .partition(|e| e.kind == ActivityKind::Fetch);
-    fold_one_kind(&mut out, fetches, "fetch");
-    fold_one_kind(&mut out, pulls, "pull");
+    // Each kind groups separately: they are different actions, and a fetch
+    // immediately followed by a pull is two of them, not one run of six refs.
+    for (kind, noun) in FOLDABLE_KINDS {
+        let (group, rest): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|e| e.kind == kind);
+        candidates = rest;
+        fold_one_kind(&mut out, group, noun);
+    }
+    // Unreachable while [`FOLDABLE_KINDS`] is also the gate — and kept anyway,
+    // because a kind admitted above and not grouped here would otherwise be
+    // *deleted* from the feed, which is a far worse way to learn about it than
+    // an unfolded row.
+    out.extend(candidates);
     out
 }
 
+/// The kinds this fold collapses, each with the noun its counted row uses
+/// ("fetch — 94 refs updated").
+///
+/// One table, read twice — once as the gate in [`fold_ref_update_bursts`] and
+/// once as the grouping — so the two cannot drift apart. Adding a kind is
+/// this list and nothing else; #487 added `Push` to it.
+const FOLDABLE_KINDS: [(ActivityKind, &str); 3] = [
+    (ActivityKind::Fetch, "fetch"),
+    (ActivityKind::Pull, "pull"),
+    (ActivityKind::Push, "push"),
+];
+
 /// Fold one kind's bursts into `out`. `noun` names the action in the counted
 /// summary ("fetch — 94 refs updated").
-fn fold_one_kind(out: &mut Vec<ActivityEvent>, mut group: Vec<ActivityEvent>, noun: &str) {
+fn fold_one_kind(out: &mut Vec<FeedEvent>, mut group: Vec<FeedEvent>, noun: &str) {
     // Group by time, independent of where these sat among other events.
     group.sort_by_key(|e| std::cmp::Reverse(e.time));
 
@@ -883,7 +1056,7 @@ fn fold_one_kind(out: &mut Vec<ActivityEvent>, mut group: Vec<ActivityEvent>, no
             out.push(first);
             continue;
         }
-        out.push(ActivityEvent {
+        out.push(FeedEvent::from_journal(ActivityEvent {
             time: first.time,
             kind: first.kind,
             // No single ref: the row is about the action, not about any one of
@@ -905,7 +1078,7 @@ fn fold_one_kind(out: &mut Vec<ActivityEvent>, mut group: Vec<ActivityEvent>, no
             undo: None,
             // Reflog-derived: no branch-tip capture exists for it (#131).
             refs: None,
-        });
+        }));
     }
 }
 
@@ -986,8 +1159,27 @@ mod tests {
     use super::*;
 
     fn entry(ref_name: &str, time: i64, old: &str, new: &str, message: &str) -> ReflogEntry {
+        let ref_kind = if ref_name == "HEAD" {
+            ReflogRefKind::Head
+        } else if ref_name.contains('/') {
+            ReflogRefKind::RemoteBranch
+        } else {
+            ReflogRefKind::LocalBranch
+        };
+        entry_of_kind(ref_kind, ref_name, time, old, new, message)
+    }
+
+    fn entry_of_kind(
+        ref_kind: ReflogRefKind,
+        ref_name: &str,
+        time: i64,
+        old: &str,
+        new: &str,
+        message: &str,
+    ) -> ReflogEntry {
         ReflogEntry {
             ref_name: ref_name.to_string(),
+            ref_kind,
             time,
             old_oid: old.to_string(),
             new_oid: new.to_string(),
@@ -1166,6 +1358,54 @@ mod tests {
         assert_eq!(feed.len(), 1, "one event for one merge: {feed:#?}");
         assert_eq!(feed[0].source, ActivitySource::App);
         assert_eq!(feed[0].summary, "merged ‘feature’ into ‘main’");
+    }
+
+    /// A pushed remote-tracking ref and an independently pushed local branch
+    /// can land the same commit in the same second. Kind, oid and time identify
+    /// neither namespace: the outgoing journal may absorb only its matching
+    /// remote-tracking echo, never the receiving repository's local movement.
+    #[test]
+    fn a_remote_push_journal_does_not_absorb_a_same_oid_local_push() {
+        let journal = vec![ActivityEvent {
+            time: 100,
+            kind: ActivityKind::Push,
+            ref_name: Some("refs/remotes/origin/main".into()),
+            summary: "pushed ‘main’ to origin".into(),
+            old_oid: Some("a".into()),
+            new_oid: Some("b".into()),
+            source: ActivitySource::App,
+            undo: None,
+            refs: None,
+        }];
+        let reflog = vec![
+            entry_of_kind(ReflogRefKind::LocalBranch, "main", 100, "a", "b", "push"),
+            entry_of_kind(
+                ReflogRefKind::RemoteBranch,
+                "origin/main",
+                100,
+                "a",
+                "b",
+                "update by push",
+            ),
+            entry("origin/feat-a", 100, "p", "q", "update by push"),
+            entry("origin/feat-b", 100, "r", "s", "update by push"),
+            entry("origin/feat-c", 100, "t", "u", "update by push"),
+        ];
+        let branches = HashMap::from([("main".to_string(), "b".to_string())]);
+
+        let feed = assemble_feed(journal, reflog, &branches, &HashSet::new(), 50);
+
+        let local_move = feed
+            .iter()
+            .find(|event| event.ref_name.as_deref() == Some("main") && event.summary == "push")
+            .expect("the independent local branch movement must survive attribution");
+        assert_eq!(local_move.new_oid.as_deref(), Some("b"));
+        assert!(
+            feed.iter()
+                .any(|event| event.summary == "push — 4 refs updated"),
+            "the matching remote echo is absorbed and only four remote rows fold: {feed:#?}"
+        );
+        assert_eq!(feed.len(), 2, "one local movement + one remote burst");
     }
 
     #[test]
@@ -1446,6 +1686,216 @@ mod tests {
             feed.iter()
                 .any(|e| e.summary == "pull — 4 refs updated" && e.ref_name.is_none()),
             "the four remote-tracking updates fold: {feed:#?}"
+        );
+    }
+
+    /// #487: push journals and reflogs one entry per remote-tracking ref it
+    /// moved, structurally identical to fetch — so a push that moves four refs
+    /// must render as one counted row, not four.
+    ///
+    /// **The fixture builds a burst production cannot emit yet, deliberately.**
+    /// The push endpoint pushes one named branch, so N = 1 today and no real
+    /// push reaches this shape. The fold has no way to know that, and the case
+    /// it exists to handle is the multi-ref one: `git push --all`, a matching
+    /// refspec, or tags pushed alongside all produce exactly these reflog
+    /// lines. #487 was filed to open the gate *before* that path lands rather
+    /// than after it floods the feed the way #329's fetch did. Asserting
+    /// against the old behaviour would have been asserting against a
+    /// hypothetical; asserting against this one is not — the fold is real code
+    /// with a real gate, and this is what it now does.
+    #[test]
+    fn a_multi_ref_push_folds_into_one_counted_row() {
+        // "update by push" is what git writes on the pusher's remote-tracking
+        // refs — probed against real git, both sides, 2026-08-26.
+        let reflog = vec![
+            entry("origin/main", 100, "a", "b", "update by push"),
+            entry("origin/feat-a", 100, "p", "q", "update by push"),
+            entry("origin/feat-b", 100, "r", "s", "update by push"),
+            entry("origin/feat-c", 100, "t", "u", "update by push"),
+        ];
+        let feed = assemble_feed(vec![], reflog, &HashMap::new(), &HashSet::new(), 50);
+
+        assert_eq!(feed.len(), 1, "one push is one row: {feed:#?}");
+        assert_eq!(
+            feed[0].summary, "push — 4 refs updated",
+            "the four remote-tracking updates fold into one counted row: {feed:#?}"
+        );
+        assert_eq!(feed[0].kind, ActivityKind::Push);
+        assert!(
+            feed[0].ref_name.is_none(),
+            "a counted row names no single ref: {feed:#?}"
+        );
+    }
+
+    /// The other half of #487, and the reason Push could not simply be added to
+    /// the gate: a push row naming a *local branch* must survive the fold, the
+    /// same asymmetry `a_pull_folds_its_ref_updates_but_keeps_the_branch_move`
+    /// pins for pull.
+    ///
+    /// Probed against real git on 2026-08-26 by pushing between two local
+    /// repositories and reading both reflogs: the pusher logs `update by push`
+    /// on `refs/remotes/origin/<branch>`, and the repository being pushed
+    /// *into* logs plain `push` on `refs/heads/<branch>`. Both parse to
+    /// `ActivityKind::Push`. The second is a branch of this repository moving —
+    /// the event itself, not bookkeeping about it — so it is exempted by
+    /// `names_a_local_branch` and never counted away. A repository can see both
+    /// at once: it is pushed into by a colleague and pushes to its own remote.
+    #[test]
+    fn a_push_that_names_a_local_branch_survives_the_fold() {
+        let reflog = vec![
+            entry("main", 100, "a", "b", "push"),
+            entry("origin/main", 100, "a", "b", "update by push"),
+            entry("origin/feat-a", 100, "p", "q", "update by push"),
+            entry("origin/feat-b", 100, "r", "s", "update by push"),
+            entry("origin/feat-c", 100, "t", "u", "update by push"),
+        ];
+        let branches = HashMap::from([("main".to_string(), "b".to_string())]);
+        let feed = assemble_feed(vec![], reflog, &branches, &HashSet::new(), 50);
+
+        assert_eq!(feed.len(), 2, "branch move + one counted row: {feed:#?}");
+        let branch_move = feed
+            .iter()
+            .find(|e| e.ref_name.as_deref() == Some("main"))
+            .expect("the local branch row survives the fold");
+        assert_eq!(branch_move.kind, ActivityKind::Push);
+        assert_eq!(branch_move.summary, "push");
+        assert_eq!(branch_move.new_oid.as_deref(), Some("b"));
+        assert!(
+            feed.iter()
+                .any(|e| e.summary == "push — 4 refs updated" && e.ref_name.is_none()),
+            "the four remote-tracking updates still fold: {feed:#?}"
+        );
+    }
+
+    /// A short reflog name cannot distinguish `refs/heads/origin/main` from
+    /// `refs/remotes/origin/main`. Both may exist at once, and the local
+    /// branch exemption must protect only the former without removing the
+    /// latter from its remote-tracking burst.
+    #[test]
+    fn a_local_origin_main_does_not_hide_remote_origin_main_from_the_push_fold() {
+        let reflog = vec![
+            entry_of_kind(
+                ReflogRefKind::LocalBranch,
+                "origin/main",
+                100,
+                "a",
+                "b",
+                "push",
+            ),
+            entry_of_kind(
+                ReflogRefKind::RemoteBranch,
+                "origin/main",
+                100,
+                "a",
+                "b",
+                "update by push",
+            ),
+            entry("origin/feat-a", 100, "p", "q", "update by push"),
+            entry("origin/feat-b", 100, "r", "s", "update by push"),
+            entry("origin/feat-c", 100, "t", "u", "update by push"),
+        ];
+        let branches = HashMap::from([("origin/main".to_string(), "b".to_string())]);
+        let feed = assemble_feed(vec![], reflog, &branches, &HashSet::new(), 50);
+
+        let branch_move = feed
+            .iter()
+            .find(|event| {
+                event.ref_name.as_deref() == Some("origin/main") && event.summary == "push"
+            })
+            .expect("the colliding local branch row survives the fold");
+        assert_eq!(branch_move.new_oid.as_deref(), Some("b"));
+        assert!(
+            feed.iter()
+                .any(|event| event.summary == "push — 4 refs updated"),
+            "all four remote-tracking rows must fold despite the local-name collision: {feed:#?}"
+        );
+        assert_eq!(
+            feed.len(),
+            2,
+            "one local move + one remote burst: {feed:#?}"
+        );
+    }
+
+    /// `refs/remotes/topic` is a legal *short local branch name*. A journal
+    /// event carries that short name without reflog namespace provenance, so
+    /// its spelling must not override the current local-branch observation and
+    /// fold the branch movement into remote-tracking bookkeeping.
+    #[test]
+    fn a_prefix_shaped_local_journal_name_survives_the_push_fold() {
+        let legal_local_name = "refs/remotes/topic";
+        let journal = vec![ActivityEvent {
+            time: 100,
+            kind: ActivityKind::Push,
+            ref_name: Some(legal_local_name.into()),
+            summary: "push".into(),
+            old_oid: Some("old-local".into()),
+            new_oid: Some("new-local".into()),
+            source: ActivitySource::App,
+            undo: None,
+            refs: None,
+        }];
+        let reflog = vec![
+            entry("origin/main", 100, "a", "b", "update by push"),
+            entry("origin/feat-a", 100, "p", "q", "update by push"),
+            entry("origin/feat-b", 100, "r", "s", "update by push"),
+            entry("origin/feat-c", 100, "t", "u", "update by push"),
+        ];
+        let branches = HashMap::from([(legal_local_name.to_string(), "new-local".to_string())]);
+
+        let feed = assemble_feed(journal, reflog, &branches, &HashSet::new(), 50);
+
+        let local_move = feed
+            .iter()
+            .find(|event| event.ref_name.as_deref() == Some(legal_local_name))
+            .expect("the legal prefix-shaped local branch survives the fold");
+        assert_eq!(local_move.summary, "push");
+        assert!(
+            feed.iter()
+                .any(|event| event.summary == "push — 4 refs updated"),
+            "only the four remote-tracking rows fold: {feed:#?}"
+        );
+        assert_eq!(feed.len(), 2, "one local move + one remote burst");
+    }
+
+    /// `refs/heads/archive` is also a legal *short* branch name. An External
+    /// journal row is not necessarily reflog-derived, so display shortening
+    /// must be driven by typed reflog provenance rather than by source plus a
+    /// prefix that can be ordinary user data.
+    #[test]
+    fn an_external_journal_name_that_looks_qualified_is_not_shortened() {
+        let legal_local_name = "refs/heads/archive";
+        let journal = vec![ActivityEvent {
+            time: 100,
+            kind: ActivityKind::BranchDeleted,
+            ref_name: Some(legal_local_name.into()),
+            summary: "deleted branch".into(),
+            old_oid: Some("deadbeef".into()),
+            new_oid: None,
+            source: ActivitySource::External,
+            undo: None,
+            refs: None,
+        }];
+
+        let feed = assemble_feed(journal, vec![], &HashMap::new(), &HashSet::new(), 50);
+
+        assert_eq!(feed.len(), 1);
+        assert_eq!(
+            feed[0].ref_name.as_deref(),
+            Some(legal_local_name),
+            "journal names are never shortened without typed reflog provenance"
+        );
+        let action = &feed[0]
+            .undo
+            .as_ref()
+            .expect("the unused branch name remains safely restorable")
+            .action;
+        assert_eq!(
+            action,
+            &UndoAction::RestoreBranch {
+                name: legal_local_name.into(),
+                tip: "deadbeef".into(),
+            },
+            "undo must restore the exact legal branch name"
         );
     }
 
@@ -1775,9 +2225,9 @@ mod tests {
     /// one fetch drifting *apart from each other* — no writer of this class can
     /// still produce that, since fetch and pull journal through the batched
     /// `fetch::journal_updates` (pull runs `fetch::run_fetch`) with one shared
-    /// timestamp, and `fold_ref_update_bursts` folds only `Fetch` and `Pull`,
-    /// so the per-ref push journalling of #487, the one remaining unbatched
-    /// writer, cannot reach this code path at all. It does **not** rule out
+    /// timestamp, and the one remaining unbatched per-ref writer cannot yet
+    /// emit a burst for the fold to count (see the paragraph below). It does
+    /// **not** rule out
     /// the whole batch's one shared timestamp landing more than
     /// [`JOURNAL_MATCH_SLACK`] after the reflog lines it is meant to match —
     /// that gap is set by however long the post-fetch ref re-read
@@ -1788,6 +2238,17 @@ mod tests {
     /// Whether it is ever actually crossed has not been measured (#522); if
     /// it is, every entry in the batch drifts together and the fold counts
     /// 2N, the same symptom this test pins in a different shape.
+    ///
+    /// **#487 narrowed the first half of that; it did not break it.** That
+    /// sentence used to dismiss `planner::push::journal_updates` — the one
+    /// remaining unbatched per-ref writer — on the grounds that
+    /// `fold_ref_update_bursts` folds only `Fetch` and `Pull`, so push could
+    /// not reach this code path at all. It can now: #487 made `Push` a fold
+    /// candidate, and that writer is still unbatched, so it *is* a writer of
+    /// this class. What holds instead is narrower and still true — the push
+    /// endpoint pushes one named branch, so that loop runs once and a single
+    /// entry cannot drift from itself. The day a multi-ref push path lands,
+    /// this is the paragraph to come back to.
     #[test]
     fn a_slow_fetch_still_counts_only_the_refs_that_moved() {
         const REFS: i64 = 250;
