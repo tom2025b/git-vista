@@ -263,21 +263,38 @@ the *difference*, and it is re-measured whenever `main` moves under the branch
 rather than carried forward: a stale baseline would quietly absorb a regression
 introduced by someone else's merge, or blame this branch for one.
 
-Measured on `5ec2ae5` (post-#530, post-#537) with `gv-sandbox` built first:
-**624 passed, 321 failed, 4 ignored**. This branch, merged up to the same
-commit: **633 passed, 321 failed, 4 ignored**. The failing sets are identical —
-`comm` over the sorted names reports zero new failures and zero newly passing.
-The +9 are exactly the nine tests added here.
+Measured on `a685960` (post-#530, #537, #533, #538, #539, #535 — protocol v8)
+with `gv-sandbox` built first: **635 passed, 321 failed, 4 ignored**. This
+branch, merged up to the same commit: **646 passed, 322 failed, 4 ignored**.
 
-`main` has since moved to `b1d9c0f` (#533), which is merged down here too. That
-baseline is *not* re-measured, and the reason is checkable rather than assumed:
-`git diff --stat 5ec2ae5..b1d9c0f` touches only `.github/workflows/ci.yml` and
-two documents — no Rust source, so no test can have changed behaviour. The
-branch suite was re-run against it anyway and still reports **633 passed, 321
-failed**, the same failing set.
+**That is one new failure, not zero, and it is named rather than rounded away:**
 
-(The same comparison against the branch's original base `405a764` read 616 →
-625, also with an identical failing set.)
+```
+handlers::fetch::tests::a_refusal_reaches_the_client_as_a_bare_fetch_error_through_a_real_router
+```
+
+It fails here for the container's documented reason and nothing else — the
+route reaches a real `git fetch` against a configured remote, which needs the
+strict tier: `couldn't resolve the git directory … missing: landlock_abi>=6,
+bwrap`, answered `500` instead of `400`. The same test is **green on CI**, on
+the same commit content (`13bb051`, run `32967288794`, all seven checks
+passing), which is a Landlock kernel.
+
+The honest way to read that: strengthening this test to drive a genuinely
+over-cap failure — the change that makes it catch a *narrowed* sniff and not
+only a removed one — moved it out of the set this container can verify and into
+the set only CI can. That is a real trade and it is recorded as one, not
+presented as an unchanged "zero new failures".
+
+`comm` over the sorted names reports that one addition and **zero newly
+passing**; every other one of the 321 is identical on both sides.
+
+Earlier bases, each measured the same way and each reporting an *identical*
+failing set (zero new, zero newly passing) with the then-current test shapes:
+`405a764` 616 → 625, `5ec2ae5` 624 → 633, `b1d9c0f` unchanged from `5ec2ae5`
+(that range touches only `.github/workflows/ci.yml` and two documents — no Rust
+source, checkable with `git diff --stat`, so no test could have changed
+behaviour).
 
 **What the baseline could not tell us, and did.** One of those 321 is
 `state::tests::selection_flow_carries_mode_and_gates_writes`, which dies at its
