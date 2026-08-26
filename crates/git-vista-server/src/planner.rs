@@ -3146,9 +3146,11 @@ mod sequence_exec;
 /// module doc.
 mod worktree_exec;
 
-/// `POST /api/amend-commit`'s handler-side 400 constructor, re-exported so
-/// `handlers::commit`'s `planner::amend_refusal` path is unchanged by the
-/// commit executors moving into [`commit_exec`].
+/// `POST /api/amend-commit`'s one 400 constructor — the handler's own
+/// request-shape refusals and [`commit_exec`]'s classified git outcomes both
+/// build through it — re-exported so `handlers::commit`'s
+/// `planner::amend_refusal` path is unchanged by the commit executors moving
+/// into [`commit_exec`].
 pub(crate) use commit_exec::amend_refusal;
 
 /// `POST /api/fetch`'s error-body constructor, re-exported so the handler's

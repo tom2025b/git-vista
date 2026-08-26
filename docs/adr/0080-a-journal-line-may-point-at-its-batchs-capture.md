@@ -1,6 +1,6 @@
 # 0080 — A journal line may point at its batch's capture, and nothing leaves the server as a pointer
 
-- **Status:** Accepted — implemented and tested
+- **Status:** Accepted — implemented and tested. **Amended 2026-08-26 by ADR 0085 (#521)**: the Consequences gained the rollback section this ADR shipped without. Nothing decided here changed.
 - **Date:** 2026-08-25
 - **Issue:** [#485](https://github.com/tom2025b/git-vista/issues/485). A #329 successor.
 - **Evidence:** `docs/investigations/2026-08-25-issue-329-fetch-feed-volume.md`,
@@ -175,6 +175,40 @@ it is outside this task's paths. The mechanism it needs now exists
 (`journal::append_all`, `handlers::journal_app_events`), so adopting it is a
 small change rather than a design question, but until it is adopted a push that
 moves many refs still pays what a fetch used to.
+
+### Consequences — rollback (added 2026-08-26, #521, ADR 0085)
+
+**This ADR shipped without weighing what a rollback across it costs, and it
+costs something.** Recorded here, at the decision, rather than left to be
+rediscovered as a bug.
+
+`RefsAtEvent` is internally tagged and, as this ADR left it, had no catch-all
+variant. A binary built before #485 therefore fails to deserialize
+`{"status":"in_batch",…}` with ``unknown variant `in_batch` ``. That failure is
+not confined to the field: `refs` is one field of an `ActivityEvent`, and
+`journal::read_all` parses a whole line at a time, so **the entire event is
+discarded** — its time, kind, ref name, summary and both tips along with the
+capture. Roll a deployment back across #485 and a 100-ref fetch renders as
+**one** feed row: the anchor survives and the other 99 vanish, for as long as
+the old binary is the one reading.
+
+What is *not* lost: the bytes. The journal is append-only and nothing rewrites
+or truncates it, so a re-upgrade restores every line. An old binary appending
+its own per-event lines to the same file is also fine — mixed-format journals
+are normal. This is a persisted-format break and a rendering loss, not data
+loss.
+
+D2's reasoning is not reopened by this. Writing the referrers as `None` would
+have kept them readable by an old binary at the price of telling every current
+and future replayer that N−1 of every N lines carry no history — a permanent
+lie bought for a temporary window, and #521 re-examined and re-rejected it.
+
+**What #521 changed, and what it did not.** ADR 0085 adds a `RefsAtEvent`
+catch-all and a per-line journal format stamp, so that the *next* variant costs
+a line its capture rather than the line, and so that a reader can name the
+format that wrote a line it cannot fully read. Neither does anything for a
+rollback across *this* ADR: old readers are binaries already built. The N−1
+loss above stands exactly as stated.
 
 ## Alternatives rejected
 

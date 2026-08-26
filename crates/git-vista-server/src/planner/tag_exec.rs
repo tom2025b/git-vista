@@ -467,9 +467,10 @@ fn sign_failure_message(kind: SignTagFailureKind) -> &'static str {
 /// other operation's executor returns. #323 already taught `middleware`'s
 /// `rewrap_error` to recognise a JSON *object* body and pass it through with
 /// `application/json` set rather than re-wrapping it as escaped text inside
-/// an `ApiError`, so this needs no `Response`-returning sibling the way
-/// [`amend_refusal`](super::commit_exec::amend_refusal)/[`amend_refusal_body`](super::commit_exec::amend_refusal_body) split into two — one plain
-/// function covers both this pipeline's callers and any future direct one.
+/// an `ApiError`, so one plain function covers both this pipeline's callers
+/// and any future direct one — the posture
+/// [`amend_refusal`](super::commit_exec::amend_refusal) joined when #336
+/// removed its route-local relabeling layer (ADR 0084).
 fn sign_refusal_body(kind: SignTagFailureKind, message: &str) -> (StatusCode, String) {
     (
         StatusCode::BAD_REQUEST,
