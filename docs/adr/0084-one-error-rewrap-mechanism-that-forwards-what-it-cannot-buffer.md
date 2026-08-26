@@ -228,14 +228,18 @@ Each mutation was reverted from a pre-mutation copy and the restore verified
 byte-identical with `diff` and a clean `git diff`; the target tests were rerun
 green after each.
 
-**The incidental coverage, now deliberate.** The handoff recorded that neither
-`/api/fetch` nor `/api/pull` had a wire-level test through the real router. That
-is right for `/api/fetch` and wrong for `/api/pull`:
-`the_strategy_mandate_is_a_400_through_a_real_router` already drove that route
+**The incidental coverage, now deliberate.** #336 claims no wire-level test
+covers `/api/fetch` or `/api/pull` — that every existing `FetchError`/`PullError`
+test calls planner functions directly. Half of that is wrong, and this ADR
+reached that independently of the handoff, which repeated the issue's claim as
+written and was itself corrected the same morning by the batch's second
+truth-check (#530, merged into this branch). Both readings agree:
+`the_strategy_mandate_is_a_400_through_a_real_router` already drove `/api/pull`
 through the real `api_contract` middleware and already parsed the body as a bare
-`PullError` — it is one of the five reds under mutation A. What it could not
-catch is a sniff *narrowed* rather than removed, because its bodies are small.
-So:
+`PullError` — it is one of the five reds under mutation A above. `/api/fetch`
+genuinely had none: the only `route("/api/fetch", …)` in the tree was the
+production registration. What the pull test could *not* catch either way is a
+sniff **narrowed** rather than removed, because its bodies are small. So:
 
 - `/api/fetch` gains its first wire-level test —
   `a_refusal_reaches_the_client_as_a_bare_fetch_error_through_a_real_router` —
