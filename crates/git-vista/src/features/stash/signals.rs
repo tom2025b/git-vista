@@ -16,6 +16,7 @@
 use leptos::*;
 
 use git_vista_protocol::operation::IdempotencyKey;
+use git_vista_protocol::DropContext;
 
 use crate::api;
 use crate::features::stash::core::{
@@ -46,20 +47,50 @@ pub async fn compose_pop(entry: &str, expected_oid: &str, key: IdempotencyKey) -
     // record could not settle it is Unknown — never Refused (#515). The old
     // arm here mapped every `Err` to Refused, which dressed transport loss
     // as a server decision.
-    let apply = ApplyOutcome::from_write(api::apply_stash_request(entry, expected_oid).await);
+    let sent = api::apply_stash_request(entry, expected_oid).await;
+    // #514: the drop half must name the apply it is completing, so the server
+    // can prove the tree still holds what that apply restored. Captured before
+    // classification, because `ApplyOutcome` deliberately keeps only the
+    // decision and not the wire detail.
+    let applied_operation = match &sent {
+        Ok(StashWriteOutcome::Answered { operation, .. })
+        | Ok(StashWriteOutcome::Reconciled { operation, .. }) => operation.clone(),
+        _ => None,
+    };
+    let apply = ApplyOutcome::from_write(sent);
 
     let scan = ConflictScan::from_fetch(api::fetch_conflicts().await);
 
     match core::drop_gate(&apply, &scan) {
         DropGate::Halt(verdict) => verdict,
+        // No id, no drop. An apply that landed but whose operation could not
+        // be named leaves nothing to prove the tree with, and the honest
+        // answer is to stop rather than fall back to the unchecked drop this
+        // whole change exists to remove. The entry stays, the applied changes
+        // stay, and the verdict says the pop did not finish.
+        DropGate::Run if applied_operation.is_none() => PopVerdict::AppliedNotDropped {
+            why: "the apply succeeded but the server did not name an operation for it, \
+                  so nothing could prove your changes are still in the working tree"
+                .to_string(),
+        },
         DropGate::Run => {
             // Same classifier discipline for the destructive half. An
             // answered 409 is a refusal (the status rides inside the
             // outcome, so the outer `Ok` still cannot be read as "it
             // worked"); a lost reply is Unknown, and the verdict says the
             // entry's fate was not observed rather than asserting it.
-            let outcome =
-                DropOutcome::from_write(api::drop_stash_request(entry, expected_oid, key).await);
+            let outcome = DropOutcome::from_write(
+                api::drop_stash_request(
+                    entry,
+                    expected_oid,
+                    key,
+                    DropContext::CompletingPop {
+                        applied_operation: applied_operation
+                            .expect("the None case is handled by the guard arm above"),
+                    },
+                )
+                .await,
+            );
             core::verdict_after_drop(&outcome)
         }
     }
@@ -189,10 +220,12 @@ impl StashNotice {
             | Ok(StashWriteOutcome::Reconciled { ok: true, .. }) => {
                 (done.to_string(), true, entry_on_success)
             }
-            Ok(StashWriteOutcome::Answered { ok: false, message })
-            | Ok(StashWriteOutcome::Reconciled { ok: false, message }) => {
-                (message, false, entry_on_failure)
-            }
+            Ok(StashWriteOutcome::Answered {
+                ok: false, message, ..
+            })
+            | Ok(StashWriteOutcome::Reconciled {
+                ok: false, message, ..
+            }) => (message, false, entry_on_failure),
             // Lost and unrecoverable: the one arm that may not claim an
             // outcome. `complete` is false NOT because it failed — nobody
             // knows — but because a view must never style this as done.

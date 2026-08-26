@@ -48,8 +48,8 @@
 
 use git_vista_protocol::operation::IdempotencyKey;
 use git_vista_protocol::{
-    BranchFromStashRequest, BranchName, CommitOid, PlanFieldError, PushStashRequest, StashEntry,
-    StashMessage, StashSelector, StashTarget,
+    BranchFromStashRequest, BranchName, CommitOid, DropContext, DropStashRequest, PlanFieldError,
+    PushStashRequest, StashEntry, StashMessage, StashSelector, StashTarget,
 };
 
 use super::{
@@ -191,6 +191,9 @@ async fn send_reconciled_with_key(
             StashWriteOutcome::Answered {
                 ok: r.ok,
                 message: r.message,
+                // #514: a composed pop's drop names the apply it completes.
+                // From the operation header the server already sends.
+                operation: r.operation,
             }
         }
         Err(transport) => {
@@ -212,7 +215,13 @@ async fn send_reconciled_with_key(
                         let message = status.message.unwrap_or_else(|| {
                             "the operation finished but recorded no message".to_string()
                         });
-                        return StashWriteOutcome::Reconciled { ok, message };
+                        return StashWriteOutcome::Reconciled {
+                            ok,
+                            message,
+                            // The id the KEY resolved to — the same operation
+                            // the header would have named (#514).
+                            operation: Some(id.clone()),
+                        };
                     }
                     // Not terminal yet, or the status read itself failed —
                     // either way the honest move is the same short wait and
@@ -300,10 +309,17 @@ pub async fn drop_stash_request(
     entry: &str,
     expected_oid: &str,
     key: IdempotencyKey,
+    context: DropContext,
 ) -> Result<StashWriteOutcome, String> {
     refuse_if_offline()?;
     refuse_if_visualize()?;
-    let body = target(entry, expected_oid)?;
+    let body = DropStashRequest {
+        target: target(entry, expected_oid)?,
+        // #514: says what this drop is the second half of, and the server
+        // decides what must be proven from it. A pop names its apply; the
+        // drawer's own Drop button names nothing, and is asked for nothing.
+        context,
+    };
     let json = serde_json::to_string(&body).map_err(|e| e.to_string())?;
     Ok(send_reconciled_with_key("/api/stash/drop", json, key).await)
 }
