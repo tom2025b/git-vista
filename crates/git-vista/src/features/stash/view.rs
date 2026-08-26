@@ -227,9 +227,20 @@ pub fn stash_section_view(
                     drawer.begin(PUSH_KEY, "stashing");
                     spawn_local(async move {
                         let result = push_stash_request(None, keep, untracked).await;
-                        drawer.set_notice(StashNotice::from_result(
+                        // Push has no target entry, so every entry answer is
+                        // None; the unknown hint warns against a blind
+                        // second push, which could stash twice (#515).
+                        drawer.set_notice(StashNotice::from_write(
                             result,
                             "Stashed your working tree changes.",
+                            None,
+                            None,
+                            (
+                                "The reply was lost and the outcome could not be \
+                                 recovered — reload to see whether a new stash entry \
+                                 exists before stashing again.",
+                                None,
+                            ),
                         ));
                         // The push has no stash entry, so it locks and
                         // releases under its reserved key — never the whole
@@ -442,9 +453,21 @@ fn action_button(
                 drawer.begin(&oid, "applying");
                 spawn_local(async move {
                     let result = crate::api::apply_stash_request(&selector, &oid).await;
-                    drawer.set_notice(StashNotice::from_result(
+                    // The entry survives every apply outcome — an apply never
+                    // consumes it, ran or not — so all three answers are
+                    // Some(true); only the tree is uncertain on a lost reply.
+                    drawer.set_notice(StashNotice::from_write(
                         result,
                         "Applied the stash. It is still in your list.",
+                        Some(true),
+                        Some(true),
+                        (
+                            "The reply was lost and the outcome could not be \
+                             recovered — whether the changes reached your working \
+                             tree is unknown; check `git status`. The entry is \
+                             still in your list either way.",
+                            Some(true),
+                        ),
                     ));
                     // Release THIS row only: busy is per-selector (#518), so
                     // finishing here must not unlock a write still in flight
@@ -499,14 +522,25 @@ fn action_button(
                 spawn_local(async move {
                     let result =
                         crate::api::branch_from_stash_request(&name, &selector, &oid).await;
-                    drawer.set_notice(StashNotice::from_result(
+                    // Success removes the entry and says so (#516); an
+                    // answered failure retains it (the server's own message
+                    // says as much); a lost, unrecoverable reply is the one
+                    // case that may not claim either (#515) — the branch AND
+                    // the removal may both have happened.
+                    drawer.set_notice(StashNotice::from_write(
                         result,
-                        // The removal must be disclosed here too: the API layer
-                        // discards the server's success sentence ("The stash
-                        // entry has been removed."), so this notice is the only
-                        // place the user learns their entry is gone (#516).
                         "Created the branch and applied the stash there. \
                          The stash entry has been removed.",
+                        Some(false),
+                        Some(true),
+                        (
+                            "The reply was lost and the outcome could not be \
+                             recovered — the branch may or may not exist, and \
+                             the stash entry may or may not have been removed. \
+                             Reload to see, and check `git branch` before \
+                             retrying.",
+                            None,
+                        ),
                     ));
                     // Per-selector release (#518) — see the Apply arm.
                     drawer.finish(&oid);
@@ -534,16 +568,23 @@ fn action_button(
                 drawer.begin(&oid, "dropping");
                 spawn_local(async move {
                     let key = crate::api::new_idempotency_key();
-                    let receipt = crate::api::drop_stash_request(&selector, &oid, key).await;
-                    // A receipt is not a success: `ok` is the HTTP status, and
-                    // reading the outer `Ok` as "it worked" would report a
-                    // refused drop as a completed one.
-                    let result = match receipt {
-                        Ok(r) if r.ok => Ok(()),
-                        Ok(r) => Err(r.message),
-                        Err(why) => Err(why),
-                    };
-                    drawer.set_notice(StashNotice::from_result(result, "Dropped the stash entry."));
+                    let result = crate::api::drop_stash_request(&selector, &oid, key).await;
+                    // The outcome carries the HTTP status inside it, so the
+                    // outer `Ok` still cannot be read as "it worked" — and a
+                    // lost reply is the one case whose entry answer is None:
+                    // the server may or may not have removed it (#515).
+                    drawer.set_notice(StashNotice::from_write(
+                        result,
+                        "Dropped the stash entry.",
+                        Some(false),
+                        Some(true),
+                        (
+                            "The reply was lost and the outcome could not be \
+                             recovered — reload the drawer to see whether the \
+                             entry was removed.",
+                            None,
+                        ),
+                    ));
                     // Per-selector release (#518) — see the Apply arm.
                     drawer.finish(&oid);
                     graph.update(|g| {

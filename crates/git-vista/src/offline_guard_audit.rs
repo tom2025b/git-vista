@@ -159,6 +159,15 @@ const TRANSPORT_HELPERS: &[&str] = &[
     "write_json_with_timeout",
     "write_json_with_key",
     "write_empty",
+    // M3.24/#515. The stash reconciliation layer: one send under an
+    // idempotency key, falling back to the operation record when the reply
+    // is lost. Both are private to `api/stash.rs` and reachable only from
+    // the four OFFLINE_GUARDED stash entry points, which call the guard
+    // before building the request — the same "infrastructure below the
+    // guard, never an entry point" claim every other name here makes, and
+    // [`the_exempt_and_transport_tables_do_not_rot`] checks it the same way.
+    "send_reconciled_with_key",
+    "send_reconciled",
 ];
 
 /// Every function in `api.rs`, in file order, that reaches the write
