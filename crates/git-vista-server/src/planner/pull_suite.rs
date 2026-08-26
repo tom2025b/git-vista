@@ -195,7 +195,14 @@ async fn run_tracked(
 ) -> (StatusCode, String) {
     let repo = repo.to_path_buf();
     crate::operations::with_progress(record, async move {
-        super::plan_and_execute_in(&repo, None, tokens(), op).await
+        super::plan_and_execute_in(
+            &repo,
+            None,
+            tokens(),
+            op,
+            crate::planner::DropProof::Nothing,
+        )
+        .await
     })
     .await
 }
@@ -203,7 +210,7 @@ async fn run_tracked(
 /// The pipeline with no operation record around it — for the tests that do not
 /// touch progress or cancellation.
 async fn pipeline(repo: &Path, op: GitOperation) -> (StatusCode, String) {
-    super::plan_and_execute_in(repo, None, tokens(), op).await
+    super::plan_and_execute_in(repo, None, tokens(), op, crate::planner::DropProof::Nothing).await
 }
 
 /// The pipeline's future stays small enough to poll on an ordinary 2 MiB
@@ -242,6 +249,7 @@ fn the_planner_pipelines_future_stays_small_enough_for_an_ordinary_stack() {
                 None,
                 tokens(),
                 pull_op(MergeStrategy::Merge),
+                crate::planner::DropProof::Nothing,
             )),
         ),
         (

@@ -211,7 +211,14 @@ async fn a_precondition_unmet_at_build_time_is_left_to_the_executor() {
     // Leg 2 — the leg this test was missing: something downstream really
     // does refuse, in git's own words. Without it, "the gate steps aside"
     // is only half a claim.
-    let (status, why) = plan_and_execute_in(&repo, None, tokens(), op).await;
+    let (status, why) = plan_and_execute_in(
+        &repo,
+        None,
+        tokens(),
+        op,
+        crate::planner::DropProof::Nothing,
+    )
+    .await;
     assert!(
         !status.is_success(),
         "the executor's own guard must refuse the duplicate branch: {why}"

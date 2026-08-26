@@ -185,7 +185,14 @@ async fn run_tracked(
 ) -> (StatusCode, String) {
     let repo = repo.to_path_buf();
     crate::operations::with_progress(record, async move {
-        super::plan_and_execute_in(&repo, None, tokens(), op).await
+        super::plan_and_execute_in(
+            &repo,
+            None,
+            tokens(),
+            op,
+            crate::planner::DropProof::Nothing,
+        )
+        .await
     })
     .await
 }
@@ -764,6 +771,7 @@ async fn a_dropped_connection_replays_instead_of_fetching_twice() {
             tokens(),
             PlanSource::Build(fetch_op()),
             None,
+            crate::planner::DropProof::Nothing,
         ),
     )
     .await;
@@ -783,6 +791,7 @@ async fn a_dropped_connection_replays_instead_of_fetching_twice() {
             tokens(),
             PlanSource::Build(fetch_op()),
             None,
+            crate::planner::DropProof::Nothing,
         ),
     )
     .await
@@ -807,6 +816,7 @@ async fn a_dropped_connection_replays_instead_of_fetching_twice() {
         tokens(),
         PlanSource::Build(fetch_op()),
         None,
+        crate::planner::DropProof::Nothing,
     )
     .await;
     assert_eq!(again_status, status);

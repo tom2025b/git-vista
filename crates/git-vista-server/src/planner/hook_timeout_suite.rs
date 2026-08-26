@@ -129,7 +129,13 @@ async fn a_commit_with_a_hook_that_sleeps_forever_times_out_and_answers() {
 
     let (status, body) = tokio::time::timeout(
         Duration::from_secs(10),
-        plan_and_execute_in(&repo, Some(id), tokens(), commit("should hang forever")),
+        plan_and_execute_in(
+            &repo,
+            Some(id),
+            tokens(),
+            commit("should hang forever"),
+            crate::planner::DropProof::Nothing,
+        ),
     )
     .await
     .expect(
@@ -211,7 +217,13 @@ async fn the_coordinator_lock_is_released_after_a_hook_timeout() {
 
     let (commit_result, branch_result) = tokio::time::timeout(Duration::from_secs(10), async {
         tokio::join!(
-            plan_and_execute_in(&repo, Some(id), tokens(), commit("hangs")),
+            plan_and_execute_in(
+                &repo,
+                Some(id),
+                tokens(),
+                commit("hangs"),
+                crate::planner::DropProof::Nothing
+            ),
             async {
                 // Do not even begin building a plan for `CreateBranch` until
                 // the commit leg is provably holding `coordinator::lock` —
@@ -226,6 +238,7 @@ async fn the_coordinator_lock_is_released_after_a_hook_timeout() {
                         name: BranchName::new("after-hook-timeout").unwrap(),
                         at: CommitOid::new(head).unwrap(),
                     },
+                    crate::planner::DropProof::Nothing,
                 )
                 .await
             },
@@ -277,8 +290,14 @@ async fn a_commit_with_no_hooks_completes_normally_under_the_real_bound() {
     let id = repo_id(&repo);
     let before = commit_count(&repo, "HEAD");
 
-    let (status, body) =
-        plan_and_execute_in(&repo, Some(id), tokens(), commit("ordinary commit")).await;
+    let (status, body) = plan_and_execute_in(
+        &repo,
+        Some(id),
+        tokens(),
+        commit("ordinary commit"),
+        crate::planner::DropProof::Nothing,
+    )
+    .await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(commit_count(&repo, "HEAD"), before + 1);
@@ -308,7 +327,13 @@ async fn a_hook_hanging_in_post_commit_reports_the_commit_that_landed() {
 
     let (status, body) = tokio::time::timeout(
         Duration::from_secs(10),
-        plan_and_execute_in(&repo, Some(id), tokens(), commit("lands, then hangs")),
+        plan_and_execute_in(
+            &repo,
+            Some(id),
+            tokens(),
+            commit("lands, then hangs"),
+            crate::planner::DropProof::Nothing,
+        ),
     )
     .await
     .expect("post-commit hanging must not hang the request itself");
