@@ -144,6 +144,71 @@ has not read this file will otherwise spend its first hour on a phantom.
 
 ---
 
+## The 26 August batch — `2026-08-26/CLOUD-1 … CLOUD-5`
+
+**First batch to use the dated-subdirectory fix** this README promised when
+`CLOUD-1` stopped being unambiguous — three batches now share that name, so
+from here a handoff's identity is `2026-08-26/CLOUD-N`, and the numbers still
+mean MERGE ORDER.
+
+| # | Handoff | Issue | ADR | Merge order |
+|---|---|---|---|---|
+| **1** | `2026-08-26/CLOUD-1-issue-336-collapse-route-local.md` | #336 | 0084 | **FIRST** — touches the contended middleware/handlers/planner area |
+| **2** | `2026-08-26/CLOUD-2-issue-521-journal-rollback.md` | #521 | 0085 | **before #3** — same activity/journal subsystem; its format decision lands first |
+| **3** | `2026-08-26/CLOUD-3-issue-487-push-fold.md` | #487 | 0086 (reserved, may go unused) | after #2, rebased on it |
+| **4** | `2026-08-26/CLOUD-4-issue-520-floor-pin.md` | #520 | 0087 | independent — CI + docs only |
+| **5** | `2026-08-26/CLOUD-5-issue-335-signature-status.md` | #335 | 0088 | **LAST** — wire-format change lands on a quiet main |
+
+ADR numbers assigned up front as always: 0083 is taken; this batch claims
+0084–0088, and a reserved number that goes unused stays burned rather than
+reassigned.
+
+### Two issues were considered and rejected by the truth-check, on the record
+
+- **#326** (planner `shape()` arms): its own text says the arms move *when a
+  milestone touches their operation* and explicitly forbids the sweep — a
+  dedicated extraction session contradicts the tracked decision. This is the
+  SECOND time #326 has been pulled from a batch for this reason (see the
+  parked `CLOUD-X` above); it should not be offered to a session again while
+  that policy stands.
+- **#450** (lesson tool): its own sequencing says "after #92 (Explain Mode)",
+  and #92 is open — the single sentence-source it must share with Explain
+  Mode does not exist yet. Premature, not wrong.
+
+Every handoff in this batch carries the three standing environment rules
+(baseline-diff instead of "workspace green", the `gv-sandbox` build line, the
+browser-leg-unrun statement) plus per-handoff citations truth-checked against
+`682f3061` on the morning of dispatch — two of the five issues had already
+drifted (functions moved by the planner split; `rewrap_error` lives in
+`middleware.rs` now), which is the recurring argument for checking.
+
+### The batch was re-checked a second time, and four of the five were wrong
+
+**Kept here deliberately, because the second pass is the whole lesson.** The
+first truth-check confirmed that cited *symbols existed*. It did not read the
+code around them. A second pass an hour later — reading the actual source
+regions rather than grepping for names — found a defect in four of the five
+handoffs, every one of them the kind a session would have acted on:
+
+| Handoff | What the first pass got wrong |
+|---|---|
+| CLOUD-1 (#336) | Repeated the issue's "no wire-level test covers `/api/fetch` or `/api/pull`". **`/api/pull` is covered** — `the_strategy_mandate_is_a_400_through_a_real_router` (`handlers/pull.rs:360`) layers the real `api_contract` middleware. Only `/api/fetch` lacks one. |
+| CLOUD-3 (#487) | **Invented a correction that was itself wrong** — claimed the issue's `push.rs:684/:693` had drifted. They are exact: `:684` is `journal_updates`, `:693` its per-ref loop. Grepping found the *call sites* and mistook them for the definition. |
+| CLOUD-4 (#520) | Said "required merge job" without establishing which job. It is the `core` job / "Core (check + test)" (`:127-128`) — true, but unverified when written. Also missed that the provisioning step only *prints* `git --version` without asserting it. |
+| CLOUD-5 (#335) | Repeated "two real outcomes have nowhere to go". **`EXPKEYSIG`/`EXPSIG` are deliberately folded into the `GOODSIG` arm** at `tags.rs:613` with a documented rationale at `:608-612`. Only `REVKEYSIG` is a true fallthrough — and that rationale comment must be rewritten by the fix, which the first draft never mentioned. |
+
+CLOUD-2 (#521) survived both passes unchanged; its ADR-0080 claim was
+independently confirmed (0080 contains no discussion of rollback, downgrade,
+or a versioned envelope).
+
+**The rule this earns:** a citation check that only proves a symbol exists is
+not a truth-check. Open the region and read what the code *does* — and treat
+"the issue is wrong" as a claim needing the same evidence as any other,
+because a confident wrong correction is worse than the stale line it
+replaced.
+
+---
+
 ## Never tell a cloud session "`cargo test --workspace` must be green"
 
 **It cannot be.** Every handoff in the 25 August batch said it, and every one
