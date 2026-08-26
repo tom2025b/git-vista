@@ -759,14 +759,26 @@ fn admits_it_could_not_read_the_refs(event: &ActivityEvent) -> bool {
 /// reported as 297 and 500 as 891. The feed stayed at one row, so #329's
 /// symptom held, but the number in it was not true.
 ///
-/// **Fixed at the writer (#485), not in the fold.** A fetch now takes one ref
-/// capture and one timestamp for the whole batch
-/// (`handlers::journal_app_events`), so its entries no longer drift apart at
-/// all, and pull journals through the same path. The fold itself still counts
-/// both copies of anything that *does* drift; nothing can currently produce
-/// that — only `Fetch` and `Pull` fold, and both are batched — so the F1 pin
-/// below became a live regression test rather than staying an expected
-/// failure. Its doc comment carries the full argument.
+/// **Fixed at the writer (#485), not in the fold — and only the relative
+/// half of it.** A fetch now takes one ref capture and one timestamp for the
+/// whole batch (`handlers::journal_app_events`), so its entries can no
+/// longer drift *apart from each other*: whatever that one moment turns out
+/// to be, every entry of the batch shares it, and pull journals through the
+/// same path. That bounds drift **within** a batch to zero; it says nothing
+/// about the **absolute** gap between git's reflog line and that one shared
+/// moment. The timestamp is sampled only after the post-fetch re-read of
+/// every remote-tracking ref (`planner::fetch::run_fetch`), a listing whose
+/// own cost was measured to grow with ref count (the 527 KiB/1.1s vs. 14
+/// MiB/27.6s numbers above) — a large enough namespace or slow enough
+/// storage could in principle push that re-read, and so the whole batch's
+/// shared moment, past [`JOURNAL_MATCH_SLACK`] of the reflog lines it needs
+/// to match. Batching would not save it: every entry in the batch would miss
+/// together instead of the tail of them missing one by one, still 2N rather
+/// than N. Whether that gap is ever actually crossed has not been measured
+/// (#522) — this paragraph states what #485 rules out, not that the window
+/// can't be exceeded. The F1 pin below is unaffected either way: it pins
+/// drift *between entries of one batch*, which #485 did fix, not drift
+/// between the batch and the reflog, which it did not touch.
 ///
 /// **Safe for undo by construction, not by luck:** [`undo_hint`] has no arm for
 /// `Fetch` or `Pull`, so neither row has ever carried a hint and dropping the
@@ -1705,12 +1717,21 @@ mod tests {
     ///
     /// **What is no longer pinned, said plainly.** The fold still counts both
     /// copies of anything that *does* drift; that is not fixed, and after this
-    /// change nothing asserts it. It is left unpinned because no writer can
-    /// currently produce it: fetch and pull journal through the batched
-    /// `fetch::journal_updates` (pull runs `fetch::run_fetch`), and
-    /// `fold_ref_update_bursts` folds only `Fetch` and `Pull` — so the per-ref
-    /// push journalling of #487, the one remaining unbatched writer, cannot
-    /// reach this code path at all.
+    /// change nothing here exercises it. What batching rules out is entries of
+    /// one fetch drifting *apart from each other* — no writer of this class can
+    /// still produce that, since fetch and pull journal through the batched
+    /// `fetch::journal_updates` (pull runs `fetch::run_fetch`) with one shared
+    /// timestamp, and `fold_ref_update_bursts` folds only `Fetch` and `Pull`,
+    /// so the per-ref push journalling of #487, the one remaining unbatched
+    /// writer, cannot reach this code path at all. It does **not** rule out
+    /// the whole batch's one shared timestamp landing more than
+    /// [`JOURNAL_MATCH_SLACK`] after the reflog lines it is meant to match —
+    /// that gap is set by however long the post-fetch ref re-read takes
+    /// before the timestamp is sampled (`handlers::journal_app_events`),
+    /// which grows with ref count and is unbounded on a large enough remote.
+    /// Whether it is ever actually crossed has not been measured (#522); if
+    /// it is, every entry in the batch drifts together and the fold counts
+    /// 2N, the same symptom this test pins in a different shape.
     #[test]
     fn a_slow_fetch_still_counts_only_the_refs_that_moved() {
         const REFS: i64 = 250;

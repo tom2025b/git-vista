@@ -1105,6 +1105,13 @@ mod tests {
     /// the list by calling the code under test would let a new variant slip in
     /// unexamined — and a new variant is exactly when "does this claim
     /// completion?" needs asking again.
+    ///
+    /// Hand-written is also how it rots: #515 added `ApplyUnknown` and
+    /// `DropUnknown` and this list carried neither, while a literal length
+    /// assertion kept the completeness claim green (#531). The census in
+    /// `exactly_one_verdict_means_the_pop_finished` is an exhaustive match
+    /// now, so the NEXT variant is a compile error there, and an entry
+    /// missing HERE is a red assertion that names it — never a stale count.
     fn every_verdict() -> Vec<PopVerdict> {
         vec![
             PopVerdict::Popped,
@@ -1130,6 +1137,12 @@ mod tests {
             },
             PopVerdict::AppliedNotDropped {
                 why: "the list moved underneath it".to_string(),
+            },
+            PopVerdict::ApplyUnknown {
+                why: "the reply was lost and the record never settled it".to_string(),
+            },
+            PopVerdict::DropUnknown {
+                why: "the reply was lost and the record never settled it".to_string(),
             },
         ]
     }
@@ -1414,25 +1427,108 @@ mod tests {
         );
     }
 
-    /// Exactly one of the five verdicts claims completion, and it is the one
-    /// where all three steps really happened.
+    /// Exactly one verdict claims completion — the one where all three steps
+    /// really happened — and no unfinished verdict may claim the entry is
+    /// gone.
     ///
     /// This is the guard against a later variant being added and quietly
     /// inheriting a permissive `is_complete`.
     ///
-    /// MUTATION 1: add any other variant to `is_complete`'s `matches!` — red,
-    ///   the count is 2. Verified by hand: red.
-    /// MUTATION 2: make `is_complete` return `false` for `Popped` too — red,
-    ///   the count is 0 and a real pop could never be reported. Verified by
+    /// # The retention invariant was restated (#531), not just re-counted
+    ///
+    /// This test used to close with "did not finish ⟹ `entry_retained()` is
+    /// `Some(true)`". That was provable only while every halt happened
+    /// BEFORE the drop was sent. #515 added `DropUnknown`, which halts
+    /// after: the drop's reply was lost, so whether the entry survived is
+    /// exactly what nobody observed, and `Some(true)` there would be the
+    /// false certainty #515 exists to remove. What the safety property
+    /// actually forbids is the dangerous claim, so that is what is pinned
+    /// now: **no verdict may say the entry is GONE (`Some(false)`) unless
+    /// the pop completed** — that claim licenses the user to walk away from
+    /// a stash that may still need rescuing, and only a completed pop has
+    /// observed the removal. `None` — "cannot know, reload the drawer" — is
+    /// an honest third answer and is admitted; each variant's exact answer
+    /// is then pinned as a literal so `None` cannot quietly spread to the
+    /// variants that CAN prove retention.
+    ///
+    /// The completeness check is an exhaustive match rather than a length
+    /// literal: the old `assert_eq!(all.len(), 7)` stayed green after #515
+    /// added two variants `every_verdict` never carried, which is how both
+    /// went unexercised by the one test whose stated job was to cover them
+    /// all (#531).
+    ///
+    /// MUTATION 1 (shrink the list): remove the `ApplyUnknown` entry from
+    ///   `every_verdict` — red on the census, "every_verdict is missing
+    ///   ApplyUnknown". Verified by hand: red.
+    /// MUTATION 2 (make the forbidden claim): have `DropUnknown`'s
+    ///   `entry_retained()` return `Some(false)` — red on the invariant
+    ///   loop, an unfinished pop claiming the entry is gone. Verified by
     ///   hand: red.
+    /// MUTATION 3 (spread the unknown): have `ApplyUnknown`'s
+    ///   `entry_retained()` return `None` — red on the literal table, `None`
+    ///   claimed by a variant that can prove retention. Verified by hand:
+    ///   red.
     #[test]
     fn exactly_one_verdict_means_the_pop_finished() {
         let all = every_verdict();
-        assert_eq!(
-            all.len(),
-            7,
-            "every_verdict must list every variant, both Conflicted routes included"
-        );
+
+        // The census. One tick per entry the list must carry: a new variant
+        // cannot compile until it gets an arm here, and that arm has nothing
+        // honest to do except tick a new box this loop then demands. Both
+        // Conflicted routes are counted separately because the enum keeps
+        // them distinguishable on `apply_refusal`, and the headline test
+        // leans on exactly that distinction.
+        #[derive(Default)]
+        struct Census {
+            popped: bool,
+            apply_refused: bool,
+            conflicted_after_reported_success: bool,
+            conflicted_via_refusal: bool,
+            applied_unverified: bool,
+            refused_unverified: bool,
+            applied_not_dropped: bool,
+            apply_unknown: bool,
+            drop_unknown: bool,
+        }
+        let mut seen = Census::default();
+        for verdict in &all {
+            match verdict {
+                PopVerdict::Popped => seen.popped = true,
+                PopVerdict::ApplyRefused { .. } => seen.apply_refused = true,
+                PopVerdict::Conflicted {
+                    apply_refusal: None,
+                    ..
+                } => seen.conflicted_after_reported_success = true,
+                PopVerdict::Conflicted {
+                    apply_refusal: Some(_),
+                    ..
+                } => seen.conflicted_via_refusal = true,
+                PopVerdict::AppliedUnverified { .. } => seen.applied_unverified = true,
+                PopVerdict::RefusedUnverified { .. } => seen.refused_unverified = true,
+                PopVerdict::AppliedNotDropped { .. } => seen.applied_not_dropped = true,
+                PopVerdict::ApplyUnknown { .. } => seen.apply_unknown = true,
+                PopVerdict::DropUnknown { .. } => seen.drop_unknown = true,
+            }
+        }
+        for (ticked, entry) in [
+            (seen.popped, "Popped"),
+            (seen.apply_refused, "ApplyRefused"),
+            (
+                seen.conflicted_after_reported_success,
+                "Conflicted via a reported-success apply",
+            ),
+            (
+                seen.conflicted_via_refusal,
+                "Conflicted via a refused apply",
+            ),
+            (seen.applied_unverified, "AppliedUnverified"),
+            (seen.refused_unverified, "RefusedUnverified"),
+            (seen.applied_not_dropped, "AppliedNotDropped"),
+            (seen.apply_unknown, "ApplyUnknown"),
+            (seen.drop_unknown, "DropUnknown"),
+        ] {
+            assert!(ticked, "every_verdict is missing {entry}");
+        }
 
         let complete: Vec<&PopVerdict> = all.iter().filter(|v| v.is_complete()).collect();
         assert_eq!(
@@ -1441,18 +1537,37 @@ mod tests {
             "exactly one verdict may claim the pop finished"
         );
 
-        // The four that do not claim completion each leave the entry in the
-        // drawer, so nothing the user had is gone.
+        // The invariant, as restated for #531 — see this test's doc comment.
         for verdict in all.iter().filter(|v| !v.is_complete()) {
-            assert!(
-                verdict.entry_retained() == Some(true),
-                "{verdict:?} did not finish, so the entry must still be there"
+            assert_ne!(
+                verdict.entry_retained(),
+                Some(false),
+                "{verdict:?} did not finish, so it may not claim the entry is gone"
             );
         }
-        assert!(
-            PopVerdict::Popped.entry_retained() == Some(false),
-            "a finished pop removed the entry"
-        );
+
+        // And each variant's exact answer, as literals — a read-back of
+        // `entry_retained()` here would pass whichever way the mapping ran.
+        for verdict in &all {
+            let expected = match verdict {
+                // The removal was observed; the entry is gone.
+                PopVerdict::Popped => Some(false),
+                // The drop was SENT and its reply lost — the one verdict
+                // with no honest bool (#515).
+                PopVerdict::DropUnknown { .. } => None,
+                // Every halt before the drop is sent (an apply never
+                // consumes the entry, ran or not) — plus AppliedNotDropped,
+                // where the server ANSWERED the drop with a refusal, so the
+                // non-removal was itself observed.
+                PopVerdict::ApplyRefused { .. }
+                | PopVerdict::Conflicted { .. }
+                | PopVerdict::AppliedUnverified { .. }
+                | PopVerdict::RefusedUnverified { .. }
+                | PopVerdict::AppliedNotDropped { .. }
+                | PopVerdict::ApplyUnknown { .. } => Some(true),
+            };
+            assert_eq!(verdict.entry_retained(), expected, "{verdict:?}");
+        }
     }
 
     /// A refused apply whose tree is verifiably clear really did leave
