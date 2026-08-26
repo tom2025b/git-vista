@@ -275,6 +275,7 @@ pub(crate) fn descriptor_for(worktree: WorktreeId) -> Option<RepositoryDescripto
 /// the CLI-arg repo (Active — the user's own working repo), `POST /api/clone`
 /// swaps it for a clone (Visualize), and `POST /api/select` moves it to any
 /// catalog entry in the mode the operator chose (ADR 0007).
+#[derive(Clone)]
 struct Current {
     path: PathBuf,
     /// Visualize = look-only: every write handler refuses (ADR 0007). This
@@ -288,6 +289,61 @@ struct Current {
 
 static CURRENT: OnceLock<RwLock<Current>> = OnceLock::new();
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Per-test repository selection. Production keeps the process-global
+    /// `CURRENT`; async tests opt into a scope so parallel tasks cannot replace
+    /// one another's fixture repository.
+    static TEST_CURRENT: RwLock<Option<Current>>;
+}
+
+#[cfg(test)]
+pub(crate) async fn with_isolated_test_current<F: std::future::Future>(future: F) -> F::Output {
+    TEST_CURRENT.scope(RwLock::new(None), future).await
+}
+
+/// Carry a test's repository selection into a detached task.
+#[cfg(test)]
+pub(crate) fn inherit_test_current<F: std::future::Future>(
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    // Capture synchronously: `tokio::spawn` first polls the returned future in
+    // the child task, where the parent's task-local scope is no longer visible.
+    // Preserve the difference between no test scope and a scoped-yet-unset
+    // selection so a detached child cannot silently fall back to `CURRENT`.
+    let inherited = TEST_CURRENT
+        .try_with(|current| {
+            current
+                .read()
+                .expect("test CURRENT lock not poisoned")
+                .clone()
+        })
+        .ok();
+
+    async move {
+        match inherited {
+            Some(current) => TEST_CURRENT.scope(RwLock::new(current), future).await,
+            None => future.await,
+        }
+    }
+}
+
+#[cfg(not(test))]
+pub(crate) fn inherit_test_current<F: std::future::Future>(future: F) -> F {
+    future
+}
+
+#[cfg(test)]
+fn set_current_resolved(path: PathBuf, mode: RepoMode, handle: Option<RepositoryHandle>) {
+    let value = Current { path, mode, handle };
+    TEST_CURRENT
+        .try_with(|current| {
+            *current.write().expect("test CURRENT lock not poisoned") = Some(value);
+        })
+        .expect("tests that select a repository must use with_isolated_test_current");
+}
+
+#[cfg(not(test))]
 fn set_current_resolved(path: PathBuf, mode: RepoMode, handle: Option<RepositoryHandle>) {
     let value = Current { path, mode, handle };
     if let Some(lock) = CURRENT.get() {
@@ -299,17 +355,34 @@ fn set_current_resolved(path: PathBuf, mode: RepoMode, handle: Option<Repository
     }
 }
 
+/// Clone the current selection while holding its lock only briefly.
+///
+/// Test tasks consult their explicit task-local scope first. Outside such a
+/// scope (and in every production build), the process-global startup selection
+/// remains the source of truth.
+fn current_snapshot() -> Option<Current> {
+    #[cfg(test)]
+    if let Ok(current) = TEST_CURRENT.try_with(|current| {
+        current
+            .read()
+            .expect("test CURRENT lock not poisoned")
+            .clone()
+    }) {
+        return current;
+    }
+
+    CURRENT
+        .get()
+        .map(|current| current.read().expect("CURRENT lock not poisoned").clone())
+}
+
 /// Snapshot the current repo path and whether it is look-only. The bool keeps
 /// the old `read_only` meaning (`mode == Visualize`) so the many read-handler
 /// call sites stay untouched; write gating goes through [`current_mode`]/
 /// [`reject_if_read_only`]. Clones out of the lock immediately so no guard is
 /// ever held across an `.await`.
 pub(crate) fn current() -> (PathBuf, bool) {
-    let g = CURRENT
-        .get()
-        .expect("CURRENT is set at startup")
-        .read()
-        .expect("CURRENT lock not poisoned");
+    let g = current_snapshot().expect("CURRENT is set at startup");
     (g.path.clone(), g.mode == RepoMode::Visualize)
 }
 
@@ -324,29 +397,19 @@ pub(crate) fn current() -> (PathBuf, bool) {
 /// the process-wide selection, and whose honest answer in that case is "no
 /// policy is known" rather than a panic or a fabricated value.
 pub(crate) fn current_path_if_set() -> Option<PathBuf> {
-    CURRENT
-        .get()
-        .map(|lock| lock.read().expect("CURRENT lock not poisoned").path.clone())
+    current_snapshot().map(|current| current.path)
 }
 
 /// The mode the current selection is open in (ADR 0006/0007).
 pub(crate) fn current_mode() -> RepoMode {
-    CURRENT
-        .get()
-        .expect("CURRENT is set at startup")
-        .read()
-        .expect("CURRENT lock not poisoned")
-        .mode
+    current_snapshot().expect("CURRENT is set at startup").mode
 }
 
 /// The opaque handle for the current default selection, or `None` in degraded
 /// mode. Used to stamp the graph with the ids the client addresses it by.
 pub(crate) fn current_handle() -> Option<RepositoryHandle> {
-    CURRENT
-        .get()
+    current_snapshot()
         .expect("CURRENT is set at startup")
-        .read()
-        .expect("CURRENT lock not poisoned")
         .handle
 }
 
@@ -393,10 +456,9 @@ pub(crate) fn current_handle() -> Option<RepositoryHandle> {
 /// that snapshot through to `sandbox::policy_for` instead of re-deriving it
 /// here at spawn time; not done tonight — named so it isn't silently lost.
 pub(crate) fn read_only_for_path(path: &Path) -> bool {
-    if let Some(lock) = CURRENT.get() {
-        let g = lock.read().expect("CURRENT lock not poisoned");
-        if g.path == path {
-            return g.mode == RepoMode::Visualize;
+    if let Some(current) = current_snapshot() {
+        if current.path == path {
+            return current.mode == RepoMode::Visualize;
         }
     }
     catalog()
@@ -698,14 +760,66 @@ mod tests {
     use super::*;
     use super::{parse_bind_addr, LOOPBACK_ADDR};
 
-    /// One test fn drives the CURRENT/CATALOG globals end-to-end — keeping every
-    /// global mutation in a single test means parallel test threads never fight
-    /// over the process-wide selection (no other test touches it). `async` (a
-    /// `tokio::test` rather than a plain `#[test]`) so the D2 section at the
-    /// end can call the real async handler `crate::handlers::rebase::rebase`
-    /// directly — see that section's own comment for why.
+    /// #438: two test tasks that select different repositories must retain
+    /// their own path and mode after both writes have happened.
+    ///
+    /// Mutation caught: bypassing the test-local selection and writing the
+    /// process-global `CURRENT` makes exactly one task observe the other's
+    /// literal selection after the barrier.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_test_selections_do_not_overwrite_each_other() {
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
+        let observe = |path: &'static str, mode: RepoMode| {
+            let barrier = std::sync::Arc::clone(&barrier);
+            tokio::spawn(async move {
+                with_isolated_test_current(async move {
+                    let path = PathBuf::from(path);
+                    set_current_resolved(path.clone(), mode, None);
+                    barrier.wait().await;
+                    assert_eq!(
+                        current(),
+                        (path, mode == RepoMode::Visualize),
+                        "a concurrent test replaced this task's repository selection"
+                    );
+                })
+                .await;
+            })
+        };
+
+        let active = observe("/tmp/git-vista-current-active", RepoMode::Active);
+        let visualize = observe("/tmp/git-vista-current-visualize", RepoMode::Visualize);
+        let (active, visualize) = tokio::join!(active, visualize);
+        active.expect("active selection task completes");
+        visualize.expect("visualize selection task completes");
+    }
+
+    /// Detached operation tasks must see the selection of the request that
+    /// spawned them, not a process-global or catalog fallback.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detached_tasks_inherit_their_test_selection() {
+        with_isolated_test_current(async {
+            let expected = PathBuf::from("/tmp/git-vista-current-detached");
+            set_current_resolved(expected.clone(), RepoMode::Active, None);
+
+            let observed = tokio::spawn(inherit_test_current(async { current() }))
+                .await
+                .expect("detached selection task completes");
+
+            assert_eq!(observed, (expected, false));
+        })
+        .await;
+    }
+
+    /// Drive the selection/catalog flow inside an explicit test-local current
+    /// scope. The production process global remains unchanged, while every
+    /// await in this long test keeps resolving its own fixture repository.
     #[tokio::test]
     async fn selection_flow_carries_mode_and_gates_writes() {
+        with_isolated_test_current(selection_flow_carries_mode_and_gates_writes_in_scope()).await;
+    }
+
+    async fn selection_flow_carries_mode_and_gates_writes_in_scope() {
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("project");
         std::fs::create_dir_all(&repo).unwrap();
@@ -960,7 +1074,17 @@ mod tests {
                 .unwrap()
                 .success());
         }
-        set_current(&success_repo, RepoMode::Active);
+        // Register the catalog entry as Visualize, then select the same
+        // worktree as Active only in this test's current-selection scope. The
+        // amend below runs through `plan_and_execute_tracked`'s real detached
+        // task. If the planner stops inheriting TEST_CURRENT, its sandbox
+        // policy falls back to the deliberately stale Visualize catalog mode
+        // and this genuine write cannot return 200.
+        let success_handle = set_current(&success_repo, RepoMode::Visualize)
+            .expect("the amend fixture registers in the catalog");
+        assert!(read_only_for_path(&success_repo));
+        assert!(select_registered(success_handle.worktree, RepoMode::Active));
+        assert!(!read_only_for_path(&success_repo));
         let tip_out = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(&success_repo)

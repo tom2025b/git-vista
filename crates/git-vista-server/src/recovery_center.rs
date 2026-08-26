@@ -1958,6 +1958,13 @@ mod tests {
     /// remains in the file — that is the gap this test closes.
     #[tokio::test]
     async fn a_stale_claimed_undo_is_refused_and_the_branch_is_left_alone() {
+        crate::state::with_isolated_test_current(
+            a_stale_claimed_undo_is_refused_and_the_branch_is_left_alone_in_scope(),
+        )
+        .await;
+    }
+
+    async fn a_stale_claimed_undo_is_refused_and_the_branch_is_left_alone_in_scope() {
         let f = fixture();
         crate::state::set_current(&f.repo, RepoMode::Active);
 
@@ -2075,6 +2082,14 @@ mod tests {
     /// from `tip_before_call`.
     #[tokio::test]
     async fn a_row_from_a_foreign_worktree_is_refused_not_executed_against_the_current_selection() {
+        crate::state::with_isolated_test_current(
+            a_row_from_a_foreign_worktree_is_refused_not_executed_against_the_current_selection_in_scope(),
+        )
+        .await;
+    }
+
+    async fn a_row_from_a_foreign_worktree_is_refused_not_executed_against_the_current_selection_in_scope(
+    ) {
         let f = fixture();
         crate::state::set_current(&f.repo, RepoMode::Active);
 
