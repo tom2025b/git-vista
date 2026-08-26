@@ -43,6 +43,29 @@ pub enum WorktreeEffect {
     /// markers on disk. Distinct from [`Self::FilesRewritten`] because the
     /// user may be left with work to finish, which is a different sentence.
     MayConflict,
+    /// Files are rewritten **only if** the branch this operation moves is the
+    /// one currently checked out; otherwise nothing in the working tree
+    /// changes.
+    ///
+    /// # Why a named condition rather than a worst case
+    ///
+    /// [`GitOperation::ResetBranch`] runs as `git reset --hard <to>` when its
+    /// branch is checked out and as `git branch -f` when it is not — two
+    /// genuinely different effects, chosen at execution time from a fact this
+    /// enum's input does not carry. Answering [`Self::FilesRewritten`] would
+    /// tell a user their files are about to be rewritten on a run where
+    /// nothing is touched, which is exactly the invention #92's acceptance
+    /// criterion 1 forbids.
+    ///
+    /// The house precedent is [`crate::Advisory::DefaultBranchUnknown`]: a
+    /// reader must be able to tell *"I checked"* from *"this depends on
+    /// something I was not given"*. The plan itself resolves the condition —
+    /// the planner attaches [`crate::Precondition::CleanWorktree`] exactly
+    /// when the hard-reset path is the one that will run — so a renderer with
+    /// the whole plan in hand can say which branch of the condition applies.
+    /// This accessor sees only the operation, and says only what the
+    /// operation determines.
+    RewrittenIfCheckedOut,
 }
 
 /// What an operation does to the **index**.
@@ -57,9 +80,215 @@ pub enum IndexEffect {
     EntriesUnstaged,
     /// Conflict stages collapse to a resolved entry.
     StagesResolved,
-    /// The index is rebuilt wholesale against a new tree — checkout, reset,
-    /// a landed merge.
+    /// The index is set from the operation's result tree — checkout, reset,
+    /// a landed merge, a rebase, a cherry-pick, a sequence step. If such an
+    /// operation stops on a conflict, unmerged stages sit in the index
+    /// instead; either way what you had staged is not what is there
+    /// afterwards, which is the fact this variant exists to state. The
+    /// worktree side of that same stop is [`WorktreeEffect::MayConflict`].
     Rebuilt,
+    /// The index is left exactly as it was **unless** the operation stops on
+    /// a conflict, in which case unmerged stages appear in it.
+    ///
+    /// This is the index-side counterpart of [`WorktreeEffect::MayConflict`]
+    /// for operations whose *clean* path does not touch the index at all —
+    /// `git stash apply` without `--index` is the case that forces the
+    /// variant to exist. Collapsing it into [`Self::Rebuilt`] would claim the
+    /// staged picture always changes when usually it does not; collapsing it
+    /// into [`Self::Untouched`] would promise it never does.
+    MayGainConflictStages,
+    /// The index is set from the operation's result tree **only if** the
+    /// branch this operation moves is the one currently checked out;
+    /// otherwise it is not touched. The index-side twin of
+    /// [`WorktreeEffect::RewrittenIfCheckedOut`], and it exists for the same
+    /// reason — see that variant's doc for the argument against worst-casing.
+    RebuiltIfCheckedOut,
+}
+
+impl GitOperation {
+    /// What this operation does to the **working tree**.
+    ///
+    /// Exhaustive, no wildcard — see this module's header for why. Where an
+    /// operation's real effect depends on something the operation itself does
+    /// not carry, the answer names the condition rather than guessing at it
+    /// (see [`WorktreeEffect::RewrittenIfCheckedOut`]).
+    pub fn worktree_effect(&self) -> WorktreeEffect {
+        match self {
+            // Ref-only work. A branch, a tag, or a remote round trip moves
+            // pointers and objects; no file in the working tree is opened.
+            GitOperation::CreateBranch { .. } => WorktreeEffect::Untouched,
+            GitOperation::DeleteBranch { .. } => WorktreeEffect::Untouched,
+            GitOperation::ForceDeleteBranch { .. } => WorktreeEffect::Untouched,
+            // Recreating a deleted branch's ref at its old tip. The undo for
+            // a deletion, and like the deletion it never checks anything out.
+            GitOperation::RestoreBranch { .. } => WorktreeEffect::Untouched,
+            GitOperation::CreateTag { .. } => WorktreeEffect::Untouched,
+            GitOperation::DeleteLocalTag { .. } => WorktreeEffect::Untouched,
+            GitOperation::DeleteRemoteTag { .. } => WorktreeEffect::Untouched,
+            GitOperation::PushTag { .. } => WorktreeEffect::Untouched,
+            GitOperation::PushBranch { .. } => WorktreeEffect::Untouched,
+            // `git fetch` writes objects and remote-tracking refs. Neither is
+            // in the working tree, which is precisely why a fetch is the safe
+            // half of a pull.
+            GitOperation::FetchRemote { .. } => WorktreeEffect::Untouched,
+
+            // Committing consumes the index and moves a ref. The files on
+            // disk are already what is being committed — that is the whole
+            // point — so nothing is rewritten.
+            GitOperation::CommitOnHead { .. } => WorktreeEffect::Untouched,
+            GitOperation::EmptyCommitOnBranch { .. } => WorktreeEffect::Untouched,
+            GitOperation::AmendCommit { .. } => WorktreeEffect::Untouched,
+
+            // Index-only verbs. `git add -A`, `git reset`, and
+            // `git apply --cached` all stop at the index.
+            GitOperation::StageAll => WorktreeEffect::Untouched,
+            GitOperation::UnstageAll => WorktreeEffect::Untouched,
+            GitOperation::StageSelection { .. } => WorktreeEffect::Untouched,
+
+            // Dropping a stash entry deletes a ref and nothing else. The
+            // working tree is untouched whether or not the entry was ever
+            // applied — which is exactly the gap #514 is about, and exactly
+            // why this arm must not claim otherwise.
+            GitOperation::DropStash { .. } => WorktreeEffect::Untouched,
+
+            // A checkout replaces tracked files with another commit's
+            // versions. It refuses rather than conflicting, so this is not
+            // `MayConflict`.
+            GitOperation::CheckoutBranch { .. } => WorktreeEffect::FilesRewritten,
+            // `git checkout --ours|--theirs` / `git rm` / `git add` against
+            // named conflicted paths: the chosen side is written to disk.
+            GitOperation::ResolveConflict { .. } => WorktreeEffect::FilesRewritten,
+            // Client-composed content written to the path, then staged.
+            GitOperation::ResolveConflictContent { .. } => WorktreeEffect::FilesRewritten,
+            // `git checkout -- <paths>`: each named path is overwritten with
+            // its checked-out version. This is the operation whose recovery
+            // is `Irrecoverable`; understating its worktree effect would be
+            // the worst place in this match to be wrong.
+            GitOperation::DiscardTrackedPaths { .. } => WorktreeEffect::FilesRewritten,
+            // `--abort` restores the pre-sequence worktree wholesale.
+            GitOperation::SequenceAbort => WorktreeEffect::FilesRewritten,
+            // Stashing reverts the working tree to HEAD — the changes are
+            // saved, and they are saved by being taken off disk.
+            GitOperation::PushStash { .. } => WorktreeEffect::FilesRewritten,
+            // The fixture reset rebuilds the demo repository from its seed.
+            GitOperation::ResetTestRepo => WorktreeEffect::FilesRewritten,
+
+            // `git clean -f` against named untracked paths: the files stop
+            // existing. A different sentence from being rewritten, and the
+            // only operation in the vocabulary that earns this variant.
+            GitOperation::DeleteUntrackedPaths { .. } => WorktreeEffect::FilesRemoved,
+
+            // Everything that runs a merge, in git's sense: it rewrites
+            // tracked files and can stop part-way leaving markers on disk.
+            GitOperation::MergeBranch { .. } => WorktreeEffect::MayConflict,
+            GitOperation::RebaseOntoBase { .. } => WorktreeEffect::MayConflict,
+            // A pull is a fetch plus an integration; the integration half
+            // settles this, and neither `MergeStrategy` avoids conflicts.
+            GitOperation::PullBranch { .. } => WorktreeEffect::MayConflict,
+            GitOperation::CherryPick { .. } => WorktreeEffect::MayConflict,
+            GitOperation::CherryPickMerge { .. } => WorktreeEffect::MayConflict,
+            GitOperation::RevertCommit { .. } => WorktreeEffect::MayConflict,
+            GitOperation::RevertMerge { .. } => WorktreeEffect::MayConflict,
+            // Continue and skip both drive the sequencer onto the next
+            // commit, which is another chance to conflict.
+            GitOperation::SequenceContinue => WorktreeEffect::MayConflict,
+            GitOperation::SequenceSkip => WorktreeEffect::MayConflict,
+            GitOperation::ApplyStash { .. } => WorktreeEffect::MayConflict,
+            // `git stash branch` applies at the stash's base commit, which
+            // usually avoids the conflict a plain apply would hit — but this
+            // repository's own executor doc records that it can still
+            // conflict when the base commit or the working tree is not what
+            // the precondition believed (`planner/stash.rs`), and the
+            // response re-reads the conflict state afterwards for that
+            // reason. `FilesRewritten` would contradict code that already
+            // handles the conflicting case.
+            GitOperation::BranchFromStash { .. } => WorktreeEffect::MayConflict,
+
+            // The one genuinely conditional arm. See the variant's doc.
+            GitOperation::ResetBranch { .. } => WorktreeEffect::RewrittenIfCheckedOut,
+        }
+    }
+
+    /// What this operation does to the **index**.
+    ///
+    /// Exhaustive, no wildcard. Same conditional discipline as
+    /// [`Self::worktree_effect`].
+    pub fn index_effect(&self) -> IndexEffect {
+        match self {
+            // Ref-only and remote-only work.
+            GitOperation::CreateBranch { .. } => IndexEffect::Untouched,
+            GitOperation::DeleteBranch { .. } => IndexEffect::Untouched,
+            GitOperation::ForceDeleteBranch { .. } => IndexEffect::Untouched,
+            GitOperation::RestoreBranch { .. } => IndexEffect::Untouched,
+            GitOperation::CreateTag { .. } => IndexEffect::Untouched,
+            GitOperation::DeleteLocalTag { .. } => IndexEffect::Untouched,
+            GitOperation::DeleteRemoteTag { .. } => IndexEffect::Untouched,
+            GitOperation::PushTag { .. } => IndexEffect::Untouched,
+            GitOperation::PushBranch { .. } => IndexEffect::Untouched,
+            GitOperation::FetchRemote { .. } => IndexEffect::Untouched,
+            GitOperation::DropStash { .. } => IndexEffect::Untouched,
+
+            // A commit writes the index's tree into a new object and moves a
+            // ref. The index's own entries are not disturbed — what changes
+            // is HEAD, which is why the same paths stop reading as staged.
+            GitOperation::CommitOnHead { .. } => IndexEffect::Untouched,
+            GitOperation::EmptyCommitOnBranch { .. } => IndexEffect::Untouched,
+            GitOperation::AmendCommit { .. } => IndexEffect::Untouched,
+
+            // `git checkout -- <paths>` restores the worktree *from* the
+            // index; `git clean -f` removes files git never tracked. Neither
+            // writes an index entry.
+            GitOperation::DiscardTrackedPaths { .. } => IndexEffect::Untouched,
+            GitOperation::DeleteUntrackedPaths { .. } => IndexEffect::Untouched,
+
+            GitOperation::StageAll => IndexEffect::EntriesStaged,
+            GitOperation::UnstageAll => IndexEffect::EntriesUnstaged,
+            // The only operation whose index effect is chosen by one of its
+            // own fields rather than by which variant it is. Reading the
+            // direction here is what keeps a single arm from having to lie
+            // about one of the two directions.
+            GitOperation::StageSelection { direction, .. } => match direction {
+                crate::patch_plan::StageDirection::Stage => IndexEffect::EntriesStaged,
+                crate::patch_plan::StageDirection::Unstage => IndexEffect::EntriesUnstaged,
+            },
+
+            // Both conflict verbs end with the path staged as resolved: the
+            // three unmerged stages collapse to one entry.
+            GitOperation::ResolveConflict { .. } => IndexEffect::StagesResolved,
+            GitOperation::ResolveConflictContent { .. } => IndexEffect::StagesResolved,
+
+            // Everything that sets the index from a result tree.
+            GitOperation::CheckoutBranch { .. } => IndexEffect::Rebuilt,
+            GitOperation::MergeBranch { .. } => IndexEffect::Rebuilt,
+            GitOperation::PullBranch { .. } => IndexEffect::Rebuilt,
+            GitOperation::RebaseOntoBase { .. } => IndexEffect::Rebuilt,
+            GitOperation::CherryPick { .. } => IndexEffect::Rebuilt,
+            GitOperation::CherryPickMerge { .. } => IndexEffect::Rebuilt,
+            GitOperation::RevertCommit { .. } => IndexEffect::Rebuilt,
+            GitOperation::RevertMerge { .. } => IndexEffect::Rebuilt,
+            GitOperation::SequenceContinue => IndexEffect::Rebuilt,
+            GitOperation::SequenceSkip => IndexEffect::Rebuilt,
+            GitOperation::SequenceAbort => IndexEffect::Rebuilt,
+            GitOperation::ResetTestRepo => IndexEffect::Rebuilt,
+            // `git stash push` resets both the worktree and the index to
+            // HEAD, so a staged change is stashed and unstaged in one step.
+            GitOperation::PushStash { .. } => IndexEffect::Rebuilt,
+            // `git stash branch` restores the index as well as the worktree
+            // — that is the documented difference between it and a plain
+            // apply, and the reason it is the recommended escape from a
+            // stash that will not apply cleanly.
+            GitOperation::BranchFromStash { .. } => IndexEffect::Rebuilt,
+
+            // `git stash apply` is run without `--index`
+            // (`planner/stash.rs`), so a clean apply leaves the index exactly
+            // as it was and the restored work arrives unstaged. Only a
+            // conflicting apply writes unmerged stages.
+            GitOperation::ApplyStash { .. } => IndexEffect::MayGainConflictStages,
+
+            // Conditional for the same reason as its worktree twin.
+            GitOperation::ResetBranch { .. } => IndexEffect::RebuiltIfCheckedOut,
+        }
+    }
 }
 
 /// Whether a git invocation needs to reach the network. This is the axis

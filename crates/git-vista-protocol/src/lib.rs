@@ -64,6 +64,7 @@ pub mod conflict;
 pub mod diff;
 pub mod dto;
 pub mod error;
+pub mod explain;
 pub mod history;
 pub mod operation;
 pub mod patch_build;
@@ -91,7 +92,9 @@ pub use dto::{
     SelectRequest, SessionInfo, SessionRequest, SignTagError, SignTagFailureKind, SignatureStatus,
     StashEntry, StashTarget, TagDetail, TagKind, WorktreePathsRequest, CLONE_IN_PROGRESS_SENTINEL,
 };
+pub use effects::{network_need_for_operation, IndexEffect, NetworkNeed, WorktreeEffect};
 pub use error::{ApiError, ApiErrorBody, ErrorCode, RequestId};
+pub use explain::{explain, Explanation, ExplanationFact, Section, Topic};
 pub use history::{HeadState, HistoryFrame, HistoryPage};
 pub use operation::{
     IdempotencyKey, OperationByKeyResponse, OperationId, OperationStage, OperationState,
