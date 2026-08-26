@@ -234,8 +234,87 @@ pub fn seed_retry_attempts_for(
     }
 }
 
+/// The sentence shown when the history seed failed (#218).
+///
+/// One function, literal words per state, so the sentence cannot drift from
+/// the mechanism: a line that always read the same way would claim a dead end
+/// while a retry was already scheduled, and stay silent at the moment the
+/// budget ran out — the state where the user genuinely is the only recovery
+/// left.
+///
+/// **It lives here, beside [`seed_retry_delay_ms`] and
+/// [`seed_retry_attempts_for`] — the two functions whose answers decide
+/// `auto_retry_pending` — rather than in `app/mod.rs`.** `mod app` is
+/// `cfg(target_arch = "wasm32")`, so nothing declared there ever reaches
+/// `cargo test`; this module is host-compiled and host-tested. That is the
+/// same reason `features/conflicts/markers.rs` is a framework-free core
+/// instead of logic inside the viewer, and the lesson #432 paid for: a
+/// decision proven only by a green gate that never compiled it is not proven.
+pub fn seed_error_status_copy(message: &str, auto_retry_pending: bool) -> String {
+    if auto_retry_pending {
+        format!("Failed to load history: {message} — retrying automatically…")
+    } else {
+        format!(
+            "Failed to load history: {message} — automatic retries stopped; \
+             use Retry or Refresh to try again."
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::seed_error_status_copy;
+
+    /// **#218: the status line must say which of the two states the user is
+    /// in, in literal words.**
+    ///
+    /// The whole point of the fix is that a seed failure is no longer a dead
+    /// end the user must guess about. Two states, and confusing them is the
+    /// defect: while a retry is scheduled the user should wait, and once the
+    /// budget is spent the user IS the only remaining recovery and must be
+    /// told so. Asserted on literal substrings rather than on the whole
+    /// sentence, so rewording stays free while the distinction cannot be lost.
+    ///
+    /// MUTATION 1 (remove the mechanism): collapse both arms to one sentence
+    ///   — red, the two states stop being distinguishable.
+    /// MUTATION 2 (weaken it, differently): invert the `auto_retry_pending`
+    ///   polarity — each arm still exists but is attached to the wrong state,
+    ///   red at the opposite assertion from mutation 1.
+    #[test]
+    fn the_seed_failure_line_tells_a_scheduled_retry_from_a_spent_budget() {
+        let pending = seed_error_status_copy("connection lost", true);
+        let spent = seed_error_status_copy("connection lost", false);
+
+        // The server's own message survives into both — the user is never
+        // shown a generic failure that hides what actually went wrong.
+        assert!(pending.contains("connection lost"), "{pending}");
+        assert!(spent.contains("connection lost"), "{spent}");
+
+        // A retry is already scheduled: say so, and do not tell the user to act.
+        assert!(
+            pending.contains("retrying automatically"),
+            "a scheduled retry must be visible, or the user retries a retry: {pending}"
+        );
+        assert!(
+            !pending.contains("use Retry"),
+            "do not ask for a manual retry while one is already scheduled: {pending}"
+        );
+
+        // The budget is spent: the user is the only recovery left, and must be
+        // told that plainly — silence here is the #218 dead end.
+        assert!(
+            spent.contains("automatic retries stopped"),
+            "the moment the budget runs out must be stated: {spent}"
+        );
+        assert!(
+            spent.contains("Retry") || spent.contains("Refresh"),
+            "when nothing else will happen, name what the user can do: {spent}"
+        );
+
+        // And the two must not read the same.
+        assert_ne!(pending, spent, "the two states must be distinguishable");
+    }
+
     #[test]
     fn the_session_retry_budget_backs_off_and_then_gives_up() {
         // Spaced, not a tight loop — a dropped tunnel needs seconds.

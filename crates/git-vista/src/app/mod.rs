@@ -44,6 +44,7 @@ use crate::features::graph::core::{
 use crate::features::operations::core::OperationsCore;
 use crate::features::operations::signals::Operations;
 use crate::features::operations::view::operations_status_view;
+use crate::features::session::core::seed_error_status_copy;
 use crate::features::session::core::seed_retry_attempts_for;
 use crate::features::session::core::seed_retry_delay_ms;
 use crate::features::session::core::session_retry_delay_ms;
@@ -346,7 +347,10 @@ pub fn App() -> impl IntoView {
         let (expected_epoch, attempts_used) = seed_retry.get_untracked();
         let attempts_used = seed_retry_attempts_for(expected_epoch, epoch, attempts_used);
         let Some(delay) = seed_retry_delay_ms(attempts_used) else {
-            return; // Budget spent for this chain: stop, leave the error visible.
+            // Budget spent for this chain: stop. The SeedError arm below reads
+            // the same bookkeeping, switches to its retries-stopped copy and
+            // offers a manual Retry — the give-up is visible, not silent.
+            return;
         };
         let next_attempt = attempts_used + 1;
         set_timeout(
@@ -1076,10 +1080,43 @@ pub fn App() -> impl IntoView {
                                 })
                                 .flatten()
                                 .unwrap_or_else(|| "the request did not complete".to_string());
+                            // Whether the bounded auto-retry above still has
+                            // budget for this failure chain — the SAME
+                            // computation, through the SAME two host-tested
+                            // policy functions, the retry effect makes when it
+                            // decides whether to arm a timer. Re-deriving it
+                            // with view-local arithmetic would let this line
+                            // promise a retry the mechanism will not make, or
+                            // sit silent through the give-up.
+                            let (expected_epoch, attempts_used) = seed_retry.get();
+                            let auto_retry_pending = seed_retry_delay_ms(
+                                seed_retry_attempts_for(expected_epoch, epoch, attempts_used),
+                            )
+                            .is_some();
                             view! {
                                 <p class="status error">
                                     <span class="nf">{ic.conflict}</span>
-                                    {format!(" Failed to load history: {message}")}
+                                    {format!(
+                                        " {}",
+                                        seed_error_status_copy(&message, auto_retry_pending),
+                                    )}
+                                    // A retry reachable from the failure itself,
+                                    // not only from the topbar. Only once the
+                                    // automatic budget is spent: while a retry
+                                    // is already scheduled, offering the button
+                                    // just invites a second bump to race it
+                                    // (the stale-timer guard above absorbs that
+                                    // race, but inviting it buys nothing).
+                                    {(!auto_retry_pending).then(|| view! {
+                                        <button
+                                            class="refresh"
+                                            on:click=refresh
+                                            title="Re-read the repository and try loading \
+                                                   the history again"
+                                        >
+                                            "Retry"
+                                        </button>
+                                    })}
                                 </p>
                             }
                             .into_view()
