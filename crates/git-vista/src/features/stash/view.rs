@@ -14,6 +14,9 @@
 //! - whether a pop finished is [`PopVerdict::is_complete`], never a check on the
 //!   HTTP result here;
 //! - which actions a row offers, and in what order, is `action_offers`;
+//! - whether an action asks before it runs, and with what words, is
+//!   `ceremony` — one gate ahead of the dispatch match, keyed on the
+//!   destructive classification, so no arm decides for itself (#525);
 //! - what a push will and will not capture is `push_preview`.
 //!
 //! The browser suite is what proves this file is *reached*; the Rust suite is
@@ -33,8 +36,8 @@ use leptos::*;
 use crate::api::{fetch_stash_patch, fetch_stashes, push_stash_request};
 use crate::datetime::time_ago;
 use crate::features::stash::core::{
-    drawer_view, push_preview, Availability, DrawerView, PushPreview, StashAction, StashRow,
-    DRAWER_REGION_LABEL, LOADING_STASHES, NO_STASHES,
+    ceremony, drawer_view, push_preview, Availability, Ceremony, DrawerView, PushPreview,
+    StashAction, StashRow, DRAWER_REGION_LABEL, LOADING_STASHES, NO_STASHES,
 };
 use crate::features::stash::signals::{compose_pop, StashDrawer, StashNotice, PUSH_KEY};
 use crate::features::status::core::StatusSections;
@@ -446,6 +449,38 @@ fn action_button(
     let on_click = move |_| {
         let selector = selector.clone();
         let oid = oid.clone();
+        // The confirmation gate (#525), ahead of the dispatch match so no arm
+        // can individually forget to ask — Pop shipped without a dialog
+        // precisely because each arm wired its own. Whether to ask is keyed
+        // on the destructive classification in core, where the wording is
+        // host-tested; this match only maps each ceremony to its dialog.
+        let named = match ceremony(action, &selector) {
+            Ceremony::Proceed => None,
+            Ceremony::Confirm(text) => {
+                let Some(win) = web_sys::window() else { return };
+                let confirmed = win.confirm_with_message(&text).unwrap_or(false);
+                if !confirmed {
+                    return;
+                }
+                None
+            }
+            // One cancellable prompt carries both the disclosure and the
+            // name (#516). Cancelling, or a blank name, declines the whole
+            // operation.
+            Ceremony::NamePrompt(text) => {
+                let Some(win) = web_sys::window() else { return };
+                let Some(name) = win
+                    .prompt_with_message(&text)
+                    .ok()
+                    .flatten()
+                    .map(|n| n.trim().to_string())
+                    .filter(|n| !n.is_empty())
+                else {
+                    return;
+                };
+                Some(name)
+            }
+        };
         match action {
             // A read — no confirmation, no epoch bump, nothing to undo.
             StashAction::Inspect => drawer.toggle_inspect(&selector),
@@ -479,6 +514,8 @@ fn action_button(
                 });
             }
             StashAction::Pop => {
+                // Confirmed by the gate above (#525): a completed pop removes
+                // the entry, and the dialog said so before this ran.
                 drawer.begin(&oid, "popping");
                 spawn_local(async move {
                     let key = crate::api::new_idempotency_key();
@@ -495,29 +532,12 @@ fn action_button(
                 });
             }
             StashAction::Branch => {
-                // Destructive (#516): success deletes the stash entry, same as
-                // the server's RiskLevel::Destructive classification. The
-                // removal warning rides in the name prompt itself rather than
-                // a separate confirm-then-prompt pair: the prompt is already a
-                // cancellable modal, so one dialog carries both the disclosure
-                // and the decision — a second dialog would add a step without
-                // adding information. Cancelling the prompt declines the whole
-                // operation.
-                let Some(win) = web_sys::window() else { return };
-                let Some(name) = win
-                    .prompt_with_message(&format!(
-                        "Branch from {selector}?\n\nThis creates a branch at the \
-                         stash's own base commit and applies the stash there. On \
-                         success the stash entry is REMOVED from your list.\n\n\
-                         Name for the new branch:"
-                    ))
-                    .ok()
-                    .flatten()
-                    .map(|n| n.trim().to_string())
-                    .filter(|n| !n.is_empty())
-                else {
-                    return;
-                };
+                // The name arrived through the gate's NamePrompt — the #516
+                // disclosure rides in that prompt. No name means the prompt
+                // was declined (or a future ceremony stopped asking for
+                // one); either way this arm fails closed rather than
+                // branching nameless.
+                let Some(name) = named else { return };
                 drawer.begin(&oid, "branching");
                 spawn_local(async move {
                     let result =
@@ -550,21 +570,8 @@ fn action_button(
                 });
             }
             StashAction::Drop => {
-                // Destructive and irreversible from the user's point of view,
-                // so it asks first. The stash's commit stays recoverable until
-                // gc via the recovery pin, which is what the wording says
-                // rather than promising the change is undoable.
-                let Some(win) = web_sys::window() else { return };
-                let confirmed = win
-                    .confirm_with_message(&format!(
-                        "Drop {selector}?\n\nThis removes the entry from your stash list. \
-                         The changes stay recoverable from the Recovery Centre until git \
-                         garbage-collects them."
-                    ))
-                    .unwrap_or(false);
-                if !confirmed {
-                    return;
-                }
+                // Confirmed by the gate above; the recoverable-until-gc
+                // wording is core's, held to its action by a host test.
                 drawer.begin(&oid, "dropping");
                 spawn_local(async move {
                     let key = crate::api::new_idempotency_key();
