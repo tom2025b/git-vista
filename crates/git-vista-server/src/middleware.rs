@@ -26,6 +26,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use http_body::Body as HttpBody;
 use http_body_util::BodyExt;
 
 use git_vista_protocol::{
@@ -79,7 +80,7 @@ pub(crate) async fn api_contract(request: Request, next: Next) -> Response {
             if response.status().is_client_error() || response.status().is_server_error() {
                 rewrap_error(response, &request_id).await
             } else {
-                response
+                relabel_json_success(response).await
             }
         }
     };
@@ -402,6 +403,73 @@ fn json_object_or_prefix_of_one(bytes: &[u8]) -> bool {
     }
 }
 
+/// Label a *success* body that is hand-serialized JSON as `application/json`.
+///
+/// The same ambiguity `rewrap_error` resolves for errors exists on the success
+/// side, and #336 is where it surfaced. Every write executor returns
+/// `(StatusCode, String)` — a channel shared by ~30 operation kinds — and puts a
+/// pre-serialized DTO in that `String`: `AmendCommitSuccess`, `FetchSuccess`,
+/// `PullSuccess`. Axum's blanket `impl IntoResponse for String` stamps all of
+/// them `text/plain`, so a 200 carrying a JSON object went out claiming to be
+/// prose. Only `/api/amend-commit` escaped that, because
+/// `handlers::commit::amend_route_response` sniffed *every* output of
+/// `plan_and_execute` and not just the refusals — the second thing that layer
+/// did, which the issue and the handoff both described as a refusal-only fix.
+/// Deleting it without this would have silently un-labeled that route's 200 and
+/// left the other four wrong; labeling it here fixes all five at once, in the
+/// one place that already owns "the whole surface answers in one shape".
+///
+/// # Why a declared length is the gate
+///
+/// This runs on **every** non-error response, including the M1.08 progress
+/// stream (`/api/operations/{id}/events`), which is an `async_stream` that stays
+/// open for the life of an operation. Reading even one frame of it here would
+/// stall the very thing it exists to deliver. So the gate is the body's own
+/// [`http_body::Body::size_hint`]: a complete in-memory `String` reports an
+/// exact size, a stream reports none. Only a body whose exact length is already
+/// known, and fits [`MAX_ERROR_BODY`], is looked at — anything else is passed
+/// through without being polled at all.
+///
+/// The `content-length` header is deliberately *not* what is consulted. It does
+/// not exist yet this far up the stack — hyper writes it when it serializes the
+/// response — so a gate on the header reads `None` for every route and relabels
+/// nothing, which is how the first version of this function silently did that.
+///
+/// Unlike the error path this only ever *relabels*. A success body is the
+/// endpoint's own payload; there is no envelope to put it in, and one that
+/// isn't JSON is left exactly as the handler built it.
+async fn relabel_json_success(response: Response) -> Response {
+    if is_json(&response) {
+        return response;
+    }
+    // The body's own exact size, not the `content-length` header: that header
+    // does not exist yet at this point in the stack — hyper writes it when it
+    // serializes the response — so reading it here would gate on `None` for
+    // every route and relabel nothing.
+    let exact = response.body().size_hint().exact();
+    if !exact.is_some_and(|len| len <= MAX_ERROR_BODY as u64) {
+        return response;
+    }
+
+    // `split_at_limit` rather than `to_bytes` even though the length says it
+    // fits: a header that lies must not cost the body. Nothing is lost on any
+    // path here — what is not relabeled is rejoined and passed on byte-for-byte.
+    let (mut parts, body) = response.into_parts();
+    let (head, rest) = split_at_limit(body, MAX_ERROR_BODY).await;
+    let is_json_object = rest.is_none()
+        && matches!(
+            serde_json::from_slice::<serde_json::Value>(&head),
+            Ok(serde_json::Value::Object(_))
+        );
+    if is_json_object {
+        parts.headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+    }
+    Response::from_parts(parts, rejoin(head, rest))
+}
+
 /// Whether a response already carries a JSON content type.
 fn is_json(response: &Response) -> bool {
     response
@@ -432,7 +500,7 @@ mod tests {
         routing::{get, post},
         Router,
     };
-    use git_vista_protocol::{AmendCommitError, AmendFailureKind, ApiError};
+    use git_vista_protocol::{AmendCommitError, AmendCommitSuccess, AmendFailureKind, ApiError};
     use tower::ServiceExt;
 
     // A tiny router carrying the contract layer over a few representative routes:
@@ -514,6 +582,46 @@ mod tests {
                         StatusCode::BAD_REQUEST,
                         format!("{OVERSIZED_PROSE_OPENING}{}", "y".repeat(OVERSIZED_LEN)),
                     )
+                }),
+            )
+            // A *success* in the shared write channel: a 200 whose `String` is
+            // already a serialized DTO, exactly as `exec_amend_commit` and
+            // `exec_fetch` build theirs. Axum stamps it `text/plain`; only the
+            // bytes say otherwise.
+            .route(
+                "/api/typed-success",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        serde_json::to_string(&AmendCommitSuccess {
+                            message: "Amended commit.".to_string(),
+                            old_tip: "1".repeat(40),
+                            new_tip: Some("0".repeat(40)),
+                            amended_published_commit: Some(false),
+                        })
+                        .unwrap(),
+                    )
+                }),
+            )
+            // A 200 that is genuinely prose, so the relabel cannot be "always".
+            .route("/api/plain-success", get(|| async { "not json at all" }))
+            // A 200 with no declared length — the shape the M1.08 progress
+            // stream has. It must reach the client unread and unlabeled.
+            .route(
+                "/api/streamed-success",
+                get(|| async {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        // A bare JSON object, deliberately: if the size-hint
+                        // gate ever leaks, this body *would* be read and
+                        // relabeled `application/json`, and the test below goes
+                        // red. A fixture that could not be mistaken for JSON
+                        // would pass whether the gate worked or not.
+                        .body(Body::from_stream(async_stream::stream! {
+                            yield Ok::<_, std::io::Error>(Bytes::from_static(b"{\"progress\":1}"));
+                        }))
+                        .unwrap()
                 }),
             )
             .route("/api/branch", post(crate::handlers::branch::create_branch))
@@ -833,6 +941,127 @@ mod tests {
         assert!(
             rest.is_some(),
             "one byte past the cap is a body with a remainder"
+        );
+    }
+
+    /// #336: a **success** body that is hand-serialized JSON is labeled
+    /// `application/json` too, on every route rather than one.
+    ///
+    /// This is the half of `amend_route_response` that neither the issue nor
+    /// the handoff described. That layer sniffed *every* output of
+    /// `plan_and_execute`, not just the refusals, so `/api/amend-commit`'s 200
+    /// was the only correctly-labeled success in the shared write channel —
+    /// `/api/commit`, `/api/fetch`, `/api/pull` and `/api/tag` all sent a JSON
+    /// object claiming to be `text/plain`. Deleting the layer without this
+    /// un-labeled the one that worked; `relabel_json_success` labels all five.
+    ///
+    /// Caught by `state::tests::selection_flow_carries_mode_and_gates_writes`
+    /// on CI, which cannot reach its own success leg in a container without
+    /// Landlock — the reason it is pinned here as well, where no sandbox is
+    /// involved and the assertion runs everywhere.
+    #[tokio::test]
+    async fn a_handlers_typed_json_success_is_labeled_json_too() {
+        let resp = app()
+            .oneshot(get_req(
+                "/api/typed-success",
+                Some(&PROTOCOL_VERSION.to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            content_type.starts_with("application/json"),
+            "a 200 carrying a serialized DTO must not claim to be prose: got \
+             {content_type:?}"
+        );
+        let body = body_string(resp).await;
+        let parsed: AmendCommitSuccess = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("the payload must survive relabeling ({e}): {body}"));
+        assert_eq!(parsed.message, "Amended commit.");
+    }
+
+    /// The paired negative: a 200 that is genuinely prose keeps its own
+    /// content-type and its own bytes. Without this, `relabel_json_success`
+    /// could be "always label 200s JSON" and the test above would still pass.
+    #[tokio::test]
+    async fn a_plain_text_success_is_left_exactly_as_the_handler_built_it() {
+        let resp = app()
+            .oneshot(get_req(
+                "/api/plain-success",
+                Some(&PROTOCOL_VERSION.to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            content_type.starts_with("text/plain"),
+            "prose must stay prose: got {content_type:?}"
+        );
+        assert_eq!(body_string(resp).await, "not json at all");
+    }
+
+    /// The stream guard, and the reason `relabel_json_success` gates on a
+    /// declared `content-length` rather than on status: the M1.08 progress
+    /// stream (`/api/operations/{id}/events`) is a 200 that stays open for the
+    /// life of an operation. Reading one frame of it to classify it would stall
+    /// the thing it exists to deliver.
+    ///
+    /// Asserted on the header rather than by timing: a body with no declared
+    /// length must come back with its own content-type untouched, which is only
+    /// true if nothing polled it. The payload here deliberately *is* a JSON
+    /// object inside an SSE frame, so a relabel that ignored the length gate
+    /// would have something to latch onto.
+    #[tokio::test]
+    async fn a_streaming_success_is_never_read_to_classify_it() {
+        let resp = app()
+            .oneshot(get_req(
+                "/api/streamed-success",
+                Some(&PROTOCOL_VERSION.to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "a stream must reach the client unread and unlabeled: got \
+             {content_type:?} — the gate leaked and the body was polled"
+        );
+
+        // The mechanism the assertion above rests on, stated directly: a
+        // streamed body reports no exact size, an in-memory one does. If this
+        // ever stops holding, the assertion above silently stops testing
+        // anything.
+        assert!(
+            Body::from_stream(async_stream::stream! {
+                yield Ok::<_, std::io::Error>(Bytes::from_static(b"{}"));
+            })
+            .size_hint()
+            .exact()
+            .is_none(),
+            "a streamed body must not report an exact size"
+        );
+        assert_eq!(
+            Body::from("{}").size_hint().exact(),
+            Some(2),
+            "an in-memory body must report its exact size"
         );
     }
 

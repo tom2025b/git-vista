@@ -118,6 +118,43 @@ still a legal JSON string character, so the lossy copy fails at end-of-input the
 way the truncation actually did. Only the copy is inspected; the original bytes
 are what get forwarded.
 
+### The half of the route-local layer nobody had described
+
+`amend_route_response` sniffed **every** output of `plan_and_execute`, not only
+the refusals — and `rewrap_error` runs only on 4xx/5xx. So that layer was also
+the only reason `/api/amend-commit`'s **200** carried `application/json`. The
+issue, the handoff and the first draft of this ADR all described it as a
+refusal-only fix; deleting it on that description silently un-labeled the
+success body, and
+`state::tests::selection_flow_carries_mode_and_gates_writes` caught it on CI at
+the assertion `the success body had zero content-type coverage before this
+test`. That test cannot reach its own success leg in a container without
+Landlock, which is why the cloud baseline could not see it.
+
+The same ambiguity is not amend-specific. Every write executor returns
+`(StatusCode, String)` with a pre-serialized DTO in the `String` —
+`AmendCommitSuccess`, `FetchSuccess`, `PullSuccess` — and axum stamps all of
+them `text/plain`. `/api/amend-commit` was simply the only one with a layer to
+fix it; `/api/commit`, `/api/fetch`, `/api/pull` and `/api/tag` have been
+sending JSON objects labeled as prose all along.
+
+So the collapse takes the same shape as the error fix: `relabel_json_success`
+runs on every non-error response and labels a body that *is* a JSON object.
+It only ever **relabels** — a success body is the endpoint's own payload, there
+is no envelope to put it in, and one that is not JSON is left exactly as the
+handler built it.
+
+**The gate is the body's own `size_hint`, not the `content-length` header.**
+This runs on every 200, including the M1.08 progress stream
+(`/api/operations/{id}/events`), an `async_stream` that stays open for the life
+of an operation; reading one frame of it to classify it would stall the thing it
+exists to deliver. A complete in-memory `String` reports an exact size, a stream
+reports none. The header would have been the obvious gate and is the wrong one:
+it does not exist yet at the layer level — hyper writes it when it serializes
+the response — so a gate on it reads `None` for every route and relabels
+nothing. The first version of this function did exactly that, and its test
+caught it.
+
 ### What the collapse removes
 
 - `planner::commit_exec::amend_refusal_body` — gone; `amend_refusal` is back to
@@ -127,8 +164,9 @@ are what get forwarded.
 - `handlers::commit::amend_route_response` — gone; `amend_commit` returns
   `(StatusCode, String)` directly, like every other write handler.
 
-The wire contract is unchanged: same status, same `application/json`, same
-bytes. Only the layer that produces the label moves.
+For `/api/amend-commit` the wire contract is unchanged on both sides — same
+status, same `application/json`, same bytes, for refusals and successes alike.
+Only the layer that produces the label moves.
 
 ## Alternatives weighed
 
@@ -158,9 +196,22 @@ benefit. Recorded, not taken.
 
 ## Consequences
 
-`http-body-util` becomes a direct dependency of `git-vista-server`. It was
-already in the tree as axum's own dependency and compiles no new code; the crate
-now names `BodyExt::frame` itself, so it declares it.
+`http-body-util` and `http-body` become direct dependencies of
+`git-vista-server`. Both were already in the tree as axum's own dependencies and
+compile no new code; the crate now names `BodyExt::frame` and
+`Body::size_hint` itself, so it declares them.
+
+**Four routes' success content-type changes**, from `text/plain` to
+`application/json`: `/api/commit`, `/api/fetch`, `/api/pull` and `/api/tag`.
+That is a correction — those bodies were always JSON objects — and it makes them
+consistent with `/api/amend-commit`, whose label is the one already pinned by a
+test. Nothing in this repository's own frontend reads a response content-type:
+`api/commits.rs` hands the raw text to `classify_amend_response(status, &text)`,
+and the single `content-type` mention in `crates/git-vista/src/api.rs` is a
+*request* header. The change is nonetheless wider than #336 asked for, and it is
+flagged here rather than buried: the alternative was to reintroduce a
+route-local relabel for the success case alone, which is the two-mechanism split
+this ADR exists to remove, and which would have left the other four wrong.
 
 An over-cap **prose** refusal is still truncated at 64 KiB. That is a real
 remaining bound and it is stated rather than hidden: the envelope now carries
@@ -182,9 +233,18 @@ magic number that would silently stop testing the edge if the cap ever moved.
 unmodified `main` — the strict sandbox tier needs `landlock_abi>=6` plus
 `bwrap`, and this kernel lacks Landlock. Measured on `405a764` with
 `gv-sandbox` built first: **616 passed, 321 failed, 4 ignored**. After this
-change: **622 passed, 321 failed, 4 ignored**. The failing sets are identical —
+change: **625 passed, 321 failed, 4 ignored**. The failing sets are identical —
 `comm` over the sorted names reports zero new failures and zero newly passing.
-The +6 are exactly the six tests added here.
+The +9 are exactly the nine tests added here.
+
+**What the baseline could not tell us, and did.** One of those 321 is
+`state::tests::selection_flow_carries_mode_and_gates_writes`, which dies at its
+sandbox-dependent leg long before the amend success assertion that this change
+first broke. A container-shaped hole in the baseline is not a hole in the
+change: it means the assertion runs for the first time on CI. It did, it went
+red, and the fix carries its own container-independent regression test
+(`a_handlers_typed_json_success_is_labeled_json_too`) so the next reader does
+not depend on a Landlock kernel to learn the same thing.
 
 **Mutation-proof, three ways, each red at assertions the others do not reach.**
 
@@ -228,6 +288,31 @@ Each mutation was reverted from a pre-mutation copy and the restore verified
 byte-identical with `diff` and a clean `git diff`; the target tests were rerun
 green after each.
 
+Two more cover the success half:
+
+*D — the `size_hint` stream gate removed.* The progress-stream fixture is polled
+and relabeled:
+
+```
+crates/git-vista-server/src/middleware.rs:1040:9:
+a stream must reach the client unread and unlabeled: got "application/json" —
+the gate leaked and the body was polled
+```
+
+The fixture's frame is a bare JSON object on purpose. One that could not be
+mistaken for JSON would leave the content-type untouched whether the gate worked
+or not — the test would have been green against its own mutation, which is no
+test at all.
+
+*E — success relabeling removed* (the regression CI caught, reproduced
+deliberately):
+
+```
+crates/git-vista-server/src/middleware.rs:978:9:
+a 200 carrying a serialized DTO must not claim to be prose: got
+"text/plain; charset=utf-8"
+```
+
 **The incidental coverage, now deliberate.** #336 claims no wire-level test
 covers `/api/fetch` or `/api/pull` — that every existing `FetchError`/`PullError`
 test calls planner functions directly. Half of that is wrong, and this ADR
@@ -251,7 +336,7 @@ sniff **narrowed** rather than removed, because its bodies are small. So:
   than a fixture: `deny_unknown_fields` echoes the offending key into serde's
   message and `parse_request` quotes it into the `PullError`.
 
-`middleware`'s own four new tests cover the mechanism route-agnostically,
+`middleware`'s own seven new tests cover the mechanism route-agnostically,
 including the reader's exactly-at-the-cap boundary and the negative for the
 prefix sniff (prose that starts with `{` must not be forwarded as JSON — the
 regression `amend_route_response`'s own doc warned is *worse* than the
