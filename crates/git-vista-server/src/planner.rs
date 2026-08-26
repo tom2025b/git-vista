@@ -151,6 +151,33 @@ async fn plan_and_execute_maybe_recovery(
 /// identically — this enum is the whole seam that lets them share
 /// [`plan_and_execute_tracked`] instead of each re-deriving it, which is ADR
 /// 0016's funnel extended to plans that arrive pre-built.
+/// What a drop must prove before it is allowed to run (#514).
+///
+/// Passed alongside the operation rather than folded into
+/// [`GitOperation::DropStash`], for two reasons that both matter:
+///
+/// 1. **It is not part of the operation's identity.** `operation_hash` is
+///    computed from the operation, and idempotency compares it. "Drop this
+///    entry at this oid" is what the user asked for; which apply preceded it
+///    is a precondition on running, not a different request. Folding it in
+///    would make two otherwise-identical drops hash differently.
+/// 2. **The journal already holds `DropStash` rows.** Adding a required field
+///    to a persisted variant makes every existing row undecodable — the exact
+///    shape #509 had to make honest. There is no reason to spend that.
+///
+/// The same posture `recovers` already takes: context that travels beside the
+/// operation, never inside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DropProof {
+    /// Nothing extra to prove — either this is not a drop at all, or it is a
+    /// standalone one (the drawer's Drop button), which restored nothing.
+    Nothing,
+    /// This drop is the second half of a composed pop, completing the named
+    /// `ApplyStash`. Before it runs, the generation that operation recorded
+    /// when it finished must still match the live one.
+    Completes(OperationId),
+}
+
 enum PlanSource {
     /// The composed path: build the plan from this operation, still inside
     /// the guard, then execute it — [`plan_and_execute_in`].
