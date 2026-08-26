@@ -96,6 +96,14 @@ mod security;
 mod session;
 mod staging;
 mod state;
+// M11.01 (#546): the read-only worktree census (`git worktree list
+// --porcelain` resolved into `git_vista_protocol::WorktreeCensus`). Contract
+// and query land first, staged the same way `conflicts` was — no route
+// exposes this yet; that is M11.03's and the checkout-collision
+// precondition's, not this issue's. See docs/superpowers/specs/
+// m3.23-worktrees.md §1.
+#[cfg_attr(not(test), allow(dead_code))]
+mod worktree_census;
 // M1.13b (#66): the single owner of TCP port 9418 in the test binary. Three
 // tests across `sandbox::escape_suite` and `planner::contract_suite` need that
 // one port (it is the only unprivileged entry in `DEFAULT_GIT_PORTS`, so the

@@ -31,6 +31,9 @@
 //!   pure [`diff_spec_argv`] mapping to `git diff`'s argv.
 //! - [`newtype`] — the validating-newtype machinery the three above share, so
 //!   every string-shaped wire value is checked in exactly one place.
+//! - [`worktree`] — the read-only worktree census (M11.01, #546):
+//!   [`WorktreeSibling`], [`Serviceable`] (the app's fence, kept separate from
+//!   git's own `locked`/`prunable` flags), and the fallible [`WorktreeCensus`].
 //!
 //! ## Why a separate crate
 //!
@@ -72,6 +75,7 @@ pub mod patch_plan;
 pub mod plan;
 pub mod status;
 pub mod version;
+pub mod worktree;
 
 pub use conflict::{
     ConflictSource, ConflictedFile, ContentResolutionRefused, Continuation, NotTextResolvable,
@@ -123,3 +127,4 @@ pub use version::{
     IDEMPOTENCY_HEADER, MAX_CLIENT_PROTOCOL, MIN_CLIENT_PROTOCOL, OPERATION_HEADER,
     PROTOCOL_HEADER, PROTOCOL_QUERY, PROTOCOL_VERSION, REQUEST_ID_HEADER,
 };
+pub use worktree::{Serviceable, WorktreeCensus, WorktreeSibling};
