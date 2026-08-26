@@ -100,6 +100,9 @@ fn record_for(key: &IdempotencyKey, op: &GitOperation) -> std::sync::Arc<operati
         Admission::Existing(record) => record,
         Admission::Fresh(..) => panic!("the key should already have been admitted"),
         Admission::Conflict => panic!("the key should name this very operation"),
+        Admission::IncompatibleKey { .. } => {
+            panic!("no test key can name an incompatible journal row")
+        }
     }
 }
 
@@ -308,6 +311,7 @@ async fn a_finished_operation_is_durable_by_the_time_the_request_returns() {
 
     let journaled = crate::durable::recover().await;
     let row = journaled
+        .records
         .iter()
         .find(|(_, s)| s.id == id)
         .expect("the finished operation must already be in the journal");
@@ -366,6 +370,7 @@ async fn a_row_left_running_recovers_as_failed_and_is_rehydrated_into_the_regist
 
     let recovered = crate::durable::recover_from(conn).await;
     let (recovered_key, recovered_status) = recovered
+        .records
         .into_iter()
         .find(|(_, s)| s.id == id)
         .expect("the seeded row must come back from recover()");
@@ -377,7 +382,7 @@ async fn a_row_left_running_recovers_as_failed_and_is_rehydrated_into_the_regist
         .unwrap_or_default()
         .contains("restarted"));
 
-    operations::rehydrate(vec![(recovered_key, recovered_status)]);
+    operations::rehydrate(vec![(recovered_key, recovered_status)], Vec::new());
     let found = operations::lookup(&id).expect("rehydrate must make it fetchable again");
     assert_eq!(found.status().state, OperationState::Failed);
     assert!(found.status().is_terminal());

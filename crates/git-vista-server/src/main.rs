@@ -233,13 +233,22 @@ async fn main() {
     // registry is repopulated, so `GET /api/operations/{id}` and idempotency
     // replay both keep working for operations admitted before this restart.
     let recovered = durable::recover().await;
-    if !recovered.is_empty() {
+    if !recovered.records.is_empty() {
         println!(
             "git-vista: {} operation(s) reloaded from the journal",
-            recovered.len()
+            recovered.records.len()
         );
     }
-    operations::rehydrate(recovered);
+    // #509: rows written by a build that understood an operation this one
+    // does not. Their keys are guarded against reuse; the rows themselves
+    // surface in the Recovery Center's history.
+    if !recovered.incompatible.is_empty() {
+        println!(
+            "git-vista: {} journal row(s) from an incompatible build; their keys are reserved",
+            recovered.incompatible.len()
+        );
+    }
+    operations::rehydrate(recovered.records, recovered.incompatible);
 
     // Warn early if the SPA hasn't been built — otherwise every page is a 404
     // and it looks like the server is broken.

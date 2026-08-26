@@ -129,7 +129,55 @@ test.describe.serial('the stash drawer', () => {
     const drawer = await openDrawer(page)
 
     // The conflicting entry is the newest, so its row's Pop is the first one.
-    await drawer.getByRole('button', { name: 'Pop', exact: true }).first().click()
+    const popButton = drawer.getByRole('button', { name: 'Pop', exact: true }).first()
+
+    // --- The confirmation gate (#525) ---------------------------------------
+    //
+    // Pop is destructive, so `core::ceremony` returns `Ceremony::Confirm` and
+    // the view raises a native `confirm()` before it dispatches anything.
+    // Playwright DISMISSES every dialog when no listener is registered — its
+    // own types say so verbatim: "When no page.on('dialog') or
+    // browserContext.on('dialog') listeners are present, all dialogs are
+    // automatically dismissed" — which turns that confirm into `false`, so
+    // without the handlers below this test can never reach its own subject.
+    //
+    // Handling it here is also the ONLY proof that the wasm view consults the
+    // gate at all. `ceremony`'s mapping is host-tested in core, but view.rs is
+    // `cfg(target_arch = "wasm32")` and `cargo test` never compiles it — the
+    // exact core-proven/consumer-unproven shape this spec's header is about.
+    // So both directions are asserted: decline first, then accept. Deleting
+    // the gate from view.rs turns the decline leg red.
+
+    // DECLINE. The dialog must appear, must say what a pop actually costs,
+    // and cancelling it must dispatch nothing.
+    const declined = new Promise((resolve) => {
+      page.once('dialog', async (d) => {
+        const message = d.message()
+        await d.dismiss()
+        resolve(message)
+      })
+    })
+    await popButton.click()
+    expect(await declined).toMatch(/only if the apply is verified clean/)
+
+    // Nothing may have been sent. `drawer.begin()` writes the busy label
+    // synchronously on dispatch, so a bypassed gate would already be on
+    // screen; the settle window is what makes this a real negative instead of
+    // a race the assertion always wins.
+    await page.waitForTimeout(1000)
+    await expect(drawer.getByText(/popping/)).toHaveCount(0)
+    await expect(drawer.getByText(/NOT popped/)).toHaveCount(0)
+
+    // ACCEPT. The same click, confirmed this time, and the pop actually runs.
+    const accepted = new Promise((resolve) => {
+      page.once('dialog', async (d) => {
+        const message = d.message()
+        await d.accept()
+        resolve(message)
+      })
+    })
+    await popButton.click()
+    expect(await accepted).toMatch(/^Pop stash@\{\d+\}\?/)
 
     // The notice. `git stash apply` on this entry exits 1 with the conflict
     // markers already written, so the composed pop halts at the gate and the
