@@ -44,6 +44,7 @@ use crate::features::graph::core::{
 use crate::features::operations::core::OperationsCore;
 use crate::features::operations::signals::Operations;
 use crate::features::operations::view::operations_status_view;
+use crate::features::session::core::seed_error_status_copy;
 use crate::features::session::core::seed_retry_attempts_for;
 use crate::features::session::core::seed_retry_delay_ms;
 use crate::features::session::core::session_retry_delay_ms;
@@ -198,29 +199,6 @@ async fn seed_for_epoch(epoch: u64) -> Result<HistorySeed, HistorySeedError> {
         frame,
         loaded,
     })
-}
-
-/// What the SeedError status line says, bound to whether the bounded
-/// automatic retry (the effect keyed on `HistoryPhase::SeedError` in [`App`])
-/// is still running for this failure chain.
-///
-/// One function, literal words per state, so the sentence cannot drift from
-/// the mechanism: a line that always read the same way would claim a dead end
-/// while a retry was already scheduled, and stay silent about the moment the
-/// budget ran out — the state where the user genuinely is the only recovery
-/// left. The honest home for this mapping is a host-tested sibling of
-/// `head_notice` (`mod app` is wasm-only, so nothing here reaches
-/// `cargo test`), but that takes a new module declared in `main.rs`; until
-/// then the words at least live in one place instead of inline markup.
-fn seed_error_status_copy(message: &str, auto_retry_pending: bool) -> String {
-    if auto_retry_pending {
-        format!("Failed to load history: {message} — retrying automatically…")
-    } else {
-        format!(
-            "Failed to load history: {message} — automatic retries stopped; \
-             use Retry or Refresh to try again."
-        )
-    }
 }
 
 #[component]

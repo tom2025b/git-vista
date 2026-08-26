@@ -767,9 +767,10 @@ fn admits_it_could_not_read_the_refs(event: &ActivityEvent) -> bool {
 /// same path. That bounds drift **within** a batch to zero; it says nothing
 /// about the **absolute** gap between git's reflog line and that one shared
 /// moment. The timestamp is sampled only after the post-fetch re-read of
-/// every remote-tracking ref (`planner::fetch::run_fetch`), a listing whose
-/// own cost was measured to grow with ref count (the 527 KiB/1.1s vs. 14
-/// MiB/27.6s numbers above) — a large enough namespace or slow enough
+/// every remote-tracking ref (`planner::fetch::run_fetch` calling
+/// `planner::transfer::remote_tracking_refs`) — one `git for-each-ref` whose
+/// cost plausibly scales with the size of the ref namespace but **has never
+/// been measured**. A large enough namespace or slow enough
 /// storage could in principle push that re-read, and so the whole batch's
 /// shared moment, past [`JOURNAL_MATCH_SLACK`] of the reflog lines it needs
 /// to match. Batching would not save it: every entry in the batch would miss
@@ -1726,9 +1727,11 @@ mod tests {
     /// writer, cannot reach this code path at all. It does **not** rule out
     /// the whole batch's one shared timestamp landing more than
     /// [`JOURNAL_MATCH_SLACK`] after the reflog lines it is meant to match —
-    /// that gap is set by however long the post-fetch ref re-read takes
-    /// before the timestamp is sampled (`handlers::journal_app_events`),
-    /// which grows with ref count and is unbounded on a large enough remote.
+    /// that gap is set by however long the post-fetch ref re-read
+    /// (`planner::transfer::remote_tracking_refs`) takes before the
+    /// timestamp is sampled (`handlers::journal_app_events`). That re-read
+    /// is one `git for-each-ref`, so its cost plausibly scales with the ref
+    /// namespace — but that is reasoning, not a measurement, and none exists.
     /// Whether it is ever actually crossed has not been measured (#522); if
     /// it is, every entry in the batch drifts together and the fold counts
     /// 2N, the same symptom this test pins in a different shape.

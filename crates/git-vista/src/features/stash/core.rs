@@ -901,11 +901,32 @@ impl PopVerdict {
     /// unobserved, and a `bool` would have to guess — the same shape of lie
     /// `TreeState` removed in #508. `Some(true)` is still provable for every
     /// pre-drop halt (an apply never consumes the entry, ran or not).
+    /// # No wildcard, deliberately (#531)
+    ///
+    /// This match used to end `_ => Some(true)`, and that arm defaulted a NEW
+    /// variant into the confident claim "the entry is still there" — the exact
+    /// shape of lie #515 removed, inherited silently by whoever added the
+    /// variant. Its sibling [`PopVerdict::tree`] lists all eight explicitly,
+    /// and [`PopVerdict::is_complete`] wildcards toward `false`, the safe
+    /// direction; this was the one place a wildcard defaulted to an
+    /// affirmative. Listing every variant makes the next one a compile error
+    /// here — in the mechanism, not only in its test's mirror.
     pub fn entry_retained(&self) -> Option<bool> {
         match self {
+            // The pop completed: apply landed and the drop was confirmed.
             PopVerdict::Popped => Some(false),
+            // Halted after the drop was sent, with the reply lost — whether
+            // the entry survived is precisely what nobody observed.
             PopVerdict::DropUnknown { .. } => None,
-            _ => Some(true),
+            // Every remaining verdict halted BEFORE the drop was sent, and an
+            // apply never consumes the entry whether it ran or not — so the
+            // entry is provably still in the drawer.
+            PopVerdict::ApplyRefused { .. }
+            | PopVerdict::Conflicted { .. }
+            | PopVerdict::AppliedUnverified { .. }
+            | PopVerdict::RefusedUnverified { .. }
+            | PopVerdict::AppliedNotDropped { .. }
+            | PopVerdict::ApplyUnknown { .. } => Some(true),
         }
     }
 
@@ -1450,6 +1471,14 @@ mod tests {
     /// an honest third answer and is admitted; each variant's exact answer
     /// is then pinned as a literal so `None` cannot quietly spread to the
     /// variants that CAN prove retention.
+    ///
+    /// **The literal per-variant table is the load-bearing half; the
+    /// `assert_ne!` loop above it is the readable summary.** They are not
+    /// redundant, and the table must not be deleted as though it were: on its
+    /// own the loop permits `None` for every variant, including the six that
+    /// can prove retention. Mutations 1 and 2 below never turned the table
+    /// red — it took a third, deliberately chosen mutation to exercise it,
+    /// which is exactly how an inert assertion hides.
     ///
     /// The completeness check is an exhaustive match rather than a length
     /// literal: the old `assert_eq!(all.len(), 7)` stayed green after #515
