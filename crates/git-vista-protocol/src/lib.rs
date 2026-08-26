@@ -72,6 +72,7 @@ pub mod patch_plan;
 pub mod plan;
 pub mod status;
 pub mod version;
+pub mod worktree_census;
 
 pub use conflict::{
     ConflictSource, ConflictedFile, ContentResolutionRefused, Continuation, NotTextResolvable,
@@ -122,4 +123,8 @@ pub use version::{
     check_compatibility, parse_protocol_header, Compatibility, ProtocolInfo, CSRF_HEADER,
     IDEMPOTENCY_HEADER, MAX_CLIENT_PROTOCOL, MIN_CLIENT_PROTOCOL, OPERATION_HEADER,
     PROTOCOL_HEADER, PROTOCOL_QUERY, PROTOCOL_VERSION, REQUEST_ID_HEADER,
+};
+pub use worktree_census::{
+    parse_worktree_list_porcelain_z, Serviceable, WorktreeCensus, WorktreeListParseError,
+    WorktreeListRecord, WorktreeSibling,
 };

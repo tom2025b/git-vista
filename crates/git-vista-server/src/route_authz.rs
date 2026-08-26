@@ -85,6 +85,12 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     // badges already carry — never working-tree contents, which is the line
     // ADR 0005 draws for what the LAN router may see.
     ("/api/tags", Method::GET, Authz::SessionRequired),
+    // M11 (#546): the worktree census. Same posture as `/api/tags` just
+    // above — not full_routes-gated, since it discloses which branch is
+    // checked out in which sibling worktree, not working-tree contents; a
+    // sibling's path is withheld unless the operator opted into
+    // `GIT_VISTA_EXPOSE_PATHS`.
+    ("/api/worktrees", Method::GET, Authz::SessionRequired),
     ("/api/activity", Method::GET, Authz::SessionRequired),
     ("/api/undoables/{id}", Method::GET, Authz::SessionRequired),
     ("/api/rebase-status", Method::GET, Authz::SessionRequired),
@@ -292,7 +298,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// dropped by a `main.rs` refactor that this scanner's pattern-matching
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
-const EXPECTED_ROUTE_COUNT: usize = 67;
+const EXPECTED_ROUTE_COUNT: usize = 68;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in

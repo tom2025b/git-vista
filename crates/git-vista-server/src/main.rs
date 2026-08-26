@@ -461,6 +461,14 @@ fn api_router(
         // committed, published history like `/api/frame`, so it is registered
         // on the LAN router too; it never discloses working-tree state.
         .route("/api/tags", get(handlers::tags::tag_list))
+        // M11 (#546): every linked worktree sibling of the repository, from
+        // `git worktree list --porcelain -z`. A read like `/api/status` (it
+        // resolves the process-wide `?repo=` selection live), registered on
+        // both listeners like `/api/catalog`/`/api/tags` above: it discloses
+        // which branch is checked out where, not any working-tree content,
+        // and a sibling's path is withheld unless the operator already opted
+        // into `GIT_VISTA_EXPOSE_PATHS`.
+        .route("/api/worktrees", get(handlers::worktrees::worktree_list))
         // M3.24 (#77): a read, so the LAN router sees it like every other
         // listing. Showing the drawer is useful before any write path exists.
         .route("/api/stashes", get(handlers::stash::stash_list))

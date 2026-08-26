@@ -32,6 +32,10 @@
 //! validates its request, builds one typed `GitOperation` (#142), and hands it
 //! to [`crate::planner`], which builds/validates/executes the reviewable Plan.
 //!
+//!   * [`worktrees`] — `GET /api/worktrees` (M11, #546): the worktree census,
+//!     every linked worktree sibling of a repository from
+//!     `git worktree list --porcelain -z`.
+//!
 //! [`journal_app_event`] lives here because the write handlers across several of
 //! those submodules all record their successful operation the same way; the undo
 //! handler in [`crate::activity`] records through it too, so it's `pub(crate)`.
@@ -70,6 +74,8 @@ pub(crate) mod stash;
 pub(crate) mod tags;
 // M1.04 (#57): establish / check / revoke a loopback session.
 pub(crate) mod session;
+// M11 (#546): `GET /api/worktrees`, the worktree census.
+pub(crate) mod worktrees;
 
 /// One entry of a batched app journal write: exactly the five fields
 /// [`journal_app_event`] takes, minus the repository they are written to.
