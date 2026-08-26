@@ -93,6 +93,19 @@ Real gpg emits one sig-level line per signature, so on real input the ordering
 is unobservable — which is precisely why it is pinned by a test against a
 literal rather than left to a fixture that can never exercise it.
 
+**And why that pin has to be exhaustive over orderings, not illustrative.** The
+first version of the ordering test hand-picked five pairs and wrote each with
+the milder keyword first, which defends against a first-match-wins reducer and
+nothing else. An outside review (codex, 2026-08-26) showed by simulation that a
+reducer regressing to last-line-wins passes all five, while `BADSIG` followed by
+`REVKEYSIG` returns `Revoked` — a **forged** signature downgraded to a softer
+verdict, the single outcome this classifier exists to make impossible. The
+production reducer was correct throughout; the proof was half a proof. The test
+now generates every ordered pair of distinct table entries and requires the
+stronger to win in *both* orders, with an anti-vacuity assertion on the table's
+width, because a hand-written list can be complete today and silently partial
+after the next keyword lands.
+
 `NO_PUBKEY` stays *below* `GOODSIG`, preserving pre-#335 behaviour: a run that
 produced a good signature has answered the question even if some other key in
 the same run was missing.
@@ -248,6 +261,12 @@ badge is the first candidate to take it and the capitals should go.
 - Mutation-proved twice: reverting `REVKEYSIG` to the fallthrough, and swapping
   the two expiry rows of the precedence table. Each is red at a different
   assertion, and the restore is byte-identical. Evidence in the PR body.
+- The ordering contract is mutation-proved in both directions after the review
+  finding above: `verdict = Some(rank)` (last-line-wins) is red on
+  "`BADSIG` must outrank `REVKEYSIG` when it comes FIRST", and
+  `verdict = verdict.or(Some(rank))` (first-line-wins) is red on the same pair
+  "when it comes SECOND". Neither mutation is caught by both halves, which is
+  the reason both orders are asserted rather than one.
 - `cargo fmt --all`; clippy clean at `-D warnings` on both the native and the
   `wasm32-unknown-unknown` targets.
 - **The browser leg has not been run.** This change touches the tag band's
