@@ -30,3 +30,12 @@ git-vista-core = { workspace = true }
 git-vista-protocol = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# #450's `lesson.rs` tests: a real repository built by real `git`, so
+# `get_lesson`'s fidelity is proven against genuine on-disk state and not
+# just against hand-typed JSON. Dev-only, both directions — `git-vista-fixtures`
+# itself never depends on `git-vista-server` (see its own Cargo.toml), so this
+# does not touch `tests/no_write_dependency.rs`'s guarantee, which walks the
+# whole resolved graph, dev-dependencies included.
+git-vista-fixtures = { workspace = true }

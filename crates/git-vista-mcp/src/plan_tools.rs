@@ -727,7 +727,13 @@ pub(crate) fn call_plan_tool(
 /// forbids) would satisfy `operation_for` and be refused *here*, before any
 /// request exists, because `exposure_of` still classifies it `Excluded`. A
 /// dispatch arm wired to the wrong variant is caught the same way.
-fn check_exposure(name: &str, op: &GitOperation) -> Result<(), ToolError> {
+///
+/// `pub(crate)` since #450: `lesson::call` builds an operation through
+/// [`operation_for`] the same way a `plan_*` tool does, and must pass it
+/// through this same second lock — otherwise `get_lesson` would be a second,
+/// unguarded door onto whatever `operation_for` ever gains a dispatch arm for
+/// in the future, bypassing the exclusion this function exists to enforce.
+pub(crate) fn check_exposure(name: &str, op: &GitOperation) -> Result<(), ToolError> {
     match exposure_of(op) {
         Exposure::Tool(expected) if expected == name => Ok(()),
         Exposure::Tool(other) => Err(ToolError::Execution(format!(
@@ -758,19 +764,41 @@ pub(crate) fn call_plan_tool_live(
     )
 }
 
+/// `POST` `op` to [`PLAN_ENDPOINT`] and return the typed [`Plan`] the server
+/// answered with — the same request every `plan_*` tool makes, minus the
+/// `{"plan": …, "review": …}` envelope [`build_plan`] wraps it in.
+///
+/// `pub(crate)` since #450: `lesson::call` needs the `Plan` itself (to call
+/// `git_vista_protocol::explain` on), not the review digest, but it must
+/// still be the server's own answer, not a plan reconstructed locally from
+/// `op` — a lesson about state the repository does not actually carry is
+/// exactly the invention #450's own acceptance criterion forbids. Routing
+/// both this function and [`build_plan`] through the identical POST is what
+/// keeps that true for both callers by construction rather than by
+/// convention: there is no second code path that could drift from what the
+/// server actually decided.
+pub(crate) fn build_plan_typed(
+    op: GitOperation,
+    session: &mut Option<Session>,
+    post: &mut PostFn<'_>,
+    authenticate: &mut dyn FnMut() -> Result<Session, String>,
+) -> Result<Plan, ToolError> {
+    let body = serde_json::to_vec(&op)
+        .map_err(|e| ToolError::Execution(format!("could not encode the operation: {e}")))?;
+    let raw = crate::tools::authed_post(PLAN_ENDPOINT, &body, session, post, authenticate)
+        .map_err(ToolError::Execution)?;
+    serde_json::from_slice(&raw).map_err(|e| {
+        ToolError::Execution(format!("{PLAN_ENDPOINT} did not return a valid Plan: {e}"))
+    })
+}
+
 fn build_plan(
     op: GitOperation,
     session: &mut Option<Session>,
     post: &mut PostFn<'_>,
     authenticate: &mut dyn FnMut() -> Result<Session, String>,
 ) -> Result<serde_json::Value, ToolError> {
-    let body = serde_json::to_vec(&op)
-        .map_err(|e| ToolError::Execution(format!("could not encode the operation: {e}")))?;
-    let raw = crate::tools::authed_post(PLAN_ENDPOINT, &body, session, post, authenticate)
-        .map_err(ToolError::Execution)?;
-    let plan: Plan = serde_json::from_slice(&raw).map_err(|e| {
-        ToolError::Execution(format!("{PLAN_ENDPOINT} did not return a valid Plan: {e}"))
-    })?;
+    let plan = build_plan_typed(op, session, post, authenticate)?;
     let plan_json = serde_json::to_value(&plan)
         .map_err(|e| ToolError::Execution(format!("could not re-encode the plan: {e}")))?;
     Ok(serde_json::json!({

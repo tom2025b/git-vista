@@ -950,6 +950,7 @@ name = "git-vista-mcp"
 version = "0.2.0"
 dependencies = [
  "git-vista-core",
+ "git-vista-fixtures",
  "git-vista-protocol",
  "serde",
  "serde_json",

@@ -7,6 +7,14 @@
 //! wire types verbatim — no ad hoc reshaping. See each tool's doc comment
 //! below for exactly which DTO it carries and why.
 //!
+//! `get_lesson` (#450, [`crate::lesson`]) joins this prefix too. It is not a
+//! seventh verbatim DTO round-trip — it builds a plan through the same
+//! `/api/plan` endpoint `plan_*` tools use and re-expresses the result as a
+//! structured teaching document — but it belongs beside the reads rather
+//! than among the `plan_*`/`execute_plan` tools below: it neither adds a
+//! `plan_<operation>` name to that one-tool-per-mutation table nor executes
+//! anything.
+//!
 //! # Why this crate may depend on `git-vista-core` but never `git-vista-server`
 //!
 //! `git-vista-protocol`'s paged-history envelopes ([`git_vista_protocol::HistoryFrame`],
@@ -57,16 +65,18 @@ pub enum ToolError {
 }
 
 /// The catalog of tools this bridge advertises to `tools/list` — the
-/// read-only surface here, then M2.23d's (#248) `plan_*` build-only tools
-/// appended from [`crate::plan_tools`].
+/// read-only surface here, then `get_lesson` (#450, [`crate::lesson`]), then
+/// M2.23d's (#248) `plan_*` build-only tools appended from
+/// [`crate::plan_tools`].
 pub fn tool_catalog() -> serde_json::Value {
     let mut catalog = read_tool_catalog();
     let array = catalog
         .as_array_mut()
         .expect("the read catalog is a JSON array");
+    array.extend(crate::lesson::lesson_tool_catalog());
     array.extend(crate::plan_tools::plan_tool_catalog());
     // M2.23e (#249): the one write tool, appended last so it is always the
-    // catalog's final entry — see `tools::tests::the_tool_catalog_lists_exactly_the_six_read_tools`.
+    // catalog's final entry — see `tools::tests::the_tool_catalog_lists_exactly_the_read_and_lesson_tools`.
     array.extend(crate::execute_tool::execute_tool_catalog());
     catalog
 }
@@ -350,6 +360,11 @@ pub fn call_tool(
             let path = format!("/api/activity{qs}");
             get_json::<Vec<git_vista_core::activity::ActivityEvent>>(&path, session)
         }
+        // #450: build a plan exactly the way the named plan_* tool would (the
+        // same POST /api/plan, through the same two locks), then explain the
+        // plan the server actually returned. See `lesson.rs`'s module doc for
+        // why this is not simply a local transform of a caller-supplied plan.
+        "get_lesson" => crate::lesson::call_live(arguments, session),
         // M2.23d (#248): the `plan_*` build-only surface, then M2.23e (#249)'s
         // one write tool. Tried *after* the read tools and before the
         // unknown-tool refusal, so neither can shadow a read tool's name, and
@@ -705,12 +720,13 @@ mod tests {
     }
 
     #[test]
-    fn the_tool_catalog_lists_exactly_the_six_read_tools() {
+    fn the_tool_catalog_lists_exactly_the_read_and_lesson_tools() {
         // #248 appended the `plan_*` surface after these, so the read tools
-        // are now a *prefix* of the catalog rather than the whole of it —
-        // still pinned in order, and still pinned to exactly these names, so
-        // a read tool silently added, removed or renamed fails here as
-        // before. `plan_tools`'s own census owns the rest of the catalog.
+        // (plus #450's `get_lesson`) are now a *prefix* of the catalog rather
+        // than the whole of it — still pinned in order, and still pinned to
+        // exactly these names, so a read tool silently added, removed or
+        // renamed fails here as before. `plan_tools`'s own census owns the
+        // rest of the catalog.
         let cat = tool_catalog();
         let names: Vec<&str> = cat
             .as_array()
@@ -726,6 +742,7 @@ mod tests {
             "get_commit_diff",
             "get_status",
             "get_activity",
+            "get_lesson",
         ];
         assert_eq!(names[..expected_reads.len()], expected_reads);
         // M2.23e (#249) appended exactly one write tool, `execute_plan`, as
