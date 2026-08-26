@@ -43,23 +43,38 @@ deliverables:
 
 ## The defect (found by adversarial review of #237, filed as #335)
 
-`classify_verify_tag_output` (`crates/git-vista-server/src/handlers/tags.rs`)
-maps gpg status lines onto `SignatureStatus` — five variants: `Unsigned`,
-`Valid`, `Invalid`, `UnknownKey`, `Unverifiable`. Two real outcomes have
-nowhere to go:
+`classify_verify_tag_output` (`crates/git-vista-server/src/handlers/tags.rs:598`)
+maps gpg status lines onto `SignatureStatus`
+(`crates/git-vista-protocol/src/dto.rs:1194`) — five variants: `Unsigned`,
+`Valid`, `Invalid`, `UnknownKey`, `Unverifiable`.
 
-| gpg status | Meaning | Today reports |
-|---|---|---|
-| `EXPKEYSIG` | crypto passed; signing key has since expired | `Valid` |
-| `EXPSIG` | crypto passed; the signature itself expired | `Valid` |
-| `REVKEYSIG` | signature by a REVOKED key — often compromise | `Unverifiable` (unhandled fallthrough) |
+**Correction to the issue text, verified against `405a7644` — read this
+before you start, the two cases are NOT the same shape:**
 
-An expired key reading identically to a live trusted signature, and a
-revoked key reading as a shrug, are both honesty defects in a surface whose
-whole point is stating what the crypto actually said.
+| gpg status | Meaning | Today reports | Handled? |
+|---|---|---|---|
+| `EXPKEYSIG` | crypto passed; signing key has since expired | `Valid` | **deliberately** — `tags.rs:613` maps it alongside `GOODSIG` |
+| `EXPSIG` | crypto passed; the signature itself expired | `Valid` | **deliberately** — same arm |
+| `REVKEYSIG` | signature by a REVOKED key — often compromise | `Unverifiable` | **no** — genuinely absent from the file; reaches the no-recognised-line fallthrough |
 
-Re-verify the classifier and the enum against your checkout before building
-— variants or wording may have moved since the issue was filed.
+The issue says all three "have nowhere to go". That is true only of
+`REVKEYSIG`. The two expired statuses are *consciously* folded into the
+`GOODSIG` arm at `tags.rs:613`, and the comment above it at **`:608-612`**
+states the reasoning: the cryptographic check itself passed (gpg emits them
+exactly where it would emit `GOODSIG`), and there is no variant for
+"passed, but expired", so it reports the same fact `GOODSIG` does.
+
+**This changes your job in two ways:**
+- That comment becomes FALSE the moment you add the variants. Replacing it
+  with one that states the new mapping is part of the work, not a nicety —
+  a stale rationale is how the next reader concludes the fold was
+  accidental.
+- `REVKEYSIG` is a true fallthrough and is the more serious half: a revoked
+  key reading as a generic "could not check" is the one case where the
+  honest answer is closer to alarm than to a shrug.
+
+Re-verify all of the above against your own checkout before building —
+these citations were checked on 2026-08-26 and can drift.
 
 ## The job
 
@@ -71,8 +86,13 @@ Re-verify the classifier and the enum against your checkout before building
    docs prescribe (read how #506's v7 bump was done and match it — including
    whether a bump is required for an additive enum variant, which the
    protocol docs answer; do not guess).
-2. **Classify the three gpg statuses** in `classify_verify_tag_output`,
-   killing the `REVKEYSIG` fallthrough explicitly.
+2. **Classify the three gpg statuses** in `classify_verify_tag_output`: split
+   `EXPKEYSIG`/`EXPSIG` out of the `GOODSIG` arm at `:613`, kill the
+   `REVKEYSIG` fallthrough explicitly, and **rewrite the `:608-612` rationale
+   comment** so it describes the mapping that now exists rather than the one
+   it replaced. Preserve the `BADSIG`-outranks-everything precedence the
+   surrounding doc comment (`:586-596`) argues for — a revoked-key line must
+   not be able to downgrade a `BADSIG`, exactly as `NO_PUBKEY` cannot today.
 3. **Frontend tag band**: display the new statuses with wording that says
    what happened — "signed, key since expired" is information; "expired" is
    ambiguity. Revoked reads as a warning, not a shrug. Touch ONLY the
