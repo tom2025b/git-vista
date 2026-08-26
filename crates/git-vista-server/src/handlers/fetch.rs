@@ -99,7 +99,41 @@ fn refusal(message: &str) -> (StatusCode, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use git_vista_fixtures::{git, seeded};
     use git_vista_protocol::FetchError;
+
+    /// A real configured local remote whose upload-pack reports an over-cap
+    /// failure. The script sits inside the served repository so the remote
+    /// sandbox can read it without widening the grant.
+    fn repo_with_oversized_fetch_failure() -> (tempfile::TempDir, std::path::PathBuf) {
+        let (dir, repo) = seeded();
+        let remote = repo.join("upstream.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        git::run(&remote, &["init", "-q", "--bare", "-b", "main"]);
+        git::run(
+            &repo,
+            &["remote", "add", "origin", &remote.display().to_string()],
+        );
+
+        let script = repo.join("oversized-upload-pack.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s' '{}' >&2\nexit 3\n",
+                "x".repeat(crate::middleware::MAX_ERROR_BODY + 8 * 1024)
+            ),
+        )
+        .unwrap();
+        git::run(
+            &repo,
+            &[
+                "config",
+                "remote.origin.uploadpack",
+                &format!("sh {}", script.display()),
+            ],
+        );
+        (dir, repo)
+    }
 
     /// Every refusal the shape gate makes is parseable as the endpoint's one
     /// error type — the property a client depends on, asserted by parsing
@@ -117,6 +151,133 @@ mod tests {
                 "a request refused before planning cannot have moved a ref"
             );
         }
+    }
+
+    /// **The refusal at the wire** (#336): through a real `Router`, the real
+    /// `api_contract` middleware and the real handler, a `/api/fetch` refusal
+    /// reaches the client as a **bare** [`FetchError`] — not dug out of an
+    /// `ApiError` envelope's `message` field.
+    ///
+    /// The test above proves what `validate_remote` *returns*; nothing proved
+    /// what a client *receives*, and those are different questions. This route
+    /// hand-serializes its typed DTO into the shared `(StatusCode, String)`
+    /// channel, which axum stamps `text/plain`, so the only thing that keeps
+    /// the DTO intact on the wire is `middleware::rewrap_error`'s byte sniff
+    /// (#323) — one general mechanism with no route-local layer behind it
+    /// (`/api/amend-commit` had one until #336; ADR 0084). Remove or narrow
+    /// that sniff and this goes red at `bare()` below, which is the point: the
+    /// incidental coverage is now deliberate.
+    ///
+    /// The second leg is what stops the first from being satisfiable by a
+    /// middleware that labeled *everything* JSON: the read-only refusal on the
+    /// same route is prose, and must still arrive as a proper envelope.
+    #[tokio::test]
+    async fn a_refusal_reaches_the_client_as_a_bare_fetch_error_through_a_real_router() {
+        crate::state::with_isolated_test_current(async {
+            use axum::body::{to_bytes, Body};
+            use axum::http::{header, Request};
+            use axum::routing::post;
+            use axum::Router;
+            use git_vista_protocol::{ApiError, RepoMode, PROTOCOL_HEADER, PROTOCOL_VERSION};
+            use tower::ServiceExt;
+
+            let router = Router::new()
+                .route("/api/fetch", post(fetch_remote))
+                .layer(axum::middleware::from_fn(crate::middleware::idempotency))
+                .layer(axum::middleware::from_fn(crate::middleware::api_contract));
+
+            async fn post_body(
+                router: &Router,
+                body: &'static str,
+            ) -> (StatusCode, String, String) {
+                let resp = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/fetch")
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
+                            .header(
+                                git_vista_protocol::IDEMPOTENCY_HEADER,
+                                "fetch-over-cap-proof",
+                            )
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let content_type = resp
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                let bytes = to_bytes(resp.into_body(), 8 * 1024 * 1024).await.unwrap();
+                (
+                    status,
+                    content_type,
+                    String::from_utf8_lossy(&bytes).into_owned(),
+                )
+            }
+
+            /// The endpoint's own error body — parsed directly, **not** dug out
+            /// of an `ApiError` envelope.
+            fn bare(raw: &str) -> FetchError {
+                serde_json::from_str(raw).unwrap_or_else(|e| {
+                    panic!(
+                        "body was not a bare FetchError: {e}; {} bytes, starting {:?}",
+                        raw.len(),
+                        &raw[..raw.len().min(120)]
+                    )
+                })
+            }
+
+            // Leg 1: the endpoint's own typed failure, deliberately over the
+            // middleware cap. A below-cap body catches removal of the sniff,
+            // but stays green if the general mechanism is narrowed to refuse
+            // classification whenever a remainder exists.
+            let (_dir, repo) = repo_with_oversized_fetch_failure();
+            crate::state::set_current(&repo, RepoMode::Active);
+            let (status, content_type, raw) = post_body(&router, r#"{"remote":"origin"}"#).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{raw}");
+            assert!(
+                raw.len() > crate::middleware::MAX_ERROR_BODY,
+                "the fetch fixture must actually exceed the middleware cap: {} bytes, body={raw}",
+                raw.len(),
+            );
+            assert!(
+                content_type.starts_with("application/json"),
+                "a typed refusal must reach the client labeled JSON: {content_type:?}"
+            );
+            let error = bare(&raw);
+            assert_eq!(error.kind, FetchFailureKind::Other, "{raw}");
+            assert!(
+                error.updated_refs.is_empty(),
+                "a request refused before planning cannot have moved a ref"
+            );
+            assert!(
+                !raw.contains("\\\"kind\\\""),
+                "the DTO was escaped into an outer envelope's string field — \
+                 double-encoded: {raw}"
+            );
+
+            // Leg 2: the paired negative. The read-only refusal on this same
+            // route is prose, and must arrive as a proper `ApiError` envelope —
+            // so leg 1 cannot be satisfied by labeling every body JSON.
+            crate::state::set_current(&repo, RepoMode::Visualize);
+            let (status, _, raw) = post_body(&router, r#"{"remote":"origin"}"#).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{raw}");
+            let enveloped: ApiError = serde_json::from_str(&raw)
+                .unwrap_or_else(|e| panic!("a prose refusal must still be enveloped ({e}): {raw}"));
+            assert!(
+                enveloped.error.message.contains("Visualize"),
+                "the envelope must carry what the server said: {}",
+                enveloped.error.message
+            );
+        })
+        .await;
     }
 
     /// The paired positive: ordinary remote names pass, and pass *as

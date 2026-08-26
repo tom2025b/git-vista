@@ -32,6 +32,18 @@ git-vista-git = { workspace = true }
 # per-process random key, so a cursor can't be forged and dies with a restart.
 # digest-0.10-compatible, pairing with the existing `sha2` dependency below.
 hmac = "0.12"
+# Frame-level access to a response body (`BodyExt::frame`) for the middleware's
+# error-rewrap sniff (#336): it reads a *bounded* prefix to classify the body
+# and hands the unread remainder back for forwarding, instead of `to_bytes`'
+# all-or-nothing collect that discards a body larger than the cap. Already in
+# the tree as axum's own dependency; declared directly because this crate now
+# names the trait itself.
+# `Body::size_hint` — how the middleware tells a complete in-memory response
+# body from a live stream without polling it (#336). The `content-length` header
+# does not exist yet at the layer level, so the body's own exact size is the only
+# honest signal. Already in the tree as axum's own dependency.
+http-body = "1"
+http-body-util = "0.1"
 # Landlock + prctl raw syscalls for the M1.13b (#66) sandbox shim
 # (`gv-sandbox`). Reviewed kernel-ABI dependency — see docs/NATIVE_DEPENDENCIES.md.
 libc = { workspace = true }

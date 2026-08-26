@@ -19,13 +19,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::{
-    body::to_bytes,
+    body::{Body, Bytes},
     extract::Request,
     http::{header, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
+use http_body::{Body as HttpBody, Frame};
+use http_body_util::{BodyExt, StreamBody};
 
 use git_vista_protocol::{
     check_compatibility, parse_protocol_header, ApiError, ErrorCode, IdempotencyKey, OperationId,
@@ -37,10 +39,16 @@ use git_vista_protocol::{
 /// precisely to *learn* the protocol, so it cannot be required to already speak it.
 const NEGOTIATION_PATH: &str = "/api/protocol";
 
-/// Upper bound on how much of an error response body we'll buffer to rewrap it.
-/// Error messages are git stderr / short strings; this cap also stops a
-/// pathological body from being buffered whole.
-const MAX_ERROR_BODY: usize = 64 * 1024;
+/// Upper bound on how much of an error response body we hold in memory at once
+/// to classify and rewrap it. Error messages are git stderr / short strings, so
+/// a real refusal is far below this; the cap is what stops a pathological body
+/// from being buffered whole.
+///
+/// It bounds *buffering*, not typed DTO delivery: an over-cap JSON object is
+/// forwarded without ever being held whole (#336). For a plain-text refusal,
+/// unread data is deliberately omitted from the bounded envelope, which says
+/// it was truncated; later transport errors and trailers are still forwarded.
+pub(crate) const MAX_ERROR_BODY: usize = 64 * 1024;
 
 /// Mint a process-unique request id. A monotonic counter is enough to tie a
 /// client-reported id to this run's log line; it needs no randomness (so nothing
@@ -71,7 +79,7 @@ pub(crate) async fn api_contract(request: Request, next: Next) -> Response {
             if response.status().is_client_error() || response.status().is_server_error() {
                 rewrap_error(response, &request_id).await
             } else {
-                response
+                relabel_json_success(response).await
             }
         }
     };
@@ -212,25 +220,69 @@ fn error_envelope(code: ErrorCode, message: String, request_id: &RequestId) -> R
 /// Rewrap a handler's plain-text error response into the [`ApiError`] envelope. A
 /// response already carrying JSON (an envelope we produced, or a handler that
 /// opted in) is passed through untouched, so this never double-wraps.
+///
+/// # Why the body is *split*, not collected
+///
+/// #323's sniff has to look at the bytes (see the long comment below for why
+/// the content-type header cannot answer the question). The obvious way to get
+/// them — `to_bytes(body, MAX_ERROR_BODY)` — is all-or-nothing: it returns
+/// `Err` for a body one byte over the cap and hands back *nothing*, so an
+/// oversized refusal used to arrive at the client as an empty envelope
+/// carrying the status's canonical reason ("Bad Request") and none of what the
+/// server actually said. That is reachable: `git`'s stderr is captured through
+/// `git_cmd::git_output_bounded`'s plain `cmd.output()`, which applies no size
+/// cap at all, so a `pre-commit` hook printing a megabyte of rejection text
+/// becomes a megabyte of `message` inside a typed DTO. JSON escaping only
+/// widens the gap — one control byte of hook output becomes six bytes of
+/// `\uXXXX` — so a body can clear 64 KiB from well under it.
+///
+/// So this reads a **bounded prefix** and keeps the unread remainder as a body
+/// to forward rather than collecting it. Two outcomes:
+///
+/// * the data ended inside the cap — the common case, and the classification
+///   is exact: the full bytes either parse as a JSON object or they don't;
+/// * the body ran past the cap — nothing beyond the prefix is ever held in
+///   memory. A prefix that is the *beginning* of a JSON object (see
+///   [`incomplete_json_object_prefix`]) gets the `application/json` label and
+///   the whole body is streamed on untouched, which is exactly what the client
+///   needs to parse its typed DTO; anything else is prose, and the prefix is
+///   enveloped with an explicit truncation marker. Unread data is omitted,
+///   while any later transport error or trailers frames remain observable.
+///
+/// The memory bound is therefore [`MAX_ERROR_BODY`] plus the one frame that
+/// crossed it — never the body — whatever a hook decides to print.
 async fn rewrap_error(response: Response, request_id: &RequestId) -> Response {
     if is_json(&response) {
         return response;
     }
-    let status = response.status();
-    let bytes = to_bytes(response.into_body(), MAX_ERROR_BODY)
-        .await
-        .unwrap_or_default();
+    let (mut parts, body) = response.into_parts();
+    let status = parts.status;
+    let (head, remainder) = split_at_limit(body, MAX_ERROR_BODY).await;
+    let (rest, complete, overflow) = match remainder {
+        BodyRemainder::End => (None, true, false),
+        BodyRemainder::Overflow(rest) => (Some(rest), false, true),
+        // Trailers end the data portion cleanly. Keep them on the body, but
+        // classify the complete data prefix rather than treating metadata as
+        // a transport failure.
+        BodyRemainder::Trailers(rest) => (Some(rest), true, false),
+        // There is no complete byte body to classify after a transport error
+        // frame. Put the consumed prefix back and preserve the original
+        // response headers and frame semantics.
+        BodyRemainder::Interrupted(rest) => {
+            return Response::from_parts(parts, rejoin(head, Some(rest)));
+        }
+    };
 
     // #323: a handler's own typed error DTO — `AmendCommitError`,
-    // `FetchError`, `PullError` — travels out of `execute()` through the exact
-    // same `(StatusCode, String)` shape a plain-text refusal uses, because
-    // that dispatcher's return type is shared by ~30 operation kinds and can't
-    // vary per handler (see `planner::execute`). Axum's blanket `impl
-    // IntoResponse for String` always stamps `text/plain` (axum-core
-    // `into_response.rs`'s `Cow<'static, str>` impl), so the content-type
-    // header the `is_json` check above relies on can never distinguish a
-    // pre-serialized JSON body from an actual plain-text message here — only
-    // the bytes can. Without this, a body like
+    // `CommitError`, `FetchError`, `PullError`, `SignTagError` — travels out of
+    // `execute()` through the exact same `(StatusCode, String)` shape a
+    // plain-text refusal uses, because that dispatcher's return type is shared
+    // by ~30 operation kinds and can't vary per handler (see
+    // `planner::execute`). Axum's blanket `impl IntoResponse for String` always
+    // stamps `text/plain` (axum-core `into_response.rs`'s `Cow<'static, str>`
+    // impl), so the content-type header the `is_json` check above relies on can
+    // never distinguish a pre-serialized JSON body from an actual plain-text
+    // message here — only the bytes can. Without this, a body like
     // `{"kind":"StaleTip","message":"…"}` was read as plain text and escaped
     // whole into *this* envelope's own `message` field: the client parses the
     // outer `ApiError` fine, then finds literal wire JSON where it expected to
@@ -238,11 +290,23 @@ async fn rewrap_error(response: Response, request_id: &RequestId) -> Response {
     // #316 already fixed once on the frontend. A JSON *object* is unambiguous
     // enough to trust as "already carrying JSON": git's own stderr/stdout text
     // and this server's plain refusal prose never happen to parse as one.
-    if let Ok(serde_json::Value::Object(_)) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-        return (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response();
+    let head_is_json = if !complete {
+        incomplete_json_object_prefix(&head)
+    } else {
+        matches!(
+            serde_json::from_slice::<serde_json::Value>(&head),
+            Ok(serde_json::Value::Object(_))
+        )
+    };
+    if head_is_json {
+        parts.headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        return Response::from_parts(parts, rejoin(head, rest));
     }
 
-    let message = String::from_utf8_lossy(&bytes).trim().to_string();
+    let message = String::from_utf8_lossy(&head).trim().to_string();
     let message = if message.is_empty() {
         status
             .canonical_reason()
@@ -251,12 +315,253 @@ async fn rewrap_error(response: Response, request_id: &RequestId) -> Response {
     } else {
         message
     };
+    // Say so rather than handing the client a sentence that stops mid-word and
+    // reads as the whole of what the server said.
+    let message = if overflow {
+        format!("{message} … (truncated at {MAX_ERROR_BODY} bytes)")
+    } else {
+        message
+    };
     let code = ErrorCode::from_status(status.as_u16());
-    (
+    let mut enveloped = (
         status,
         Json(ApiError::new(code, message, request_id.clone())),
     )
-        .into_response()
+        .into_response();
+    if let Some(rest) = rest {
+        // An over-cap prose suffix is deliberately omitted from the bounded
+        // envelope, but transport failures and trailers later in that suffix
+        // are not data and remain part of the response semantics. For a clean
+        // data prefix followed directly by trailers, retain the whole tail.
+        let tail = if overflow {
+            retain_non_data_frames(rest)
+        } else {
+            rest
+        };
+        let body = std::mem::replace(enveloped.body_mut(), Body::empty());
+        *enveloped.body_mut() = append_body(body, tail);
+    }
+    enveloped
+}
+
+/// Read at most `limit` bytes off `body`, returning that prefix and — only when
+/// the body had more to give — the *unread* remainder, ready to be forwarded.
+///
+/// [`BodyRemainder::Overflow`] is the signal "this body is longer than
+/// `limit`"; it is not a second buffer. Nothing past the frame that crossed
+/// the limit is ever polled here, so the peak allocation is `limit` plus that
+/// one frame regardless of how much the handler had to say. A body that ends
+/// exactly at `limit` reports [`BodyRemainder::End`]: the loop keeps reading
+/// until the frame that overshoots, so
+/// "exactly `limit` bytes" and "more than `limit` bytes" are distinguished by
+/// the reader rather than guessed from the length (the same probe-byte
+/// reasoning `git_cmd::read_to_cap` uses).
+///
+/// A transport error interrupts classification rather than masquerading as
+/// clean EOF. Trailers, by contrast, cleanly finish the data portion and are
+/// carried separately so the complete bytes can still be classified. In both
+/// cases the original frame and unread body are retained for the caller.
+enum BodyRemainder {
+    End,
+    Overflow(Body),
+    Trailers(Body),
+    Interrupted(Body),
+}
+
+async fn split_at_limit(mut body: Body, limit: usize) -> (Bytes, BodyRemainder) {
+    let mut head: Vec<u8> = Vec::new();
+    loop {
+        let Some(frame) = body.frame().await else {
+            return (Bytes::from(head), BodyRemainder::End);
+        };
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(error) => {
+                return (
+                    Bytes::from(head),
+                    BodyRemainder::Interrupted(prepend_frame(Err(error), body)),
+                );
+            }
+        };
+        let data = match frame.into_data() {
+            Ok(data) => data,
+            Err(frame) => {
+                return (
+                    Bytes::from(head),
+                    BodyRemainder::Trailers(prepend_frame(Ok(frame), body)),
+                );
+            }
+        };
+        if head.len() + data.len() <= limit {
+            head.extend_from_slice(&data);
+            continue;
+        }
+        let room = limit - head.len();
+        head.extend_from_slice(&data[..room]);
+        let tail = data.slice(room..);
+        return (
+            Bytes::from(head),
+            BodyRemainder::Overflow(prepend_frame(Ok(Frame::data(tail)), body)),
+        );
+    }
+}
+
+/// Put one already-polled frame back in front of a body without erasing later
+/// errors or trailers. `Body::from_stream` accepts data only; `StreamBody` is
+/// deliberately frame-level.
+fn prepend_frame(first: Result<Frame<Bytes>, axum::Error>, mut rest: Body) -> Body {
+    Body::new(StreamBody::new(async_stream::stream! {
+        yield first;
+        while let Some(frame) = rest.frame().await {
+            yield frame;
+        }
+    }))
+}
+
+/// Put a prefix back in front of the remainder it was split from, so the whole
+/// body is forwarded byte-for-byte. `None` means there was no remainder and the
+/// prefix *is* the body.
+fn rejoin(head: Bytes, rest: Option<Body>) -> Body {
+    match rest {
+        None => Body::from(head),
+        Some(rest) if head.is_empty() => rest,
+        Some(rest) => prepend_frame(Ok(Frame::data(head)), rest),
+    }
+}
+
+/// Concatenate two frame-level bodies without converting either to a data
+/// stream, so errors and trailers retain their original frame semantics.
+fn append_body(mut first: Body, mut second: Body) -> Body {
+    Body::new(StreamBody::new(async_stream::stream! {
+        while let Some(frame) = first.frame().await {
+            yield frame;
+        }
+        while let Some(frame) = second.frame().await {
+            yield frame;
+        }
+    }))
+}
+
+/// Drop only unread data frames from an intentionally truncated prose suffix.
+/// Errors and trailers are transport semantics, not message bytes, and must
+/// still be observed by the client without requiring this layer to drain or
+/// buffer the remainder before returning the response.
+fn retain_non_data_frames(mut body: Body) -> Body {
+    Body::new(StreamBody::new(async_stream::stream! {
+        while let Some(frame) = body.frame().await {
+            match frame {
+                Err(error) => yield Err(error),
+                Ok(frame) => {
+                    if let Err(non_data) = frame.into_data() {
+                        yield Ok(non_data);
+                    }
+                }
+            }
+        }
+    }))
+}
+
+/// Whether `bytes` is the start of a JSON object that was cut off before the
+/// closing brace.
+///
+/// The distinction `serde_json` makes is what carries this: a truncated object
+/// fails with [`serde_json::Error::is_eof`] ("the input ended while more was
+/// expected"), whereas prose that merely *starts* with `{` fails with a syntax
+/// error at the first token that isn't JSON. Prose is refused on the first
+/// character anyway — the leading-`{` check is what keeps an empty or
+/// whitespace-only prefix (also an EOF error) from reading as JSON.
+///
+/// A *complete* object is deliberately false here: when unread bytes remain,
+/// they may be trailing garbage, so a valid prefix cannot prove the whole body
+/// is JSON.
+///
+/// Sniffed through `from_utf8_lossy` rather than the raw bytes because the cut
+/// can land in the middle of a multi-byte character, which the byte parser
+/// would report as a *syntax* error and this would then misread as prose; a
+/// replacement character is still a legal JSON string character, so the lossy
+/// copy fails at end-of-input the way the truncation actually did. The lossy
+/// copy is only ever looked at — what gets forwarded is the original bytes.
+fn incomplete_json_object_prefix(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    if text.trim_start().as_bytes().first() != Some(&b'{') {
+        return false;
+    }
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(_) => false,
+        Err(e) => e.is_eof(),
+    }
+}
+
+/// Label a *success* body that is hand-serialized JSON as `application/json`.
+///
+/// The same ambiguity `rewrap_error` resolves for errors exists on the success
+/// side, and #336 is where it surfaced. Every write executor returns
+/// `(StatusCode, String)` — a channel shared by ~30 operation kinds — and puts a
+/// pre-serialized DTO in that `String`: `AmendCommitSuccess`, `FetchSuccess`,
+/// `PullSuccess`. Axum's blanket `impl IntoResponse for String` stamps all of
+/// them `text/plain`, so a 200 carrying a JSON object went out claiming to be
+/// prose. Only `/api/amend-commit` escaped that, because
+/// `handlers::commit::amend_route_response` sniffed *every* output of
+/// `plan_and_execute` and not just the refusals — the second thing that layer
+/// did, which the issue and the handoff both described as a refusal-only fix.
+/// Deleting it without this would have silently un-labeled that route's 200 and
+/// left the other four wrong; labeling it here fixes all five at once, in the
+/// one place that already owns "the whole surface answers in one shape".
+///
+/// # Why a declared length is the gate
+///
+/// This runs on **every** non-error response, including the M1.08 progress
+/// stream (`/api/operations/{id}/events`), which is an `async_stream` that stays
+/// open for the life of an operation. Reading even one frame of it here would
+/// stall the very thing it exists to deliver. So the gate is the body's own
+/// [`http_body::Body::size_hint`]: a complete in-memory `String` reports an
+/// exact size, a stream reports none. Only a body whose exact length is already
+/// known, and fits [`MAX_ERROR_BODY`], is looked at — anything else is passed
+/// through without being polled at all.
+///
+/// The `content-length` header is deliberately *not* what is consulted. It does
+/// not exist yet this far up the stack — hyper writes it when it serializes the
+/// response — so a gate on the header reads `None` for every route and relabels
+/// nothing, which is how the first version of this function silently did that.
+///
+/// Unlike the error path this only ever *relabels*. A success body is the
+/// endpoint's own payload; there is no envelope to put it in, and one that
+/// isn't JSON is left exactly as the handler built it.
+async fn relabel_json_success(response: Response) -> Response {
+    if is_json(&response) {
+        return response;
+    }
+    // The body's own exact size, not the `content-length` header: that header
+    // does not exist yet at this point in the stack — hyper writes it when it
+    // serializes the response — so reading it here would gate on `None` for
+    // every route and relabel nothing.
+    let exact = response.body().size_hint().exact();
+    if exact.is_none_or(|len| len > MAX_ERROR_BODY as u64) {
+        return response;
+    }
+
+    // `split_at_limit` rather than `to_bytes` even though the length says it
+    // fits: a header that lies must not cost the body. Nothing is lost on any
+    // path here — what is not relabeled is rejoined and passed on byte-for-byte.
+    let (mut parts, body) = response.into_parts();
+    let (head, remainder) = split_at_limit(body, MAX_ERROR_BODY).await;
+    let (rest, complete) = match remainder {
+        BodyRemainder::End => (None, true),
+        BodyRemainder::Trailers(rest) => (Some(rest), true),
+        BodyRemainder::Overflow(rest) | BodyRemainder::Interrupted(rest) => (Some(rest), false),
+    };
+    let is_json_object = complete
+        && matches!(
+            serde_json::from_slice::<serde_json::Value>(&head),
+            Ok(serde_json::Value::Object(_))
+        );
+    if is_json_object {
+        parts.headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+    }
+    Response::from_parts(parts, rejoin(head, rest))
 }
 
 /// Whether a response already carries a JSON content type.
@@ -285,17 +590,59 @@ fn with_contract_headers(mut response: Response, request_id: &RequestId) -> Resp
 mod tests {
     use super::*;
     use axum::{
-        http::Request as HttpRequest,
+        http::{HeaderMap, Request as HttpRequest},
         routing::{get, post},
         Router,
     };
-    use git_vista_protocol::{AmendCommitError, AmendFailureKind, ApiError};
+    use git_vista_protocol::{AmendCommitError, AmendCommitSuccess, AmendFailureKind, ApiError};
+    use http_body::Frame;
+    use http_body_util::StreamBody;
     use tower::ServiceExt;
 
     // A tiny router carrying the contract layer over a few representative routes:
     // the exempt negotiation endpoint, a plain OK route, a route that returns a
     // handler-style `(StatusCode, String)` error, and the real `create_branch`
     // write handler (to exercise body rejection at the wire).
+    /// Comfortably past [`MAX_ERROR_BODY`], so nothing below depends on the
+    /// exact cap — only on being over it.
+    const OVERSIZED_LEN: usize = MAX_ERROR_BODY + 8 * 1024;
+
+    /// The first words of the oversized *prose* refusal, so a test can prove
+    /// the client still receives what the server actually said rather than the
+    /// status's canonical reason.
+    const OVERSIZED_PROSE_OPENING: &str = "the pre-commit hook rejected this: ";
+
+    fn oversized_prose() -> String {
+        format!("{OVERSIZED_PROSE_OPENING}{}", "y".repeat(OVERSIZED_LEN))
+    }
+
+    /// A hook's rejection text, past the cap and full of the newlines and
+    /// control bytes real hook output carries — the escaping is the point, since
+    /// `\n` doubles and a control byte becomes six `\uXXXX` bytes, so the
+    /// serialized DTO clears 64 KiB from a message already over it.
+    fn oversized_hook_output() -> String {
+        let unit = "policy check failed\n\tsee CONTRIBUTING.md\u{1}\n";
+        unit.repeat(OVERSIZED_LEN / unit.len() + 1)
+    }
+
+    /// Exactly one complete JSON object in the sniffed prefix, followed by a
+    /// byte that makes the whole body invalid JSON. The arithmetic is pinned
+    /// so a cap change cannot quietly turn this into a different boundary.
+    fn complete_json_prefix_with_trailing_garbage() -> String {
+        let body = format!(r#"{{"m":"{}"}}X"#, "a".repeat(MAX_ERROR_BODY - 8));
+        assert_eq!(
+            body[..MAX_ERROR_BODY].len(),
+            MAX_ERROR_BODY,
+            "the sniffed prefix must be exactly the cap"
+        );
+        assert_eq!(
+            body.len(),
+            MAX_ERROR_BODY + 1,
+            "the fixture must leave exactly one unread garbage byte"
+        );
+        body
+    }
+
     fn app() -> Router {
         Router::new()
             .route("/api/protocol", get(|| async { "negotiation" }))
@@ -324,6 +671,151 @@ mod tests {
                     )
                 }),
             )
+            // The same typed-DTO shape as `/api/typed-refusal`, but with a
+            // `message` past `MAX_ERROR_BODY` — the #336 edge. `git`'s stderr
+            // is captured with no size cap (`git_cmd::git_output_bounded`'s
+            // plain `cmd.output()`), so a rejecting hook that prints more than
+            // 64 KiB puts more than 64 KiB into the DTO, and JSON escaping only
+            // widens it further.
+            .route(
+                "/api/oversized-typed-refusal",
+                get(|| async {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        serde_json::to_string(&AmendCommitError {
+                            kind: AmendFailureKind::HookRejected,
+                            message: oversized_hook_output(),
+                        })
+                        .unwrap(),
+                    )
+                }),
+            )
+            // The same size, but genuinely plain text: the other half of the
+            // #336 edge, where the answer is to envelope what fits and say so
+            // rather than to forward it.
+            .route(
+                "/api/oversized-prose",
+                get(|| async { (StatusCode::BAD_REQUEST, oversized_prose()) }),
+            )
+            .route(
+                "/api/oversized-prose-then-error",
+                get(|| async {
+                    Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::new(StreamBody::new(async_stream::stream! {
+                            yield Ok::<Frame<Bytes>, std::io::Error>(Frame::data(
+                                Bytes::from(oversized_prose())
+                            ));
+                            yield Err::<Frame<Bytes>, _>(std::io::Error::other(
+                                "oversized body exploded"
+                            ));
+                        })))
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/api/oversized-prose-then-trailers",
+                get(|| async {
+                    let mut trailers = HeaderMap::new();
+                    trailers.insert("x-overflow-proof", HeaderValue::from_static("kept"));
+                    Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::new(StreamBody::new(async_stream::stream! {
+                            yield Ok::<Frame<Bytes>, std::convert::Infallible>(Frame::data(
+                                Bytes::from(oversized_prose())
+                            ));
+                            yield Ok(Frame::trailers(trailers));
+                        })))
+                        .unwrap()
+                }),
+            )
+            // The first MAX_ERROR_BODY bytes are a complete JSON object, but
+            // the unread byte makes the full response invalid JSON. A complete
+            // prefix cannot prove an over-cap body is JSON.
+            .route(
+                "/api/complete-json-prefix-with-trailing-garbage",
+                get(|| async {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        complete_json_prefix_with_trailing_garbage(),
+                    )
+                }),
+            )
+            // Frame-level contract fixtures. Classification has to stop when
+            // it encounters either transport failure or trailers, but the
+            // consumed prefix and that frame must still reach the caller.
+            .route(
+                "/api/data-then-error",
+                get(|| async {
+                    Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::new(StreamBody::new(async_stream::stream! {
+                            yield Ok::<Frame<Bytes>, std::io::Error>(Frame::data(
+                                Bytes::from_static(b"{}")
+                            ));
+                            yield Err::<Frame<Bytes>, _>(std::io::Error::other(
+                                "body exploded"
+                            ));
+                        })))
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/api/data-then-trailers",
+                get(|| async {
+                    let mut trailers = HeaderMap::new();
+                    trailers.insert("x-proof", HeaderValue::from_static("kept"));
+                    Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::new(StreamBody::new(async_stream::stream! {
+                            yield Ok::<Frame<Bytes>, std::convert::Infallible>(Frame::data(
+                                Bytes::from_static(b"{}")
+                            ));
+                            yield Ok(Frame::trailers(trailers));
+                        })))
+                        .unwrap()
+                }),
+            )
+            // A *success* in the shared write channel: a 200 whose `String` is
+            // already a serialized DTO, exactly as `exec_amend_commit` and
+            // `exec_fetch` build theirs. Axum stamps it `text/plain`; only the
+            // bytes say otherwise.
+            .route(
+                "/api/typed-success",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        serde_json::to_string(&AmendCommitSuccess {
+                            message: "Amended commit.".to_string(),
+                            old_tip: "1".repeat(40),
+                            new_tip: Some("0".repeat(40)),
+                            amended_published_commit: Some(false),
+                        })
+                        .unwrap(),
+                    )
+                }),
+            )
+            // A 200 that is genuinely prose, so the relabel cannot be "always".
+            .route("/api/plain-success", get(|| async { "not json at all" }))
+            // A 200 with no declared length — the shape the M1.08 progress
+            // stream has. It must reach the client unread and unlabeled.
+            .route(
+                "/api/streamed-success",
+                get(|| async {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        // A bare JSON object, deliberately: if the size-hint
+                        // gate ever leaks, this body *would* be read and
+                        // relabeled `application/json`, and the test below goes
+                        // red. A fixture that could not be mistaken for JSON
+                        // would pass whether the gate worked or not.
+                        .body(Body::from_stream(async_stream::stream! {
+                            yield Ok::<_, std::io::Error>(Bytes::from_static(b"{\"progress\":1}"));
+                        }))
+                        .unwrap()
+                }),
+            )
             .route("/api/branch", post(crate::handlers::branch::create_branch))
             // The M1.08 stream route: the one path that may negotiate through
             // the query string, and the one whose id echoes the key in scope.
@@ -343,8 +835,14 @@ mod tests {
             .layer(axum::middleware::from_fn(api_contract))
     }
 
+    /// Read a whole test response. The cap is deliberately far above
+    /// [`MAX_ERROR_BODY`] — these tests exist partly to prove what the
+    /// middleware does with a body *larger* than its own buffering cap, so
+    /// reading them back at that cap would collapse the very thing under test.
+    const TEST_BODY_CAP: usize = 8 * 1024 * 1024;
+
     async fn body_string(response: Response) -> String {
-        let bytes = to_bytes(response.into_body(), MAX_ERROR_BODY)
+        let bytes = axum::body::to_bytes(response.into_body(), TEST_BODY_CAP)
             .await
             .unwrap();
         String::from_utf8(bytes.to_vec()).unwrap()
@@ -474,6 +972,455 @@ mod tests {
         assert!(
             content_type.starts_with("application/json"),
             "expected an application/json content-type, got {content_type:?}"
+        );
+    }
+
+    /// #336: the same typed DTO, past [`MAX_ERROR_BODY`], must still reach the
+    /// client **whole**.
+    ///
+    /// This is the edge the amend route's own local relabeling layer used to
+    /// cover alone, and the reason it could be collapsed into this one
+    /// mechanism (ADR 0084). Before the fix, `to_bytes`' all-or-nothing collect
+    /// returned `Err` for an over-cap body and `unwrap_or_default()` turned it
+    /// into *no bytes at all*: the client received an `ApiError` envelope
+    /// carrying the string "Bad Request" and none of what the hook said, on
+    /// every route that hand-serializes its error DTO — `/api/commit`,
+    /// `/api/fetch`, `/api/pull`, `/api/tag` included, none of which ever had a
+    /// route-local layer to fall back on.
+    ///
+    /// The message is compared byte-for-byte, not merely "parsed": a fix that
+    /// forwarded a *truncated* body would still fail to parse and would look
+    /// like this test working, while a fix that forwarded only the prefix and
+    /// closed the object for it would parse and be silently wrong.
+    #[tokio::test]
+    async fn an_oversized_typed_refusal_reaches_the_client_whole() {
+        let resp = app()
+            .oneshot(get_req(
+                "/api/oversized-typed-refusal",
+                Some(&PROTOCOL_VERSION.to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            content_type.starts_with("application/json"),
+            "an over-cap typed refusal must be labeled JSON like an under-cap \
+             one — the client parses the DTO, not an envelope: got {content_type:?}"
+        );
+        let body = body_string(resp).await;
+        assert!(
+            body.len() > MAX_ERROR_BODY,
+            "the fixture must actually exceed the cap or this test proves \
+             nothing: serialized body was {} bytes",
+            body.len()
+        );
+        let parsed: AmendCommitError = serde_json::from_str(&body).unwrap_or_else(|e| {
+            panic!(
+                "an over-cap typed refusal did not survive as a bare \
+                 AmendCommitError ({e}): {} bytes, starting {:?}",
+                body.len(),
+                &body[..body.len().min(120)]
+            )
+        });
+        assert_eq!(parsed.kind, AmendFailureKind::HookRejected);
+        assert_eq!(
+            parsed.message,
+            oversized_hook_output(),
+            "the hook's own text must arrive byte-for-byte, not truncated at \
+             the buffering cap"
+        );
+    }
+
+    /// #336, the other half: an over-cap body that is genuinely plain text is
+    /// still enveloped — and the envelope carries what the server said, with an
+    /// explicit truncation marker, instead of collapsing to the status's
+    /// canonical reason.
+    ///
+    /// Two things are asserted separately on purpose. That the message is
+    /// non-empty rules out the old `unwrap_or_default()` behaviour; that it
+    /// *opens with the server's own words* rules out a fix that kept some
+    /// arbitrary slice. The marker is asserted last so a client is never handed
+    /// a sentence that stops mid-word and reads as the whole answer.
+    #[tokio::test]
+    async fn an_oversized_prose_refusal_is_enveloped_with_what_fits_and_says_so() {
+        let resp = app()
+            .oneshot(get_req(
+                "/api/oversized-prose",
+                Some(&PROTOCOL_VERSION.to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body = body_string(resp).await;
+        let err: ApiError = serde_json::from_str(&body).unwrap_or_else(|e| {
+            panic!("an over-cap prose refusal must still be a proper envelope ({e})")
+        });
+        assert_ne!(
+            err.error.message,
+            StatusCode::BAD_REQUEST.canonical_reason().unwrap(),
+            "the envelope collapsed to the canonical reason — the server's own \
+             words were discarded, which is exactly the #336 defect"
+        );
+        assert!(
+            err.error.message.starts_with(OVERSIZED_PROSE_OPENING),
+            "the envelope must open with what the server actually said: {:?}",
+            &err.error.message[..err.error.message.len().min(120)]
+        );
+        assert!(
+            err.error.message.contains("truncated"),
+            "a truncated message must say it was truncated rather than read as \
+             the whole of the answer"
+        );
+    }
+
+    /// The paired negative for the prefix sniff: prose that merely *begins*
+    /// with `{` and runs past the cap must not be mistaken for a truncated JSON
+    /// object and forwarded as `application/json`.
+    ///
+    /// Without this, `incomplete_json_object_prefix` could be weakened to "the
+    /// first non-space byte is `{`" and every test above would still pass,
+    /// while a client received an English sentence labeled JSON — the
+    /// regression `handlers::commit`'s own sniff comment warns is *worse* than
+    /// the double-encoding #323 set out to fix.
+    #[tokio::test]
+    async fn over_cap_prose_that_merely_starts_with_a_brace_is_not_read_as_json() {
+        let opening = "{ this is not JSON, it is a shell trace: ";
+        assert!(
+            !incomplete_json_object_prefix(
+                format!("{opening}{}", "z".repeat(OVERSIZED_LEN)).as_bytes()
+            ),
+            "a prefix that starts with a brace but breaks JSON syntax on the \
+             next token is prose, not a truncated object"
+        );
+        // …and the genuine article still reads as one, so the check above is
+        // not just "always false".
+        assert!(
+            incomplete_json_object_prefix(
+                format!(
+                    r#"{{"kind":"hook_rejected","message":"{}"#,
+                    "a".repeat(OVERSIZED_LEN)
+                )
+                .as_bytes()
+            ),
+            "an object cut off mid-string is exactly what a truncated prefix of \
+             a typed DTO looks like"
+        );
+    }
+
+    /// A complete JSON value at the cap says nothing about the unread bytes.
+    /// Treating the prefix as proof would forward invalid JSON with a JSON
+    /// content type instead of the bounded prose envelope.
+    #[tokio::test]
+    async fn a_complete_json_prefix_with_trailing_garbage_is_not_labeled_json() {
+        let fixture = complete_json_prefix_with_trailing_garbage();
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&fixture).is_err(),
+            "the full fixture must be invalid JSON or this test proves nothing"
+        );
+
+        let resp = app()
+            .oneshot(get_req(
+                "/api/complete-json-prefix-with-trailing-garbage",
+                Some(&PROTOCOL_VERSION.to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let raw = body_string(resp).await;
+        let error: ApiError = serde_json::from_str(&raw).unwrap_or_else(|e| {
+            panic!(
+                "a complete prefix plus unread garbage must be enveloped as prose, \
+                 not forwarded as invalid JSON ({e})"
+            )
+        });
+        assert!(
+            error.error.message.contains("truncated"),
+            "the envelope must disclose that unread bytes were omitted"
+        );
+    }
+
+    /// A response-body failure is part of the body stream, not a clean EOF.
+    /// The contract layer may decline to classify the body, but it must not
+    /// turn `[Data("{}"), Err(boom)]` into a successful two-byte body.
+    #[tokio::test]
+    async fn a_body_error_after_data_is_preserved() {
+        let resp = app()
+            .oneshot(get_req(
+                "/api/data-then-error",
+                Some(&PROTOCOL_VERSION.to_string()),
+            ))
+            .await
+            .unwrap();
+        let mut body = resp.into_body();
+        let first = body
+            .frame()
+            .await
+            .expect("the data frame must remain")
+            .expect("the first frame is data");
+        assert_eq!(first.into_data().expect("first frame is data"), "{}");
+        let error = body
+            .frame()
+            .await
+            .expect("the error frame must remain")
+            .expect_err("the second frame must still be an error");
+        assert!(
+            error.to_string().contains("body exploded"),
+            "the original transport error must survive: {error}"
+        );
+    }
+
+    /// Trailers carry end-to-end metadata. Looking only at data frames must
+    /// not erase them while rebuilding the response body.
+    #[tokio::test]
+    async fn trailers_after_data_are_preserved() {
+        let resp = app()
+            .oneshot(get_req(
+                "/api/data-then-trailers",
+                Some(&PROTOCOL_VERSION.to_string()),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("application/json")),
+            "a complete JSON object remains JSON when trailers follow"
+        );
+        let mut body = resp.into_body();
+        let first = body
+            .frame()
+            .await
+            .expect("the data frame must remain")
+            .expect("the first frame is data");
+        assert_eq!(first.into_data().expect("first frame is data"), "{}");
+        let trailers = body
+            .frame()
+            .await
+            .expect("the trailers frame must remain")
+            .expect("trailers are not a body error")
+            .into_trailers()
+            .expect("the second frame must still be trailers");
+        assert_eq!(
+            trailers
+                .get("x-proof")
+                .expect("the original x-proof trailer must survive"),
+            "kept"
+        );
+    }
+
+    /// Crossing the byte cap deliberately truncates unread prose data, but it
+    /// must not turn a later transport failure into clean EOF or discard
+    /// end-to-end trailer metadata along with those data bytes.
+    #[tokio::test]
+    async fn an_oversized_prose_tail_keeps_later_errors_and_trailers() {
+        let resp = app()
+            .oneshot(get_req(
+                "/api/oversized-prose-then-error",
+                Some(&PROTOCOL_VERSION.to_string()),
+            ))
+            .await
+            .unwrap();
+        let mut body = resp.into_body();
+        let envelope = body
+            .frame()
+            .await
+            .expect("the bounded envelope must remain")
+            .expect("the envelope frame is data")
+            .into_data()
+            .expect("the first frame is the envelope");
+        let parsed: ApiError = serde_json::from_slice(&envelope)
+            .expect("the retained prefix must be a complete error envelope");
+        assert!(parsed.error.message.contains("truncated"));
+        let error = body
+            .frame()
+            .await
+            .expect("the post-cap error frame must remain")
+            .expect_err("the second frame must still be an error");
+        assert!(
+            error.to_string().contains("oversized body exploded"),
+            "the original post-cap transport error must survive: {error}"
+        );
+
+        let resp = app()
+            .oneshot(get_req(
+                "/api/oversized-prose-then-trailers",
+                Some(&PROTOCOL_VERSION.to_string()),
+            ))
+            .await
+            .unwrap();
+        let mut body = resp.into_body();
+        let envelope = body
+            .frame()
+            .await
+            .expect("the bounded envelope must remain")
+            .expect("the envelope frame is data")
+            .into_data()
+            .expect("the first frame is the envelope");
+        serde_json::from_slice::<ApiError>(&envelope)
+            .expect("the retained prefix must be a complete error envelope");
+        let trailers = body
+            .frame()
+            .await
+            .expect("the post-cap trailers frame must remain")
+            .expect("trailers are not a body error")
+            .into_trailers()
+            .expect("the second frame must still be trailers");
+        assert_eq!(
+            trailers
+                .get("x-overflow-proof")
+                .expect("the original post-cap trailer must survive"),
+            "kept"
+        );
+    }
+
+    /// The reader's own boundary: a body that ends *exactly* at the cap is
+    /// complete, not "over it". Getting this wrong would push every 64-KiB-on-
+    /// the-nose refusal down the truncation path and stamp it as truncated when
+    /// nothing was lost.
+    #[tokio::test]
+    async fn a_body_that_ends_exactly_at_the_cap_reports_no_remainder() {
+        let exact = vec![b'x'; MAX_ERROR_BODY];
+        let (head, rest) = split_at_limit(Body::from(exact.clone()), MAX_ERROR_BODY).await;
+        assert_eq!(head.len(), MAX_ERROR_BODY);
+        assert!(
+            matches!(rest, BodyRemainder::End),
+            "a body of exactly the cap has no remainder to forward"
+        );
+
+        let (head, rest) =
+            split_at_limit(Body::from([exact, vec![b'x']].concat()), MAX_ERROR_BODY).await;
+        assert_eq!(head.len(), MAX_ERROR_BODY);
+        assert!(
+            matches!(rest, BodyRemainder::Overflow(_)),
+            "one byte past the cap is a body with a remainder"
+        );
+    }
+
+    /// #336: a **success** body that is hand-serialized JSON is labeled
+    /// `application/json` too, on every route rather than one.
+    ///
+    /// This is the half of `amend_route_response` that neither the issue nor
+    /// the handoff described. That layer sniffed *every* output of
+    /// `plan_and_execute`, not just the refusals, so `/api/amend-commit`'s 200
+    /// was the only correctly-labeled success in the shared write channel —
+    /// `/api/commit`, `/api/fetch`, `/api/pull` and `/api/tag` all sent a JSON
+    /// object claiming to be `text/plain`. Deleting the layer without this
+    /// un-labeled the one that worked; `relabel_json_success` labels all five.
+    ///
+    /// Caught by `state::tests::selection_flow_carries_mode_and_gates_writes`
+    /// on CI, which cannot reach its own success leg in a container without
+    /// Landlock — the reason it is pinned here as well, where no sandbox is
+    /// involved and the assertion runs everywhere.
+    #[tokio::test]
+    async fn a_handlers_typed_json_success_is_labeled_json_too() {
+        let resp = app()
+            .oneshot(get_req(
+                "/api/typed-success",
+                Some(&PROTOCOL_VERSION.to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            content_type.starts_with("application/json"),
+            "a 200 carrying a serialized DTO must not claim to be prose: got \
+             {content_type:?}"
+        );
+        let body = body_string(resp).await;
+        let parsed: AmendCommitSuccess = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("the payload must survive relabeling ({e}): {body}"));
+        assert_eq!(parsed.message, "Amended commit.");
+    }
+
+    /// The paired negative: a 200 that is genuinely prose keeps its own
+    /// content-type and its own bytes. Without this, `relabel_json_success`
+    /// could be "always label 200s JSON" and the test above would still pass.
+    #[tokio::test]
+    async fn a_plain_text_success_is_left_exactly_as_the_handler_built_it() {
+        let resp = app()
+            .oneshot(get_req(
+                "/api/plain-success",
+                Some(&PROTOCOL_VERSION.to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            content_type.starts_with("text/plain"),
+            "prose must stay prose: got {content_type:?}"
+        );
+        assert_eq!(body_string(resp).await, "not json at all");
+    }
+
+    /// The stream guard, and the reason `relabel_json_success` gates on a
+    /// declared `content-length` rather than on status: the M1.08 progress
+    /// stream (`/api/operations/{id}/events`) is a 200 that stays open for the
+    /// life of an operation. Reading one frame of it to classify it would stall
+    /// the thing it exists to deliver.
+    ///
+    /// Asserted on the header rather than by timing: a body with no declared
+    /// length must come back with its own content-type untouched, which is only
+    /// true if nothing polled it. The payload here deliberately *is* a JSON
+    /// object inside an SSE frame, so a relabel that ignored the length gate
+    /// would have something to latch onto.
+    #[tokio::test]
+    async fn a_streaming_success_is_never_read_to_classify_it() {
+        let resp = app()
+            .oneshot(get_req(
+                "/api/streamed-success",
+                Some(&PROTOCOL_VERSION.to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "a stream must reach the client unread and unlabeled: got \
+             {content_type:?} — the gate leaked and the body was polled"
+        );
+
+        // The mechanism the assertion above rests on, stated directly: a
+        // streamed body reports no exact size, an in-memory one does. If this
+        // ever stops holding, the assertion above silently stops testing
+        // anything.
+        assert!(
+            Body::from_stream(async_stream::stream! {
+                yield Ok::<_, std::io::Error>(Bytes::from_static(b"{}"));
+            })
+            .size_hint()
+            .exact()
+            .is_none(),
+            "a streamed body must not report an exact size"
+        );
+        assert_eq!(
+            Body::from("{}").size_hint().exact(),
+            Some(2),
+            "an in-memory body must report its exact size"
         );
     }
 
