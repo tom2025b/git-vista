@@ -399,7 +399,8 @@ fn the_history_query_shows_only_this_repositorys_terminal_rows() {
 }
 
 /// A row whose payload no longer decodes must still be **scanned** — key
-/// intact, `status: None` — never silently dropped from the walk.
+/// intact, payload carried as incompatible (#509) — never silently dropped
+/// from the walk.
 ///
 /// This is the durable half of the pagination fix: `recovery_center`'s
 /// pager counts and cursors on scanned keys, which only works if a bad row
@@ -435,12 +436,18 @@ fn a_row_with_an_undecodable_payload_is_scanned_with_its_key_intact() {
         "the corrupt row must still occupy its place in the scan"
     );
     assert_eq!(rows[1].accepted_at, UnixSeconds(200));
+    // #509: an undecodable payload is carried as an incompatible record —
+    // never a decoded guess, and (since `'not json'` has no `"op"` envelope)
+    // never a claimed op kind either.
+    match &rows[1].payload {
+        ScannedPayload::Incompatible(record) => {
+            assert_eq!(record.op_kind, None, "'not json' carries no op string");
+        }
+        other => panic!("the corrupt row's payload must not be guessed at: {other:?}"),
+    }
     assert!(
-        rows[1].status.is_none(),
-        "the corrupt row's payload must be dropped, not guessed at"
-    );
-    assert!(
-        rows[0].status.is_some() && rows[2].status.is_some(),
+        matches!(rows[0].payload, ScannedPayload::Decoded(_))
+            && matches!(rows[2].payload, ScannedPayload::Decoded(_)),
         "the rows around it decode as before"
     );
 }
@@ -517,4 +524,151 @@ fn a_running_row_left_by_a_dead_process_is_closed_out_as_failed() {
     // not the original `running` row.
     let reloaded = load_all_blocking(&conn).unwrap();
     assert_eq!(reloaded[0].1.state, OperationState::Failed);
+}
+
+// ---------------------------------------------------------------------------
+// #509 — rows from a binary that understood an operation this one does not
+// ---------------------------------------------------------------------------
+
+/// The issue's own fixture, verbatim: a schema-v2 `operation_json` written by
+/// a binary that still had `PopStash` (removed in #501). The current enum has
+/// no `pop_stash` arm, so this payload can never decode here.
+const POP_STASH_JSON: &str =
+    r#"{"op":"pop_stash","repo":"/tmp/repo","selector":"stash@{0}","expected_oid":"0123...789"}"#;
+
+/// Overwrite `id`'s payload with [`POP_STASH_JSON`] out-of-band — the state a
+/// journal is in after a downgrade past an operation's removal.
+fn strand_as_pop_stash(conn: &Connection, id: &str) {
+    conn.execute(
+        "UPDATE operations SET operation_json = ?1 WHERE id = ?2",
+        rusqlite::params![POP_STASH_JSON, id],
+    )
+    .unwrap();
+}
+
+/// #509, acceptance 1: "cannot decode" and "does not exist" are
+/// distinguishable at the single-record lookup. Before the fix both were
+/// `None`, and the handler above answered 404 for a row that was sitting
+/// right there in the table.
+#[test]
+fn a_pop_stash_row_is_looked_up_as_incompatible_never_as_missing() {
+    let (_dir, path) = scratch_db();
+    let conn = open_at(&path).unwrap();
+    insert_or_update(&conn, &key("pop-stash"), &sample("pop-stash-op")).unwrap();
+    strand_as_pop_stash(&conn, "pop-stash-op");
+
+    match load_operation_blocking(&conn, &OperationId::new("pop-stash-op").unwrap()) {
+        DurableLookup::Incompatible(record) => {
+            // The raw stored facts are readable even though the payload is
+            // not — and the op string is the bytes' own word, not a guess.
+            assert_eq!(record.op_kind.as_deref(), Some("pop_stash"));
+            assert_eq!(record.key, key("pop-stash"));
+            assert_eq!(record.state_raw, "succeeded");
+            assert_eq!(record.repository_raw, "r");
+            assert_eq!(record.accepted_at, UnixSeconds(1_000));
+        }
+        DurableLookup::Found(_) => panic!("an unknown op variant must not decode"),
+        DurableLookup::Missing => {
+            panic!("#509: 'cannot decode' must never read as 'does not exist'")
+        }
+    }
+
+    // The other half of the distinction: an id nothing ever wrote.
+    assert!(matches!(
+        load_operation_blocking(&conn, &OperationId::new("never-written").unwrap()),
+        DurableLookup::Missing
+    ));
+}
+
+/// #509, acceptance 2: the history scan carries the stranded row as
+/// incompatible, with its stored facts intact, instead of omitting it.
+#[test]
+fn a_pop_stash_row_surfaces_in_the_history_scan_with_its_stored_facts() {
+    let (_dir, path) = scratch_db();
+    let conn = open_at(&path).unwrap();
+    let mut status = sample("pop-stash-history");
+    // The shape such a row has once startup recovery has closed it out.
+    status.state = OperationState::Failed;
+    status.status = Some(500);
+    insert_or_update(&conn, &key("pop-stash-history"), &status).unwrap();
+    strand_as_pop_stash(&conn, "pop-stash-history");
+
+    let rows = select_operations_blocking(
+        &conn,
+        &RepositoryToken::new("r").unwrap(),
+        &[OperationState::Succeeded, OperationState::Failed],
+        None,
+        50,
+    )
+    .unwrap();
+    assert_eq!(rows.len(), 1, "the row must occupy its place in the scan");
+    match &rows[0].payload {
+        ScannedPayload::Incompatible(record) => {
+            assert_eq!(record.op_kind.as_deref(), Some("pop_stash"));
+            assert_eq!(record.state_raw, "failed");
+            assert_eq!(record.status, Some(500));
+        }
+        other => panic!("the stranded row must surface as incompatible: {other:?}"),
+    }
+}
+
+/// #509, acceptance 3: startup recovery closes out a stranded `running` row —
+/// the row that, before the fix, stayed 'running' forever because the sweep
+/// only saw records that decoded. The close-out is durable, honest about why,
+/// and leaves the payload bytes untouched for a build that understands them.
+#[test]
+fn a_running_pop_stash_row_is_closed_out_as_failed_at_startup() {
+    let (dir, path) = scratch_db();
+    {
+        let conn = open_at(&path).unwrap();
+        let mut stranded = sample("stranded-pop-stash");
+        stranded.state = OperationState::Running;
+        stranded.stage = OperationStage::Executing;
+        stranded.status = None;
+        stranded.message = None;
+        stranded.ended_at = None;
+        insert_or_update(&conn, &key("stranded"), &stranded).unwrap();
+        strand_as_pop_stash(&conn, "stranded-pop-stash");
+    }
+    // `recover_blocking` wants the same `'static` shape `open_private` hands
+    // out; leak a private connection the same way it does.
+    let conn: &'static StdMutex<Connection> =
+        Box::leak(Box::new(StdMutex::new(open_at(&path).unwrap())));
+    std::mem::forget(dir);
+
+    let journal = recover_blocking(conn).unwrap();
+    assert!(
+        journal
+            .records
+            .iter()
+            .all(|(_, s)| s.id.as_str() != "stranded-pop-stash"),
+        "an undecodable row must never be dressed as a decoded record"
+    );
+    let record = journal
+        .incompatible
+        .iter()
+        .find(|r| r.id.as_str() == "stranded-pop-stash")
+        .expect("the stranded row must come back as incompatible");
+    assert_eq!(record.state_raw, "failed");
+    assert_eq!(record.status, Some(500));
+    assert!(record.ended_at.is_some(), "terminal means an end time");
+    let message = record.message.as_deref().unwrap();
+    assert!(message.contains("'pop_stash'"), "{message}");
+    assert!(message.contains("closed out as failed"), "{message}");
+
+    // Durable, not just in the returned view: the row itself can never read
+    // 'running' again, while its payload stays byte-for-byte what the older
+    // binary wrote.
+    let guard = conn.lock().unwrap();
+    let (state, ended_at, json): (String, Option<i64>, String) = guard
+        .query_row(
+            "SELECT state, ended_at, operation_json FROM operations
+             WHERE id = 'stranded-pop-stash'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "failed");
+    assert!(ended_at.is_some());
+    assert_eq!(json, POP_STASH_JSON);
 }

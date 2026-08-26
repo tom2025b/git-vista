@@ -335,19 +335,17 @@ pub(crate) async fn persist_to(
 /// [`open_private`]) instead of the shared journal — safe to call mid-suite
 /// precisely because nothing else can be writing to a private connection.
 #[cfg(test)]
-pub(crate) async fn recover_from(
-    conn: &'static StdMutex<Connection>,
-) -> Vec<(IdempotencyKey, OperationStatus)> {
+pub(crate) async fn recover_from(conn: &'static StdMutex<Connection>) -> RecoveredJournal {
     let loaded = tokio::task::spawn_blocking(move || recover_blocking(conn)).await;
     match loaded {
-        Ok(Ok(records)) => records,
+        Ok(Ok(journal)) => journal,
         Ok(Err(e)) => {
             eprintln!("git-vista: couldn't open the isolated test journal: {e}");
-            Vec::new()
+            RecoveredJournal::default()
         }
         Err(e) => {
             eprintln!("git-vista: the isolated-journal recovery task panicked: {e}");
-            Vec::new()
+            RecoveredJournal::default()
         }
     }
 }
@@ -467,11 +465,11 @@ fn insert_or_update(
     Ok(())
 }
 
-/// The `SELECT` column list every [`row_to_status`] caller must use, verbatim
+/// The `SELECT` column list every [`row_to_loaded`] caller must use, verbatim
 /// and in this order — [`load_all_blocking`], [`load_operation_blocking`], and
 /// [`select_operations_blocking`].
 ///
-/// [`row_to_status`] decodes by **position** (`row.get(0)` … `row.get(14)`),
+/// [`row_to_loaded`] decodes by **position** (`row.get(0)` … `row.get(14)`),
 /// so a list that is reordered, shortened, or replaced with `SELECT *` in one
 /// caller misaligns every field after the first difference — and misaligns it
 /// *silently*, because most of these columns are `TEXT` and would decode as
@@ -481,29 +479,94 @@ const STATUS_COLUMNS: &str = "id, idempotency_key, state, stage, operation_json,
      repository, worktree, accepted_at, ended_at, status, message,
      generation, recovery_json, recovers_operation";
 
-/// Every row in the journal, decoded back into `(key, status)`. A row that
-/// fails to decode (a shape this build doesn't recognise, or a hand-edited
-/// database) is logged and skipped rather than failing the whole load — one
-/// bad row must not make every other recorded operation unrecoverable.
-fn load_all_blocking(
+/// The raw stored facts of a journal row whose payload this build cannot
+/// decode (#509) — most plausibly a row written by a binary that understood an
+/// operation this one does not, the way `PopStash`'s removal (#501) stranded
+/// its schema-v2 rows. Carries only what the bytes themselves say: the `"op"`
+/// discriminant string when the JSON envelope is at least well-formed, the
+/// `state` column's verbatim spelling, and the plain columns — never a
+/// guessed-at [`OperationStatus`].
+///
+/// This type existing is the fix's core: before it, "cannot decode" collapsed
+/// into "does not exist" at [`row_to_loaded`]'s seam, and every caller
+/// downstream — single lookup, history, startup recovery, idempotency reuse —
+/// inherited the lie at once.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct IncompatibleRecord {
+    pub id: OperationId,
+    pub key: IdempotencyKey,
+    /// The stored operation's `"op"` discriminant, verbatim; `None` when even
+    /// the JSON envelope is unreadable. Kind only, never the payload's fields
+    /// — the same boundary [`redact_operation`] draws for log lines.
+    pub op_kind: Option<String>,
+    /// The `state` column verbatim, including spellings this build's
+    /// [`parse_state`] doesn't know.
+    pub state_raw: String,
+    pub repository_raw: String,
+    pub worktree_raw: String,
+    pub accepted_at: UnixSeconds,
+    pub ended_at: Option<UnixSeconds>,
+    pub status: Option<u16>,
+    pub message: Option<String>,
+}
+
+impl IncompatibleRecord {
+    /// Terminal by the `state` column's raw spelling — the only fact available
+    /// when the payload doesn't decode. An unknown spelling reads as
+    /// non-terminal on purpose: a row this build can't even classify gets
+    /// closed out by [`recover_blocking`] rather than left running forever.
+    pub(crate) fn is_terminal_raw(&self) -> bool {
+        matches!(self.state_raw.as_str(), "succeeded" | "failed")
+    }
+}
+
+/// One journal row, as much of it as this build can honestly claim.
+pub(crate) enum LoadedRow {
+    // Boxed for the same reason `PlanSource::Submit` boxes its `Plan`:
+    // `OperationStatus` dwarfs the other variant, and every scan pays the
+    // enum's stack size.
+    Decoded(IdempotencyKey, Box<OperationStatus>),
+    Incompatible(IncompatibleRecord),
+}
+
+/// Every row in the journal, split into fully-decoded `(key, status)` records
+/// and [`IncompatibleRecord`]s whose payload this build cannot read. Only a
+/// row whose `id`/`key` columns themselves no longer validate — out-of-band
+/// tampering, since the server minted and checked both on write — is logged
+/// and skipped: one bad row must not make every other recorded operation
+/// unrecoverable, and an incompatible row is not a bad row, it is a fact.
+#[allow(clippy::type_complexity)]
+fn load_journal_blocking(
     conn: &Connection,
-) -> rusqlite::Result<Vec<(IdempotencyKey, OperationStatus)>> {
+) -> rusqlite::Result<(
+    Vec<(IdempotencyKey, OperationStatus)>,
+    Vec<IncompatibleRecord>,
+)> {
     let mut stmt = conn.prepare(&format!("SELECT {STATUS_COLUMNS} FROM operations"))?;
-    let rows = stmt.query_map([], row_to_status)?;
-    let mut out = Vec::new();
+    let rows = stmt.query_map([], row_to_loaded)?;
+    let mut decoded = Vec::new();
+    let mut incompatible = Vec::new();
     for row in rows {
         match row {
-            Ok(Some(entry)) => out.push(entry),
-            Ok(None) => {} // a field didn't parse; already logged in row_to_status
+            Ok(Some(LoadedRow::Decoded(key, status))) => decoded.push((key, *status)),
+            Ok(Some(LoadedRow::Incompatible(record))) => incompatible.push(record),
+            Ok(None) => {} // id/key unreadable; already logged in row_to_loaded
             Err(e) => eprintln!("git-vista: couldn't read a journal row: {e}"),
         }
     }
-    Ok(out)
+    Ok((decoded, incompatible))
 }
 
-fn row_to_status(
-    row: &rusqlite::Row,
-) -> rusqlite::Result<Option<(IdempotencyKey, OperationStatus)>> {
+/// [`load_journal_blocking`]'s decoded half, for the suites written before
+/// #509 taught the load path to keep incompatible rows.
+#[cfg(test)]
+fn load_all_blocking(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<(IdempotencyKey, OperationStatus)>> {
+    Ok(load_journal_blocking(conn)?.0)
+}
+
+fn row_to_loaded(row: &rusqlite::Row) -> rusqlite::Result<Option<LoadedRow>> {
     let id: String = row.get(0)?;
     let key: String = row.get(1)?;
     let state: String = row.get(2)?;
@@ -520,43 +583,73 @@ fn row_to_status(
     let recovery_json: Option<String> = row.get(13)?;
     let recovers_operation: Option<String> = row.get(14)?;
 
+    // The two columns every outcome below needs a name from. The server
+    // minted and validated both on write, so a failure here is out-of-band
+    // tampering rather than version skew — the one shape nothing can honestly
+    // represent, logged and dropped.
+    let (Ok(id), Ok(key)) = (OperationId::new(id), IdempotencyKey::new(key)) else {
+        eprintln!("git-vista: a journal row's id or key column no longer validates; skipped");
+        return Ok(None);
+    };
+
     let decoded = (|| {
-        Some((
-            IdempotencyKey::new(key).ok()?,
-            OperationStatus {
-                id: OperationId::new(id).ok()?,
-                state: parse_state(&state)?,
-                stage: parse_stage(&stage)?,
-                operation: serde_json::from_str::<GitOperation>(&operation_json).ok()?,
-                operation_hash: OperationHash::new(operation_hash).ok()?,
-                repository: RepositoryToken::new(repository).ok()?,
-                worktree: WorktreeToken::new(worktree).ok()?,
+        Some(OperationStatus {
+            id: id.clone(),
+            state: parse_state(&state)?,
+            stage: parse_stage(&stage)?,
+            operation: serde_json::from_str::<GitOperation>(&operation_json).ok()?,
+            operation_hash: OperationHash::new(operation_hash).ok()?,
+            repository: RepositoryToken::new(repository.clone()).ok()?,
+            worktree: WorktreeToken::new(worktree.clone()).ok()?,
+            accepted_at: UnixSeconds(accepted_at),
+            ended_at: ended_at.map(UnixSeconds),
+            status,
+            message: message.clone(),
+            generation: generation.and_then(|g| GenerationToken::new(g).ok()),
+            recovery: recovery_json.and_then(|r| serde_json::from_str::<RecoveryStrategy>(&r).ok()),
+            // M3.25 (#78): `None` for every row written before the column
+            // existed, and for every operation that recovers nothing —
+            // which is nearly all of them.
+            recovers: recovers_operation.and_then(|id| OperationId::new(id).ok()),
+            // M2.20c (#229): transfer progress is deliberately **not** a
+            // column and is never rehydrated. It describes a transfer in
+            // flight, and this table only ever hands back records this
+            // process did not run: every row `recover` returns is
+            // terminal (it force-fails anything a prior process left
+            // running), so a persisted "receiving 62%" would be a
+            // progress report about a process that no longer exists.
+            progress: None,
+        })
+    })();
+
+    Ok(Some(match decoded {
+        Some(status) => LoadedRow::Decoded(key, Box::new(status)),
+        None => {
+            // #509: a payload this build can't decode is an incompatible
+            // record, never a vanished one. Kind only in the log — the raw
+            // JSON can carry free text a user typed.
+            let op_kind = serde_json::from_str::<serde_json::Value>(&operation_json)
+                .ok()
+                .and_then(|v| v.get("op").and_then(|t| t.as_str()).map(str::to_string));
+            eprintln!(
+                "git-vista: journal row {} holds an operation this build can't decode (op: {}); kept as incompatible",
+                id.as_str(),
+                op_kind.as_deref().unwrap_or("<unreadable>")
+            );
+            LoadedRow::Incompatible(IncompatibleRecord {
+                id,
+                key,
+                op_kind,
+                state_raw: state,
+                repository_raw: repository,
+                worktree_raw: worktree,
                 accepted_at: UnixSeconds(accepted_at),
                 ended_at: ended_at.map(UnixSeconds),
                 status,
                 message,
-                generation: generation.and_then(|g| GenerationToken::new(g).ok()),
-                recovery: recovery_json
-                    .and_then(|r| serde_json::from_str::<RecoveryStrategy>(&r).ok()),
-                // M3.25 (#78): `None` for every row written before the column
-                // existed, and for every operation that recovers nothing —
-                // which is nearly all of them.
-                recovers: recovers_operation.and_then(|id| OperationId::new(id).ok()),
-                // M2.20c (#229): transfer progress is deliberately **not** a
-                // column and is never rehydrated. It describes a transfer in
-                // flight, and this table only ever hands back records this
-                // process did not run: every row `recover` returns is
-                // terminal (it force-fails anything a prior process left
-                // running), so a persisted "receiving 62%" would be a
-                // progress report about a process that no longer exists.
-                progress: None,
-            },
-        ))
-    })();
-    if decoded.is_none() {
-        eprintln!("git-vista: journal row for an operation id didn't decode; skipped");
-    }
-    Ok(decoded)
+            })
+        }
+    }))
 }
 
 fn parse_state(s: &str) -> Option<OperationState> {
@@ -668,12 +761,26 @@ fn state_literal(state: OperationState) -> &'static str {
 pub(crate) struct ScannedOperation {
     pub accepted_at: UnixSeconds,
     pub id: OperationId,
-    /// `None` when the payload didn't decode — logged, dropped from the page,
-    /// but still counted and still able to carry the cursor past itself.
-    pub status: Option<OperationStatus>,
+    pub payload: ScannedPayload,
 }
 
-/// [`row_to_status`], with the keyset key read first and kept even when the
+/// What a scanned row's payload columns yielded. Three outcomes, because two
+/// different failures deserve two different faces (#509): an incompatible row
+/// still has raw facts worth showing, an unreadable one has nothing but its
+/// keyset key.
+#[derive(Debug)]
+pub(crate) enum ScannedPayload {
+    Decoded(Box<OperationStatus>),
+    /// The payload didn't decode but the row's stored facts did — surfaced to
+    /// the Recovery Center as what it is, never silently dropped.
+    Incompatible(IncompatibleRecord),
+    /// A payload column the SQL driver itself couldn't read, or a key column
+    /// that no longer validates — logged, dropped from the page, but still
+    /// counted and still able to carry the cursor past itself.
+    Unreadable,
+}
+
+/// [`row_to_loaded`], with the keyset key read first and kept even when the
 /// payload fails to decode.
 ///
 /// `Ok(None)` — the row vanishing from the scan entirely — is reserved for a
@@ -691,21 +798,22 @@ fn row_to_scanned(row: &rusqlite::Row) -> rusqlite::Result<Option<ScannedOperati
         eprintln!("git-vista: a journal row's id column isn't an operation id; skipped");
         return Ok(None);
     };
-    let status = match row_to_status(row) {
-        Ok(Some((_key, status))) => Some(status),
-        Ok(None) => None, // a field didn't parse; already logged in row_to_status
+    let payload = match row_to_loaded(row) {
+        Ok(Some(LoadedRow::Decoded(_key, status))) => ScannedPayload::Decoded(status),
+        Ok(Some(LoadedRow::Incompatible(record))) => ScannedPayload::Incompatible(record),
+        Ok(None) => ScannedPayload::Unreadable, // key column unreadable; logged in row_to_loaded
         Err(e) => {
             // A payload column the SQL driver itself couldn't read (a type
-            // mismatch, say). Same outcome as a parse failure: the record is
-            // gone, the key is not.
+            // mismatch, say). Same outcome as an unreadable key: the record is
+            // gone, the keyset key is not.
             eprintln!("git-vista: couldn't read a history row's payload: {e}");
-            None
+            ScannedPayload::Unreadable
         }
     };
     Ok(Some(ScannedOperation {
         accepted_at: UnixSeconds(accepted_at),
         id,
-        status,
+        payload,
     }))
 }
 
@@ -763,13 +871,31 @@ fn select_operations_blocking(
 /// table in the first place: a browsable history must outlive both the
 /// eviction and the process.
 ///
-/// `None` covers "no such id ever existed" and "the row didn't decode" alike;
-/// the sole caller (`recovery_center::recover_operation`) answers 404 for
-/// both, the same as any other unknown id.
-pub(crate) async fn load_operation(id: &OperationId) -> Option<OperationStatus> {
+/// "Cannot decode" and "does not exist" answered apart (#509). This used to be
+/// an `Option` whose `None` covered both, which dressed a row from an
+/// incompatible build as a 404 — the caller could neither explain the record
+/// nor stop treating its id as never-minted.
+///
+/// A journal that can't be opened at all still reads as [`Missing`]
+/// (best-effort, like every read here except [`list_operations`]) — logged,
+/// never invented into a record.
+///
+/// [`Missing`]: DurableLookup::Missing
+pub(crate) enum DurableLookup {
+    Found(Box<OperationStatus>),
+    Incompatible(IncompatibleRecord),
+    Missing,
+}
+
+/// `Missing` still covers "no such id ever existed" and the tampering shape
+/// where the row's own id/key columns no longer validate; a payload this build
+/// cannot decode is `Incompatible`, never `Missing`.
+pub(crate) async fn load_operation(id: &OperationId) -> DurableLookup {
     let id = id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let conn = db().ok()?;
+        let Ok(conn) = db() else {
+            return DurableLookup::Missing;
+        };
         let conn = conn.lock().expect("operations db lock");
         load_operation_blocking(&conn, &id)
     })
@@ -778,20 +904,26 @@ pub(crate) async fn load_operation(id: &OperationId) -> Option<OperationStatus> 
         Ok(found) => found,
         Err(e) => {
             eprintln!("git-vista: the journal read task panicked: {e}");
-            None
+            DurableLookup::Missing
         }
     }
 }
 
-fn load_operation_blocking(conn: &Connection, id: &OperationId) -> Option<OperationStatus> {
-    conn.query_row(
+fn load_operation_blocking(conn: &Connection, id: &OperationId) -> DurableLookup {
+    let loaded = conn.query_row(
         &format!("SELECT {STATUS_COLUMNS} FROM operations WHERE id = ?1"),
         params![id.as_str()],
-        row_to_status,
-    )
-    .ok()
-    .flatten()
-    .map(|(_key, status)| status)
+        row_to_loaded,
+    );
+    match loaded {
+        Ok(Some(LoadedRow::Decoded(_key, status))) => DurableLookup::Found(status),
+        Ok(Some(LoadedRow::Incompatible(record))) => DurableLookup::Incompatible(record),
+        Ok(None) | Err(rusqlite::Error::QueryReturnedNoRows) => DurableLookup::Missing,
+        Err(e) => {
+            eprintln!("git-vista: couldn't read the journal row for an operation id: {e}");
+            DurableLookup::Missing
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -817,29 +949,55 @@ fn load_operation_blocking(conn: &Connection, id: &OperationId) -> Option<Operat
 /// a test or any other code path where operations may be in flight — use
 /// [`open_private`] plus [`recover_from`] for that instead of this function;
 /// this was the actual root cause of issue #158.
-pub(crate) async fn recover() -> Vec<(IdempotencyKey, OperationStatus)> {
+pub(crate) async fn recover() -> RecoveredJournal {
     let loaded = tokio::task::spawn_blocking(|| recover_blocking(db()?)).await;
     match loaded {
-        Ok(Ok(records)) => records,
+        Ok(Ok(journal)) => journal,
         Ok(Err(e)) => {
             eprintln!("git-vista: couldn't open the operation journal: {e}");
-            Vec::new()
+            RecoveredJournal::default()
         }
         Err(e) => {
             eprintln!("git-vista: the journal recovery task panicked: {e}");
-            Vec::new()
+            RecoveredJournal::default()
         }
+    }
+}
+
+/// What startup recovery hands to `main.rs`: the decoded records for
+/// [`crate::operations::rehydrate`]'s registry, plus the incompatible rows
+/// (#509) whose idempotency keys must be guarded against reuse-as-fresh —
+/// they still hold their `UNIQUE` key in SQLite, and a registry that has
+/// never heard of them would admit that key as a brand-new operation.
+#[derive(Default)]
+pub(crate) struct RecoveredJournal {
+    pub records: Vec<(IdempotencyKey, OperationStatus)>,
+    pub incompatible: Vec<IncompatibleRecord>,
+}
+
+/// The terminal message the startup sweep writes onto an incompatible row
+/// (#509). Names the stored op kind when the bytes carry one, and claims
+/// nothing when they don't.
+fn incompatible_close_out_message(op_kind: Option<&str>) -> String {
+    match op_kind {
+        Some(kind) => format!(
+            "This operation ('{kind}') was written by a Git-Vista build that \
+             understood an operation this build does not. It can never be \
+             resumed, so it was closed out as failed."
+        ),
+        None => "This operation's stored record can't be decoded by this \
+                 build. It can never be resumed, so it was closed out as \
+                 failed."
+            .to_string(),
     }
 }
 
 /// Takes the connection explicitly (rather than calling [`db`] itself) so a
 /// caller can supply an isolated connection instead of the process-wide
 /// singleton — see [`open_private`].
-fn recover_blocking(
-    conn: &'static StdMutex<Connection>,
-) -> Result<Vec<(IdempotencyKey, OperationStatus)>, DurableError> {
+fn recover_blocking(conn: &'static StdMutex<Connection>) -> Result<RecoveredJournal, DurableError> {
     let conn = conn.lock().expect("operations db lock");
-    let mut records = load_all_blocking(&conn)?;
+    let (mut records, mut incompatible) = load_journal_blocking(&conn)?;
     let now = crate::activity::now_secs();
 
     for (key, record) in records.iter_mut().filter(|(_, r)| !r.is_terminal()) {
@@ -854,7 +1012,32 @@ fn recover_blocking(
         record.ended_at = Some(UnixSeconds(now));
         insert_or_update(&conn, key, record)?;
     }
-    Ok(records)
+
+    // #509: the same close-out, for rows whose payload this build can't
+    // decode. `insert_or_update` needs an `OperationStatus` this row cannot
+    // produce, so the update targets the columns directly — and only the
+    // lifecycle columns, never the payload, which stays byte-for-byte what
+    // the older binary wrote in case a build that understands it returns.
+    // An operation whose semantics this binary cannot know can never be
+    // resumed by it; a terminal record beats an eternal 'running'.
+    for record in incompatible.iter_mut().filter(|r| !r.is_terminal_raw()) {
+        let message = incompatible_close_out_message(record.op_kind.as_deref());
+        conn.execute(
+            "UPDATE operations
+             SET state = 'failed', stage = 'finished', status = 500,
+                 message = ?1, ended_at = ?2
+             WHERE id = ?3",
+            params![message, now, record.id.as_str()],
+        )?;
+        record.state_raw = "failed".to_string();
+        record.status = Some(500);
+        record.message = Some(message);
+        record.ended_at = Some(UnixSeconds(now));
+    }
+    Ok(RecoveredJournal {
+        records,
+        incompatible,
+    })
 }
 
 // ---------------------------------------------------------------------------

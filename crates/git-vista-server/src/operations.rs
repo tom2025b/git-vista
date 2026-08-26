@@ -352,6 +352,37 @@ pub(crate) enum Admission {
     /// The key was reused for a *different* operation. Refused, because
     /// replaying a result computed for something else is worse than failing.
     Conflict,
+    /// The key names a journal row written by a build that understood an
+    /// operation this one does not (#509). Refused with the record's name:
+    /// the key is still `UNIQUE` in SQLite, so admitting it as fresh would
+    /// execute a brand-new git operation where the client asked for a replay
+    /// — the idempotency guarantee defeated exactly where its record went
+    /// invisible.
+    IncompatibleKey {
+        id: OperationId,
+        op_kind: Option<String>,
+    },
+}
+
+/// The refusal a request reusing an incompatible record's key receives
+/// (#509). Names the record and, when the bytes carry one, the op kind this
+/// build doesn't know — a conflict a client can act on, never a silent fresh
+/// execution.
+pub(crate) fn incompatible_key_refusal(id: &OperationId, op_kind: Option<&str>) -> String {
+    match op_kind {
+        Some(kind) => format!(
+            "That idempotency key already names operation {} — written by a \
+             Git-Vista build that understood an operation ('{kind}') this \
+             build does not. It can't be replayed or re-run; send a new key.",
+            id.as_str()
+        ),
+        None => format!(
+            "That idempotency key already names operation {}, whose stored \
+             record this build can't decode. It can't be replayed or re-run; \
+             send a new key.",
+            id.as_str()
+        ),
+    }
 }
 
 /// The process-wide registry. The `std` mutex guards only the maps and is never
@@ -362,6 +393,12 @@ struct Registry {
     /// Insertion order, for oldest-first eviction. Ids only — the maps own the
     /// records.
     order: VecDeque<OperationId>,
+    /// Keys of journal rows this build cannot decode (#509), loaded once by
+    /// [`rehydrate`]. Outside `order` and never evicted: each entry is a few
+    /// strings, the set only grows when a binary that removed an operation
+    /// opens an older journal, and evicting one would re-open exactly the
+    /// reuse-as-fresh hole it guards.
+    incompatible_keys: HashMap<IdempotencyKey, (OperationId, Option<String>)>,
 }
 
 static REGISTRY: OnceLock<StdMutex<Registry>> = OnceLock::new();
@@ -372,6 +409,7 @@ fn registry() -> &'static StdMutex<Registry> {
             by_key: HashMap::new(),
             by_id: HashMap::new(),
             order: VecDeque::new(),
+            incompatible_keys: HashMap::new(),
         })
     })
 }
@@ -399,6 +437,17 @@ pub(crate) fn admit(
     let now = crate::activity::now_secs();
     let mut reg = registry().lock().expect("operation registry lock");
     evict(&mut reg, now);
+
+    // #509: checked before `by_key`, which can never hold such a key — an
+    // incompatible row is exactly one `rehydrate` could not turn into a
+    // record. Whatever operation the request carries, the answer is the
+    // same: this key is spent, on something this build can't even read.
+    if let Some((id, op_kind)) = reg.incompatible_keys.get(key) {
+        return Admission::IncompatibleKey {
+            id: id.clone(),
+            op_kind: op_kind.clone(),
+        };
+    }
 
     if let Some(existing) = reg.by_key.get(key) {
         let existing = Arc::clone(existing);
@@ -489,8 +538,21 @@ pub(crate) fn lookup_by_key(key: &IdempotencyKey) -> Option<OperationId> {
 /// into a `Failed` record before returning. This function only ever *adds*
 /// entries to an empty registry, so it does not need `admit`'s duplicate/
 /// conflict logic.
-pub(crate) fn rehydrate(records: Vec<(IdempotencyKey, OperationStatus)>) {
+///
+/// `incompatible` (#509) carries the journal rows whose payload the durable
+/// layer could not decode. They cannot become [`Record`]s — there is no
+/// [`OperationStatus`] to publish — but their keys are real and `UNIQUE` in
+/// SQLite, so they land in the registry's poisoned-key set, where [`admit`]
+/// refuses them instead of executing a fresh git operation under a spent key.
+pub(crate) fn rehydrate(
+    records: Vec<(IdempotencyKey, OperationStatus)>,
+    incompatible: Vec<crate::durable::IncompatibleRecord>,
+) {
     let mut reg = registry().lock().expect("operation registry lock");
+    for record in incompatible {
+        reg.incompatible_keys
+            .insert(record.key, (record.id, record.op_kind));
+    }
     for (key, status) in records {
         let id = status.id.clone();
         let (status_tx, _) = watch::channel(status);
@@ -794,6 +856,56 @@ mod tests {
         assert!(matches!(
             admit_op(&k, &op("something else entirely"), &hash('d')),
             Admission::Conflict
+        ));
+    }
+
+    /// #509, acceptance 4: a key that names a journal row this build cannot
+    /// decode is refused by name — never admitted as `Fresh`, which is what
+    /// happened before the fix (the registry had never heard of the key, so
+    /// a "replay" request silently executed a brand-new git operation).
+    #[test]
+    fn a_key_from_an_incompatible_record_is_refused_not_run_fresh() {
+        let k = key("incompatible-pop-stash");
+        let id = OperationId::new("incompatible-op-id").unwrap();
+        rehydrate(
+            Vec::new(),
+            vec![crate::durable::IncompatibleRecord {
+                id: id.clone(),
+                key: k.clone(),
+                op_kind: Some("pop_stash".to_string()),
+                state_raw: "failed".to_string(),
+                repository_raw: "r".to_string(),
+                worktree_raw: "w".to_string(),
+                accepted_at: UnixSeconds(1),
+                ended_at: Some(UnixSeconds(2)),
+                status: Some(500),
+                message: None,
+            }],
+        );
+
+        match admit_op(&k, &op("a brand-new intent"), &hash('9')) {
+            Admission::IncompatibleKey { id: named, op_kind } => {
+                assert_eq!(named, id);
+                assert_eq!(op_kind.as_deref(), Some("pop_stash"));
+            }
+            Admission::Fresh(..) => {
+                panic!("#509: a spent key must never execute a fresh operation")
+            }
+            _ => panic!("the poisoned key must be refused by name"),
+        }
+
+        // The sentence a client actually reads, bound to the record's facts.
+        assert_eq!(
+            incompatible_key_refusal(&id, Some("pop_stash")),
+            "That idempotency key already names operation incompatible-op-id — written by a \
+             Git-Vista build that understood an operation ('pop_stash') this build does not. \
+             It can't be replayed or re-run; send a new key."
+        );
+
+        // The guard is per-key, not a mode: a neighbouring key still admits.
+        assert!(matches!(
+            admit_op(&key("incompatible-neighbour"), &op("x"), &hash('8')),
+            Admission::Fresh(..)
         ));
     }
 
