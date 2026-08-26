@@ -166,11 +166,12 @@ beside the events, and `read_all` prints the report. Three things get counted:
   unreadable, with the highest version seen;
 - events whose capture came back `Unknown`.
 
-A line stamped newer than `JOURNAL_FORMAT_VERSION` is **read, not refused**. The
-format has grown additively so far — every field added since #131 is optional,
-by ADR 0070's rule, and D3 makes the one enum tolerant — so a newer line is
-mostly readable, and refusing it would discard data the reader can still use in
-order to be principled about data it cannot.
+A line stamped newer than `JOURNAL_FORMAT_VERSION` is **attempted, not refused
+by version alone**. The format has grown additively so far — every field added
+since #131 is optional, by ADR 0070's rule, and D3 makes the one enum tolerant —
+so a compatible newer line remains readable. An incompatible event shape is
+still skipped wholesale by the ordinary full-decode error path. The version
+probe explains that skip; it does not turn partial fields into an event.
 
 Version reporting does **not** wait for that full event decode. The parser first
 reads an envelope-only `VersionProbe` containing only optional `v`, then parses
@@ -181,13 +182,15 @@ merely decorative. Malformed JSON, or a `v` whose own value cannot be read as an
 integer, still has only the generic unreadable-line diagnostic.
 
 Additive growth remains a review convention, not something the compiler
-enforces. When the full event is readable, the notice says:
+enforces. The aggregate notice distinguishes compatible retained events from
+incompatible skipped events:
 
 ```
 git-vista: 99 journal line(s) were written by newer journal formats; the newest
-was journal format v3; this binary writes v1. They were read as far as this
-binary understands them — a field or ref capture it has no reading for is
-treated as "not recorded", never as "nothing was there".
+was journal format v3; this binary writes v1. Compatible newer events were
+retained; incompatible newer events were skipped by the unreadable-line
+diagnostics above. On retained events, a field or ref capture this binary has no
+reading for is treated as "not recorded", never as "nothing was there".
 ```
 
 The aggregate deliberately says *formats* and names only the newest. Mixed
@@ -224,6 +227,24 @@ different ways before the implementation was restored byte-for-byte:
 
 After every attack, `journal.rs` was restored from the same known-good snapshot
 and `diff -q` confirmed byte identity before the next mutation.
+
+The post-review truthfulness amendment was attacked twice more. Restoring the
+old unqualified notice failed at:
+
+```
+the notice must distinguish retained compatible events from the two skipped
+incompatible events
+```
+
+Keeping the new distinction but appending the old claim that every line was
+read as far as understood reached the independent negative assertion:
+
+```
+the aggregate must not claim skipped events were partially retained
+```
+
+Both mutations were restored from `/tmp/gv534-journal.rs.amend-good`, and
+`diff -q` confirmed byte identity after each restore.
 
 ## What this buys, split honestly between the past and the future
 

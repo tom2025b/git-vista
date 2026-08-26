@@ -543,10 +543,11 @@ impl WindowReport {
             out.push(format!(
                 "git-vista: {} journal line(s) were written by newer journal \
                  formats; the newest was journal format v{newest}; this binary \
-                 writes v{JOURNAL_FORMAT_VERSION}. They were read as far as this \
-                 binary understands them — a field or ref capture it has no \
-                 reading for is treated as \"not recorded\", never as \"nothing \
-                 was there\".",
+                 writes v{JOURNAL_FORMAT_VERSION}. Compatible newer events were \
+                 retained; incompatible newer events were skipped by the \
+                 unreadable-line diagnostics above. On retained events, a field \
+                 or ref capture this binary has no reading for is treated as \
+                 \"not recorded\", never as \"nothing was there\".",
                 self.from_newer
             ));
         }
@@ -565,13 +566,12 @@ impl WindowReport {
 /// Parse an already-capped window of journal lines, keeping account of what
 /// could not be read.
 ///
-/// **A line stamped newer than this binary writes is read, not refused.** The
-/// format is additive by construction — every field added since #131 is
-/// optional, and [`RefsAtEvent::Unknown`] makes the one enum tolerant — so a
-/// newer line is mostly readable, and refusing it would throw away the part
-/// this reader *can* use in order to be principled about the part it cannot.
-/// That is the #521 defect with a version number attached. It reads as far as
-/// it understands and says so instead.
+/// **A line stamped newer than this binary writes is attempted, not refused by
+/// version alone.** The format is additive by construction — every field added
+/// since #131 is optional, and [`RefsAtEvent::Unknown`] makes the one enum
+/// tolerant — so a compatible newer line remains readable. An incompatible
+/// event shape is still skipped by the ordinary full-decode error path, while
+/// the independent envelope probe preserves its writer-version explanation.
 fn parse_window(lines: &[&str]) -> Window {
     let mut events = Vec::new();
     let mut report = WindowReport::default();
@@ -2604,6 +2604,15 @@ mod tests {
             said.contains("newer journal formats")
                 && said.contains(&format!("journal format v{newer}")),
             "the version notice must explain the two unreadable lines: {said}"
+        );
+        assert!(
+            said.contains("Compatible newer events were retained")
+                && said.contains("incompatible newer events were skipped"),
+            "the notice must distinguish retained compatible events from the two skipped incompatible events: {said}"
+        );
+        assert!(
+            !said.contains("They were read as far as this binary understands them"),
+            "the aggregate must not claim skipped events were partially retained: {said}"
         );
     }
 
