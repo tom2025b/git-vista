@@ -367,18 +367,42 @@ pub enum HeadAtEvent {
     Unreadable { reason: String },
 }
 
+/// The namespace that owned a reflog entry before its ref name was shortened
+/// for display. A local branch and a remote-tracking branch may have the same
+/// short name (`origin/main`), so this provenance cannot be reconstructed from
+/// [`ReflogEntry::ref_name`] or from the current branch map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReflogRefKind {
+    Head,
+    LocalBranch,
+    RemoteBranch,
+}
+
 /// One raw reflog line, as read natively by `git-vista-git` — ref name plus
-/// the entry's old/new oids, timestamp and message. Defined here (not in the
-/// git crate) so [`assemble_feed`] can take them without core depending on
+/// its namespace, old/new oids, timestamp and message. Defined here (not in
+/// the git crate) so [`assemble_feed`] can take it without core depending on
 /// anything platform-specific.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReflogEntry {
     /// Short ref name: `"HEAD"`, `"main"`, `"origin/main"`.
     pub ref_name: String,
+    /// The namespace observed by the reflog reader before shortening.
+    pub ref_kind: ReflogRefKind,
     pub time: i64,
     pub old_oid: String,
     pub new_oid: String,
     pub message: String,
+}
+
+impl ReflogEntry {
+    /// Reattach the namespace while fold classification is still pending.
+    fn qualified_ref_name(&self) -> String {
+        match self.ref_kind {
+            ReflogRefKind::Head => self.ref_name.clone(),
+            ReflogRefKind::LocalBranch => format!("refs/heads/{}", self.ref_name),
+            ReflogRefKind::RemoteBranch => format!("refs/remotes/{}", self.ref_name),
+        }
+    }
 }
 
 /// The conventional 7-char short id, for labels.
@@ -519,7 +543,7 @@ pub fn assemble_feed(
             let mut span = i;
             while span + 1 < reflog.len() {
                 let next = &reflog[span + 1];
-                if next.ref_name != entry.ref_name {
+                if next.ref_kind != entry.ref_kind || next.ref_name != entry.ref_name {
                     break;
                 }
                 let (next_kind, _) = parse_reflog_message(&next.message);
@@ -532,7 +556,7 @@ pub fn assemble_feed(
             events.push(ActivityEvent {
                 time: entry.time,
                 kind: ActivityKind::Rebase,
-                ref_name: Some(entry.ref_name.clone()),
+                ref_name: Some(entry.qualified_ref_name()),
                 summary: if steps > 1 {
                     format!("rebase ({steps} steps)")
                 } else {
@@ -551,7 +575,7 @@ pub fn assemble_feed(
         events.push(ActivityEvent {
             time: entry.time,
             kind,
-            ref_name: Some(entry.ref_name.clone()),
+            ref_name: Some(entry.qualified_ref_name()),
             summary,
             old_oid: Some(entry.old_oid.clone()),
             new_oid: Some(entry.new_oid.clone()),
@@ -613,6 +637,25 @@ pub fn assemble_feed(
     // with one row that must survive — see [`fold_ref_update_bursts`].
     let mut events = fold_ref_update_bursts(events, branches);
 
+    // Reflog category was retained through the fold as a qualified ref name;
+    // now restore the short display name before undo and wire shaping. App
+    // journal events keep their full names. The synthesized External journal
+    // rows use short local names already, so neither prefix matches them.
+    for event in &mut events {
+        if event.source != ActivitySource::External {
+            continue;
+        }
+        let Some(name) = event.ref_name.as_mut() else {
+            continue;
+        };
+        let short = name
+            .strip_prefix("refs/heads/")
+            .or_else(|| name.strip_prefix("refs/remotes/"));
+        if let Some(short) = short {
+            *name = short.to_string();
+        }
+    }
+
     // -- 5. Undo hints, computed against the repo's *current* state. ---------
     for event in &mut events {
         event.undo = undo_hint(event, branches, remote);
@@ -649,12 +692,12 @@ pub fn assemble_feed(
 /// True when this event's ref is a *local branch* rather than a
 /// remote-tracking ref — the distinction [`fold_ref_update_bursts`] turns on.
 ///
-/// The two sources spell refs differently: the journal writes them in full
-/// (`refs/heads/main`, `refs/remotes/origin/main`) and reflog entries carry the
-/// short name (`main`, `origin/main`). A short name is ambiguous on its face —
-/// a local branch may legitimately be called `origin/main` — so it is resolved
-/// against the repo's *actual* branch list rather than by guessing at the
-/// slash.
+/// Journal entries already carry full names. Reflog entries are also kept
+/// qualified through the fold: [`ReflogRefKind`] restores the namespace that
+/// the reflog reader observed before shortening the name for display. This is
+/// load-bearing because `refs/heads/origin/main` and
+/// `refs/remotes/origin/main` may exist at once. A legacy or synthetic short
+/// name falls back to the repo's actual branch list.
 fn names_a_local_branch(ref_name: Option<&str>, branches: &HashMap<String, String>) -> bool {
     let Some(name) = ref_name else {
         return false;
@@ -995,8 +1038,27 @@ mod tests {
     use super::*;
 
     fn entry(ref_name: &str, time: i64, old: &str, new: &str, message: &str) -> ReflogEntry {
+        let ref_kind = if ref_name == "HEAD" {
+            ReflogRefKind::Head
+        } else if ref_name.contains('/') {
+            ReflogRefKind::RemoteBranch
+        } else {
+            ReflogRefKind::LocalBranch
+        };
+        entry_of_kind(ref_kind, ref_name, time, old, new, message)
+    }
+
+    fn entry_of_kind(
+        ref_kind: ReflogRefKind,
+        ref_name: &str,
+        time: i64,
+        old: &str,
+        new: &str,
+        message: &str,
+    ) -> ReflogEntry {
         ReflogEntry {
             ref_name: ref_name.to_string(),
+            ref_kind,
             time,
             old_oid: old.to_string(),
             new_oid: new.to_string(),
@@ -1533,6 +1595,55 @@ mod tests {
             feed.iter()
                 .any(|e| e.summary == "push — 4 refs updated" && e.ref_name.is_none()),
             "the four remote-tracking updates still fold: {feed:#?}"
+        );
+    }
+
+    /// A short reflog name cannot distinguish `refs/heads/origin/main` from
+    /// `refs/remotes/origin/main`. Both may exist at once, and the local
+    /// branch exemption must protect only the former without removing the
+    /// latter from its remote-tracking burst.
+    #[test]
+    fn a_local_origin_main_does_not_hide_remote_origin_main_from_the_push_fold() {
+        let reflog = vec![
+            entry_of_kind(
+                ReflogRefKind::LocalBranch,
+                "origin/main",
+                100,
+                "a",
+                "b",
+                "push",
+            ),
+            entry_of_kind(
+                ReflogRefKind::RemoteBranch,
+                "origin/main",
+                100,
+                "a",
+                "b",
+                "update by push",
+            ),
+            entry("origin/feat-a", 100, "p", "q", "update by push"),
+            entry("origin/feat-b", 100, "r", "s", "update by push"),
+            entry("origin/feat-c", 100, "t", "u", "update by push"),
+        ];
+        let branches = HashMap::from([("origin/main".to_string(), "b".to_string())]);
+        let feed = assemble_feed(vec![], reflog, &branches, &HashSet::new(), 50);
+
+        let branch_move = feed
+            .iter()
+            .find(|event| {
+                event.ref_name.as_deref() == Some("origin/main") && event.summary == "push"
+            })
+            .expect("the colliding local branch row survives the fold");
+        assert_eq!(branch_move.new_oid.as_deref(), Some("b"));
+        assert!(
+            feed.iter()
+                .any(|event| event.summary == "push — 4 refs updated"),
+            "all four remote-tracking rows must fold despite the local-name collision: {feed:#?}"
+        );
+        assert_eq!(
+            feed.len(),
+            2,
+            "one local move + one remote burst: {feed:#?}"
         );
     }
 
