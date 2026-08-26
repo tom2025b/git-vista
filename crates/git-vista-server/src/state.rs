@@ -1162,22 +1162,25 @@ mod tests {
             "the refusal was rewrapped into an ApiError envelope — double-encoded: {body}"
         );
 
-        // A third case, proving the *other* direction of the fix:
-        // `amend_route_response` must NOT label every `plan_and_execute`
-        // output JSON, only the ones that actually are. `plan_and_execute`
-        // itself refuses with plain English when the idempotency header is
-        // absent (`middleware::idempotency` just forwards the request
-        // untouched when the header is missing — see its own doc comment —
-        // so nothing upstream of the handler catches this one). If
-        // `amend_route_response` mislabeled that prose `application/json`,
-        // `middleware::rewrap_error`'s `is_json` check would pass it through
-        // untouched and the client would receive a raw English sentence
-        // that fails to parse as `ApiError` despite the header claiming
-        // JSON — worse than the double-encoding #323 set out to fix, not
-        // better. With the fix, the prose stays `text/plain` through
-        // `amend_route_response`, and `api_contract`'s `rewrap_error` still
-        // wraps it into a proper envelope, same as any other route's plain
-        // refusal.
+        // A third case, proving the *other* direction of the fix: not every
+        // `plan_and_execute` output from this route is JSON, and the ones that
+        // are not must still be enveloped. `plan_and_execute` itself refuses
+        // with plain English when the idempotency header is absent
+        // (`middleware::idempotency` just forwards the request untouched when
+        // the header is missing — see its own doc comment — so nothing
+        // upstream of the handler catches this one). Anything that labeled
+        // that prose `application/json` would make `middleware::rewrap_error`'s
+        // `is_json` check pass it through untouched, and the client would
+        // receive a raw English sentence that fails to parse as `ApiError`
+        // despite the header claiming JSON — worse than the double-encoding
+        // #323 set out to fix, not better.
+        //
+        // Until #336 this route ran its output through a local
+        // `amend_route_response` sniff, and this case was that sniff's
+        // negative. It is now the negative for `rewrap_error`'s own sniff,
+        // which is the only one left (ADR 0084): the prose stays `text/plain`
+        // out of the handler, and `api_contract` wraps it into a proper
+        // envelope, same as any other route's plain refusal.
         let no_key_body =
             format!(r#"{{"message":"amended","allow_empty":true,"expected_tip":"{tip}"}}"#);
         let req_no_key = HttpRequest::post("/api/amend-commit")

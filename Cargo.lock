@@ -977,6 +977,7 @@ dependencies = [
  "git-vista-git",
  "git-vista-protocol",
  "hmac",
+ "http-body-util",
  "libc",
  "rusqlite",
  "seccompiler",
