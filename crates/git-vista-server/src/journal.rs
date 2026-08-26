@@ -526,6 +526,12 @@ struct WindowReport {
     from_newer: usize,
     /// The highest such version seen — what to name in the notice.
     newest_version: Option<u32>,
+    /// How many of [`Self::from_newer`] this binary could not decode at all,
+    /// so the notice can say how many newer lines actually survived rather
+    /// than implying all of them did or none did. A newer line is counted in
+    /// both this and [`Self::unreadable`]: it is one line that is both newer
+    /// and unreadable, and the two facts have different remedies.
+    from_newer_skipped: usize,
     /// Events whose capture came back [`RefsAtEvent::Unknown`]: a capture is
     /// recorded and this binary has no reading for its `status`.
     unreadable_captures: usize,
@@ -543,12 +549,13 @@ impl WindowReport {
             out.push(format!(
                 "git-vista: {} journal line(s) were written by newer journal \
                  formats; the newest was journal format v{newest}; this binary \
-                 writes v{JOURNAL_FORMAT_VERSION}. Compatible newer events were \
-                 retained; incompatible newer events were skipped by the \
-                 unreadable-line diagnostics above. On retained events, a field \
-                 or ref capture this binary has no reading for is treated as \
-                 \"not recorded\", never as \"nothing was there\".",
-                self.from_newer
+                 writes v{JOURNAL_FORMAT_VERSION}. {} retained, {} skipped as \
+                 unreadable. On a retained line, a field or ref capture this \
+                 binary has no reading for is treated as \"not recorded\", \
+                 never as \"nothing was there\".",
+                self.from_newer,
+                self.from_newer - self.from_newer_skipped,
+                self.from_newer_skipped
             ));
         }
         if self.unreadable_captures > 0 {
@@ -576,10 +583,12 @@ fn parse_window(lines: &[&str]) -> Window {
     let mut events = Vec::new();
     let mut report = WindowReport::default();
     for line in lines.iter().filter(|l| !l.trim().is_empty()) {
+        let mut newer = false;
         if let Ok(VersionProbe { v: Some(v) }) = serde_json::from_str(line) {
             if v > JOURNAL_FORMAT_VERSION {
                 report.from_newer += 1;
                 report.newest_version = report.newest_version.max(Some(v));
+                newer = true;
             }
         }
         match serde_json::from_str::<ReadLine>(line) {
@@ -594,7 +603,12 @@ fn parse_window(lines: &[&str]) -> Window {
                 }
                 events.push(event);
             }
-            Err(e) => report.unreadable.push(e.to_string()),
+            Err(e) => {
+                if newer {
+                    report.from_newer_skipped += 1;
+                }
+                report.unreadable.push(e.to_string());
+            }
         }
     }
     Window { events, report }
@@ -2606,9 +2620,9 @@ mod tests {
             "the version notice must explain the two unreadable lines: {said}"
         );
         assert!(
-            said.contains("Compatible newer events were retained")
-                && said.contains("incompatible newer events were skipped"),
-            "the notice must distinguish retained compatible events from the two skipped incompatible events: {said}"
+            said.contains("0 retained, 2 skipped as unreadable"),
+            "both newer lines were skipped, and the notice must count them \
+             rather than describing the two classes in the abstract: {said}"
         );
         assert!(
             !said.contains("They were read as far as this binary understands them"),
@@ -2643,6 +2657,18 @@ mod tests {
         assert!(
             said.contains(&format!("newest was journal format v{v3}")),
             "the notice must still name the newest version: {said}"
+        );
+        // The mirror of the incompatible case: NOTHING was skipped here, so
+        // the notice must not point at unreadable-line diagnostics this read
+        // never emitted. Counting both classes is what makes the one sentence
+        // true in either direction.
+        assert!(
+            said.contains("2 retained, 0 skipped as unreadable"),
+            "both newer lines were readable and the notice must say so: {said}"
+        );
+        assert!(
+            window.report.unreadable.is_empty(),
+            "precondition: this window has no unreadable lines to refer to"
         );
         assert!(
             !said.contains(&format!(
