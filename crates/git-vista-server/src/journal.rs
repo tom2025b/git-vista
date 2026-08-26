@@ -108,6 +108,18 @@ struct ReadLine {
     event: ActivityEvent,
 }
 
+/// The part of a journal envelope that must remain readable even when the
+/// flattened event is from a format this binary cannot deserialize.
+///
+/// Probing this separately is the stamp's diagnostic value: an unknown future
+/// event kind or a missing required event field can still be attributed to the
+/// newer writer before full event decoding fails.
+#[derive(serde::Deserialize)]
+struct VersionProbe {
+    #[serde(default)]
+    v: Option<u32>,
+}
+
 fn journal_path(repo: &Path) -> Option<PathBuf> {
     state_dir(repo).map(|d| d.join("journal.jsonl"))
 }
@@ -529,11 +541,12 @@ impl WindowReport {
             .collect();
         if let (true, Some(newest)) = (self.from_newer > 0, self.newest_version) {
             out.push(format!(
-                "git-vista: {} journal line(s) were written by journal format \
-                 v{newest}; this binary writes v{JOURNAL_FORMAT_VERSION}. They were \
-                 read as far as this binary understands them — a field or ref \
-                 capture it has no reading for is treated as \"not recorded\", \
-                 never as \"nothing was there\".",
+                "git-vista: {} journal line(s) were written by newer journal \
+                 formats; the newest was journal format v{newest}; this binary \
+                 writes v{JOURNAL_FORMAT_VERSION}. They were read as far as this \
+                 binary understands them — a field or ref capture it has no \
+                 reading for is treated as \"not recorded\", never as \"nothing \
+                 was there\".",
                 self.from_newer
             ));
         }
@@ -563,12 +576,19 @@ fn parse_window(lines: &[&str]) -> Window {
     let mut events = Vec::new();
     let mut report = WindowReport::default();
     for line in lines.iter().filter(|l| !l.trim().is_empty()) {
+        if let Ok(VersionProbe { v: Some(v) }) = serde_json::from_str(line) {
+            if v > JOURNAL_FORMAT_VERSION {
+                report.from_newer += 1;
+                report.newest_version = report.newest_version.max(Some(v));
+            }
+        }
         match serde_json::from_str::<ReadLine>(line) {
             Ok(ReadLine { v, event }) => {
-                if v.is_some_and(|v| v > JOURNAL_FORMAT_VERSION) {
-                    report.from_newer += 1;
-                    report.newest_version = report.newest_version.max(v);
-                }
+                // `v` remains part of the full envelope shape so stamped and
+                // unstamped success paths are both exercised here. Reporting
+                // uses the independent probe above and must not move back
+                // behind this successful decode.
+                let _ = v;
                 if matches!(event.refs, Some(RefsAtEvent::Unknown)) {
                     report.unreadable_captures += 1;
                 }
@@ -2535,6 +2555,91 @@ mod tests {
         assert!(
             said.contains("skipping an unreadable journal line"),
             "the pre-existing loud skip survives the rewrite: {said}"
+        );
+    }
+
+    /// A version stamp must still explain a line whose event shape this binary
+    /// cannot deserialize. Probing `v` only after [`ReadLine`] succeeds makes
+    /// the stamp useless in exactly the case it exists to diagnose.
+    #[test]
+    fn incompatible_newer_lines_still_report_their_writer_version() {
+        let newer = JOURNAL_FORMAT_VERSION + 1;
+        let future_kind = format!(
+            r#"{{"v":{newer},"time":7,"kind":"FutureKind","ref_name":"main","summary":"future kind","old_oid":"a","new_oid":"b","source":"App"}}"#
+        );
+        let future_required_field = format!(
+            r#"{{"v":{newer},"time":8,"kind":"Commit","ref_name":"main","summary":"future required field","old_oid":"a","new_oid":"b"}}"#
+        );
+
+        let kind_error = serde_json::from_str::<ReadLine>(&future_kind)
+            .err()
+            .expect("the future event kind must be incompatible");
+        assert!(
+            kind_error
+                .to_string()
+                .contains("unknown variant `FutureKind`"),
+            "fixture must fail on the future kind, not malformed JSON: {kind_error}"
+        );
+        let field_error = serde_json::from_str::<ReadLine>(&future_required_field)
+            .err()
+            .expect("the missing required event field must be incompatible");
+        assert!(
+            field_error.to_string().contains("missing field `source`"),
+            "fixture must fail on a required event field: {field_error}"
+        );
+
+        let window = parse_window(&[&future_kind, &future_required_field]);
+        assert!(
+            window.events.is_empty(),
+            "neither incompatible event may be invented"
+        );
+        assert_eq!(window.report.unreadable.len(), 2);
+        assert_eq!(
+            window.report.from_newer, 2,
+            "the envelope version must be counted independently of event decoding"
+        );
+        assert_eq!(window.report.newest_version, Some(newer));
+        let said = window.report.notices().join("\n");
+        assert!(
+            said.contains("newer journal formats")
+                && said.contains(&format!("journal format v{newer}")),
+            "the version notice must explain the two unreadable lines: {said}"
+        );
+    }
+
+    /// Mixed generations are normal in an append-only file. An aggregate
+    /// count paired with only the maximum version must not claim every line
+    /// came from that one maximum writer.
+    #[test]
+    fn mixed_future_versions_are_attributed_to_newer_formats_not_only_the_newest() {
+        let v2 = JOURNAL_FORMAT_VERSION + 1;
+        let v3 = JOURNAL_FORMAT_VERSION + 2;
+        let line = |version, summary| {
+            format!(
+                r#"{{"v":{version},"time":7,"kind":"Commit","ref_name":"main","summary":"{summary}","old_oid":"a","new_oid":"b","source":"App"}}"#
+            )
+        };
+        let line_v2 = line(v2, "from v2");
+        let line_v3 = line(v3, "from v3");
+        let window = parse_window(&[&line_v2, &line_v3]);
+
+        assert_eq!(window.events.len(), 2);
+        assert_eq!(window.report.from_newer, 2);
+        assert_eq!(window.report.newest_version, Some(v3));
+        let said = window.report.notices().join("\n");
+        assert!(
+            said.contains("2 journal line(s) were written by newer journal formats"),
+            "the aggregate must not attribute both lines to one version: {said}"
+        );
+        assert!(
+            said.contains(&format!("newest was journal format v{v3}")),
+            "the notice must still name the newest version: {said}"
+        );
+        assert!(
+            !said.contains(&format!(
+                "2 journal line(s) were written by journal format v{v3}"
+            )),
+            "mixed v{v2}/v{v3} lines must not be blamed wholly on v{v3}: {said}"
         );
     }
 }

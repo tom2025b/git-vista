@@ -162,24 +162,37 @@ beside the events, and `read_all` prints the report. Three things get counted:
 
 - lines skipped because they would not parse at all (the pre-existing loud skip,
   now counted rather than only logged one by one);
-- lines stamped **newer** than this binary writes, with the highest version seen;
+- lines stamped **newer** than this binary writes, even when the event itself is
+  unreadable, with the highest version seen;
 - events whose capture came back `Unknown`.
 
 A line stamped newer than `JOURNAL_FORMAT_VERSION` is **read, not refused**. The
 format has grown additively so far — every field added since #131 is optional,
 by ADR 0070's rule, and D3 makes the one enum tolerant — so a newer line is
 mostly readable, and refusing it would discard data the reader can still use in
-order to be principled about data it cannot. That rule is a review convention,
-not something the compiler enforces; a future *required* field would still cost
-an old reader the line, and the stamp is then exactly what tells it why. It says
-so instead:
+order to be principled about data it cannot.
+
+Version reporting does **not** wait for that full event decode. The parser first
+reads an envelope-only `VersionProbe` containing only optional `v`, then parses
+the flattened `ReadLine`. Consequently an unknown future `kind` or a future
+required event field can still cost this reader the event, but cannot also erase
+the newer writer's version. This is what makes the stamp explanatory rather than
+merely decorative. Malformed JSON, or a `v` whose own value cannot be read as an
+integer, still has only the generic unreadable-line diagnostic.
+
+Additive growth remains a review convention, not something the compiler
+enforces. When the full event is readable, the notice says:
 
 ```
-git-vista: 99 journal line(s) were written by journal format v2; this binary
-writes v1. They were read as far as this binary understands them — a field or
-ref capture it has no reading for is treated as "not recorded", never as
-"nothing was there".
+git-vista: 99 journal line(s) were written by newer journal formats; the newest
+was journal format v3; this binary writes v1. They were read as far as this
+binary understands them — a field or ref capture it has no reading for is
+treated as "not recorded", never as "nothing was there".
 ```
+
+The aggregate deliberately says *formats* and names only the newest. Mixed
+generations are normal in an append-only file, so a count spanning v2 and v3
+must not claim every counted line was written by v3.
 
 with a companion for the capture itself, which can also arrive on an unstamped
 line — a corrupt or hand-edited `status`:
@@ -194,6 +207,23 @@ The first sentence is the whole benefit of D2, stated as the thing it produces. 
 report is a value with its own tests rather than a `eprintln!` asserted through
 captured stderr — ADR 0082's lesson, that a mechanism which "should have run" is
 worth nothing unless something exercises it.
+
+### Mutation record for the explanatory stamp and mixed-version notice
+
+Two focused regression tests pin these claims, and each was attacked in two
+different ways before the implementation was restored byte-for-byte:
+
+- removing the independent version probe changed the incompatible-line count
+  from the expected `2` to `0`;
+- requiring the probe to recognize `ActivityKind` changed that count to `1`,
+  proving an unknown future kind must not gate the envelope stamp;
+- restoring the old single-version wording made the mixed v2/v3 assertion fail
+  on `2 journal line(s) were written by journal format v3`;
+- retaining the first newer version instead of the maximum produced
+  `left: Some(2)`, `right: Some(3)`.
+
+After every attack, `journal.rs` was restored from the same known-good snapshot
+and `diff -q` confirmed byte identity before the next mutation.
 
 ## What this buys, split honestly between the past and the future
 
