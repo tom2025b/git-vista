@@ -64,6 +64,11 @@ pub fn tool_catalog() -> serde_json::Value {
     let array = catalog
         .as_array_mut()
         .expect("the read catalog is a JSON array");
+    // M12/CLOUD-4 (#450): `get_lesson`, a read tool that explains a `plan_*`
+    // tool's own plan locally. Placed right after the live-read six and
+    // before the plan-building surface — it reads no live state itself, but
+    // it is not a write either, so it belongs with the reads.
+    array.extend(crate::lesson::lesson_tool_catalog());
     array.extend(crate::plan_tools::plan_tool_catalog());
     // M2.23e (#249): the one write tool, appended last so it is always the
     // catalog's final entry — see `tools::tests::the_tool_catalog_lists_exactly_the_six_read_tools`.
@@ -350,6 +355,9 @@ pub fn call_tool(
             let path = format!("/api/activity{qs}");
             get_json::<Vec<git_vista_core::activity::ActivityEvent>>(&path, session)
         }
+        // M12/CLOUD-4 (#450): local — no HTTP call. See `lesson`'s module doc
+        // for why explaining a `plan` object needs no network round trip.
+        "get_lesson" => crate::lesson::get_lesson(arguments),
         // M2.23d (#248): the `plan_*` build-only surface, then M2.23e (#249)'s
         // one write tool. Tried *after* the read tools and before the
         // unknown-tool refusal, so neither can shadow a read tool's name, and
@@ -705,12 +713,17 @@ mod tests {
     }
 
     #[test]
-    fn the_tool_catalog_lists_exactly_the_six_read_tools() {
+    fn the_tool_catalog_lists_exactly_the_seven_read_tools() {
         // #248 appended the `plan_*` surface after these, so the read tools
         // are now a *prefix* of the catalog rather than the whole of it —
         // still pinned in order, and still pinned to exactly these names, so
         // a read tool silently added, removed or renamed fails here as
         // before. `plan_tools`'s own census owns the rest of the catalog.
+        //
+        // `get_lesson` (#450) joined this prefix rather than the six that
+        // reach the live server: it never makes an HTTP call (see
+        // `lesson`'s module doc), but it mutates nothing either, so it is
+        // still a read for this census's purpose.
         let cat = tool_catalog();
         let names: Vec<&str> = cat
             .as_array()
@@ -726,6 +739,7 @@ mod tests {
             "get_commit_diff",
             "get_status",
             "get_activity",
+            "get_lesson",
         ];
         assert_eq!(names[..expected_reads.len()], expected_reads);
         // M2.23e (#249) appended exactly one write tool, `execute_plan`, as

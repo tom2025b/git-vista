@@ -52,6 +52,7 @@
 mod auth;
 mod execute_tool;
 mod http;
+mod lesson;
 mod plan_tools;
 mod tools;
 
