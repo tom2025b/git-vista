@@ -170,6 +170,78 @@ jobs:
           # key included — moves with it.
           echo "version=$floor" >> "$GITHUB_OUTPUT"
 
+          # -- #520: the reviewed version -> commit mapping (ADR 0087) --------
+          #
+          # The heading above stays the single source of the VERSION. It is not
+          # a source of SOURCE. `v2.32.0` is a ref in somebody else's
+          # repository, and a ref is a name that can be repointed; the steps
+          # below clone that name and run `make` over whatever comes back —
+          # arbitrary code, from a mutable ref, inside a required merge job.
+          # So the document says WHICH git, and this table says which COMMIT
+          # was reviewed for it. Both are needed and neither substitutes.
+          #
+          # HOW TO UPDATE THIS WHEN THE FLOOR MOVES. The procedure is part of
+          # the boundary — skipped, it turns the pin back into the tag:
+          #
+          #   1. Edit `## Git: X.Y or later` in docs/SUPPORTED_VERSIONS.md.
+          #      That is still the only place the version number lives.
+          #   2. Resolve the new tag yourself, from a machine you trust:
+          #        git ls-remote --tags https://github.com/git/git 'vX.Y.0^{}'
+          #      The `^{}` line is the commit; the bare line is the tag object.
+          #      The commit is what goes in the table.
+          #   3. Corroborate it against a second, independent source before
+          #      writing it down — a clone you already had, git's release
+          #      announcement, or `git verify-tag vX.Y.0` with Junio C
+          #      Hamano's key in your keyring. CI does not check signatures
+          #      (ADR 0087 names that as a non-goal); this human step is the
+          #      review that the pin is a durable record of.
+          #   4. ADD a row below. Do not edit or delete an existing one: the
+          #      rows are the record of what was reviewed, and when.
+          #   5. Push. The first run is a cache MISS by construction, because
+          #      the pin is part of the cache key — so a new row is exercised
+          #      on the very next CI run rather than whenever the cache
+          #      happens to expire.
+          #
+          # One row today, because the floor is 2.32 and 2.32 is what has
+          # actually been reviewed. A floor with no row fails the job; it does
+          # not fall back to trusting the tag.
+          case "$floor" in
+            # git 2.32.0 — tag v2.32.0 peels to this commit (subject "Git
+            # 2.32", authored 2021-06-06). Resolved and reviewed 2026-08-26
+            # for #520.
+            2.32) pin=ebf3c04b262aa27fbb97f8a0156c2347fecafafb ;;
+            *)
+              echo "::error::no reviewed commit pin for git floor $floor. docs/SUPPORTED_VERSIONS.md moved the floor but the version->commit table in .github/workflows/ci.yml did not follow it. Follow the update procedure written above that table; building a tag nobody has reviewed is exactly what #520 closed."
+              exit 1
+              ;;
+          esac
+          echo "reviewed pin for git $floor: $pin"
+          echo "commit=$pin" >> "$GITHUB_OUTPUT"
+
+          # -- #520: arch + toolchain identity for the cache key --------------
+          #
+          # `runner.os` alone is `Linux` for 22.04 and 24.04, and for x86_64
+          # and arm64 alike. What gets cached is a C binary compiled against
+          # this image's headers and linked against its glibc, so the key has
+          # to carry the things that actually decide whether that artifact is
+          # the right one to hand back. Hashed to keep the key short; the
+          # facts are echoed in full first, so a key that changes is
+          # diagnosable from the log instead of mysterious.
+          #
+          # Fail closed when a fact cannot be read. A key that quietly loses
+          # its toolchain identity is precisely the failure mode this exists
+          # to prevent, and it would fail silently and permanently.
+          arch=$(uname -m)
+          triple=$(cc -dumpmachine 2>/dev/null || true)
+          libc=$(ldd --version 2>/dev/null | head -1 | grep -oP '[0-9]+\.[0-9]+$' || true)
+          if [ -z "$arch" ] || [ -z "$triple" ] || [ -z "$libc" ]; then
+            echo "::error::could not read the runner's toolchain identity (uname -m='$arch', cc -dumpmachine='$triple', glibc='$libc'). The floor cache key has to carry it, so this fails rather than storing a compiled binary under a key that does not say what built it."
+            exit 1
+          fi
+          echo "floor toolchain identity: arch=$arch triple=$triple glibc=$libc"
+          toolchain=$(printf '%s\n' "$arch" "$triple" "$libc" | sha256sum | cut -c1-12)
+          echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
+
       # -- #365: the floor is EXERCISED, not merely enforced as a lower bound --
       #
       # The step above rejects a runner older than 2.32. It does not run
@@ -183,12 +255,25 @@ jobs:
       # binary is missing reports the same green as one that passed. So the
       # test writes a report and this job checks it, the same anti-vacuity
       # shape the sandbox job uses against GV_ESCAPE_REPORT. See ADR 0082.
+
+      # #520: the key names everything that decides what may be served from
+      # it — runner OS and arch, a digest of the C toolchain the artifact was
+      # built against, the documented floor version, and the reviewed commit
+      # that version pins to. Two consequences, both intended: an entry
+      # written before the pin existed can never satisfy this key again, and
+      # moving the pin forces a re-provision, so the check below runs on the
+      # first build of any newly-pinned source rather than whenever the cache
+      # happens to expire.
+      #
+      # Deliberately NO `restore-keys`. A prefix fallback would let an entry
+      # keyed on some other commit answer a lookup for this one, which hands
+      # the whole boundary straight back. See ADR 0087.
       - name: Cache the git floor build
         id: git_floor_cache
         uses: actions/cache@v4
         with:
           path: ~/.cache/gv-git-floor
-          key: gv-git-floor-${{ runner.os }}-${{ steps.git_floor.outputs.version }}
+          key: gv-git-floor-${{ runner.os }}-${{ runner.arch }}-tc${{ steps.git_floor.outputs.toolchain }}-${{ steps.git_floor.outputs.version }}-${{ steps.git_floor.outputs.commit }}
 
       # A cache hit needs no network at all, which is most of the answer to
       # "what happens when the source is briefly unreachable". A miss retries
@@ -210,9 +295,27 @@ jobs:
             sleep $((attempt * 5))
           done
           if [ "$ok" != true ]; then
-            echo "::error::PROVISIONING FAILED: could not fetch git v${floor}.0 after 3 attempts. This is not a parser regression — the floor leg could not be built. Re-run the job; a successful run populates the cache keyed on the floor number."
+            echo "::error::PROVISIONING FAILED: could not fetch git v${floor}.0 after 3 attempts. This is not a parser regression — the floor leg could not be built. Re-run the job; a successful run populates the cache, which is keyed on the pinned source and this runner's toolchain identity (#520)."
             exit 1
           fi
+
+          # #520: the tag got us a tree; this is what says it is the REVIEWED
+          # tree. It runs HERE — after the clone, before `make` — because
+          # `make` executes makefiles and scripts out of that tree, so a check
+          # placed after the build would be interrogating something that has
+          # already had its say. `HEAD^{}` peels, so it reads the same commit
+          # whether HEAD landed on the tag object or on its target.
+          #
+          # A refusal here builds nothing and caches nothing: the job fails,
+          # and actions/cache only writes its entry when the job succeeds.
+          want='${{ steps.git_floor.outputs.commit }}'
+          got=$(git -C "$src/git" rev-parse 'HEAD^{}' 2>/dev/null || true)
+          if [ "$got" != "$want" ]; then
+            echo "::error::FLOOR PIN MISMATCH: https://github.com/git/git tag v${floor}.0 peels to commit ${got:-<unreadable>}, but the reviewed pin for git ${floor} is ${want}. Either the tag moved, or the retrieval path is not serving the reviewed source, or the pin in .github/workflows/ci.yml is stale. Nothing was built and nothing was cached. Do NOT resolve this by copying the got hash over the want hash — resolve and review the new commit first; the procedure is written above the pin table in this file."
+            exit 1
+          fi
+          echo "floor source verified: v${floor}.0 -> $got matches the reviewed pin"
+
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends zlib1g-dev
           # NO_GETTEXT/NO_TCLTK: msgfmt and tclsh are not needed to run
