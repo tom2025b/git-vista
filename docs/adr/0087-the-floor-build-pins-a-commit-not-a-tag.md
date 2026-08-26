@@ -39,12 +39,25 @@ behaviour assertion in this pipeline exists. So "it verifies the printed version
 just a weak check; it is a check that happens strictly downstream of the execution it
 would need to have prevented.
 
-**3. Binary → verification. Open, exactly as the issue describes.** The only identity
-check on the resulting binary is the string it prints. `version_of()`
-(`crates/git-vista-fixtures/tests/status_floor.rs:120-130`) runs `<binary> --version`
-and strips the literal prefix `git version `; the test asserts that string against the
-documented floor, and CI asserts the same string a second time out of the test's report.
-A binary that prints `git version 2.32.0` satisfies every one of them.
+**3. Binary → verification. Open, and one degree weaker than the issue's wording.** The
+issue says the job "verifies the printed version". Read literally at the point of the
+build, it does not verify anything at all: the provisioning step's closing
+`"$HOME/.cache/gv-git-floor/bin/git" --version` is a bare invocation whose output is
+captured nowhere and compared to nothing. Under `set -euo pipefail` it proves the binary
+*executes*. That is the whole of what happens at the moment the artifact comes into
+existence.
+
+The assertions are real, but they are two and three steps downstream, and all of them
+read the same one string. `version_of()`
+(`crates/git-vista-fixtures/tests/status_floor.rs:120-130`) runs `<binary> --version` and
+strips the literal prefix `git version `; the test asserts that string against the
+documented floor; the "Report assertions" step asserts it a second time out of the
+report the test writes. A binary that prints `git version 2.32.0` satisfies every one of
+them.
+
+So the accurate statement is not "the printed version is verified, which is weak" but
+"nothing is asserted where the artifact is produced, and what is asserted later is a
+string the artifact chooses for itself".
 
 There is a real partial mitigation here, and it deserves saying rather than being quietly
 dropped to make the finding look worse: the battery holds **both** binaries to
@@ -85,8 +98,9 @@ own header enumerates, and `on: pull_request: branches: [main]` puts it on every
 closed, so the fix does not shrink.** Two corrections to the issue's framing, and both
 change the *shape* of the fix rather than the conclusion:
 
-- The compromise lands at `make`, not at `git status`. **The check must therefore precede
-  the build**, not merely exist.
+- The compromise lands at `make`, not at `git status`, and the build step asserts nothing
+  about what it produced. **The check must therefore precede the build**, not merely
+  exist somewhere in the job.
 - The cache's role is persistence under a stable trusted key, not third-party poisoning.
   That is precisely the argument for putting the pin **into the key**: it is what makes
   every pre-pin entry unreachable and forces the new check to run on any newly-pinned
