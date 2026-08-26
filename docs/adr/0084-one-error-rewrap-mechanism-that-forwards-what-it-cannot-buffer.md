@@ -231,11 +231,19 @@ magic number that would silently stop testing the edge if the cap ever moved.
 
 **Baseline.** ~320 `git-vista-server` tests fail in the cloud container on
 unmodified `main` — the strict sandbox tier needs `landlock_abi>=6` plus
-`bwrap`, and this kernel lacks Landlock. Measured on `405a764` with
-`gv-sandbox` built first: **616 passed, 321 failed, 4 ignored**. After this
-change: **625 passed, 321 failed, 4 ignored**. The failing sets are identical —
+`bwrap`, and this kernel lacks Landlock. So the number that means anything is
+the *difference*, and it is re-measured whenever `main` moves under the branch
+rather than carried forward: a stale baseline would quietly absorb a regression
+introduced by someone else's merge, or blame this branch for one.
+
+Measured on `5ec2ae5` (post-#530, post-#537) with `gv-sandbox` built first:
+**624 passed, 321 failed, 4 ignored**. This branch, merged up to the same
+commit: **633 passed, 321 failed, 4 ignored**. The failing sets are identical —
 `comm` over the sorted names reports zero new failures and zero newly passing.
 The +9 are exactly the nine tests added here.
+
+(The same comparison against the branch's original base `405a764` read 616 →
+625, also with an identical failing set.)
 
 **What the baseline could not tell us, and did.** One of those 321 is
 `state::tests::selection_flow_carries_mode_and_gates_writes`, which dies at its
