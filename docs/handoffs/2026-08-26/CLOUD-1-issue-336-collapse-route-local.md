@@ -75,12 +75,26 @@ for the common case but genuinely stronger in one edge: it sniffs the
 2. **If collapsing:** remove `amend_refusal_body` / `amend_route_response`,
    restore `amend_refusal` to the plain `(StatusCode, String)` shape — WITHOUT
    disturbing the revert-conflict (#327) work that shares these files.
-3. **Pin the incidental coverage:** `/api/fetch` and `/api/pull`
-   hand-serialize their errors and are covered ONLY by the general sniff
-   today — no wire-level test reaches them through the real router (existing
-   `FetchError`/`PullError` tests call planner functions directly). Add
-   wire-level tests through the real router + middleware for both, so
-   narrowing the general sniff ever again turns something red.
+3. **Pin the incidental coverage — but the issue is half wrong here, and
+   knowing which half saves you the work of inventing a pattern that already
+   exists.** The issue claims "no wire-level test covers them: every existing
+   `FetchError`/`PullError` test calls planner functions directly, bypassing
+   the router and `api_contract` entirely." Verified against `405a7644`:
+
+   - **`/api/pull` IS covered.** `the_strategy_mandate_is_a_400_through_a_real_router`
+     (`handlers/pull.rs:360`) builds a real `Router`, layers
+     `middleware::api_contract`, and asserts a 400 refusal whose typed DTO
+     body is parsed directly — its own doc comment states it mirrors
+     `/api/amend-commit`'s contract and notes `/api/fetch` builds `FetchError`
+     the same way.
+   - **`/api/fetch` is NOT covered.** The only `route("/api/fetch", …)` in the
+     tree is the production registration at `main.rs:575`.
+
+   So: extend the existing pull test's shape to `/api/fetch` rather than
+   inventing one, and add whatever the surviving mechanism from step 1 needs
+   to make a narrowing of the general sniff turn something red. If your own
+   check disagrees with either bullet, say so in the PR body and follow your
+   check — not this document.
 4. **Mutation-prove whichever mechanism survives, two different ways** —
    remove the sniff, then weaken it (e.g. relabel only sub-64KiB bodies) —
    red at different assertions, byte-identical restore verified with diff.

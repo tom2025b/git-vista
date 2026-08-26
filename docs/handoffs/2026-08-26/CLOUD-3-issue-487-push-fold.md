@@ -39,10 +39,11 @@ deliverables:
 - `fold_ref_update_bursts` at `crates/git-vista-core/src/activity.rs:775`,
   with the candidate gate at `:780`:
   `matches!(e.kind, ActivityKind::Fetch | ActivityKind::Pull)`.
-- `push::journal_updates` call sites at `planner/push.rs:489/:505/:510` —
-  the issue's `:684/:693` line numbers have drifted; the per-ref loop is in
-  the function those calls reach. Open it and confirm the loop before
-  building on it.
+- `push::journal_updates` is defined at **`planner/push.rs:684`** with its
+  per-ref loop at **`:693`** — **the issue's line numbers are correct and
+  current** (an earlier draft of this handoff claimed they had drifted; that
+  claim was wrong and is retracted here). Its three call sites are at
+  `:489`, `:505` and `:510`.
 - The issue's survey stands: exactly two per-item journal loops exist
   (fetch — folded since #329 — and push), and the synthesized
   `BranchDeleted` loop is CORRECTLY per-item (N distinct user actions; its
