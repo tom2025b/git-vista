@@ -345,7 +345,7 @@ pub fn append_all(repo: &Path, events: &[ActivityEvent]) {
             }
         };
         // Every line this binary writes says which format wrote it (#521,
-        // ADR 0085). Costs `"v":1,` — seven bytes against a batched line's
+        // ADR 0085). Costs `"v":1,` — six bytes against a batched line's
         // measured 225 — and is ignored outright by every reader that does
         // not know the field.
         let Ok(line) = serde_json::to_string(&WrittenLine {

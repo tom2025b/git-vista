@@ -113,8 +113,8 @@ capture, and it is the reason the field is optional rather than
 wire DTO of `/api/activity`. A journal format version is a fact about a file on
 disk; it has no meaning to a browser, which has its own version negotiation in
 `git-vista-protocol`. So the stamp is a server-side envelope
-(`journal::JournalLine`, `v` plus `#[serde(flatten)]` over the event) and
-`ActivityEvent` is untouched. **The line is not the event; the line is a
+(`journal::WrittenLine` and `journal::ReadLine`, each `v` plus
+`#[serde(flatten)]` over the event) and `ActivityEvent` is untouched. **The line is not the event; the line is a
 versioned envelope around one.** That is the structural change, and it is what
 makes a future format change expressible at all.
 
@@ -166,10 +166,13 @@ beside the events, and `read_all` prints the report. Three things get counted:
 - events whose capture came back `Unknown`.
 
 A line stamped newer than `JOURNAL_FORMAT_VERSION` is **read, not refused**. The
-format is additive by construction — every field added since #131 is optional,
-and D3 makes the one enum tolerant — so a newer line is mostly readable, and
-refusing it would discard data the reader can still use in order to be
-principled about data it cannot. It says so instead:
+format has grown additively so far — every field added since #131 is optional,
+by ADR 0070's rule, and D3 makes the one enum tolerant — so a newer line is
+mostly readable, and refusing it would discard data the reader can still use in
+order to be principled about data it cannot. That rule is a review convention,
+not something the compiler enforces; a future *required* field would still cost
+an old reader the line, and the stamp is then exactly what tells it why. It says
+so instead:
 
 ```
 git-vista: 99 journal line(s) were written by journal format v2; this binary
@@ -178,7 +181,16 @@ ref capture it has no reading for is treated as "not recorded", never as
 "nothing was there".
 ```
 
-That sentence is the whole benefit of D2, stated as the thing it produces. The
+with a companion for the capture itself, which can also arrive on an unstamped
+line — a corrupt or hand-edited `status`:
+
+```
+git-vista: 1 journal line(s) carry a ref capture in a shape this binary cannot
+read; those events are shown with no capture at all, which is not a claim that
+the repository had no refs.
+```
+
+The first sentence is the whole benefit of D2, stated as the thing it produces. The
 report is a value with its own tests rather than a `eprintln!` asserted through
 captured stderr — ADR 0082's lesson, that a mechanism which "should have run" is
 worth nothing unless something exercises it.
@@ -203,9 +215,9 @@ M5-family reviews flagged both.
 
 ## Consequences
 
-**A journal line grows by seven bytes.** `"v":1,` on every line `append_all`
-writes. Against ADR 0080's measured 225 bytes/line at 500 refs that is ~3%, and
-against a single event's 407 bytes ~1.7%. The read cap bounds the total either
+**A journal line grows by six bytes.** `"v":1,` on every line `append_all`
+writes. Against ADR 0080's measured 225 bytes/line at 500 refs that is 2.7%, and
+against a single event's 407 bytes 1.5%. The read cap bounds the total either
 way.
 
 **ADR 0080 D1's "byte-for-byte unchanged" claim about `journal::append` is no
