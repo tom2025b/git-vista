@@ -120,8 +120,20 @@ async fn a_double_clicked_commit_creates_exactly_one_commit() {
     let before = commit_count(&repo, "HEAD");
 
     let (a, b) = tokio::join!(
-        plan_and_execute_in(&repo, Some(id), tokens(), commit("double click")),
-        plan_and_execute_in(&repo, Some(id), tokens(), commit("double click")),
+        plan_and_execute_in(
+            &repo,
+            Some(id),
+            tokens(),
+            commit("double click"),
+            crate::planner::DropProof::Nothing
+        ),
+        plan_and_execute_in(
+            &repo,
+            Some(id),
+            tokens(),
+            commit("double click"),
+            crate::planner::DropProof::Nothing
+        ),
     );
 
     let statuses = [a.0, b.0];
@@ -165,6 +177,7 @@ async fn concurrent_identical_branch_creates_leave_one_branch() {
                     name: BranchName::new("feature").unwrap(),
                     at: CommitOid::new(at).unwrap(),
                 },
+                crate::planner::DropProof::Nothing,
             )
             .await
         }));
@@ -203,7 +216,14 @@ async fn a_cancelled_queued_request_never_mutates() {
     let queued = {
         let repo = repo.clone();
         tokio::spawn(async move {
-            plan_and_execute_in(&repo, Some(id), tokens(), commit("never runs")).await
+            plan_and_execute_in(
+                &repo,
+                Some(id),
+                tokens(),
+                commit("never runs"),
+                crate::planner::DropProof::Nothing,
+            )
+            .await
         })
     };
     // Let it reach the guard and block there.
@@ -219,8 +239,14 @@ async fn a_cancelled_queued_request_never_mutates() {
     );
 
     // The guard is usable afterwards: a real request still succeeds.
-    let (status, body) =
-        plan_and_execute_in(&repo, Some(id), tokens(), commit("after the cancel")).await;
+    let (status, body) = plan_and_execute_in(
+        &repo,
+        Some(id),
+        tokens(),
+        commit("after the cancel"),
+        crate::planner::DropProof::Nothing,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(commit_count(&repo, "HEAD"), before + 1);
 }
@@ -298,6 +324,7 @@ async fn concurrent_mutations_from_two_linked_worktrees_serialize() {
                 name: BranchName::new("from-main-worktree").unwrap(),
                 at: CommitOid::new(at.clone()).unwrap(),
             },
+            crate::planner::DropProof::Nothing
         ),
         plan_and_execute_in(
             &linked,
@@ -307,6 +334,7 @@ async fn concurrent_mutations_from_two_linked_worktrees_serialize() {
                 name: BranchName::new("from-linked-worktree").unwrap(),
                 at: CommitOid::new(at.clone()).unwrap(),
             },
+            crate::planner::DropProof::Nothing
         ),
     );
 
@@ -347,7 +375,14 @@ async fn a_repository_busy_with_an_external_git_is_refused() {
     let lock_path = repo.join(".git").join("index.lock");
     let mut holder = hold_lock_open(&repo, &lock_path);
 
-    let (status, body) = plan_and_execute_in(&repo, Some(id), tokens(), commit("blocked")).await;
+    let (status, body) = plan_and_execute_in(
+        &repo,
+        Some(id),
+        tokens(),
+        commit("blocked"),
+        crate::planner::DropProof::Nothing,
+    )
+    .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(
         body.contains("Another git process is working in this repository"),
@@ -363,7 +398,14 @@ async fn a_repository_busy_with_an_external_git_is_refused() {
     holder.kill().expect("kill the holder");
     holder.wait().expect("reap the holder");
     std::fs::remove_file(&lock_path).unwrap();
-    let (status, body) = plan_and_execute_in(&repo, Some(id), tokens(), commit("unblocked")).await;
+    let (status, body) = plan_and_execute_in(
+        &repo,
+        Some(id),
+        tokens(),
+        commit("unblocked"),
+        crate::planner::DropProof::Nothing,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(commit_count(&repo, "HEAD"), before + 1);
 }
@@ -445,8 +487,14 @@ async fn a_running_write_does_not_stall_other_tasks() {
         })
     };
 
-    let (status, body) =
-        plan_and_execute_in(&repo, Some(id), tokens(), commit("while others run")).await;
+    let (status, body) = plan_and_execute_in(
+        &repo,
+        Some(id),
+        tokens(),
+        commit("while others run"),
+        crate::planner::DropProof::Nothing,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
     assert!(
