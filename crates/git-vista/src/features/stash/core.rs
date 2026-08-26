@@ -346,12 +346,13 @@ impl StashAction {
 
     /// Whether performing this can lose the user's work if it goes wrong.
     ///
-    /// What actually keys on it: the view's danger styling, and the core
-    /// test pinning that Inspect is offered ahead of every destructive
-    /// action. The confirmation dialogs themselves are hand-written per
-    /// action arm rather than gated on this flag — Pop currently has none
-    /// at all — which is #525's business, and this comment claims only
-    /// what the code delivers.
+    /// What actually keys on it: the view's danger styling, the core test
+    /// pinning that Inspect is offered ahead of every destructive action,
+    /// and — since #525 — [`ceremony`], which returns a dialog for every
+    /// action this returns `true` for and [`Ceremony::Proceed`] for every
+    /// other. The view routes each tap through that one gate before its
+    /// dispatch match, so a destructive action asks first by construction
+    /// rather than by its own arm remembering to.
     pub fn destructive(self) -> bool {
         match self {
             StashAction::Inspect | StashAction::Apply => false,
@@ -364,6 +365,73 @@ impl StashAction {
             // safe here let the view skip the warning entirely (#516).
             StashAction::Pop | StashAction::Drop | StashAction::Branch => true,
         }
+    }
+}
+
+/// What must happen between a tap on an action and its dispatch.
+///
+/// Produced only by [`ceremony`]; the view maps each variant to its dialog
+/// and never decides for itself whether to ask.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ceremony {
+    /// Dispatch without asking. Only reachable for an action whose
+    /// [`StashAction::destructive`] is `false` — the gate in [`ceremony`]
+    /// is what guarantees that, and the census test pins it.
+    Proceed,
+    /// Ask yes/no first; the payload is the finished dialog text.
+    /// Cancelling declines the action.
+    Confirm(String),
+    /// The action needs a name, and the disclosure rides inside the name
+    /// prompt itself (#516): the prompt is already a cancellable modal, so
+    /// one dialog carries both the warning and the decision — a second
+    /// would add a step without adding information. Cancelling the prompt,
+    /// or leaving the name blank, declines the whole operation.
+    NamePrompt(String),
+}
+
+/// The confirmation gate (#525): what stands between a tap and its dispatch.
+///
+/// # Whether to ask is keyed on the classification, never per arm
+///
+/// #525's defect: each view arm hand-wired its own dialog, and Pop —
+/// destructive, removes the entry when it succeeds — simply had none. A
+/// per-arm ceremony is one every new arm can forget, so the *whether* lives
+/// here, on [`StashAction::destructive`], where no arm can opt out. Only the
+/// WORDING is per-action, in the match below — exhaustive over all five
+/// actions, so the next verb cannot compile until its ceremony is written
+/// down here.
+///
+/// The wording lives here rather than in markup for the usual reason: a
+/// host test can hold each sentence to its action, and the Pop text in
+/// particular must not overclaim — the drop half of a pop only runs after a
+/// verified-clear apply, so "removed" is conditional and the dialog says so.
+pub fn ceremony(action: StashAction, selector: &str) -> Ceremony {
+    if !action.destructive() {
+        return Ceremony::Proceed;
+    }
+    match action {
+        StashAction::Pop => Ceremony::Confirm(format!(
+            "Pop {selector}?\n\nA pop applies the changes to your working tree, and \
+             only if the apply is verified clean it then REMOVES the entry from your \
+             stash list. If the apply fails or hits conflicts, the entry stays in \
+             your list."
+        )),
+        StashAction::Drop => Ceremony::Confirm(format!(
+            "Drop {selector}?\n\nThis removes the entry from your stash list. \
+             The changes stay recoverable from the Recovery Centre until git \
+             garbage-collects them."
+        )),
+        StashAction::Branch => Ceremony::NamePrompt(format!(
+            "Branch from {selector}?\n\nThis creates a branch at the \
+             stash's own base commit and applies the stash there. On \
+             success the stash entry is REMOVED from your list.\n\n\
+             Name for the new branch:"
+        )),
+        // Unreachable through the gate above, and deliberately NOT a
+        // wildcard: a new variant must appear somewhere in this match, and
+        // parking a destructive one here would trip the census test's
+        // literal table rather than silently skipping its dialog.
+        StashAction::Inspect | StashAction::Apply => Ceremony::Proceed,
     }
 }
 
@@ -1532,6 +1600,152 @@ mod tests {
     fn read_only_maps_to_the_refusing_gate() {
         assert_eq!(write_gate(true), WriteGate::ReadOnly);
         assert_eq!(write_gate(false), WriteGate::Allowed);
+    }
+
+    // -----------------------------------------------------------------------
+    // #525 — the confirmation ceremony is keyed on the classification
+    // -----------------------------------------------------------------------
+
+    /// **#525: every destructive action asks first, and no safe action does.**
+    ///
+    /// The census is a LITERAL table, not a read-back of `destructive()` —
+    /// asserting `ceremony(a) != Proceed` iff `a.destructive()` would pass
+    /// whichever way both leaned. And the table is an exhaustive `match`, so
+    /// a NEW action cannot compile until its row is written here — which is
+    /// the moment "does this one ask?" must be answered out loud. That is
+    /// what makes the gate mechanical: a destructive verb added without a
+    /// ceremony is a red test (or a compile error), never a silent skip.
+    ///
+    /// MUTATION 1 (removes the mechanism): make `ceremony` return
+    ///   `Ceremony::Proceed` unconditionally — red on the Pop row, a
+    ///   destructive action dispatching unasked, which is #525's defect
+    ///   verbatim. Verified by hand: red.
+    /// MUTATION 2 (keeps the gate, breaks the key): park `Pop` in
+    ///   `ceremony`'s non-destructive arm (`Inspect | Apply | Pop`) — red on
+    ///   the same row by a different route: the gate still runs, but the
+    ///   wording table quietly declines to ask. Verified by hand: red.
+    #[test]
+    fn every_destructive_action_asks_first_and_no_safe_action_does() {
+        // One row per action: (asks first?). Adding a variant breaks this
+        // match, forcing the new row — the census cannot go stale silently.
+        let asks_first = |action: StashAction| -> bool {
+            match action {
+                StashAction::Inspect => false,
+                StashAction::Apply => false,
+                StashAction::Pop => true,
+                StashAction::Branch => true,
+                StashAction::Drop => true,
+            }
+        };
+
+        for action in [
+            StashAction::Inspect,
+            StashAction::Apply,
+            StashAction::Pop,
+            StashAction::Branch,
+            StashAction::Drop,
+        ] {
+            let ritual = ceremony(action, "stash@{0}");
+            assert_eq!(
+                !matches!(ritual, Ceremony::Proceed),
+                asks_first(action),
+                "{action:?}: ceremony disagrees with the census, got {ritual:?}"
+            );
+            // The classification must agree with the SAME literal row, so the
+            // gate (which keys on it) and this census cannot drift apart.
+            assert_eq!(
+                action.destructive(),
+                asks_first(action),
+                "{action:?}: destructive() disagrees with the census"
+            );
+        }
+    }
+
+    /// The Pop dialog names what a completed pop costs — and does not
+    /// overclaim. The entry is removed only when the whole pop succeeds:
+    /// the drop half runs solely behind [`drop_gate`], after a
+    /// verified-clear apply, so "REMOVES" must be stated as conditional.
+    ///
+    /// Asserted against the literal words, not against another call into
+    /// the code that produces them.
+    ///
+    /// MUTATION 1 (removes the honesty): reword Pop's dialog to
+    ///   "This applies the changes and REMOVES the entry from your stash
+    ///   list." — red on the `verified clean` assertion: the removal is no
+    ///   longer stated as conditional. Verified by hand: red.
+    /// MUTATION 2 (breaks the addressing): drop the `Pop {selector}?`
+    ///   opener — red on the `starts_with`, a dialog that no longer says
+    ///   which entry it is about. Verified by hand: red.
+    #[test]
+    fn the_pop_confirmation_names_the_cost_without_overclaiming() {
+        let Ceremony::Confirm(text) = ceremony(StashAction::Pop, "stash@{2}") else {
+            panic!("pop is destructive and must confirm, not prompt or proceed");
+        };
+        assert!(
+            text.starts_with("Pop stash@{2}?"),
+            "the dialog must name the entry it is about, got: {text}"
+        );
+        assert!(
+            text.contains("REMOVES the entry"),
+            "the cost — the entry leaves the list — must be named, got: {text}"
+        );
+        assert!(
+            text.contains("only if the apply is verified clean"),
+            "removal is conditional on the verified apply; stating it flat \
+             would overclaim, got: {text}"
+        );
+        assert!(
+            text.contains("the entry stays"),
+            "the failure half must be said too — nothing is lost on a halt, \
+             got: {text}"
+        );
+    }
+
+    /// Drop and Branch keep the ceremonies they already had, with their
+    /// wording now held here where a test can reach it. Branch's is a
+    /// [`Ceremony::NamePrompt`] — the #516 decision that one cancellable
+    /// prompt carries both the disclosure and the name — and its text must
+    /// end by asking for the name, or the prompt's input box dangles under
+    /// a sentence about something else.
+    ///
+    /// MUTATION 1: return `Ceremony::Confirm` for Branch — red on the
+    ///   variant match, the name prompt is gone and the operation has no
+    ///   name to send. Verified by hand: red.
+    /// MUTATION 2: drop the "REMOVED from your list" sentence from Branch's
+    ///   prompt — red, the disclosure #516 added is gone while the prompt
+    ///   still shows. Verified by hand: red.
+    #[test]
+    fn drop_confirms_and_branch_discloses_inside_its_name_prompt() {
+        let Ceremony::Confirm(drop_text) = ceremony(StashAction::Drop, "stash@{0}") else {
+            panic!("drop must confirm");
+        };
+        assert!(drop_text.starts_with("Drop stash@{0}?"), "got: {drop_text}");
+        assert!(
+            drop_text.contains("removes the entry from your stash list"),
+            "got: {drop_text}"
+        );
+        // Recoverable-until-gc is a promise about the Recovery Centre, not
+        // about undo; the wording must keep making the weaker, true claim.
+        assert!(
+            drop_text.contains("recoverable from the Recovery Centre"),
+            "got: {drop_text}"
+        );
+
+        let Ceremony::NamePrompt(branch_text) = ceremony(StashAction::Branch, "stash@{1}") else {
+            panic!("branch needs a name, and the warning rides in the prompt (#516)");
+        };
+        assert!(
+            branch_text.starts_with("Branch from stash@{1}?"),
+            "got: {branch_text}"
+        );
+        assert!(
+            branch_text.contains("REMOVED from your list"),
+            "the #516 disclosure must survive the move into core, got: {branch_text}"
+        );
+        assert!(
+            branch_text.ends_with("Name for the new branch:"),
+            "the prompt's input box answers its last line, got: {branch_text}"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -210,8 +210,19 @@ carries a tolerant reader and every line carries its provenance, so the *next*
 — is a capture-sized loss on rollback instead of a line-sized one, and is
 diagnosable at read time instead of guessed at.
 
-This is the same lesson #509 is teaching the durable operation store, and the
-M5-family reviews flagged both.
+**The durable operation store reached the same conclusion the same day.**
+ADR 0089 (#509, landed 2026-08-26) found `row_to_loaded` turning every
+payload-decode failure into `None` — so an `operation_records` row this build
+cannot deserialize read as *no record at all* — and its D1 is "decode failure is
+a third outcome, never absence", splitting `DurableLookup` into
+`Found` / `Incompatible` / `Missing`.
+
+That is D3 above, one storage layer over. Two independent stores, two reviews,
+one defect: **a value the reader cannot decode had been spelled the same way as
+a value that was never written.** `Incompatible` is to `Missing` what `Unknown`
+is to an absent `refs` field. The M5-family reviews flagged both, and the pair
+is the argument for treating "I cannot read this" as a first-class answer
+wherever this codebase persists anything.
 
 ## Consequences
 
