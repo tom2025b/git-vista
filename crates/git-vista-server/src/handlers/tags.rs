@@ -532,8 +532,10 @@ fn tag_detail(record: &TagRecord) -> Option<TagDetail> {
 /// as [`SignatureStatus::Unverifiable`] (no recognised line) rather than
 /// `UnknownKey`. Both are honest answers to "can this be verified here", and
 /// either way the load-bearing claim holds: for the common case (an
-/// untrusted repository), **no tag can ever classify as [`Valid`] or
-/// [`Invalid`]** — every signed tag reports `UnknownKey` or `Unverifiable`
+/// untrusted repository), **no tag can ever classify as one of the verdicts
+/// that require the crypto to have run** — [`Valid`], [`Invalid`], or any of
+/// the three #335 added ([`ValidExpiredKey`], [`ValidExpiredSignature`],
+/// [`Revoked`]). Every signed tag reports `UnknownKey` or `Unverifiable`
 /// regardless of whether the signature is genuine, unless the operator has
 /// explicitly trusted the repository (`Tier::Unsandboxed`, which applies no
 /// exclude at all). This is a real, reachable limitation of the current
@@ -556,6 +558,9 @@ fn tag_detail(record: &TagRecord) -> Option<TagDetail> {
 ///
 /// [`Valid`]: SignatureStatus::Valid
 /// [`Invalid`]: SignatureStatus::Invalid
+/// [`ValidExpiredKey`]: SignatureStatus::ValidExpiredKey
+/// [`ValidExpiredSignature`]: SignatureStatus::ValidExpiredSignature
+/// [`Revoked`]: SignatureStatus::Revoked
 async fn verify_tag_signature(repo: &std::path::Path, name: &TagName) -> SignatureStatus {
     let output =
         match crate::git_cmd::git_output(repo, &["verify-tag", "--raw", name.as_str()]).await {
@@ -575,13 +580,115 @@ async fn verify_tag_signature(repo: &std::path::Path, name: &TagName) -> Signatu
     classify_verify_tag_output(&output.stderr)
 }
 
+/// Every gpg status keyword `classify_verify_tag_output` **acts on**, in
+/// resolution order: the first entry whose keyword appears anywhere in the run
+/// decides the verdict, whatever order the lines actually arrived in.
+///
+/// Ordered most-alarming-first, and that ordering is the whole contract:
+///
+/// * `BADSIG` wins unconditionally — see the classifier's own doc for why a
+///   provably forged signature may never be downgraded by a later line.
+/// * `REVKEYSIG` outranks the two expiries and `GOODSIG`. All four mean the
+///   bytes checked out; a revoked key is the one among them whose owner has
+///   published that it should no longer be trusted, so it may never be
+///   reported as the milder fact.
+/// * `EXPKEYSIG` outranks `EXPSIG`: a key that expired invalidates every
+///   signature it ever made, while a signature expiry is one signature's own
+///   time-box, so the key-level fact is the larger one to report.
+/// * `NO_PUBKEY` sits *below* `GOODSIG` — the pre-#335 behaviour, preserved
+///   deliberately: gpg emits `NO_PUBKEY` for a *second*, unrelated key in some
+///   runs, and a run that produced a good signature has answered the question.
+///
+/// Real gpg emits exactly one of the five sig-level lines per signature, so on
+/// real input the order is unobservable. It is pinned anyway because the
+/// function makes no assumption about line order, and a table whose rows can be
+/// swapped without a test failing is not a contract.
+const VERDICT_PRECEDENCE: &[(&str, SignatureStatus)] = &[
+    ("BADSIG", SignatureStatus::Invalid),
+    ("REVKEYSIG", SignatureStatus::Revoked),
+    ("EXPKEYSIG", SignatureStatus::ValidExpiredKey),
+    ("EXPSIG", SignatureStatus::ValidExpiredSignature),
+    ("GOODSIG", SignatureStatus::Valid),
+    ("NO_PUBKEY", SignatureStatus::UnknownKey),
+];
+
+/// Every gpg status keyword `classify_verify_tag_output` **deliberately
+/// absorbs** — carries no verdict, so seeing one changes nothing.
+///
+/// # Why this list exists at all (#335)
+///
+/// Before #335 the classifier's `match` ended in a bare `_ => {}`, so a status
+/// keyword nobody had thought about was indistinguishable from one that had
+/// been considered and dismissed. `REVKEYSIG` — "the signature is good, and
+/// the key that made it has been revoked" — went through that arm for two
+/// milestones and surfaced as [`SignatureStatus::Unverifiable`], i.e. "we
+/// could not check", for the single most alarming thing gpg can say about a
+/// signature it *did* check.
+///
+/// A `match` cannot be made exhaustive over a vocabulary that lives in another
+/// project's source, so the fallthrough stays — but it is no longer silent.
+/// Anything outside this census and [`VERDICT_PRECEDENCE`] is reported on the
+/// server's stderr by [`classify_verify_tag_output`], and
+/// `every_status_line_in_every_fixture_is_acted_on_or_censused` fails the
+/// build the moment a committed fixture carries one.
+///
+/// # Provenance
+///
+/// Every keyword below is a real status keyword of the gpg this project
+/// targets — each was read out of the shipped `gpg` 2.4.4 binary's own string
+/// table, not written from memory — and the ones marked *(observed)* also
+/// appear verbatim in a fixture committed in this file's test module.
+const ABSORBED_GPG_STATUS: &[&str] = &[
+    // Framing and identification. (observed: all four)
+    "NEWSIG",
+    "KEY_CONSIDERED",
+    "SIG_ID",
+    "VALIDSIG",
+    // The trust *computation*, which is a statement about the keyring's web of
+    // trust and not about these bytes. gpg emits exactly one of these five per
+    // verified signature; `TRUST_ULTIMATE` is the one a fixture here observes,
+    // because a locally generated signing key is ultimately trusted by
+    // construction. Deliberately absorbed rather than acted on: this surface
+    // reports what the *cryptography* said, and ADR 0088 records the choice not
+    // to fold trust into it. (observed: TRUST_ULTIMATE)
+    "TRUST_UNDEFINED",
+    "TRUST_NEVER",
+    "TRUST_MARGINAL",
+    "TRUST_FULLY",
+    "TRUST_ULTIMATE",
+    // Key-lifetime notes that accompany, and are subordinate to, the sig-level
+    // line. `KEYEXPIRED` rides along with `EXPKEYSIG` and `KEYREVOKED` with
+    // `REVKEYSIG`, but either can also describe a *different* key gpg
+    // considered on the way, so neither may be read as a verdict on its own —
+    // the sig-level line in `VERDICT_PRECEDENCE` is the one that names the key
+    // that actually made this signature. (observed: both)
+    "KEYEXPIRED",
+    "KEYREVOKED",
+    // "gpg could not finish", with no statement about the bytes. `ERRSIG` is
+    // the partner of `NO_PUBKEY` (which *is* acted on) and, alone, means only
+    // that verification did not complete — which is what an empty verdict
+    // already reports as `Unverifiable`. (observed: both)
+    "ERRSIG",
+    "FAILURE",
+    // Signature metadata carried by the signature itself. Displayed by gpg,
+    // ignored here: none of it is a verdict.
+    "NOTATION_NAME",
+    "NOTATION_DATA",
+    "NOTATION_FLAGS",
+    "POLICY_URL",
+    "VERIFICATION_COMPLIANCE_MODE",
+    "PROGRESS",
+];
+
 /// Classify one `git verify-tag --raw` run from its captured stderr.
 ///
 /// Split from [`verify_tag_signature`] so the mapping is testable against
 /// **exact bytes gpg was measured to emit** — for a genuine good signature, a
-/// tampered one (same key, altered tag content), and a signature checked
-/// with no matching public key in the keyring — rather than requiring a real
-/// gpg keypair and a spawned process in this crate's test suite.
+/// tampered one (same key, altered tag content), a signature checked with no
+/// matching public key in the keyring, and (#335) one made by a key that has
+/// since expired, one whose own expiry has passed, and one made by a revoked
+/// key — rather than requiring a real gpg keypair and a spawned process in
+/// this crate's test suite.
 ///
 /// # Why `BADSIG` is checked first and wins unconditionally
 ///
@@ -594,38 +701,78 @@ async fn verify_tag_signature(repo: &std::path::Path, name: &TagName) -> Signatu
 /// false-negative this exists to prevent (a forged tag reported as merely
 /// "unverifiable" reads as far less alarming than what it is). So this scans
 /// every line before deciding, and `BADSIG` outranks everything else
-/// regardless of what order the lines arrived in.
+/// regardless of what order the lines arrived in — as the first row of
+/// [`VERDICT_PRECEDENCE`], which generalises that rule to all six verdicts.
+///
+/// # The fallthrough is deliberate, and no longer silent (#335)
+///
+/// gpg's status protocol is another project's vocabulary and grows without
+/// asking us, so a keyword this build has never heard of must not stop a tag
+/// from being described. It still classifies as
+/// [`Unverifiable`](SignatureStatus::Unverifiable) — but it is now *named* on
+/// the server's stderr, and [`ABSORBED_GPG_STATUS`] records every keyword that
+/// reaches the fallthrough on purpose. That is the difference between "we
+/// considered this and it carries no verdict" and "nobody ever looked", which
+/// is the confusion `REVKEYSIG` hid behind for two milestones.
 fn classify_verify_tag_output(stderr: &[u8]) -> SignatureStatus {
+    let (status, unrecognised) = classify_verify_tag_output_with_census(stderr);
+    for keyword in unrecognised {
+        // `{:?}` and the length cap, not `{}`: this string came out of a
+        // subprocess reading a repository the operator may not trust, and the
+        // server's stderr is a terminal.
+        let shown: String = keyword.chars().take(MAX_LOGGED_STATUS_KEYWORD).collect();
+        eprintln!(
+            "git-vista: `git verify-tag --raw` emitted gpg status {shown:?}, which this build \
+             neither acts on nor lists in ABSORBED_GPG_STATUS; the tag was classified {status:?}. \
+             Please report this (git-vista#335)."
+        );
+    }
+    status
+}
+
+/// How much of an unrecognised status keyword [`classify_verify_tag_output`]
+/// will print. Real keywords are short `SCREAMING_SNAKE_CASE` words; a long one
+/// means the line was not what this function thinks it is, and there is no
+/// reason to spill it whole into the operator's terminal.
+const MAX_LOGGED_STATUS_KEYWORD: usize = 32;
+
+/// The whole of [`classify_verify_tag_output`]'s work, with the census it kept
+/// on the way: the verdict, plus every status keyword that was neither acted on
+/// nor deliberately absorbed, de-duplicated and in first-seen order.
+///
+/// Separate from its caller purely so the tests can assert on the census
+/// without capturing stderr — the caller adds nothing but the reporting.
+fn classify_verify_tag_output_with_census(stderr: &[u8]) -> (SignatureStatus, Vec<String>) {
     let text = String::from_utf8_lossy(stderr);
-    let mut good = false;
-    let mut no_pubkey = false;
+    // The index into `VERDICT_PRECEDENCE` of the most alarming verdict seen so
+    // far; `None` until a line carries one. Lower index wins, so this is a
+    // running minimum and line order cannot change the answer.
+    let mut verdict: Option<usize> = None;
+    let mut unrecognised: Vec<String> = Vec::new();
     for line in text.lines() {
         let Some(status) = line.strip_prefix("[GNUPG:] ") else {
             continue;
         };
-        match status.split_whitespace().next().unwrap_or("") {
-            "BADSIG" => return SignatureStatus::Invalid,
-            // EXPKEYSIG/EXPSIG: the cryptographic check itself passed (gpg
-            // emits them exactly where it would emit GOODSIG); the key or
-            // signature having since expired has no variant of its own in
-            // `SignatureStatus`, so this reports the same fact GOODSIG does
-            // rather than inventing a false `Invalid` or `Unverifiable`.
-            "GOODSIG" | "EXPKEYSIG" | "EXPSIG" => good = true,
-            "NO_PUBKEY" => no_pubkey = true,
-            _ => {}
+        let keyword = status.split_whitespace().next().unwrap_or("");
+        if let Some(rank) = VERDICT_PRECEDENCE.iter().position(|(k, _)| *k == keyword) {
+            verdict = Some(verdict.map_or(rank, |best| best.min(rank)));
+        } else if !ABSORBED_GPG_STATUS.contains(&keyword)
+            && !keyword.is_empty()
+            && !unrecognised.iter().any(|seen| seen == keyword)
+        {
+            unrecognised.push(keyword.to_string());
         }
     }
-    if good {
-        SignatureStatus::Valid
-    } else if no_pubkey {
-        SignatureStatus::UnknownKey
-    } else {
-        // No recognised status line at all: gpg didn't run (missing binary,
+    let status = match verdict {
+        Some(rank) => VERDICT_PRECEDENCE[rank].1,
+        // No line carrying a verdict at all: gpg didn't run (missing binary,
         // misconfigured `gpg.program`) or produced output this function does
-        // not understand. "Could not run/complete verification" is the
-        // honest bucket for both.
-        SignatureStatus::Unverifiable
-    }
+        // not understand. "Could not run/complete verification" is the honest
+        // bucket for both — and if it was the second, `unrecognised` now names
+        // what was not understood instead of swallowing it.
+        None => SignatureStatus::Unverifiable,
+    };
+    (status, unrecognised)
 }
 
 /// Fit a tag's annotation into a [`TagMessage`], appending [`TRUNCATION_NOTE`]
@@ -684,6 +831,115 @@ fn fit_message(message: Option<&str>, already_truncated: bool) -> Option<TagMess
 pub(crate) mod tests {
     use super::*;
     use git_vista_core::model::Oid;
+
+    // -----------------------------------------------------------------------
+    // Captured gpg status output — the six verification outcomes this
+    // classifier distinguishes
+    // -----------------------------------------------------------------------
+    //
+    // Every one of these is **verbatim stderr** from a real
+    // `git verify-tag --raw` run (git 2.43, gpg 2.4.4), not a hand-written
+    // approximation of one. Named as consts rather than inlined into a single
+    // test each so that
+    // `every_status_line_in_every_fixture_is_acted_on_or_censused` can sweep
+    // the whole set: that guard is only worth having if it sees every shape of
+    // real output this file knows about.
+
+    /// A genuinely signed, unmodified tag with the signer's public key present
+    /// in the keyring — the case that must classify `Valid`.
+    const FIXTURE_GOODSIG: &[u8] =
+        b"[GNUPG:] NEWSIG\n\
+          [GNUPG:] KEY_CONSIDERED 55D729CA8C0B4F896D1053CC41815B16FFE44E12 0\n\
+          [GNUPG:] SIG_ID 2J09+YBlXtuNyycCev8X5A6r47Q 2026-08-06 1786044942\n\
+          [GNUPG:] GOODSIG 41815B16FFE44E12 Test Signer <signer@example.com>\n\
+          [GNUPG:] VALIDSIG 55D729CA8C0B4F896D1053CC41815B16FFE44E12 2026-08-06 1786044942 0 4 0 22 10 00 55D729CA8C0B4F896D1053CC41815B16FFE44E12\n\
+          [GNUPG:] TRUST_ULTIMATE 0 pgp\n";
+
+    /// The same signature and the same known key, with a message byte flipped
+    /// after signing — a **tampered** tag object.
+    const FIXTURE_BADSIG: &[u8] = b"[GNUPG:] NEWSIG\n\
+          [GNUPG:] KEY_CONSIDERED 55D729CA8C0B4F896D1053CC41815B16FFE44E12 0\n\
+          [GNUPG:] BADSIG 41815B16FFE44E12 Test Signer <signer@example.com>\n\
+          [GNUPG:] FAILURE gpg-exit 33554433\n";
+
+    /// The genuine, untampered signature verified against an **empty
+    /// keyring** — what this server's `Strict` tier produces for every signed
+    /// tag on an untrusted repository.
+    const FIXTURE_NO_PUBKEY: &[u8] =
+        b"[GNUPG:] NEWSIG\n\
+          [GNUPG:] ERRSIG 41815B16FFE44E12 22 10 00 1786044942 9 55D729CA8C0B4F896D1053CC41815B16FFE44E12\n\
+          [GNUPG:] NO_PUBKEY 41815B16FFE44E12\n\
+          [GNUPG:] FAILURE gpg-exit 33554433\n";
+
+    /// #335, case 1. A key generated with a one-day lifetime under
+    /// `gpg --faked-system-time 20260101T000000!`, used to sign a tag at that
+    /// same frozen instant, then verified at real wall-clock time — so the
+    /// signature is sound and the key expired months ago. Note `EXPKEYSIG`
+    /// standing exactly where `GOODSIG` stands in [`FIXTURE_GOODSIG`]: that
+    /// substitution is the entire difference, and it is why the pre-#335 code
+    /// reporting `Valid` here was not an obviously wrong reading — merely a
+    /// dishonest one.
+    const FIXTURE_EXPKEYSIG: &[u8] =
+        b"[GNUPG:] NEWSIG\n\
+          [GNUPG:] KEYEXPIRED 1767312000\n\
+          [GNUPG:] KEY_CONSIDERED 959E350133ED3193BCBD77ED13869CFAF336A08E 0\n\
+          [GNUPG:] KEYEXPIRED 1767312000\n\
+          [GNUPG:] SIG_ID SpX+uvn3TtT0vg7gHJmrCq/wL/I 2026-01-01 1767225600\n\
+          [GNUPG:] EXPKEYSIG 13869CFAF336A08E Expired Key Signer <expkey@example.com>\n\
+          [GNUPG:] VALIDSIG 959E350133ED3193BCBD77ED13869CFAF336A08E 2026-01-01 1767225600 0 4 0 22 10 00 959E350133ED3193BCBD77ED13869CFAF336A08E\n";
+
+    /// #335, case 2. A key with a five-year lifetime, signing at the same
+    /// frozen instant but through `gpg --default-sig-expire 1d` — so the
+    /// **key** is still perfectly good today and the **signature** carries its
+    /// own expiry, which has passed. The distinguishing fact is not in the
+    /// `EXPSIG` line but one line below it: `VALIDSIG`'s third field is the
+    /// signature's expiration timestamp, `1767312000` here against `0` (never)
+    /// in every other fixture.
+    const FIXTURE_EXPSIG: &[u8] =
+        b"[GNUPG:] NEWSIG\n\
+          [GNUPG:] KEY_CONSIDERED 030FA93A5DCE2EFE33EEBF7D75E72AD4EED63BE2 0\n\
+          [GNUPG:] SIG_ID 04AU39FHJ6QKmPrPZdzxKb6D2s0 2026-01-01 1767225600\n\
+          [GNUPG:] EXPSIG 75E72AD4EED63BE2 Expired Sig Signer <expsig@example.com>\n\
+          [GNUPG:] VALIDSIG 030FA93A5DCE2EFE33EEBF7D75E72AD4EED63BE2 2026-01-01 1767225600 1767312000 4 0 22 10 00 030FA93A5DCE2EFE33EEBF7D75E72AD4EED63BE2\n\
+          [GNUPG:] TRUST_ULTIMATE 0 pgp\n\
+          [GNUPG:] FAILURE gpg-exit 33554433\n";
+
+    /// #335, case 3, and the one the issue was filed for. A tag signed by a
+    /// live, trusted key, after which the key's own revocation certificate was
+    /// imported — the real shape of "the signer believes this key is
+    /// compromised". gpg is emphatic: `REVKEYSIG` where `GOODSIG` would be,
+    /// plus a standalone `KEYREVOKED`. Before #335 **neither** keyword was
+    /// matched, so this classified `Unverifiable` — "we could not check" — for
+    /// output in which gpg checked, succeeded, and then said the key must not
+    /// be trusted.
+    const FIXTURE_REVKEYSIG: &[u8] =
+        b"[GNUPG:] NEWSIG\n\
+          [GNUPG:] KEY_CONSIDERED 849A5B092888495017F2AB5BDD8E770D34A7C578 0\n\
+          [GNUPG:] SIG_ID 8v4c2pA6lm5iszvv5eLYAwr3c+U 2026-08-26 1787730169\n\
+          [GNUPG:] REVKEYSIG DD8E770D34A7C578 Revoked Key Signer <revkey@example.com>\n\
+          [GNUPG:] VALIDSIG 849A5B092888495017F2AB5BDD8E770D34A7C578 2026-08-26 1787730169 0 4 0 22 10 00 849A5B092888495017F2AB5BDD8E770D34A7C578\n\
+          [GNUPG:] KEYREVOKED\n\
+          [GNUPG:] KEY_CONSIDERED 849A5B092888495017F2AB5BDD8E770D34A7C578 0\n\
+          [GNUPG:] TRUST_ULTIMATE 0 pgp\n";
+
+    /// Every captured fixture with the verdict it must produce — the table the
+    /// sweep guards iterate.
+    const ALL_FIXTURES: &[(&str, &[u8], SignatureStatus)] = &[
+        ("GOODSIG", FIXTURE_GOODSIG, SignatureStatus::Valid),
+        ("BADSIG", FIXTURE_BADSIG, SignatureStatus::Invalid),
+        ("NO_PUBKEY", FIXTURE_NO_PUBKEY, SignatureStatus::UnknownKey),
+        (
+            "EXPKEYSIG",
+            FIXTURE_EXPKEYSIG,
+            SignatureStatus::ValidExpiredKey,
+        ),
+        (
+            "EXPSIG",
+            FIXTURE_EXPSIG,
+            SignatureStatus::ValidExpiredSignature,
+        ),
+        ("REVKEYSIG", FIXTURE_REVKEYSIG, SignatureStatus::Revoked),
+    ];
 
     /// What [`build_tagged_fixture`] planted, read back **out of git** so the
     /// router test can compare the response against git's own answers rather
@@ -1117,13 +1373,10 @@ pub(crate) mod tests {
     /// key present in the keyring — the case that must classify `Valid`.
     #[test]
     fn a_verified_signature_classifies_valid() {
-        let raw = b"[GNUPG:] NEWSIG\n\
-                     [GNUPG:] KEY_CONSIDERED 55D729CA8C0B4F896D1053CC41815B16FFE44E12 0\n\
-                     [GNUPG:] SIG_ID 2J09+YBlXtuNyycCev8X5A6r47Q 2026-08-06 1786044942\n\
-                     [GNUPG:] GOODSIG 41815B16FFE44E12 Test Signer <signer@example.com>\n\
-                     [GNUPG:] VALIDSIG 55D729CA8C0B4F896D1053CC41815B16FFE44E12 2026-08-06 1786044942 0 4 0 22 10 00 55D729CA8C0B4F896D1053CC41815B16FFE44E12\n\
-                     [GNUPG:] TRUST_ULTIMATE 0 pgp\n";
-        assert_eq!(classify_verify_tag_output(raw), SignatureStatus::Valid);
+        assert_eq!(
+            classify_verify_tag_output(FIXTURE_GOODSIG),
+            SignatureStatus::Valid
+        );
     }
 
     /// # The critical distinction (issue #237)
@@ -1140,11 +1393,7 @@ pub(crate) mod tests {
     /// exists to catch.
     #[test]
     fn a_forged_signature_classifies_invalid_never_unknown_key_or_unverifiable() {
-        let raw = b"[GNUPG:] NEWSIG\n\
-                     [GNUPG:] KEY_CONSIDERED 55D729CA8C0B4F896D1053CC41815B16FFE44E12 0\n\
-                     [GNUPG:] BADSIG 41815B16FFE44E12 Test Signer <signer@example.com>\n\
-                     [GNUPG:] FAILURE gpg-exit 33554433\n";
-        let status = classify_verify_tag_output(raw);
+        let status = classify_verify_tag_output(FIXTURE_BADSIG);
         assert_eq!(status, SignatureStatus::Invalid);
         assert_ne!(status, SignatureStatus::UnknownKey);
         assert_ne!(status, SignatureStatus::Unverifiable);
@@ -1159,11 +1408,7 @@ pub(crate) mod tests {
     /// never read as `Invalid`: an absent key is not evidence of forgery.
     #[test]
     fn a_signature_with_no_matching_pubkey_classifies_unknown_key_never_invalid() {
-        let raw = b"[GNUPG:] NEWSIG\n\
-                     [GNUPG:] ERRSIG 41815B16FFE44E12 22 10 00 1786044942 9 55D729CA8C0B4F896D1053CC41815B16FFE44E12\n\
-                     [GNUPG:] NO_PUBKEY 41815B16FFE44E12\n\
-                     [GNUPG:] FAILURE gpg-exit 33554433\n";
-        let status = classify_verify_tag_output(raw);
+        let status = classify_verify_tag_output(FIXTURE_NO_PUBKEY);
         assert_eq!(status, SignatureStatus::UnknownKey);
         assert_ne!(status, SignatureStatus::Invalid);
     }
@@ -1197,5 +1442,296 @@ pub(crate) mod tests {
         let raw = b"[GNUPG:] GOODSIG 41815B16FFE44E12 Test Signer <signer@example.com>\n\
                      [GNUPG:] BADSIG 41815B16FFE44E12 Test Signer <signer@example.com>\n";
         assert_eq!(classify_verify_tag_output(raw), SignatureStatus::Invalid);
+    }
+    /// #335, case 1 — the honesty defect this issue was opened for. gpg said
+    /// `EXPKEYSIG`: it checked the bytes, they matched, **and** the key has
+    /// since expired. Before this change that reported `Valid` — wire-identical
+    /// to a live, trusted signature — so a reader could not tell a maintained
+    /// release key from one abandoned years ago.
+    ///
+    /// The `assert_ne!` is the load-bearing half: `ValidExpiredKey` must not
+    /// collapse back into `Valid`, and equally must not over-correct into
+    /// `Invalid` or `Unverifiable`, because nothing here failed and nothing
+    /// went unchecked.
+    #[test]
+    fn an_expired_key_signature_classifies_valid_expired_key_never_plain_valid() {
+        let status = classify_verify_tag_output(FIXTURE_EXPKEYSIG);
+        assert_eq!(status, SignatureStatus::ValidExpiredKey);
+        assert_ne!(status, SignatureStatus::Valid);
+        assert_ne!(status, SignatureStatus::Invalid);
+        assert_ne!(status, SignatureStatus::Unverifiable);
+    }
+
+    /// #335, case 2. gpg said `EXPSIG` — the signature carried its own expiry
+    /// and that date has passed, while the key itself is still good. Same
+    /// pre-#335 report as case 1 (`Valid`), and it must not now be conflated
+    /// with case 1 either: an expired *key* and an expired *signature* are
+    /// different facts about different things, which is why they get two
+    /// variants rather than one `Expired`.
+    #[test]
+    fn an_expired_signature_classifies_valid_expired_signature_never_plain_valid() {
+        let status = classify_verify_tag_output(FIXTURE_EXPSIG);
+        assert_eq!(status, SignatureStatus::ValidExpiredSignature);
+        assert_ne!(status, SignatureStatus::Valid);
+        assert_ne!(status, SignatureStatus::ValidExpiredKey);
+    }
+
+    /// #335, case 3, and the most serious of the three. gpg said `REVKEYSIG`:
+    /// the bytes check out and the key that made them has been **revoked** —
+    /// which is what a signer publishes when they believe the key is
+    /// compromised. Before this change no arm matched `REVKEYSIG` at all, so it
+    /// fell through to `Unverifiable`: a shrug ("we could not check") for the
+    /// one answer in the vocabulary that most warrants alarm, on output where
+    /// gpg had checked and had a great deal to say.
+    ///
+    /// So the three `assert_ne!`s name all three ways this must not be
+    /// reported: not as the old shrug, not as ordinary validity, and not as
+    /// either of the milder expiry facts.
+    #[test]
+    fn a_revoked_key_signature_classifies_revoked_never_unverifiable() {
+        let status = classify_verify_tag_output(FIXTURE_REVKEYSIG);
+        assert_eq!(status, SignatureStatus::Revoked);
+        assert_ne!(status, SignatureStatus::Unverifiable);
+        assert_ne!(status, SignatureStatus::Valid);
+        assert_ne!(status, SignatureStatus::ValidExpiredKey);
+    }
+
+    /// All six captured outcomes, swept as a table: every fixture classifies to
+    /// its own status, and no two share one.
+    ///
+    /// Written as a sweep rather than six `assert_eq!`s because the property
+    /// that matters is *distinctness across the set*. A mutation that maps two
+    /// gpg statuses to the same variant fails here on the pair, even if each
+    /// individual expectation was quietly updated to match.
+    #[test]
+    fn the_six_captured_outcomes_classify_to_six_distinct_statuses() {
+        let mut seen: std::collections::BTreeMap<String, &str> = std::collections::BTreeMap::new();
+        for (name, raw, expected) in ALL_FIXTURES {
+            let got = classify_verify_tag_output(raw);
+            assert_eq!(got, *expected, "{name} fixture");
+            if let Some(other) = seen.insert(format!("{got:?}"), name) {
+                panic!("{name} and {other} both classify {got:?} — the vocabulary collapsed");
+            }
+        }
+        assert_eq!(seen.len(), ALL_FIXTURES.len());
+    }
+
+    /// **The exhaustiveness guard (#335, acceptance 4).**
+    ///
+    /// A `match` cannot be exhaustive over gpg's status vocabulary — it lives
+    /// in another project's source and grows without asking us — so the
+    /// classifier keeps a fallthrough. What #335 fixed is that the fallthrough
+    /// was *silent*: `REVKEYSIG` sat in it for two milestones, reported as
+    /// "could not check", and nothing anywhere failed.
+    ///
+    /// This is the replacement guarantee, and it is deliberately checked
+    /// against **real gpg output** rather than against a list someone wrote
+    /// down: every status keyword appearing in any committed fixture must be
+    /// either acted on ([`VERDICT_PRECEDENCE`]) or consciously absorbed
+    /// ([`ABSORBED_GPG_STATUS`]). A future contributor who captures a new
+    /// fixture carrying a keyword nobody has classified gets a red test naming
+    /// it, instead of a tag that quietly reads "unverifiable".
+    #[test]
+    fn every_status_line_in_every_fixture_is_acted_on_or_censused() {
+        for (name, raw, _) in ALL_FIXTURES {
+            let (_, unrecognised) = classify_verify_tag_output_with_census(raw);
+            assert!(
+                unrecognised.is_empty(),
+                "the {name} fixture carries gpg status {unrecognised:?}, which this build neither \
+                 acts on nor lists in ABSORBED_GPG_STATUS — classify it or absorb it deliberately"
+            );
+        }
+    }
+
+    /// The other half of the guard: a keyword in neither list is **named**, not
+    /// swallowed.
+    ///
+    /// This is what makes the test above more than a tautology. The census is
+    /// only worth keeping if failing to be in it has a consequence, so here a
+    /// status keyword gpg 2.4.4 does not have is fed through a fixture that is
+    /// otherwise an ordinary good signature: the verdict is unchanged (an
+    /// unknown line may never move a verdict), and the keyword comes back in
+    /// the census so the caller can report it.
+    #[test]
+    fn an_unmodelled_gpg_status_is_named_rather_than_silently_absorbed() {
+        let raw = b"[GNUPG:] NEWSIG\n\
+                    [GNUPG:] GOODSIG 41815B16FFE44E12 Test Signer <signer@example.com>\n\
+                    [GNUPG:] SOMEFUTURESIG 41815B16FFE44E12 whatever gpg adds next\n";
+        let (status, unrecognised) = classify_verify_tag_output_with_census(raw);
+        assert_eq!(
+            status,
+            SignatureStatus::Valid,
+            "an unrecognised line must never move the verdict"
+        );
+        assert_eq!(unrecognised, vec!["SOMEFUTURESIG".to_string()]);
+
+        // And with no verdict line at all it still classifies `Unverifiable` —
+        // the pre-#335 behaviour — but the reason is no longer invisible.
+        let (status, unrecognised) =
+            classify_verify_tag_output_with_census(b"[GNUPG:] SOMEFUTURESIG 1\n");
+        assert_eq!(status, SignatureStatus::Unverifiable);
+        assert_eq!(unrecognised, vec!["SOMEFUTURESIG".to_string()]);
+    }
+
+    /// A keyword is reported once however many times it appears, so a run that
+    /// repeats an unknown line per-subkey cannot flood the operator's terminal.
+    #[test]
+    fn an_unmodelled_status_is_reported_once_not_once_per_line() {
+        let raw = b"[GNUPG:] SOMEFUTURESIG a\n\
+                    [GNUPG:] SOMEFUTURESIG b\n\
+                    [GNUPG:] OTHERFUTURESIG c\n\
+                    [GNUPG:] SOMEFUTURESIG d\n";
+        let (_, unrecognised) = classify_verify_tag_output_with_census(raw);
+        assert_eq!(
+            unrecognised,
+            vec!["SOMEFUTURESIG".to_string(), "OTHERFUTURESIG".to_string()],
+            "de-duplicated, and in first-seen order"
+        );
+    }
+
+    /// The precedence table, pinned row by row against a literal written out
+    /// here rather than read back from the table itself.
+    ///
+    /// The order is a security contract, not an implementation detail — it is
+    /// what stops a revoked key from being reported as merely expired, or a
+    /// forged signature from being softened by a later line — and gpg emits
+    /// exactly one sig-level line per signature, so **no fixture can catch a
+    /// reordering**. Only this pin can.
+    #[test]
+    fn the_verdict_precedence_table_is_pinned_most_alarming_first() {
+        assert_eq!(
+            VERDICT_PRECEDENCE,
+            &[
+                ("BADSIG", SignatureStatus::Invalid),
+                ("REVKEYSIG", SignatureStatus::Revoked),
+                ("EXPKEYSIG", SignatureStatus::ValidExpiredKey),
+                ("EXPSIG", SignatureStatus::ValidExpiredSignature),
+                ("GOODSIG", SignatureStatus::Valid),
+                ("NO_PUBKEY", SignatureStatus::UnknownKey),
+            ]
+        );
+    }
+
+    /// The absorbed census, pinned the same way and for the same reason: adding
+    /// a keyword to it is a decision that a status carries no verdict, and a
+    /// decision nobody had to write down twice is one that can be made by
+    /// accident while silencing a warning.
+    #[test]
+    fn the_absorbed_status_census_is_pinned() {
+        assert_eq!(
+            ABSORBED_GPG_STATUS,
+            &[
+                "NEWSIG",
+                "KEY_CONSIDERED",
+                "SIG_ID",
+                "VALIDSIG",
+                "TRUST_UNDEFINED",
+                "TRUST_NEVER",
+                "TRUST_MARGINAL",
+                "TRUST_FULLY",
+                "TRUST_ULTIMATE",
+                "KEYEXPIRED",
+                "KEYREVOKED",
+                "ERRSIG",
+                "FAILURE",
+                "NOTATION_NAME",
+                "NOTATION_DATA",
+                "NOTATION_FLAGS",
+                "POLICY_URL",
+                "VERIFICATION_COMPLIANCE_MODE",
+                "PROGRESS",
+            ]
+        );
+        // Nothing may sit in both lists: a keyword that carries a verdict and
+        // is also "deliberately ignored" is a contradiction, and whichever list
+        // the code consulted first would silently win.
+        for (acted_on, _) in VERDICT_PRECEDENCE {
+            assert!(
+                !ABSORBED_GPG_STATUS.contains(acted_on),
+                "{acted_on} is both acted on and absorbed"
+            );
+        }
+    }
+
+    /// Adversarial ordering across the three statuses #335 added, which real
+    /// gpg will not produce in one run and which the precedence table is
+    /// therefore the only thing standing behind.
+    ///
+    /// Each case names the severity rule it defends, and each is written with
+    /// the *milder* keyword first so a first-match-wins implementation — the
+    /// obvious wrong way to write this — fails rather than passing by luck.
+    #[test]
+    fn severity_decides_the_verdict_regardless_of_line_order() {
+        // A revoked key beats an ordinary good signature: revocation is the
+        // signer's own statement that the key must not be trusted.
+        assert_eq!(
+            classify_verify_tag_output(
+                b"[GNUPG:] GOODSIG 4181 Signer <s@example.com>\n\
+                  [GNUPG:] REVKEYSIG 4181 Signer <s@example.com>\n"
+            ),
+            SignatureStatus::Revoked
+        );
+        // …and beats both expiries, which are lapses rather than warnings.
+        assert_eq!(
+            classify_verify_tag_output(
+                b"[GNUPG:] EXPKEYSIG 4181 Signer <s@example.com>\n\
+                  [GNUPG:] REVKEYSIG 4181 Signer <s@example.com>\n"
+            ),
+            SignatureStatus::Revoked
+        );
+        // A forged signature still outranks everything, including revocation:
+        // `BADSIG` is the one line that says the bytes themselves are wrong.
+        assert_eq!(
+            classify_verify_tag_output(
+                b"[GNUPG:] REVKEYSIG 4181 Signer <s@example.com>\n\
+                  [GNUPG:] BADSIG 4181 Signer <s@example.com>\n"
+            ),
+            SignatureStatus::Invalid
+        );
+        // An expired key outranks an expired signature: the key-level fact
+        // covers every signature that key ever made.
+        assert_eq!(
+            classify_verify_tag_output(
+                b"[GNUPG:] EXPSIG 4181 Signer <s@example.com>\n\
+                  [GNUPG:] EXPKEYSIG 4181 Signer <s@example.com>\n"
+            ),
+            SignatureStatus::ValidExpiredKey
+        );
+        // And the pre-#335 relationship is unchanged: a good signature in the
+        // same run as a `NO_PUBKEY` for some other key is still `Valid`.
+        assert_eq!(
+            classify_verify_tag_output(
+                b"[GNUPG:] NO_PUBKEY 9999\n\
+                  [GNUPG:] GOODSIG 4181 Signer <s@example.com>\n"
+            ),
+            SignatureStatus::Valid
+        );
+    }
+
+    /// The `KEYEXPIRED` / `KEYREVOKED` lines that ride along with the two
+    /// interesting fixtures are **not** what the verdict is read from.
+    ///
+    /// Both can describe a different key gpg considered on the way, so keying
+    /// off them would classify a signature by the state of a key that did not
+    /// make it. Here each appears with a plain `GOODSIG` and must change
+    /// nothing — the shape a lazier implementation of #335 would have got
+    /// wrong, since both keywords are present in the fixtures it was written
+    /// against.
+    #[test]
+    fn a_key_lifetime_line_beside_a_goodsig_does_not_become_the_verdict() {
+        assert_eq!(
+            classify_verify_tag_output(
+                b"[GNUPG:] KEYEXPIRED 1767312000\n\
+                  [GNUPG:] GOODSIG 4181 Signer <s@example.com>\n"
+            ),
+            SignatureStatus::Valid
+        );
+        assert_eq!(
+            classify_verify_tag_output(
+                b"[GNUPG:] KEYREVOKED\n\
+                  [GNUPG:] GOODSIG 4181 Signer <s@example.com>\n"
+            ),
+            SignatureStatus::Valid
+        );
     }
 }

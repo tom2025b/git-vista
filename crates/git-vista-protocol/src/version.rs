@@ -65,19 +65,38 @@ use serde::{Deserialize, Serialize};
 /// Both shape changes shipped in PR #500 without this bump. #506 records how
 /// four review passes missed it; the short version is that nothing fails when
 /// this number stays still, which is why the golden fixture below now pins it.
-pub const PROTOCOL_VERSION: u32 = 7;
+///
+/// **v8 (M2.21, #335)** — [`crate::SignatureStatus`] gains three variants:
+/// `valid_expired_key`, `valid_expired_signature` and `revoked` (ADR 0088).
+/// This is the case that looks additive and is not. The crate's M1.02
+/// additive rule is about *fields* on a response DTO: a v7 client tolerates a
+/// key it does not know because response DTOs omit `deny_unknown_fields`. A
+/// new **enum variant** is the opposite — `SignatureStatus` is a closed
+/// vocabulary with no `#[serde(other)]` arm, so `"revoked"` arriving at a v7
+/// client is an `unknown variant` error, and because `signature` is a
+/// required field of `TagDetail`, that error fails the *whole* `TagDetail`,
+/// not the one field. The tag list does not degrade to a vaguer badge; it
+/// stops rendering. `TagDetail` additionally carries `deny_unknown_fields`,
+/// so there is no tolerance to fall back on anywhere in the shape.
+///
+/// A v7 client would have negotiated successfully against a `[7, 7]` window
+/// and only then discovered it could not read the tag list of any repository
+/// holding one expired or revoked signature — precisely the situation ADR
+/// 0002's negotiation exists to prevent. So the window moves whole, as it did
+/// for v5, v6 and v7.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// The oldest client protocol version this server build still accepts. Together
 /// with [`MAX_CLIENT_PROTOCOL`] it is the compatibility window a client's version
 /// must fall inside. Equal to [`PROTOCOL_VERSION`] until a compatible-but-older
 /// contract must be supported.
-pub const MIN_CLIENT_PROTOCOL: u32 = 7;
+pub const MIN_CLIENT_PROTOCOL: u32 = 8;
 
 /// The newest client protocol version this server build can accept. A client
 /// reporting a version above this is *ahead* of the server (the server was
 /// downgraded, or the client cache is from a newer deploy) and is refused the
 /// same way as one that is too old.
-pub const MAX_CLIENT_PROTOCOL: u32 = 7;
+pub const MAX_CLIENT_PROTOCOL: u32 = 8;
 
 /// Request header a client must send on every `/api/*` call **except**
 /// `GET /api/protocol`, carrying the [`PROTOCOL_VERSION`] it was built against.
@@ -255,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v7_is_hard_compatibility_window() {
+    fn protocol_v8_is_hard_compatibility_window() {
         // M1.10 (#63) bumped the wire protocol to 4 and moved the whole window,
         // not just the ceiling: a v3 client cannot page history, so v3 must be
         // refused exactly like any other out-of-window version, not tolerated.
@@ -284,12 +303,20 @@ mod tests {
         // is REFUSED rather than tolerated. Those shapes shipped without a
         // bump; a cached PWA negotiated against a [6, 6] window and only then
         // found it could not read the drawer. Whole window again.
-        assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(MIN_CLIENT_PROTOCOL, 7);
-        assert_eq!(MAX_CLIENT_PROTOCOL, 7);
-        assert_eq!(check_compatibility(6, 7, 7), Compatibility::ClientTooOld);
-        assert_eq!(check_compatibility(7, 7, 7), Compatibility::Compatible);
-        assert_eq!(check_compatibility(8, 7, 7), Compatibility::ClientTooNew);
+        //
+        // M2.21 (#335) bumped it to 8, and this one is the trap the M1.02
+        // additive rule does NOT cover: a new `SignatureStatus` *variant*
+        // reads as additive and behaves as a hard break. The vocabulary is
+        // closed with no `#[serde(other)]`, so `"revoked"` is an unknown
+        // variant at a v7 client, and `signature` is a required field of
+        // `TagDetail` — the whole tag record fails to deserialize, so the tag
+        // list stops rendering rather than degrading. Whole window again.
+        assert_eq!(PROTOCOL_VERSION, 8);
+        assert_eq!(MIN_CLIENT_PROTOCOL, 8);
+        assert_eq!(MAX_CLIENT_PROTOCOL, 8);
+        assert_eq!(check_compatibility(7, 8, 8), Compatibility::ClientTooOld);
+        assert_eq!(check_compatibility(8, 8, 8), Compatibility::Compatible);
+        assert_eq!(check_compatibility(9, 8, 8), Compatibility::ClientTooNew);
     }
 
     #[test]

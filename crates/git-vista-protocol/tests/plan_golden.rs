@@ -1133,19 +1133,95 @@ fn tag_detail_pins_its_wire_shape_for_both_kinds() {
     // And the signature vocabulary is closed: every declared status has a
     // pinned wire name, and an invented one is refused — "unverifiable" and
     // "invalid" must never collapse into each other by rename.
-    for (status, wire) in [
+    //
+    // Both directions per status, not just serialization: this vocabulary is
+    // read by the frontend, so a wire name that serializes correctly and
+    // deserializes into the wrong variant would be a silent mis-report.
+    const PINNED: &[(SignatureStatus, &str)] = &[
         (SignatureStatus::Unsigned, "unsigned"),
         (SignatureStatus::Valid, "valid"),
+        (SignatureStatus::ValidExpiredKey, "valid_expired_key"),
+        (
+            SignatureStatus::ValidExpiredSignature,
+            "valid_expired_signature",
+        ),
         (SignatureStatus::Invalid, "invalid"),
+        (SignatureStatus::Revoked, "revoked"),
         (SignatureStatus::UnknownKey, "unknown_key"),
         (SignatureStatus::Unverifiable, "unverifiable"),
-    ] {
+    ];
+    for (status, wire) in PINNED {
         assert_eq!(
             serde_json::to_value(status).unwrap(),
             serde_json::json!(wire)
         );
+        assert_eq!(
+            serde_json::from_value::<SignatureStatus>(serde_json::json!(wire)).unwrap(),
+            *status
+        );
     }
+
+    // The census, derived from `dto.rs` rather than copied beside it — same
+    // reasoning as `golden_set_covers_every_operation_variant`: the compiler
+    // forces a new `SignatureStatus` variant to grow arms in the server's
+    // classifier and the frontend's badge, and nothing forces it to grow a
+    // pinned wire name. Derived, that omission fails here with the missing
+    // name reported.
+    let declared = declared_signature_status_tags();
+    let pinned: std::collections::BTreeSet<String> =
+        PINNED.iter().map(|(_, wire)| wire.to_string()).collect();
+    assert_eq!(pinned.len(), PINNED.len(), "two statuses share a wire name");
+    assert_eq!(
+        pinned, declared,
+        "the pinned signature vocabulary and `SignatureStatus` disagree — a \
+         variant with no pinned wire name, a pin for a variant that no longer \
+         exists, or a wire rename that has not reached this test"
+    );
+
+    // #335 / ADR 0088: why adding a variant here is a protocol bump and not an
+    // additive change. The vocabulary has no `#[serde(other)]` arm, so an
+    // unrecognised name is an error — and because `signature` is a required
+    // field, that error takes the *whole* `TagDetail` with it rather than
+    // leaving one field unset. A client one protocol version behind therefore
+    // stops rendering the tag list rather than degrading to a vaguer badge,
+    // which is what moved `MIN_CLIENT_PROTOCOL` to 8 alongside this.
     assert!(serde_json::from_value::<SignatureStatus>(serde_json::json!("verified")).is_err());
+    let from_a_newer_server = serde_json::json!({
+        "name": "v1.0.0",
+        "kind": "annotated",
+        "target": "2".repeat(40),
+        "tag_object": "8".repeat(40),
+        "tagger": null,
+        "message": null,
+        "signature": "some_status_added_after_this_build",
+    });
+    let refused = serde_json::from_value::<TagDetail>(from_a_newer_server).unwrap_err();
+    assert!(
+        refused.to_string().contains("unknown variant"),
+        "an unmodelled status must fail the whole record, loudly — {refused}"
+    );
+}
+
+/// The `snake_case` wire names `SignatureStatus` declares, read out of
+/// `dto.rs` itself.
+///
+/// Same extractor, and the same reason, as [`declared_operation_tags`]: a
+/// literal list here would agree with a stale pin forever. `SignatureStatus`
+/// is `#[serde(rename_all = "snake_case")]` with no per-variant `rename`, so
+/// the variant name lowered to snake_case *is* the wire name; the pin above
+/// is what proves that derivation still describes what serde emits.
+fn declared_signature_status_tags() -> std::collections::BTreeSet<String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/dto.rs");
+    let src = strip_line_comments(&std::fs::read_to_string(&path).expect("readable dto.rs"));
+    let body = braced_body(&src, "pub enum SignatureStatus ")
+        .expect("dto.rs still declares `pub enum SignatureStatus { .. }`");
+    let names = top_level_variant_names(body);
+    assert!(
+        !names.is_empty(),
+        "extracted no variants from SignatureStatus — the scanner no longer \
+         recognises the enum's shape, which would let the census pass vacuously"
+    );
+    names.iter().map(|n| snake_case(n)).collect()
 }
 
 #[test]
