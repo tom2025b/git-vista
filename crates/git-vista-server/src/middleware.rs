@@ -44,11 +44,10 @@ const NEGOTIATION_PATH: &str = "/api/protocol";
 /// a real refusal is far below this; the cap is what stops a pathological body
 /// from being buffered whole.
 ///
-/// It bounds *buffering*, not what the client receives: a body that runs past
-/// it is not discarded — see [`rewrap_error`], which reads this much as a
-/// prefix and forwards the rest without ever holding it (#336). For a
-/// plain-text refusal this is also the point at which the enveloped `message`
-/// is truncated, and it says so when it truncates.
+/// It bounds *buffering*, not typed DTO delivery: an over-cap JSON object is
+/// forwarded without ever being held whole (#336). For a plain-text refusal,
+/// unread data is deliberately omitted from the bounded envelope, which says
+/// it was truncated; later transport errors and trailers are still forwarded.
 pub(crate) const MAX_ERROR_BODY: usize = 64 * 1024;
 
 /// Mint a process-unique request id. A monotonic counter is enough to tie a
@@ -240,14 +239,15 @@ fn error_envelope(code: ErrorCode, message: String, request_id: &RequestId) -> R
 /// So this reads a **bounded prefix** and keeps the unread remainder as a body
 /// to forward rather than collecting it. Two outcomes:
 ///
-/// * the body ended inside the cap — the common case, and the classification
+/// * the data ended inside the cap — the common case, and the classification
 ///   is exact: the full bytes either parse as a JSON object or they don't;
 /// * the body ran past the cap — nothing beyond the prefix is ever held in
 ///   memory. A prefix that is the *beginning* of a JSON object (see
 ///   [`incomplete_json_object_prefix`]) gets the `application/json` label and
 ///   the whole body is streamed on untouched, which is exactly what the client
 ///   needs to parse its typed DTO; anything else is prose, and the prefix is
-///   enveloped with an explicit truncation marker rather than silently lost.
+///   enveloped with an explicit truncation marker. Unread data is omitted,
+///   while any later transport error or trailers frames remain observable.
 ///
 /// The memory bound is therefore [`MAX_ERROR_BODY`] plus the one frame that
 /// crossed it — never the body — whatever a hook decides to print.
@@ -258,12 +258,16 @@ async fn rewrap_error(response: Response, request_id: &RequestId) -> Response {
     let (mut parts, body) = response.into_parts();
     let status = parts.status;
     let (head, remainder) = split_at_limit(body, MAX_ERROR_BODY).await;
-    let rest = match remainder {
-        BodyRemainder::End => None,
-        BodyRemainder::Overflow(rest) => Some(rest),
+    let (rest, complete, overflow) = match remainder {
+        BodyRemainder::End => (None, true, false),
+        BodyRemainder::Overflow(rest) => (Some(rest), false, true),
+        // Trailers end the data portion cleanly. Keep them on the body, but
+        // classify the complete data prefix rather than treating metadata as
+        // a transport failure.
+        BodyRemainder::Trailers(rest) => (Some(rest), true, false),
         // There is no complete byte body to classify after a transport error
-        // or trailers frame. Put the consumed prefix back and preserve the
-        // original response headers and frame semantics.
+        // frame. Put the consumed prefix back and preserve the original
+        // response headers and frame semantics.
         BodyRemainder::Interrupted(rest) => {
             return Response::from_parts(parts, rejoin(head, Some(rest)));
         }
@@ -286,7 +290,7 @@ async fn rewrap_error(response: Response, request_id: &RequestId) -> Response {
     // #316 already fixed once on the frontend. A JSON *object* is unambiguous
     // enough to trust as "already carrying JSON": git's own stderr/stdout text
     // and this server's plain refusal prose never happen to parse as one.
-    let head_is_json = if rest.is_some() {
+    let head_is_json = if !complete {
         incomplete_json_object_prefix(&head)
     } else {
         matches!(
@@ -313,17 +317,31 @@ async fn rewrap_error(response: Response, request_id: &RequestId) -> Response {
     };
     // Say so rather than handing the client a sentence that stops mid-word and
     // reads as the whole of what the server said.
-    let message = if rest.is_some() {
+    let message = if overflow {
         format!("{message} … (truncated at {MAX_ERROR_BODY} bytes)")
     } else {
         message
     };
     let code = ErrorCode::from_status(status.as_u16());
-    (
+    let mut enveloped = (
         status,
         Json(ApiError::new(code, message, request_id.clone())),
     )
-        .into_response()
+        .into_response();
+    if let Some(rest) = rest {
+        // An over-cap prose suffix is deliberately omitted from the bounded
+        // envelope, but transport failures and trailers later in that suffix
+        // are not data and remain part of the response semantics. For a clean
+        // data prefix followed directly by trailers, retain the whole tail.
+        let tail = if overflow {
+            retain_non_data_frames(rest)
+        } else {
+            rest
+        };
+        let body = std::mem::replace(enveloped.body_mut(), Body::empty());
+        *enveloped.body_mut() = append_body(body, tail);
+    }
+    enveloped
 }
 
 /// Read at most `limit` bytes off `body`, returning that prefix and — only when
@@ -339,12 +357,14 @@ async fn rewrap_error(response: Response, request_id: &RequestId) -> Response {
 /// the reader rather than guessed from the length (the same probe-byte
 /// reasoning `git_cmd::read_to_cap` uses).
 ///
-/// A transport error or trailers frame interrupts classification rather than
-/// masquerading as clean EOF. The frame and unread body are returned so the
-/// caller can put the consumed bytes back in front and forward them unchanged.
+/// A transport error interrupts classification rather than masquerading as
+/// clean EOF. Trailers, by contrast, cleanly finish the data portion and are
+/// carried separately so the complete bytes can still be classified. In both
+/// cases the original frame and unread body are retained for the caller.
 enum BodyRemainder {
     End,
     Overflow(Body),
+    Trailers(Body),
     Interrupted(Body),
 }
 
@@ -368,7 +388,7 @@ async fn split_at_limit(mut body: Body, limit: usize) -> (Bytes, BodyRemainder) 
             Err(frame) => {
                 return (
                     Bytes::from(head),
-                    BodyRemainder::Interrupted(prepend_frame(Ok(frame), body)),
+                    BodyRemainder::Trailers(prepend_frame(Ok(frame), body)),
                 );
             }
         };
@@ -407,6 +427,38 @@ fn rejoin(head: Bytes, rest: Option<Body>) -> Body {
         Some(rest) if head.is_empty() => rest,
         Some(rest) => prepend_frame(Ok(Frame::data(head)), rest),
     }
+}
+
+/// Concatenate two frame-level bodies without converting either to a data
+/// stream, so errors and trailers retain their original frame semantics.
+fn append_body(mut first: Body, mut second: Body) -> Body {
+    Body::new(StreamBody::new(async_stream::stream! {
+        while let Some(frame) = first.frame().await {
+            yield frame;
+        }
+        while let Some(frame) = second.frame().await {
+            yield frame;
+        }
+    }))
+}
+
+/// Drop only unread data frames from an intentionally truncated prose suffix.
+/// Errors and trailers are transport semantics, not message bytes, and must
+/// still be observed by the client without requiring this layer to drain or
+/// buffer the remainder before returning the response.
+fn retain_non_data_frames(mut body: Body) -> Body {
+    Body::new(StreamBody::new(async_stream::stream! {
+        while let Some(frame) = body.frame().await {
+            match frame {
+                Err(error) => yield Err(error),
+                Ok(frame) => {
+                    if let Err(non_data) = frame.into_data() {
+                        yield Ok(non_data);
+                    }
+                }
+            }
+        }
+    }))
 }
 
 /// Whether `bytes` is the start of a JSON object that was cut off before the
@@ -495,6 +547,7 @@ async fn relabel_json_success(response: Response) -> Response {
     let (head, remainder) = split_at_limit(body, MAX_ERROR_BODY).await;
     let (rest, complete) = match remainder {
         BodyRemainder::End => (None, true),
+        BodyRemainder::Trailers(rest) => (Some(rest), true),
         BodyRemainder::Overflow(rest) | BodyRemainder::Interrupted(rest) => (Some(rest), false),
     };
     let is_json_object = complete
@@ -558,6 +611,10 @@ mod tests {
     /// the client still receives what the server actually said rather than the
     /// status's canonical reason.
     const OVERSIZED_PROSE_OPENING: &str = "the pre-commit hook rejected this: ";
+
+    fn oversized_prose() -> String {
+        format!("{OVERSIZED_PROSE_OPENING}{}", "y".repeat(OVERSIZED_LEN))
+    }
 
     /// A hook's rejection text, past the cap and full of the newlines and
     /// control bytes real hook output carries — the escaping is the point, since
@@ -638,11 +695,38 @@ mod tests {
             // rather than to forward it.
             .route(
                 "/api/oversized-prose",
+                get(|| async { (StatusCode::BAD_REQUEST, oversized_prose()) }),
+            )
+            .route(
+                "/api/oversized-prose-then-error",
                 get(|| async {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        format!("{OVERSIZED_PROSE_OPENING}{}", "y".repeat(OVERSIZED_LEN)),
-                    )
+                    Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::new(StreamBody::new(async_stream::stream! {
+                            yield Ok::<Frame<Bytes>, std::io::Error>(Frame::data(
+                                Bytes::from(oversized_prose())
+                            ));
+                            yield Err::<Frame<Bytes>, _>(std::io::Error::other(
+                                "oversized body exploded"
+                            ));
+                        })))
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/api/oversized-prose-then-trailers",
+                get(|| async {
+                    let mut trailers = HeaderMap::new();
+                    trailers.insert("x-overflow-proof", HeaderValue::from_static("kept"));
+                    Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::new(StreamBody::new(async_stream::stream! {
+                            yield Ok::<Frame<Bytes>, std::convert::Infallible>(Frame::data(
+                                Bytes::from(oversized_prose())
+                            ));
+                            yield Ok(Frame::trailers(trailers));
+                        })))
+                        .unwrap()
                 }),
             )
             // The first MAX_ERROR_BODY bytes are a complete JSON object, but
@@ -1102,6 +1186,13 @@ mod tests {
             ))
             .await
             .unwrap();
+        assert!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("application/json")),
+            "a complete JSON object remains JSON when trailers follow"
+        );
         let mut body = resp.into_body();
         let first = body
             .frame()
@@ -1120,6 +1211,71 @@ mod tests {
             trailers
                 .get("x-proof")
                 .expect("the original x-proof trailer must survive"),
+            "kept"
+        );
+    }
+
+    /// Crossing the byte cap deliberately truncates unread prose data, but it
+    /// must not turn a later transport failure into clean EOF or discard
+    /// end-to-end trailer metadata along with those data bytes.
+    #[tokio::test]
+    async fn an_oversized_prose_tail_keeps_later_errors_and_trailers() {
+        let resp = app()
+            .oneshot(get_req(
+                "/api/oversized-prose-then-error",
+                Some(&PROTOCOL_VERSION.to_string()),
+            ))
+            .await
+            .unwrap();
+        let mut body = resp.into_body();
+        let envelope = body
+            .frame()
+            .await
+            .expect("the bounded envelope must remain")
+            .expect("the envelope frame is data")
+            .into_data()
+            .expect("the first frame is the envelope");
+        let parsed: ApiError = serde_json::from_slice(&envelope)
+            .expect("the retained prefix must be a complete error envelope");
+        assert!(parsed.error.message.contains("truncated"));
+        let error = body
+            .frame()
+            .await
+            .expect("the post-cap error frame must remain")
+            .expect_err("the second frame must still be an error");
+        assert!(
+            error.to_string().contains("oversized body exploded"),
+            "the original post-cap transport error must survive: {error}"
+        );
+
+        let resp = app()
+            .oneshot(get_req(
+                "/api/oversized-prose-then-trailers",
+                Some(&PROTOCOL_VERSION.to_string()),
+            ))
+            .await
+            .unwrap();
+        let mut body = resp.into_body();
+        let envelope = body
+            .frame()
+            .await
+            .expect("the bounded envelope must remain")
+            .expect("the envelope frame is data")
+            .into_data()
+            .expect("the first frame is the envelope");
+        serde_json::from_slice::<ApiError>(&envelope)
+            .expect("the retained prefix must be a complete error envelope");
+        let trailers = body
+            .frame()
+            .await
+            .expect("the post-cap trailers frame must remain")
+            .expect("trailers are not a body error")
+            .into_trailers()
+            .expect("the second frame must still be trailers");
+        assert_eq!(
+            trailers
+                .get("x-overflow-proof")
+                .expect("the original post-cap trailer must survive"),
             "kept"
         );
     }

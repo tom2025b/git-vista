@@ -90,7 +90,7 @@ let (head, rest) = split_at_limit(response.into_body(), MAX_ERROR_BODY).await;
 
 `split_at_limit` reads frames until one crosses the limit, keeps the bytes up to
 it, and hands back the remainder **as a body to forward** — not as a second
-buffer. Nothing past the crossing frame is polled there. Three outcomes:
+buffer. Nothing past the crossing frame is polled there. Four outcomes:
 
 - **The body ended inside the cap** (every real refusal). Classification is
   exact, and identical to before: the full bytes either parse as a JSON object
@@ -102,19 +102,26 @@ buffer. Nothing past the crossing frame is polled there. Three outcomes:
   A genuinely incomplete object gets the `application/json` label and the
   whole body is streamed on untouched; anything else is prose, and the prefix
   is enveloped **with an explicit truncation marker** rather than silently
-  replaced by "Bad Request".
-- **A body error or trailers frame interrupted classification.** There is no
-  complete byte body to label or envelope. The consumed data is put back in
-  front of the original error or trailers frame, and all remaining frames are
-  forwarded at frame level. Neither condition is rewritten as clean EOF.
+  replaced by "Bad Request". Unread prose data is dropped lazily, but later
+  body errors and trailers are forwarded after the envelope at frame level.
+- **A body error interrupted classification.** There is no complete byte body
+  to label or envelope. The consumed data is put back in front of the original
+  error, and all remaining frames are forwarded at frame level. The failure is
+  not rewritten as clean EOF.
+- **Trailers followed the complete data.** Trailers are end metadata rather
+  than an incomplete data body. The bytes are classified normally, including
+  JSON relabeling or prose enveloping, and the original trailers follow the
+  transformed data unchanged.
 
 ### How it is bounded
 
 Peak memory is `MAX_ERROR_BODY` plus the single frame that crossed it — never
 the body, whatever a hook decides to print. The constant's meaning changes from
-"the most we will deliver" to "the most we will hold", and its doc comment now
-says so. The client receives the whole DTO because the bytes are *forwarded*,
-which costs no buffer at all; the server never sees them together.
+"the most we will deliver" to "the most typed data we will hold", and its doc
+comment now says so. The client receives the whole DTO because the bytes are
+*forwarded*, which costs no buffer at all; the server never sees them together.
+When over-cap prose is truncated, a lazy frame filter drops only unread data;
+it neither drains the body before headers nor drops later errors or trailers.
 
 The sniff is done through `String::from_utf8_lossy` rather than the raw bytes:
 the cut can land mid-character, which the byte parser reports as a syntax error
@@ -235,9 +242,11 @@ reason and said nothing. An over-cap **JSON** refusal is no longer truncated at
 all.
 
 A body error after data remains an error, and a trailers frame remains a
-trailers frame. Classification stops at either condition and forwards the
-consumed data plus the original frame sequence; the middleware no longer turns
-an error into clean EOF or drops trailer metadata through a data-only stream.
+trailers frame. Errors stop classification and forward the original sequence;
+trailers mark a complete data body, so that body is still classified before the
+metadata is appended unchanged. Even when over-cap prose data is deliberately
+truncated, a lazy frame filter retains later errors and trailers rather than
+turning the former into clean EOF or dropping the latter.
 
 An over-cap prefix that is itself a complete JSON object is treated as prose,
 because unread bytes make the whole body's syntax unknowable. This is
@@ -410,6 +419,32 @@ provenance-sensitive assertions:
 the original transport error must survive: replacement body error
 the original x-proof trailer must survive
 ```
+
+The exact post-review counterexamples were then attacked independently. Making
+trailers interrupt classification again preserved their bytes but failed the
+new contract assertion:
+
+```
+a complete JSON object remains JSON when trailers follow
+```
+
+Restoring the former discard-trailers path instead failed at:
+
+```
+the trailers frame must remain
+```
+
+For an over-cap prose data frame followed by non-data frames, dropping only the
+later error and then dropping only the later trailers reached two separate
+assertions:
+
+```
+the post-cap error frame must remain
+the post-cap trailers frame must remain
+```
+
+All four mutations were restored from `/tmp/gv536-middleware.rs.amend-good`;
+`diff -q` confirmed a byte-identical source file after each restore.
 
 *H — the cap boundary weakened in both directions.* Dropping the overflow
 remainder and treating an exact-sized final data frame as overflow reached the
