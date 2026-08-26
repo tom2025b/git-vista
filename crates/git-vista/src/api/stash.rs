@@ -54,8 +54,9 @@ use git_vista_protocol::{
 
 use super::{
     network_error, receipt, refuse_if_offline, refuse_if_visualize, req_get, send_write_with_key,
-    user_facing_error, write_json, WriteReceipt, REQUEST_TIMEOUT_MS,
+    REQUEST_TIMEOUT_MS,
 };
+use crate::features::stash::core::StashWriteOutcome;
 
 /// The `(selector, expected_oid)` pair every write echoes back, validated
 /// through the shared newtypes before anything is sent.
@@ -149,6 +150,92 @@ pub async fn fetch_stash_patch(entry: &str) -> Result<String, String> {
 pub const BLANK_STASH_MESSAGE: &str =
     "Stash message can't be blank — omit it entirely to let git write its own.";
 
+/// How long to wait between operation-status polls while reconciling a lost
+/// stash-write reply, and how many polls to make (#515).
+///
+/// The write is already terminal or nearly so by the time this runs — both
+/// HTTP attempts have finished failing, which took at least one full
+/// [`REQUEST_TIMEOUT_MS`] — so this is a short follow-up read of an in-memory
+/// record, not a wait on git. 20 × 500ms bounds the whole recovery at ten
+/// seconds; a record still non-terminal after that reports
+/// [`StashWriteOutcome::Unknown`] with a reload hint rather than parking the
+/// drawer on an open-ended poll.
+const RECONCILE_POLL_MS: u64 = 500;
+const RECONCILE_POLL_ATTEMPTS: u32 = 20;
+
+/// Send one stash write under a caller-owned key, and account for a lost
+/// reply (#515).
+///
+/// Every stash POST enters the server's tracked planner (each handler in
+/// `handlers/stash.rs` calls `planner::plan_and_execute`), so when both HTTP
+/// attempts are lost the truth still exists: the operation record, reachable
+/// by the idempotency key via `GET /api/operations/by-key/{key}` and then
+/// `GET /api/operations/{id}`. That record stores the HTTP status and body
+/// the handler recorded — the full answer, not just "it ran".
+///
+/// This is the same machinery the dispatched operations have used since
+/// M2.20f (`features/operations/signals.rs` binds key → id → stream); the
+/// stash callers used to discard the key on the error path instead, which is
+/// how a lost reply got dressed as `Refused` — the defect this function
+/// exists to remove. Only when the record itself cannot settle the question
+/// does the outcome say [`StashWriteOutcome::Unknown`], and the vocabulary
+/// forces the caller to carry that honestly.
+async fn send_reconciled_with_key(
+    url: &str,
+    json: String,
+    key: IdempotencyKey,
+) -> StashWriteOutcome {
+    match send_write_with_key(url, Some(json), key.clone(), REQUEST_TIMEOUT_MS).await {
+        Ok((resp, _key)) => {
+            let r = receipt(resp).await;
+            StashWriteOutcome::Answered {
+                ok: r.ok,
+                message: r.message,
+            }
+        }
+        Err(transport) => {
+            let Some(id) = super::operations::resolve_operation_id(key, || false).await else {
+                return StashWriteOutcome::Unknown {
+                    why: format!(
+                        "{transport} — and no operation record was found under this \
+                         request's key, so the outcome could not be recovered"
+                    ),
+                };
+            };
+            for _ in 0..RECONCILE_POLL_ATTEMPTS {
+                match super::operations::fetch_operation_status(&id).await {
+                    Ok(status) if status.ended_at.is_some() => {
+                        // The recorded response: `status` is the HTTP code the
+                        // handler returned, `message` its body. Same standing
+                        // as hearing it directly — the server said it.
+                        let ok = matches!(status.status, Some(code) if (200..300).contains(&code));
+                        let message = status.message.unwrap_or_else(|| {
+                            "the operation finished but recorded no message".to_string()
+                        });
+                        return StashWriteOutcome::Reconciled { ok, message };
+                    }
+                    // Not terminal yet, or the status read itself failed —
+                    // either way the honest move is the same short wait and
+                    // another look, bounded above.
+                    Ok(_) | Err(_) => super::sleep_ms(RECONCILE_POLL_MS).await,
+                }
+            }
+            StashWriteOutcome::Unknown {
+                why: format!(
+                    "{transport} — the operation record was found but had not settled \
+                     within the recovery budget; reload the drawer to see the result"
+                ),
+            }
+        }
+    }
+}
+
+/// [`send_reconciled_with_key`] under a key minted here — for the writes
+/// where the user action and the request are one and the same.
+async fn send_reconciled(url: &str, json: String) -> StashWriteOutcome {
+    send_reconciled_with_key(url, json, super::new_idempotency_key()).await
+}
+
 /// Put the working tree in the drawer (`POST /api/stash/push`).
 ///
 /// `keep_index` and `include_untracked` are taken as plain required arguments
@@ -159,7 +246,7 @@ pub async fn push_stash_request(
     message: Option<&str>,
     keep_index: bool,
     include_untracked: bool,
-) -> Result<(), String> {
+) -> Result<StashWriteOutcome, String> {
     refuse_if_offline()?;
     refuse_if_visualize()?;
     let message = match message {
@@ -176,33 +263,29 @@ pub async fn push_stash_request(
         keep_index,
         include_untracked,
     };
-    let (resp, _key) = write_json("/api/stash/push", &body).await?;
-    if resp.ok() {
-        Ok(())
-    } else {
-        Err(user_facing_error("/api/stash/push", resp).await)
-    }
+    let json = serde_json::to_string(&body).map_err(|e| e.to_string())?;
+    Ok(send_reconciled("/api/stash/push", json).await)
 }
 
 /// Restore a stash's changes, keeping the entry (`POST /api/stash/apply`).
 ///
-/// Not operation-tracked: an apply keeps the entry whatever happens, so its
-/// worst outcome is a messy worktree with the stash still safe in the drawer —
-/// the same posture `create_tag_request` takes for the non-destructive half of
-/// its pair. The destructive half of a pop goes through
-/// [`drop_stash_request`], which is.
+/// Operation-tracked like every stash write — the handler calls the same
+/// `plan_and_execute` as push, drop and branch. This doc used to claim the
+/// opposite ("not operation-tracked"), a comment outside review flagged as
+/// false against the handler; #515 leans on the tracking being real, so the
+/// claim was re-verified at `handlers/stash.rs` before this sentence
+/// replaced it.
 ///
 /// Both halves of the identity go out together; see the module doc.
-pub async fn apply_stash_request(entry: &str, expected_oid: &str) -> Result<(), String> {
+pub async fn apply_stash_request(
+    entry: &str,
+    expected_oid: &str,
+) -> Result<StashWriteOutcome, String> {
     refuse_if_offline()?;
     refuse_if_visualize()?;
     let body = target(entry, expected_oid)?;
-    let (resp, _key) = write_json("/api/stash/apply", &body).await?;
-    if resp.ok() {
-        Ok(())
-    } else {
-        Err(user_facing_error("/api/stash/apply", resp).await)
-    }
+    let json = serde_json::to_string(&body).map_err(|e| e.to_string())?;
+    Ok(send_reconciled("/api/stash/apply", json).await)
 }
 
 /// Discard an entry (`POST /api/stash/drop`).
@@ -217,14 +300,12 @@ pub async fn drop_stash_request(
     entry: &str,
     expected_oid: &str,
     key: IdempotencyKey,
-) -> Result<WriteReceipt, String> {
+) -> Result<StashWriteOutcome, String> {
     refuse_if_offline()?;
     refuse_if_visualize()?;
     let body = target(entry, expected_oid)?;
     let json = serde_json::to_string(&body).map_err(|e| e.to_string())?;
-    let (resp, _key) =
-        send_write_with_key("/api/stash/drop", Some(json), key, REQUEST_TIMEOUT_MS).await?;
-    Ok(receipt(resp).await)
+    Ok(send_reconciled_with_key("/api/stash/drop", json, key).await)
 }
 
 /// Create a branch at the stash's own base commit, check it out, apply the
@@ -239,7 +320,7 @@ pub async fn branch_from_stash_request(
     name: &str,
     entry: &str,
     expected_oid: &str,
-) -> Result<(), String> {
+) -> Result<StashWriteOutcome, String> {
     refuse_if_offline()?;
     refuse_if_visualize()?;
     let body = BranchFromStashRequest {
@@ -251,10 +332,10 @@ pub async fn branch_from_stash_request(
         name: BranchName::new(name).map_err(|e| e.to_string())?,
         target: target(entry, expected_oid)?,
     };
-    let (resp, _key) = write_json("/api/stash/branch", &body).await?;
-    if resp.ok() {
-        Ok(())
-    } else {
-        Err(user_facing_error("/api/stash/branch", resp).await)
-    }
+    let json = serde_json::to_string(&body).map_err(|e| e.to_string())?;
+    // The outcome carries the server's body now (#515) — including the one
+    // sentence of substance the old signature discarded, "The stash entry has
+    // been removed." The view still states the removal in its own notice
+    // (#516); the two say the same thing from two sources on purpose.
+    Ok(send_reconciled("/api/stash/branch", json).await)
 }
