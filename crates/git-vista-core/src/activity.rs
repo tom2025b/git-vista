@@ -25,6 +25,7 @@
 //! can't reset a branch that has since moved.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Deref;
 
 use serde::{Deserialize, Serialize};
 
@@ -405,6 +406,60 @@ impl ReflogEntry {
     }
 }
 
+/// One event while feed-only reflog provenance is still needed.
+///
+/// `ActivityEvent` is both the journal and wire shape, so reflog namespace is
+/// deliberately not added to it. This private sidecar survives only through
+/// duplicate attribution and ref-update folding. Journal events always carry
+/// `None`: their names are user data and may legally begin with `refs/heads/`
+/// or `refs/remotes/`.
+#[derive(Debug, Clone)]
+struct FeedEvent {
+    event: ActivityEvent,
+    reflog_ref_kind: Option<ReflogRefKind>,
+}
+
+impl FeedEvent {
+    fn from_reflog(event: ActivityEvent, ref_kind: ReflogRefKind) -> Self {
+        Self {
+            event,
+            reflog_ref_kind: Some(ref_kind),
+        }
+    }
+
+    fn from_journal(event: ActivityEvent) -> Self {
+        Self {
+            event,
+            reflog_ref_kind: None,
+        }
+    }
+
+    /// Restore a short display name only when the sidecar proves this event
+    /// came from the corresponding reflog namespace. A journal string that
+    /// merely resembles a qualified ref is returned byte-for-byte.
+    fn into_activity(mut self) -> ActivityEvent {
+        let prefix = match self.reflog_ref_kind {
+            Some(ReflogRefKind::LocalBranch) => Some("refs/heads/"),
+            Some(ReflogRefKind::RemoteBranch) => Some("refs/remotes/"),
+            Some(ReflogRefKind::Head) | None => None,
+        };
+        if let (Some(prefix), Some(name)) = (prefix, self.event.ref_name.as_mut()) {
+            if let Some(short) = name.strip_prefix(prefix) {
+                *name = short.to_string();
+            }
+        }
+        self.event
+    }
+}
+
+impl Deref for FeedEvent {
+    type Target = ActivityEvent;
+
+    fn deref(&self) -> &Self::Target {
+        &self.event
+    }
+}
+
 /// The conventional 7-char short id, for labels.
 fn short(oid: &str) -> &str {
     &oid[..oid.len().min(7)]
@@ -529,7 +584,7 @@ pub fn assemble_feed(
     // A rebase writes start/one-per-pick/finish lines back to back on the same
     // ref; entries arrive newest-first per ref, so a consecutive run of Rebase
     // entries on one ref is one user action: newest new_oid ← oldest old_oid.
-    let mut events: Vec<ActivityEvent> = Vec::with_capacity(reflog.len());
+    let mut events: Vec<FeedEvent> = Vec::with_capacity(reflog.len());
     let mut i = 0;
     while i < reflog.len() {
         let entry = &reflog[i];
@@ -553,37 +608,43 @@ pub fn assemble_feed(
                 span += 1;
             }
             let steps = span - i + 1;
-            events.push(ActivityEvent {
-                time: entry.time,
-                kind: ActivityKind::Rebase,
-                ref_name: Some(entry.qualified_ref_name()),
-                summary: if steps > 1 {
-                    format!("rebase ({steps} steps)")
-                } else {
-                    summary
+            events.push(FeedEvent::from_reflog(
+                ActivityEvent {
+                    time: entry.time,
+                    kind: ActivityKind::Rebase,
+                    ref_name: Some(entry.qualified_ref_name()),
+                    summary: if steps > 1 {
+                        format!("rebase ({steps} steps)")
+                    } else {
+                        summary
+                    },
+                    old_oid: Some(reflog[span].old_oid.clone()),
+                    new_oid: Some(entry.new_oid.clone()),
+                    source: ActivitySource::External,
+                    undo: None,
+                    // Reflog-derived: no branch-tip capture exists for it (#131).
+                    refs: None,
                 },
-                old_oid: Some(reflog[span].old_oid.clone()),
+                entry.ref_kind,
+            ));
+            i = span + 1;
+            continue;
+        }
+        events.push(FeedEvent::from_reflog(
+            ActivityEvent {
+                time: entry.time,
+                kind,
+                ref_name: Some(entry.qualified_ref_name()),
+                summary,
+                old_oid: Some(entry.old_oid.clone()),
                 new_oid: Some(entry.new_oid.clone()),
                 source: ActivitySource::External,
                 undo: None,
                 // Reflog-derived: no branch-tip capture exists for it (#131).
                 refs: None,
-            });
-            i = span + 1;
-            continue;
-        }
-        events.push(ActivityEvent {
-            time: entry.time,
-            kind,
-            ref_name: Some(entry.qualified_ref_name()),
-            summary,
-            old_oid: Some(entry.old_oid.clone()),
-            new_oid: Some(entry.new_oid.clone()),
-            source: ActivitySource::External,
-            undo: None,
-            // Reflog-derived: no branch-tip capture exists for it (#131).
-            refs: None,
-        });
+            },
+            entry.ref_kind,
+        ));
         i += 1;
     }
 
@@ -627,7 +688,7 @@ pub fn assemble_feed(
     // to resolve the batched captures (#485). Every event copied here is a
     // small one — the ref maps live on one line per batch, and that one is
     // cloned once.
-    events.extend(journal.iter().cloned());
+    events.extend(journal.iter().cloned().map(FeedEvent::from_journal));
 
     // -- 4. Fold a burst of remote-tracking ref updates into one row. --------
     // One `git fetch` is one user action with one outcome they care about
@@ -635,26 +696,10 @@ pub fn assemble_feed(
     // sources. #329: a fetch of 94 refs put 94 rows in the feed and buried the
     // revert the user was actually looking for. A pull floods the same way,
     // with one row that must survive — see [`fold_ref_update_bursts`].
-    let mut events = fold_ref_update_bursts(events, branches);
-
-    // Reflog category was retained through the fold as a qualified ref name;
-    // now restore the short display name before undo and wire shaping. App
-    // journal events keep their full names. The synthesized External journal
-    // rows use short local names already, so neither prefix matches them.
-    for event in &mut events {
-        if event.source != ActivitySource::External {
-            continue;
-        }
-        let Some(name) = event.ref_name.as_mut() else {
-            continue;
-        };
-        let short = name
-            .strip_prefix("refs/heads/")
-            .or_else(|| name.strip_prefix("refs/remotes/"));
-        if let Some(short) = short {
-            *name = short.to_string();
-        }
-    }
+    let mut events: Vec<ActivityEvent> = fold_ref_update_bursts(events, branches)
+        .into_iter()
+        .map(FeedEvent::into_activity)
+        .collect();
 
     // -- 5. Undo hints, computed against the repo's *current* state. ---------
     for event in &mut events {
@@ -692,25 +737,23 @@ pub fn assemble_feed(
 /// True when this event's ref is a *local branch* rather than a
 /// remote-tracking ref — the distinction [`fold_ref_update_bursts`] turns on.
 ///
-/// Journal entries already carry full names. Reflog entries are also kept
-/// qualified through the fold: [`ReflogRefKind`] restores the namespace that
-/// the reflog reader observed before shortening the name for display. This is
-/// load-bearing because `refs/heads/origin/main` and
-/// `refs/remotes/origin/main` may exist at once. A legacy or synthetic short
-/// name falls back to the repo's actual branch list.
-fn names_a_local_branch(ref_name: Option<&str>, branches: &HashMap<String, String>) -> bool {
-    let Some(name) = ref_name else {
+/// Reflog entries answer from the typed sidecar observed by the reader. A
+/// journal event has no such sidecar, so only an exact hit in the current local
+/// branch map can classify it. Its string is never treated as provenance:
+/// `refs/remotes/topic` is itself a legal short local branch name.
+fn names_a_local_branch(event: &FeedEvent, branches: &HashMap<String, String>) -> bool {
+    match event.reflog_ref_kind {
+        Some(ReflogRefKind::LocalBranch) => return true,
+        Some(ReflogRefKind::Head | ReflogRefKind::RemoteBranch) => return false,
+        None => {}
+    }
+    let Some(name) = event.ref_name.as_deref() else {
         return false;
     };
-    // A full ref path answers for itself, whether or not the branch still
-    // exists; only the short form needs the branch list to disambiguate.
-    if name.starts_with("refs/heads/") {
+    if branches.contains_key(name) {
         return true;
     }
-    if name.starts_with("refs/remotes/") {
-        return false;
-    }
-    branches.contains_key(name)
+    false
 }
 
 /// True for the foldable-kind events that must never be folded into a count:
@@ -874,12 +917,12 @@ fn admits_it_could_not_read_the_refs(event: &ActivityEvent) -> bool {
 /// *wrong* for, say, `BranchDeleted`, whose `old_oid` is precisely what its
 /// undo needs.
 fn fold_ref_update_bursts(
-    events: Vec<ActivityEvent>,
+    events: Vec<FeedEvent>,
     branches: &HashMap<String, String>,
-) -> Vec<ActivityEvent> {
+) -> Vec<FeedEvent> {
     let (mut candidates, mut out): (Vec<_>, Vec<_>) = events.into_iter().partition(|e| {
         FOLDABLE_KINDS.iter().any(|(kind, _)| *kind == e.kind)
-            && !names_a_local_branch(e.ref_name.as_deref(), branches)
+            && !names_a_local_branch(e, branches)
             && !admits_it_could_not_read_the_refs(e)
     });
 
@@ -912,7 +955,7 @@ const FOLDABLE_KINDS: [(ActivityKind, &str); 3] = [
 
 /// Fold one kind's bursts into `out`. `noun` names the action in the counted
 /// summary ("fetch — 94 refs updated").
-fn fold_one_kind(out: &mut Vec<ActivityEvent>, mut group: Vec<ActivityEvent>, noun: &str) {
+fn fold_one_kind(out: &mut Vec<FeedEvent>, mut group: Vec<FeedEvent>, noun: &str) {
     // Group by time, independent of where these sat among other events.
     group.sort_by_key(|e| std::cmp::Reverse(e.time));
 
@@ -935,7 +978,7 @@ fn fold_one_kind(out: &mut Vec<ActivityEvent>, mut group: Vec<ActivityEvent>, no
             out.push(first);
             continue;
         }
-        out.push(ActivityEvent {
+        out.push(FeedEvent::from_journal(ActivityEvent {
             time: first.time,
             kind: first.kind,
             // No single ref: the row is about the action, not about any one of
@@ -957,7 +1000,7 @@ fn fold_one_kind(out: &mut Vec<ActivityEvent>, mut group: Vec<ActivityEvent>, no
             undo: None,
             // Reflog-derived: no branch-tip capture exists for it (#131).
             refs: None,
-        });
+        }));
     }
 }
 
@@ -1644,6 +1687,89 @@ mod tests {
             feed.len(),
             2,
             "one local move + one remote burst: {feed:#?}"
+        );
+    }
+
+    /// `refs/remotes/topic` is a legal *short local branch name*. A journal
+    /// event carries that short name without reflog namespace provenance, so
+    /// its spelling must not override the current local-branch observation and
+    /// fold the branch movement into remote-tracking bookkeeping.
+    #[test]
+    fn a_prefix_shaped_local_journal_name_survives_the_push_fold() {
+        let legal_local_name = "refs/remotes/topic";
+        let journal = vec![ActivityEvent {
+            time: 100,
+            kind: ActivityKind::Push,
+            ref_name: Some(legal_local_name.into()),
+            summary: "push".into(),
+            old_oid: Some("old-local".into()),
+            new_oid: Some("new-local".into()),
+            source: ActivitySource::App,
+            undo: None,
+            refs: None,
+        }];
+        let reflog = vec![
+            entry("origin/main", 100, "a", "b", "update by push"),
+            entry("origin/feat-a", 100, "p", "q", "update by push"),
+            entry("origin/feat-b", 100, "r", "s", "update by push"),
+            entry("origin/feat-c", 100, "t", "u", "update by push"),
+        ];
+        let branches = HashMap::from([(legal_local_name.to_string(), "new-local".to_string())]);
+
+        let feed = assemble_feed(journal, reflog, &branches, &HashSet::new(), 50);
+
+        let local_move = feed
+            .iter()
+            .find(|event| event.ref_name.as_deref() == Some(legal_local_name))
+            .expect("the legal prefix-shaped local branch survives the fold");
+        assert_eq!(local_move.summary, "push");
+        assert!(
+            feed.iter()
+                .any(|event| event.summary == "push — 4 refs updated"),
+            "only the four remote-tracking rows fold: {feed:#?}"
+        );
+        assert_eq!(feed.len(), 2, "one local move + one remote burst");
+    }
+
+    /// `refs/heads/archive` is also a legal *short* branch name. An External
+    /// journal row is not necessarily reflog-derived, so display shortening
+    /// must be driven by typed reflog provenance rather than by source plus a
+    /// prefix that can be ordinary user data.
+    #[test]
+    fn an_external_journal_name_that_looks_qualified_is_not_shortened() {
+        let legal_local_name = "refs/heads/archive";
+        let journal = vec![ActivityEvent {
+            time: 100,
+            kind: ActivityKind::BranchDeleted,
+            ref_name: Some(legal_local_name.into()),
+            summary: "deleted branch".into(),
+            old_oid: Some("deadbeef".into()),
+            new_oid: None,
+            source: ActivitySource::External,
+            undo: None,
+            refs: None,
+        }];
+
+        let feed = assemble_feed(journal, vec![], &HashMap::new(), &HashSet::new(), 50);
+
+        assert_eq!(feed.len(), 1);
+        assert_eq!(
+            feed[0].ref_name.as_deref(),
+            Some(legal_local_name),
+            "journal names are never shortened without typed reflog provenance"
+        );
+        let action = &feed[0]
+            .undo
+            .as_ref()
+            .expect("the unused branch name remains safely restorable")
+            .action;
+        assert_eq!(
+            action,
+            &UndoAction::RestoreBranch {
+                name: legal_local_name.into(),
+                tip: "deadbeef".into(),
+            },
+            "undo must restore the exact legal branch name"
         );
     }
 
