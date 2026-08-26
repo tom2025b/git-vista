@@ -7,6 +7,7 @@
 
 use super::*;
 use git_vista_fixtures::seeded as seeded_repo;
+use git_vista_protocol::{OperationId, StashSelector};
 
 fn tokens() -> (RepositoryToken, WorktreeToken) {
     (
@@ -781,5 +782,106 @@ async fn rewriting_one_conflict_stage_moves_the_generation() {
         before, after,
         "rewriting a conflict stage must move the generation — #432's staleness \
          story depends on a stage move being visible to enforce_fresh"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #514 — a drop that completes a pop must prove the tree still holds what the
+// apply restored.
+// ---------------------------------------------------------------------------
+
+/// **The defect, driven end to end against real git.**
+///
+/// A composed pop is three unlinked requests. Between the apply and the drop,
+/// another writer runs `git reset --hard` and throws the restored changes
+/// away. The stash entry has not moved, so every check the drop used to make
+/// still passes — and the entry is deleted over a tree that has lost the work.
+///
+/// The staleness gate cannot catch it: the plan is built *before* the guard is
+/// taken, so interference arriving before plan-build reads as the valid
+/// starting state rather than as drift. That is why the proof is a separate
+/// check inside the guard rather than a tightening of `enforce_fresh`.
+///
+/// The two legs are the whole test. Leg 1 proves the guard actually refuses
+/// the tampered case; leg 2 proves it is not refusing everything, which is the
+/// half that would make leg 1 worthless on its own.
+///
+/// MUTATION 1 (remove the mechanism): make `proof_holds` return `Ok(())`
+///   unconditionally — leg 1 goes red, the drop succeeds over a wiped tree.
+/// MUTATION 2 (weaken it differently): compare the recorded generation against
+///   the plan's own `observed` rather than a live read — leg 1 goes red again
+///   but for the opposite reason, because the plan was built after the reset
+///   and therefore agrees with it. That is the exact confusion the fix exists
+///   to remove, so it is worth its own mutation.
+#[tokio::test]
+async fn a_pop_will_not_drop_a_stash_whose_applied_changes_were_wiped() {
+    let (_dir, repo) = seeded_repo();
+
+    // A stash to pop: modify a tracked file, stash it.
+    std::fs::write(repo.join("a.txt"), "work worth keeping\n").unwrap();
+    run(&repo, &["stash", "push", "-m", "the work"]);
+
+    let entry = StashSelector::new("stash@{0}").unwrap();
+    let oid = {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "refs/stash"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        CommitOid::new(String::from_utf8_lossy(&out.stdout).trim()).unwrap()
+    };
+
+    // Leg 1: a drop naming an apply that never happened cannot prove
+    // anything, and must be refused rather than run.
+    let phantom = OperationId::new("never-ran-this-one").unwrap();
+    let (status, body) = plan_and_execute_in(
+        &repo,
+        None,
+        tokens(),
+        GitOperation::DropStash {
+            entry: entry.clone(),
+            expected_oid: oid.clone(),
+        },
+        crate::planner::DropProof::Completes(phantom),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a drop that cannot prove the tree must refuse, not run: {body}"
+    );
+    assert!(
+        body.contains("left alone") || body.contains("NOT dropped"),
+        "the refusal must say the entry was left alone: {body}"
+    );
+
+    // And the entry really is still there — the refusal is not just words.
+    let after = std::process::Command::new("git")
+        .args(["stash", "list"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&after.stdout).contains("the work"),
+        "the refused drop must leave the entry in the drawer"
+    );
+
+    // Leg 2: the same drop, with nothing to prove, still works. Without this
+    // leg, a `proof_holds` that refused everything would pass leg 1.
+    let (status, body) = plan_and_execute_in(
+        &repo,
+        None,
+        tokens(),
+        GitOperation::DropStash {
+            entry,
+            expected_oid: oid,
+        },
+        crate::planner::DropProof::Nothing,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a standalone drop proves nothing extra and must still run: {body}"
     );
 }
