@@ -262,10 +262,10 @@ async fn plan_and_execute_tracked(
         }
         // #509: the key belongs to a journal row this build can't decode.
         // There is no record to replay and nothing may run fresh under it.
-        crate::operations::Admission::IncompatibleKey { id, op_kind } => {
+        crate::operations::Admission::IncompatibleKey { id, blame } => {
             return (
                 StatusCode::CONFLICT,
-                crate::operations::incompatible_key_refusal(&id, op_kind.as_deref()),
+                crate::operations::incompatible_key_refusal(&id, &blame),
             );
         }
     };

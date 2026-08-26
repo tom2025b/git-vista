@@ -794,15 +794,21 @@ pub(crate) struct IncompatibleHistoryEntry {
 /// the bytes carry one, and nothing is blamed on version skew when they
 /// don't.
 fn incompatible_entry(record: crate::durable::IncompatibleRecord) -> IncompatibleHistoryEntry {
-    let note = match record.op_kind.as_deref() {
-        Some(kind) => format!(
+    let note = match record.blame() {
+        crate::durable::Blame::UnknownOperation(kind) => format!(
             "Written by a Git-Vista build that understood an operation \
              ('{kind}') this build does not; only the row's stored facts are \
              shown."
         ),
-        None => "This row's stored operation can't be decoded by this build; \
-                 only the row's stored facts are shown."
-            .to_string(),
+        crate::durable::Blame::UnreadableField(field) => format!(
+            "This build could not read this row's `{field}` — which build \
+             wrote it is unknown; only the row's stored facts are shown."
+        ),
+        crate::durable::Blame::Undecodable => {
+            "This row's stored operation can't be decoded by this build; \
+             only the row's stored facts are shown."
+                .to_string()
+        }
     };
     IncompatibleHistoryEntry {
         id: record.id,
@@ -902,7 +908,7 @@ fn split_page(
     for s in scanned {
         match s.payload {
             crate::durable::ScannedPayload::Decoded(status) => rows.push(*status),
-            crate::durable::ScannedPayload::Incompatible(record) => incompatible.push(record),
+            crate::durable::ScannedPayload::Incompatible(record) => incompatible.push(*record),
             crate::durable::ScannedPayload::Unreadable => {}
         }
     }
@@ -1047,16 +1053,22 @@ fn state_permits_recovery_attempt(state: OperationState) -> bool {
 /// payload this build cannot decode (#509). Worded here, once, so the
 /// sentence stays bound to what is known: the stored op kind when the bytes
 /// carry one, and no claim about *which* build wrote it when they don't.
-fn incompatible_recover_refusal(op_kind: Option<&str>) -> String {
-    match op_kind {
-        Some(kind) => format!(
+fn incompatible_recover_refusal(blame: crate::durable::Blame) -> String {
+    match blame {
+        crate::durable::Blame::UnknownOperation(kind) => format!(
             "This operation was written by a Git-Vista build that understood \
              an operation ('{kind}') this build does not — it can't be \
              replayed or recovered."
         ),
-        None => "This operation's stored record can't be decoded by this \
-                 build — it can't be replayed or recovered."
-            .to_string(),
+        crate::durable::Blame::UnreadableField(field) => format!(
+            "This build could not read this operation's `{field}` — it can't \
+             be replayed or recovered. Which build wrote the row is unknown."
+        ),
+        crate::durable::Blame::Undecodable => {
+            "This operation's stored record can't be decoded by this \
+             build — it can't be replayed or recovered."
+                .to_string()
+        }
     }
 }
 
@@ -1106,7 +1118,7 @@ pub async fn recover_operation(
         crate::durable::DurableLookup::Incompatible(record) => {
             return (
                 StatusCode::CONFLICT,
-                incompatible_recover_refusal(record.op_kind.as_deref()),
+                incompatible_recover_refusal(record.blame()),
             );
         }
         crate::durable::DurableLookup::Missing => {
@@ -1245,11 +1257,12 @@ mod tests {
         crate::durable::ScannedOperation {
             accepted_at: UnixSeconds(accepted_at),
             id: OperationId::new(id).unwrap(),
-            payload: crate::durable::ScannedPayload::Incompatible(
+            payload: crate::durable::ScannedPayload::Incompatible(Box::new(
                 crate::durable::IncompatibleRecord {
                     id: OperationId::new(id).unwrap(),
                     key: IdempotencyKey::new(format!("rc-{id}")).unwrap(),
                     op_kind: Some("pop_stash".to_string()),
+                    failure: crate::durable::DecodeFailure::UnknownOperation,
                     state_raw: "failed".to_string(),
                     repository_raw: "r".to_string(),
                     worktree_raw: "w".to_string(),
@@ -1258,7 +1271,7 @@ mod tests {
                     status: Some(500),
                     message: None,
                 },
-            ),
+            )),
         }
     }
 
@@ -1400,7 +1413,7 @@ mod tests {
         };
         let mut unreadable_op = record.clone();
 
-        let entry = incompatible_entry(record);
+        let entry = incompatible_entry(*record);
         assert_eq!(entry.op.as_deref(), Some("pop_stash"));
         assert_eq!(entry.state, "failed");
         assert_eq!(entry.repository, "r");
@@ -1411,7 +1424,7 @@ mod tests {
         );
 
         unreadable_op.op_kind = None;
-        let entry = incompatible_entry(unreadable_op);
+        let entry = incompatible_entry(*unreadable_op);
         assert_eq!(entry.op, None);
         assert_eq!(
             entry.note,
@@ -1425,12 +1438,14 @@ mod tests {
     #[test]
     fn the_recover_refusal_names_the_stored_op_when_the_bytes_carry_one() {
         assert_eq!(
-            incompatible_recover_refusal(Some("pop_stash")),
+            incompatible_recover_refusal(crate::durable::Blame::UnknownOperation(
+                "pop_stash".to_string()
+            )),
             "This operation was written by a Git-Vista build that understood an operation \
              ('pop_stash') this build does not — it can't be replayed or recovered."
         );
         assert_eq!(
-            incompatible_recover_refusal(None),
+            incompatible_recover_refusal(crate::durable::Blame::Undecodable),
             "This operation's stored record can't be decoded by this build — it can't be \
              replayed or recovered."
         );

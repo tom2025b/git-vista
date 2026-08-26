@@ -498,7 +498,20 @@ pub(crate) struct IncompatibleRecord {
     /// The stored operation's `"op"` discriminant, verbatim; `None` when even
     /// the JSON envelope is unreadable. Kind only, never the payload's fields
     /// — the same boundary [`redact_operation`] draws for log lines.
+    ///
+    /// **A readable `op` string is not evidence of version skew.** It is
+    /// lifted from the raw envelope whichever field actually failed, so it
+    /// answers "which operation was this row about" and nothing else. What
+    /// this build may claim about *why* the row is unreadable comes from
+    /// [`DecodeFailure`] alone — see [`IncompatibleRecord::blames_version_skew`].
     pub op_kind: Option<String>,
+    /// Which part of the payload this build could not read. The whole reason
+    /// it is carried: five of the six ways a row fails to decode say nothing
+    /// about the operation being unknown, and a message that blames another
+    /// build for a corrupt token or an unrecognised `stage` spelling is a
+    /// false sentence — one that [`close_out_incompatible_blocking`] would
+    /// then write permanently into the `message` column.
+    pub failure: DecodeFailure,
     /// The `state` column verbatim, including spellings this build's
     /// [`parse_state`] doesn't know.
     pub state_raw: String,
@@ -510,6 +523,31 @@ pub(crate) struct IncompatibleRecord {
     pub message: Option<String>,
 }
 
+/// Why a stored row would not decode.
+///
+/// #509 shipped without this distinction and every refusal, note and persisted
+/// close-out message keyed its "written by a build that understood an
+/// operation this build does not" sentence on `op_kind.is_some()`. But the
+/// `op` string is readable whenever the JSON envelope is well-formed, which it
+/// is for a row that failed on a validating newtype or an unrecognised `state`
+/// spelling — operations this build understands perfectly. Skew is a claim
+/// about another binary, so only the one arm that can actually observe it may
+/// make it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecodeFailure {
+    /// `serde_json` could not turn the payload into a [`GitOperation`]. This
+    /// is the shape #509 exists for — most plausibly a variant a later build
+    /// wrote and this one has removed or never had, the way `PopStash`'s
+    /// removal (#501) stranded its schema-v2 rows.
+    UnknownOperation,
+    /// Some other stored field did not survive the trip: a closed-set parser
+    /// (`state`, `stage`) met a spelling it does not know, or a validating
+    /// newtype rejected its column. Names the field so the operator is told
+    /// where to look; says nothing about which build wrote the row, because
+    /// nothing here can tell.
+    UnreadableField(&'static str),
+}
+
 impl IncompatibleRecord {
     /// Terminal by the `state` column's raw spelling — the only fact available
     /// when the payload doesn't decode. An unknown spelling reads as
@@ -518,6 +556,42 @@ impl IncompatibleRecord {
     pub(crate) fn is_terminal_raw(&self) -> bool {
         matches!(self.state_raw.as_str(), "succeeded" | "failed")
     }
+
+    /// What any message about this row may honestly claim.
+    ///
+    /// Every sentence this build writes about an incompatible record — the
+    /// history note, the recover refusal, the idempotency-key refusal, and the
+    /// one persisted into the `message` column — is built from this and never
+    /// from `op_kind` directly. That is the whole guard: `op_kind` is readable
+    /// whenever the JSON envelope is well-formed, so keying a version-skew
+    /// claim on it attributes a corrupt token to another build.
+    pub(crate) fn blame(&self) -> Blame {
+        match (self.failure, self.op_kind.as_deref()) {
+            (DecodeFailure::UnknownOperation, Some(kind)) => {
+                Blame::UnknownOperation(kind.to_string())
+            }
+            (DecodeFailure::UnknownOperation, None) => Blame::Undecodable,
+            (DecodeFailure::UnreadableField(field), _) => Blame::UnreadableField(field),
+        }
+    }
+}
+
+/// What may be said about a row that would not decode — the honest claim,
+/// computed once by [`IncompatibleRecord::blame`] and carried wherever a
+/// message needs it (including into the idempotency-key registry, which
+/// outlives the record itself).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Blame {
+    /// The operation itself is unknown to this build and its discriminant is
+    /// readable. The one case that is evidence of version skew, and the only
+    /// one allowed to say so.
+    UnknownOperation(String),
+    /// A stored field would not read. Names the field; blames no build,
+    /// because nothing here can tell which one wrote the row.
+    UnreadableField(&'static str),
+    /// The payload would not decode and its envelope carries no readable
+    /// `op` either — nothing can be named at all.
+    Undecodable,
 }
 
 /// One journal row, as much of it as this build can honestly claim.
@@ -592,15 +666,22 @@ fn row_to_loaded(row: &rusqlite::Row) -> rusqlite::Result<Option<LoadedRow>> {
         return Ok(None);
     };
 
+    // Each field names itself on failure. The `ok_or` noise is the point:
+    // collapsing these into one `?`-chain is what let a corrupt token be
+    // reported as another build's unknown operation (#509 follow-up).
     let decoded = (|| {
-        Some(OperationStatus {
+        Ok::<OperationStatus, DecodeFailure>(OperationStatus {
             id: id.clone(),
-            state: parse_state(&state)?,
-            stage: parse_stage(&stage)?,
-            operation: serde_json::from_str::<GitOperation>(&operation_json).ok()?,
-            operation_hash: OperationHash::new(operation_hash).ok()?,
-            repository: RepositoryToken::new(repository.clone()).ok()?,
-            worktree: WorktreeToken::new(worktree.clone()).ok()?,
+            state: parse_state(&state).ok_or(DecodeFailure::UnreadableField("state"))?,
+            stage: parse_stage(&stage).ok_or(DecodeFailure::UnreadableField("stage"))?,
+            operation: serde_json::from_str::<GitOperation>(&operation_json)
+                .map_err(|_| DecodeFailure::UnknownOperation)?,
+            operation_hash: OperationHash::new(operation_hash)
+                .map_err(|_| DecodeFailure::UnreadableField("operation_hash"))?,
+            repository: RepositoryToken::new(repository.clone())
+                .map_err(|_| DecodeFailure::UnreadableField("repository"))?,
+            worktree: WorktreeToken::new(worktree.clone())
+                .map_err(|_| DecodeFailure::UnreadableField("worktree"))?,
             accepted_at: UnixSeconds(accepted_at),
             ended_at: ended_at.map(UnixSeconds),
             status,
@@ -623,23 +704,36 @@ fn row_to_loaded(row: &rusqlite::Row) -> rusqlite::Result<Option<LoadedRow>> {
     })();
 
     Ok(Some(match decoded {
-        Some(status) => LoadedRow::Decoded(key, Box::new(status)),
-        None => {
+        Ok(status) => LoadedRow::Decoded(key, Box::new(status)),
+        Err(failure) => {
             // #509: a payload this build can't decode is an incompatible
             // record, never a vanished one. Kind only in the log — the raw
             // JSON can carry free text a user typed.
             let op_kind = serde_json::from_str::<serde_json::Value>(&operation_json)
                 .ok()
                 .and_then(|v| v.get("op").and_then(|t| t.as_str()).map(str::to_string));
-            eprintln!(
-                "git-vista: journal row {} holds an operation this build can't decode (op: {}); kept as incompatible",
-                id.as_str(),
-                op_kind.as_deref().unwrap_or("<unreadable>")
-            );
+            // The log says which field failed for the same reason the stored
+            // message does: "can't decode (op: commit_on_head)" sent an
+            // operator hunting version skew when the real cause was a `stage`
+            // spelling this build does not know.
+            match failure {
+                DecodeFailure::UnknownOperation => eprintln!(
+                    "git-vista: journal row {} holds an operation this build does not know (op: {}); kept as incompatible",
+                    id.as_str(),
+                    op_kind.as_deref().unwrap_or("<unreadable>")
+                ),
+                DecodeFailure::UnreadableField(field) => eprintln!(
+                    "git-vista: journal row {} has an unreadable `{}` column (op: {}); kept as incompatible",
+                    id.as_str(),
+                    field,
+                    op_kind.as_deref().unwrap_or("<unreadable>")
+                ),
+            }
             LoadedRow::Incompatible(IncompatibleRecord {
                 id,
                 key,
                 op_kind,
+                failure,
                 state_raw: state,
                 repository_raw: repository,
                 worktree_raw: worktree,
@@ -773,7 +867,10 @@ pub(crate) enum ScannedPayload {
     Decoded(Box<OperationStatus>),
     /// The payload didn't decode but the row's stored facts did — surfaced to
     /// the Recovery Center as what it is, never silently dropped.
-    Incompatible(IncompatibleRecord),
+    ///
+    /// Boxed for the same reason `Decoded` is: it grew a [`DecodeFailure`] and
+    /// is now the widest variant, and every scan pays the enum's stack size.
+    Incompatible(Box<IncompatibleRecord>),
     /// A payload column the SQL driver itself couldn't read, or a key column
     /// that no longer validates — logged, dropped from the page, but still
     /// counted and still able to carry the cursor past itself.
@@ -800,7 +897,7 @@ fn row_to_scanned(row: &rusqlite::Row) -> rusqlite::Result<Option<ScannedOperati
     };
     let payload = match row_to_loaded(row) {
         Ok(Some(LoadedRow::Decoded(_key, status))) => ScannedPayload::Decoded(status),
-        Ok(Some(LoadedRow::Incompatible(record))) => ScannedPayload::Incompatible(record),
+        Ok(Some(LoadedRow::Incompatible(record))) => ScannedPayload::Incompatible(Box::new(record)),
         Ok(None) => ScannedPayload::Unreadable, // key column unreadable; logged in row_to_loaded
         Err(e) => {
             // A payload column the SQL driver itself couldn't read (a type
@@ -883,7 +980,7 @@ fn select_operations_blocking(
 /// [`Missing`]: DurableLookup::Missing
 pub(crate) enum DurableLookup {
     Found(Box<OperationStatus>),
-    Incompatible(IncompatibleRecord),
+    Incompatible(Box<IncompatibleRecord>),
     Missing,
 }
 
@@ -917,7 +1014,7 @@ fn load_operation_blocking(conn: &Connection, id: &OperationId) -> DurableLookup
     );
     match loaded {
         Ok(Some(LoadedRow::Decoded(_key, status))) => DurableLookup::Found(status),
-        Ok(Some(LoadedRow::Incompatible(record))) => DurableLookup::Incompatible(record),
+        Ok(Some(LoadedRow::Incompatible(record))) => DurableLookup::Incompatible(Box::new(record)),
         Ok(None) | Err(rusqlite::Error::QueryReturnedNoRows) => DurableLookup::Missing,
         Err(e) => {
             eprintln!("git-vista: couldn't read the journal row for an operation id: {e}");
@@ -978,17 +1075,28 @@ pub(crate) struct RecoveredJournal {
 /// The terminal message the startup sweep writes onto an incompatible row
 /// (#509). Names the stored op kind when the bytes carry one, and claims
 /// nothing when they don't.
-fn incompatible_close_out_message(op_kind: Option<&str>) -> String {
-    match op_kind {
-        Some(kind) => format!(
+fn incompatible_close_out_message(record: &IncompatibleRecord) -> String {
+    // "can never be resumed" was the original wording and it was an absolute
+    // this code cannot support: the row is unresumable BY THIS BUILD, which is
+    // precisely why the payload is left intact for one that can read it. The
+    // sentence is persisted, so a later build reads it as a claim about
+    // itself.
+    let closed = "This build closed it out as failed rather than leave it \
+                  running forever; its stored payload was left untouched.";
+    match record.blame() {
+        Blame::UnknownOperation(kind) => format!(
             "This operation ('{kind}') was written by a Git-Vista build that \
-             understood an operation this build does not. It can never be \
-             resumed, so it was closed out as failed."
+             understood an operation this build does not, so this build cannot \
+             resume it. {closed}"
         ),
-        None => "This operation's stored record can't be decoded by this \
-                 build. It can never be resumed, so it was closed out as \
-                 failed."
-            .to_string(),
+        Blame::UnreadableField(field) => format!(
+            "This build could not read this record's `{field}`, so it cannot \
+             resume the operation. This says nothing about which build wrote \
+             the row. {closed}"
+        ),
+        Blame::Undecodable => {
+            format!("This build could not decode this record's stored operation. {closed}")
+        }
     }
 }
 
@@ -1015,13 +1123,25 @@ fn recover_blocking(conn: &'static StdMutex<Connection>) -> Result<RecoveredJour
 
     // #509: the same close-out, for rows whose payload this build can't
     // decode. `insert_or_update` needs an `OperationStatus` this row cannot
-    // produce, so the update targets the columns directly — and only the
-    // lifecycle columns, never the payload, which stays byte-for-byte what
-    // the older binary wrote in case a build that understands it returns.
-    // An operation whose semantics this binary cannot know can never be
-    // resumed by it; a terminal record beats an eternal 'running'.
+    // produce, so the update targets the columns directly.
+    //
+    // What survives and what does not, stated exactly — the first version of
+    // this comment claimed "only the lifecycle columns, never the payload,
+    // which stays byte-for-byte" and that is only half true. The
+    // `operation_json` payload IS preserved byte-for-byte, deliberately, so a
+    // build that understands the operation can still read it. But the
+    // lifecycle record is OVERWRITTEN: `state`, `stage`, `status`, `message`
+    // and `ended_at` all go, including whatever the original `message` held.
+    // A returning build therefore cannot distinguish a genuine failure from
+    // this close-out, and cannot recover the state it might have reconciled
+    // against git. That is the accepted cost of not leaving a row 'running'
+    // forever, and the `closed-out-by-incompatible-build:` prefix below is
+    // what lets a later reader tell the two apart at all.
     for record in incompatible.iter_mut().filter(|r| !r.is_terminal_raw()) {
-        let message = incompatible_close_out_message(record.op_kind.as_deref());
+        let message = format!(
+            "closed-out-by-incompatible-build: {}",
+            incompatible_close_out_message(record)
+        );
         conn.execute(
             "UPDATE operations
              SET state = 'failed', stage = 'finished', status = 500,

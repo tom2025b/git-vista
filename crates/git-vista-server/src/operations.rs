@@ -360,7 +360,9 @@ pub(crate) enum Admission {
     /// invisible.
     IncompatibleKey {
         id: OperationId,
-        op_kind: Option<String>,
+        /// What may honestly be said about the row — computed at decode time
+        /// and carried here because the record itself does not outlive startup.
+        blame: crate::durable::Blame,
     },
 }
 
@@ -368,15 +370,21 @@ pub(crate) enum Admission {
 /// (#509). Names the record and, when the bytes carry one, the op kind this
 /// build doesn't know — a conflict a client can act on, never a silent fresh
 /// execution.
-pub(crate) fn incompatible_key_refusal(id: &OperationId, op_kind: Option<&str>) -> String {
-    match op_kind {
-        Some(kind) => format!(
+pub(crate) fn incompatible_key_refusal(id: &OperationId, blame: &crate::durable::Blame) -> String {
+    match blame {
+        crate::durable::Blame::UnknownOperation(kind) => format!(
             "That idempotency key already names operation {} — written by a \
              Git-Vista build that understood an operation ('{kind}') this \
              build does not. It can't be replayed or re-run; send a new key.",
             id.as_str()
         ),
-        None => format!(
+        crate::durable::Blame::UnreadableField(field) => format!(
+            "That idempotency key already names operation {}, whose stored \
+             `{field}` this build could not read. It can't be replayed or \
+             re-run; send a new key.",
+            id.as_str()
+        ),
+        crate::durable::Blame::Undecodable => format!(
             "That idempotency key already names operation {}, whose stored \
              record this build can't decode. It can't be replayed or re-run; \
              send a new key.",
@@ -398,7 +406,7 @@ struct Registry {
     /// strings, the set only grows when a binary that removed an operation
     /// opens an older journal, and evicting one would re-open exactly the
     /// reuse-as-fresh hole it guards.
-    incompatible_keys: HashMap<IdempotencyKey, (OperationId, Option<String>)>,
+    incompatible_keys: HashMap<IdempotencyKey, (OperationId, crate::durable::Blame)>,
 }
 
 static REGISTRY: OnceLock<StdMutex<Registry>> = OnceLock::new();
@@ -442,10 +450,10 @@ pub(crate) fn admit(
     // incompatible row is exactly one `rehydrate` could not turn into a
     // record. Whatever operation the request carries, the answer is the
     // same: this key is spent, on something this build can't even read.
-    if let Some((id, op_kind)) = reg.incompatible_keys.get(key) {
+    if let Some((id, blame)) = reg.incompatible_keys.get(key) {
         return Admission::IncompatibleKey {
             id: id.clone(),
-            op_kind: op_kind.clone(),
+            blame: blame.clone(),
         };
     }
 
@@ -550,8 +558,8 @@ pub(crate) fn rehydrate(
 ) {
     let mut reg = registry().lock().expect("operation registry lock");
     for record in incompatible {
-        reg.incompatible_keys
-            .insert(record.key, (record.id, record.op_kind));
+        let blame = record.blame();
+        reg.incompatible_keys.insert(record.key, (record.id, blame));
     }
     for (key, status) in records {
         let id = status.id.clone();
@@ -873,6 +881,7 @@ mod tests {
                 id: id.clone(),
                 key: k.clone(),
                 op_kind: Some("pop_stash".to_string()),
+                failure: crate::durable::DecodeFailure::UnknownOperation,
                 state_raw: "failed".to_string(),
                 repository_raw: "r".to_string(),
                 worktree_raw: "w".to_string(),
@@ -884,9 +893,12 @@ mod tests {
         );
 
         match admit_op(&k, &op("a brand-new intent"), &hash('9')) {
-            Admission::IncompatibleKey { id: named, op_kind } => {
+            Admission::IncompatibleKey { id: named, blame } => {
                 assert_eq!(named, id);
-                assert_eq!(op_kind.as_deref(), Some("pop_stash"));
+                assert_eq!(
+                    blame,
+                    crate::durable::Blame::UnknownOperation("pop_stash".to_string())
+                );
             }
             Admission::Fresh(..) => {
                 panic!("#509: a spent key must never execute a fresh operation")
@@ -896,7 +908,10 @@ mod tests {
 
         // The sentence a client actually reads, bound to the record's facts.
         assert_eq!(
-            incompatible_key_refusal(&id, Some("pop_stash")),
+            incompatible_key_refusal(
+                &id,
+                &crate::durable::Blame::UnknownOperation("pop_stash".to_string())
+            ),
             "That idempotency key already names operation incompatible-op-id — written by a \
              Git-Vista build that understood an operation ('pop_stash') this build does not. \
              It can't be replayed or re-run; send a new key."

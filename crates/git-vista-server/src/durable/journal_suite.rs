@@ -580,6 +580,87 @@ fn a_pop_stash_row_is_looked_up_as_incompatible_never_as_missing() {
     ));
 }
 
+/// A row whose `stage` column carries a spelling this build does not know —
+/// the shape a DOWNGRADE produces when a later build added a stage. The
+/// payload here is an operation this build understands perfectly.
+fn strand_with_unknown_stage(conn: &Connection, id: &str) {
+    conn.execute(
+        "UPDATE operations SET stage = 'verifying' WHERE id = ?1",
+        rusqlite::params![id],
+    )
+    .unwrap();
+}
+
+/// **A readable `op` string is not evidence of version skew.**
+///
+/// #509 shipped keying its "written by a build that understood an operation
+/// this build does not" sentence on `op_kind.is_some()` — but `op_kind` is
+/// lifted from the raw JSON envelope whichever field actually failed, and a
+/// row can fail on `state`, `stage`, `operation_hash`, `repository` or
+/// `worktree` while carrying an operation this build knows. The message was
+/// then UPDATEd permanently into the `message` column, so a later build that
+/// *does* understand the operation would read its own history claiming it does
+/// not.
+///
+/// This drives the REAL decode path for both shapes — the hand-built
+/// `IncompatibleRecord`s elsewhere cannot observe which arm failed, which is
+/// exactly what hid this.
+///
+/// MUTATION 1 (mechanism removed): make the decode closure collapse to one
+///   failure again (`DecodeFailure::UnknownOperation` for every arm) — red on
+///   the unknown-stage row's blame.
+/// MUTATION 2 (mechanism weakened): have `blame()` fall back to
+///   `UnknownOperation(kind)` whenever `op_kind` is readable — red on the
+///   persisted close-out sentence instead, a different assertion.
+#[test]
+fn only_an_unknown_operation_may_be_blamed_on_another_build() {
+    let (_dir, path) = scratch_db();
+    let conn = open_at(&path).unwrap();
+
+    // (a) genuinely unknown operation -> skew may be claimed.
+    insert_or_update(&conn, &key("skew"), &sample("skew-op")).unwrap();
+    strand_as_pop_stash(&conn, "skew-op");
+
+    // (b) an operation this build knows, in a row whose `stage` it does not.
+    insert_or_update(&conn, &key("stage"), &sample("stage-op")).unwrap();
+    strand_with_unknown_stage(&conn, "stage-op");
+
+    let blame_of = |id: &str| match load_operation_blocking(&conn, &OperationId::new(id).unwrap()) {
+        DurableLookup::Incompatible(record) => record.blame(),
+        DurableLookup::Found(_) => panic!("{id}: expected an incompatible row, it decoded"),
+        DurableLookup::Missing => panic!("{id}: expected an incompatible row, it read as missing"),
+    };
+
+    assert_eq!(
+        blame_of("skew-op"),
+        crate::durable::Blame::UnknownOperation("pop_stash".to_string()),
+        "an operation this build cannot deserialize is the one case skew may be claimed"
+    );
+    assert_eq!(
+        blame_of("stage-op"),
+        crate::durable::Blame::UnreadableField("stage"),
+        "#509 follow-up: an unreadable column must never be blamed on another build's operation"
+    );
+
+    // And the sentence that gets PERSISTED — the one a later build reads back
+    // as a claim about itself. It must name the field and blame nobody.
+    let message = incompatible_close_out_message_for_test(&conn, "stage-op");
+    assert!(
+        message.contains("`stage`") && !message.contains("understood an operation"),
+        "the persisted close-out must say what could not be read, not who wrote it; got: {message}"
+    );
+}
+
+/// The close-out sentence this build would persist for `id`, by the real
+/// path — loads the row, then asks the same builder `recover_blocking` uses.
+fn incompatible_close_out_message_for_test(conn: &Connection, id: &str) -> String {
+    match load_operation_blocking(conn, &OperationId::new(id).unwrap()) {
+        DurableLookup::Incompatible(record) => super::incompatible_close_out_message(&record),
+        DurableLookup::Found(_) => panic!("{id}: expected an incompatible row, it decoded"),
+        DurableLookup::Missing => panic!("{id}: expected an incompatible row, it read as missing"),
+    }
+}
+
 /// #509, acceptance 2: the history scan carries the stranded row as
 /// incompatible, with its stored facts intact, instead of omitting it.
 #[test]
@@ -654,7 +735,16 @@ fn a_running_pop_stash_row_is_closed_out_as_failed_at_startup() {
     assert!(record.ended_at.is_some(), "terminal means an end time");
     let message = record.message.as_deref().unwrap();
     assert!(message.contains("'pop_stash'"), "{message}");
-    assert!(message.contains("closed out as failed"), "{message}");
+    assert!(message.contains("closed it out as failed"), "{message}");
+    // The marker a returning build needs. The close-out OVERWRITES `state`,
+    // `stage`, `status`, `message` and `ended_at`, so without this prefix a
+    // later build that understands `pop_stash` cannot tell a genuine failure
+    // from a stranger's close-out — it would read a 500 it never produced as
+    // its own operation's real outcome.
+    assert!(
+        message.starts_with("closed-out-by-incompatible-build:"),
+        "a close-out must be distinguishable from a genuine failure: {message}"
+    );
 
     // Durable, not just in the returned view: the row itself can never read
     // 'running' again, while its payload stays byte-for-byte what the older
