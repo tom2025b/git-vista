@@ -1181,25 +1181,85 @@ pub enum TagKind {
     Annotated,
 }
 
-/// What is known about an annotated tag's GPG signature (M2.21a, #235).
+/// What is known about an annotated tag's GPG signature (M2.21a, #235; the
+/// three lifetime/revocation variants #335, ADR 0088).
 ///
-/// **Shapes only** — no verification logic exists in this crate or, yet, in
-/// the server; M2.21c (#74) owns running the actual verification. The
-/// vocabulary is closed and deliberately keeps "we could not check" apart
-/// from "we checked and it failed": collapsing those two is how a UI ends up
-/// calling an unverifiable signature invalid (alarming users over a missing
-/// keyring) or, worse, valid.
+/// **Shapes only** — no verification logic exists in this crate; the server's
+/// `handlers::tags::classify_verify_tag_output` owns the mapping from gpg's
+/// status protocol onto this vocabulary. The vocabulary is closed and
+/// deliberately keeps "we could not check" apart from "we checked and it
+/// failed": collapsing those two is how a UI ends up calling an unverifiable
+/// signature invalid (alarming users over a missing keyring) or, worse, valid.
+///
+/// # Why "the crypto passed" is four variants, not one
+///
+/// gpg answers a verification with one of five sig-level status lines, and
+/// three of them mean *the bytes check out* while still carrying a fact that
+/// changes what the signature is worth: `GOODSIG` (nothing else to say),
+/// `EXPKEYSIG` (the signing key has since expired), `EXPSIG` (the signature
+/// itself carried an expiry that has passed) and `REVKEYSIG` (the key was
+/// **revoked** — the usual reason being that its owner believes it
+/// compromised). Before #335 all three of the latter collapsed: the two
+/// expiries reported [`Valid`], identical on the wire to a live trusted
+/// signature, and `REVKEYSIG` was not matched at all and fell through to
+/// [`Unverifiable`] — a shrug, for the one outcome in the set that most
+/// deserves alarm. Both are honesty defects in a surface whose entire purpose
+/// is stating what the crypto actually said, so each gets its own variant.
+///
+/// [`Valid`]: Self::Valid
+/// [`Unverifiable`]: Self::Unverifiable
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SignatureStatus {
     /// The tag carries no signature at all (every lightweight tag, and any
     /// unsigned annotated tag).
     Unsigned,
-    /// A signature is present and verified against a known key.
+    /// A signature is present and verified against a known key, with nothing
+    /// further to say about it — gpg's `GOODSIG`. This variant makes the
+    /// strongest claim in the vocabulary, which is exactly why the three
+    /// qualified outcomes below are **not** spelled with it.
     Valid,
+    /// The cryptographic check passed, but the **key** that made the
+    /// signature has since expired (gpg's `EXPKEYSIG`).
+    ///
+    /// Kept apart from [`Valid`] because the two are not the same claim: the
+    /// bytes are as sound as the day they were signed, but the key's owner
+    /// has stopped asserting anything with it, so an expired key is no longer
+    /// evidence that whoever holds it today is who signed this. Kept apart
+    /// from [`Invalid`] for the mirror-image reason — nothing about the bytes
+    /// failed.
+    ///
+    /// [`Valid`]: Self::Valid
+    /// [`Invalid`]: Self::Invalid
+    ValidExpiredKey,
+    /// The cryptographic check passed, but the **signature** carried its own
+    /// expiration date and that date has passed (gpg's `EXPSIG`).
+    ///
+    /// A different fact from [`ValidExpiredKey`], and it is the signer who
+    /// made them different: an expiring signature is a deliberate "this
+    /// assertion is time-boxed", set when the signature was made, while an
+    /// expired key is a fact about the key's whole lifetime. Merging them
+    /// would report a signer's deliberate time-boxing as a key-management
+    /// lapse, and vice versa.
+    ///
+    /// [`ValidExpiredKey`]: Self::ValidExpiredKey
+    ValidExpiredSignature,
     /// A signature is present and verification *ran* and *failed* — the
     /// bytes do not check out against the key that claims to have made them.
     Invalid,
+    /// The cryptographic check passed, but the key that made the signature
+    /// has been **revoked** (gpg's `REVKEYSIG`).
+    ///
+    /// The bytes match, so this is not [`Invalid`]; but revocation is the
+    /// signal a key's owner publishes when they believe it compromised or
+    /// retired, so this is the least trustworthy "the crypto passed" outcome
+    /// in the vocabulary and must never be shown as one of the two
+    /// [expired](Self::ValidExpiredKey) ones, still less as [`Valid`]. It is
+    /// deliberately *not* spelled `Valid…` for that reason.
+    ///
+    /// [`Invalid`]: Self::Invalid
+    /// [`Valid`]: Self::Valid
+    Revoked,
     /// A signature is present but the key that made it is not in the
     /// verifying keyring — nothing can be said about the bytes either way.
     UnknownKey,
@@ -1208,6 +1268,12 @@ pub enum SignatureStatus {
     /// machinery worked and lacked one key; here the machinery itself was
     /// unavailable — the same "could not be asked" honesty the server's
     /// `Obs::Unknown` keeps for observations.
+    ///
+    /// **Not a bucket for "gpg said something we do not model."** #335 found
+    /// `REVKEYSIG` arriving here through an unmatched `match` arm, which read
+    /// on screen as "we could not check" for a signature gpg had checked and
+    /// had a great deal to say about. The classifier now names every status
+    /// it absorbs; see its `ABSORBED_GPG_STATUS` census.
     ///
     /// [`UnknownKey`]: Self::UnknownKey
     Unverifiable,

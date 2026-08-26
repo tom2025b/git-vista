@@ -68,11 +68,37 @@ pub struct TagRow {
 /// "invalid", because "we could not check" and "we checked and it failed" are
 /// different facts and the DTO keeps them apart precisely so a UI does not
 /// collapse them.
+///
+/// # Why the three #335 statuses are worded the way they are (ADR 0088)
+///
+/// A badge is the whole of what a reader gets here — the row has no room for a
+/// sentence — so each of these has to say *what happened*, not merely that
+/// something did:
+///
+/// * **"signed, key since expired"**, not "expired". The bare word leaves the
+///   reader to guess which thing expired and whether the signature still
+///   means anything; "signed, key since expired" says both — it was signed,
+///   and the lapse came afterwards.
+/// * **"signed, signature expired"** for the sibling case, naming the *other*
+///   thing that expired in the same breath. The two badges differ by one word
+///   because the two facts differ by one word.
+/// * **"signed, key REVOKED"**. Revocation is the signer saying the key must
+///   not be trusted, usually because it was compromised, so this may not read
+///   like the shrug it used to be (it arrived as `Unverifiable`, "not
+///   checked", before #335). The capitals are doing real work: this badge
+///   renders with the same neutral `act-pill` class as every other one — the
+///   tag band has no severity colour, and inventing one would mean editing
+///   `styles.css`, which is outside this change and under the a11y
+///   stylesheet census — so the wording is the only channel available to
+///   carry weight, and it is used.
 pub fn signature_badge(status: SignatureStatus) -> Option<&'static str> {
     match status {
         SignatureStatus::Unsigned => None,
         SignatureStatus::Valid => Some("signature valid"),
+        SignatureStatus::ValidExpiredKey => Some("signed, key since expired"),
+        SignatureStatus::ValidExpiredSignature => Some("signed, signature expired"),
         SignatureStatus::Invalid => Some("signature invalid"),
+        SignatureStatus::Revoked => Some("signed, key REVOKED"),
         SignatureStatus::UnknownKey => Some("signed, key unknown"),
         SignatureStatus::Unverifiable => Some("signed, not checked"),
     }
@@ -310,13 +336,16 @@ mod tests {
         assert_eq!(signature_badge(SignatureStatus::Unsigned), None);
         let badges = [
             signature_badge(SignatureStatus::Valid),
+            signature_badge(SignatureStatus::ValidExpiredKey),
+            signature_badge(SignatureStatus::ValidExpiredSignature),
             signature_badge(SignatureStatus::Invalid),
+            signature_badge(SignatureStatus::Revoked),
             signature_badge(SignatureStatus::UnknownKey),
             signature_badge(SignatureStatus::Unverifiable),
         ];
         assert!(badges.iter().all(Option::is_some));
         let distinct: std::collections::BTreeSet<_> = badges.iter().collect();
-        assert_eq!(distinct.len(), 4, "no two statuses may share wording");
+        assert_eq!(distinct.len(), 7, "no two statuses may share wording");
         // The specific confusion the DTO exists to prevent.
         let unverifiable = signature_badge(SignatureStatus::Unverifiable).unwrap();
         assert!(
@@ -327,6 +356,83 @@ mod tests {
             !unverifiable.contains("valid"),
             "nor as a valid one — {unverifiable:?}"
         );
+    }
+
+    /// #335: an expired key and an expired signature must each say **what**
+    /// expired, and neither may borrow the unqualified word `valid`.
+    ///
+    /// The wording rule is the point, not the exact string. A badge reading
+    /// just "expired" would pass a distinctness check and still leave the
+    /// reader unable to tell whether the tag is trustworthy, which is the
+    /// ambiguity #335 exists to remove — so each badge is required to name its
+    /// subject, and required to keep the word "signed", because in both cases
+    /// the signature itself checked out.
+    #[test]
+    fn each_expiry_badge_names_what_expired_and_never_claims_bare_validity() {
+        let key = signature_badge(SignatureStatus::ValidExpiredKey).unwrap();
+        let sig = signature_badge(SignatureStatus::ValidExpiredSignature).unwrap();
+        for badge in [key, sig] {
+            assert!(
+                badge.contains("expired"),
+                "an expiry badge must say so — {badge:?}"
+            );
+            assert!(
+                badge.starts_with("signed,"),
+                "the crypto passed, and the badge must lead with that — {badge:?}"
+            );
+            assert!(
+                !badge.contains("valid"),
+                "`valid` unqualified is the overclaim #335 removed — {badge:?}"
+            );
+        }
+        assert!(
+            key.contains("key"),
+            "the key-expiry badge must name the key — {key:?}"
+        );
+        assert!(
+            sig.contains("signature"),
+            "the signature-expiry badge must name the signature — {sig:?}"
+        );
+        assert_ne!(key, sig, "the two expiries are different facts");
+        // Neither may read like the other's subject: "signed, key since
+        // expired" naming the signature, or vice versa, would put the reader
+        // back where #335 found them.
+        assert!(!key.contains("signature"), "{key:?}");
+        assert!(!sig.contains("key"), "{sig:?}");
+    }
+
+    /// #335, the badge that mattered most: a revoked key read as
+    /// `Unverifiable` — "signed, not checked" — before the classifier learned
+    /// `REVKEYSIG`. Whatever wording is chosen, it must be a warning and not a
+    /// shrug, so this pins the properties rather than the string: it names
+    /// revocation, it does not borrow any of the three softer badges' wording,
+    /// and it does not claim validity.
+    #[test]
+    fn the_revoked_badge_is_a_warning_not_a_shrug() {
+        let revoked = signature_badge(SignatureStatus::Revoked).unwrap();
+        assert!(
+            revoked.to_ascii_lowercase().contains("revok"),
+            "a revoked key must be named as revoked — {revoked:?}"
+        );
+        assert!(
+            !revoked.contains("valid"),
+            "revocation is not a flavour of valid — {revoked:?}"
+        );
+        for shrug in ["not checked", "unknown", "unverifiable"] {
+            assert!(
+                !revoked.to_ascii_lowercase().contains(shrug),
+                "a revoked key must not read as {shrug:?} — {revoked:?}"
+            );
+        }
+        // And it must not be reachable by accident from the three statuses it
+        // was previously confused with.
+        for other in [
+            SignatureStatus::Unverifiable,
+            SignatureStatus::UnknownKey,
+            SignatureStatus::Valid,
+        ] {
+            assert_ne!(signature_badge(other), Some(revoked));
+        }
     }
 
     /// The four states must stay four states. Written as a table so a mutation
