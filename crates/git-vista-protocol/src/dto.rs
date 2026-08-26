@@ -1416,6 +1416,84 @@ pub struct StashTarget {
     pub expected_oid: crate::plan::CommitOid,
 }
 
+/// Body of `POST /api/stash/drop` — remove one entry from the drawer
+/// (M3, #514; ADR 0090).
+///
+/// # Why this is not just a [`StashTarget`]
+///
+/// It was, and that was the defect. A composed pop is three unlinked
+/// requests — apply, read the conflict state, drop — and each POST takes and
+/// releases the repository guard on its own. The drop's only check was that
+/// `entry` still names `expected_oid`: proof the *stash entry* had not moved,
+/// and no proof at all that the working tree still held the changes the apply
+/// had just restored. A `git reset --hard` landing between the two steps left
+/// the entry exactly where it was, so the drop proceeded and the pop reported
+/// success over a tree that had lost the work.
+///
+/// The staleness gate could not save it. The generation digest *does* include
+/// worktree status, but the plan is built before the guard is taken, so
+/// interference arriving before plan-build is read as the valid starting
+/// state rather than as drift.
+///
+/// # `applied_operation`, and why the apply's id rather than a fingerprint
+///
+/// The server already records, on every operation's terminal transition, the
+/// generation the repository had when that operation finished. So the client
+/// does not need to observe or carry a fingerprint of its own — it hands back
+/// the id it was already given for the apply, and the server reads the
+/// fingerprint it stored itself. Less to plumb, and nothing the client could
+/// get wrong or forge into agreement: the server checks the named operation
+/// really was an apply of *this* entry at *this* oid, and really succeeded,
+/// before it trusts the generation attached to it.
+///
+/// # Required, and an enum rather than an `Option`
+///
+/// Not every drop follows an apply. The drawer's own Drop button is a
+/// standalone destructive act with no restored changes to protect, and it
+/// must keep working — so the field cannot simply be "the apply's id".
+///
+/// `Option<OperationId>` would express that and would be the wrong shape:
+/// `None` is exactly what a caller that stopped proving anything sends, and
+/// the composed pop's drop would silently fall back to the unchecked path
+/// with nothing red anywhere. [`DropContext`] makes the two cases *different
+/// answers to a question that must be answered*, rather than one answer and
+/// its absence. Required, with no `#[serde(default)]`, which is why this
+/// shipped with the v9 bump rather than as an additive field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DropStashRequest {
+    /// Which entry, and the oid the client believes it names — unchanged from
+    /// the shape this body used to be.
+    pub target: StashTarget,
+    /// Why this drop is happening, which decides what must be proven first.
+    pub context: DropContext,
+}
+
+/// What a drop is the second half of, if anything (M3, #514).
+///
+/// The discriminator the server keys its extra proof on: a pop's drop must
+/// show the tree still holds what its apply restored; a standalone drop has
+/// no such claim to make and is not asked to make one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum DropContext {
+    /// The drawer's Drop button: the user asked for this entry to go, full
+    /// stop. Nothing was restored, so there is nothing to verify beyond the
+    /// selector/oid pair every stash write already checks.
+    Standalone,
+    /// The second half of a composed pop. Carries the `ApplyStash` operation
+    /// whose changes are now in the tree; the server compares the generation
+    /// that operation recorded when it finished against the live one, under
+    /// the coordinator guard.
+    ///
+    /// The id is not taken on trust: the server checks the named operation
+    /// really was an apply of *this* entry at *this* oid and really
+    /// succeeded, before it trusts the generation attached to it.
+    CompletingPop {
+        applied_operation: crate::OperationId,
+    },
+}
+
 /// Body of `POST /api/stash/push` — put the working tree in the drawer
 /// (M3.24, #77; ADR 0079).
 ///
