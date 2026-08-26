@@ -440,6 +440,101 @@ mod tests {
         );
     }
 
+    /// **The over-cap refusal at the wire** (#336): a `PullError` larger than
+    /// `middleware::MAX_ERROR_BODY` must still reach the client as a bare
+    /// `PullError`, through the real router and the real middleware.
+    ///
+    /// `the_strategy_mandate_is_a_400_through_a_real_router` above already pins
+    /// the small case, and would go red if `rewrap_error`'s #323 sniff were
+    /// removed outright. It would **not** go red if the sniff were merely
+    /// *narrowed* to bodies that fit the middleware's 64 KiB buffering cap —
+    /// which is precisely what the old code did, silently: `to_bytes` returned
+    /// `Err` for an over-cap body and `unwrap_or_default()` replaced it with
+    /// nothing, so the client got an `ApiError` reading "Bad Request" and none
+    /// of the server's own words. This test is that missing assertion.
+    ///
+    /// The oversized body is produced by the endpoint's **own** refusal path,
+    /// not a fixture: `deny_unknown_fields` echoes the offending key into
+    /// serde's message, and `parse_request` quotes that message into the
+    /// `PullError` it builds. No route-local layer stands behind this one — the
+    /// general mechanism is all there is (ADR 0084).
+    #[tokio::test]
+    async fn an_over_cap_refusal_reaches_the_client_as_a_bare_pull_error_through_a_real_router() {
+        use crate::middleware::MAX_ERROR_BODY;
+        use axum::body::{to_bytes, Body};
+        use axum::http::{header, Request};
+        use axum::routing::post;
+        use axum::Router;
+        use git_vista_protocol::{PROTOCOL_HEADER, PROTOCOL_VERSION};
+        use tower::ServiceExt;
+
+        let router = Router::new()
+            .route("/api/pull", post(pull_branch))
+            .layer(axum::middleware::from_fn(crate::middleware::api_contract));
+
+        // One unknown key, comfortably past the cap. `PullRequest` and
+        // `StrategyProbe` both carry `deny_unknown_fields`, so this is refused
+        // by the endpoint's generic arm — which quotes serde's message, key
+        // and all.
+        let key = "z".repeat(MAX_ERROR_BODY + 8 * 1024);
+        let body = format!(r#"{{"remote":"origin","branch":"main","strategy":"merge","{key}":1}}"#);
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/pull")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            content_type.starts_with("application/json"),
+            "an over-cap typed refusal must be labeled JSON like an under-cap \
+             one: got {content_type:?}"
+        );
+        let raw = {
+            let bytes = to_bytes(resp.into_body(), 8 * 1024 * 1024).await.unwrap();
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        assert!(
+            raw.len() > MAX_ERROR_BODY,
+            "the fixture must actually exceed the buffering cap or this test \
+             proves nothing: the body came back as {} bytes",
+            raw.len()
+        );
+        let parsed: PullError = serde_json::from_str(&raw).unwrap_or_else(|e| {
+            panic!(
+                "an over-cap refusal did not survive as a bare PullError ({e}): \
+                 {} bytes, starting {:?}",
+                raw.len(),
+                &raw[..raw.len().min(120)]
+            )
+        });
+        assert_eq!(parsed.kind, PullFailureKind::Other);
+        assert!(
+            parsed.message.contains(&key),
+            "the message must carry the whole of what the server said, not a \
+             prefix of it — the key it quoted is {} bytes and the message is {}",
+            key.len(),
+            parsed.message.len()
+        );
+        assert!(
+            parsed.worktree_restored,
+            "a request refused before planning cannot have touched the worktree"
+        );
+    }
+
     /// The paired positive: ordinary names pass, and pass *as themselves*
     /// (trimmed, not rewritten). Without this, a gate that refused everything
     /// would satisfy the test above while accepting nothing.

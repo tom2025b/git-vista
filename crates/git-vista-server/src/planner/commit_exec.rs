@@ -24,7 +24,6 @@
 use std::path::{Path, PathBuf};
 
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
 
 use git_vista_protocol::{
     AmendCommitError, AmendCommitSuccess, AmendFailureKind, BranchName, CommitError,
@@ -372,7 +371,7 @@ pub(super) async fn exec_amend_commit(
     observed: &Observed,
 ) -> (StatusCode, String) {
     let Some(branch) = observed.head_branch.clone() else {
-        return amend_refusal_body(
+        return amend_refusal(
             AmendFailureKind::Other,
             "Amending requires a checked-out branch — HEAD is detached. \
              Check out a branch and try again.",
@@ -381,13 +380,13 @@ pub(super) async fn exec_amend_commit(
     match observed.head_tip.known().map(String::as_str) {
         Some(tip) if tip == expected_tip.as_str() => {}
         Some(_) => {
-            return amend_refusal_body(
+            return amend_refusal(
                 AmendFailureKind::StaleTip,
                 "HEAD has moved since this amend was reviewed — refresh and try again.",
             )
         }
         None => {
-            return amend_refusal_body(
+            return amend_refusal(
                 AmendFailureKind::StaleTip,
                 "There is no commit here to amend — refresh and try again.",
             )
@@ -413,7 +412,7 @@ pub(super) async fn exec_amend_commit(
             // `expected_tip`, so that's the pre-spawn tip to verify against.
             let old = Obs::Known(expected_tip.as_str().to_string());
             let check = check_head_after_hook_timeout(repo, need, &old).await;
-            return amend_refusal_body(
+            return amend_refusal(
                 AmendFailureKind::HookTimedOut,
                 &hook_timeout_message(&check),
             );
@@ -429,7 +428,7 @@ pub(super) async fn exec_amend_commit(
         );
         // Amend shares `git commit`'s quirk: some refusals go to stdout.
         let msg = stderr_stdout_or(&output, "git commit --amend failed.");
-        return amend_refusal_body(kind, &msg);
+        return amend_refusal(kind, &msg);
     }
 
     let new = Obs::from_read(rev_parse(repo, "HEAD").await);
@@ -469,46 +468,34 @@ pub(super) async fn exec_amend_commit(
     )
 }
 
-/// The one constructor for `/api/amend-commit`'s 400 contract at the handler
-/// boundary: the handler's own request-shape rejections build their refusal
-/// through this function, which returns a real `Response` labeled
-/// `application/json` directly — never through the `(StatusCode, String)`
-/// prose channel `plan_and_execute` and its executors return everywhere else.
+/// The one constructor for `/api/amend-commit`'s 400 contract, wherever the
+/// refusal is made: the handler's own request-shape rejections and
+/// [`exec_amend_commit`]'s classified git outcomes both build the typed
+/// [`AmendCommitError`] JSON through this function, into the same
+/// `(StatusCode, String)` prose channel [`plan_and_execute`](super::plan_and_execute)
+/// and every other operation's executor return.
 ///
-/// #323: that prose channel is exactly the trap. `String` implements
-/// `IntoResponse` as `text/plain`, so a `(StatusCode, String)` carrying
-/// hand-serialized JSON reads as plain text at the wire, and
-/// `middleware::rewrap_error` — which keys on content-type, not content —
-/// re-envelopes it into `ApiError`, double-encoding the real
-/// `AmendCommitError` payload into that envelope's `message` field as an
-/// escaped string. Building the `Response` here, with its content-type set
-/// by `Json`, is what makes `rewrap_error`'s `is_json` check pass the body
-/// through untouched. [`amend_refusal_body`] is the sibling that keeps the
-/// old `(StatusCode, String)` shape for `exec_amend_commit`'s callers, which
-/// share `plan_and_execute`'s return type; `handlers::commit::amend_route_response`
-/// is what re-labels *that* channel's output as JSON at the final hop for
-/// this route.
-pub(crate) fn amend_refusal(kind: AmendFailureKind, message: &str) -> axum::response::Response {
-    eprintln!("git-vista: /api/amend-commit refused ({kind:?}): {message}");
-    (
-        StatusCode::BAD_REQUEST,
-        axum::Json(AmendCommitError {
-            kind,
-            message: message.to_string(),
-        }),
-    )
-        .into_response()
-}
-
-/// [`amend_refusal`]'s sibling for `exec_amend_commit`'s own callers: same
-/// `AmendCommitError` JSON, same eprintln, but kept in the old
-/// `(StatusCode, String)` shape because `exec_amend_commit` shares
-/// `plan_and_execute`'s return type with every other operation's executor —
-/// widening it to `Response` here would ripple through the whole shared
-/// pipeline for one route. `handlers::commit::amend_route_response` re-labels
-/// this channel's output as `application/json` at the final hop instead, so
-/// the wire contract is still met without that ripple.
-fn amend_refusal_body(kind: AmendFailureKind, message: &str) -> (StatusCode, String) {
+/// #323 is why the body is JSON in a `String` at all, and why that used to
+/// look like a trap: `String` implements `IntoResponse` as `text/plain`, so a
+/// `(StatusCode, String)` carrying hand-serialized JSON reads as plain text at
+/// the wire. `middleware::rewrap_error` answers that by sniffing the *bytes* —
+/// a body that parses as a JSON object is relabeled `application/json` and
+/// passed through instead of being escaped into an `ApiError.message` — which
+/// is the same one mechanism [`commit_refusal_body`] and
+/// [`sign_refusal_body`](super::tag_exec::sign_refusal_body) already rely on
+/// with no route-local help.
+///
+/// This function used to be one of a pair — a `Response`-returning
+/// `amend_refusal` for the handler and a `(StatusCode, String)`
+/// `amend_refusal_body` for the executor, re-labeled at the route by
+/// `handlers::commit::amend_route_response`. That layer existed because
+/// `rewrap_error` discarded any body over its 64 KiB buffering cap, so an
+/// oversized refusal (a hook printing a large rejection) survived only on the
+/// route that bypassed the sniff. #336 fixed that in `rewrap_error` itself —
+/// it now forwards an over-cap body instead of collecting it — so the second
+/// mechanism covered nothing the first did not, and ADR 0084 records collapsing
+/// it into this one.
+pub(crate) fn amend_refusal(kind: AmendFailureKind, message: &str) -> (StatusCode, String) {
     eprintln!("git-vista: /api/amend-commit refused ({kind:?}): {message}");
     (
         StatusCode::BAD_REQUEST,
@@ -791,12 +778,12 @@ pub(super) fn classify_commit_failure(
 /// Build a failed `POST /api/commit` refusal's `(StatusCode, String)` — the
 /// typed [`CommitError`] JSON, serialized into the same shared prose
 /// channel [`plan_and_execute`](super::plan_and_execute) and its executors return everywhere else.
-/// Needs no `Response`-returning sibling the way
-/// [`amend_refusal`]/[`amend_refusal_body`] split into two:
-/// `middleware::rewrap_error`'s #323 fix already recognises a JSON *object*
-/// body on any route and passes it through with `application/json` set
-/// rather than re-wrapping it as escaped text — the same posture
-/// [`sign_refusal_body`](super::tag_exec::sign_refusal_body) already relies on, added after that fix landed.
+/// Needs no route-local relabeling layer: `middleware::rewrap_error`'s #323
+/// fix already recognises a JSON *object* body on any route and passes it
+/// through with `application/json` set rather than re-wrapping it as escaped
+/// text — the same posture [`amend_refusal`] and
+/// [`sign_refusal_body`](super::tag_exec::sign_refusal_body) take, the first of
+/// them since #336 collapsed the one exception (ADR 0084).
 pub(super) fn commit_refusal_body(kind: CommitFailureKind, message: &str) -> (StatusCode, String) {
     eprintln!("git-vista: /api/commit refused ({kind:?}): {message}");
     (
