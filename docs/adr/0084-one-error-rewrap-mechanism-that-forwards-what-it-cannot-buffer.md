@@ -242,6 +242,13 @@ commit: **633 passed, 321 failed, 4 ignored**. The failing sets are identical �
 `comm` over the sorted names reports zero new failures and zero newly passing.
 The +9 are exactly the nine tests added here.
 
+`main` has since moved to `b1d9c0f` (#533), which is merged down here too. That
+baseline is *not* re-measured, and the reason is checkable rather than assumed:
+`git diff --stat 5ec2ae5..b1d9c0f` touches only `.github/workflows/ci.yml` and
+two documents — no Rust source, so no test can have changed behaviour. The
+branch suite was re-run against it anyway and still reports **633 passed, 321
+failed**, the same failing set.
+
 (The same comparison against the branch's original base `405a764` read 616 →
 625, also with an identical failing set.)
 
