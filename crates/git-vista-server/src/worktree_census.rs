@@ -8,9 +8,13 @@
 //! wire type land and are reviewed first, with no route yet exposing them —
 //! this issue is scoped to the query, not the UI (M11.03) or the
 //! checkout-collision precondition the spec's §2 designs next. Nothing here
-//! is called from a handler yet; [`worktree_census`] has `#[allow(dead_code)]`
-//! outside tests for exactly that reason, the same attribute `conflicts`
-//! carries for the same reason.
+//! is called from a handler yet; [`worktree_census`] itself carries
+//! `#[allow(dead_code)]` outside tests for exactly that reason — on the
+//! function only, not the `mod worktree_census;` declaration in `main.rs`
+//! (see that declaration's own comment for why: unlike `conflicts`, which
+//! has no caller anywhere in it, everything below `worktree_census` is
+//! reached from within this module and should stay eligible for the
+//! dead-code lint).
 //!
 //! # No new sandbox tier, no new grant
 //!
@@ -53,14 +57,15 @@
 //!
 //! `git worktree list --porcelain` has a `-z` form that NUL-terminates
 //! records instead of newline-terminates them, which is the safer contract
-//! for a path that could contain a literal newline. It is not used here: the
-//! git-scm manual for 2.31 (the closest version with its own page; 2.32's
-//! page redirects to it, meaning nothing about `worktree list` changed
-//! between them) documents `list`, `--porcelain`, and `-v`/`--verbose` and
-//! says nothing about `-z` at all, while the current manual documents it —
-//! so `-z` post-dates this project's documented git floor
-//! (`docs/SUPPORTED_VERSIONS.md`, "Git: 2.32 or later"). Parsing the
-//! newline-terminated form inherits git's own limitation at that floor: a
+//! for a path that could contain a literal newline. It is not used here:
+//! git-scm's manual for 2.31 documents `list`, `--porcelain`, and
+//! `-v`/`--verbose` and says nothing about `-z` at all; 2.32 has no distinct
+//! page of its own on git-scm.com at all (its URL redirects to 2.31's); the
+//! *current* manual documents `-z`. Taken together, `-z` was added to
+//! `worktree list` at some later version, after this project's documented
+//! git floor (`docs/SUPPORTED_VERSIONS.md`, "Git: 2.32 or later") — so it
+//! isn't used here. Parsing the newline-terminated form inherits git's own
+//! limitation at that floor: a
 //! worktree path containing a literal newline cannot be parsed unambiguously.
 //! That is a fact about the porcelain contract at the supported floor, not a
 //! defect introduced by [`parse_worktree_porcelain`].
@@ -127,7 +132,7 @@ pub(crate) async fn worktree_census(
         );
     }
 
-    let mut common_dir_cache: Option<Result<PathBuf, String>> = None;
+    let mut common_dir_cache: Option<PathBuf> = None;
     let mut siblings = Vec::with_capacity(raw_records.len());
     let mut current_count = 0usize;
 
@@ -177,7 +182,7 @@ async fn resolve_sibling(
     current: &RepoFacts,
     expose_paths: bool,
     path_is_allowed: &dyn Fn(&Path) -> bool,
-    common_dir_cache: &mut Option<Result<PathBuf, String>>,
+    common_dir_cache: &mut Option<PathBuf>,
 ) -> Result<WorktreeSibling, String> {
     let (worktree_id, repository_id, root_for_fence) = if raw.prunable {
         // `prunable` is git's own flag; whether it means "the directory is
@@ -334,14 +339,20 @@ fn canonicalize_lossy(path: &Path) -> String {
 /// best-effort-canonical path. Only called for a repository that lazily turns
 /// out to hold a `prunable`-and-unreadable sibling — most censuses never
 /// spawn this.
-async fn get_common_dir(
-    repo: &Path,
-    cache: &mut Option<Result<PathBuf, String>>,
-) -> Result<PathBuf, String> {
-    if cache.is_none() {
-        *cache = Some(common_dir(repo).await);
+///
+/// Only a **successful** read is cached. A failure here is propagated by the
+/// caller's `?` straight to `WorktreeCensus::CensusFailed`, which ends the
+/// whole census immediately — so a cached failure could never be read back
+/// by a second `prunable` row in the same call. Caching it anyway would be
+/// dead machinery for a path that cannot execute; simpler to just re-run
+/// `common_dir` on the (census-ending) failure case; it happens at most once.
+async fn get_common_dir(repo: &Path, cache: &mut Option<PathBuf>) -> Result<PathBuf, String> {
+    if let Some(dir) = cache {
+        return Ok(dir.clone());
     }
-    cache.clone().expect("just set")
+    let dir = common_dir(repo).await?;
+    *cache = Some(dir.clone());
+    Ok(dir)
 }
 
 async fn common_dir(repo: &Path) -> Result<PathBuf, String> {

@@ -112,12 +112,13 @@ fact-folding this design exists to prevent, just one level down.
 
 `git worktree list --porcelain -z` NUL-terminates records, which is the
 safer contract for a path containing a literal newline. It is not used:
-`docs/SUPPORTED_VERSIONS.md` documents a git floor of 2.32, and the git-scm
-manual for 2.31 — the closest version with its own page; 2.32's page
-redirects to it, meaning nothing about `worktree list` changed between them —
-documents `list`, `--porcelain`, and `-v`/`--verbose`, and says nothing about
-`-z` at all, while the current manual does. So `-z` post-dates this project's
-documented floor. Parsing the newline form inherits git's own limitation at
+`docs/SUPPORTED_VERSIONS.md` documents a git floor of 2.32. The git-scm
+manual for 2.31 documents `list`, `--porcelain`, and `-v`/`--verbose` and
+says nothing about `-z` at all; 2.32 has no distinct page of its own (its
+URL redirects to 2.31's); the current manual documents `-z`. Taken together,
+`-z` was added to `worktree list` at some later version, after this
+project's documented floor. Parsing the newline form inherits git's own
+limitation at
 that floor (a literal newline in a worktree path cannot be parsed
 unambiguously) rather than a defect in the parser — and the one place that
 could bite silently, quoting, doesn't apply here: the manual documents that

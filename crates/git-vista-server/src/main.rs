@@ -102,7 +102,14 @@ mod state;
 // exposes this yet; that is M11.03's and the checkout-collision
 // precondition's, not this issue's. See docs/superpowers/specs/
 // m3.23-worktrees.md §1.
-#[cfg_attr(not(test), allow(dead_code))]
+//
+// Unlike `conflicts` (whose `allow(dead_code)` sits on the `mod` line because
+// nothing in it has a caller at all), only the public entry point
+// `worktree_census` gets the attribute, on itself — its internal helpers
+// (`correlate_missing_admin_dir`, `common_dir`, `is_null_oid`, the parser)
+// are each called from within the module, so a future edit that orphans one
+// of them should still trip clippy's dead-code lint rather than being
+// silently exempted by a blanket module-level attribute.
 mod worktree_census;
 // M1.13b (#66): the single owner of TCP port 9418 in the test binary. Three
 // tests across `sandbox::escape_suite` and `planner::contract_suite` need that
