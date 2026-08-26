@@ -18,6 +18,7 @@ use crate::features::dialogs::core::{
     delete_confirm_prompt, merge_confirm_prompt, worktree_confirm, ConfirmPrompt, Dialog,
     PullTarget, WorktreeAction, TOUCH_TARGET_STYLE,
 };
+use crate::features::explain::core::{render, LinkTarget, RenderedSection, Span};
 use crate::features::graph::core::{disabled_menu_item_copy, push_confirm_copy};
 use crate::features::operations::kind::OperationKind;
 use crate::state::{Features, PendingOp};
@@ -82,6 +83,22 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
             // HEAD has no valid target, so the dialog is informational (Cancel only)
             // — and a live HEAD read that failed outright disables the destructive
             // arms too, because "couldn't tell" is never "safe to offer".
+            // Explain Mode (M6.39b, #545). Present only where the operation
+            // actually carries a plan — today that is the force-with-lease
+            // push, whose menu entry already fetches one to read `risk`.
+            //
+            // `None` here means "this operation has no plan to explain", NOT
+            // "this operation is simple". Every other confirmation in this
+            // modal is built from its arguments and has never seen a plan;
+            // giving them a panel means giving them a plan first, which is a
+            // server round trip and a new failure mode per dialog. #545
+            // carries that argument in full.
+            let explanation = match &op {
+                PendingOp::Push {
+                    force: Some(f), ..
+                } => Some(f.explanation.clone()),
+                _ => None,
+            };
             let ConfirmPrompt {
                 title,
                 body,
@@ -384,6 +401,7 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                         <div style="margin-bottom:14px; line-height:1.4; \
                                     white-space:pre-wrap; max-height:50vh; \
                                     overflow-y:auto;">{body}</div>
+                        {explanation.map(|e| explanation_panel_view(&e))}
                         {arm_control}
                         {visible_reason.map(|reason| view! {
                             <div style="margin-bottom:10px; color:var(--muted); \
@@ -433,6 +451,124 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                 </div>
             }
         })
+    }
+}
+
+/// Explain Mode's panel (M6.39b, #545): the plan, in ordinary language,
+/// under the confirmation it belongs to.
+///
+/// Every word here comes from `features::explain::core`, which is pure and
+/// host-tested; this function only arranges what that module returns. Keeping
+/// the split that strict is what makes #92's criterion 5 checkable at all —
+/// `cargo test` never compiles this file.
+fn explanation_panel_view(explanation: &git_vista_protocol::Explanation) -> impl IntoView {
+    let sections = render(explanation);
+    view! {
+        <div style="margin-bottom:14px; border:1px solid #30363d; \
+                    border-radius:8px; overflow:hidden;">
+            <div style="padding:8px 12px; background:#0d1117; color:var(--muted); \
+                        font-size:12px; letter-spacing:0.04em; \
+                        text-transform:uppercase;">
+                "What this plan says"
+            </div>
+            {sections.into_iter().map(section_view).collect_view()}
+        </div>
+    }
+}
+
+/// One collapsible section.
+///
+/// **Default expanded**, and the collapsed state persists per topic rather
+/// than per plan — see `features::explain::core::storage_key` for why that
+/// distinction is the whole feature rather than a detail. A teaching panel
+/// that starts closed is one a learner never opens; an expert closes it once
+/// and it stays closed for every operation afterwards.
+fn section_view(section: RenderedSection) -> impl IntoView {
+    let topic = section.topic;
+    let (open, set_open) = create_signal(crate::prefs::load_explain_section_open(topic));
+    let heading = section.heading;
+    let when_empty = section.when_empty;
+    let lines = section.lines;
+    let empty = lines.is_empty();
+
+    view! {
+        <div style="border-top:1px solid #21262d;">
+            // A `<button>` rather than `<details>`: this modal takes no form
+            // controls (see the module doc), and the open/closed change has to
+            // be announced, not merely visible — the same reasoning the arm
+            // control above is built on.
+            <button
+                style=format!(
+                    "{BUTTON_BASE}{TOUCH_TARGET_STYLE}width:100%; text-align:left; \
+                     border-radius:0; color:var(--fg); background:#161b22; \
+                     border:none; display:flex; align-items:center; gap:8px;"
+                )
+                aria-expanded=move || if open.get() { "true" } else { "false" }
+                on:click=move |_| {
+                    let next = !open.get_untracked();
+                    set_open.set(next);
+                    crate::prefs::store_explain_section_open(topic, next);
+                }
+            >
+                <span style="color:var(--muted); width:1em;">
+                    {move || if open.get() { "▾" } else { "▸" }}
+                </span>
+                <span style="font-weight:600;">{heading}</span>
+            </button>
+            <div style=move || {
+                if open.get() {
+                    "padding:0 12px 10px 30px; line-height:1.5;".to_string()
+                } else {
+                    "display:none;".to_string()
+                }
+            }>
+                {if empty {
+                    // Stated, never hidden: "nothing has to be true first" is
+                    // itself the answer, and a section that vanishes teaches
+                    // nothing (ADR 0091, decision 5).
+                    view! {
+                        <div style="color:var(--muted);">{when_empty}</div>
+                    }.into_view()
+                } else {
+                    lines.into_iter().map(line_view).collect_view()
+                }}
+            </div>
+        </div>
+    }
+}
+
+/// One line of a section.
+///
+/// `data-explain-ref` / `data-explain-commit` carry the object the line names
+/// — #92's criterion 3. The attribute is deliberately the whole of it for now:
+/// the panel *identifies* the ref the graph draws, and wiring the click
+/// through to focus that node is left to the graph slice rather than
+/// half-built here. A browser test can assert the attribute; nothing claims
+/// the line is navigable yet.
+fn line_view(line: crate::features::explain::core::Line) -> impl IntoView {
+    let (ref_attr, commit_attr) = match &line.link {
+        Some(LinkTarget::Ref(r)) => (Some(r.clone()), None),
+        Some(LinkTarget::Commit(c)) => (None, Some(c.clone())),
+        None => (None, None),
+    };
+    let parts = crate::features::explain::core::spans(&line.text);
+    view! {
+        <div
+            style="margin:6px 0;"
+            data-explain-ref=ref_attr
+            data-explain-commit=commit_attr
+        >
+            {parts.into_iter().map(|p| match p {
+                Span::Text(t) => view! { <span>{t}</span> }.into_view(),
+                // git's own words, set apart so a branch called `main` cannot
+                // be read as the English word.
+                Span::Code(c) => view! {
+                    <span style="font-family:ui-monospace,monospace; \
+                                 background:#0d1117; padding:1px 4px; \
+                                 border-radius:4px;">{c}</span>
+                }.into_view(),
+            }).collect_view()}
+        </div>
     }
 }
 

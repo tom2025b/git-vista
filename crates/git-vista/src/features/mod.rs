@@ -12,6 +12,7 @@ pub mod activity;
 pub mod conflicts;
 pub mod dialogs;
 pub mod diff;
+pub mod explain;
 pub mod graph;
 pub mod operations;
 pub mod session;

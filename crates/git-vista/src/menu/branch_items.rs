@@ -308,13 +308,23 @@ pub(super) fn build_branch_items(
                         if !still_current() {
                             return;
                         }
-                        // Both taken off the SAME leased plan. The advisories
-                        // are the planner's answer about the remote's default
-                        // branch, which this client cannot see for itself
-                        // (M4.32, #85) — computed server-side, carried here,
-                        // never re-derived.
-                        let (risk, advisories) = match leased {
-                            Ok(plan) => (plan.risk, plan.advisories),
+                        // All three taken off the SAME leased plan. The
+                        // advisories are the planner's answer about the
+                        // remote's default branch, which this client cannot
+                        // see for itself (M4.32, #85) — computed server-side,
+                        // carried here, never re-derived.
+                        //
+                        // M6.39b (#545) adds the explanation, and adds it
+                        // here rather than in the modal for the same reason:
+                        // it must explain the plan whose risk colours the
+                        // button. Building it from a second preview fetched
+                        // when the modal opens would cost another round trip
+                        // and could describe a repository that had moved.
+                        let (risk, advisories, explanation) = match leased {
+                            Ok(plan) => {
+                                let explanation = git_vista_protocol::explain(&plan);
+                                (plan.risk, plan.advisories, explanation)
+                            }
                             Err(e) => {
                                 dialogs.open(Dialog::Error);
                                 shell.open_error(ErrorNotice {
@@ -332,6 +342,7 @@ pub(super) fn build_branch_items(
                                 expected_remote_tip: oid,
                                 risk,
                                 advisories,
+                                explanation,
                             }),
                         });
                     });

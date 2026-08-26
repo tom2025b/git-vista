@@ -171,3 +171,29 @@ pub fn clear_comparison() {
         let _ = s.remove_item(COMPARISON_KEY);
     }
 }
+
+/// Whether one Explain Mode section is expanded (M6.39b, #545).
+///
+/// **Default expanded**, and that is a decision rather than an accident: a
+/// teaching feature that starts collapsed is one a learner never finds. The
+/// expert who does not want it collapses it once, and — because the key is
+/// [`storage_key`](crate::features::explain::core::storage_key), which carries
+/// the topic and nothing else — it stays collapsed for every operation rather
+/// than only for the one they were looking at.
+pub fn load_explain_section_open(topic: git_vista_protocol::Topic) -> bool {
+    let key = crate::features::explain::core::storage_key(topic);
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(key).ok().flatten())
+        .is_none_or(|v| v != "closed")
+}
+
+/// Persist one Explain Mode section's collapsed state. Best-effort, like every
+/// other write in this module: private browsing may refuse it, and the panel
+/// still works for this session.
+pub fn store_explain_section_open(topic: git_vista_protocol::Topic, open: bool) {
+    let key = crate::features::explain::core::storage_key(topic);
+    if let Some(s) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = s.set_item(key, if open { "open" } else { "closed" });
+    }
+}

@@ -15,7 +15,7 @@
 
 use git_vista_core::activity::Undoable;
 use git_vista_protocol::plan::Advisory;
-use git_vista_protocol::{CommitOid, MergeStrategy, RiskLevel};
+use git_vista_protocol::{CommitOid, Explanation, MergeStrategy, RiskLevel};
 
 /// A branch operation awaiting confirmation in the modal (Issue #33 follow-up).
 /// Merge and delete change history/refs and push reaches the network, so each is
@@ -164,6 +164,19 @@ pub struct ForceWithLease {
     /// server already answered the question; re-deriving it here could only
     /// disagree.
     pub advisories: Vec<Advisory>,
+    /// Explain Mode's typed explanation of **this exact plan** (M6.39b, #545).
+    ///
+    /// Carried for the same reason `advisories` is, and it is the same plan:
+    /// the menu already fetches a leased preview to read `risk`, so the rest
+    /// of that plan was being read and thrown away. Taking the explanation
+    /// off it costs no extra round trip and — more to the point — guarantees
+    /// the panel explains the plan whose risk the button is coloured by,
+    /// rather than a second plan built a moment later that could differ.
+    ///
+    /// Stored as the protocol's typed [`Explanation`], not as rendered text:
+    /// the words are `features::explain::core`'s job and live in the view,
+    /// which is what keeps every sentence in one replaceable place.
+    pub explanation: Explanation,
 }
 
 /// The live "which branch is checked out?" answer a menu pre-check hands the
@@ -325,6 +338,21 @@ mod tests {
         CommitOid::new(c.to_string().repeat(40)).unwrap()
     }
 
+    /// An explanation with no sections, for the tests in this module — which
+    /// are about the operation's one-line **caption**, never about the panel.
+    ///
+    /// This is not a shape [`git_vista_protocol::explain`] produces: it always
+    /// emits six sections, empty ones included. It exists so these assertions
+    /// say plainly that the explanation is not what they are measuring, rather
+    /// than carrying a plausible-looking one that a later reader might mistake
+    /// for coverage. The panel's own behaviour is pinned in
+    /// `features::explain::core` and in the protocol crate's parity test.
+    fn caption_only_explanation() -> Explanation {
+        Explanation {
+            sections: Vec::new(),
+        }
+    }
+
     #[test]
     fn every_variant_describes_itself_without_naming_its_enum() {
         // A status strip reading "ForceDelete" would be leaking the type name at the user.
@@ -345,6 +373,7 @@ mod tests {
                     expected_remote_tip: oid('a'),
                     risk: RiskLevel::Destructive,
                     advisories: Vec::new(),
+                    explanation: caption_only_explanation(),
                 }),
             },
             OperationKind::Delete {
@@ -410,6 +439,7 @@ mod tests {
                 expected_remote_tip: oid('a'),
                 risk: RiskLevel::Destructive,
                 advisories: Vec::new(),
+                explanation: caption_only_explanation(),
             }),
         }
         .describe();
