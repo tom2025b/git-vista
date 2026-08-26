@@ -1653,58 +1653,69 @@ pub(crate) mod tests {
         }
     }
 
-    /// Adversarial ordering across the three statuses #335 added, which real
-    /// gpg will not produce in one run and which the precedence table is
-    /// therefore the only thing standing behind.
+    /// **Severity decides the verdict, whatever order the lines arrive in —
+    /// checked over EVERY ordered pair, not a hand-picked few.**
     ///
-    /// Each case names the severity rule it defends, and each is written with
-    /// the *milder* keyword first so a first-match-wins implementation — the
-    /// obvious wrong way to write this — fails rather than passing by luck.
+    /// Real gpg will not emit two verdict keywords in one run, so the
+    /// precedence table is the only thing standing behind this. The first
+    /// version of this test wrote each pair with the *milder* keyword first,
+    /// which defends against first-match-wins — and nothing else. An outside
+    /// review (codex, 2026-08-26) showed by simulation that a reducer
+    /// regressing to last-line-wins (`verdict = Some(rank)` instead of
+    /// `best.min(rank)`) passed all five hand-picked pairs, while
+    /// `BADSIG` then `REVKEYSIG` would return `Revoked` — **downgrading a
+    /// forged signature to a softer verdict**, which is the one outcome this
+    /// classifier exists to make impossible.
+    ///
+    /// So the pairs are generated rather than chosen: for every ordered pair
+    /// of distinct entries in [`VERDICT_PRECEDENCE`], the stronger one (lower
+    /// index) must win in BOTH orders. A hand-written list can be complete
+    /// today and silently partial after the next keyword is added; this
+    /// cannot.
+    ///
+    /// MUTATION 1 (last-line-wins): `verdict = Some(rank)` — red on the pairs
+    ///   where the stronger keyword comes first.
+    /// MUTATION 2 (first-line-wins): `verdict = verdict.or(Some(rank))` — red
+    ///   on the pairs where the milder keyword comes first.
+    /// Neither mutation is caught by both halves, which is exactly why both
+    /// orders must be asserted.
     #[test]
-    fn severity_decides_the_verdict_regardless_of_line_order() {
-        // A revoked key beats an ordinary good signature: revocation is the
-        // signer's own statement that the key must not be trusted.
-        assert_eq!(
-            classify_verify_tag_output(
-                b"[GNUPG:] GOODSIG 4181 Signer <s@example.com>\n\
-                  [GNUPG:] REVKEYSIG 4181 Signer <s@example.com>\n"
-            ),
-            SignatureStatus::Revoked
-        );
-        // …and beats both expiries, which are lapses rather than warnings.
-        assert_eq!(
-            classify_verify_tag_output(
-                b"[GNUPG:] EXPKEYSIG 4181 Signer <s@example.com>\n\
-                  [GNUPG:] REVKEYSIG 4181 Signer <s@example.com>\n"
-            ),
-            SignatureStatus::Revoked
-        );
-        // A forged signature still outranks everything, including revocation:
-        // `BADSIG` is the one line that says the bytes themselves are wrong.
-        assert_eq!(
-            classify_verify_tag_output(
-                b"[GNUPG:] REVKEYSIG 4181 Signer <s@example.com>\n\
-                  [GNUPG:] BADSIG 4181 Signer <s@example.com>\n"
-            ),
-            SignatureStatus::Invalid
-        );
-        // An expired key outranks an expired signature: the key-level fact
-        // covers every signature that key ever made.
-        assert_eq!(
-            classify_verify_tag_output(
-                b"[GNUPG:] EXPSIG 4181 Signer <s@example.com>\n\
-                  [GNUPG:] EXPKEYSIG 4181 Signer <s@example.com>\n"
-            ),
-            SignatureStatus::ValidExpiredKey
-        );
-        // And the pre-#335 relationship is unchanged: a good signature in the
-        // same run as a `NO_PUBKEY` for some other key is still `Valid`.
-        assert_eq!(
-            classify_verify_tag_output(
-                b"[GNUPG:] NO_PUBKEY 9999\n\
-                  [GNUPG:] GOODSIG 4181 Signer <s@example.com>\n"
-            ),
-            SignatureStatus::Valid
+    fn severity_decides_the_verdict_over_every_ordered_pair() {
+        for (i, (strong_kw, strong_status)) in VERDICT_PRECEDENCE.iter().enumerate() {
+            for (weak_kw, _) in VERDICT_PRECEDENCE.iter().skip(i + 1) {
+                // Stronger first, then milder.
+                let strong_first = format!(
+                    "[GNUPG:] {strong_kw} 4181 Signer <s@example.com>\n\
+                     [GNUPG:] {weak_kw} 4181 Signer <s@example.com>\n"
+                );
+                assert_eq!(
+                    classify_verify_tag_output(strong_first.as_bytes()),
+                    *strong_status,
+                    "{strong_kw} must outrank {weak_kw} when it comes FIRST \
+                     (a last-line-wins reducer fails here)"
+                );
+
+                // Milder first, then stronger — the same verdict.
+                let weak_first = format!(
+                    "[GNUPG:] {weak_kw} 4181 Signer <s@example.com>\n\
+                     [GNUPG:] {strong_kw} 4181 Signer <s@example.com>\n"
+                );
+                assert_eq!(
+                    classify_verify_tag_output(weak_first.as_bytes()),
+                    *strong_status,
+                    "{strong_kw} must outrank {weak_kw} when it comes SECOND \
+                     (a first-match-wins reducer fails here)"
+                );
+            }
+        }
+
+        // Anti-vacuity: the loop above must actually have compared something.
+        // A table trimmed to one entry would make every assertion above
+        // unreachable and leave this test green while proving nothing.
+        assert!(
+            VERDICT_PRECEDENCE.len() >= 6,
+            "the precedence table lost entries; this test's coverage is only \
+             as wide as the table it iterates"
         );
     }
 
