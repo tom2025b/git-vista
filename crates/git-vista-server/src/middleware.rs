@@ -17,6 +17,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::{
     body::{Body, Bytes},
@@ -406,6 +407,99 @@ async fn split_at_limit(mut body: Body, limit: usize) -> (Bytes, BodyRemainder) 
     }
 }
 
+/// What [`split_at_limit_when_ready`] found: either a classifiable prefix, or
+/// proof that the body cannot be classified without waiting for it.
+enum ReadyOutcome {
+    /// Every frame read so far arrived the instant it was polled — the same
+    /// outcome [`split_at_limit`] always returns.
+    Ready(Bytes, BodyRemainder),
+    /// A frame was not available the instant it was polled. The body is
+    /// handed back exactly as it stood before that poll — nothing read from
+    /// it is lost, and nothing about it is altered — so the caller can
+    /// forward it untouched instead of waiting.
+    NotReady(Body),
+}
+
+/// [`split_at_limit`] for [`relabel_json_success`]'s gate specifically: it
+/// additionally requires that every frame it reads be available the instant
+/// it is polled, with nothing to actually wait for (#540).
+///
+/// `size_hint().exact()` is a byte-count promise, not a readiness one. Every
+/// success body in the tree today is a complete in-memory `String`, which
+/// answers every poll immediately by construction — but nothing stops a
+/// future hand-rolled [`http_body::Body`] from reporting an exact length and
+/// then producing it asynchronously, and awaiting *that* here would delay the
+/// response's own headers exactly the way the M1.08 progress stream is
+/// protected from above by never being polled at all. Rather than trust the
+/// declared length as proof the data is already sitting in memory, each frame
+/// is polled through a `Duration::ZERO` [`tokio::time::timeout`]: `Timeout`
+/// polls the wrapped future first and only consults the deadline when that
+/// poll is `Pending`. The `Pending` → [`ReadyOutcome::NotReady`] direction is
+/// guaranteed by that ordering alone, not by timing: it fires on the very
+/// frame that would have blocked, on any machine, at any load. The other
+/// direction is a genuine claim about the body, not about this function: a
+/// frame answers within the same poll only if producing it truly needs no
+/// suspension at all, the way `http_body_util::Full` (what every
+/// `Body::from(String)`/`Body::from(&str)` success body is backed by today)
+/// always does. A body that is logically in-memory but reaches this layer
+/// behind one layer of genuine indirection — spawned onto another task and
+/// read back over a channel, say — would poll `Pending` on its first frame
+/// here and be classified `NotReady` even though the data exists; that is a
+/// false negative, not a false positive, so the outcome is the same
+/// conservative "forward it unlabeled" every other unrecognized shape gets,
+/// never a wrongly-labeled or corrupted response. No body of that shape
+/// exists on the success path today.
+///
+/// Deliberately separate from [`split_at_limit`] rather than folded into it:
+/// `rewrap_error` uses that function on every error body regardless of
+/// declared length, including ones produced by a running `git` subprocess —
+/// bodies that are legitimately not ready on their first poll but that
+/// `rewrap_error` must still classify. Gating that path on readiness too
+/// would silently stop classifying most real refusals; the two callers want
+/// different guarantees from the same read loop, so they get different
+/// functions instead of one with a flag that changes what the error path
+/// promises.
+async fn split_at_limit_when_ready(mut body: Body, limit: usize) -> ReadyOutcome {
+    let mut head: Vec<u8> = Vec::new();
+    loop {
+        let Ok(polled) = tokio::time::timeout(Duration::ZERO, body.frame()).await else {
+            return ReadyOutcome::NotReady(rejoin(Bytes::from(head), Some(body)));
+        };
+        let Some(frame) = polled else {
+            return ReadyOutcome::Ready(Bytes::from(head), BodyRemainder::End);
+        };
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(error) => {
+                return ReadyOutcome::Ready(
+                    Bytes::from(head),
+                    BodyRemainder::Interrupted(prepend_frame(Err(error), body)),
+                );
+            }
+        };
+        let data = match frame.into_data() {
+            Ok(data) => data,
+            Err(frame) => {
+                return ReadyOutcome::Ready(
+                    Bytes::from(head),
+                    BodyRemainder::Trailers(prepend_frame(Ok(frame), body)),
+                );
+            }
+        };
+        if head.len() + data.len() <= limit {
+            head.extend_from_slice(&data);
+            continue;
+        }
+        let room = limit - head.len();
+        head.extend_from_slice(&data[..room]);
+        let tail = data.slice(room..);
+        return ReadyOutcome::Ready(
+            Bytes::from(head),
+            BodyRemainder::Overflow(prepend_frame(Ok(Frame::data(tail)), body)),
+        );
+    }
+}
+
 /// Put one already-polled frame back in front of a body without erasing later
 /// errors or trailers. `Body::from_stream` accepts data only; `StreamBody` is
 /// deliberately frame-level.
@@ -524,6 +618,18 @@ fn incomplete_json_object_prefix(bytes: &[u8]) -> bool {
 /// response — so a gate on the header reads `None` for every route and relabels
 /// nothing, which is how the first version of this function silently did that.
 ///
+/// **An exact size is a byte-count promise, not a readiness promise (#540).**
+/// Every success body in the tree today is a complete in-memory `String`,
+/// which answers every poll immediately — but nothing in `size_hint` itself
+/// says so; a future hand-rolled body could report `exact() == Some(2)` and
+/// still produce those two bytes asynchronously. So the declared length is
+/// only the *first* filter, cheap enough to run on every response; the actual
+/// read, in [`split_at_limit_when_ready`], additionally requires every frame
+/// to be available the instant it is polled. A body that fails that check is
+/// forwarded exactly as built, the same as one whose length was never known
+/// at all — this function still never infers safety from a claim it cannot
+/// verify without touching the data.
+///
 /// Unlike the error path this only ever *relabels*. A success body is the
 /// endpoint's own payload; there is no envelope to put it in, and one that
 /// isn't JSON is left exactly as the handler built it.
@@ -534,17 +640,26 @@ async fn relabel_json_success(response: Response) -> Response {
     // The body's own exact size, not the `content-length` header: that header
     // does not exist yet at this point in the stack — hyper writes it when it
     // serializes the response — so reading it here would gate on `None` for
-    // every route and relabel nothing.
+    // every route and relabel nothing. This is a cheap pre-filter, not proof
+    // the body is ready — see `split_at_limit_when_ready` below.
     let exact = response.body().size_hint().exact();
     if exact.is_none_or(|len| len > MAX_ERROR_BODY as u64) {
         return response;
     }
 
-    // `split_at_limit` rather than `to_bytes` even though the length says it
-    // fits: a header that lies must not cost the body. Nothing is lost on any
-    // path here — what is not relabeled is rejoined and passed on byte-for-byte.
+    // `split_at_limit_when_ready` rather than `to_bytes` even though the
+    // length says it fits: a header that lies must not cost the body, and
+    // nor must a body whose declared length outruns its own readiness
+    // (#540). Nothing is lost on any path here — what is not relabeled is
+    // rejoined and passed on byte-for-byte.
     let (mut parts, body) = response.into_parts();
-    let (head, remainder) = split_at_limit(body, MAX_ERROR_BODY).await;
+    let (head, remainder) = match split_at_limit_when_ready(body, MAX_ERROR_BODY).await {
+        // The body was not ready the instant it was polled, despite its
+        // declared length. Forward it untouched rather than await it — that
+        // wait is exactly what would delay this response's headers.
+        ReadyOutcome::NotReady(body) => return Response::from_parts(parts, body),
+        ReadyOutcome::Ready(head, remainder) => (head, remainder),
+    };
     let (rest, complete) = match remainder {
         BodyRemainder::End => (None, true),
         BodyRemainder::Trailers(rest) => (Some(rest), true),
@@ -595,8 +710,12 @@ mod tests {
         Router,
     };
     use git_vista_protocol::{AmendCommitError, AmendCommitSuccess, AmendFailureKind, ApiError};
-    use http_body::Frame;
+    use http_body::{Frame, SizeHint};
     use http_body_util::StreamBody;
+    use std::collections::VecDeque;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use tower::ServiceExt;
 
     // A tiny router carrying the contract layer over a few representative routes:
@@ -606,6 +725,12 @@ mod tests {
     /// Comfortably past [`MAX_ERROR_BODY`], so nothing below depends on the
     /// exact cap — only on being over it.
     const OVERSIZED_LEN: usize = MAX_ERROR_BODY + 8 * 1024;
+
+    /// How long [`ScheduledBody`]'s delayed frames wait before yielding.
+    /// Long enough that a request which actually waited for it would fail
+    /// the "returned promptly" assertion by a wide, non-flaky margin; short
+    /// enough that a passing test run costs nothing.
+    const SLOW_FRAME_DELAY: Duration = Duration::from_millis(200);
 
     /// The first words of the oversized *prose* refusal, so a test can prove
     /// the client still receives what the server actually said rather than the
@@ -641,6 +766,70 @@ mod tests {
             "the fixture must leave exactly one unread garbage byte"
         );
         body
+    }
+
+    /// A body that reports its whole length via `size_hint().exact()` up
+    /// front — the same shape every real success payload has — but yields
+    /// its frames one at a time, delaying before any frame marked `true`.
+    /// Exists to prove `relabel_json_success`'s gate does not trust that
+    /// declared length as proof the data is already sitting in memory
+    /// (#540): this body says "N bytes total" honestly, and still produces
+    /// some of them on its own schedule rather than all at once.
+    struct ScheduledBody {
+        frames: VecDeque<(bool, Bytes)>,
+        total_len: u64,
+        delay: Duration,
+        pending: Option<Pin<Box<tokio::time::Sleep>>>,
+    }
+
+    impl ScheduledBody {
+        /// `frames` pairs each chunk with whether it should be delayed
+        /// before being handed out. `delay` is shared by every delayed
+        /// frame — one duration is enough to prove readiness is checked at
+        /// all, and reusing it keeps every fixture built from this type
+        /// timed the same way.
+        fn new(frames: Vec<(bool, &'static [u8])>, delay: Duration) -> Self {
+            let total_len = frames.iter().map(|(_, d)| d.len() as u64).sum();
+            Self {
+                frames: frames
+                    .into_iter()
+                    .map(|(slow, d)| (slow, Bytes::from_static(d)))
+                    .collect(),
+                total_len,
+                delay,
+                pending: None,
+            }
+        }
+    }
+
+    impl HttpBody for ScheduledBody {
+        type Data = Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            let this = self.get_mut();
+            let Some((slow, _)) = this.frames.front() else {
+                return Poll::Ready(None);
+            };
+            if *slow {
+                let sleep = this
+                    .pending
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(this.delay)));
+                if sleep.as_mut().poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+            }
+            this.pending = None;
+            let (_, data) = this.frames.pop_front().expect("checked non-empty above");
+            Poll::Ready(Some(Ok(Frame::data(data))))
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::with_exact(self.total_len)
+        }
     }
 
     fn app() -> Router {
@@ -813,6 +1002,42 @@ mod tests {
                         .body(Body::from_stream(async_stream::stream! {
                             yield Ok::<_, std::io::Error>(Bytes::from_static(b"{\"progress\":1}"));
                         }))
+                        .unwrap()
+                }),
+            )
+            // #540: a body that declares its whole length up front, exactly
+            // like every real success body does, but is not ready the
+            // instant it is first polled. If the gate ever goes back to
+            // trusting `size_hint().exact()` alone, this route's headers
+            // would not return until `SLOW_FRAME_DELAY` elapses.
+            .route(
+                "/api/exact-size-slow-first-frame",
+                get(|| async {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/plain")
+                        .body(Body::new(ScheduledBody::new(
+                            vec![(true, b"{}".as_slice())],
+                            SLOW_FRAME_DELAY,
+                        )))
+                        .unwrap()
+                }),
+            )
+            // #540, the second way the gate could quietly go back to
+            // trusting a claimed length alone: checking readiness only on a
+            // body's *first* frame and draining the rest unconditionally
+            // would still pass this fixture, whose first chunk is ready
+            // immediately and whose second is not.
+            .route(
+                "/api/exact-size-slow-second-frame",
+                get(|| async {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/plain")
+                        .body(Body::new(ScheduledBody::new(
+                            vec![(false, b"{\"a\":1".as_slice()), (true, b"}".as_slice())],
+                            SLOW_FRAME_DELAY,
+                        )))
                         .unwrap()
                 }),
             )
@@ -1422,6 +1647,99 @@ mod tests {
             Some(2),
             "an in-memory body must report its exact size"
         );
+    }
+
+    /// #540: `size_hint().exact()` is a byte-count promise, not a readiness
+    /// one. A body that reports its whole length up front but does not have
+    /// its first frame ready the instant it is polled must not be awaited
+    /// here — doing so would delay this response's own headers by however
+    /// long that body takes, defeating the reason the gate exists at all.
+    ///
+    /// Asserted on wall-clock time against `SLOW_FRAME_DELAY`, because the
+    /// failure mode this pins is "the response came back late", not "the
+    /// response came back wrong" — a content check alone would pass even if
+    /// the gate silently blocked for the whole delay before answering.
+    ///
+    /// This is the essential regression test the issue names: if
+    /// `relabel_json_success` goes back to trusting `size_hint().exact()`
+    /// alone (calling `split_at_limit` instead of
+    /// `split_at_limit_when_ready`), this test fails at the elapsed-time
+    /// assertion below, not at the content-type one — the response still
+    /// comes back correct, just late.
+    #[tokio::test]
+    async fn a_body_with_a_declared_size_but_no_ready_first_frame_does_not_delay_headers() {
+        let started = std::time::Instant::now();
+        let resp = app()
+            .oneshot(get_req(
+                "/api/exact-size-slow-first-frame",
+                Some(&PROTOCOL_VERSION.to_string()),
+            ))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(resp.status(), 200);
+        assert!(
+            elapsed < SLOW_FRAME_DELAY / 2,
+            "the response must return well before its slow body is ready, \
+             not after: took {elapsed:?} against a {SLOW_FRAME_DELAY:?} delay"
+        );
+        // Left exactly as built: the gate never got far enough to read it,
+        // so there is nothing to relabel.
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            content_type.starts_with("text/plain"),
+            "a body that was never actually read must not be relabeled: got \
+             {content_type:?}"
+        );
+        // The bytes still arrive, correct and entire, once the caller
+        // actually waits for them — this is a deferred forward, not a
+        // dropped body.
+        assert_eq!(body_string(resp).await, "{}");
+    }
+
+    /// #540, the second way the gate could quietly go back to trusting a
+    /// claimed length alone: checking readiness only on a body's *first*
+    /// frame, then draining every later frame unconditionally, would still
+    /// pass the test above (its one frame is the slow one) while failing to
+    /// protect a body whose first chunk is ready immediately and whose
+    /// second is not — a shape a real partially-buffered body could take.
+    /// This is the second, differently-shaped mutation-proof break: it goes
+    /// red only if every frame is checked, not just the first.
+    #[tokio::test]
+    async fn a_body_ready_on_its_first_frame_but_not_its_second_does_not_delay_headers() {
+        let started = std::time::Instant::now();
+        let resp = app()
+            .oneshot(get_req(
+                "/api/exact-size-slow-second-frame",
+                Some(&PROTOCOL_VERSION.to_string()),
+            ))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(resp.status(), 200);
+        assert!(
+            elapsed < SLOW_FRAME_DELAY / 2,
+            "a delayed *second* frame must not delay headers either: took \
+             {elapsed:?} against a {SLOW_FRAME_DELAY:?} delay"
+        );
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            content_type.starts_with("text/plain"),
+            "a body that was never fully read must not be relabeled even \
+             though its complete bytes would parse as JSON: got \
+             {content_type:?}"
+        );
+        assert_eq!(body_string(resp).await, "{\"a\":1}");
     }
 
     // --- The "no path-based repository selection" guard, at the wire ------------
