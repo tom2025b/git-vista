@@ -670,14 +670,14 @@ fn names_a_local_branch(ref_name: Option<&str>, branches: &HashMap<String, Strin
     branches.contains_key(name)
 }
 
-/// True for the one [`ActivityKind::Fetch`]/[`ActivityKind::Pull`] event that
-/// must never be folded into a count: the admission
-/// `planner::fetch::journal_unobserved` writes when `git fetch` succeeded and
-/// only the re-read of `refs/remotes/<remote>/*` failed.
+/// True for the foldable-kind events that must never be folded into a count:
+/// the admissions `planner::fetch::journal_unobserved` and
+/// `planner::push::journal_unobserved` write when the git command itself
+/// succeeded and only the re-read of `refs/remotes/<remote>/*` failed.
 ///
 /// **The discriminator is the whole shape, not any one field** (ADR 0081). No
-/// ref name *and* no old oid *and* no new oid is what that one writer produces
-/// and nothing else does:
+/// ref name *and* no old oid *and* no new oid is what those two writers
+/// produce and nothing else this fold looks at does:
 ///
 /// - Reflog-derived events are built in [`assemble_feed`]'s step 1 from a
 ///   [`ReflogEntry`], which carries a ref name and both oids by construction —
@@ -688,20 +688,28 @@ fn names_a_local_branch(ref_name: Option<&str>, branches: &HashMap<String, Strin
 ///   the `ref_name` is what separates those entries from this one.
 /// - Journalled pulls come from `planner::branch_exec`, which names the branch
 ///   the pull landed on.
-/// - The two other all-`None` journal writers — `planner::worktree_exec`'s two
-///   admissions and `planner::push`'s — carry `ActivityKind::Other` and
-///   `ActivityKind::Push`, kinds this fold never looks at.
+/// - `planner::worktree_exec`'s two all-`None` admissions carry
+///   `ActivityKind::Other`, a kind this fold never looks at.
+/// - `planner::push::journal_unobserved` is all-`None` too, and since #487 made
+///   `ActivityKind::Push` a fold candidate this test is what keeps it out —
+///   for precisely the reason it keeps fetch's out. The push succeeded, so git
+///   logged every ref it moved; the admission carries no `new_oid`, so it
+///   suppresses none of those reflog lines in attribution and would fold in
+///   with them, counting itself as a ref and deleting the one row that says
+///   what reached the remote is unknown. For a push that row matters more than
+///   for a fetch: what may have changed is not on this machine, and no later
+///   local read will reveal it.
 ///
 /// Keying on `ref_name` alone would be wider than that: it would also exclude
-/// any future Fetch/Pull event that names no ref but does know an oid, and such
-/// an event knows what it moved and belongs in the count.
+/// any future foldable-kind event that names no ref but does know an oid, and
+/// such an event knows what it moved and belongs in the count.
 fn admits_it_could_not_read_the_refs(event: &ActivityEvent) -> bool {
     event.ref_name.is_none() && event.old_oid.is_none() && event.new_oid.is_none()
 }
 
-/// Collapse each run of remote-tracking ref updates — [`ActivityKind::Fetch`]
-/// and [`ActivityKind::Pull`] — that happened within [`FETCH_BURST_GAP`] of one
-/// another into a single counted row.
+/// Collapse each run of remote-tracking ref updates — [`ActivityKind::Fetch`],
+/// [`ActivityKind::Pull`] and [`ActivityKind::Push`] — that happened within
+/// [`FETCH_BURST_GAP`] of one another into a single counted row.
 ///
 /// Deliberately here rather than at the write path: a fetch run from the
 /// terminal has reflog lines and no journal entry at all, so an operation id
@@ -716,6 +724,27 @@ fn admits_it_could_not_read_the_refs(event: &ActivityEvent) -> bool {
 /// the bookkeeping folds. (Git's own hint here is the capital letter on
 /// `Fast-forward`; keying on that would be far too fragile, so the local branch
 /// list decides — see [`names_a_local_branch`].)
+///
+/// **A push's local-branch movement is never folded either (#487).** Push
+/// carries the same asymmetry, and it is not hypothetical. Probed against real
+/// git on 2026-08-26 (`git push` between two local repositories, reflogs read
+/// on both sides): the *pushing* repository logs `update by push` on
+/// `refs/remotes/<remote>/<branch>`, and the *receiving* repository logs plain
+/// `push` on `refs/heads/<branch>`. Both parse to [`ActivityKind::Push`] — see
+/// [`parse_reflog_message`], which matches `update by push` and any message
+/// starting `push`. Only the first is bookkeeping. A repository that others
+/// push into watches its own branches move under that second message, and
+/// those rows *are* the event, exactly as a pull's branch move is. So the same
+/// [`names_a_local_branch`] exemption covers both, for the same reason.
+///
+/// **Why the gate opened before the flood (#487).** The push endpoint pushes
+/// one named branch, so N = 1 and no burst can reach here from production
+/// today; an unfolded Push row is what a user sees now, and it is the right
+/// row. The gate is opened ahead of the multi-ref push path — `--all`, a
+/// matching refspec, tags pushed alongside — so the day it lands it does not
+/// reproduce #329 under a different kind. The fold cannot know what the writer
+/// is currently able to emit, so the pins for it build the multi-ref burst
+/// directly; see `a_multi_ref_push_folds_into_one_counted_row`.
 ///
 /// A run of one is returned untouched — a single-ref fetch already says the
 /// useful thing ("fetched ‘origin/main’ from origin") and rewriting it as
@@ -763,34 +792,65 @@ fn admits_it_could_not_read_the_refs(event: &ActivityEvent) -> bool {
 /// capture and one timestamp for the whole batch
 /// (`handlers::journal_app_events`), so its entries no longer drift apart at
 /// all, and pull journals through the same path. The fold itself still counts
-/// both copies of anything that *does* drift; nothing can currently produce
-/// that — only `Fetch` and `Pull` fold, and both are batched — so the F1 pin
-/// below became a live regression test rather than staying an expected
-/// failure. Its doc comment carries the full argument.
+/// both copies of anything that *does* drift, and the F1 pin below is a live
+/// regression test for fetch rather than the expected failure it started as.
+/// Its doc comment carries the full argument.
+///
+/// **Push does not inherit that batching — reported, not fixed here (#487).**
+/// `planner::push::journal_updates` loops over the refs that moved calling
+/// `journal_app_event`, the *singular*, and that one delegates to
+/// `journal_app_events` with a batch of one. So each ref takes its own
+/// `now_secs()` reading and its own `journal::append_all` ref capture: exactly
+/// the writer shape #485 removed from fetch, still present in push. It cannot
+/// bite today — that loop runs over the single ref a one-branch push moves —
+/// but it is the drift the count above inflates on, and it would arrive with
+/// the multi-ref push path rather than after it. Batching push's writer is a
+/// change to `planner::push` with its own before/after measurement, not a
+/// rider on this gate. Nothing pins push's drift here because push cannot yet
+/// produce it; what is pinned is that the fold counts a push burst correctly
+/// when the entries do *not* drift.
 ///
 /// **Safe for undo by construction, not by luck:** [`undo_hint`] has no arm for
-/// `Fetch` or `Pull`, so neither row has ever carried a hint and dropping the
-/// per-ref oids cannot take one away. The same fold would be *wrong* for, say,
-/// `BranchDeleted`, whose `old_oid` is precisely what its undo needs.
+/// `Fetch`, `Pull` or `Push`, so none of those rows has ever carried a hint and
+/// dropping the per-ref oids cannot take one away. The same fold would be
+/// *wrong* for, say, `BranchDeleted`, whose `old_oid` is precisely what its
+/// undo needs.
 fn fold_ref_update_bursts(
     events: Vec<ActivityEvent>,
     branches: &HashMap<String, String>,
 ) -> Vec<ActivityEvent> {
-    let (candidates, mut out): (Vec<_>, Vec<_>) = events.into_iter().partition(|e| {
-        matches!(e.kind, ActivityKind::Fetch | ActivityKind::Pull)
+    let (mut candidates, mut out): (Vec<_>, Vec<_>) = events.into_iter().partition(|e| {
+        FOLDABLE_KINDS.iter().any(|(kind, _)| *kind == e.kind)
             && !names_a_local_branch(e.ref_name.as_deref(), branches)
             && !admits_it_could_not_read_the_refs(e)
     });
 
-    // Fetch and Pull group separately: they are different actions, and a fetch
-    // immediately followed by a pull is two of them.
-    let (fetches, pulls): (Vec<_>, Vec<_>) = candidates
-        .into_iter()
-        .partition(|e| e.kind == ActivityKind::Fetch);
-    fold_one_kind(&mut out, fetches, "fetch");
-    fold_one_kind(&mut out, pulls, "pull");
+    // Each kind groups separately: they are different actions, and a fetch
+    // immediately followed by a pull is two of them, not one run of six refs.
+    for (kind, noun) in FOLDABLE_KINDS {
+        let (group, rest): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|e| e.kind == kind);
+        candidates = rest;
+        fold_one_kind(&mut out, group, noun);
+    }
+    // Unreachable while [`FOLDABLE_KINDS`] is also the gate — and kept anyway,
+    // because a kind admitted above and not grouped here would otherwise be
+    // *deleted* from the feed, which is a far worse way to learn about it than
+    // an unfolded row.
+    out.extend(candidates);
     out
 }
+
+/// The kinds this fold collapses, each with the noun its counted row uses
+/// ("fetch — 94 refs updated").
+///
+/// One table, read twice — once as the gate in [`fold_ref_update_bursts`] and
+/// once as the grouping — so the two cannot drift apart. Adding a kind is
+/// this list and nothing else; #487 added `Push` to it.
+const FOLDABLE_KINDS: [(ActivityKind, &str); 3] = [
+    (ActivityKind::Fetch, "fetch"),
+    (ActivityKind::Pull, "pull"),
+    (ActivityKind::Push, "push"),
+];
 
 /// Fold one kind's bursts into `out`. `noun` names the action in the counted
 /// summary ("fetch — 94 refs updated").
@@ -1383,6 +1443,84 @@ mod tests {
         );
     }
 
+    /// #487: push journals and reflogs one entry per remote-tracking ref it
+    /// moved, structurally identical to fetch — so a push that moves four refs
+    /// must render as one counted row, not four.
+    ///
+    /// **The fixture builds a burst production cannot emit yet, deliberately.**
+    /// The push endpoint pushes one named branch, so N = 1 today and no real
+    /// push reaches this shape. The fold has no way to know that, and the case
+    /// it exists to handle is the multi-ref one: `git push --all`, a matching
+    /// refspec, or tags pushed alongside all produce exactly these reflog
+    /// lines. #487 was filed to open the gate *before* that path lands rather
+    /// than after it floods the feed the way #329's fetch did. Asserting
+    /// against the old behaviour would have been asserting against a
+    /// hypothetical; asserting against this one is not — the fold is real code
+    /// with a real gate, and this is what it now does.
+    #[test]
+    fn a_multi_ref_push_folds_into_one_counted_row() {
+        // "update by push" is what git writes on the pusher's remote-tracking
+        // refs — probed against real git, both sides, 2026-08-26.
+        let reflog = vec![
+            entry("origin/main", 100, "a", "b", "update by push"),
+            entry("origin/feat-a", 100, "p", "q", "update by push"),
+            entry("origin/feat-b", 100, "r", "s", "update by push"),
+            entry("origin/feat-c", 100, "t", "u", "update by push"),
+        ];
+        let feed = assemble_feed(vec![], reflog, &HashMap::new(), &HashSet::new(), 50);
+
+        assert_eq!(feed.len(), 1, "one push is one row: {feed:#?}");
+        assert_eq!(
+            feed[0].summary, "push — 4 refs updated",
+            "the four remote-tracking updates fold into one counted row: {feed:#?}"
+        );
+        assert_eq!(feed[0].kind, ActivityKind::Push);
+        assert!(
+            feed[0].ref_name.is_none(),
+            "a counted row names no single ref: {feed:#?}"
+        );
+    }
+
+    /// The other half of #487, and the reason Push could not simply be added to
+    /// the gate: a push row naming a *local branch* must survive the fold, the
+    /// same asymmetry `a_pull_folds_its_ref_updates_but_keeps_the_branch_move`
+    /// pins for pull.
+    ///
+    /// Probed against real git on 2026-08-26 by pushing between two local
+    /// repositories and reading both reflogs: the pusher logs `update by push`
+    /// on `refs/remotes/origin/<branch>`, and the repository being pushed
+    /// *into* logs plain `push` on `refs/heads/<branch>`. Both parse to
+    /// `ActivityKind::Push`. The second is a branch of this repository moving —
+    /// the event itself, not bookkeeping about it — so it is exempted by
+    /// `names_a_local_branch` and never counted away. A repository can see both
+    /// at once: it is pushed into by a colleague and pushes to its own remote.
+    #[test]
+    fn a_push_that_names_a_local_branch_survives_the_fold() {
+        let reflog = vec![
+            entry("main", 100, "a", "b", "push"),
+            entry("origin/main", 100, "a", "b", "update by push"),
+            entry("origin/feat-a", 100, "p", "q", "update by push"),
+            entry("origin/feat-b", 100, "r", "s", "update by push"),
+            entry("origin/feat-c", 100, "t", "u", "update by push"),
+        ];
+        let branches = HashMap::from([("main".to_string(), "b".to_string())]);
+        let feed = assemble_feed(vec![], reflog, &branches, &HashSet::new(), 50);
+
+        assert_eq!(feed.len(), 2, "branch move + one counted row: {feed:#?}");
+        let branch_move = feed
+            .iter()
+            .find(|e| e.ref_name.as_deref() == Some("main"))
+            .expect("the local branch row survives the fold");
+        assert_eq!(branch_move.kind, ActivityKind::Push);
+        assert_eq!(branch_move.summary, "push");
+        assert_eq!(branch_move.new_oid.as_deref(), Some("b"));
+        assert!(
+            feed.iter()
+                .any(|e| e.summary == "push — 4 refs updated" && e.ref_name.is_none()),
+            "the four remote-tracking updates still fold: {feed:#?}"
+        );
+    }
+
     #[test]
     fn a_terminal_fetch_folds_too_even_with_no_journal() {
         // A fetch run outside the app has reflog lines and no journal entry —
@@ -1707,10 +1845,17 @@ mod tests {
     /// copies of anything that *does* drift; that is not fixed, and after this
     /// change nothing asserts it. It is left unpinned because no writer can
     /// currently produce it: fetch and pull journal through the batched
-    /// `fetch::journal_updates` (pull runs `fetch::run_fetch`), and
-    /// `fold_ref_update_bursts` folds only `Fetch` and `Pull` — so the per-ref
-    /// push journalling of #487, the one remaining unbatched writer, cannot
-    /// reach this code path at all.
+    /// `fetch::journal_updates` (pull runs `fetch::run_fetch`).
+    ///
+    /// **#487 narrowed that argument; it did not break it.** This paragraph
+    /// used to dismiss `planner::push::journal_updates` — the one remaining
+    /// unbatched per-ref writer — on the grounds that `fold_ref_update_bursts`
+    /// folds only `Fetch` and `Pull`, so push could not reach this path at
+    /// all. It can now: #487 made `Push` a fold candidate, and that writer is
+    /// still unbatched. What holds instead is narrower and still true — the
+    /// push endpoint pushes one named branch, so that loop runs once and a
+    /// single entry cannot drift from itself. The day a multi-ref push path
+    /// lands, this is the paragraph to come back to.
     #[test]
     fn a_slow_fetch_still_counts_only_the_refs_that_moved() {
         const REFS: i64 = 250;
