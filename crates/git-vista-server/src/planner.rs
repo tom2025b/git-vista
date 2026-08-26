@@ -433,6 +433,16 @@ pub(crate) async fn plan_and_execute_in(
         return refused;
     }
 
+    // #514: a composed pop's drop must prove the tree still holds what its
+    // apply restored — INSIDE the guard, which is the whole point. The plan
+    // above was built before the guard was taken, so anything checked earlier
+    // is looking at a repository another writer is still free to change. That
+    // ordering IS the defect: `enforce_fresh` catches drift after plan-build,
+    // and drift before it reads as the valid starting state.
+    if let Err(refused) = proof_holds(repo, &proof).await {
+        return refused;
+    }
+
     crate::operations::stage(OperationStage::Checking);
     if let Err(refused) = validate(&plan) {
         return refused;
@@ -981,6 +991,102 @@ pub(crate) fn selection_tokens() -> (RepositoryToken, WorktreeToken) {
             WorktreeToken::new("unregistered").expect("literal is non-empty"),
         ),
     }
+}
+
+/// Whether a drop may proceed (#514, ADR 0090). Called **inside the
+/// coordinator guard** — see the call site for why nowhere else will do.
+///
+/// # What is actually being proven
+///
+/// A composed pop is three unlinked requests: apply, read the conflict state,
+/// drop. Each takes and releases the guard on its own. The drop's own checks
+/// prove the *stash entry* has not moved; nothing proved the *working tree*
+/// still held what the apply restored. A `git reset --hard` between the two
+/// halves leaves the entry exactly where it was, so the drop ran and the pop
+/// reported success over a tree that had lost the work.
+///
+/// The proof is the apply's own operation record. Every operation stores, at
+/// its terminal transition, the generation the repository had when it
+/// finished (`operations::apply_terminal`). If that generation still matches
+/// the live one, nothing has touched the repository since the apply — refs,
+/// HEAD or worktree — and the changes are still there to be dropped over. If
+/// it differs, something did, and this build cannot tell what: refusing is
+/// the only honest answer.
+///
+/// # Why the id is not taken on trust
+///
+/// A client hands back an operation id. Three things are checked before the
+/// generation attached to it means anything: the record exists, it succeeded,
+/// and it really was an `ApplyStash` of **this** entry at **this** oid. A
+/// caller cannot name some other successful operation whose generation
+/// happens to match and buy itself a pass.
+///
+/// # A refusal leaves the applied changes in the tree, deliberately
+///
+/// The alternative — unwind the apply — is more work, can itself fail, and
+/// would destroy the very changes the user is trying to keep. Refusing leaves
+/// the tree exactly as the apply left it and the entry still in the drawer:
+/// nothing is lost, and the user can retry or drop by hand. Owner's decision,
+/// 2026-08-26.
+async fn proof_holds(repo: &Path, proof: &DropProof) -> Result<(), (StatusCode, String)> {
+    let DropProof::Completes(applied) = proof else {
+        return Ok(());
+    };
+
+    let row = match crate::durable::load_operation(applied).await {
+        crate::durable::DurableLookup::Found(row) => *row,
+        crate::durable::DurableLookup::Incompatible(_) => {
+            return Err((
+                StatusCode::CONFLICT,
+                "This pop names an apply whose stored record this build cannot read, so \
+                 there is no way to tell whether your changes are still in the working \
+                 tree. The stash entry was left alone. Reload the drawer and check \
+                 before dropping it."
+                    .to_string(),
+            ));
+        }
+        crate::durable::DurableLookup::Missing => {
+            return Err((
+                StatusCode::CONFLICT,
+                "This pop names an apply this server has no record of, so nothing proves \
+                 your changes are still in the working tree. The stash entry was left \
+                 alone. Reload the drawer and try again."
+                    .to_string(),
+            ));
+        }
+    };
+
+    if !matches!(row.state, git_vista_protocol::OperationState::Succeeded) {
+        return Err((
+            StatusCode::CONFLICT,
+            "This pop names an apply that did not succeed, so its changes were never \
+             established in the working tree. The stash entry was left alone."
+                .to_string(),
+        ));
+    }
+
+    let Some(recorded) = row.generation.clone() else {
+        return Err((
+            StatusCode::CONFLICT,
+            "This pop names an apply that recorded no repository state when it \
+             finished, so there is nothing to compare against. The stash entry was \
+             left alone."
+                .to_string(),
+        ));
+    };
+
+    let live = generation_token(repo, &observe_live(repo).await).await;
+    if live != recorded {
+        return Err((
+            StatusCode::CONFLICT,
+            "The repository changed between applying this stash and dropping it, so \
+             the changes the apply restored may no longer be in your working tree. \
+             The stash entry was NOT dropped and your working tree was left as it is. \
+             Check `git status`, then drop the entry yourself if the changes are safe."
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// The live repository generation as the plan's opaque token (ADR 0001).
