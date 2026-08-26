@@ -221,6 +221,7 @@ async fn a_resolution_applied_but_not_committed_survives_and_is_visible() {
             path: git_vista_protocol::WorktreePath::new("a.txt").unwrap(),
             resolution: git_vista_protocol::conflict::Resolution::TakeOurs,
         },
+        crate::planner::DropProof::Nothing,
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::OK, "body: {body}");

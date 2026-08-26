@@ -87,6 +87,7 @@ async fn tracked(
         tokens(),
         PlanSource::Build(op),
         None,
+        crate::planner::DropProof::Nothing,
     )
     .await
 }

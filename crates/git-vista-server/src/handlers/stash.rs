@@ -50,8 +50,8 @@ use axum::http::StatusCode;
 use axum::Json;
 
 use git_vista_protocol::{
-    BranchFromStashRequest, CommitOid, GitOperation, PushStashRequest, StashEntry, StashSelector,
-    StashTarget,
+    BranchFromStashRequest, CommitOid, DropContext, DropStashRequest, GitOperation,
+    PushStashRequest, StashEntry, StashSelector, StashTarget,
 };
 
 use crate::planner;
@@ -440,13 +440,27 @@ pub(crate) async fn branch_from_stash(
 /// between this and dropping a stash the user never chose: every drop
 /// renumbers the list, so a selector planned seconds ago may now address
 /// someone else's work.
-pub(crate) async fn drop_stash(Json(req): Json<StashTarget>) -> (StatusCode, String) {
+pub(crate) async fn drop_stash(Json(req): Json<DropStashRequest>) -> (StatusCode, String) {
     if let Some(rejected) = reject_if_read_only() {
         return rejected;
     }
-    planner::plan_and_execute(GitOperation::DropStash {
-        entry: req.entry,
-        expected_oid: req.expected_oid,
-    })
+    // #514: what the client says this drop is the second half of decides what
+    // must be proven first. A standalone drop proves nothing beyond the
+    // selector/oid pair every stash write already checks; a pop's drop must
+    // show the tree still holds what its apply restored, and that comparison
+    // happens inside the coordinator guard — see `planner::proof_holds`.
+    let proof = match req.context {
+        DropContext::Standalone => planner::DropProof::Nothing,
+        DropContext::CompletingPop { applied_operation } => {
+            planner::DropProof::Completes(applied_operation)
+        }
+    };
+    planner::plan_and_execute_proving(
+        GitOperation::DropStash {
+            entry: req.target.entry,
+            expected_oid: req.target.expected_oid,
+        },
+        proof,
+    )
     .await
 }

@@ -31,6 +31,7 @@
 //! for any `:hover` rule — real obligations, and there is nothing here that
 //! earns them. `.act-undo` already carries both.
 
+use git_vista_protocol::DropContext;
 use leptos::*;
 
 use crate::api::{fetch_stash_patch, fetch_stashes, push_stash_request};
@@ -575,7 +576,17 @@ fn action_button(
                 drawer.begin(&oid, "dropping");
                 spawn_local(async move {
                     let key = crate::api::new_idempotency_key();
-                    let result = crate::api::drop_stash_request(&selector, &oid, key).await;
+                    let result = crate::api::drop_stash_request(
+                        &selector,
+                        &oid,
+                        key,
+                        // The drawer's own Drop button: the user asked for
+                        // this entry to go, full stop. Nothing was
+                        // restored, so there is nothing to prove beyond
+                        // the selector/oid pair (#514).
+                        DropContext::Standalone,
+                    )
+                    .await;
                     // The outcome carries the HTTP status inside it, so the
                     // outer `Ok` still cannot be read as "it worked" — and a
                     // lost reply is the one case whose entry answer is None:

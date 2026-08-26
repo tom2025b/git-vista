@@ -147,8 +147,14 @@ fn bare_target_inside(dir: &Path, repo: &Path, name: &str) -> PathBuf {
 async fn drive_fetch(repo: &Path, raw_remote: &str) -> (StatusCode, String) {
     match validate_remote(raw_remote) {
         Ok(remote) => {
-            super::plan_and_execute_in(repo, None, tokens(), GitOperation::FetchRemote { remote })
-                .await
+            super::plan_and_execute_in(
+                repo,
+                None,
+                tokens(),
+                GitOperation::FetchRemote { remote },
+                crate::planner::DropProof::Nothing,
+            )
+            .await
         }
         Err(refused) => refused,
     }
@@ -480,6 +486,7 @@ async fn pull_refuses_an_unconfigured_remote_before_reaching_its_executor() {
             branch: BranchName::new("main").unwrap(),
             strategy: MergeStrategy::Merge,
         },
+        crate::planner::DropProof::Nothing,
     )
     .await;
 
@@ -575,6 +582,7 @@ async fn push_refuses_an_unconfigured_remote_before_reaching_its_executor() {
             set_upstream: false,
             force: ForcePublish::None,
         },
+        crate::planner::DropProof::Nothing,
     )
     .await;
 

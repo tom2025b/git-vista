@@ -38,6 +38,7 @@
 //! also reads as clear.
 
 use git_vista_protocol::conflict::{ConflictedFile, Continuation};
+use git_vista_protocol::OperationId;
 
 use crate::features::status::core::{StatusSection, StatusSections};
 
@@ -671,11 +672,28 @@ pub enum ApplyOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StashWriteOutcome {
     /// The server answered this request directly. `ok` is `Response::ok()`.
-    Answered { ok: bool, message: String },
+    ///
+    /// `operation` is the id the server minted for it, from the operation
+    /// header. Carried since #514 because a composed pop's drop must name the
+    /// apply it is completing — the server compares the generation that
+    /// operation recorded against the live one before it will drop anything.
+    Answered {
+        ok: bool,
+        message: String,
+        operation: Option<OperationId>,
+    },
     /// Both attempts were lost, but the operation record was found terminal —
     /// this is the RECORDED answer, recovered by the key. Same standing as
     /// [`Self::Answered`]: the server said it, we just heard it late.
-    Reconciled { ok: bool, message: String },
+    ///
+    /// The id here is the one the KEY resolved to, which is how the answer was
+    /// recovered at all — so it names the same operation the header would
+    /// have.
+    Reconciled {
+        ok: bool,
+        message: String,
+        operation: Option<OperationId>,
+    },
     /// Lost, and the record could not settle it (never admitted, still
     /// running past the reconciliation budget, or unreachable). The one case
     /// with no answer to report — and it must be REPORTED as no answer.
@@ -691,10 +709,12 @@ impl ApplyOutcome {
             Err(local) => ApplyOutcome::Refused(local),
             Ok(StashWriteOutcome::Answered { ok: true, .. })
             | Ok(StashWriteOutcome::Reconciled { ok: true, .. }) => ApplyOutcome::Applied,
-            Ok(StashWriteOutcome::Answered { ok: false, message })
-            | Ok(StashWriteOutcome::Reconciled { ok: false, message }) => {
-                ApplyOutcome::Refused(message)
-            }
+            Ok(StashWriteOutcome::Answered {
+                ok: false, message, ..
+            })
+            | Ok(StashWriteOutcome::Reconciled {
+                ok: false, message, ..
+            }) => ApplyOutcome::Refused(message),
             Ok(StashWriteOutcome::Unknown { why }) => ApplyOutcome::Unknown(why),
         }
     }
@@ -746,10 +766,12 @@ impl DropOutcome {
             Err(local) => DropOutcome::Refused(local),
             Ok(StashWriteOutcome::Answered { ok: true, .. })
             | Ok(StashWriteOutcome::Reconciled { ok: true, .. }) => DropOutcome::Dropped,
-            Ok(StashWriteOutcome::Answered { ok: false, message })
-            | Ok(StashWriteOutcome::Reconciled { ok: false, message }) => {
-                DropOutcome::Refused(message)
-            }
+            Ok(StashWriteOutcome::Answered {
+                ok: false, message, ..
+            })
+            | Ok(StashWriteOutcome::Reconciled {
+                ok: false, message, ..
+            }) => DropOutcome::Refused(message),
             Ok(StashWriteOutcome::Unknown { why }) => DropOutcome::Unknown(why),
         }
     }
@@ -2402,7 +2424,8 @@ mod tests {
         assert_eq!(
             ApplyOutcome::from_write(Ok(W::Reconciled {
                 ok: true,
-                message: msg("done")
+                message: msg("done"),
+                operation: None
             })),
             ApplyOutcome::Applied,
             "a recovered success is a success"
@@ -2410,7 +2433,8 @@ mod tests {
         assert_eq!(
             ApplyOutcome::from_write(Ok(W::Reconciled {
                 ok: false,
-                message: msg("no")
+                message: msg("no"),
+                operation: None
             })),
             ApplyOutcome::Refused(msg("no")),
             "a recovered refusal is a refusal — not an unknown"
@@ -2427,7 +2451,8 @@ mod tests {
         assert_eq!(
             DropOutcome::from_write(Ok(W::Answered {
                 ok: false,
-                message: msg("409")
+                message: msg("409"),
+                operation: None
             })),
             DropOutcome::Refused(msg("409"))
         );

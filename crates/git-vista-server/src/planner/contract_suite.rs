@@ -135,7 +135,7 @@ fn wpath(s: &str) -> WorktreePath {
 /// stages, so these tests exercise the production composition — mutation guard
 /// included — instead of a copy of it that could drift.
 async fn pipeline(repo: &Path, op: GitOperation) -> (StatusCode, String) {
-    plan_and_execute_in(repo, None, tokens(), op).await
+    plan_and_execute_in(repo, None, tokens(), op, crate::planner::DropProof::Nothing).await
 }
 
 /// [`pipeline`] driven inside a tracked operation's progress scope — the shape
@@ -158,7 +158,13 @@ async fn tracked_pipeline(repo: &Path, op: GitOperation, key: &str) -> (StatusCo
         };
     let out = crate::operations::with_progress(
         record,
-        plan_and_execute_in(repo, None, tokens(), op.clone()),
+        plan_and_execute_in(
+            repo,
+            None,
+            tokens(),
+            op.clone(),
+            crate::planner::DropProof::Nothing,
+        ),
     )
     .await;
     handle.finish(out.0, out.1.clone(), None);
