@@ -1,7 +1,8 @@
 # 0084 — One error-rewrap mechanism, and it forwards what it cannot buffer
 
-- **Status:** Accepted — implemented and tested; exact-sized asynchronous
-  success-body provenance deferred; browser leg unrun
+- **Status:** Accepted — implemented and tested; the exact-sized-but-not-ready
+  success-body gap closed by a readiness poll, not full typed-body provenance
+  (#540); browser leg unrun
 - **Date:** 2026-08-26
 - **Issue:** [#336](https://github.com/tom2025b/git-vista/issues/336). A #323 successor.
 - **Handoff:** `docs/handoffs/2026-08-26/CLOUD-1-issue-336-collapse-route-local.md`.
@@ -169,13 +170,28 @@ caught it.
 
 An exact size is a byte-count promise, **not a readiness promise**. A generic
 body may report `exact() == Some(2)` and still yield those bytes asynchronously;
-the current relabeler would await it before returning the response headers. No
-current route has that shape: hand-serialized write results are in-memory
-`String` bodies, while the SSE route reports no exact size. The robust fix is
-explicit typed-body provenance (or typed responses at the planner/handler
-boundary), not another guess from generic transport metadata. That
-cross-cutting return-type change is deferred rather than folded into this
-already-wide PR; the outside-review report records the gap for a follow-up.
+the relabeler as first written would await it before returning the response
+headers. No current route has that shape: hand-serialized write results are
+in-memory `String` bodies, while the SSE route reports no exact size. This was
+filed as #540 and deliberately deferred out of this PR rather than folded in
+speculatively — a repair to route-global body handling is exactly the shape
+most able to break something no test covers, and nothing in the tree could
+trigger the gap yet.
+
+**#540 closed the gap with a readiness poll, not the typed-body provenance this
+ADR originally called the robust fix.** `relabel_json_success` now reads its
+bounded prefix through `read_ready_prefix` rather than `split_at_limit`: each
+frame is polled once with a no-op waker, and the read stops the instant a
+frame is not immediately ready, handing the body back untouched — nothing was
+consumed by a `Pending` poll — rather than awaiting it. The gate is therefore
+"an exact size *and* the data is actually sitting there right now", not size
+alone. This is a smaller claim than provenance would have made: it stops the
+concrete defect (headers delayed behind a body that lies about readiness)
+without changing what any handler returns or adding a way for a body to
+*declare* what it is. Explicit typed-body provenance — the planner/handler
+return-type change described below — remains open ground for a future PR if a
+body ever needs to be trusted for a reason other than "it happened to be
+ready when asked."
 
 ### What the collapse removes
 
@@ -502,3 +518,49 @@ after every mutation was restored.
 frontend is untouched by this change and the wire bytes for `/api/amend-commit`
 are unchanged — same status, same content-type, same body — but that is
 reasoning, not a measurement, and the browser leg is what would measure it.
+
+### #540 follow-up: the readiness poll
+
+Measured in a cloud container without Landlock, with `gv-sandbox` built first.
+Baseline on unmodified `main` at this ADR's own head commit:
+**655 passed, 323 failed, 4 ignored** (982 total) — the container's own
+Landlock-dependent sandbox suite, unrelated to this change. With the fix and
+its two new tests applied: **657 passed, 323 failed, 4 ignored** (984 total).
+`comm -3` over the two sorted failing-test-name lists reports zero difference:
+the same 323 names fail on both sides, and the fix adds exactly its own two
+new passing tests and nothing else.
+
+**Mutation-proof, two different ways.**
+
+*A — reverted to trusting `size_hint().exact()` alone* (`read_ready_prefix`
+swapped back for `split_at_limit` in `relabel_json_success`, the pre-#540
+gate). Both new tests hang past their 500 ms timeout:
+
+```
+relabel_json_success awaited a body that reports an exact size but never
+becomes ready — the #540 defect: an exact size is a byte-count promise, not a
+readiness one: Elapsed(())
+
+relabel_json_success kept awaiting past the first frame — a gate that only
+checks readiness once still delays headers on a body that goes Pending on its
+second frame: Elapsed(())
+```
+
+*B — the gate weakened rather than removed*: readiness checked only on the
+loop's first iteration, falling back to a blocking `.await` for every frame
+after it. The never-ready fixture (which never gets past its first, checked
+poll) still passes; the ready-once-then-never fixture — whose second frame is
+exactly what the weakened check stops examining — hangs at a different
+assertion:
+
+```
+relabel_json_success kept awaiting past the first frame — a gate that only
+checks readiness once still delays headers on a body that goes Pending on its
+second frame: Elapsed(())
+```
+
+Each mutation was restored from a pre-mutation copy and the restore verified
+byte-identical with `diff -q` before the next.
+
+**Green.** `cargo fmt --all -- --check` clean; `cargo clippy --all-targets --
+-D warnings` clean over the workspace.
