@@ -37,13 +37,29 @@ deliverables:
 
 ## The defect (codex cloud, §M3 — REASONED; the local review found no defect in the same job: reconcile, don't assume)
 
-`.github/workflows/ci.yml:186-226` (re-verify the range on your checkout —
-it may have drifted) clones `github.com/git/git` at tag `v${floor}.0` on
-cache miss, builds, installs, executes — inside a **required** merge job. It
-verifies the PRINTED VERSION but pins no commit and checks no checksum. A
-moved tag or compromised retrieval path yields a binary that prints
-`git version 2.32.0`, passes, and is cached under the trusted key. The cache
-key also omits arch/toolchain identity.
+Verified against `405a7644` on 2026-08-26 (re-check on your own checkout):
+
+- The steps live at **`.github/workflows/ci.yml:186-226`**, inside the
+  **`core` job — the required check named "Core (check + test)"** (job
+  declared at `:127`, name at `:128`). "Required merge job" is confirmed,
+  not assumed.
+- On cache miss it runs `git clone --depth 1 -b "v${floor}.0"
+  https://github.com/git/git`, builds with `make … install`, then runs
+  `"$HOME/.cache/gv-git-floor/bin/git" --version`.
+- **Sharper than the issue's wording:** that final line *prints* the version;
+  there is no comparison against `${floor}` in the step itself. Determine
+  whether any assertion exists elsewhere (the `git_floor` step at `:153` and
+  the report-check the surrounding comments describe) before repeating the
+  issue's "it verifies the printed version" phrasing in your ADR — the
+  boundary you are describing is weaker if nothing asserts at all, and the
+  ADR must say what is actually there.
+- Cache key is `gv-git-floor-${{ runner.os }}-${{ steps.git_floor.outputs.version }}`
+  — `runner.os` is "Linux", so the issue's "omits arch/toolchain identity"
+  claim holds.
+
+No commit pin and no checksum: a moved tag or compromised retrieval path
+yields a binary that prints the expected version, passes, and is cached under
+the trusted key.
 
 Your first job is the reconciliation the issue asks for: read the job as it
 stands and state plainly whether the reasoned attack path is real on the
