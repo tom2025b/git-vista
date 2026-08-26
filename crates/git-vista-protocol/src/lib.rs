@@ -58,6 +58,8 @@
 #[macro_use]
 pub mod newtype;
 
+pub mod effects;
+
 pub mod conflict;
 pub mod diff;
 pub mod dto;
