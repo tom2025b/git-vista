@@ -1,6 +1,7 @@
 # 0084 — One error-rewrap mechanism, and it forwards what it cannot buffer
 
-- **Status:** Accepted — implemented and tested; browser leg unrun
+- **Status:** Accepted — implemented and tested; exact-sized asynchronous
+  success-body provenance deferred; browser leg unrun
 - **Date:** 2026-08-26
 - **Issue:** [#336](https://github.com/tom2025b/git-vista/issues/336). A #323 successor.
 - **Handoff:** `docs/handoffs/2026-08-26/CLOUD-1-issue-336-collapse-route-local.md`.
@@ -89,19 +90,23 @@ let (head, rest) = split_at_limit(response.into_body(), MAX_ERROR_BODY).await;
 
 `split_at_limit` reads frames until one crosses the limit, keeps the bytes up to
 it, and hands back the remainder **as a body to forward** — not as a second
-buffer. Nothing past the crossing frame is polled there. Two outcomes:
+buffer. Nothing past the crossing frame is polled there. Three outcomes:
 
 - **The body ended inside the cap** (every real refusal). Classification is
   exact, and identical to before: the full bytes either parse as a JSON object
   or they do not.
 - **The body ran past the cap.** The prefix is classified by
-  `json_object_or_prefix_of_one`, which separates a *truncated* JSON object from
-  prose that merely starts with `{` by the kind of error `serde_json` returns —
-  `Error::is_eof` for input that ended while more was expected, a syntax error
-  for a token that is not JSON. A truncated object gets the
-  `application/json` label and the whole body is streamed on untouched; anything
-  else is prose, and the prefix is enveloped **with an explicit truncation
-  marker** rather than silently replaced by "Bad Request".
+  `incomplete_json_object_prefix`, which accepts only a JSON object cut off
+  while more input was required (`serde_json::Error::is_eof`). A complete
+  object in the prefix is *not* proof: unread bytes may be trailing garbage.
+  A genuinely incomplete object gets the `application/json` label and the
+  whole body is streamed on untouched; anything else is prose, and the prefix
+  is enveloped **with an explicit truncation marker** rather than silently
+  replaced by "Bad Request".
+- **A body error or trailers frame interrupted classification.** There is no
+  complete byte body to label or envelope. The consumed data is put back in
+  front of the original error or trailers frame, and all remaining frames are
+  forwarded at frame level. Neither condition is rewritten as clean EOF.
 
 ### How it is bounded
 
@@ -155,6 +160,16 @@ the response — so a gate on it reads `None` for every route and relabels
 nothing. The first version of this function did exactly that, and its test
 caught it.
 
+An exact size is a byte-count promise, **not a readiness promise**. A generic
+body may report `exact() == Some(2)` and still yield those bytes asynchronously;
+the current relabeler would await it before returning the response headers. No
+current route has that shape: hand-serialized write results are in-memory
+`String` bodies, while the SSE route reports no exact size. The robust fix is
+explicit typed-body provenance (or typed responses at the planner/handler
+boundary), not another guess from generic transport metadata. That
+cross-cutting return-type change is deferred rather than folded into this
+already-wide PR; the outside-review report records the gap for a follow-up.
+
 ### What the collapse removes
 
 - `planner::commit_exec::amend_refusal_body` — gone; `amend_refusal` is back to
@@ -188,11 +203,11 @@ and it fixes the callers rather than the mechanism, so the next handler that
 returns a large error body reintroduces the defect silently. The middleware is
 where "any error, one shape" is promised; that is where totality belongs.
 
-**Widen `plan_and_execute`'s return type to `Response` so handlers can say
-"this is JSON" instead of the middleware guessing.** The cleanest answer to the
-root ambiguity, and out of scope here: the return type is shared by ~30
-operation kinds and the ripple reaches the whole pipeline for one route's
-benefit. Recorded, not taken.
+**Widen `plan_and_execute`'s return type to carry typed-body provenance so
+handlers can say "this is JSON" instead of the middleware guessing.** The
+cleanest answer to both the root ambiguity and the exact-sized asynchronous
+body gap, and out of scope here: the return type is shared by ~30 operation
+kinds and the ripple reaches the whole pipeline. Recorded, not taken.
 
 ## Consequences
 
@@ -218,6 +233,18 @@ remaining bound and it is stated rather than hidden: the envelope now carries
 what fits *and says it was truncated*, where before it carried the canonical
 reason and said nothing. An over-cap **JSON** refusal is no longer truncated at
 all.
+
+A body error after data remains an error, and a trailers frame remains a
+trailers frame. Classification stops at either condition and forwards the
+consumed data plus the original frame sequence; the middleware no longer turns
+an error into clean EOF or drops trailer metadata through a data-only stream.
+
+An over-cap prefix that is itself a complete JSON object is treated as prose,
+because unread bytes make the whole body's syntax unknowable. This is
+conservative by design: a hypothetical object followed only by more whitespace
+will be enveloped, while an object followed by non-whitespace garbage will no
+longer be mislabeled as valid JSON. Current typed DTOs do not append an
+over-cap whitespace suffix.
 
 The amend route loses a layer, and with it the `Response`/`(StatusCode, String)`
 split that three separate doc comments elsewhere in the planner existed to
@@ -261,13 +288,14 @@ red, and the fix carries its own container-independent regression test
 (`a_handlers_typed_json_success_is_labeled_json_too`) so the next reader does
 not depend on a Landlock kernel to learn the same thing.
 
-**Mutation-proof, three ways, each red at assertions the others do not reach.**
+**Mutation-proof of the original mechanism and the outside-review repairs.**
 
 *A — the sniff removed entirely* (the relabel branch deleted). Five tests red:
 
 ```
-crates/git-vista-server/src/handlers/fetch.rs:190:41:
-body was not a bare FetchError: missing field `kind` at line 1 column 180
+crates/git-vista-server/src/handlers/fetch.rs:229:21:
+body was not a bare FetchError: missing field `kind` at line 1 column 65664;
+65664 bytes, starting "{\"error\":{\"code\":\"bad_request\",…
 crates/git-vista-server/src/handlers/pull.rs:408:37:
 body was not a bare PullError: missing field `kind` at line 1 column 517
 crates/git-vista-server/src/middleware.rs:647:33:
@@ -275,13 +303,19 @@ body was not a bare AmendCommitError: missing field `kind` at line 1 column 176
 ```
 
 *B — the sniff narrowed to bodies that fit the cap* (`rest.is_some()` ⇒ not
-JSON: the old cap-then-sniff ordering, restored exactly). Two tests red, and the
-three assertions above stay green:
+JSON: the old cap-then-sniff ordering, restored exactly). Three route/general
+tests red. The fetch test now constructs a real configured local remote whose
+`upload-pack` emits an over-cap failure and asserts the serialized wire body is
+actually over the cap; the earlier small fixture was the hole this mutation
+exposed:
 
 ```
 crates/git-vista-server/src/handlers/pull.rs:517:13:
 an over-cap refusal did not survive as a bare PullError (missing field `kind`
 at line 1 column 65664): 65664 bytes, starting "{\"error\":{\"code\":\"bad_request\",…
+crates/git-vista-server/src/handlers/fetch.rs:229:21:
+body was not a bare FetchError: missing field `kind` at line 1 column 65664;
+65664 bytes, starting "{\"error\":{\"code\":\"bad_request\",…
 crates/git-vista-server/src/middleware.rs:726:13:
 an over-cap typed refusal did not survive as a bare AmendCommitError (missing
 field `kind` at line 1 column 70904): 70904 bytes, starting "{\"error\":…
@@ -328,6 +362,50 @@ a 200 carrying a serialized DTO must not claim to be prose: got
 "text/plain; charset=utf-8"
 ```
 
+*F — over-cap prefix classification weakened two ways.* Restoring the old
+"complete object is enough" result made the trailing-garbage regression red:
+
+```
+a complete prefix plus unread garbage must be enveloped as prose, not
+forwarded as invalid JSON (missing field `error` at line 1 column 65536)
+```
+
+Weakening it further to "any leading brace is enough" made that assertion red
+again and independently hit the paired prose guard:
+
+```
+a prefix that starts with a brace but breaks JSON syntax on the next token is
+prose, not a truncated object
+```
+
+*G — frame semantics weakened two ways.* Restoring the former clean-EOF/error
+and discard-trailers branches hit the existence assertions:
+
+```
+the error frame must remain
+the trailers frame must remain
+```
+
+Forwarding replacement frames instead of the originals reached different,
+provenance-sensitive assertions:
+
+```
+the original transport error must survive: replacement body error
+the original x-proof trailer must survive
+```
+
+*H — the cap boundary weakened in both directions.* Dropping the overflow
+remainder and treating an exact-sized final data frame as overflow reached the
+opposite halves of the boundary test:
+
+```
+one byte past the cap is a body with a remainder
+a body of exactly the cap has no remainder to forward
+```
+
+Every outside-review mutation above was restored from a pre-mutation copy and
+verified byte-identical with `diff -q` before the next mutation.
+
 **The incidental coverage, now deliberate.** #336 claims no wire-level test
 covers `/api/fetch` or `/api/pull` — that every existing `FetchError`/`PullError`
 test calls planner functions directly. Half of that is wrong, and this ADR
@@ -343,15 +421,16 @@ sniff **narrowed** rather than removed, because its bodies are small. So:
 
 - `/api/fetch` gains its first wire-level test —
   `a_refusal_reaches_the_client_as_a_bare_fetch_error_through_a_real_router` —
-  with the read-only prose refusal on the same route as its paired negative, so
-  it cannot be satisfied by a middleware that labeled everything JSON.
+  now driven by a real over-cap fetch failure, with the read-only prose refusal
+  on the same route as its paired negative, so it catches both narrowing and a
+  middleware that labeled everything JSON.
 - `/api/pull` gains
   `an_over_cap_refusal_reaches_the_client_as_a_bare_pull_error_through_a_real_router`,
   whose >64 KiB body is produced by the endpoint's **own** refusal path rather
   than a fixture: `deny_unknown_fields` echoes the offending key into serde's
   message and `parse_request` quotes it into the `PullError`.
 
-`middleware`'s own seven new tests cover the mechanism route-agnostically,
+`middleware`'s own ten new tests cover the mechanism route-agnostically,
 including the reader's exactly-at-the-cap boundary and the negative for the
 prefix sniff (prose that starts with `{` must not be forwarded as JSON — the
 regression `amend_route_response`'s own doc warned is *worse* than the
@@ -359,6 +438,13 @@ double-encoding #323 set out to fix).
 
 **Green.** `cargo fmt --all --check` clean; `cargo clippy --all-targets -- -D
 warnings` clean over the workspace.
+
+The outside-review repair was then verified on the Landlock-capable host, with
+`gv-sandbox` built first: `cargo fmt --all`, buildlocked
+`cargo clippy --all-targets -- -D warnings`, and the full buildlocked server
+binary suite — **957 passed, 0 failed, 4 ignored** (961 total). The strengthened
+real `/api/fetch` route test and all 25 middleware tests also passed separately
+after every mutation was restored.
 
 **Unrun here.** `ci/browser/run.sh` cannot run in the cloud container. The
 frontend is untouched by this change and the wire bytes for `/api/amend-commit`

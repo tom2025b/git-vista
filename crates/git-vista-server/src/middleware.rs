@@ -26,8 +26,8 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use http_body::Body as HttpBody;
-use http_body_util::BodyExt;
+use http_body::{Body as HttpBody, Frame};
+use http_body_util::{BodyExt, StreamBody};
 
 use git_vista_protocol::{
     check_compatibility, parse_protocol_header, ApiError, ErrorCode, IdempotencyKey, OperationId,
@@ -244,7 +244,7 @@ fn error_envelope(code: ErrorCode, message: String, request_id: &RequestId) -> R
 ///   is exact: the full bytes either parse as a JSON object or they don't;
 /// * the body ran past the cap — nothing beyond the prefix is ever held in
 ///   memory. A prefix that is the *beginning* of a JSON object (see
-///   [`json_object_or_prefix_of_one`]) gets the `application/json` label and
+///   [`incomplete_json_object_prefix`]) gets the `application/json` label and
 ///   the whole body is streamed on untouched, which is exactly what the client
 ///   needs to parse its typed DTO; anything else is prose, and the prefix is
 ///   enveloped with an explicit truncation marker rather than silently lost.
@@ -255,8 +255,19 @@ async fn rewrap_error(response: Response, request_id: &RequestId) -> Response {
     if is_json(&response) {
         return response;
     }
-    let status = response.status();
-    let (head, rest) = split_at_limit(response.into_body(), MAX_ERROR_BODY).await;
+    let (mut parts, body) = response.into_parts();
+    let status = parts.status;
+    let (head, remainder) = split_at_limit(body, MAX_ERROR_BODY).await;
+    let rest = match remainder {
+        BodyRemainder::End => None,
+        BodyRemainder::Overflow(rest) => Some(rest),
+        // There is no complete byte body to classify after a transport error
+        // or trailers frame. Put the consumed prefix back and preserve the
+        // original response headers and frame semantics.
+        BodyRemainder::Interrupted(rest) => {
+            return Response::from_parts(parts, rejoin(head, Some(rest)));
+        }
+    };
 
     // #323: a handler's own typed error DTO — `AmendCommitError`,
     // `CommitError`, `FetchError`, `PullError`, `SignTagError` — travels out of
@@ -276,7 +287,7 @@ async fn rewrap_error(response: Response, request_id: &RequestId) -> Response {
     // enough to trust as "already carrying JSON": git's own stderr/stdout text
     // and this server's plain refusal prose never happen to parse as one.
     let head_is_json = if rest.is_some() {
-        json_object_or_prefix_of_one(&head)
+        incomplete_json_object_prefix(&head)
     } else {
         matches!(
             serde_json::from_slice::<serde_json::Value>(&head),
@@ -284,12 +295,11 @@ async fn rewrap_error(response: Response, request_id: &RequestId) -> Response {
         )
     };
     if head_is_json {
-        return (
-            status,
-            [(header::CONTENT_TYPE, "application/json")],
-            rejoin(head, rest),
-        )
-            .into_response();
+        parts.headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        return Response::from_parts(parts, rejoin(head, rest));
     }
 
     let message = String::from_utf8_lossy(&head).trim().to_string();
@@ -319,30 +329,48 @@ async fn rewrap_error(response: Response, request_id: &RequestId) -> Response {
 /// Read at most `limit` bytes off `body`, returning that prefix and — only when
 /// the body had more to give — the *unread* remainder, ready to be forwarded.
 ///
-/// `Some(rest)` is the signal "this body is longer than `limit`"; it is not a
-/// second buffer. Nothing past the frame that crossed the limit is ever polled
-/// here, so the peak allocation is `limit` plus that one frame regardless of
-/// how much the handler had to say. A body that ends exactly at `limit` reports
-/// `None`: the loop keeps reading until the frame that overshoots, so
+/// [`BodyRemainder::Overflow`] is the signal "this body is longer than
+/// `limit`"; it is not a second buffer. Nothing past the frame that crossed
+/// the limit is ever polled here, so the peak allocation is `limit` plus that
+/// one frame regardless of how much the handler had to say. A body that ends
+/// exactly at `limit` reports [`BodyRemainder::End`]: the loop keeps reading
+/// until the frame that overshoots, so
 /// "exactly `limit` bytes" and "more than `limit` bytes" are distinguished by
 /// the reader rather than guessed from the length (the same probe-byte
 /// reasoning `git_cmd::read_to_cap` uses).
 ///
-/// A transport error mid-body is reported as end-of-body: there is nothing
-/// further to forward, and the prefix already read is still the best thing to
-/// tell the client.
-async fn split_at_limit(mut body: Body, limit: usize) -> (Bytes, Option<Body>) {
+/// A transport error or trailers frame interrupts classification rather than
+/// masquerading as clean EOF. The frame and unread body are returned so the
+/// caller can put the consumed bytes back in front and forward them unchanged.
+enum BodyRemainder {
+    End,
+    Overflow(Body),
+    Interrupted(Body),
+}
+
+async fn split_at_limit(mut body: Body, limit: usize) -> (Bytes, BodyRemainder) {
     let mut head: Vec<u8> = Vec::new();
     loop {
         let Some(frame) = body.frame().await else {
-            return (Bytes::from(head), None);
+            return (Bytes::from(head), BodyRemainder::End);
         };
-        let Ok(frame) = frame else {
-            return (Bytes::from(head), None);
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(error) => {
+                return (
+                    Bytes::from(head),
+                    BodyRemainder::Interrupted(prepend_frame(Err(error), body)),
+                );
+            }
         };
-        let Ok(data) = frame.into_data() else {
-            // A trailers frame: no content, keep reading.
-            continue;
+        let data = match frame.into_data() {
+            Ok(data) => data,
+            Err(frame) => {
+                return (
+                    Bytes::from(head),
+                    BodyRemainder::Interrupted(prepend_frame(Ok(frame), body)),
+                );
+            }
         };
         if head.len() + data.len() <= limit {
             head.extend_from_slice(&data);
@@ -351,14 +379,23 @@ async fn split_at_limit(mut body: Body, limit: usize) -> (Bytes, Option<Body>) {
         let room = limit - head.len();
         head.extend_from_slice(&data[..room]);
         let tail = data.slice(room..);
-        let stream = async_stream::stream! {
-            yield Ok::<Bytes, axum::Error>(tail);
-            for await chunk in body.into_data_stream() {
-                yield chunk;
-            }
-        };
-        return (Bytes::from(head), Some(Body::from_stream(stream)));
+        return (
+            Bytes::from(head),
+            BodyRemainder::Overflow(prepend_frame(Ok(Frame::data(tail)), body)),
+        );
     }
+}
+
+/// Put one already-polled frame back in front of a body without erasing later
+/// errors or trailers. `Body::from_stream` accepts data only; `StreamBody` is
+/// deliberately frame-level.
+fn prepend_frame(first: Result<Frame<Bytes>, axum::Error>, mut rest: Body) -> Body {
+    Body::new(StreamBody::new(async_stream::stream! {
+        yield first;
+        while let Some(frame) = rest.frame().await {
+            yield frame;
+        }
+    }))
 }
 
 /// Put a prefix back in front of the remainder it was split from, so the whole
@@ -367,17 +404,13 @@ async fn split_at_limit(mut body: Body, limit: usize) -> (Bytes, Option<Body>) {
 fn rejoin(head: Bytes, rest: Option<Body>) -> Body {
     match rest {
         None => Body::from(head),
-        Some(rest) => Body::from_stream(async_stream::stream! {
-            yield Ok::<Bytes, axum::Error>(head);
-            for await chunk in rest.into_data_stream() {
-                yield chunk;
-            }
-        }),
+        Some(rest) if head.is_empty() => rest,
+        Some(rest) => prepend_frame(Ok(Frame::data(head)), rest),
     }
 }
 
-/// Whether `bytes` is a JSON object, or the start of one — the sniff for a
-/// prefix that was cut off before the closing brace.
+/// Whether `bytes` is the start of a JSON object that was cut off before the
+/// closing brace.
 ///
 /// The distinction `serde_json` makes is what carries this: a truncated object
 /// fails with [`serde_json::Error::is_eof`] ("the input ended while more was
@@ -386,19 +419,23 @@ fn rejoin(head: Bytes, rest: Option<Body>) -> Body {
 /// character anyway — the leading-`{` check is what keeps an empty or
 /// whitespace-only prefix (also an EOF error) from reading as JSON.
 ///
+/// A *complete* object is deliberately false here: when unread bytes remain,
+/// they may be trailing garbage, so a valid prefix cannot prove the whole body
+/// is JSON.
+///
 /// Sniffed through `from_utf8_lossy` rather than the raw bytes because the cut
 /// can land in the middle of a multi-byte character, which the byte parser
 /// would report as a *syntax* error and this would then misread as prose; a
 /// replacement character is still a legal JSON string character, so the lossy
 /// copy fails at end-of-input the way the truncation actually did. The lossy
 /// copy is only ever looked at — what gets forwarded is the original bytes.
-fn json_object_or_prefix_of_one(bytes: &[u8]) -> bool {
+fn incomplete_json_object_prefix(bytes: &[u8]) -> bool {
     let text = String::from_utf8_lossy(bytes);
     if text.trim_start().as_bytes().first() != Some(&b'{') {
         return false;
     }
     match serde_json::from_str::<serde_json::Value>(&text) {
-        Ok(value) => value.is_object(),
+        Ok(_) => false,
         Err(e) => e.is_eof(),
     }
 }
@@ -447,7 +484,7 @@ async fn relabel_json_success(response: Response) -> Response {
     // serializes the response — so reading it here would gate on `None` for
     // every route and relabel nothing.
     let exact = response.body().size_hint().exact();
-    if !exact.is_some_and(|len| len <= MAX_ERROR_BODY as u64) {
+    if exact.is_none_or(|len| len > MAX_ERROR_BODY as u64) {
         return response;
     }
 
@@ -455,8 +492,12 @@ async fn relabel_json_success(response: Response) -> Response {
     // fits: a header that lies must not cost the body. Nothing is lost on any
     // path here — what is not relabeled is rejoined and passed on byte-for-byte.
     let (mut parts, body) = response.into_parts();
-    let (head, rest) = split_at_limit(body, MAX_ERROR_BODY).await;
-    let is_json_object = rest.is_none()
+    let (head, remainder) = split_at_limit(body, MAX_ERROR_BODY).await;
+    let (rest, complete) = match remainder {
+        BodyRemainder::End => (None, true),
+        BodyRemainder::Overflow(rest) | BodyRemainder::Interrupted(rest) => (Some(rest), false),
+    };
+    let is_json_object = complete
         && matches!(
             serde_json::from_slice::<serde_json::Value>(&head),
             Ok(serde_json::Value::Object(_))
@@ -496,11 +537,13 @@ fn with_contract_headers(mut response: Response, request_id: &RequestId) -> Resp
 mod tests {
     use super::*;
     use axum::{
-        http::Request as HttpRequest,
+        http::{HeaderMap, Request as HttpRequest},
         routing::{get, post},
         Router,
     };
     use git_vista_protocol::{AmendCommitError, AmendCommitSuccess, AmendFailureKind, ApiError};
+    use http_body::Frame;
+    use http_body_util::StreamBody;
     use tower::ServiceExt;
 
     // A tiny router carrying the contract layer over a few representative routes:
@@ -523,6 +566,24 @@ mod tests {
     fn oversized_hook_output() -> String {
         let unit = "policy check failed\n\tsee CONTRIBUTING.md\u{1}\n";
         unit.repeat(OVERSIZED_LEN / unit.len() + 1)
+    }
+
+    /// Exactly one complete JSON object in the sniffed prefix, followed by a
+    /// byte that makes the whole body invalid JSON. The arithmetic is pinned
+    /// so a cap change cannot quietly turn this into a different boundary.
+    fn complete_json_prefix_with_trailing_garbage() -> String {
+        let body = format!(r#"{{"m":"{}"}}X"#, "a".repeat(MAX_ERROR_BODY - 8));
+        assert_eq!(
+            body[..MAX_ERROR_BODY].len(),
+            MAX_ERROR_BODY,
+            "the sniffed prefix must be exactly the cap"
+        );
+        assert_eq!(
+            body.len(),
+            MAX_ERROR_BODY + 1,
+            "the fixture must leave exactly one unread garbage byte"
+        );
+        body
     }
 
     fn app() -> Router {
@@ -582,6 +643,53 @@ mod tests {
                         StatusCode::BAD_REQUEST,
                         format!("{OVERSIZED_PROSE_OPENING}{}", "y".repeat(OVERSIZED_LEN)),
                     )
+                }),
+            )
+            // The first MAX_ERROR_BODY bytes are a complete JSON object, but
+            // the unread byte makes the full response invalid JSON. A complete
+            // prefix cannot prove an over-cap body is JSON.
+            .route(
+                "/api/complete-json-prefix-with-trailing-garbage",
+                get(|| async {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        complete_json_prefix_with_trailing_garbage(),
+                    )
+                }),
+            )
+            // Frame-level contract fixtures. Classification has to stop when
+            // it encounters either transport failure or trailers, but the
+            // consumed prefix and that frame must still reach the caller.
+            .route(
+                "/api/data-then-error",
+                get(|| async {
+                    Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::new(StreamBody::new(async_stream::stream! {
+                            yield Ok::<Frame<Bytes>, std::io::Error>(Frame::data(
+                                Bytes::from_static(b"{}")
+                            ));
+                            yield Err::<Frame<Bytes>, _>(std::io::Error::other(
+                                "body exploded"
+                            ));
+                        })))
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/api/data-then-trailers",
+                get(|| async {
+                    let mut trailers = HeaderMap::new();
+                    trailers.insert("x-proof", HeaderValue::from_static("kept"));
+                    Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::new(StreamBody::new(async_stream::stream! {
+                            yield Ok::<Frame<Bytes>, std::convert::Infallible>(Frame::data(
+                                Bytes::from_static(b"{}")
+                            ));
+                            yield Ok(Frame::trailers(trailers));
+                        })))
+                        .unwrap()
                 }),
             )
             // A *success* in the shared write channel: a 200 whose `String` is
@@ -891,7 +999,7 @@ mod tests {
     /// with `{` and runs past the cap must not be mistaken for a truncated JSON
     /// object and forwarded as `application/json`.
     ///
-    /// Without this, `json_object_or_prefix_of_one` could be weakened to "the
+    /// Without this, `incomplete_json_object_prefix` could be weakened to "the
     /// first non-space byte is `{`" and every test above would still pass,
     /// while a client received an English sentence labeled JSON — the
     /// regression `handlers::commit`'s own sniff comment warns is *worse* than
@@ -900,7 +1008,7 @@ mod tests {
     async fn over_cap_prose_that_merely_starts_with_a_brace_is_not_read_as_json() {
         let opening = "{ this is not JSON, it is a shell trace: ";
         assert!(
-            !json_object_or_prefix_of_one(
+            !incomplete_json_object_prefix(
                 format!("{opening}{}", "z".repeat(OVERSIZED_LEN)).as_bytes()
             ),
             "a prefix that starts with a brace but breaks JSON syntax on the \
@@ -909,7 +1017,7 @@ mod tests {
         // …and the genuine article still reads as one, so the check above is
         // not just "always false".
         assert!(
-            json_object_or_prefix_of_one(
+            incomplete_json_object_prefix(
                 format!(
                     r#"{{"kind":"hook_rejected","message":"{}"#,
                     "a".repeat(OVERSIZED_LEN)
@@ -918,6 +1026,101 @@ mod tests {
             ),
             "an object cut off mid-string is exactly what a truncated prefix of \
              a typed DTO looks like"
+        );
+    }
+
+    /// A complete JSON value at the cap says nothing about the unread bytes.
+    /// Treating the prefix as proof would forward invalid JSON with a JSON
+    /// content type instead of the bounded prose envelope.
+    #[tokio::test]
+    async fn a_complete_json_prefix_with_trailing_garbage_is_not_labeled_json() {
+        let fixture = complete_json_prefix_with_trailing_garbage();
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&fixture).is_err(),
+            "the full fixture must be invalid JSON or this test proves nothing"
+        );
+
+        let resp = app()
+            .oneshot(get_req(
+                "/api/complete-json-prefix-with-trailing-garbage",
+                Some(&PROTOCOL_VERSION.to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let raw = body_string(resp).await;
+        let error: ApiError = serde_json::from_str(&raw).unwrap_or_else(|e| {
+            panic!(
+                "a complete prefix plus unread garbage must be enveloped as prose, \
+                 not forwarded as invalid JSON ({e})"
+            )
+        });
+        assert!(
+            error.error.message.contains("truncated"),
+            "the envelope must disclose that unread bytes were omitted"
+        );
+    }
+
+    /// A response-body failure is part of the body stream, not a clean EOF.
+    /// The contract layer may decline to classify the body, but it must not
+    /// turn `[Data("{}"), Err(boom)]` into a successful two-byte body.
+    #[tokio::test]
+    async fn a_body_error_after_data_is_preserved() {
+        let resp = app()
+            .oneshot(get_req(
+                "/api/data-then-error",
+                Some(&PROTOCOL_VERSION.to_string()),
+            ))
+            .await
+            .unwrap();
+        let mut body = resp.into_body();
+        let first = body
+            .frame()
+            .await
+            .expect("the data frame must remain")
+            .expect("the first frame is data");
+        assert_eq!(first.into_data().expect("first frame is data"), "{}");
+        let error = body
+            .frame()
+            .await
+            .expect("the error frame must remain")
+            .expect_err("the second frame must still be an error");
+        assert!(
+            error.to_string().contains("body exploded"),
+            "the original transport error must survive: {error}"
+        );
+    }
+
+    /// Trailers carry end-to-end metadata. Looking only at data frames must
+    /// not erase them while rebuilding the response body.
+    #[tokio::test]
+    async fn trailers_after_data_are_preserved() {
+        let resp = app()
+            .oneshot(get_req(
+                "/api/data-then-trailers",
+                Some(&PROTOCOL_VERSION.to_string()),
+            ))
+            .await
+            .unwrap();
+        let mut body = resp.into_body();
+        let first = body
+            .frame()
+            .await
+            .expect("the data frame must remain")
+            .expect("the first frame is data");
+        assert_eq!(first.into_data().expect("first frame is data"), "{}");
+        let trailers = body
+            .frame()
+            .await
+            .expect("the trailers frame must remain")
+            .expect("trailers are not a body error")
+            .into_trailers()
+            .expect("the second frame must still be trailers");
+        assert_eq!(
+            trailers
+                .get("x-proof")
+                .expect("the original x-proof trailer must survive"),
+            "kept"
         );
     }
 
@@ -931,7 +1134,7 @@ mod tests {
         let (head, rest) = split_at_limit(Body::from(exact.clone()), MAX_ERROR_BODY).await;
         assert_eq!(head.len(), MAX_ERROR_BODY);
         assert!(
-            rest.is_none(),
+            matches!(rest, BodyRemainder::End),
             "a body of exactly the cap has no remainder to forward"
         );
 
@@ -939,7 +1142,7 @@ mod tests {
             split_at_limit(Body::from([exact, vec![b'x']].concat()), MAX_ERROR_BODY).await;
         assert_eq!(head.len(), MAX_ERROR_BODY);
         assert!(
-            rest.is_some(),
+            matches!(rest, BodyRemainder::Overflow(_)),
             "one byte past the cap is a body with a remainder"
         );
     }
