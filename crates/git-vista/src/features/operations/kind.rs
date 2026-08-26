@@ -338,6 +338,21 @@ mod tests {
         CommitOid::new(c.to_string().repeat(40)).unwrap()
     }
 
+    /// An explanation with no sections, for the tests in this module — which
+    /// are about the operation's one-line **caption**, never about the panel.
+    ///
+    /// This is not a shape [`git_vista_protocol::explain`] produces: it always
+    /// emits six sections, empty ones included. It exists so these assertions
+    /// say plainly that the explanation is not what they are measuring, rather
+    /// than carrying a plausible-looking one that a later reader might mistake
+    /// for coverage. The panel's own behaviour is pinned in
+    /// `features::explain::core` and in the protocol crate's parity test.
+    fn caption_only_explanation() -> Explanation {
+        Explanation {
+            sections: Vec::new(),
+        }
+    }
+
     #[test]
     fn every_variant_describes_itself_without_naming_its_enum() {
         // A status strip reading "ForceDelete" would be leaking the type name at the user.

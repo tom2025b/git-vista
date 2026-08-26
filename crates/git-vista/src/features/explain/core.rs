@@ -20,7 +20,7 @@
 
 use git_vista_protocol::{
     Advisory, CommitOid, Explanation, ExplanationFact, IndexEffect, NetworkNeed, Precondition,
-    RecoveryStrategy, RefChange, RefName, RefState, RiskLevel, Topic, WorktreeEffect,
+    RecoveryStrategy, RefChange, RefState, RiskLevel, Topic, WorktreeEffect,
 };
 
 /// The visual object a line points at, so the viewer can link it — #92's
@@ -119,6 +119,77 @@ pub fn when_empty(topic: Topic) -> &'static str {
         Topic::HowToUndo => "Nothing is known about how to undo this.",
         Topic::WorthKnowing => "Nothing else worth flagging.",
     }
+}
+
+/// The `localStorage` key a section's collapsed state persists under.
+///
+/// **Keyed on the topic alone — never on the plan, the operation, or the
+/// branch.** That is the whole design of it: an expert who collapses "What
+/// must be true first" means *always*, and a key carrying anything
+/// plan-shaped would make them collapse the same section again on every
+/// operation, forever. The panel would look like it remembered while
+/// remembering nothing that matters.
+///
+/// Six keys exist and no more, which is also why this returns a `&'static
+/// str` rather than building a string: there is nothing to interpolate, and a
+/// signature that cannot interpolate cannot drift into keying on a plan.
+pub fn storage_key(topic: Topic) -> &'static str {
+    match topic {
+        Topic::MustBeTrueFirst => "git-vista.explain.must-be-true-first",
+        Topic::WhatMoves => "git-vista.explain.what-moves",
+        Topic::IndexAndWorktree => "git-vista.explain.index-and-worktree",
+        Topic::Remote => "git-vista.explain.remote",
+        Topic::HowToUndo => "git-vista.explain.how-to-undo",
+        Topic::WorthKnowing => "git-vista.explain.worth-knowing",
+    }
+}
+
+/// A run of a sentence, split on the backticks that mark git's own words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Span {
+    /// Ordinary prose.
+    Text(String),
+    /// A ref name, an oid, a remote — something the repository itself named,
+    /// which the view sets in monospace so it is not mistaken for English.
+    Code(String),
+}
+
+/// Split a sentence into prose and code runs.
+///
+/// The sentences above mark git's own words with backticks, because a branch
+/// called `main` and the English word "main" are not the same thing and a
+/// reader has to be able to tell. Nothing renders markdown here — the modal is
+/// inline-styled plain DOM — so this is the whole of the formatting the panel
+/// supports, deliberately: one rule, no nesting, no escapes to get wrong.
+///
+/// An unclosed backtick yields the rest of the sentence as prose rather than
+/// swallowing it. A sentence is never worth losing to a typo in its own
+/// punctuation.
+pub fn spans(text: &str) -> Vec<Span> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('`') {
+        let (before, after_open) = rest.split_at(open);
+        if !before.is_empty() {
+            out.push(Span::Text(before.to_string()));
+        }
+        let after_open = &after_open[1..];
+        match after_open.find('`') {
+            Some(close) => {
+                out.push(Span::Code(after_open[..close].to_string()));
+                rest = &after_open[close + 1..];
+            }
+            // Unclosed: the backtick was a typo, not a marker. Keep the words.
+            None => {
+                out.push(Span::Text(format!("`{after_open}")));
+                return out;
+            }
+        }
+    }
+    if !rest.is_empty() {
+        out.push(Span::Text(rest.to_string()));
+    }
+    out
 }
 
 /// One fact, in words. Exhaustive over every fact kind and every variant each
@@ -224,7 +295,9 @@ fn precondition(p: &Precondition) -> String {
             format!("`{branch}` must be the branch you currently have checked out.")
         }
         Precondition::BranchNotCheckedOut { branch } => {
-            format!("`{branch}` must **not** be the branch you currently have checked out.")
+            format!(
+                "`{branch}` must be some branch OTHER than the one you currently have checked out."
+            )
         }
         Precondition::CleanWorktree => {
             "Your working tree must have no uncommitted changes — nothing edited, nothing staged."
@@ -387,8 +460,8 @@ fn recovery(r: &RecoveryStrategy) -> String {
                 .to_string()
         }
         RecoveryStrategy::Irrecoverable => {
-            "**Git-Vista offers no undo for this.** No ref moves back, and \
-             nothing in its own record can replay it."
+            "Git-Vista offers no undo for this — no ref moves back, and nothing in \
+             its own record can replay it."
                 .to_string()
         }
     }
@@ -404,14 +477,14 @@ fn advisory(a: &Advisory) -> String {
         // The whole content is the gap, so it is stated as one. This is the
         // distinction between "I checked" and "I could not check".
         Advisory::DefaultBranchUnknown { reason } => format!(
-            "Whether this targets the default branch could **not** be \
-             determined ({reason}). Not an error and not a refusal — a stated \
-             gap in what this preview can tell you."
+            "Whether this targets the default branch could NOT be determined \
+             ({reason}). Not an error and not a refusal — a stated gap in \
+             what this preview can tell you."
         ),
         Advisory::RemoteHistoryReplaced { branch, remote } => format!(
             "If this succeeds, `{branch}` on `{remote}` is replaced, and nothing \
              this application offers can put it back there. Recovery below \
-             describes what can be restored **locally** — this is the part it \
+             describes what can be restored on your own machine; this is the part it \
              cannot reach."
         ),
     }
@@ -443,7 +516,7 @@ fn short(oid: &CommitOid) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use git_vista_protocol::{BranchName, RemoteName, StashMessage, TagName};
+    use git_vista_protocol::{BranchName, RefName, RemoteName, StashMessage, TagName};
 
     fn oid(c: char) -> CommitOid {
         CommitOid::new(c.to_string().repeat(40)).unwrap()
@@ -588,7 +661,7 @@ mod tests {
                 "{fact:?} renders as {s:?} — too short to be a sentence"
             );
             assert!(
-                s.ends_with('.') || s.ends_with('`') || s.ends_with("**"),
+                s.ends_with('.'),
                 "{fact:?} renders as {s:?} — not a finished sentence"
             );
         }
@@ -717,7 +790,7 @@ mod tests {
         });
         assert_eq!(link_target(&f), None);
         assert!(
-            sentence(&f).contains("could **not** be"),
+            sentence(&f).contains("could NOT be"),
             "the sentence must state the gap, not describe a push"
         );
     }
@@ -734,6 +807,108 @@ mod tests {
         ] {
             assert!(!heading(t).trim().is_empty(), "{t:?} has no heading");
             assert!(!when_empty(t).trim().is_empty(), "{t:?} has no empty line");
+        }
+    }
+
+    #[test]
+    fn spans_split_on_backticks_and_lose_nothing() {
+        assert_eq!(
+            spans("`main` moves from `abc1234` to a new commit."),
+            vec![
+                Span::Code("main".into()),
+                Span::Text(" moves from ".into()),
+                Span::Code("abc1234".into()),
+                Span::Text(" to a new commit.".into()),
+            ]
+        );
+        assert_eq!(
+            spans("No file in your working tree changes."),
+            vec![Span::Text("No file in your working tree changes.".into())]
+        );
+        // The property that matters more than the shape: every character of
+        // the sentence survives the split. A renderer that silently drops
+        // words is worse than one that shows a stray backtick.
+        for fact in every_fact() {
+            let s = sentence(&fact);
+            let rebuilt: String = spans(&s)
+                .into_iter()
+                .map(|sp| match sp {
+                    Span::Text(t) => t,
+                    Span::Code(c) => format!("`{c}`"),
+                })
+                .collect();
+            assert_eq!(rebuilt, s, "spans lost characters from {s:?}");
+        }
+    }
+
+    #[test]
+    fn an_unclosed_backtick_keeps_its_words() {
+        assert_eq!(
+            spans("a `broken sentence"),
+            vec![
+                Span::Text("a ".into()),
+                Span::Text("`broken sentence".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_topic_has_its_own_storage_key_and_they_are_all_distinct() {
+        let topics = [
+            Topic::MustBeTrueFirst,
+            Topic::WhatMoves,
+            Topic::IndexAndWorktree,
+            Topic::Remote,
+            Topic::HowToUndo,
+            Topic::WorthKnowing,
+        ];
+        let mut keys: Vec<&str> = topics.iter().map(|t| storage_key(*t)).collect();
+        keys.sort();
+        let distinct = {
+            let mut d = keys.clone();
+            d.dedup();
+            d
+        };
+        assert_eq!(
+            keys, distinct,
+            "two topics share a storage key — collapsing one would collapse the other"
+        );
+        for k in &keys {
+            assert!(
+                k.starts_with("git-vista.explain."),
+                "{k:?} is not namespaced with the rest of this app's preferences"
+            );
+        }
+    }
+
+    #[test]
+    fn a_storage_key_carries_nothing_but_its_topic() {
+        // The defect this guards against does not look like a bug: a key of
+        // "git-vista.explain.what-moves.refs/heads/main" persists perfectly
+        // well and reads as thorough. It just means an expert who collapses a
+        // section collapses it for *that branch*, and has to do it again on
+        // the next one, forever. The signature returns `&'static str`
+        // precisely so there is nothing to interpolate — this asserts the
+        // resulting keys are in fact constant-shaped.
+        for t in [
+            Topic::MustBeTrueFirst,
+            Topic::WhatMoves,
+            Topic::IndexAndWorktree,
+            Topic::Remote,
+            Topic::HowToUndo,
+            Topic::WorthKnowing,
+        ] {
+            let k = storage_key(t);
+            assert_eq!(
+                k.matches('.').count(),
+                2,
+                "{k:?} has more segments than `git-vista.explain.<topic>` — \
+                 something plan-shaped may have crept into the key"
+            );
+            assert!(
+                !k.contains('/') && !k.contains(':'),
+                "{k:?} looks like it carries a ref or an oid"
+            );
         }
     }
 
