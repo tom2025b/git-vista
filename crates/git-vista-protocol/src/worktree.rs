@@ -271,7 +271,7 @@ mod tests {
     /// null").
     #[test]
     fn absent_path_is_omitted_not_sent_as_null() {
-        let json = serde_json::to_value(&sibling()).unwrap();
+        let json = serde_json::to_value(sibling()).unwrap();
         assert!(
             !json.as_object().unwrap().contains_key("path"),
             "path must be absent from the wire when None, not present as null: {json}"
@@ -318,8 +318,8 @@ mod tests {
         let empty = WorktreeCensus::Observed { siblings: vec![] };
         assert_ne!(failed, empty);
 
-        let failed_json = serde_json::to_value(&failed).unwrap();
-        let empty_json = serde_json::to_value(&empty).unwrap();
+        let failed_json = serde_json::to_value(failed).unwrap();
+        let empty_json = serde_json::to_value(empty).unwrap();
         assert_ne!(failed_json, empty_json);
         assert_eq!(failed_json["kind"], "census_failed");
         assert_eq!(empty_json["kind"], "observed");

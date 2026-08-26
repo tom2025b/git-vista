@@ -21,7 +21,7 @@ fn head_tip(repo: &Path) -> String {
     fx::out(repo, &["rev-parse", "HEAD"])
 }
 
-fn current_of<'a>(siblings: &'a [WorktreeSibling]) -> Vec<&'a WorktreeSibling> {
+fn current_of(siblings: &[WorktreeSibling]) -> Vec<&WorktreeSibling> {
     siblings.iter().filter(|s| s.is_current).collect()
 }
 
