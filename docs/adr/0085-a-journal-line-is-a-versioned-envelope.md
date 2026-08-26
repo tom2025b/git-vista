@@ -182,16 +182,31 @@ merely decorative. Malformed JSON, or a `v` whose own value cannot be read as an
 integer, still has only the generic unreadable-line diagnostic.
 
 Additive growth remains a review convention, not something the compiler
-enforces. The aggregate notice distinguishes compatible retained events from
-incompatible skipped events:
+enforces. The aggregate notice **counts** the two classes rather than
+describing them, so the one sentence is true whichever way a window falls:
 
 ```
 git-vista: 99 journal line(s) were written by newer journal formats; the newest
-was journal format v3; this binary writes v1. Compatible newer events were
-retained; incompatible newer events were skipped by the unreadable-line
-diagnostics above. On retained events, a field or ref capture this binary has no
+was journal format v3; this binary writes v1. 97 retained, 2 skipped as
+unreadable. On a retained line, a field or ref capture this binary has no
 reading for is treated as "not recorded", never as "nothing was there".
 ```
+
+Counting rather than describing is the third and last correction this sentence
+needed, and the first two are why. It began as *"they were read as far as this
+binary understands them"* — false once the probe made `from_newer` include
+lines that were never read at all. Naming the classes instead fixed that
+direction and broke the mirror one: on a window where every newer line decoded,
+it still spoke of *"incompatible newer events skipped by the unreadable-line
+diagnostics above"* with no such diagnostics above it. A qualitative sentence
+has to be true in both directions at once, and this one could not be; two
+integers are.
+
+`WindowReport::from_newer_skipped` is incremented only where **both** facts are
+in hand — the envelope probe said newer *and* the full decode failed. A newer
+unreadable line is deliberately counted in `from_newer_skipped` **and** in
+`unreadable`: it is one line that is both, and the two facts have different
+remedies.
 
 The aggregate deliberately says *formats* and names only the newest. Mixed
 generations are normal in an append-only file, so a count spanning v2 and v3
@@ -245,6 +260,24 @@ the aggregate must not claim skipped events were partially retained
 
 Both mutations were restored from `/tmp/gv534-journal.rs.amend-good`, and
 `diff -q` confirmed byte identity after each restore.
+
+The counting amendment was mutation-proved twice more, red in **different
+tests** at **different assertions**, each restore verified byte-identical by a
+clean `git diff` against the commit:
+
+- never attributing the skip to the newer stamp (dropping the `if newer`
+  increment) reported `2 retained, 0 skipped` for two lines neither of which
+  was read — red at *"both newer lines were skipped, and the notice must count
+  them rather than describing the two classes in the abstract"*;
+- attributing the skip at probe time instead of at decode-failure time counted
+  every newer line as skipped, reporting `0 retained, 2 skipped` for two lines
+  that both decoded — red at *"both newer lines were readable and the notice
+  must say so"*.
+
+The second is the one a single-direction test would have missed, which is why
+the all-compatible case also asserts its own precondition — that its window
+holds no unreadable lines at all. Without that, it could pass while pointing at
+diagnostics that merely happened to exist.
 
 ## What this buys, split honestly between the past and the future
 
