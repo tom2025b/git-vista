@@ -434,6 +434,28 @@ impl FeedEvent {
         }
     }
 
+    /// Whether a journal name can identify this exact reflog namespace.
+    ///
+    /// Local writers store the branch's short name; remote-update writers
+    /// store the full `refs/remotes/...` name. A short local branch may itself
+    /// begin with `refs/`, so that ambiguous spelling is never used to absorb
+    /// a local reflog row: keeping a duplicate is safer than erasing an
+    /// independent movement. HEAD is its own singleton namespace.
+    fn matches_journal_ref(&self, journal_ref: Option<&str>) -> bool {
+        let Some(reflog_name) = self.event.ref_name.as_deref() else {
+            return false;
+        };
+        match self.reflog_ref_kind {
+            Some(ReflogRefKind::LocalBranch) => journal_ref.is_some_and(|journal_name| {
+                !journal_name.starts_with("refs/")
+                    && reflog_name.strip_prefix("refs/heads/") == Some(journal_name)
+            }),
+            Some(ReflogRefKind::RemoteBranch) => journal_ref == Some(reflog_name),
+            Some(ReflogRefKind::Head) => reflog_name == "HEAD",
+            None => false,
+        }
+    }
+
     /// Restore a short display name only when the sidecar proves this event
     /// came from the corresponding reflog namespace. A journal string that
     /// merely resembles a qualified ref is returned byte-for-byte.
@@ -670,9 +692,11 @@ pub fn assemble_feed(
     });
 
     // -- 3. Attribute app events: a reflog entry matching a journal entry ----
-    // (same kind, same resulting oid, near-same moment) *is* that journal
-    // entry — keep the journal copy, which knows the source and has the
-    // richer summary.
+    // Same kind, resulting oid and near-same moment are not enough: a local
+    // branch and remote-tracking branch can land the same commit together.
+    // Require namespace-consistent ref identity too. The matching reflog row
+    // *is* that journal entry, so keep the journal copy, which knows the source
+    // and has the richer summary.
     events.retain(|e| {
         let Some(new_oid) = &e.new_oid else {
             return true;
@@ -681,6 +705,7 @@ pub fn assemble_feed(
             j.kind == e.kind
                 && j.new_oid.as_deref() == Some(new_oid)
                 && (e.time - j.time).abs() <= JOURNAL_MATCH_SLACK
+                && e.matches_journal_ref(j.ref_name.as_deref())
         })
     });
 
@@ -1280,6 +1305,54 @@ mod tests {
         assert_eq!(feed.len(), 1, "one event for one merge: {feed:#?}");
         assert_eq!(feed[0].source, ActivitySource::App);
         assert_eq!(feed[0].summary, "merged ‘feature’ into ‘main’");
+    }
+
+    /// A pushed remote-tracking ref and an independently pushed local branch
+    /// can land the same commit in the same second. Kind, oid and time identify
+    /// neither namespace: the outgoing journal may absorb only its matching
+    /// remote-tracking echo, never the receiving repository's local movement.
+    #[test]
+    fn a_remote_push_journal_does_not_absorb_a_same_oid_local_push() {
+        let journal = vec![ActivityEvent {
+            time: 100,
+            kind: ActivityKind::Push,
+            ref_name: Some("refs/remotes/origin/main".into()),
+            summary: "pushed ‘main’ to origin".into(),
+            old_oid: Some("a".into()),
+            new_oid: Some("b".into()),
+            source: ActivitySource::App,
+            undo: None,
+            refs: None,
+        }];
+        let reflog = vec![
+            entry_of_kind(ReflogRefKind::LocalBranch, "main", 100, "a", "b", "push"),
+            entry_of_kind(
+                ReflogRefKind::RemoteBranch,
+                "origin/main",
+                100,
+                "a",
+                "b",
+                "update by push",
+            ),
+            entry("origin/feat-a", 100, "p", "q", "update by push"),
+            entry("origin/feat-b", 100, "r", "s", "update by push"),
+            entry("origin/feat-c", 100, "t", "u", "update by push"),
+        ];
+        let branches = HashMap::from([("main".to_string(), "b".to_string())]);
+
+        let feed = assemble_feed(journal, reflog, &branches, &HashSet::new(), 50);
+
+        let local_move = feed
+            .iter()
+            .find(|event| event.ref_name.as_deref() == Some("main") && event.summary == "push")
+            .expect("the independent local branch movement must survive attribution");
+        assert_eq!(local_move.new_oid.as_deref(), Some("b"));
+        assert!(
+            feed.iter()
+                .any(|event| event.summary == "push — 4 refs updated"),
+            "the matching remote echo is absorbed and only four remote rows fold: {feed:#?}"
+        );
+        assert_eq!(feed.len(), 2, "one local movement + one remote burst");
     }
 
     #[test]
