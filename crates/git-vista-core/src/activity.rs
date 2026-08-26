@@ -788,27 +788,42 @@ fn admits_it_could_not_read_the_refs(event: &ActivityEvent) -> bool {
 /// reported as 297 and 500 as 891. The feed stayed at one row, so #329's
 /// symptom held, but the number in it was not true.
 ///
-/// **Fixed at the writer (#485), not in the fold.** A fetch now takes one ref
-/// capture and one timestamp for the whole batch
-/// (`handlers::journal_app_events`), so its entries no longer drift apart at
-/// all, and pull journals through the same path. The fold itself still counts
-/// both copies of anything that *does* drift, and the F1 pin below is a live
-/// regression test for fetch rather than the expected failure it started as.
-/// Its doc comment carries the full argument.
+/// **Fixed at the writer (#485), not in the fold — and only the relative
+/// half of it.** A fetch now takes one ref capture and one timestamp for the
+/// whole batch (`handlers::journal_app_events`), so its entries can no
+/// longer drift *apart from each other*: whatever that one moment turns out
+/// to be, every entry of the batch shares it, and pull journals through the
+/// same path. That bounds drift **within** a batch to zero; it says nothing
+/// about the **absolute** gap between git's reflog line and that one shared
+/// moment. The timestamp is sampled only after the post-fetch re-read of
+/// every remote-tracking ref (`planner::fetch::run_fetch` calling
+/// `planner::transfer::remote_tracking_refs`) — one `git for-each-ref` whose
+/// cost plausibly scales with the size of the ref namespace but **has never
+/// been measured**. A large enough namespace or slow enough
+/// storage could in principle push that re-read, and so the whole batch's
+/// shared moment, past [`JOURNAL_MATCH_SLACK`] of the reflog lines it needs
+/// to match. Batching would not save it: every entry in the batch would miss
+/// together instead of the tail of them missing one by one, still 2N rather
+/// than N. Whether that gap is ever actually crossed has not been measured
+/// (#522) — this paragraph states what #485 rules out, not that the window
+/// can't be exceeded. The F1 pin below is unaffected either way: it pins
+/// drift *between entries of one batch*, which #485 did fix, not drift
+/// between the batch and the reflog, which it did not touch.
 ///
-/// **Push does not inherit that batching — reported, not fixed here (#487).**
-/// `planner::push::journal_updates` loops over the refs that moved calling
-/// `journal_app_event`, the *singular*, and that one delegates to
-/// `journal_app_events` with a batch of one. So each ref takes its own
-/// `now_secs()` reading and its own `journal::append_all` ref capture: exactly
-/// the writer shape #485 removed from fetch, still present in push. It cannot
-/// bite today — that loop runs over the single ref a one-branch push moves —
-/// but it is the drift the count above inflates on, and it would arrive with
-/// the multi-ref push path rather than after it. Batching push's writer is a
-/// change to `planner::push` with its own before/after measurement, not a
-/// rider on this gate. Nothing pins push's drift here because push cannot yet
-/// produce it; what is pinned is that the fold counts a push burst correctly
-/// when the entries do *not* drift.
+/// **Push does not inherit even that relative half — reported, not fixed
+/// here (#487).** `planner::push::journal_updates` loops over the refs that
+/// moved calling `journal_app_event`, the *singular*, and that one delegates
+/// to `journal_app_events` with a batch of one. So each ref takes its own
+/// `now_secs()` reading and its own `journal::append_all` ref capture:
+/// exactly the writer shape #485 removed from fetch, still present in push —
+/// and it is drift *between entries of one operation*, the half batching does
+/// rule out for fetch. It cannot bite today, because that loop runs over the
+/// single ref a one-branch push moves and one entry cannot drift from itself;
+/// it would arrive **with** the multi-ref push path rather than after it.
+/// Batching push's writer is a change to `planner::push` with its own
+/// before/after measurement, not a rider on this gate. Nothing pins push's
+/// drift here because push cannot yet produce it; what is pinned is that the
+/// fold counts a push burst correctly when the entries do *not* drift.
 ///
 /// **Safe for undo by construction, not by luck:** [`undo_hint`] has no arm for
 /// `Fetch`, `Pull` or `Push`, so none of those rows has ever carried a hint and
@@ -1843,19 +1858,34 @@ mod tests {
     ///
     /// **What is no longer pinned, said plainly.** The fold still counts both
     /// copies of anything that *does* drift; that is not fixed, and after this
-    /// change nothing asserts it. It is left unpinned because no writer can
-    /// currently produce it: fetch and pull journal through the batched
-    /// `fetch::journal_updates` (pull runs `fetch::run_fetch`).
+    /// change nothing here exercises it. What batching rules out is entries of
+    /// one fetch drifting *apart from each other* — no writer of this class can
+    /// still produce that, since fetch and pull journal through the batched
+    /// `fetch::journal_updates` (pull runs `fetch::run_fetch`) with one shared
+    /// timestamp, and the one remaining unbatched per-ref writer cannot yet
+    /// emit a burst for the fold to count (see the paragraph below). It does
+    /// **not** rule out
+    /// the whole batch's one shared timestamp landing more than
+    /// [`JOURNAL_MATCH_SLACK`] after the reflog lines it is meant to match —
+    /// that gap is set by however long the post-fetch ref re-read
+    /// (`planner::transfer::remote_tracking_refs`) takes before the
+    /// timestamp is sampled (`handlers::journal_app_events`). That re-read
+    /// is one `git for-each-ref`, so its cost plausibly scales with the ref
+    /// namespace — but that is reasoning, not a measurement, and none exists.
+    /// Whether it is ever actually crossed has not been measured (#522); if
+    /// it is, every entry in the batch drifts together and the fold counts
+    /// 2N, the same symptom this test pins in a different shape.
     ///
-    /// **#487 narrowed that argument; it did not break it.** This paragraph
-    /// used to dismiss `planner::push::journal_updates` — the one remaining
-    /// unbatched per-ref writer — on the grounds that `fold_ref_update_bursts`
-    /// folds only `Fetch` and `Pull`, so push could not reach this path at
-    /// all. It can now: #487 made `Push` a fold candidate, and that writer is
-    /// still unbatched. What holds instead is narrower and still true — the
-    /// push endpoint pushes one named branch, so that loop runs once and a
-    /// single entry cannot drift from itself. The day a multi-ref push path
-    /// lands, this is the paragraph to come back to.
+    /// **#487 narrowed the first half of that; it did not break it.** That
+    /// sentence used to dismiss `planner::push::journal_updates` — the one
+    /// remaining unbatched per-ref writer — on the grounds that
+    /// `fold_ref_update_bursts` folds only `Fetch` and `Pull`, so push could
+    /// not reach this code path at all. It can now: #487 made `Push` a fold
+    /// candidate, and that writer is still unbatched, so it *is* a writer of
+    /// this class. What holds instead is narrower and still true — the push
+    /// endpoint pushes one named branch, so that loop runs once and a single
+    /// entry cannot drift from itself. The day a multi-ref push path lands,
+    /// this is the paragraph to come back to.
     #[test]
     fn a_slow_fetch_still_counts_only_the_refs_that_moved() {
         const REFS: i64 = 250;
