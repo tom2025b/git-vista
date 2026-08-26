@@ -72,7 +72,21 @@ const PLAN_TTL_SECS: i64 = 300;
 /// The single entry point every write handler calls; everything below it is
 /// private to the planner.
 pub(crate) async fn plan_and_execute(op: GitOperation) -> (StatusCode, String) {
-    plan_and_execute_maybe_recovery(op, None).await
+    plan_and_execute_maybe_recovery(op, None, DropProof::Nothing).await
+}
+
+/// [`plan_and_execute`], for a drop that must first prove the working tree
+/// still holds what an apply restored (M3, #514; ADR 0090).
+///
+/// The proof is checked **inside the coordinator guard**, which is the only
+/// place it means anything: the plan is built before the guard is taken, so a
+/// check made any earlier is looking at a repository another writer is still
+/// free to change.
+pub(crate) async fn plan_and_execute_proving(
+    op: GitOperation,
+    proof: DropProof,
+) -> (StatusCode, String) {
+    plan_and_execute_maybe_recovery(op, None, proof).await
 }
 
 /// [`plan_and_execute`], for an operation that is itself the executed recovery
@@ -91,7 +105,7 @@ pub(crate) async fn plan_and_execute_recovery(
     op: GitOperation,
     recovers: OperationId,
 ) -> (StatusCode, String) {
-    plan_and_execute_maybe_recovery(op, Some(recovers)).await
+    plan_and_execute_maybe_recovery(op, Some(recovers), DropProof::Nothing).await
 }
 
 /// The shared body of [`plan_and_execute`] and [`plan_and_execute_recovery`]:
@@ -107,6 +121,7 @@ pub(crate) async fn plan_and_execute_recovery(
 async fn plan_and_execute_maybe_recovery(
     op: GitOperation,
     recovers: Option<OperationId>,
+    proof: DropProof,
 ) -> (StatusCode, String) {
     // The write gate, kept here as well as in the handlers (defense in depth —
     // no operation executes against a Visualize-mode selection).
@@ -141,6 +156,7 @@ async fn plan_and_execute_maybe_recovery(
         selection_tokens(),
         PlanSource::Build(op),
         recovers,
+        proof,
     )
     .await
 }
@@ -261,6 +277,7 @@ async fn plan_and_execute_tracked(
     tokens: (RepositoryToken, WorktreeToken),
     source: PlanSource,
     recovers: Option<OperationId>,
+    proof: DropProof,
 ) -> (StatusCode, String) {
     let hash = source.hash();
     let (repository, worktree) = tokens.clone();
@@ -321,7 +338,9 @@ async fn plan_and_execute_tracked(
             crate::durable::persist(durable_key.clone(), durable_record.status()).await;
 
             let (status, message) = match source {
-                PlanSource::Build(op) => plan_and_execute_in(&repo, repo_id, tokens, op).await,
+                PlanSource::Build(op) => {
+                    plan_and_execute_in(&repo, repo_id, tokens, op, proof).await
+                }
                 PlanSource::Submit(plan) => submit_plan(&repo, repo_id, tokens, *plan).await,
             };
             // The generation *after* execution: the datum a reconnecting client
@@ -392,6 +411,7 @@ pub(crate) async fn plan_and_execute_in(
     repo_id: Option<RepositoryId>,
     tokens: (RepositoryToken, WorktreeToken),
     op: GitOperation,
+    proof: DropProof,
 ) -> (StatusCode, String) {
     // The stage reports are no-ops unless this pipeline is running under a
     // tracked operation (M1.08), so the seam the test suites drive is
@@ -635,6 +655,9 @@ pub(crate) async fn submit_plan_tracked(plan: Plan) -> (StatusCode, String) {
         // A submitted plan runs through the review-roundtrip seam (#249),
         // never the Recovery Center — it recovers nothing.
         None,
+        // #514's proof rides with a composed pop's drop, which is built here
+        // rather than submitted; a reviewed plan has nothing to prove.
+        DropProof::Nothing,
     )
     .await
 }
