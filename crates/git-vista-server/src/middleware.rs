@@ -1512,6 +1512,36 @@ mod tests {
         );
     }
 
+    /// Exact body lengths are `u64`; neither reporting nor decrementing a
+    /// valid remainder may silently narrow it through a 32-bit counter.
+    #[tokio::test]
+    async fn a_known_size_body_preserves_remainders_above_u32() {
+        let initial = u64::from(u32::MAX) + 2;
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::new(vec![Step::Data(b"x")])),
+            remaining: Some(initial),
+        };
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(4_294_967_297),
+            "the initial u64 remainder must be advertised exactly"
+        );
+
+        let data = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the one-byte frame remains")
+            .expect("the frame is not an error")
+            .into_data()
+            .expect("the frame carries data");
+        assert_eq!(data, Bytes::from_static(b"x"));
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(4_294_967_296),
+            "subtracting one byte must retain the full u64 remainder"
+        );
+    }
+
     /// HTTP body sizes count octets, not Unicode scalar values. A valid UTF-8
     /// payload therefore still consumes its full byte length.
     #[tokio::test]
