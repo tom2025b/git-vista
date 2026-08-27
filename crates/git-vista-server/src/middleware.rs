@@ -1284,7 +1284,8 @@ mod tests {
             }
             this.yielded = true;
             let mut trailers = HeaderMap::new();
-            trailers.insert("x-checksum", HeaderValue::from_static("zero-data"));
+            trailers.append("x-checksum", HeaderValue::from_static("zero-data"));
+            trailers.append("x-checksum", HeaderValue::from_static("second-value"));
             Poll::Ready(Some(Ok(Frame::trailers(trailers))))
         }
 
@@ -1559,7 +1560,12 @@ mod tests {
             .expect("trailers are not an error")
             .into_trailers()
             .expect("the pending frame is trailers");
-        assert_eq!(trailers.get("x-checksum").unwrap(), "zero-data");
+        let values: Vec<_> = trailers
+            .get_all("x-checksum")
+            .iter()
+            .map(|value| value.to_str().expect("static trailer values are text"))
+            .collect();
+        assert_eq!(values, ["zero-data", "second-value"]);
         assert_eq!(body.size_hint().exact(), Some(0));
     }
 
