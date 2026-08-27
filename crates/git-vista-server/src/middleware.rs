@@ -1521,6 +1521,10 @@ mod tests {
             inner,
             remaining: Some(0),
         };
+        assert!(
+            !body.is_end_stream(),
+            "exact zero counts DATA bytes; the pending trailer keeps the stream open"
+        );
 
         let trailers = std::pin::Pin::new(&mut body)
             .frame()

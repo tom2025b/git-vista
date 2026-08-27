@@ -21,3 +21,4 @@
 - 2026-08-27 codex — Give the no-remainder arm a deliberately false original hint; survivor S22 deleted one `return` and re-wrapped fully observed bytes with stale producer provenance instead of their known actual length.
 - 2026-08-27 codex — Exercise a legal trailer-only inner body whose byte hint is exact zero; survivor S23 treated the inner byte count as lifecycle state and skipped metadata without polling.
 - 2026-08-27 codex — Exercise both zero-byte underclaims and oversized claims after full buffering; survivor S24 special-cased stale exact zero as an empty body and discarded observed bytes.
+- 2026-08-27 codex — Assert lifecycle state on the exact-zero trailer fixture as well as polling it; survivor S25 derived `is_end_stream` from an inner byte hint and would let Hyper suppress pending trailers.
