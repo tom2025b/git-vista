@@ -1465,7 +1465,11 @@ mod tests {
     async fn a_known_size_body_delegates_end_of_stream_to_the_inner_body() {
         let mut body = KnownSizeBody {
             inner: Body::from("x"),
-            remaining: Some(1),
+            // Deliberately disagree with the one-byte inner body. If this were
+            // `Some(1)`, draining the inner would make both `is_end_stream`
+            // and `remaining == Some(0)` true at once, so the wrong
+            // conjunction of those independent states would pass.
+            remaining: Some(9),
         };
         assert!(
             !body.is_end_stream(),
@@ -1473,6 +1477,11 @@ mod tests {
              not yet at end of stream"
         );
         while std::pin::Pin::new(&mut body).frame().await.is_some() {}
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(8),
+            "precondition: the byte hint remains nonzero after the inner ends"
+        );
         assert!(
             body.is_end_stream(),
             "once the inner body is drained the wrapper must say so — the \
