@@ -15,6 +15,9 @@ pub mod diff;
 pub mod explain;
 pub mod graph;
 pub mod operations;
+// #387: the full-screen viewer's readiness predicate — derived from the same
+// staleness check `viewer.rs`'s body match already makes, not a new signal.
+pub mod readiness;
 pub mod session;
 pub mod shell;
 pub mod status;
