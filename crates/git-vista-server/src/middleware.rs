@@ -1477,6 +1477,55 @@ mod tests {
         );
     }
 
+    /// A spent or invalidated size hint is an accounting state, not a stream
+    /// lifecycle state. The inner body may still have an overrun frame,
+    /// trailers, or an error queued after the declared byte count reaches
+    /// zero. Hyper consults `is_end_stream` before polling those frames, so
+    /// deriving this answer from `remaining` would silently discard them.
+    ///
+    /// This kills the mutation `remaining == Some(0) || inner.is_end_stream()`:
+    /// the first frame spends the declared two bytes while two frames remain.
+    /// The second frame then invalidates the hint while one frame remains,
+    /// pinning the same invariant after `remaining` becomes `None`.
+    #[tokio::test]
+    async fn a_spent_or_invalidated_hint_does_not_end_the_inner_stream() {
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::data(&[b"ab", b"cde", b"f"])),
+            remaining: Some(2),
+        };
+
+        let exact = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the exact-length frame remains")
+            .expect("no error");
+        assert_eq!(exact.data_ref().map(Bytes::len), Some(2));
+        assert_eq!(body.size_hint().exact(), Some(0));
+        assert!(
+            !body.is_end_stream(),
+            "spending the declared byte count must not hide an overrun frame"
+        );
+
+        let overrun = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the overrun frame remains")
+            .expect("no error");
+        assert_eq!(overrun.data_ref().map(Bytes::len), Some(3));
+        assert_eq!(body.size_hint().exact(), None);
+        assert!(
+            !body.is_end_stream(),
+            "invalidating the hint must not hide a later frame either"
+        );
+
+        let after_invalidation = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the post-invalidation frame remains")
+            .expect("no error");
+        assert_eq!(after_invalidation.data_ref().map(Bytes::len), Some(1));
+    }
+
     /// N3: a `Pending` poll consumes no bytes and contradicts nothing, so it
     /// must leave the remaining count exactly where it was.
     ///
