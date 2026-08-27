@@ -1704,6 +1704,43 @@ mod tests {
         );
     }
 
+    /// Reaching the declared byte count says nothing about whether the inner
+    /// body is ready to yield its terminal trailers. `Pending` after exact
+    /// DATA must remain `Pending`; laundering it into EOF would make the next
+    /// frame unreachable even though the byte accounting looked complete.
+    #[test]
+    fn a_pending_poll_after_size_exhaustion_is_not_end_of_stream() {
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::new(vec![
+                Step::Data(b"ab"),
+                Step::PendingOnce,
+                Step::Trailers,
+            ])),
+            remaining: Some(2),
+        };
+
+        let Poll::Ready(Some(Ok(data))) = poll_once(&mut body) else {
+            panic!("the exact-length data frame must arrive first");
+        };
+        assert_eq!(data.data_ref().map(Bytes::len), Some(2));
+        assert_eq!(body.size_hint().exact(), Some(0));
+
+        assert!(
+            matches!(poll_once(&mut body), Poll::Pending),
+            "Pending after exact exhaustion is not clean EOF"
+        );
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(0),
+            "Pending consumes no bytes at the boundary"
+        );
+
+        let Poll::Ready(Some(Ok(trailers))) = poll_once(&mut body) else {
+            panic!("the trailers after Pending must remain reachable");
+        };
+        assert!(trailers.is_trailers(), "the final frame carries trailers");
+    }
+
     /// N4: an error frame must reach the caller as an error.
     ///
     /// Turning it into a clean `Ready(None)` converts a transport failure into

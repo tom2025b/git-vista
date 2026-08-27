@@ -10,3 +10,4 @@
 - 2026-08-27 codex — Test Pending liveness with a waker-capturing body, not `ScriptedBody`; the manual no-op fixture could not detect survivor S11 substituting its own inert context.
 - 2026-08-27 codex — Treat empty DATA as a first-class forwarded frame that consumes zero bytes; survivor S12 laundered it into EOF and hid later data because no `KnownSizeBody` fixture emitted one.
 - 2026-08-27 codex — Assert unknown rejoin hints before polling; survivor S13 defaulted absent `original_exact` to zero, a false framing claim that later frame reads happened to invalidate after the damage point.
+- 2026-08-27 codex — Exercise `Pending` after exact DATA with trailers still queued; survivor S14 converted that readiness state to EOF because the earlier Pending fixture ran only at a positive remainder.
