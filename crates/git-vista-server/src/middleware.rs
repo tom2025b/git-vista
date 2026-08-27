@@ -1762,7 +1762,45 @@ mod tests {
         assert!(
             matches!(std::pin::Pin::new(&mut body).frame().await, Some(Err(_))),
             "an error frame must surface as an error, never as clean \
-             end-of-stream — that would report a truncated body as complete"
+            end-of-stream — that would report a truncated body as complete"
+        );
+    }
+
+    /// Delivering every declared byte does not make a later transport error
+    /// optional. The size hint describes DATA only; an error queued after an
+    /// exact-length frame must still reach the caller with its identity intact
+    /// and must not perturb the zero remaining count.
+    #[tokio::test]
+    async fn an_error_after_exact_data_is_not_laundered_into_eof() {
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::new(vec![Step::Data(b"ab"), Step::Error])),
+            remaining: Some(2),
+        };
+
+        let data = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the exact-length frame remains")
+            .expect("the first frame is not an error")
+            .into_data()
+            .expect("the first frame is data");
+        assert_eq!(data, Bytes::from_static(b"ab"));
+        assert_eq!(body.size_hint().exact(), Some(0));
+
+        let error = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("an error after exact DATA is not clean EOF")
+            .expect_err("the second frame remains an error");
+        assert_eq!(
+            error.to_string(),
+            "scripted body failure",
+            "the wrapper must preserve the original transport error"
+        );
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(0),
+            "an error frame consumes no declared bytes"
         );
     }
 
