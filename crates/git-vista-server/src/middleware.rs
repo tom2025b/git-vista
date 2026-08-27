@@ -1180,12 +1180,24 @@ mod tests {
     /// adversarial pass: a wrapper that mishandles `Pending`, an error frame,
     /// or a frame arriving *after* some state transition cannot be caught by a
     /// body that never produces one.
+    #[derive(Debug)]
+    struct MarkerBodyError;
+
+    impl std::fmt::Display for MarkerBodyError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("marker body failure")
+        }
+    }
+
+    impl std::error::Error for MarkerBodyError {}
+
     enum Step {
         Data(&'static [u8]),
         /// Yields `Poll::Pending` exactly once, then continues to the next
         /// step. Consumes no bytes and supplies no evidence either way.
         PendingOnce,
         Error,
+        MarkerError,
         Trailers,
     }
 
@@ -1252,6 +1264,9 @@ mod tests {
                             Step::Error => Poll::Ready(Some(Err(axum::Error::new(
                                 std::io::Error::other("scripted body failure"),
                             )))),
+                            Step::MarkerError => {
+                                Poll::Ready(Some(Err(axum::Error::new(MarkerBodyError))))
+                            }
                             Step::Trailers => {
                                 let mut trailers = HeaderMap::new();
                                 trailers.insert("x-checksum", HeaderValue::from_static("ok"));
@@ -2000,6 +2015,37 @@ mod tests {
             body.size_hint().exact(),
             Some(0),
             "an error frame consumes no declared bytes"
+        );
+    }
+
+    /// Equal display text does not make two errors interchangeable. The
+    /// wrapper promises untouched frame delegation, including the concrete
+    /// source type callers may downcast for recovery or classification.
+    #[tokio::test]
+    async fn an_error_frame_preserves_its_underlying_type() {
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::new(vec![Step::MarkerError])),
+            remaining: Some(0),
+        };
+
+        let error = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the marker error is not clean EOF")
+            .expect_err("the frame remains an error");
+        assert_eq!(error.to_string(), "marker body failure");
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+        let mut marker_found = false;
+        while let Some(candidate) = current {
+            if candidate.downcast_ref::<MarkerBodyError>().is_some() {
+                marker_found = true;
+                break;
+            }
+            current = candidate.source();
+        }
+        assert!(
+            marker_found,
+            "the wrapper must preserve the concrete error in its source chain, not a text-only replacement"
         );
     }
 
