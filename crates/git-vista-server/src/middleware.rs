@@ -1375,8 +1375,47 @@ mod tests {
         assert_eq!(
             seen_frames, 3,
             "precondition: the fixture must really deliver three separate \
-             frames, or this test degrades to the endpoint check it replaced"
+            frames, or this test degrades to the endpoint check it replaced"
         );
+    }
+
+    /// An empty DATA frame is still a frame, not an end-of-stream marker, and
+    /// it consumes zero declared bytes. A wrapper that launders it into
+    /// `Ready(None)` hides every later frame; one that merely invalidates the
+    /// hint also invents evidence that the inner body never supplied.
+    #[tokio::test]
+    async fn an_empty_data_frame_is_forwarded_without_consuming_length() {
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::new(vec![
+                Step::Data(b""),
+                Step::Data(b"abc"),
+            ])),
+            remaining: Some(3),
+        };
+
+        let empty = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("an empty data frame is not EOF")
+            .expect("no error")
+            .into_data()
+            .expect("the first frame is data");
+        assert!(empty.is_empty(), "precondition: the first frame is empty");
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(3),
+            "zero bytes consumed must leave all 3 bytes promised"
+        );
+
+        let data = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("data after an empty frame remains reachable")
+            .expect("no error")
+            .into_data()
+            .expect("the second frame is data");
+        assert_eq!(data, Bytes::from_static(b"abc"));
+        assert_eq!(body.size_hint().exact(), Some(0));
     }
 
     /// The trailer invariant, which the production code asserts in a comment
