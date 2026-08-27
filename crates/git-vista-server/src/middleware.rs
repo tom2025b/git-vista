@@ -1619,9 +1619,15 @@ mod tests {
             .map(|value| value.to_str().expect("static trailer values are text"))
             .collect();
         assert_eq!(values, ["zero-data", "second-value"]);
-        assert!(
-            trailers.get("x-checksum").unwrap().is_sensitive(),
-            "delegation must preserve HeaderValue's non-byte sensitivity flag"
+        let sensitivities: Vec<_> = trailers
+            .get_all("x-checksum")
+            .iter()
+            .map(HeaderValue::is_sensitive)
+            .collect();
+        assert_eq!(
+            sensitivities,
+            [true, false],
+            "delegation must preserve each HeaderValue sensitivity flag in order"
         );
         assert_eq!(body.size_hint().exact(), Some(0));
     }
