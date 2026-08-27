@@ -1424,6 +1424,32 @@ mod tests {
         );
     }
 
+    /// Byte accounting must use the full platform frame length. A 64-KiB
+    /// frame sits exactly one past `u16::MAX`, so narrowing `usize` before the
+    /// subtraction would wrap its consumed length to zero.
+    #[tokio::test]
+    async fn a_large_data_frame_uses_its_full_length() {
+        let frame_len = u16::MAX as usize + 1;
+        let mut body = KnownSizeBody {
+            inner: Body::from(Bytes::from(vec![b'x'; frame_len])),
+            remaining: Some(frame_len as u64),
+        };
+
+        let data = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the large frame remains")
+            .expect("the large frame is not an error")
+            .into_data()
+            .expect("the frame carries data");
+        assert_eq!(data.len(), frame_len);
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(0),
+            "all 65,536 bytes must be subtracted without integer narrowing"
+        );
+    }
+
     /// An empty DATA frame is still a frame, not an end-of-stream marker, and
     /// it consumes zero declared bytes. A wrapper that launders it into
     /// `Ready(None)` hides every later frame; one that merely invalidates the
