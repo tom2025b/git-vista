@@ -1554,6 +1554,37 @@ mod tests {
         );
     }
 
+    /// A truthful exact hint describes bytes still to come. This fixture
+    /// starts with two promised bytes, yields its one-byte first frame, and
+    /// then leaves one byte pending forever, so partial consumption must move
+    /// the exact hint from two to one.
+    #[tokio::test]
+    async fn ready_once_then_never_ready_reports_one_remaining_byte_after_its_first_frame() {
+        let mut body = ReadyOnceThenNeverReady {
+            served_first: false,
+        };
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(2),
+            "before any frame is consumed, both promised bytes remain"
+        );
+
+        let first = body
+            .frame()
+            .await
+            .expect("the fixture's first frame is immediately ready")
+            .expect("the fixture is infallible")
+            .into_data()
+            .expect("the fixture's first frame carries data");
+        assert_eq!(first, Bytes::from_static(b"{"));
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(1),
+            "after the one-byte first frame is consumed, only one promised \
+             byte remains"
+        );
+    }
+
     /// #515 defect 1: `rejoin` must not silently downgrade a body with a known
     /// exact length to unknown length just because classifying it required
     /// splitting it into a bytes-in-hand prefix plus an unread remainder.
