@@ -1264,6 +1264,43 @@ mod tests {
         }
     }
 
+    /// A body that records the waker supplied by its caller before returning
+    /// `Pending`. Unlike [`ScriptedBody`], this exercises the liveness half of
+    /// the `poll_frame` contract: forwarding `Pending` is insufficient if the
+    /// wrapper substituted a waker that can never wake the real task.
+    struct WakerProbeBody {
+        captured: Arc<Mutex<Option<std::task::Waker>>>,
+    }
+
+    impl HttpBody for WakerProbeBody {
+        type Data = Bytes;
+        type Error = axum::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            *self
+                .get_mut()
+                .captured
+                .lock()
+                .expect("the waker probe lock is not poisoned") = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    struct CountingWake(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl std::task::Wake for CountingWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Poll a body once, by hand, with a no-op waker.
     ///
     /// Needed because `Pending` is unreachable through `.frame().await` — the
@@ -1589,6 +1626,42 @@ mod tests {
             body.size_hint().exact(),
             Some(0),
             "and the data frame that followed still counts normally"
+        );
+    }
+
+    /// The wrapper must pass the caller's actual context through to its inner
+    /// body. Returning the inner `Pending` while polling it with a no-op waker
+    /// looks correct in a hand-polled test, but the real future can then sleep
+    /// forever because its wakeup was registered against nobody.
+    #[test]
+    fn a_pending_inner_body_receives_the_callers_waker() {
+        let captured = Arc::new(Mutex::new(None));
+        let mut body = KnownSizeBody {
+            inner: Body::new(WakerProbeBody {
+                captured: Arc::clone(&captured),
+            }),
+            remaining: Some(3),
+        };
+        let wake_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let caller = std::task::Waker::from(Arc::new(CountingWake(Arc::clone(&wake_count))));
+        let mut cx = Context::from_waker(&caller);
+
+        assert!(matches!(Pin::new(&mut body).poll_frame(&mut cx), Poll::Pending));
+        let inner_waker = captured
+            .lock()
+            .expect("the waker probe lock is not poisoned")
+            .take()
+            .expect("the inner body must receive a waker before returning Pending");
+        assert!(
+            inner_waker.will_wake(&caller),
+            "KnownSizeBody must forward the caller's waker, not substitute an \
+             inert context"
+        );
+        inner_waker.wake_by_ref();
+        assert_eq!(
+            wake_count.load(Ordering::Relaxed),
+            1,
+            "waking through the inner body's captured waker must reach the caller"
         );
     }
 

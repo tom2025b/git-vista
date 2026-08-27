@@ -7,3 +7,4 @@
 - 2026-08-27 codex — Make trailer accounting discriminating at a nonzero remainder; a trailer observed only at `Some(0)` cannot distinguish no change from the wrong forced-zero implementation (survivor S8).
 - 2026-08-27 codex — Decouple inner EOF from exact-byte exhaustion in the delegation fixture; using a deliberately false nine-byte claim kills survivor S9's `inner.is_end_stream() && remaining == Some(0)` gate.
 - 2026-08-27 codex — Make the overrun fixture cross the boundary inside its first frame and assert every later frame/hint; landing on zero before overrunning let survivor S10 delay invalidation by one frame.
+- 2026-08-27 codex — Test Pending liveness with a waker-capturing body, not `ScriptedBody`; the manual no-op fixture could not detect survivor S11 substituting its own inert context.
