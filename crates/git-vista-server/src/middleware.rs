@@ -1707,15 +1707,27 @@ mod tests {
     /// asserted it, so the constant-`true` mutation passed every test.
     #[tokio::test]
     async fn a_known_size_body_with_bytes_left_is_not_end_of_stream() {
-        let body = KnownSizeBody {
-            inner: Body::new(ScriptedBody::data(&[b"abc"])),
-            remaining: Some(3),
+        let mut body = KnownSizeBody {
+            // One byte is the smallest nonzero boundary. A predicate that
+            // invents EOF only at `Some(1)` must be just as observable as a
+            // constant-true implementation.
+            inner: Body::new(ScriptedBody::data(&[b"x"])),
+            remaining: Some(1),
         };
         assert!(
             !body.is_end_stream(),
             "a body with bytes still to come must not report end-of-stream — \
              Hyper would suppress the payload entirely"
         );
+        let data = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the queued one-byte frame proves the lifecycle precondition")
+            .expect("the queued frame is not an error")
+            .into_data()
+            .expect("the queued frame is data");
+        assert_eq!(data, Bytes::from_static(b"x"));
+        assert_eq!(body.size_hint().exact(), Some(0));
     }
 
     /// N2, the same method in the other direction: the wrapper must DELEGATE
