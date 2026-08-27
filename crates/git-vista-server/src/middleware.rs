@@ -1284,7 +1284,9 @@ mod tests {
             }
             this.yielded = true;
             let mut trailers = HeaderMap::new();
-            trailers.append("x-checksum", HeaderValue::from_static("zero-data"));
+            let mut first = HeaderValue::from_static("zero-data");
+            first.set_sensitive(true);
+            trailers.append("x-checksum", first);
             trailers.append("x-checksum", HeaderValue::from_static("second-value"));
             Poll::Ready(Some(Ok(Frame::trailers(trailers))))
         }
@@ -1566,6 +1568,10 @@ mod tests {
             .map(|value| value.to_str().expect("static trailer values are text"))
             .collect();
         assert_eq!(values, ["zero-data", "second-value"]);
+        assert!(
+            trailers.get("x-checksum").unwrap().is_sensitive(),
+            "delegation must preserve HeaderValue's non-byte sensitivity flag"
+        );
         assert_eq!(body.size_hint().exact(), Some(0));
     }
 

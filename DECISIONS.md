@@ -24,3 +24,4 @@
 - 2026-08-27 codex — Assert lifecycle state on the exact-zero trailer fixture as well as polling it; survivor S25 derived `is_end_stream` from an inner byte hint and would let Hyper suppress pending trailers.
 - 2026-08-27 codex — Add a 65,536-byte single-frame boundary case; survivor S26 narrowed `usize` through `u16`, counted the whole frame as zero bytes, and evaded every tiny direct fixture.
 - 2026-08-27 codex — Put two values under one trailer name and assert both in order; survivor S27 rebuilt `HeaderMap` with `insert`, preserving the last visible value while collapsing the multimap.
+- 2026-08-27 codex — Mark a trailer value sensitive and assert the flag after delegation; survivor S28 rebuilt identical bytes but erased `HeaderValue`'s redaction/compression metadata.
