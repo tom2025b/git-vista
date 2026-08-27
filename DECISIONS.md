@@ -18,3 +18,5 @@
 - 2026-08-27T14:52:06-04:00 — Test defect 2 directly on `ReadyOnceThenNeverReady` before and after consuming its first frame, because the body contract concerns remaining bytes and a route-level header test never observes the fixture at that partial-consumption seam.
 - 2026-08-27T14:53:36-04:00 — Accept defect 2's exact test failure (`Some(2)` actual versus `Some(1)` expected after consuming `{`) as RED evidence, because it reproduces the stale-remaining-size defect without depending on response routing.
 - 2026-08-27T14:53:36-04:00 — Derive `ReadyOnceThenNeverReady::size_hint` solely from `served_first` (`2` before, `1` after), because the fixture has exactly one byte delivered and exactly one byte permanently pending.
+- 2026-08-27T14:54:29-04:00 — Keep defect 2's implementation to `if served_first { 1 } else { 2 }`, because it is the minimal state-derived remaining-byte claim and introduces no new fixture state.
+- 2026-08-27T14:54:29-04:00 — Accept the exact partial-consumption test's 1 passed and 0 failed result as GREEN evidence, because it observes both the initial promise and the remaining promise around a real frame poll.

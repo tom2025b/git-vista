@@ -1023,7 +1023,7 @@ mod tests {
         }
 
         fn size_hint(&self) -> SizeHint {
-            SizeHint::with_exact(2)
+            SizeHint::with_exact(if self.served_first { 1 } else { 2 })
         }
     }
 
