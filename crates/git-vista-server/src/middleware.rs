@@ -1518,34 +1518,42 @@ mod tests {
     /// hint also invents evidence that the inner body never supplied.
     #[tokio::test]
     async fn an_empty_data_frame_is_forwarded_without_consuming_length() {
-        let mut body = KnownSizeBody {
-            inner: Body::new(ScriptedBody::new(vec![Step::Data(b""), Step::Data(b"abc")])),
-            remaining: Some(3),
-        };
+        for (remaining, after_one_byte) in
+            [(Some(3), Some(2)), (Some(0), None), (None, None)]
+        {
+            let mut body = KnownSizeBody {
+                inner: Body::new(ScriptedBody::new(vec![Step::Data(b""), Step::Data(b"x")])),
+                remaining,
+            };
 
-        let empty = std::pin::Pin::new(&mut body)
-            .frame()
-            .await
-            .expect("an empty data frame is not EOF")
-            .expect("no error")
-            .into_data()
-            .expect("the first frame is data");
-        assert!(empty.is_empty(), "precondition: the first frame is empty");
-        assert_eq!(
-            body.size_hint().exact(),
-            Some(3),
-            "zero bytes consumed must leave all 3 bytes promised"
-        );
+            let empty = std::pin::Pin::new(&mut body)
+                .frame()
+                .await
+                .expect("an empty data frame is not EOF")
+                .expect("no error")
+                .into_data()
+                .expect("the first frame is data");
+            assert!(empty.is_empty(), "precondition: the first frame is empty");
+            assert_eq!(
+                body.size_hint().exact(),
+                remaining,
+                "zero bytes consumed must preserve accounting state {remaining:?}"
+            );
 
-        let data = std::pin::Pin::new(&mut body)
-            .frame()
-            .await
-            .expect("data after an empty frame remains reachable")
-            .expect("no error")
-            .into_data()
-            .expect("the second frame is data");
-        assert_eq!(data, Bytes::from_static(b"abc"));
-        assert_eq!(body.size_hint().exact(), Some(0));
+            let data = std::pin::Pin::new(&mut body)
+                .frame()
+                .await
+                .expect("data after an empty frame remains reachable")
+                .expect("no error")
+                .into_data()
+                .expect("the second frame is data");
+            assert_eq!(data, Bytes::from_static(b"x"));
+            assert_eq!(
+                body.size_hint().exact(),
+                after_one_byte,
+                "the later byte must still be counted in state {remaining:?}"
+            );
+        }
     }
 
     /// The trailer invariant, which the production code asserts in a comment
