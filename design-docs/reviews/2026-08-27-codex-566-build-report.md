@@ -10,7 +10,7 @@
 
 - `split_at_limit_when_ready` now counts yielded frames with the existing `MAX_SPLIT_FRAMES` budget. Exhaustion returns `ReadyOutcome::NotReady(rejoin(...))`, so an unverified success body is forwarded unlabeled rather than classified as overflow.
 - `ReadyOnceThenNeverReady::size_hint` now reports two bytes before its first frame is served and one byte afterward, matching the `http_body::Body` remaining-byte contract.
-- Added one direct regression for each defect: an externally bounded endless exact-zero body for the success reader, and a partial-consumption assertion around the fixture's first frame.
+- Added one direct regression for each defect: an externally bounded counted prefix followed by endless ready empty frames for the success reader, and a partial-consumption assertion around the fixture's first frame.
 
 I did not modify `MAX_SPLIT_FRAMES`, `split_at_limit`, or their doc comments. The reserved frame-budget classification decision and its comment remain untouched.
 
@@ -59,13 +59,15 @@ Two mechanism mutations, with the assertion unchanged:
 1. Restored the stale constant `SizeHint::with_exact(2)`: failed after consumption with actual `Some(2)`, expected `Some(1)`.
 2. Over-decremented the served state to zero: failed after consumption with actual `Some(0)`, expected `Some(1)`.
 
-After each mutation, the source and its saved green copy both had SHA-256 `afe332284443f855b3fa99358de07206f30c176d6d16b0f3bf3cd645f927bd46`. Rustfmt subsequently changed layout only; the final formatted source has SHA-256 `78318fbfa69f6e1c3e9c4b20f84f30b7a6ab2c22482a617af424ba122c231963`, and no mutant was retained.
+After each mutation, the source and its saved green copy both had SHA-256 `afe332284443f855b3fa99358de07206f30c176d6d16b0f3bf3cd645f927bd46`. Rustfmt subsequently changed layout only; the pre-review formatted source had SHA-256 `78318fbfa69f6e1c3e9c4b20f84f30b7a6ab2c22482a617af424ba122c231963`, and no mutant was retained.
 
-## Pre-merge acceptance
+## Final pre-merge acceptance
 
-- `buildlock cargo fmt --all -- --check` — passed after applying rustfmt to the new blocks.
+- `buildlock cargo fmt --all -- --check` — passed after applying rustfmt to the review-strengthened test.
 - `buildlock cargo clippy -p git-vista-server --all-targets -- -D warnings` — passed.
 - `buildlock cargo test -p git-vista-server middleware` — 34 passed, 0 failed, 956 filtered in the main-binary harness.
+
+These three commands were rerun after the independent-review repair. The final formatted middleware source has SHA-256 `023b2a167dda8dcf195bbd91a691d5871c674e6e224f631cc0df5a65b5db7681`.
 
 No workspace-wide or browser suite was run; both are outside this handoff's acceptance scope.
 
@@ -75,4 +77,4 @@ No workspace-wide or browser suite was run; both are outside this handoff's acce
 
 Both defects assigned to this build are resolved and evidenced on the current #566 branch. I do **not** consider #566 landable yet: after #570 lands, `origin/main` still must be merged into this branch and all three acceptance commands above rerun against the merged tree. The fresh independent skeptic review remains part of the landing workflow.
 
-**Signed:** codex · 2026-08-27T15:00:03-04:00
+**Signed:** codex · 2026-08-27T15:18:07-04:00

@@ -1986,8 +1986,7 @@ mod tests {
                 _cx: &mut Context<'_>,
             ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
                 let this = self.get_mut();
-                this.polls
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                this.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if !this.served_prefix {
                     this.served_prefix = true;
                     return Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"{")))));

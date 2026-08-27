@@ -35,3 +35,5 @@
 - 2026-08-27T15:16:14-04:00 — Mutation-test the review-strengthened boundary by changing `>= MAX_SPLIT_FRAMES` to `> MAX_SPLIT_FRAMES`; the exact test failed with 4097 polls versus 4096, proving the pre-poll boundary is pinned.
 - 2026-08-27T15:16:14-04:00 — Mutation-test the exhaustion reconstruction by returning raw `body`; the exact test failed with remaining hint `Some(0)` versus `Some(1)`, proving the consumed prefix must be rejoined on that branch.
 - 2026-08-27T15:16:14-04:00 — Restore the review-strengthened source after each mutation and accept matching SHA-256 `39f296a3039104915f1a6d22802c01331387a78ce3808bbdb8f70a3d41d2cb91`, then require a fresh exact green run before acceptance.
+- 2026-08-27T15:18:07-04:00 — Accept the repaired final source only after a fresh fmt check, clippy with `-D warnings`, and 34-of-34 middleware run all passed, because the independent-review repair changed the committed test surface.
+- 2026-08-27T15:18:07-04:00 — Keep merge-down BLOCKED after the final live recheck showed PR #570 still OPEN with no merge commit, because the corrected handoff forbids merging stale main even after all other work is complete.
