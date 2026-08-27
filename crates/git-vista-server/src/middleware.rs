@@ -1173,50 +1173,107 @@ mod tests {
         );
     }
 
-    /// A test body that yields a KNOWN NUMBER OF SEPARATE FRAMES, optionally
-    /// finishing with a trailer frame.
+    /// What a [`ScriptedBody`] does on its next poll.
+    ///
+    /// The first version of this fixture could only yield ready data and a
+    /// trailer. That shape is exactly why six mutations survived an
+    /// adversarial pass: a wrapper that mishandles `Pending`, an error frame,
+    /// or a frame arriving *after* some state transition cannot be caught by a
+    /// body that never produces one.
+    enum Step {
+        Data(&'static [u8]),
+        /// Yields `Poll::Pending` exactly once, then continues to the next
+        /// step. Consumes no bytes and supplies no evidence either way.
+        PendingOnce,
+        Error,
+        Trailers,
+    }
+
+    /// A test body that plays a scripted sequence of frame shapes.
     ///
     /// It exists because `Body::from("abcdefg")` is `Full<Bytes>` and yields
     /// **exactly one** frame — asserted, not assumed, by
     /// `body_from_a_str_yields_exactly_one_frame` below. A drain loop over a
     /// one-frame body runs once: first frame *is* last frame, so it can only
-    /// ever check two endpoints, and a wrapper that stayed at its original
-    /// total until the very last frame would satisfy it. The first version of
-    /// this test did exactly that while its comment claimed otherwise.
-    struct ChunkedBody {
-        frames: VecDeque<Bytes>,
-        trailer_at_end: bool,
+    /// check two endpoints.
+    struct ScriptedBody {
+        steps: VecDeque<Step>,
+        pending_fired: bool,
     }
 
-    impl ChunkedBody {
-        fn new(chunks: &[&'static [u8]], trailer_at_end: bool) -> Self {
+    impl ScriptedBody {
+        fn new(steps: Vec<Step>) -> Self {
             Self {
-                frames: chunks.iter().map(|c| Bytes::from_static(c)).collect(),
-                trailer_at_end,
+                steps: steps.into_iter().collect(),
+                pending_fired: false,
             }
+        }
+
+        fn data(chunks: &[&'static [u8]]) -> Self {
+            Self::new(chunks.iter().map(|c| Step::Data(c)).collect())
         }
     }
 
-    impl HttpBody for ChunkedBody {
+    impl HttpBody for ScriptedBody {
         type Data = Bytes;
-        type Error = std::convert::Infallible;
+        type Error = axum::Error;
 
         fn poll_frame(
             self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
         ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
             let this = self.get_mut();
-            match this.frames.pop_front() {
-                Some(data) => Poll::Ready(Some(Ok(Frame::data(data)))),
-                None if this.trailer_at_end => {
-                    this.trailer_at_end = false;
-                    let mut trailers = HeaderMap::new();
-                    trailers.insert("x-checksum", HeaderValue::from_static("ok"));
-                    Poll::Ready(Some(Ok(Frame::trailers(trailers))))
+            // Loops so that a spent `PendingOnce` ADVANCES to the next step
+            // rather than ending the stream. Getting this wrong made the very
+            // first run of the Pending test fail on its own continuation — the
+            // fixture, not the code under test.
+            loop {
+                match this.steps.front() {
+                    None => return Poll::Ready(None),
+                    Some(Step::PendingOnce) if !this.pending_fired => {
+                        this.pending_fired = true;
+                        // Deliberately does NOT register the waker: every test
+                        // that drives this path polls it by hand.
+                        return Poll::Pending;
+                    }
+                    Some(Step::PendingOnce) => {
+                        // Already yielded its one Pending — drop it and carry
+                        // on to whatever it was standing in front of.
+                        this.steps.pop_front();
+                        this.pending_fired = false;
+                        continue;
+                    }
+                    Some(_) => {
+                        return match this.steps.pop_front().expect("checked non-empty") {
+                            Step::Data(d) => {
+                                Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(d)))))
+                            }
+                            Step::PendingOnce => unreachable!("handled above"),
+                            Step::Error => Poll::Ready(Some(Err(axum::Error::new(
+                                std::io::Error::other("scripted body failure"),
+                            )))),
+                            Step::Trailers => {
+                                let mut trailers = HeaderMap::new();
+                                trailers.insert("x-checksum", HeaderValue::from_static("ok"));
+                                Poll::Ready(Some(Ok(Frame::trailers(trailers))))
+                            }
+                        };
+                    }
                 }
-                None => Poll::Ready(None),
             }
         }
+    }
+
+    /// Poll a body once, by hand, with a no-op waker.
+    ///
+    /// Needed because `Pending` is unreachable through `.frame().await` — the
+    /// await simply suspends, and the test can never observe the state the
+    /// wrapper is in at that moment. Mutation N3 (clearing the size hint on a
+    /// single `Pending`) survived precisely because nothing could look here.
+    fn poll_once(body: &mut KnownSizeBody) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        Pin::new(body).poll_frame(&mut cx)
     }
 
     /// The precondition the drain test depends on, asserted rather than
@@ -1234,7 +1291,7 @@ mod tests {
         assert_eq!(
             frames, 1,
             "Body::from(&str) is Full<Bytes> and yields one frame — the reason \
-             `ChunkedBody` exists"
+             `ScriptedBody` exists"
         );
     }
 
@@ -1255,7 +1312,7 @@ mod tests {
     #[tokio::test]
     async fn a_known_size_body_reports_what_remains_not_what_it_started_with() {
         let mut body = KnownSizeBody {
-            inner: Body::new(ChunkedBody::new(&[b"abc", b"de", b"fg"], false)),
+            inner: Body::new(ScriptedBody::data(&[b"abc", b"de", b"fg"])),
             remaining: Some(7),
         };
 
@@ -1295,7 +1352,7 @@ mod tests {
     #[tokio::test]
     async fn a_trailer_frame_does_not_decrement_the_remaining_count() {
         let mut body = KnownSizeBody {
-            inner: Body::new(ChunkedBody::new(&[b"abcd"], true)),
+            inner: Body::new(ScriptedBody::new(vec![Step::Data(b"abcd"), Step::Trailers])),
             remaining: Some(4),
         };
 
@@ -1336,7 +1393,12 @@ mod tests {
     #[tokio::test]
     async fn a_body_that_overruns_its_declared_length_stops_claiming_one() {
         let mut body = KnownSizeBody {
-            inner: Body::new(ChunkedBody::new(&[b"ab", b"cde"], false)),
+            // THREE chunks, not two. The second frame is what drives
+            // `remaining` to `None`; a two-frame fixture ends on exactly that
+            // transition and can never ask what happens AFTER it. Mutations
+            // N5 (stop polling once unknown) and N6 (let unknown become exact
+            // again) both survived for want of this third frame.
+            inner: Body::new(ScriptedBody::data(&[b"ab", b"cde", b"f"])),
             remaining: Some(2),
         };
         let mut delivered = 0usize;
@@ -1345,7 +1407,12 @@ mod tests {
                 delivered += data.len();
             }
         }
-        assert_eq!(delivered, 5, "precondition: the body really does overrun");
+        assert_eq!(
+            delivered, 6,
+            "an overrun invalidates the HINT, never the body: every later byte \
+             must still be delivered. A wrapper that stops polling once it can \
+             no longer count is silently truncating the response"
+        );
 
         let hint = body.size_hint();
         assert_eq!(
@@ -1356,7 +1423,117 @@ mod tests {
              exists to avoid"
         );
         assert_eq!(hint.lower(), 0, "unknown means no lower bound is promised");
-        assert_eq!(hint.upper(), None, "unknown means no upper bound either");
+        assert_eq!(
+            hint.upper(),
+            None,
+            "unknown must STAY unknown — a later data frame must not restore a \
+             confident exact claim the body already disproved"
+        );
+    }
+
+    /// N1, and the worst of them: `is_end_stream` is not cosmetic metadata.
+    ///
+    /// Hyper checks it before retaining a response body — its HTTP/1
+    /// dispatcher drops the body receiver when it returns true, and its HTTP/2
+    /// server sends an end-stream response instead of building body state. A
+    /// wrapper that wrongly answers `true` therefore makes a non-empty
+    /// response go out **bodyless**: silent data loss, strictly worse than the
+    /// wrong size hint this type was written to fix.
+    ///
+    /// `KnownSizeBody` delegates the method correctly and always has. Nothing
+    /// asserted it, so the constant-`true` mutation passed every test.
+    #[tokio::test]
+    async fn a_known_size_body_with_bytes_left_is_not_end_of_stream() {
+        let body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::data(&[b"abc"])),
+            remaining: Some(3),
+        };
+        assert!(
+            !body.is_end_stream(),
+            "a body with bytes still to come must not report end-of-stream — \
+             Hyper would suppress the payload entirely"
+        );
+    }
+
+    /// N2, the same method in the other direction: the wrapper must DELEGATE
+    /// this answer, never invent one. A constant `false` is also wrong, and
+    /// also passed everything.
+    #[tokio::test]
+    async fn a_known_size_body_delegates_end_of_stream_to_the_inner_body() {
+        let mut body = KnownSizeBody {
+            inner: Body::from("x"),
+            remaining: Some(1),
+        };
+        assert!(
+            !body.is_end_stream(),
+            "precondition: a Full<Bytes> with its one frame still pending is \
+             not yet at end of stream"
+        );
+        while std::pin::Pin::new(&mut body).frame().await.is_some() {}
+        assert!(
+            body.is_end_stream(),
+            "once the inner body is drained the wrapper must say so — the \
+             answer belongs to `inner`, and this type only ever forwards it"
+        );
+    }
+
+    /// N3: a `Pending` poll consumes no bytes and contradicts nothing, so it
+    /// must leave the remaining count exactly where it was.
+    ///
+    /// Unreachable through `.frame().await`, which simply suspends — so this
+    /// polls by hand with a no-op waker. That blind spot is the entire reason
+    /// the mutation survived.
+    #[tokio::test]
+    async fn a_pending_poll_does_not_disturb_the_remaining_count() {
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::new(vec![
+                Step::PendingOnce,
+                Step::Data(b"abc"),
+            ])),
+            remaining: Some(3),
+        };
+        assert!(
+            matches!(poll_once(&mut body), Poll::Pending),
+            "precondition: the fixture must actually return Pending here, or \
+             this test proves nothing about Pending"
+        );
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(3),
+            "Pending consumed no bytes, so all 3 must still be promised"
+        );
+
+        assert!(matches!(poll_once(&mut body), Poll::Ready(Some(Ok(_)))));
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(0),
+            "and the data frame that followed still counts normally"
+        );
+    }
+
+    /// N4: an error frame must reach the caller as an error.
+    ///
+    /// Turning it into a clean `Ready(None)` converts a transport failure into
+    /// a silent truncation — the response looks complete and is not. An
+    /// existing test proves the middleware preserves errors generally, but its
+    /// fixture has no exact size, so `rejoin` never wraps it in
+    /// `KnownSizeBody` and this seam went unexercised.
+    #[tokio::test]
+    async fn an_error_frame_is_not_laundered_into_a_clean_end_of_stream() {
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::new(vec![Step::Data(b"ab"), Step::Error])),
+            remaining: Some(9),
+        };
+        let first = std::pin::Pin::new(&mut body).frame().await;
+        assert!(
+            matches!(first, Some(Ok(_))),
+            "precondition: data comes first"
+        );
+        assert!(
+            matches!(std::pin::Pin::new(&mut body).frame().await, Some(Err(_))),
+            "an error frame must surface as an error, never as clean \
+             end-of-stream — that would report a truncated body as complete"
+        );
     }
 
     /// The opposite direction, which the first version of this fix left
@@ -1373,7 +1550,7 @@ mod tests {
     #[tokio::test]
     async fn an_underrunning_body_is_recorded_as_it_actually_behaves() {
         let mut body = KnownSizeBody {
-            inner: Body::new(ChunkedBody::new(&[b"ab"], false)),
+            inner: Body::new(ScriptedBody::data(&[b"ab"])),
             remaining: Some(9),
         };
         let mut delivered = 0usize;
@@ -1437,6 +1614,13 @@ mod tests {
             Some(expected_total),
             "the rejoined body must still report the original body's exact \
              length rather than acquiring StreamBody's unknown-length default"
+        );
+        // N1 at the real seam: Hyper consults this before deciding whether the
+        // response has a body at all.
+        assert!(
+            !resp.body().is_end_stream(),
+            "a non-empty rejoined body must not claim end-of-stream — Hyper \
+             would send the response bodyless"
         );
         // The size-hint fix must not have disturbed the bytes it was already
         // proven (above) to deliver whole.
