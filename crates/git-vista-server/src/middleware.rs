@@ -503,11 +503,7 @@ async fn split_at_limit_when_ready(
     let mut frames_read: usize = 0;
     loop {
         if frames_read >= MAX_SPLIT_FRAMES {
-            return ReadyOutcome::NotReady(rejoin(
-                Bytes::from(head),
-                Some(body),
-                original_exact,
-            ));
+            return ReadyOutcome::NotReady(rejoin(Bytes::from(head), Some(body), original_exact));
         }
         let Ok(polled) = tokio::time::timeout(Duration::ZERO, body.frame()).await else {
             return ReadyOutcome::NotReady(rejoin(Bytes::from(head), Some(body), original_exact));
@@ -2012,12 +2008,10 @@ mod tests {
             let _ = tx.send(outcome);
         });
 
-        let outcome = rx
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect(
-                "split_at_limit_when_ready must give up once its frame budget \
+        let outcome = rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
+            "split_at_limit_when_ready must give up once its frame budget \
                  is exhausted instead of spinning forever on ready empty frames",
-            );
+        );
         let forwarded = match outcome {
             ReadyOutcome::NotReady(body) => body,
             ReadyOutcome::Ready(_, _) => panic!(

@@ -24,3 +24,8 @@
 - 2026-08-27T14:56:35-04:00 — Mutation 2 for defect 2 changed the post-service remainder from `1` to `0`; the same test failed with actual `Some(0)` versus expected `Some(1)`, a distinct failure proving it rejects over-decrement as well as staleness.
 - 2026-08-27T14:56:35-04:00 — Restore defect 2 from the pre-mutation copy after each run and accept SHA-256 `afe332284443f855b3fa99358de07206f30c176d6d16b0f3bf3cd645f927bd46` on both source and backup as byte-identical restoration evidence.
 - 2026-08-27T14:56:35-04:00 — Run only the handoff's three acceptance commands before checking #570, because the browser and workspace-wide suites are explicitly outside this task.
+- 2026-08-27T15:00:03-04:00 — Apply rustfmt after the first format check reported layout-only differences, then require a fresh clean format check before clippy and tests, because acceptance is based on the final formatted source.
+- 2026-08-27T15:00:03-04:00 — Accept pre-merge acceptance only after fmt returned 0, clippy returned 0 under `-D warnings`, and the intended middleware harness reported 34 passed and 0 failed.
+- 2026-08-27T15:00:03-04:00 — Mark merge-down BLOCKED and do not fetch or merge `main`, because live PR #570 remains OPEN with no merge commit and Tom explicitly forbade merging stale main.
+- 2026-08-27T15:00:03-04:00 — Report #566 as not yet landable despite both local defects being resolved, because the required post-#570 merge-down and acceptance rerun cannot yet be established.
+- 2026-08-27T15:01:59-04:00 — Force-add the handoff-mandated build report under ignored `design-docs/`, because the repository ignore rule would otherwise silently omit the required deliverable from the branch.
