@@ -2035,37 +2035,46 @@ mod tests {
     /// forever because its wakeup was registered against nobody.
     #[test]
     fn a_pending_inner_body_receives_the_callers_waker() {
-        let captured = Arc::new(Mutex::new(None));
-        let mut body = KnownSizeBody {
-            inner: Body::new(WakerProbeBody {
-                captured: Arc::clone(&captured),
-            }),
-            remaining: Some(3),
-        };
-        let wake_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let caller = std::task::Waker::from(Arc::new(CountingWake(Arc::clone(&wake_count))));
-        let mut cx = Context::from_waker(&caller);
+        for remaining in [Some(3), Some(0), None] {
+            let captured = Arc::new(Mutex::new(None));
+            let mut body = KnownSizeBody {
+                inner: Body::new(WakerProbeBody {
+                    captured: Arc::clone(&captured),
+                }),
+                remaining,
+            };
+            let wake_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let caller =
+                std::task::Waker::from(Arc::new(CountingWake(Arc::clone(&wake_count))));
+            let mut cx = Context::from_waker(&caller);
 
-        assert!(matches!(
-            Pin::new(&mut body).poll_frame(&mut cx),
-            Poll::Pending
-        ));
-        let inner_waker = captured
-            .lock()
-            .expect("the waker probe lock is not poisoned")
-            .take()
-            .expect("the inner body must receive a waker before returning Pending");
-        assert!(
-            inner_waker.will_wake(&caller),
-            "KnownSizeBody must forward the caller's waker, not substitute an \
-             inert context"
-        );
-        inner_waker.wake_by_ref();
-        assert_eq!(
-            wake_count.load(Ordering::Relaxed),
-            1,
-            "waking through the inner body's captured waker must reach the caller"
-        );
+            assert!(matches!(
+                Pin::new(&mut body).poll_frame(&mut cx),
+                Poll::Pending
+            ));
+            assert_eq!(
+                body.size_hint().exact(),
+                remaining,
+                "Pending must preserve the accounting state under test"
+            );
+            let inner_waker = captured
+                .lock()
+                .expect("the waker probe lock is not poisoned")
+                .take()
+                .expect("the inner body must receive a waker before returning Pending");
+            assert!(
+                inner_waker.will_wake(&caller),
+                "KnownSizeBody must forward the caller's waker in state \
+                 {remaining:?}, not substitute an inert context"
+            );
+            inner_waker.wake_by_ref();
+            assert_eq!(
+                wake_count.load(Ordering::Relaxed),
+                1,
+                "waking through the inner body's captured waker in state \
+                 {remaining:?} must reach the caller"
+            );
+        }
     }
 
     /// Reaching the declared byte count says nothing about whether the inner
