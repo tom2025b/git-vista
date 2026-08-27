@@ -20,3 +20,7 @@
 - 2026-08-27T14:53:36-04:00 — Derive `ReadyOnceThenNeverReady::size_hint` solely from `served_first` (`2` before, `1` after), because the fixture has exactly one byte delivered and exactly one byte permanently pending.
 - 2026-08-27T14:54:29-04:00 — Keep defect 2's implementation to `if served_first { 1 } else { 2 }`, because it is the minimal state-derived remaining-byte claim and introduces no new fixture state.
 - 2026-08-27T14:54:29-04:00 — Accept the exact partial-consumption test's 1 passed and 0 failed result as GREEN evidence, because it observes both the initial promise and the remaining promise around a real frame poll.
+- 2026-08-27T14:56:35-04:00 — Mutation 1 for defect 2 restored the stale constant total `2`; the exact test failed after consumption with actual `Some(2)` versus expected `Some(1)`, proving it catches the shipped defect.
+- 2026-08-27T14:56:35-04:00 — Mutation 2 for defect 2 changed the post-service remainder from `1` to `0`; the same test failed with actual `Some(0)` versus expected `Some(1)`, a distinct failure proving it rejects over-decrement as well as staleness.
+- 2026-08-27T14:56:35-04:00 — Restore defect 2 from the pre-mutation copy after each run and accept SHA-256 `afe332284443f855b3fa99358de07206f30c176d6d16b0f3bf3cd645f927bd46` on both source and backup as byte-identical restoration evidence.
+- 2026-08-27T14:56:35-04:00 — Run only the handoff's three acceptance commands before checking #570, because the browser and workspace-wide suites are explicitly outside this task.
