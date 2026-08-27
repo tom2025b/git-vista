@@ -1277,6 +1277,10 @@ mod tests {
                 }
             }
         }
+
+        fn is_end_stream(&self) -> bool {
+            self.steps.is_empty()
+        }
     }
 
     /// A legal trailer-only body: zero DATA bytes remain, but one metadata
@@ -1740,6 +1744,14 @@ mod tests {
         assert_eq!(hint.exact(), None, "EOF cannot restore exactness");
         assert_eq!(hint.lower(), 0);
         assert_eq!(hint.upper(), None);
+        assert!(
+            body.inner.is_end_stream(),
+            "precondition: the overrun inner body is now ended"
+        );
+        assert!(
+            body.is_end_stream(),
+            "unknown byte accounting cannot suppress the inner terminal state"
+        );
     }
 
     /// Invalidating the byte-count hint does not invalidate non-DATA frame
@@ -1844,6 +1856,33 @@ mod tests {
             body.is_end_stream(),
             "once the inner body is drained the wrapper must say so — the \
              answer belongs to `inner`, and this type only ever forwards it"
+        );
+
+        let mut unknown_hint_body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::data(&[b"x"])),
+            remaining: Some(1),
+        };
+        assert_eq!(
+            unknown_hint_body.inner.size_hint().exact(),
+            None,
+            "precondition: ScriptedBody keeps the default unknown byte hint"
+        );
+        let data = std::pin::Pin::new(&mut unknown_hint_body)
+            .frame()
+            .await
+            .expect("the unknown-hint body yields its frame")
+            .expect("the frame is not an error")
+            .into_data()
+            .expect("the frame is data");
+        assert_eq!(data, Bytes::from_static(b"x"));
+        assert_eq!(unknown_hint_body.size_hint().exact(), Some(0));
+        assert!(
+            unknown_hint_body.inner.is_end_stream(),
+            "precondition: the scripted inner lifecycle is now ended"
+        );
+        assert!(
+            unknown_hint_body.is_end_stream(),
+            "delegation cannot be gated on either wrapper accounting or the inner byte hint"
         );
     }
 
