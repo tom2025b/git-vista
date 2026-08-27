@@ -1375,7 +1375,23 @@ mod tests {
         assert_eq!(
             seen_frames, 3,
             "precondition: the fixture must really deliver three separate \
-            frames, or this test degrades to the endpoint check it replaced"
+             frames, or this test degrades to the endpoint check it replaced"
+        );
+        let hint = body.size_hint();
+        assert_eq!(
+            hint.exact(),
+            Some(0),
+            "observing EOF must not erase a correct exact-zero remainder"
+        );
+        assert_eq!(hint.lower(), 0);
+        assert_eq!(hint.upper(), Some(0));
+        assert!(
+            matches!(poll_once(&mut body), Poll::Ready(None)),
+            "after the first EOF, every later poll must keep returning Ready(None)"
+        );
+        assert!(
+            matches!(poll_once(&mut body), Poll::Ready(None)),
+            "EOF remains fused across repeated polls"
         );
     }
 

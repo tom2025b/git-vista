@@ -15,3 +15,4 @@
 - 2026-08-27 codex — Exercise trailers after a direct overrun and pin `x-checksum`; survivor S16 dropped trailers only after `remaining` became unknown, a state no trailer fixture reached.
 - 2026-08-27 codex — Cover `rejoin`'s empty-head/rest-present arm with exact-zero DATA plus trailers; survivor S17 returned the unknown stream early and skipped restoration of `original_exact`.
 - 2026-08-27 codex — Pin data shape, error identity, and nonzero remaining count around the underrun error fixture; survivor S18 forwarded `Err` but silently rewrote the byte hint to zero.
+- 2026-08-27 codex — After exact drain, assert `Some(0)` survives EOF and poll EOF repeatedly; survivor S19 overloaded unknown as an ended marker and no prior test observed post-EOF state.
