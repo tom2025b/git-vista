@@ -1668,6 +1668,45 @@ mod tests {
         );
     }
 
+    /// Invalidating a false exact-size claim is permanent. Even if the inner
+    /// body later reports exact zero because its own frame was drained, that
+    /// hint cannot erase the wrapper's direct evidence that the declaration
+    /// was wrong; reaching EOF cannot convert unknown back to exact zero.
+    #[tokio::test]
+    async fn an_invalidated_hint_stays_unknown_through_inner_eof() {
+        let mut body = KnownSizeBody {
+            inner: Body::from("abc"),
+            remaining: Some(2),
+        };
+
+        let data = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the boundary-crossing frame remains")
+            .expect("the frame is not an error")
+            .into_data()
+            .expect("the frame is data");
+        assert_eq!(data, Bytes::from_static(b"abc"));
+        assert_eq!(
+            body.inner.size_hint().exact(),
+            Some(0),
+            "precondition: the drained Full body now advertises exact zero"
+        );
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), None, "the false claim stays invalidated");
+        assert_eq!(hint.lower(), 0);
+        assert_eq!(hint.upper(), None);
+
+        assert!(
+            std::pin::Pin::new(&mut body).frame().await.is_none(),
+            "the inner body reaches explicit EOF"
+        );
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), None, "EOF cannot restore exactness");
+        assert_eq!(hint.lower(), 0);
+        assert_eq!(hint.upper(), None);
+    }
+
     /// Invalidating the byte-count hint does not invalidate non-DATA frame
     /// semantics. A trailer after an overrun remains observable with its exact
     /// metadata, and the hint remains unknown before and after it.
