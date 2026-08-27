@@ -1941,6 +1941,24 @@ mod tests {
         );
     }
 
+    /// A fully buffered body has no unread remainder, but passing through
+    /// `rejoin` must still preserve the exact length it advertised before the
+    /// split. Routing this arm through a frame-level stream preserves bytes
+    /// while silently downgrading the hint to unknown.
+    #[tokio::test]
+    async fn rejoin_preserves_a_known_exact_size_without_a_remainder() {
+        let body = rejoin(Bytes::from_static(b"abc"), None, Some(3));
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), Some(3));
+        assert_eq!(hint.lower(), 3);
+        assert_eq!(hint.upper(), Some(3));
+
+        let bytes = axum::body::to_bytes(body, 4)
+            .await
+            .expect("the buffered body remains readable");
+        assert_eq!(bytes, Bytes::from_static(b"abc"));
+    }
+
     /// #515 defect 1: `rejoin` must not silently downgrade a body with a known
     /// exact length to unknown length just because classifying it required
     /// splitting it into a bytes-in-hand prefix plus an unread remainder.
