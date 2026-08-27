@@ -29,3 +29,4 @@
 - 2026-08-27 codex — Tentatively close the novel phase after three re-audits produced no new natural family; an independent review remains a required check on that verdict.
 - 2026-08-27 codex — Reproduce N1–N6 independently on the then-current 51-test source: all are caught at 46/5, 50/1, 48/3, 48/3, 48/3, and 50/1 respectively.
 - 2026-08-27 codex — Reopen the campaign after independent review identified the unobserved post-overrun error state; S30 (`remaining == None` plus `Err` becomes EOF) survived 51/0 and is caught 51/1 by `an_error_after_an_overrun_is_not_laundered_into_eof`.
+- 2026-08-27 codex — Test the symmetric readiness seam rather than assume S30 closed it; S31 (`remaining == None` plus `Pending` becomes EOF) survived 52/0 and is caught 52/1 by `a_pending_poll_after_an_overrun_preserves_later_trailers`.

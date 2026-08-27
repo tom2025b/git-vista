@@ -1908,6 +1908,51 @@ mod tests {
         assert!(trailers.is_trailers(), "the final frame carries trailers");
     }
 
+    /// Backpressure remains backpressure after an overrun invalidates the
+    /// exact-size hint. Unknown byte accounting does not end the inner body,
+    /// and a `Pending` poll must not hide a trailer that arrives next.
+    #[test]
+    fn a_pending_poll_after_an_overrun_preserves_later_trailers() {
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::new(vec![
+                Step::Data(b"abc"),
+                Step::PendingOnce,
+                Step::Trailers,
+            ])),
+            remaining: Some(2),
+        };
+
+        let Poll::Ready(Some(Ok(data))) = poll_once(&mut body) else {
+            panic!("the boundary-crossing frame must arrive first");
+        };
+        assert_eq!(data.data_ref().map(Bytes::len), Some(3));
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), None, "the overrun invalidates exactness");
+        assert_eq!(hint.lower(), 0);
+        assert_eq!(hint.upper(), None);
+
+        assert!(
+            matches!(poll_once(&mut body), Poll::Pending),
+            "Pending after an overrun is not clean EOF"
+        );
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), None, "Pending cannot restore exactness");
+        assert_eq!(hint.lower(), 0);
+        assert_eq!(hint.upper(), None);
+
+        let Poll::Ready(Some(Ok(trailers))) = poll_once(&mut body) else {
+            panic!("trailers after post-overrun Pending remain reachable");
+        };
+        let trailers = trailers
+            .into_trailers()
+            .expect("the final frame carries trailers");
+        assert_eq!(
+            trailers.get("x-checksum"),
+            Some(&HeaderValue::from_static("ok"))
+        );
+        assert_eq!(body.size_hint().exact(), None);
+    }
+
     /// Consecutive `Pending` polls are ordinary asynchronous backpressure, not
     /// evidence that the stream ended. Each consumes zero bytes, and later
     /// data must remain reachable no matter how many times readiness pauses.
