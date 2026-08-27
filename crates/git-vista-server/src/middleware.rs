@@ -1442,6 +1442,41 @@ mod tests {
         );
     }
 
+    /// A one-byte remainder reached by subtraction is still an exact claim,
+    /// not an accounting failure. Construction-time `Some(1)` coverage cannot
+    /// detect an off-by-one transition that discards this state only after a
+    /// frame has been consumed.
+    #[tokio::test]
+    async fn a_data_frame_can_leave_exactly_one_byte_remaining() {
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::data(&[b"abc", b"x"])),
+            remaining: Some(4),
+        };
+
+        let first = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the three-byte frame remains")
+            .expect("the frame is not an error")
+            .into_data()
+            .expect("the frame is data");
+        assert_eq!(first, Bytes::from_static(b"abc"));
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), Some(1));
+        assert_eq!(hint.lower(), 1);
+        assert_eq!(hint.upper(), Some(1));
+
+        let last = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the final byte remains")
+            .expect("the frame is not an error")
+            .into_data()
+            .expect("the frame is data");
+        assert_eq!(last, Bytes::from_static(b"x"));
+        assert_eq!(body.size_hint().exact(), Some(0));
+    }
+
     /// Byte accounting must use the full platform frame length. A 64-KiB
     /// frame sits exactly one past `u16::MAX`, so narrowing `usize` before the
     /// subtraction would wrap its consumed length to zero.
