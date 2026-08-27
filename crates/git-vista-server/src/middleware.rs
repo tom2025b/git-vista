@@ -2021,22 +2021,24 @@ mod tests {
     /// bytes with a stale, false `original_exact` value.
     #[tokio::test]
     async fn rejoin_uses_observed_length_when_no_remainder_exists() {
-        let mut body = rejoin(Bytes::from_static(b"ab"), None, Some(9));
-        assert_eq!(
-            body.size_hint().exact(),
-            Some(2),
-            "the fully observed body is two bytes, regardless of its old claim"
-        );
+        for claimed in [0, 9] {
+            let mut body = rejoin(Bytes::from_static(b"ab"), None, Some(claimed));
+            assert_eq!(
+                body.size_hint().exact(),
+                Some(2),
+                "the fully observed body is two bytes, not the stale claim {claimed}"
+            );
 
-        let data = std::pin::Pin::new(&mut body)
-            .frame()
-            .await
-            .expect("the buffered frame remains")
-            .expect("the buffered frame is not an error")
-            .into_data()
-            .expect("the buffered frame is data");
-        assert_eq!(data, Bytes::from_static(b"ab"));
-        assert_eq!(body.size_hint().exact(), Some(0));
+            let data = std::pin::Pin::new(&mut body)
+                .frame()
+                .await
+                .expect("the buffered frame remains")
+                .expect("the buffered frame is not an error")
+                .into_data()
+                .expect("the buffered frame is data");
+            assert_eq!(data, Bytes::from_static(b"ab"));
+            assert_eq!(body.size_hint().exact(), Some(0));
+        }
     }
 
     /// #515 defect 1: `rejoin` must not silently downgrade a body with a known
