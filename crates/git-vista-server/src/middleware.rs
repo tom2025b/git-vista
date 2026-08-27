@@ -1475,10 +1475,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_data_frame_is_forwarded_without_consuming_length() {
         let mut body = KnownSizeBody {
-            inner: Body::new(ScriptedBody::new(vec![
-                Step::Data(b""),
-                Step::Data(b"abc"),
-            ])),
+            inner: Body::new(ScriptedBody::new(vec![Step::Data(b""), Step::Data(b"abc")])),
             remaining: Some(3),
         };
 
@@ -1665,10 +1662,7 @@ mod tests {
     #[tokio::test]
     async fn trailers_after_an_overrun_are_preserved() {
         let mut body = KnownSizeBody {
-            inner: Body::new(ScriptedBody::new(vec![
-                Step::Data(b"abc"),
-                Step::Trailers,
-            ])),
+            inner: Body::new(ScriptedBody::new(vec![Step::Data(b"abc"), Step::Trailers])),
             remaining: Some(2),
         };
 
@@ -1855,7 +1849,10 @@ mod tests {
         let caller = std::task::Waker::from(Arc::new(CountingWake(Arc::clone(&wake_count))));
         let mut cx = Context::from_waker(&caller);
 
-        assert!(matches!(Pin::new(&mut body).poll_frame(&mut cx), Poll::Pending));
+        assert!(matches!(
+            Pin::new(&mut body).poll_frame(&mut cx),
+            Poll::Pending
+        ));
         let inner_waker = captured
             .lock()
             .expect("the waker probe lock is not poisoned")
@@ -1978,6 +1975,42 @@ mod tests {
             Some(7),
             "an error frame consumes no bytes and must not rewrite the hint"
         );
+    }
+
+    /// Once a DATA overrun invalidates the exact-size hint, the wrapper must
+    /// still delegate the next transport error. `remaining == None` means
+    /// only that byte accounting became unknown; treating it as a terminal
+    /// stream state would silently turn this error into a successful EOF.
+    #[tokio::test]
+    async fn an_error_after_an_overrun_is_not_laundered_into_eof() {
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::new(vec![Step::Data(b"abc"), Step::Error])),
+            remaining: Some(2),
+        };
+
+        let data = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the boundary-crossing frame remains")
+            .expect("the first frame is not an error")
+            .into_data()
+            .expect("the first frame is data");
+        assert_eq!(data, Bytes::from_static(b"abc"));
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), None, "the overrun invalidates exactness");
+        assert_eq!(hint.lower(), 0);
+        assert_eq!(hint.upper(), None);
+
+        let error = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("an error after an overrun is not clean EOF")
+            .expect_err("the second frame remains an error");
+        assert_eq!(error.to_string(), "scripted body failure");
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), None, "an error cannot restore exactness");
+        assert_eq!(hint.lower(), 0);
+        assert_eq!(hint.upper(), None);
     }
 
     /// Delivering every declared byte does not make a later transport error

@@ -26,3 +26,6 @@
 - 2026-08-27 codex — Put two values under one trailer name and assert both in order; survivor S27 rebuilt `HeaderMap` with `insert`, preserving the last visible value while collapsing the multimap.
 - 2026-08-27 codex — Mark a trailer value sensitive and assert the flag after delegation; survivor S28 rebuilt identical bytes but erased `HeaderValue`'s redaction/compression metadata.
 - 2026-08-27 codex — Use a marker error and walk its source chain (rather than require a top-level downcast, because `axum::Body` legitimately nests one wrapper); survivor S29 preserved display text while replacing the recoverable concrete cause.
+- 2026-08-27 codex — Tentatively close the novel phase after three re-audits produced no new natural family; an independent review remains a required check on that verdict.
+- 2026-08-27 codex — Reproduce N1–N6 independently on the then-current 51-test source: all are caught at 46/5, 50/1, 48/3, 48/3, 48/3, and 50/1 respectively.
+- 2026-08-27 codex — Reopen the campaign after independent review identified the unobserved post-overrun error state; S30 (`remaining == None` plus `Err` becomes EOF) survived 51/0 and is caught 51/1 by `an_error_after_an_overrun_is_not_laundered_into_eof`.
