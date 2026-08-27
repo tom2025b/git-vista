@@ -9,3 +9,4 @@
 - 2026-08-27 codex — Make the overrun fixture cross the boundary inside its first frame and assert every later frame/hint; landing on zero before overrunning let survivor S10 delay invalidation by one frame.
 - 2026-08-27 codex — Test Pending liveness with a waker-capturing body, not `ScriptedBody`; the manual no-op fixture could not detect survivor S11 substituting its own inert context.
 - 2026-08-27 codex — Treat empty DATA as a first-class forwarded frame that consumes zero bytes; survivor S12 laundered it into EOF and hid later data because no `KnownSizeBody` fixture emitted one.
+- 2026-08-27 codex — Assert unknown rejoin hints before polling; survivor S13 defaulted absent `original_exact` to zero, a false framing claim that later frame reads happened to invalidate after the damage point.

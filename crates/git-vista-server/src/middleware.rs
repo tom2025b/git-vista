@@ -1820,6 +1820,34 @@ mod tests {
         assert_eq!(body_string(resp).await.len() as u64, expected_total);
     }
 
+    /// `None` means the original body was genuinely streaming and made no
+    /// exact-length claim. Defaulting that absence to zero is not conservative:
+    /// Hyper can turn `Some(0)` into `Content-Length: 0` and suppress the
+    /// nonempty frames that follow before polling gets a chance to invalidate
+    /// the lie.
+    #[tokio::test]
+    async fn rejoin_does_not_invent_zero_for_an_unknown_length() {
+        let rest = Body::from_stream(async_stream::stream! {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"def"));
+        });
+        assert_eq!(
+            rest.size_hint().exact(),
+            None,
+            "precondition: the remainder is a genuine unknown-length stream"
+        );
+
+        let body = rejoin(Bytes::from_static(b"abc"), Some(rest), None);
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), None, "unknown must not default to exact zero");
+        assert_eq!(hint.lower(), 0, "unknown has no positive lower bound");
+        assert_eq!(hint.upper(), None, "unknown has no upper bound");
+
+        let bytes = axum::body::to_bytes(body, 16)
+            .await
+            .expect("the rejoined stream remains readable");
+        assert_eq!(bytes, Bytes::from_static(b"abcdef"));
+    }
+
     /// #336, the other half: an over-cap body that is genuinely plain text is
     /// still enveloped — and the envelope carries what the server said, with an
     /// explicit truncation marker, instead of collapsing to the status's
