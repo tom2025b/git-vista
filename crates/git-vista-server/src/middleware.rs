@@ -470,9 +470,27 @@ fn prepend_frame(first: Result<Frame<Bytes>, axum::Error>, mut rest: Body) -> Bo
 /// This delegates frame polling to the wrapped body untouched and overrides
 /// only `size_hint`, so it changes nothing about what bytes are produced or
 /// when — only what the body *claims* about its own length.
+///
+/// **`size_hint` describes what REMAINS, not what the body started with.**
+/// That is `http_body::Body`'s contract, and the first version of this type
+/// broke it: it stored the original total once and returned it forever, so
+/// after a 7-byte body had handed over 6 bytes it still answered `Some(7)`
+/// instead of `Some(1)`. Every read was correct at construction — which is
+/// exactly why a check made before any frame was polled found nothing wrong.
+/// `remaining` is therefore decremented as data frames go past.
 struct KnownSizeBody {
     inner: Body,
-    exact: u64,
+    /// Bytes still to come, or `None` once the wrapped body has proven its
+    /// own declared length was a lie.
+    ///
+    /// A body that yields MORE than it promised has invalidated the very
+    /// claim this wrapper exists to carry forward. Saturating at zero would
+    /// keep asserting an exact size — `Some(0)` — while more bytes were still
+    /// arriving, which is the original defect in a new costume: a confident
+    /// answer that is false. Going to `None` says the honest thing instead:
+    /// the length was known, the body contradicted it, and it is not known
+    /// any more.
+    remaining: Option<u64>,
 }
 
 impl HttpBody for KnownSizeBody {
@@ -483,7 +501,19 @@ impl HttpBody for KnownSizeBody {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_frame(cx)
+        let this = self.get_mut();
+        let polled = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
+        // Only DATA frames consume declared length. Trailers carry no bytes
+        // the `Content-Length` this hint feeds would ever count, so a trailer
+        // frame must leave `remaining` alone.
+        if let std::task::Poll::Ready(Some(Ok(frame))) = &polled {
+            if let Some(data) = frame.data_ref() {
+                this.remaining = this
+                    .remaining
+                    .and_then(|left| left.checked_sub(data.len() as u64));
+            }
+        }
+        polled
     }
 
     fn is_end_stream(&self) -> bool {
@@ -491,7 +521,11 @@ impl HttpBody for KnownSizeBody {
     }
 
     fn size_hint(&self) -> SizeHint {
-        SizeHint::with_exact(self.exact)
+        match self.remaining {
+            Some(left) => SizeHint::with_exact(left),
+            // Unknown, not zero: see `remaining`.
+            None => SizeHint::default(),
+        }
     }
 }
 
@@ -517,7 +551,7 @@ fn rejoin(head: Bytes, rest: Option<Body>, original_exact: Option<u64>) -> Body 
     match original_exact {
         Some(exact) => Body::new(KnownSizeBody {
             inner: joined,
-            exact,
+            remaining: Some(exact),
         }),
         None => joined,
     }
@@ -1133,6 +1167,85 @@ mod tests {
             oversized_hook_output(),
             "the hook's own text must arrive byte-for-byte, not truncated at \
              the buffering cap"
+        );
+    }
+
+    /// `KnownSizeBody` must report what REMAINS, not what the body started
+    /// with — `http_body::Body`'s actual contract, and the thing the first
+    /// version of this wrapper got wrong.
+    ///
+    /// This is codex's counterexample, kept as its literal numbers rather than
+    /// paraphrased: a 7-byte body, 6 bytes consumed, must answer `Some(1)`.
+    /// The shipped version answered `Some(7)` — correct at construction, stale
+    /// forever after. That is why the check which found nothing wrong had
+    /// looked only before any frame was polled: the value it read was the one
+    /// value that was never wrong.
+    ///
+    /// Deliberately drains frame-by-frame and asserts after EACH one, rather
+    /// than only at the end. A wrapper that reset to the total, or jumped
+    /// straight to zero, would still satisfy a single end-state assertion.
+    #[tokio::test]
+    async fn a_known_size_body_reports_what_remains_not_what_it_started_with() {
+        let inner = Body::from("abcdefg"); // 7 bytes
+        let mut body = KnownSizeBody {
+            inner,
+            remaining: Some(7),
+        };
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(7),
+            "before anything is polled, everything still remains"
+        );
+
+        let mut seen = 0u64;
+        while let Some(frame) = std::pin::Pin::new(&mut body).frame().await {
+            let frame = frame.expect("the fixture body yields no errors");
+            if let Some(data) = frame.data_ref() {
+                seen += data.len() as u64;
+            }
+            assert_eq!(
+                body.size_hint().exact(),
+                Some(7 - seen),
+                "after {seen} of 7 bytes, exactly {} must remain",
+                7 - seen
+            );
+        }
+        assert_eq!(seen, 7, "the fixture must actually deliver all 7 bytes");
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(0),
+            "a fully drained body has nothing left to promise"
+        );
+    }
+
+    /// The companion case, and the reason `remaining` is an `Option` rather
+    /// than a saturating counter: a wrapped body that yields MORE than its
+    /// declared length has disproved the claim this wrapper carries.
+    ///
+    /// Saturating at zero would answer `Some(0)` — still an *exact* claim,
+    /// still false, still being made while bytes keep arriving. That is the
+    /// original defect wearing a different hat. The honest answer is that the
+    /// length is no longer known.
+    #[tokio::test]
+    async fn a_body_that_overruns_its_declared_length_stops_claiming_one() {
+        // Declares 2, delivers 5.
+        let mut body = KnownSizeBody {
+            inner: Body::from("abcde"),
+            remaining: Some(2),
+        };
+        let mut delivered = 0usize;
+        while let Some(frame) = std::pin::Pin::new(&mut body).frame().await {
+            if let Some(data) = frame.expect("no errors").data_ref() {
+                delivered += data.len();
+            }
+        }
+        assert_eq!(delivered, 5, "precondition: the body really does overrun");
+        assert_eq!(
+            body.size_hint().exact(),
+            None,
+            "a body that outran its own declared length must report an \
+             UNKNOWN size, never a confident zero — an exact claim that is \
+             false is the defect this type exists to avoid"
         );
     }
 
