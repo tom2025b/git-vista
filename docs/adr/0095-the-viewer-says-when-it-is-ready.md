@@ -34,6 +34,11 @@ The third is the one that matters, and it is invisible from outside the app.
 `viewer.rs` renders `"Loading…"` in **six** arms of one match. Only one of them is a genuine *"nothing has come back yet"*. The other five are ADR 0053's rule applied once per document kind: a resource that resolved **successfully**, but for a document that is no longer the one open, is **dropped rather than painted**.
 
 ```mermaid
+---
+config:
+  flowchart:
+    wrappingWidth: 480
+---
 flowchart TD
   OPEN["<b>What is open right now</b><br/>ViewerDoc::Diff { id: abc123 }"]
   FETCH["<b>What the resource settled on</b><br/>one of three shapes"]
@@ -74,9 +79,36 @@ flowchart TD
 
 **The viewer publishes `aria-busy` on `.viewer-modal`, and its value is derived from the same two facts the `body` match already reads — not from a new source of truth.**
 
-Three parts, and the boundary between them is load-bearing:
+Three parts, and the boundary between them is load-bearing. The diagram at the end of this section shows where each one sits.
+
+**1. The predicate is pure and host-tested.** `features/readiness/core.rs` follows the `features/*/core.rs` convention: no Leptos, no `crate::state`, no `#[cfg(target_arch = "wasm32")]`. It compiles and runs under `cargo test`.
+
+```rust
+pub fn is_viewer_busy(open: &DocIdentity, outcome: &FetchOutcome) -> bool {
+    match outcome {
+        FetchOutcome::Pending => true,
+        FetchOutcome::Err => false,
+        FetchOutcome::Ok(got) => got != open,
+    }
+}
+```
+
+**2. The identity types carry only what the existing check compares.** `DocIdentity` holds an id, a path, a spec — never a `CommitDiff`, `FileContent`, `ConflictPanes` or `StagingDiff`. The staleness check `viewer.rs` already makes never looks past a payload's identity, so neither does this.
+
+**3. The marshalling stays in `viewer.rs` and makes no decision.** `viewer_doc_identity` and `doc_result_outcome` reduce the live Leptos types down to the identity types. `doc_result_outcome` is **exhaustive over `DocResult` with no wildcard arm**, deliberately: a variant added later without a matching arm fails the build rather than silently reading as settled.
+
+### The rule that governs all three
+
+> **Readiness is derived from the same information the render decision uses.**
+
+Not from a parallel signal that could disagree with it. A readiness attribute that says "busy" while the app has painted content — or "ready" while it shows a placeholder — is worse than none, because two consumers now trust it.
 
 ```mermaid
+---
+config:
+  flowchart:
+    wrappingWidth: 480
+---
 flowchart TD
   STATE["<b>crate::state::ViewerDoc</b><br/>what document is open<br/>Leptos, wasm-only"]
   RESULT["<b>DocResult</b><br/>what the resource resolved<br/>Leptos, wasm-only"]
@@ -101,28 +133,6 @@ flowchart TD
   class CORE pure
   class ATTR,SPEC,A11Y pub
 ```
-
-**1. The predicate is pure and host-tested.** `features/readiness/core.rs` follows the `features/*/core.rs` convention: no Leptos, no `crate::state`, no `#[cfg(target_arch = "wasm32")]`. It compiles and runs under `cargo test`.
-
-```rust
-pub fn is_viewer_busy(open: &DocIdentity, outcome: &FetchOutcome) -> bool {
-    match outcome {
-        FetchOutcome::Pending => true,
-        FetchOutcome::Err => false,
-        FetchOutcome::Ok(got) => got != open,
-    }
-}
-```
-
-**2. The identity types carry only what the existing check compares.** `DocIdentity` holds an id, a path, a spec — never a `CommitDiff`, `FileContent`, `ConflictPanes` or `StagingDiff`. The staleness check `viewer.rs` already makes never looks past a payload's identity, so neither does this.
-
-**3. The marshalling stays in `viewer.rs` and makes no decision.** `viewer_doc_identity` and `doc_result_outcome` reduce the live Leptos types down to the identity types. `doc_result_outcome` is **exhaustive over `DocResult` with no wildcard arm**, deliberately: a variant added later without a matching arm fails the build rather than silently reading as settled.
-
-### The rule that governs all three
-
-> **Readiness is derived from the same information the render decision uses.**
-
-Not from a parallel signal that could disagree with it. A readiness attribute that says "busy" while the app has painted content — or "ready" while it shows a placeholder — is worse than none, because two consumers now trust it.
 
 ---
 

@@ -16,6 +16,11 @@ So the gap is not a lost file. Nothing was written and then deleted; a number wa
 That left a small, real problem. A reader walking `docs/adr/` in order hits a missing number and cannot tell which of three things happened:
 
 ```mermaid
+---
+config:
+  flowchart:
+    wrappingWidth: 480
+---
 flowchart TD
   GAP["<b>0086 is missing</b><br/>a reader finds nothing at this number"]
   Q1["<b>Was it written and lost?</b><br/>then history is damaged<br/>and should be recovered"]
