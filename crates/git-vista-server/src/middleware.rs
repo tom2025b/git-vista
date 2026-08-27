@@ -2445,6 +2445,32 @@ mod tests {
         assert_eq!(bytes, Bytes::from_static(b"abcdef"));
     }
 
+    /// An empty observed prefix does not make an unknown streaming body empty.
+    /// A trailer-only remainder is a legal zero-DATA stream, and rejoin must
+    /// preserve both its unknown byte hint and its metadata frame.
+    #[tokio::test]
+    async fn rejoin_preserves_an_unknown_trailer_only_remainder() {
+        let rest = Body::new(ScriptedBody::new(vec![Step::Trailers]));
+        let mut body = rejoin(Bytes::new(), Some(rest), None);
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), None);
+        assert_eq!(hint.lower(), 0);
+        assert_eq!(hint.upper(), None);
+
+        let trailers = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the unknown trailer remainder is not EOF")
+            .expect("the trailer is not an error")
+            .into_trailers()
+            .expect("the remainder carries trailers");
+        assert_eq!(
+            trailers.get("x-checksum"),
+            Some(&HeaderValue::from_static("ok"))
+        );
+        assert_eq!(body.size_hint().exact(), None);
+    }
+
     /// An empty prefix is an optimization opportunity, not permission to skip
     /// restoring the original exact hint. A zero-byte body may still carry
     /// trailers, so `rest` is present even though `head` is empty; returning
