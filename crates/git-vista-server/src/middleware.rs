@@ -1645,6 +1645,47 @@ mod tests {
         assert_eq!(body.size_hint().exact(), Some(0));
     }
 
+    /// Trailer delegation is independent of byte-accounting state. Rich
+    /// metadata must retain duplicate values, per-value sensitivity, opaque
+    /// bytes, and order at positive, exhausted, and invalidated remainders.
+    #[tokio::test]
+    async fn trailer_metadata_is_preserved_across_accounting_states() {
+        for remaining in [Some(7), Some(0), None] {
+            let mut body = KnownSizeBody {
+                inner: Body::new(ExactZeroTrailerBody { yielded: false }),
+                remaining,
+            };
+            let trailers = std::pin::Pin::new(&mut body)
+                .frame()
+                .await
+                .expect("the rich trailer frame is not EOF")
+                .expect("the rich trailer frame is not an error")
+                .into_trailers()
+                .expect("the frame carries trailers");
+            let values: Vec<_> = trailers
+                .get_all("x-checksum")
+                .iter()
+                .map(|value| value.to_str().expect("checksum values are text"))
+                .collect();
+            assert_eq!(values, ["zero-data", "second-value"], "at {remaining:?}");
+            let sensitivities: Vec<_> = trailers
+                .get_all("x-checksum")
+                .iter()
+                .map(HeaderValue::is_sensitive)
+                .collect();
+            assert_eq!(sensitivities, [true, false], "at {remaining:?}");
+            assert_eq!(
+                trailers
+                    .get("x-opaque")
+                    .expect("the opaque trailer remains")
+                    .as_bytes(),
+                b"opaque\xfa",
+                "at {remaining:?}"
+            );
+            assert_eq!(body.size_hint().exact(), remaining);
+        }
+    }
+
     /// The companion case, and the reason `remaining` is an `Option` rather
     /// than a saturating counter: a wrapped body that yields MORE than its
     /// declared length has disproved the claim this wrapper carries.
