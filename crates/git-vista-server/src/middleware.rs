@@ -730,6 +730,9 @@ mod tests {
     use git_vista_protocol::{AmendCommitError, AmendCommitSuccess, AmendFailureKind, ApiError};
     use http_body::Frame;
     use http_body_util::StreamBody;
+    use std::collections::VecDeque;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use tower::ServiceExt;
 
     // A tiny router carrying the contract layer over a few representative routes:
@@ -1170,51 +1173,155 @@ mod tests {
         );
     }
 
+    /// A test body that yields a KNOWN NUMBER OF SEPARATE FRAMES, optionally
+    /// finishing with a trailer frame.
+    ///
+    /// It exists because `Body::from("abcdefg")` is `Full<Bytes>` and yields
+    /// **exactly one** frame — asserted, not assumed, by
+    /// `body_from_a_str_yields_exactly_one_frame` below. A drain loop over a
+    /// one-frame body runs once: first frame *is* last frame, so it can only
+    /// ever check two endpoints, and a wrapper that stayed at its original
+    /// total until the very last frame would satisfy it. The first version of
+    /// this test did exactly that while its comment claimed otherwise.
+    struct ChunkedBody {
+        frames: VecDeque<Bytes>,
+        trailer_at_end: bool,
+    }
+
+    impl ChunkedBody {
+        fn new(chunks: &[&'static [u8]], trailer_at_end: bool) -> Self {
+            Self {
+                frames: chunks.iter().map(|c| Bytes::from_static(c)).collect(),
+                trailer_at_end,
+            }
+        }
+    }
+
+    impl HttpBody for ChunkedBody {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            let this = self.get_mut();
+            match this.frames.pop_front() {
+                Some(data) => Poll::Ready(Some(Ok(Frame::data(data)))),
+                None if this.trailer_at_end => {
+                    this.trailer_at_end = false;
+                    let mut trailers = HeaderMap::new();
+                    trailers.insert("x-checksum", HeaderValue::from_static("ok"));
+                    Poll::Ready(Some(Ok(Frame::trailers(trailers))))
+                }
+                None => Poll::Ready(None),
+            }
+        }
+    }
+
+    /// The precondition the drain test depends on, asserted rather than
+    /// believed: a `Body::from(&str)` really is a single frame. If a future
+    /// axum/http-body ever splits it, this fails and tells you why the
+    /// multi-frame fixture exists.
+    #[tokio::test]
+    async fn body_from_a_str_yields_exactly_one_frame() {
+        let mut body = Body::from("abcdefg");
+        let mut frames = 0;
+        while let Some(f) = std::pin::Pin::new(&mut body).frame().await {
+            f.expect("no errors");
+            frames += 1;
+        }
+        assert_eq!(
+            frames, 1,
+            "Body::from(&str) is Full<Bytes> and yields one frame — the reason \
+             `ChunkedBody` exists"
+        );
+    }
+
     /// `KnownSizeBody` must report what REMAINS, not what the body started
     /// with — `http_body::Body`'s actual contract, and the thing the first
     /// version of this wrapper got wrong.
     ///
-    /// This is codex's counterexample, kept as its literal numbers rather than
-    /// paraphrased: a 7-byte body, 6 bytes consumed, must answer `Some(1)`.
-    /// The shipped version answered `Some(7)` — correct at construction, stale
-    /// forever after. That is why the check which found nothing wrong had
-    /// looked only before any frame was polled: the value it read was the one
-    /// value that was never wrong.
+    /// **Every expected value below is a LITERAL**, never `total - seen`.
+    /// Computing the expectation with the same arithmetic the implementation
+    /// uses is how an assertion quietly becomes `f(x) == f(x)`; the numbers
+    /// here are worked out by hand from the fixture's own chunk sizes.
     ///
-    /// Deliberately drains frame-by-frame and asserts after EACH one, rather
-    /// than only at the end. A wrapper that reset to the total, or jumped
-    /// straight to zero, would still satisfy a single end-state assertion.
+    /// Three frames, so the loop genuinely iterates: 3 + 2 + 2 = 7 bytes,
+    /// giving four observation points — 7 before anything, then 4, 2, 0. A
+    /// wrapper that held its total until the last frame (the mutation that
+    /// survived the first version of this test) dies on the very first
+    /// intermediate check.
     #[tokio::test]
     async fn a_known_size_body_reports_what_remains_not_what_it_started_with() {
-        let inner = Body::from("abcdefg"); // 7 bytes
         let mut body = KnownSizeBody {
-            inner,
+            inner: Body::new(ChunkedBody::new(&[b"abc", b"de", b"fg"], false)),
             remaining: Some(7),
         };
+
+        let expected_after_each_frame = [Some(4u64), Some(2), Some(0)];
+
         assert_eq!(
             body.size_hint().exact(),
             Some(7),
-            "before anything is polled, everything still remains"
+            "before anything is polled, all 7 bytes still remain"
         );
 
-        let mut seen = 0u64;
+        let mut seen_frames = 0usize;
         while let Some(frame) = std::pin::Pin::new(&mut body).frame().await {
-            let frame = frame.expect("the fixture body yields no errors");
-            if let Some(data) = frame.data_ref() {
-                seen += data.len() as u64;
-            }
+            frame.expect("the fixture yields no errors");
             assert_eq!(
                 body.size_hint().exact(),
-                Some(7 - seen),
-                "after {seen} of 7 bytes, exactly {} must remain",
-                7 - seen
+                expected_after_each_frame[seen_frames],
+                "after frame {} the remaining count is wrong",
+                seen_frames + 1
             );
+            seen_frames += 1;
         }
-        assert_eq!(seen, 7, "the fixture must actually deliver all 7 bytes");
+        assert_eq!(
+            seen_frames, 3,
+            "precondition: the fixture must really deliver three separate \
+             frames, or this test degrades to the endpoint check it replaced"
+        );
+    }
+
+    /// The trailer invariant, which the production code asserts in a comment
+    /// and — until now — no test held.
+    ///
+    /// Reachable in production: `BodyRemainder::Trailers(rest)` is rejoined
+    /// with `original_exact` on the error path. A trailer carries no bytes the
+    /// `Content-Length` this hint feeds would ever count, so it must leave
+    /// `remaining` untouched.
+    #[tokio::test]
+    async fn a_trailer_frame_does_not_decrement_the_remaining_count() {
+        let mut body = KnownSizeBody {
+            inner: Body::new(ChunkedBody::new(&[b"abcd"], true)),
+            remaining: Some(4),
+        };
+
+        let first = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("a data frame")
+            .expect("no error");
+        assert!(first.is_data(), "precondition: first frame carries data");
+        assert_eq!(body.size_hint().exact(), Some(0), "4 data bytes consumed");
+
+        let second = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("a trailer frame")
+            .expect("no error");
+        assert!(
+            second.is_trailers(),
+            "precondition: the fixture must actually yield a trailer, or this \
+             test proves nothing about trailers"
+        );
         assert_eq!(
             body.size_hint().exact(),
             Some(0),
-            "a fully drained body has nothing left to promise"
+            "a trailer carries no counted bytes, so it must not move the \
+             remaining count — not even below zero into unknown"
         );
     }
 
@@ -1222,15 +1329,14 @@ mod tests {
     /// than a saturating counter: a wrapped body that yields MORE than its
     /// declared length has disproved the claim this wrapper carries.
     ///
-    /// Saturating at zero would answer `Some(0)` — still an *exact* claim,
-    /// still false, still being made while bytes keep arriving. That is the
-    /// original defect wearing a different hat. The honest answer is that the
-    /// length is no longer known.
+    /// Asserts the full shape of the hint, not merely that `exact()` is
+    /// `None`: `exact()` also returns `None` for any range with unequal
+    /// bounds, so checking it alone would accept a hint that still asserted,
+    /// say, "between 2 and 9 bytes". Unknown means lower 0, upper None.
     #[tokio::test]
     async fn a_body_that_overruns_its_declared_length_stops_claiming_one() {
-        // Declares 2, delivers 5.
         let mut body = KnownSizeBody {
-            inner: Body::from("abcde"),
+            inner: Body::new(ChunkedBody::new(&[b"ab", b"cde"], false)),
             remaining: Some(2),
         };
         let mut delivered = 0usize;
@@ -1240,12 +1346,52 @@ mod tests {
             }
         }
         assert_eq!(delivered, 5, "precondition: the body really does overrun");
+
+        let hint = body.size_hint();
+        assert_eq!(
+            hint.exact(),
+            None,
+            "a body that outran its own declared length must stop claiming an \
+             exact size — an exact claim that is false is the defect this type \
+             exists to avoid"
+        );
+        assert_eq!(hint.lower(), 0, "unknown means no lower bound is promised");
+        assert_eq!(hint.upper(), None, "unknown means no upper bound either");
+    }
+
+    /// The opposite direction, which the first version of this fix left
+    /// undefended: a body that yields FEWER bytes than it declared.
+    ///
+    /// The wrapper cannot detect this while frames are still arriving — a
+    /// short body and a slow one look identical until the stream ends. What it
+    /// must not do is keep promising the shortfall AFTER end-of-stream, since
+    /// by then the promise is unfulfillable. Documenting the current behaviour
+    /// honestly: `remaining` stays at the undelivered count, and the honest
+    /// reading is that this hint was wrong from the start because the wrapped
+    /// body lied. Pinned so a future change here is deliberate rather than
+    /// accidental.
+    #[tokio::test]
+    async fn an_underrunning_body_is_recorded_as_it_actually_behaves() {
+        let mut body = KnownSizeBody {
+            inner: Body::new(ChunkedBody::new(&[b"ab"], false)),
+            remaining: Some(9),
+        };
+        let mut delivered = 0usize;
+        while let Some(frame) = std::pin::Pin::new(&mut body).frame().await {
+            if let Some(data) = frame.expect("no errors").data_ref() {
+                delivered += data.len();
+            }
+        }
+        assert_eq!(delivered, 2, "precondition: the body really does underrun");
         assert_eq!(
             body.size_hint().exact(),
-            None,
-            "a body that outran its own declared length must report an \
-             UNKNOWN size, never a confident zero — an exact claim that is \
-             false is the defect this type exists to avoid"
+            Some(7),
+            "current behaviour, pinned deliberately: 9 were promised, 2 \
+             arrived, and the wrapper still reports the 7 that never came. \
+             This is a faithful echo of the wrapped body's own false claim, \
+             not an independent one — but a caller reading it after \
+             end-of-stream is being told about bytes that will never arrive. \
+             If this is ever changed to report unknown, change it here first"
         );
     }
 
