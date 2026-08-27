@@ -1798,6 +1798,35 @@ mod tests {
         assert!(trailers.is_trailers(), "the final frame carries trailers");
     }
 
+    /// Consecutive `Pending` polls are ordinary asynchronous backpressure, not
+    /// evidence that the stream ended. Each consumes zero bytes, and later
+    /// data must remain reachable no matter how many times readiness pauses.
+    #[test]
+    fn consecutive_pending_polls_remain_pending_and_preserve_later_data() {
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::new(vec![
+                Step::PendingOnce,
+                Step::PendingOnce,
+                Step::Data(b"x"),
+            ])),
+            remaining: Some(1),
+        };
+
+        assert!(matches!(poll_once(&mut body), Poll::Pending));
+        assert_eq!(body.size_hint().exact(), Some(1));
+        assert!(
+            matches!(poll_once(&mut body), Poll::Pending),
+            "a second consecutive Pending is not EOF"
+        );
+        assert_eq!(body.size_hint().exact(), Some(1));
+
+        let Poll::Ready(Some(Ok(data))) = poll_once(&mut body) else {
+            panic!("data after consecutive Pending polls remains reachable");
+        };
+        assert_eq!(data.data_ref().map(Bytes::len), Some(1));
+        assert_eq!(body.size_hint().exact(), Some(0));
+    }
+
     /// N4: an error frame must reach the caller as an error.
     ///
     /// Turning it into a clean `Ready(None)` converts a transport failure into
