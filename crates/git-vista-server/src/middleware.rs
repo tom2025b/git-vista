@@ -1307,6 +1307,11 @@ mod tests {
             first.set_sensitive(true);
             trailers.append("x-checksum", first);
             trailers.append("x-checksum", HeaderValue::from_static("second-value"));
+            trailers.insert(
+                "x-opaque",
+                HeaderValue::from_bytes(b"opaque\xfa")
+                    .expect("opaque bytes are legal in an HTTP header value"),
+            );
             Poll::Ready(Some(Ok(Frame::trailers(trailers))))
         }
 
@@ -1628,6 +1633,14 @@ mod tests {
             sensitivities,
             [true, false],
             "delegation must preserve each HeaderValue sensitivity flag in order"
+        );
+        assert_eq!(
+            trailers
+                .get("x-opaque")
+                .expect("the opaque trailer remains")
+                .as_bytes(),
+            b"opaque\xfa",
+            "delegation must preserve legal non-UTF-8 header bytes"
         );
         assert_eq!(body.size_hint().exact(), Some(0));
     }
