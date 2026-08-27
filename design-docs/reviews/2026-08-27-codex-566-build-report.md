@@ -69,12 +69,16 @@ After each mutation, the source and its saved green copy both had SHA-256 `afe33
 
 These three commands were rerun after the independent-review repair. The final formatted middleware source has SHA-256 `023b2a167dda8dcf195bbd91a691d5871c674e6e224f631cc0df5a65b5db7681`.
 
+The scoped independent Codex re-review marked the boundary/rejoin finding and both documentation findings addressed, and found no new Critical or Important breakage. This does not replace the required fresh independent Claude landing review.
+
+Remote CI on the final code-bearing commit `651b59cb9a02dced1ec17886bca4e820cf1c18cb` passed all seven checks: Core, Frontend, Lint, M1.06 write contract, Sandbox, secret scanning, and security audit.
+
 No workspace-wide or browser suite was run; both are outside this handoff's acceptance scope.
 
 ## Merge-down status and landability
 
-**Merge-down: BLOCKED.** At the prescribed last-step check, PR #570 remained `OPEN`, with `mergedAt: null` and no merge commit. I did not fetch or merge stale `main`.
+**Merge-down: BLOCKED.** At the prescribed last-step check, PR #570 remained `OPEN` at `854953f590579d698c25448d7aa71618abf3894d`, with `mergedAt: null` and no merge commit. I did not fetch or merge stale `main`.
 
 Both defects assigned to this build are resolved and evidenced on the current #566 branch. I do **not** consider #566 landable yet: after #570 lands, `origin/main` still must be merged into this branch and all three acceptance commands above rerun against the merged tree. The fresh independent skeptic review remains part of the landing workflow.
 
-**Signed:** codex · 2026-08-27T15:18:07-04:00
+**Signed:** codex · 2026-08-27T15:22:38-04:00
