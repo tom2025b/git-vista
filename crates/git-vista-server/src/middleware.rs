@@ -1199,6 +1199,7 @@ mod tests {
         Error,
         MarkerError,
         Trailers,
+        EmptyTrailers,
     }
 
     /// A test body that plays a scripted sequence of frame shapes.
@@ -1271,6 +1272,9 @@ mod tests {
                                 let mut trailers = HeaderMap::new();
                                 trailers.insert("x-checksum", HeaderValue::from_static("ok"));
                                 Poll::Ready(Some(Ok(Frame::trailers(trailers))))
+                            }
+                            Step::EmptyTrailers => {
+                                Poll::Ready(Some(Ok(Frame::trailers(HeaderMap::new()))))
                             }
                         };
                     }
@@ -1652,8 +1656,45 @@ mod tests {
             body.size_hint().exact(),
             Some(2),
             "a trailer carries no counted bytes, so it must not move the \
-             nonzero remaining count"
+            nonzero remaining count"
         );
+    }
+
+    /// An empty trailer map is still an observable frame. It must not be
+    /// confused with EOF, and forwarding it must not hide a later frame.
+    #[tokio::test]
+    async fn an_empty_trailer_frame_is_forwarded_across_accounting_states() {
+        for (remaining, after_one_byte) in
+            [(Some(7), Some(6)), (Some(0), None), (None, None)]
+        {
+            let mut body = KnownSizeBody {
+                inner: Body::new(ScriptedBody::new(vec![
+                    Step::EmptyTrailers,
+                    Step::Data(b"x"),
+                ])),
+                remaining,
+            };
+
+            let trailers = std::pin::Pin::new(&mut body)
+                .frame()
+                .await
+                .expect("an empty trailer frame is not EOF")
+                .expect("the empty trailer frame is not an error")
+                .into_trailers()
+                .expect("the first frame carries trailers");
+            assert!(trailers.is_empty(), "precondition: trailer map is empty");
+            assert_eq!(body.size_hint().exact(), remaining);
+
+            let data = std::pin::Pin::new(&mut body)
+                .frame()
+                .await
+                .expect("data after an empty trailer remains reachable")
+                .expect("the later data frame is not an error")
+                .into_data()
+                .expect("the second frame carries data");
+            assert_eq!(data, Bytes::from_static(b"x"));
+            assert_eq!(body.size_hint().exact(), after_one_byte);
+        }
     }
 
     /// An inner exact-zero hint means only that no DATA bytes remain. It does
