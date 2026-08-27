@@ -494,11 +494,15 @@ enum ReadyOutcome {
 /// different guarantees from the same read loop, so they get different
 /// functions instead of one with a flag that changes what the error path
 /// promises.
-async fn split_at_limit_when_ready(mut body: Body, limit: usize) -> ReadyOutcome {
+async fn split_at_limit_when_ready(
+    mut body: Body,
+    limit: usize,
+    original_exact: Option<u64>,
+) -> ReadyOutcome {
     let mut head: Vec<u8> = Vec::new();
     loop {
         let Ok(polled) = tokio::time::timeout(Duration::ZERO, body.frame()).await else {
-            return ReadyOutcome::NotReady(rejoin(Bytes::from(head), Some(body)));
+            return ReadyOutcome::NotReady(rejoin(Bytes::from(head), Some(body), original_exact));
         };
         let Some(frame) = polled else {
             return ReadyOutcome::Ready(Bytes::from(head), BodyRemainder::End);
@@ -747,7 +751,7 @@ async fn relabel_json_success(response: Response) -> Response {
     // (#540). Nothing is lost on any path here — what is not relabeled is
     // rejoined and passed on byte-for-byte.
     let (mut parts, body) = response.into_parts();
-    let (head, remainder) = match split_at_limit_when_ready(body, MAX_ERROR_BODY).await {
+    let (head, remainder) = match split_at_limit_when_ready(body, MAX_ERROR_BODY, exact).await {
         // The body was not ready the instant it was polled, despite its
         // declared length. Forward it untouched rather than await it — that
         // wait is exactly what would delay this response's headers.
@@ -771,10 +775,11 @@ async fn relabel_json_success(response: Response) -> Response {
         );
     }
     // `exact` was already established above (the gate this function opens
-    // on) to be `Some` and within `MAX_ERROR_BODY` before `split_at_limit`
-    // ever ran, so it is exactly the "known original length" `rejoin` needs
-    // to keep reporting after the prefix and remainder are stitched back
-    // together.
+    // on) to be `Some` and within `MAX_ERROR_BODY` before
+    // `split_at_limit_when_ready` ever ran, so it is exactly the "known
+    // original length" `rejoin` needs to keep reporting after the prefix
+    // and remainder are stitched back together — on this path and on
+    // `NotReady`'s, which now threads the same value through.
     Response::from_parts(parts, rejoin(head, rest, exact))
 }
 
