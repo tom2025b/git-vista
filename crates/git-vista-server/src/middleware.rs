@@ -1795,15 +1795,30 @@ mod tests {
             inner: Body::new(ScriptedBody::new(vec![Step::Data(b"ab"), Step::Error])),
             remaining: Some(9),
         };
-        let first = std::pin::Pin::new(&mut body).frame().await;
-        assert!(
-            matches!(first, Some(Ok(_))),
-            "precondition: data comes first"
+        let data = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("data comes first")
+            .expect("the first frame is not an error")
+            .into_data()
+            .expect("the first frame is data");
+        assert_eq!(data, Bytes::from_static(b"ab"));
+        assert_eq!(body.size_hint().exact(), Some(7));
+
+        let error = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the error frame is not clean EOF")
+            .expect_err("the second frame remains an error");
+        assert_eq!(
+            error.to_string(),
+            "scripted body failure",
+            "the wrapper must preserve the original error identity"
         );
-        assert!(
-            matches!(std::pin::Pin::new(&mut body).frame().await, Some(Err(_))),
-            "an error frame must surface as an error, never as clean \
-            end-of-stream — that would report a truncated body as complete"
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(7),
+            "an error frame consumes no bytes and must not rewrite the hint"
         );
     }
 
