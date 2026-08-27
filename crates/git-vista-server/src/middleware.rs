@@ -2238,30 +2238,37 @@ mod tests {
     /// source type callers may downcast for recovery or classification.
     #[tokio::test]
     async fn an_error_frame_preserves_its_underlying_type() {
-        let mut body = KnownSizeBody {
-            inner: Body::new(ScriptedBody::new(vec![Step::MarkerError])),
-            remaining: Some(0),
-        };
+        for remaining in [Some(7), Some(0), None] {
+            let mut body = KnownSizeBody {
+                inner: Body::new(ScriptedBody::new(vec![Step::MarkerError])),
+                remaining,
+            };
 
-        let error = std::pin::Pin::new(&mut body)
-            .frame()
-            .await
-            .expect("the marker error is not clean EOF")
-            .expect_err("the frame remains an error");
-        assert_eq!(error.to_string(), "marker body failure");
-        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(&error);
-        let mut marker_found = false;
-        while let Some(candidate) = current {
-            if candidate.downcast_ref::<MarkerBodyError>().is_some() {
-                marker_found = true;
-                break;
+            let error = std::pin::Pin::new(&mut body)
+                .frame()
+                .await
+                .expect("the marker error is not clean EOF")
+                .expect_err("the frame remains an error");
+            assert_eq!(error.to_string(), "marker body failure");
+            let mut current: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+            let mut marker_found = false;
+            while let Some(candidate) = current {
+                if candidate.downcast_ref::<MarkerBodyError>().is_some() {
+                    marker_found = true;
+                    break;
+                }
+                current = candidate.source();
             }
-            current = candidate.source();
+            assert!(
+                marker_found,
+                "the wrapper must preserve the concrete error in its source chain at {remaining:?}"
+            );
+            assert_eq!(
+                body.size_hint().exact(),
+                remaining,
+                "an error cannot rewrite accounting state"
+            );
         }
-        assert!(
-            marker_found,
-            "the wrapper must preserve the concrete error in its source chain, not a text-only replacement"
-        );
     }
 
     /// The opposite direction, which the first version of this fix left
