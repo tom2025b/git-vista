@@ -500,13 +500,22 @@ async fn split_at_limit_when_ready(
     original_exact: Option<u64>,
 ) -> ReadyOutcome {
     let mut head: Vec<u8> = Vec::new();
+    let mut frames_read: usize = 0;
     loop {
+        if frames_read >= MAX_SPLIT_FRAMES {
+            return ReadyOutcome::NotReady(rejoin(
+                Bytes::from(head),
+                Some(body),
+                original_exact,
+            ));
+        }
         let Ok(polled) = tokio::time::timeout(Duration::ZERO, body.frame()).await else {
             return ReadyOutcome::NotReady(rejoin(Bytes::from(head), Some(body), original_exact));
         };
         let Some(frame) = polled else {
             return ReadyOutcome::Ready(Bytes::from(head), BodyRemainder::End);
         };
+        frames_read += 1;
         let frame = match frame {
             Ok(frame) => frame,
             Err(error) => {
