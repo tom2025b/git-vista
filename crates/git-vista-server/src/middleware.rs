@@ -1959,6 +1959,30 @@ mod tests {
         assert_eq!(bytes, Bytes::from_static(b"abc"));
     }
 
+    /// Once the split has reached EOF, the buffered prefix is the complete
+    /// body and its observed length is stronger evidence than the original
+    /// producer's claim. The no-remainder fast path must not re-wrap these
+    /// bytes with a stale, false `original_exact` value.
+    #[tokio::test]
+    async fn rejoin_uses_observed_length_when_no_remainder_exists() {
+        let mut body = rejoin(Bytes::from_static(b"ab"), None, Some(9));
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(2),
+            "the fully observed body is two bytes, regardless of its old claim"
+        );
+
+        let data = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the buffered frame remains")
+            .expect("the buffered frame is not an error")
+            .into_data()
+            .expect("the buffered frame is data");
+        assert_eq!(data, Bytes::from_static(b"ab"));
+        assert_eq!(body.size_hint().exact(), Some(0));
+    }
+
     /// #515 defect 1: `rejoin` must not silently downgrade a body with a known
     /// exact length to unknown length just because classifying it required
     /// splitting it into a bytes-in-hand prefix plus an unread remainder.

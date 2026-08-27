@@ -18,3 +18,4 @@
 - 2026-08-27 codex — After exact drain, assert `Some(0)` survives EOF and poll EOF repeatedly; survivor S19 overloaded unknown as an ended marker and no prior test observed post-EOF state.
 - 2026-08-27 codex — Exercise two consecutive `Pending` polls before later DATA; survivor S20 invented EOF from repeated backpressure even though one `Pending` was already covered.
 - 2026-08-27 codex — Pin the exact hint on `rejoin`'s fully buffered/no-remainder arm; survivor S21 preserved all bytes while a frame-stream refactor silently downgraded known length to unknown.
+- 2026-08-27 codex — Give the no-remainder arm a deliberately false original hint; survivor S22 deleted one `return` and re-wrapped fully observed bytes with stale producer provenance instead of their known actual length.
