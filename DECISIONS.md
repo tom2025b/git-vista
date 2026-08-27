@@ -19,3 +19,4 @@
 - 2026-08-27 codex — Exercise two consecutive `Pending` polls before later DATA; survivor S20 invented EOF from repeated backpressure even though one `Pending` was already covered.
 - 2026-08-27 codex — Pin the exact hint on `rejoin`'s fully buffered/no-remainder arm; survivor S21 preserved all bytes while a frame-stream refactor silently downgraded known length to unknown.
 - 2026-08-27 codex — Give the no-remainder arm a deliberately false original hint; survivor S22 deleted one `return` and re-wrapped fully observed bytes with stale producer provenance instead of their known actual length.
+- 2026-08-27 codex — Exercise a legal trailer-only inner body whose byte hint is exact zero; survivor S23 treated the inner byte count as lifecycle state and skipped metadata without polling.

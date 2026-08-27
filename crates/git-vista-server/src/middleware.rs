@@ -1264,6 +1264,35 @@ mod tests {
         }
     }
 
+    /// A legal trailer-only body: zero DATA bytes remain, but one metadata
+    /// frame is still pending. An exact-zero hint is byte accounting, not EOF.
+    struct ExactZeroTrailerBody {
+        yielded: bool,
+    }
+
+    impl HttpBody for ExactZeroTrailerBody {
+        type Data = Bytes;
+        type Error = axum::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            let this = self.get_mut();
+            if this.yielded {
+                return Poll::Ready(None);
+            }
+            this.yielded = true;
+            let mut trailers = HeaderMap::new();
+            trailers.insert("x-checksum", HeaderValue::from_static("zero-data"));
+            Poll::Ready(Some(Ok(Frame::trailers(trailers))))
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::with_exact(0)
+        }
+    }
+
     /// A body that records the waker supplied by its caller before returning
     /// `Pending`. Unlike [`ScriptedBody`], this exercises the liveness half of
     /// the `poll_frame` contract: forwarding `Pending` is insufficient if the
@@ -1475,6 +1504,33 @@ mod tests {
             "a trailer carries no counted bytes, so it must not move the \
              nonzero remaining count"
         );
+    }
+
+    /// An inner exact-zero hint means only that no DATA bytes remain. It does
+    /// not prove that trailers are absent, so the wrapper must still poll and
+    /// forward a trailer-only body.
+    #[tokio::test]
+    async fn an_inner_exact_zero_hint_does_not_hide_trailers() {
+        let inner = Body::new(ExactZeroTrailerBody { yielded: false });
+        assert_eq!(
+            inner.size_hint().exact(),
+            Some(0),
+            "precondition: the inner body truthfully advertises zero DATA bytes"
+        );
+        let mut body = KnownSizeBody {
+            inner,
+            remaining: Some(0),
+        };
+
+        let trailers = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("exact zero must not be mistaken for clean EOF")
+            .expect("trailers are not an error")
+            .into_trailers()
+            .expect("the pending frame is trailers");
+        assert_eq!(trailers.get("x-checksum").unwrap(), "zero-data");
+        assert_eq!(body.size_hint().exact(), Some(0));
     }
 
     /// The companion case, and the reason `remaining` is an `Option` rather
