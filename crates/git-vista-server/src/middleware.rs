@@ -1611,7 +1611,11 @@ mod tests {
             .await
             .expect("the boundary-crossing frame remains")
             .expect("no error");
-        assert_eq!(first.data_ref().map(Bytes::len), Some(3));
+        assert_eq!(
+            first.into_data().expect("the crossing frame is data"),
+            Bytes::from_static(b"abc"),
+            "the wrapper delegates the crossing frame byte-for-byte"
+        );
         let hint = body.size_hint();
         assert_eq!(
             hint.exact(),
@@ -1633,7 +1637,11 @@ mod tests {
             .await
             .expect("the first post-invalidation frame remains")
             .expect("no error");
-        assert_eq!(second.data_ref().map(Bytes::len), Some(2));
+        assert_eq!(
+            second.into_data().expect("the first later frame is data"),
+            Bytes::from_static(b"de"),
+            "hint invalidation must not corrupt later payload bytes"
+        );
         let hint = body.size_hint();
         assert_eq!(hint.exact(), None, "unknown must stay unknown");
         assert_eq!(hint.lower(), 0, "unknown keeps a zero lower bound");
@@ -1644,7 +1652,11 @@ mod tests {
             .await
             .expect("the second post-invalidation frame remains")
             .expect("no error");
-        assert_eq!(third.data_ref().map(Bytes::len), Some(1));
+        assert_eq!(
+            third.into_data().expect("the second later frame is data"),
+            Bytes::from_static(b"f"),
+            "every post-invalidation frame is delegated byte-for-byte"
+        );
         let hint = body.size_hint();
         assert_eq!(hint.exact(), None, "later data cannot restore exactness");
         assert_eq!(hint.lower(), 0, "unknown keeps a zero lower bound");
