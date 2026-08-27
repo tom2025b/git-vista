@@ -1352,7 +1352,10 @@ mod tests {
     #[tokio::test]
     async fn a_trailer_frame_does_not_decrement_the_remaining_count() {
         let mut body = KnownSizeBody {
-            inner: Body::new(ScriptedBody::new(vec![Step::Data(b"abcd"), Step::Trailers])),
+            // Leave two bytes deliberately outstanding before the trailer.
+            // A zero-at-trailer fixture cannot distinguish "left unchanged"
+            // from the wrong implementation "force to zero".
+            inner: Body::new(ScriptedBody::new(vec![Step::Data(b"ab"), Step::Trailers])),
             remaining: Some(4),
         };
 
@@ -1362,7 +1365,7 @@ mod tests {
             .expect("a data frame")
             .expect("no error");
         assert!(first.is_data(), "precondition: first frame carries data");
-        assert_eq!(body.size_hint().exact(), Some(0), "4 data bytes consumed");
+        assert_eq!(body.size_hint().exact(), Some(2), "2 data bytes consumed");
 
         let second = std::pin::Pin::new(&mut body)
             .frame()
@@ -1376,9 +1379,9 @@ mod tests {
         );
         assert_eq!(
             body.size_hint().exact(),
-            Some(0),
+            Some(2),
             "a trailer carries no counted bytes, so it must not move the \
-             remaining count — not even below zero into unknown"
+             nonzero remaining count"
         );
     }
 
