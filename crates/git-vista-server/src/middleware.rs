@@ -1922,6 +1922,76 @@ mod tests {
         );
     }
 
+    /// #540: the success reader needs the same protection from an endless
+    /// run of ready empty frames as [`split_at_limit`], but its conservative
+    /// exhaustion result is different: it must stop classifying and forward
+    /// the body as [`ReadyOutcome::NotReady`], not call it an overflow.
+    ///
+    /// This is driven on a worker OS thread for the same reason as the test
+    /// above. An always-ready body never yields to a runtime timer, so only an
+    /// external `recv_timeout` can reliably distinguish "returned" from
+    /// "spinning forever".
+    #[test]
+    fn an_endless_run_of_empty_frames_does_not_spin_split_at_limit_when_ready() {
+        struct EndlessExactZeroBody;
+
+        impl HttpBody for EndlessExactZeroBody {
+            type Data = Bytes;
+            type Error = std::convert::Infallible;
+
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+                Poll::Ready(Some(Ok(Frame::data(Bytes::new()))))
+            }
+
+            fn size_hint(&self) -> SizeHint {
+                SizeHint::with_exact(0)
+            }
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let body = Body::new(EndlessExactZeroBody);
+            let original_exact = body.size_hint().exact();
+            assert_eq!(
+                original_exact,
+                Some(0),
+                "the endless fixture must truthfully promise zero data bytes"
+            );
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("building a throwaway single-threaded runtime for this worker thread");
+            let outcome = rt.block_on(split_at_limit_when_ready(
+                body,
+                MAX_ERROR_BODY,
+                original_exact,
+            ));
+            let _ = tx.send(outcome);
+        });
+
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect(
+                "split_at_limit_when_ready must give up once its frame budget \
+                 is exhausted instead of spinning forever on ready empty frames",
+            );
+        let forwarded = match outcome {
+            ReadyOutcome::NotReady(body) => body,
+            ReadyOutcome::Ready(_, _) => panic!(
+                "frame-budget exhaustion cannot classify this body as ready; \
+                 it must conservatively forward it unlabeled"
+            ),
+        };
+        assert_eq!(
+            forwarded.size_hint().exact(),
+            Some(0),
+            "forwarding the exact-zero body must preserve its truthful hint"
+        );
+    }
+
     /// #336: a **success** body that is hand-serialized JSON is labeled
     /// `application/json` too, on every route rather than one.
     ///
