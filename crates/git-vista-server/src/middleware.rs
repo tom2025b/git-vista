@@ -1312,6 +1312,7 @@ mod tests {
                 HeaderValue::from_bytes(b"opaque\xfa")
                     .expect("opaque bytes are legal in an HTTP header value"),
             );
+            trailers.insert("x-empty", HeaderValue::from_static(""));
             Poll::Ready(Some(Ok(Frame::trailers(trailers))))
         }
 
@@ -1745,6 +1746,23 @@ mod tests {
                     .as_bytes(),
                 b"opaque\xfa",
                 "at {remaining:?}"
+            );
+            assert_eq!(
+                trailers
+                    .get("x-empty")
+                    .expect("the empty-valued trailer remains")
+                    .as_bytes(),
+                b"",
+                "at {remaining:?}"
+            );
+            assert_eq!(
+                trailers.len(),
+                4,
+                "no trailer fields may be injected or removed at {remaining:?}"
+            );
+            assert!(
+                !trailers.contains_key("x-known-size-body"),
+                "delegation must not inject wrapper-specific trailer fields"
             );
             assert_eq!(body.size_hint().exact(), remaining);
         }
