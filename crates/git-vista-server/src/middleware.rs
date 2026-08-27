@@ -1512,6 +1512,32 @@ mod tests {
         );
     }
 
+    /// HTTP body sizes count octets, not Unicode scalar values. A valid UTF-8
+    /// payload therefore still consumes its full byte length.
+    #[tokio::test]
+    async fn a_multibyte_data_frame_counts_bytes_not_characters() {
+        let payload = "é".as_bytes();
+        assert_eq!(payload.len(), 2, "precondition: UTF-8 uses two bytes here");
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::new(vec![Step::Data(payload)])),
+            remaining: Some(payload.len() as u64),
+        };
+
+        let data = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the multibyte frame remains")
+            .expect("the multibyte frame is not an error")
+            .into_data()
+            .expect("the frame carries data");
+        assert_eq!(data.as_ref(), payload, "payload bytes must be unchanged");
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(0),
+            "both UTF-8 bytes must be consumed"
+        );
+    }
+
     /// An empty DATA frame is still a frame, not an end-of-stream marker, and
     /// it consumes zero declared bytes. A wrapper that launders it into
     /// `Ready(None)` hides every later frame; one that merely invalidates the
