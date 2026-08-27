@@ -881,7 +881,6 @@ mod tests {
     /// some of them on its own schedule rather than all at once.
     struct ScheduledBody {
         frames: VecDeque<(bool, Bytes)>,
-        total_len: u64,
         delay: Duration,
         pending: Option<Pin<Box<tokio::time::Sleep>>>,
     }
@@ -893,13 +892,11 @@ mod tests {
         /// all, and reusing it keeps every fixture built from this type
         /// timed the same way.
         fn new(frames: Vec<(bool, &'static [u8])>, delay: Duration) -> Self {
-            let total_len = frames.iter().map(|(_, d)| d.len() as u64).sum();
             Self {
                 frames: frames
                     .into_iter()
                     .map(|(slow, d)| (slow, Bytes::from_static(d)))
                     .collect(),
-                total_len,
                 delay,
                 pending: None,
             }
@@ -931,8 +928,93 @@ mod tests {
             Poll::Ready(Some(Ok(Frame::data(data))))
         }
 
+        /// The bytes still to come, recomputed from what is actually left —
+        /// not the length this body started with.
+        ///
+        /// `http_body`'s contract is that `size_hint` describes what REMAINS,
+        /// and a fixture that keeps reporting its original total after
+        /// yielding half of it is not a model of a real body: it is a model of
+        /// a body that lies, which makes it useless for proving how production
+        /// treats an honest one. Before this, the initial total was stored once
+        /// and returned forever.
+        ///
+        /// The value the gate in `relabel_json_success` actually reads is
+        /// unchanged, because that read happens before any frame is taken —
+        /// with nothing yet popped, "what remains" and "the total" are the same
+        /// number. What changes is that the fixture stays truthful *after* that
+        /// point, so any future assertion about a partially-drained body is
+        /// measuring production rather than the double's own bookkeeping bug.
         fn size_hint(&self) -> SizeHint {
-            SizeHint::with_exact(self.total_len)
+            SizeHint::with_exact(self.frames.iter().map(|(_, d)| d.len() as u64).sum())
+        }
+    }
+
+    /// Grafted from #564 (pair 540 adjudication): the NON-RACING half of the
+    /// readiness proof.
+    ///
+    /// [`ScheduledBody`] proves the gate does not wait for a frame that
+    /// arrives *late* — but "late" means a real duration, so a test built on
+    /// it can only distinguish correct from broken by how long it took, and
+    /// a loaded machine can blur that. A body that never yields at all has no
+    /// race to win: correct behaviour returns almost immediately, and the old
+    /// defect never returns. The bound in the tests below is therefore not
+    /// measuring speed — it is the only way to tell "returned" from "hung
+    /// forever" without waiting forever.
+    ///
+    /// Both fixtures are kept, deliberately. They prove different things:
+    /// indefinite `Pending` makes a blocking gate unambiguous, while
+    /// [`ScheduledBody`]'s eventual completion proves the body is *forwarded*
+    /// rather than dropped. Neither implies the other.
+    struct ExactSizeNeverReady {
+        len: u64,
+    }
+
+    impl HttpBody for ExactSizeNeverReady {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            Poll::Pending
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::with_exact(self.len)
+        }
+    }
+
+    /// The paired mutation-catcher, also grafted from #564: a body that hands
+    /// over its first frame immediately and then goes `Pending` forever,
+    /// while `size_hint` still promises both bytes.
+    ///
+    /// A gate that checks readiness only ONCE — on the first frame — and then
+    /// falls back to awaiting the rest would read one byte synchronously and
+    /// hang exactly like the original defect. This fixture only goes green if
+    /// every frame's readiness is checked, which is the invariant
+    /// `split_at_limit_when_ready`'s loop actually encodes.
+    struct ReadyOnceThenNeverReady {
+        served_first: bool,
+    }
+
+    impl HttpBody for ReadyOnceThenNeverReady {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            if self.served_first {
+                return Poll::Pending;
+            }
+            self.served_first = true;
+            Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"{")))))
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::with_exact(2)
         }
     }
 
@@ -1142,6 +1224,30 @@ mod tests {
                             vec![(false, b"{\"a\":1".as_slice()), (true, b"}".as_slice())],
                             SLOW_FRAME_DELAY,
                         )))
+                        .unwrap()
+                }),
+            )
+            // #540, grafted from #564: bodies whose `size_hint` claims data
+            // that never becomes ready to hand over — at all, or past the
+            // first frame. Unlike the two `slow-*` routes above these have no
+            // timing to lose: a gate that awaits them never returns.
+            .route(
+                "/api/exact-size-never-ready",
+                get(|| async {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Body::new(ExactSizeNeverReady { len: 2 }))
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/api/exact-size-ready-once-then-never",
+                get(|| async {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Body::new(ReadyOnceThenNeverReady {
+                            served_first: false,
+                        }))
                         .unwrap()
                 }),
             )
@@ -1363,6 +1469,79 @@ mod tests {
             oversized_hook_output(),
             "the hook's own text must arrive byte-for-byte, not truncated at \
              the buffering cap"
+        );
+    }
+
+    /// Grafted from #564 (pair 540 adjudication). #540: an exact size states a
+    /// byte COUNT, not readiness. A body that truthfully reports
+    /// `size_hint().exact() == Some(2)` but never becomes ready to produce
+    /// those bytes must not delay the response's headers.
+    ///
+    /// Before the fix the gate trusted the size alone and unconditionally
+    /// awaited the body to classify it; against a body that never becomes
+    /// ready, that await never resolves and the whole response hangs.
+    ///
+    /// The bound here is NOT a speed assertion — this repo's standing caution
+    /// against wall-clock tests still holds. It is the only way to tell
+    /// "returned" from "hung forever" without waiting forever: correct
+    /// behaviour returns in microseconds, the defect never returns at all, and
+    /// any generous bound cleanly separates the two. That is exactly why the
+    /// never-ready shape is worth keeping alongside `ScheduledBody` — the slow
+    /// fixtures have a real duration to race, and this one has none.
+    #[tokio::test]
+    async fn an_exact_sized_body_that_is_never_ready_does_not_delay_headers() {
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            app().oneshot(get_req(
+                "/api/exact-size-never-ready",
+                Some(&PROTOCOL_VERSION.to_string()),
+            )),
+        )
+        .await
+        .expect(
+            "relabel_json_success awaited a body that reports an exact size \
+             but never becomes ready — the #540 defect: an exact size is a \
+             byte-count promise, not a readiness one",
+        )
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        // Unread and unrelabeled: nothing about the body was ever safe to
+        // look at, so it must carry no content-type of the gate's making.
+        assert!(
+            resp.headers().get(header::CONTENT_TYPE).is_none(),
+            "a body that was never polled cannot have gained a content-type"
+        );
+    }
+
+    /// The paired mutation-catcher for a *weakened* readiness gate, also
+    /// grafted from #564: a gate that checks only the FIRST frame's readiness
+    /// and then falls back to awaiting the rest would still hang here, because
+    /// `size_hint` promises two bytes and only the first is ever produced.
+    ///
+    /// This is the assertion that pins "every frame", not "the first frame" —
+    /// the invariant `split_at_limit_when_ready`'s loop actually encodes, and
+    /// the one a plausible simplification would quietly break.
+    #[tokio::test]
+    async fn an_exact_sized_body_ready_once_then_never_does_not_delay_headers() {
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            app().oneshot(get_req(
+                "/api/exact-size-ready-once-then-never",
+                Some(&PROTOCOL_VERSION.to_string()),
+            )),
+        )
+        .await
+        .expect(
+            "relabel_json_success kept awaiting past the first frame — a gate \
+             that only checks readiness once still delays headers on a body \
+             that goes Pending on its second frame",
+        )
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(
+            resp.headers().get(header::CONTENT_TYPE).is_none(),
+            "the body was only partially read before going Pending, so it \
+             must not have been relabeled"
         );
     }
 
