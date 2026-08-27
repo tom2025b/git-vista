@@ -1530,6 +1530,47 @@ mod tests {
         );
     }
 
+    /// Invalidating the byte-count hint does not invalidate non-DATA frame
+    /// semantics. A trailer after an overrun remains observable with its exact
+    /// metadata, and the hint remains unknown before and after it.
+    #[tokio::test]
+    async fn trailers_after_an_overrun_are_preserved() {
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::new(vec![
+                Step::Data(b"abc"),
+                Step::Trailers,
+            ])),
+            remaining: Some(2),
+        };
+
+        let data = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the boundary-crossing frame remains")
+            .expect("no error")
+            .into_data()
+            .expect("the first frame is data");
+        assert_eq!(data, Bytes::from_static(b"abc"));
+        assert_eq!(body.size_hint().exact(), None);
+
+        let trailers = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("trailers after an overrun are not EOF")
+            .expect("trailers are not an error")
+            .into_trailers()
+            .expect("the second frame carries trailers");
+        assert_eq!(
+            trailers.get("x-checksum"),
+            Some(&HeaderValue::from_static("ok")),
+            "the wrapper must preserve exact trailer metadata"
+        );
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), None, "a trailer cannot restore exactness");
+        assert_eq!(hint.lower(), 0, "unknown keeps a zero lower bound");
+        assert_eq!(hint.upper(), None, "unknown keeps no upper bound");
+    }
+
     /// N1, and the worst of them: `is_end_stream` is not cosmetic metadata.
     ///
     /// Hyper checks it before retaining a response body — its HTTP/1

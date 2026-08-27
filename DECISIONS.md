@@ -12,3 +12,4 @@
 - 2026-08-27 codex — Assert unknown rejoin hints before polling; survivor S13 defaulted absent `original_exact` to zero, a false framing claim that later frame reads happened to invalidate after the damage point.
 - 2026-08-27 codex — Exercise `Pending` after exact DATA with trailers still queued; survivor S14 converted that readiness state to EOF because the earlier Pending fixture ran only at a positive remainder.
 - 2026-08-27 codex — Exercise an error after exact DATA and assert its original text plus unchanged hint; survivor S15 laundered errors only at `Some(0)`/`None`, outside the earlier underrun fixture.
+- 2026-08-27 codex — Exercise trailers after a direct overrun and pin `x-checksum`; survivor S16 dropped trailers only after `remaining` became unknown, a state no trailer fixture reached.
