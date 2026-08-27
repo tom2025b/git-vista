@@ -37,3 +37,4 @@
 - 2026-08-27 codex — Exercise `Some(1)` as a subtraction result, not only a construction state; S35 discarded exactly-one-byte remainders as unknown, survived 54/0, and is caught 54/1 by `a_data_frame_can_leave_exactly_one_byte_remaining`.
 - 2026-08-27 codex — Require delegated true EOS across accounting states; S36 gated inner EOS on a positive remainder, survived 55/0, and is caught 53/2 by the unknown-hint exact-exhaustion and invalidated-EOF assertions.
 - 2026-08-27 codex — Make `ScriptedBody` report its real lifecycle so an inner unknown byte hint cannot mask delegation; S37 gated EOS on inner exact zero, survived 55/0, and is caught 54/1 by `a_known_size_body_delegates_end_of_stream_to_the_inner_body`.
+- 2026-08-27 codex — Exercise the empty-head rejoin arm with a nonzero claim and an immediate typed error; S38 hardcoded that arm to exact zero, survived 55/0, and is caught 55/1 by `rejoin_restores_a_nonzero_size_when_the_head_is_empty`.

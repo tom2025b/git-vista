@@ -2457,6 +2457,32 @@ mod tests {
         assert_eq!(body.size_hint().exact(), Some(0));
     }
 
+    /// An empty prefix can also precede an error before any declared DATA was
+    /// observed. It does not prove that the original exact claim was zero;
+    /// the empty-head arm must restore any known value and still delegate the
+    /// remainder's original error.
+    #[tokio::test]
+    async fn rejoin_restores_a_nonzero_size_when_the_head_is_empty() {
+        let rest = Body::new(ScriptedBody::new(vec![Step::MarkerError]));
+        let mut body = rejoin(Bytes::new(), Some(rest), Some(7));
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), Some(7));
+        assert_eq!(hint.lower(), 7);
+        assert_eq!(hint.upper(), Some(7));
+
+        let error = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the empty-head remainder is not clean EOF")
+            .expect_err("the remainder's marker error is preserved");
+        assert_eq!(error.to_string(), "marker body failure");
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(7),
+            "an error consumes none of the declared bytes"
+        );
+    }
+
     /// #336, the other half: an over-cap body that is genuinely plain text is
     /// still enveloped — and the envelope carries what the server said, with an
     /// explicit truncation marker, instead of collapsing to the status's
