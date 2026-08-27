@@ -34,6 +34,15 @@ Two mechanism mutations, with the assertion unchanged:
 
 After each mutation, the source and its saved green copy both had SHA-256 `19b3e20c8001683dddd1dd6046eadb366d51caa8e633b7233b3e098ae69a7062`.
 
+Independent review found that the initial exact-zero case did not pin the exact boundary or prove that exhaustion rejoined a non-empty prefix. The final regression is therefore stronger: it yields one counted byte, then endless ready empty frames, and asserts exactly 4,096 polls, the original exact hint, replay of the consumed `{`, and no extra remainder poll during replay.
+
+Two additional mechanism mutations on that final regression failed differently:
+
+1. Changed the pre-poll comparison from `>= MAX_SPLIT_FRAMES` to `> MAX_SPLIT_FRAMES`: failed with 4,097 polls versus the required 4,096.
+2. Returned raw `body` instead of `NotReady(rejoin(...))` on exhaustion: failed with actual remaining hint `Some(0)` versus restored original hint `Some(1)`.
+
+After each review-driven mutation, the source and its saved green copy both had SHA-256 `39f296a3039104915f1a6d22802c01331387a78ce3808bbdb8f70a3d41d2cb91`, and the exact regression passed again after restoration.
+
 ### Defect 2 — `ReadyOnceThenNeverReady` remaining size
 
 Exact command:

@@ -448,10 +448,11 @@ enum ReadyOutcome {
     /// Every frame read so far arrived the instant it was polled — the same
     /// outcome [`split_at_limit`] always returns.
     Ready(Bytes, BodyRemainder),
-    /// A frame was not available the instant it was polled. The body is
-    /// handed back exactly as it stood before that poll — nothing read from
-    /// it is lost, and nothing about it is altered — so the caller can
-    /// forward it untouched instead of waiting.
+    /// Classification stopped conservatively: either a frame was not ready
+    /// on its first poll, or the frame budget was exhausted. Any prefix
+    /// already read is rejoined with the unread body, so the caller can
+    /// forward the complete byte sequence unlabeled instead of waiting or
+    /// guessing.
     NotReady(Body),
 }
 
@@ -991,8 +992,8 @@ mod tests {
     }
 
     /// The paired mutation-catcher, also grafted from #564: a body that hands
-    /// over its first frame immediately and then goes `Pending` forever,
-    /// while `size_hint` still promises both bytes.
+    /// over its first frame immediately and then goes `Pending` forever.
+    /// Its hint truthfully starts at two bytes and falls to one afterward.
     ///
     /// A gate that checks readiness only ONCE — on the first frame — and then
     /// falls back to awaiting the rest would read one byte synchronously and
@@ -1958,10 +1959,12 @@ mod tests {
         );
     }
 
-    /// #540: the success reader needs the same protection from an endless
-    /// run of ready empty frames as [`split_at_limit`], but its conservative
-    /// exhaustion result is different: it must stop classifying and forward
-    /// the body as [`ReadyOutcome::NotReady`], not call it an overflow.
+    /// #540: after one ready byte, the success reader needs the same
+    /// protection from an endless run of ready empty frames as
+    /// [`split_at_limit`], but its conservative exhaustion result is
+    /// different: it must stop classifying, rejoin the consumed prefix, and
+    /// forward the body as [`ReadyOutcome::NotReady`], not call it an
+    /// overflow.
     ///
     /// This is driven on a worker OS thread for the same reason as the test
     /// above. An always-ready body never yields to a runtime timer, so only an
@@ -1969,9 +1972,12 @@ mod tests {
     /// "spinning forever".
     #[test]
     fn an_endless_run_of_empty_frames_does_not_spin_split_at_limit_when_ready() {
-        struct EndlessExactZeroBody;
+        struct CountedPrefixThenEndlessEmptyBody {
+            served_prefix: bool,
+            polls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
 
-        impl HttpBody for EndlessExactZeroBody {
+        impl HttpBody for CountedPrefixThenEndlessEmptyBody {
             type Data = Bytes;
             type Error = std::convert::Infallible;
 
@@ -1979,22 +1985,34 @@ mod tests {
                 self: Pin<&mut Self>,
                 _cx: &mut Context<'_>,
             ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+                let this = self.get_mut();
+                this.polls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if !this.served_prefix {
+                    this.served_prefix = true;
+                    return Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"{")))));
+                }
                 Poll::Ready(Some(Ok(Frame::data(Bytes::new()))))
             }
 
             fn size_hint(&self) -> SizeHint {
-                SizeHint::with_exact(0)
+                SizeHint::with_exact(if self.served_prefix { 0 } else { 1 })
             }
         }
 
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_polls = std::sync::Arc::clone(&polls);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let body = Body::new(EndlessExactZeroBody);
+            let body = Body::new(CountedPrefixThenEndlessEmptyBody {
+                served_prefix: false,
+                polls: worker_polls,
+            });
             let original_exact = body.size_hint().exact();
             assert_eq!(
                 original_exact,
-                Some(0),
-                "the endless fixture must truthfully promise zero data bytes"
+                Some(1),
+                "the fixture must truthfully promise its one-byte prefix"
             );
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_time()
@@ -2010,9 +2028,14 @@ mod tests {
 
         let outcome = rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
             "split_at_limit_when_ready must give up once its frame budget \
-                 is exhausted instead of spinning forever on ready empty frames",
+             is exhausted instead of spinning forever on ready empty frames",
         );
-        let forwarded = match outcome {
+        assert_eq!(
+            polls.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_SPLIT_FRAMES,
+            "the reader must poll exactly its frame budget before giving up"
+        );
+        let mut forwarded = match outcome {
             ReadyOutcome::NotReady(body) => body,
             ReadyOutcome::Ready(_, _) => panic!(
                 "frame-budget exhaustion cannot classify this body as ready; \
@@ -2021,8 +2044,26 @@ mod tests {
         };
         assert_eq!(
             forwarded.size_hint().exact(),
-            Some(0),
-            "forwarding the exact-zero body must preserve its truthful hint"
+            Some(1),
+            "rejoining must restore the original body's one-byte exact hint"
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("building a throwaway runtime to inspect the forwarded prefix");
+        let replayed = rt.block_on(async {
+            forwarded
+                .frame()
+                .await
+                .expect("the consumed prefix must be replayed")
+                .expect("the fixture is infallible")
+                .into_data()
+                .expect("the replayed prefix must remain a data frame")
+        });
+        assert_eq!(replayed, Bytes::from_static(b"{"));
+        assert_eq!(
+            polls.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_SPLIT_FRAMES,
+            "replaying the saved prefix must not poll the unread remainder"
         );
     }
 
