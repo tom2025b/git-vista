@@ -13,3 +13,4 @@
 - 2026-08-27 codex — Exercise `Pending` after exact DATA with trailers still queued; survivor S14 converted that readiness state to EOF because the earlier Pending fixture ran only at a positive remainder.
 - 2026-08-27 codex — Exercise an error after exact DATA and assert its original text plus unchanged hint; survivor S15 laundered errors only at `Some(0)`/`None`, outside the earlier underrun fixture.
 - 2026-08-27 codex — Exercise trailers after a direct overrun and pin `x-checksum`; survivor S16 dropped trailers only after `remaining` became unknown, a state no trailer fixture reached.
+- 2026-08-27 codex — Cover `rejoin`'s empty-head/rest-present arm with exact-zero DATA plus trailers; survivor S17 returned the unknown stream early and skipped restoration of `original_exact`.

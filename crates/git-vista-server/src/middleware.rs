@@ -1964,6 +1964,36 @@ mod tests {
         assert_eq!(bytes, Bytes::from_static(b"abcdef"));
     }
 
+    /// An empty prefix is an optimization opportunity, not permission to skip
+    /// restoring the original exact hint. A zero-byte body may still carry
+    /// trailers, so `rest` is present even though `head` is empty; returning
+    /// that stream directly would downgrade exact zero to unknown.
+    #[tokio::test]
+    async fn rejoin_restores_a_known_size_when_the_head_is_empty() {
+        let rest = Body::new(ScriptedBody::new(vec![Step::Trailers]));
+        assert_eq!(
+            rest.size_hint().exact(),
+            None,
+            "precondition: the frame-level trailer stream has no exact hint"
+        );
+
+        let mut body = rejoin(Bytes::new(), Some(rest), Some(0));
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(0),
+            "the original zero-byte claim must survive the empty-head arm"
+        );
+        let trailers = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the trailer remainder remains")
+            .expect("trailers are not an error")
+            .into_trailers()
+            .expect("the remainder carries trailers");
+        assert_eq!(trailers.get("x-checksum").unwrap(), "ok");
+        assert_eq!(body.size_hint().exact(), Some(0));
+    }
+
     /// #336, the other half: an over-cap body that is genuinely plain text is
     /// still enveloped — and the envelope carries what the server said, with an
     /// explicit truncation marker, instead of collapsing to the status's
