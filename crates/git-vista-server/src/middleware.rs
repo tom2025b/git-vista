@@ -2166,13 +2166,16 @@ mod tests {
                 }),
                 remaining,
             };
-            let wake_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let caller =
-                std::task::Waker::from(Arc::new(CountingWake(Arc::clone(&wake_count))));
-            let mut cx = Context::from_waker(&caller);
+            let wake_count_a = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let wake_count_b = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let caller_a =
+                std::task::Waker::from(Arc::new(CountingWake(Arc::clone(&wake_count_a))));
+            let caller_b =
+                std::task::Waker::from(Arc::new(CountingWake(Arc::clone(&wake_count_b))));
+            let mut cx_a = Context::from_waker(&caller_a);
 
             assert!(matches!(
-                Pin::new(&mut body).poll_frame(&mut cx),
+                Pin::new(&mut body).poll_frame(&mut cx_a),
                 Poll::Pending
             ));
             assert_eq!(
@@ -2180,23 +2183,45 @@ mod tests {
                 remaining,
                 "Pending must preserve the accounting state under test"
             );
-            let inner_waker = captured
+            let first_waker = captured
                 .lock()
                 .expect("the waker probe lock is not poisoned")
                 .take()
                 .expect("the inner body must receive a waker before returning Pending");
             assert!(
-                inner_waker.will_wake(&caller),
+                first_waker.will_wake(&caller_a) && !first_waker.will_wake(&caller_b),
                 "KnownSizeBody must forward the caller's waker in state \
                  {remaining:?}, not substitute an inert context"
             );
-            inner_waker.wake_by_ref();
+            first_waker.wake_by_ref();
             assert_eq!(
-                wake_count.load(Ordering::Relaxed),
+                wake_count_a.load(Ordering::Relaxed),
                 1,
                 "waking through the inner body's captured waker in state \
                  {remaining:?} must reach the caller"
             );
+            assert_eq!(wake_count_b.load(Ordering::Relaxed), 0);
+
+            let mut cx_b = Context::from_waker(&caller_b);
+            assert!(matches!(
+                Pin::new(&mut body).poll_frame(&mut cx_b),
+                Poll::Pending
+            ));
+            let replacement_waker = captured
+                .lock()
+                .expect("the waker probe lock is not poisoned")
+                .take()
+                .expect("the inner body must receive the replacement waker");
+            assert!(
+                replacement_waker.will_wake(&caller_b)
+                    && !replacement_waker.will_wake(&caller_a),
+                "a second poll in state {remaining:?} must replace a stale \
+                 caller waker"
+            );
+            replacement_waker.wake_by_ref();
+            assert_eq!(wake_count_a.load(Ordering::Relaxed), 1);
+            assert_eq!(wake_count_b.load(Ordering::Relaxed), 1);
+            assert_eq!(body.size_hint().exact(), remaining);
         }
     }
 
