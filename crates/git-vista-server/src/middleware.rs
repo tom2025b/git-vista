@@ -2318,6 +2318,24 @@ mod tests {
         assert_eq!(bytes, Bytes::from_static(b"abc"));
     }
 
+    /// With no unread remainder, the buffered prefix is the complete observed
+    /// body even when the producer never offered an original exact hint.
+    /// Routing those bytes back through a frame stream would retain payload
+    /// while unnecessarily discarding their now-known length.
+    #[tokio::test]
+    async fn rejoin_uses_observed_length_without_an_original_hint() {
+        let body = rejoin(Bytes::from_static(b"abc"), None, None);
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), Some(3));
+        assert_eq!(hint.lower(), 3);
+        assert_eq!(hint.upper(), Some(3));
+
+        let bytes = axum::body::to_bytes(body, 4)
+            .await
+            .expect("the fully observed body remains readable");
+        assert_eq!(bytes, Bytes::from_static(b"abc"));
+    }
+
     /// Once the split has reached EOF, the buffered prefix is the complete
     /// body and its observed length is stronger evidence than the original
     /// producer's claim. The no-remainder fast path must not re-wrap these
