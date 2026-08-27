@@ -1396,27 +1396,20 @@ mod tests {
     #[tokio::test]
     async fn a_body_that_overruns_its_declared_length_stops_claiming_one() {
         let mut body = KnownSizeBody {
-            // THREE chunks, not two. The second frame is what drives
-            // `remaining` to `None`; a two-frame fixture ends on exactly that
-            // transition and can never ask what happens AFTER it. Mutations
-            // N5 (stop polling once unknown) and N6 (let unknown become exact
-            // again) both survived for want of this third frame.
-            inner: Body::new(ScriptedBody::data(&[b"ab", b"cde", b"f"])),
+            // THREE chunks, not two. The first crosses the declared boundary
+            // directly (2 promised, 3 delivered), and the later frames prove
+            // that invalidating the hint neither stops polling nor lets a
+            // confident exact claim reappear.
+            inner: Body::new(ScriptedBody::data(&[b"abc", b"de", b"f"])),
             remaining: Some(2),
         };
-        let mut delivered = 0usize;
-        while let Some(frame) = std::pin::Pin::new(&mut body).frame().await {
-            if let Some(data) = frame.expect("no errors").data_ref() {
-                delivered += data.len();
-            }
-        }
-        assert_eq!(
-            delivered, 6,
-            "an overrun invalidates the HINT, never the body: every later byte \
-             must still be delivered. A wrapper that stops polling once it can \
-             no longer count is silently truncating the response"
-        );
 
+        let first = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the boundary-crossing frame remains")
+            .expect("no error");
+        assert_eq!(first.data_ref().map(Bytes::len), Some(3));
         let hint = body.size_hint();
         assert_eq!(
             hint.exact(),
@@ -1429,8 +1422,35 @@ mod tests {
         assert_eq!(
             hint.upper(),
             None,
-            "unknown must STAY unknown — a later data frame must not restore a \
-             confident exact claim the body already disproved"
+            "crossing the boundary inside one frame must invalidate the hint \
+             immediately, never saturate at an exact zero"
+        );
+
+        let second = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the first post-invalidation frame remains")
+            .expect("no error");
+        assert_eq!(second.data_ref().map(Bytes::len), Some(2));
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), None, "unknown must stay unknown");
+        assert_eq!(hint.lower(), 0, "unknown keeps a zero lower bound");
+        assert_eq!(hint.upper(), None, "unknown keeps no upper bound");
+
+        let third = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the second post-invalidation frame remains")
+            .expect("no error");
+        assert_eq!(third.data_ref().map(Bytes::len), Some(1));
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), None, "later data cannot restore exactness");
+        assert_eq!(hint.lower(), 0, "unknown keeps a zero lower bound");
+        assert_eq!(hint.upper(), None, "unknown keeps no upper bound");
+
+        assert!(
+            std::pin::Pin::new(&mut body).frame().await.is_none(),
+            "precondition: the fixture delivered exactly three frames"
         );
     }
 
