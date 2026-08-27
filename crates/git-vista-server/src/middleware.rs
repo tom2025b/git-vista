@@ -27,7 +27,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use http_body::{Body as HttpBody, Frame};
+use http_body::{Body as HttpBody, Frame, SizeHint};
 use http_body_util::{BodyExt, StreamBody};
 
 use git_vista_protocol::{
@@ -258,6 +258,10 @@ async fn rewrap_error(response: Response, request_id: &RequestId) -> Response {
     }
     let (mut parts, body) = response.into_parts();
     let status = parts.status;
+    // Read off before `split_at_limit` consumes `body`: splitting and
+    // rejoining never change the byte count, so whatever the pre-split body
+    // already knew about its own length is still true of the rejoined one.
+    let original_exact = body.size_hint().exact();
     let (head, remainder) = split_at_limit(body, MAX_ERROR_BODY).await;
     let (rest, complete, overflow) = match remainder {
         BodyRemainder::End => (None, true, false),
@@ -270,7 +274,7 @@ async fn rewrap_error(response: Response, request_id: &RequestId) -> Response {
         // frame. Put the consumed prefix back and preserve the original
         // response headers and frame semantics.
         BodyRemainder::Interrupted(rest) => {
-            return Response::from_parts(parts, rejoin(head, Some(rest)));
+            return Response::from_parts(parts, rejoin(head, Some(rest), original_exact));
         }
     };
 
@@ -304,7 +308,7 @@ async fn rewrap_error(response: Response, request_id: &RequestId) -> Response {
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         );
-        return Response::from_parts(parts, rejoin(head, rest));
+        return Response::from_parts(parts, rejoin(head, rest, original_exact));
     }
 
     let message = String::from_utf8_lossy(&head).trim().to_string();
@@ -369,12 +373,43 @@ enum BodyRemainder {
     Interrupted(Body),
 }
 
+/// Upper bound on how many frames [`split_at_limit`] will read while still
+/// trying to classify a body against `limit` bytes.
+///
+/// The byte cap alone cannot bound the loop: a frame that carries zero data
+/// bytes (an empty `Frame::data`, legal for any `http_body::Body` to yield,
+/// and something a hand-rolled or adversarial stream can yield forever, each
+/// one immediately `Ready`) never advances `head.len()`, so a byte-only exit
+/// condition never fires. This budget is a second, independent exit: once
+/// exhausted, the loop gives up on classification — precisely as though the
+/// body were an oversized one — and forwards whatever remains **unread**,
+/// rather than spinning on frames that will never cross the limit.
+///
+/// 4096 is picked to sit far above anything a real error body should ever
+/// need: `MAX_ERROR_BODY` is 64 KiB, and even a body chunked unusually
+/// finely — 16 bytes per frame — would still cross the byte limit in exactly
+/// 4096 frames and return through the ordinary `Overflow` path well before
+/// this budget is ever consulted. Only a run of frames that keep the loop
+/// spinning *without* moving `head.len()` can actually exhaust it.
+const MAX_SPLIT_FRAMES: usize = 4096;
+
 async fn split_at_limit(mut body: Body, limit: usize) -> (Bytes, BodyRemainder) {
     let mut head: Vec<u8> = Vec::new();
+    let mut frames_read: usize = 0;
     loop {
+        if frames_read >= MAX_SPLIT_FRAMES {
+            // Every frame read so far has already been folded into `head` (a
+            // data frame's bytes appended) or has already caused an early
+            // return in the branch below (trailers, a transport error, or a
+            // byte-overflowing data frame) — nothing has been read-but-not-
+            // yet-handled at this point, so there is no frame to carry
+            // forward and `body` itself is exactly "everything unread".
+            return (Bytes::from(head), BodyRemainder::Overflow(body));
+        }
         let Some(frame) = body.frame().await else {
             return (Bytes::from(head), BodyRemainder::End);
         };
+        frames_read += 1;
         let frame = match frame {
             Ok(frame) => frame,
             Err(error) => {
@@ -512,14 +547,73 @@ fn prepend_frame(first: Result<Frame<Bytes>, axum::Error>, mut rest: Body) -> Bo
     }))
 }
 
+/// Wraps a body whose total byte count is already known, restoring that
+/// length after it would otherwise be lost.
+///
+/// `prepend_frame` (which both `rejoin` and `split_at_limit` build on) routes
+/// everything through `StreamBody::new(async_stream::stream! { .. })`, and an
+/// async stream has no way to describe its own length up front — it reports
+/// `SizeHint::default()` (lower `0`, upper `None`) regardless of what it will
+/// actually yield. That is correct for a genuine stream, but wrong for a body
+/// that started life with a known exact size and was merely split into two
+/// pieces and stitched back together: no byte was added or dropped, so the
+/// combined length is still known, and a caller further up (e.g. hyper
+/// deciding whether to frame the response with `Content-Length` or fall back
+/// to chunked transfer) deserves to be told that.
+///
+/// This delegates frame polling to the wrapped body untouched and overrides
+/// only `size_hint`, so it changes nothing about what bytes are produced or
+/// when — only what the body *claims* about its own length.
+struct KnownSizeBody {
+    inner: Body,
+    exact: u64,
+}
+
+impl HttpBody for KnownSizeBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.exact)
+    }
+}
+
 /// Put a prefix back in front of the remainder it was split from, so the whole
 /// body is forwarded byte-for-byte. `None` means there was no remainder and the
 /// prefix *is* the body.
-fn rejoin(head: Bytes, rest: Option<Body>) -> Body {
-    match rest {
-        None => Body::from(head),
+///
+/// `original_exact` is the *pre-split* body's own `size_hint().exact()`, read
+/// by the caller before it ever called `split_at_limit`. Splitting a body into
+/// a bytes-in-hand prefix plus an unread remainder, then stitching the two
+/// back together, does not change the total byte count — so when the original
+/// length was known, the rejoined body still reports it, via
+/// [`KnownSizeBody`], instead of silently acquiring the unknown-length default
+/// the moment a remainder gets routed through `prepend_frame`. When the
+/// original body never had a known length (a genuine stream), `None` here
+/// leaves the rejoined body exactly as unknown-length as it already was.
+fn rejoin(head: Bytes, rest: Option<Body>, original_exact: Option<u64>) -> Body {
+    let joined = match rest {
+        None => return Body::from(head),
         Some(rest) if head.is_empty() => rest,
         Some(rest) => prepend_frame(Ok(Frame::data(head)), rest),
+    };
+    match original_exact {
+        Some(exact) => Body::new(KnownSizeBody {
+            inner: joined,
+            exact,
+        }),
+        None => joined,
     }
 }
 
@@ -676,7 +770,12 @@ async fn relabel_json_success(response: Response) -> Response {
             HeaderValue::from_static("application/json"),
         );
     }
-    Response::from_parts(parts, rejoin(head, rest))
+    // `exact` was already established above (the gate this function opens
+    // on) to be `Some` and within `MAX_ERROR_BODY` before `split_at_limit`
+    // ever ran, so it is exactly the "known original length" `rejoin` needs
+    // to keep reporting after the prefix and remainder are stitched back
+    // together.
+    Response::from_parts(parts, rejoin(head, rest, exact))
 }
 
 /// Whether a response already carries a JSON content type.
@@ -1262,6 +1361,54 @@ mod tests {
         );
     }
 
+    /// #515 defect 1: `rejoin` must not silently downgrade a body with a known
+    /// exact length to unknown length just because classifying it required
+    /// splitting it into a bytes-in-hand prefix plus an unread remainder.
+    ///
+    /// `/api/oversized-typed-refusal` is exactly that split: the handler's
+    /// `String` body reports its own exact `size_hint` up front, `head` ends
+    /// up non-empty (`MAX_ERROR_BODY` bytes), and a remainder still exists
+    /// past it — the third, previously-lossy arm of `rejoin`.
+    ///
+    /// This is deliberately not "the bytes survive" — the test right above
+    /// already proves that, and would still pass with the size hint silently
+    /// reset to unknown. What is checked here is the numeric length the
+    /// rejoined body *claims* about itself, compared against a length
+    /// computed independently (the same serialization the fixture route
+    /// performs), not against whatever `split_at_limit`/`rejoin` themselves
+    /// happen to report.
+    #[tokio::test]
+    async fn rejoin_preserves_a_known_exact_size_across_a_non_empty_split() {
+        let expected_total = serde_json::to_string(&AmendCommitError {
+            kind: AmendFailureKind::HookRejected,
+            message: oversized_hook_output(),
+        })
+        .unwrap()
+        .len() as u64;
+        assert!(
+            expected_total > MAX_ERROR_BODY as u64,
+            "the fixture must actually cross the cap, or `rejoin`'s empty-head \
+             arm (which needs no fix) would be the one exercised instead"
+        );
+
+        let resp = app()
+            .oneshot(get_req(
+                "/api/oversized-typed-refusal",
+                Some(&PROTOCOL_VERSION.to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.body().size_hint().exact(),
+            Some(expected_total),
+            "the rejoined body must still report the original body's exact \
+             length rather than acquiring StreamBody's unknown-length default"
+        );
+        // The size-hint fix must not have disturbed the bytes it was already
+        // proven (above) to deliver whole.
+        assert_eq!(body_string(resp).await.len() as u64, expected_total);
+    }
+
     /// #336, the other half: an over-cap body that is genuinely plain text is
     /// still enveloped — and the envelope carries what the server said, with an
     /// explicit truncation marker, instead of collapsing to the status's
@@ -1525,6 +1672,69 @@ mod tests {
         assert!(
             matches!(rest, BodyRemainder::Overflow(_)),
             "one byte past the cap is a body with a remainder"
+        );
+    }
+
+    /// #515 defect 2: a run of ready-but-empty data frames never grows
+    /// `head.len()`, so a byte-only exit condition can never fire on its own —
+    /// this proves `split_at_limit` also gives up on frame *count*.
+    ///
+    /// The body is a genuinely endless stream (no bound on iterations, no
+    /// upper bound on frames), so a version of `split_at_limit` without the
+    /// frame budget would never return from this call at all. Per this
+    /// repo's own caution against wall-clock assertions, the bound here is
+    /// not measuring speed — it is the only way to tell "hangs forever" from
+    /// "returns" without actually waiting forever: a correct implementation
+    /// returns almost immediately (a few thousand cheap iterations), and a
+    /// broken one never returns, so any generous bound cleanly separates the
+    /// two.
+    ///
+    /// Deliberately **not** `#[tokio::test]` plus `tokio::time::timeout`:
+    /// measured directly against this exact fixture, that combination does
+    /// not work. A stream whose every poll is immediately ready and
+    /// self-wakes (exactly what an endless run of always-ready empty frames
+    /// is) can starve a single-runtime timer outright — cooperative
+    /// scheduling only interleaves at points where a task actually returns
+    /// `Poll::Pending` to the scheduler and lets something else run, and nothing
+    /// here forces that until frames stop coming, which is precisely the
+    /// mechanism under test. So this drives `split_at_limit` on its own OS
+    /// thread with its own throwaway runtime, and bounds the wait from the
+    /// *main* thread with a plain `std::sync::mpsc::recv_timeout` — a deadline
+    /// enforced by the OS, independent of whatever the worker thread's own
+    /// runtime does internally, which is what makes it trustworthy here.
+    #[test]
+    fn an_endless_run_of_empty_frames_does_not_spin_split_at_limit() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let endless_empty_frames = Body::new(StreamBody::new(async_stream::stream! {
+                loop {
+                    yield Ok::<Frame<Bytes>, std::io::Error>(Frame::data(Bytes::new()));
+                }
+            }));
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("building a throwaway single-threaded runtime for this worker thread");
+            let outcome = rt.block_on(split_at_limit(endless_empty_frames, MAX_ERROR_BODY));
+            // If `split_at_limit` really is stuck, the main thread below has
+            // already given up and dropped `rx` by the time (if ever) this
+            // line is reached — a `send` failing on a dropped receiver must
+            // not panic this (by-then-irrelevant, leaked) thread.
+            let _ = tx.send(outcome);
+        });
+
+        let (head, remainder) = rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
+            "split_at_limit must give up once its frame budget is exhausted \
+             instead of spinning forever on frames that never grow `head`",
+        );
+        assert!(
+            head.is_empty(),
+            "every yielded frame carried zero data bytes, so the accumulated \
+             prefix must still be empty"
+        );
+        assert!(
+            matches!(remainder, BodyRemainder::Overflow(_)),
+            "giving up on classification must forward the still-unread, \
+             still-endless body rather than reporting a clean end"
         );
     }
 
