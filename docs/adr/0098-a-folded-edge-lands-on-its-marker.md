@@ -1,6 +1,6 @@
 # ADR 0098 — A folded edge lands on the marker that represents its hidden endpoint
 
-**Status:** Accepted — implemented and host-tested; mutation and live verification pending
+**Status:** Accepted — implemented and live-verified; mutation proof blocked
 **Date:** 2026-08-29
 **Issues:** [#374](https://github.com/tom2025b/git-vista/issues/374), [#478](https://github.com/tom2025b/git-vista/issues/478) — folded WIP display projection
 **Supersedes:** nothing · **Superseded by:** nothing
@@ -114,14 +114,27 @@ It asserts:
 - **D4:** Keep same-slot suppression — an internal edge connects no two visible objects.
 - **D5:** Use a three-lane A2 threshold — lane width is 34px while the label gap is 18px, so lane 3 is inside the text column for the fixture's lanes 0 through 2.
 - **D6:** Reserve ADR 0098 — open PR #574 already owns 0096 and 0097.
+- **D7:** Classify live SVG paths by their endpoint grid before calling them display edges — commit edges join two row centres, while branch stubs end on a half-row.
 
 ## Verification
 
 - Targeted collapse suite: 39 passed.
-- Mutation M1, both lane remaps removed: pending.
-- Mutation M2, only `from` remapped: pending.
-- Workspace test, Clippy, format, release build, frontend build: pending.
-- Rendered SVG visual inspection: pending.
+- Workspace tests passed; `cargo clippy -- -D warnings` and
+  `cargo fmt --check` passed.
+- Release builds for both `git-vista-server` and `gv-sandbox` passed; the
+  frontend `trunk build` passed.
+- The rebuilt service rendered the Git-Vista repository with
+  `WIP: folded · 46 runs`. Visual inspection found no commit edge crossing a
+  subject as a strikethrough.
+- The only visible path wider than 400px was
+  `M 96 252 C 96 238, 1150 238, 1150 224`. Its second endpoint is half a row
+  above row 4 (`224 = node_cy(4) - ROW_HEIGHT / 2`), proving it is a branch
+  stub, not a `DisplayEdge`. That separate raw/display-space stub defect remains
+  owned by open PR #574 and is deliberately not duplicated here.
+- Required failure-atlas mutations M1 (remove both lane remaps) and M2 (leave
+  only `from_lane` remapped) could not run because this session exposes no
+  `mutation_check` tool or failure-atlas MCP server. The forbidden manual
+  patch-run-restore substitute was not used, so no `caught` verdict is claimed.
 
 ---
 
