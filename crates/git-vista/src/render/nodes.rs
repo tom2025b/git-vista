@@ -12,13 +12,15 @@ use git_vista_core::model::RefKind;
 use crate::camera::Camera;
 use crate::features::a11y::focus::GraphFocus;
 use crate::features::shell::signals::Shell;
-use crate::geometry::{node_cx, node_cy, NODE_RADIUS};
+use crate::geometry::{marker_label_x, node_cx, node_cy, NODE_RADIUS};
 use crate::gestures;
 use crate::icons::icon_set;
 use crate::state::MenuData;
 use git_vista_core::color::branch_color;
 
-use crate::features::graph::collapse::{DisplayItem, DisplayProjection};
+use crate::features::graph::collapse::{
+    marker_label_lane, place_stubs, DisplayItem, DisplayProjection, StubOverhang,
+};
 use crate::features::graph::core::RenderCtx;
 
 /// Per-commit node builder — a filled dot in the branch colour plus a larger
@@ -60,7 +62,35 @@ pub fn build_node(
         color,
     } = item
     {
-        return build_wip_group(moved, on_expand, i, anchor_row_index, count, lane, color);
+        // A marker's label starts clear of whatever crosses its slot (#573).
+        // Asked in display space, over the projection's own edges and over the
+        // stubs already placed into it — a marker stands for a whole run, so no
+        // single raw row's occupancy can answer for it.
+        let occupied = ctx.with_value(|c| {
+            let resolved = c.loaded.resolved_stubs();
+            let anchors: Vec<usize> = resolved.iter().map(|s| s.anchor_row).collect();
+            display.with_value(|d| {
+                let overhangs: Vec<StubOverhang> = place_stubs(d, &anchors)
+                    .into_iter()
+                    .map(|p| StubOverhang {
+                        display_row: p.display_row,
+                        lane: resolved[p.index].lane,
+                        depth: resolved[p.index].stub.depth,
+                    })
+                    .collect();
+                marker_label_lane(d, &overhangs, i, lane)
+            })
+        });
+        return build_wip_group(
+            moved,
+            on_expand,
+            i,
+            anchor_row_index,
+            count,
+            lane,
+            color,
+            marker_label_x(lane, occupied),
+        );
     }
     let DisplayItem::Single { row_index } = item else {
         return ().into_view();
@@ -319,6 +349,7 @@ fn build_wip_group(
     count: usize,
     lane: usize,
     color: usize,
+    label_x: i32,
 ) -> View {
     let cx = node_cx(lane);
     let cy = node_cy(i);
@@ -353,7 +384,7 @@ fn build_wip_group(
             >
                 <title>{label.clone()}</title>
             </circle>
-            <text x=cx + NODE_RADIUS + 8 y=cy + 4 class="wip-group-label" fill=stroke>
+            <text x=label_x y=cy + 4 class="wip-group-label" fill=stroke>
                 {label.clone()}
             </text>
             <circle

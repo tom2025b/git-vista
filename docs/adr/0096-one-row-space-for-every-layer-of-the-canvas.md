@@ -1,6 +1,6 @@
 # ADR 0096 — Every layer of the canvas is placed by display slot, and the stub layer was the one that was not
 
-**Status:** Accepted — implemented, mutation-proved two ways, browser-verified
+**Status:** Accepted — implemented, mutation-proved two ways, browser-verified · residual closed by [ADR 0097](0097-a-marker-label-is-a-display-space-question.md) ([#573](https://github.com/tom2025b/git-vista/issues/573))
 **Date:** 2026-08-28
 **Issue:** [#571](https://github.com/tom2025b/git-vista/issues/571) — folded WIP runs draw branch stubs at raw row indices
 **Supersedes:** nothing · **Superseded by:** nothing
