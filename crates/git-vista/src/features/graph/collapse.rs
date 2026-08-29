@@ -872,7 +872,9 @@ mod tests {
         // of 3 reaches past the visible graph and into the text column. A
         // one- or two-lane turn remains ordinary graph geometry.
         const TEXT_COLUMN_CROSSING_LANE_DELTA: usize = 3;
-        assert!(LANE_WIDTH > LABEL_GAP);
+        // The premise the delta above rests on, checked at compile time: a
+        // plain `assert!` over two constants is a clippy error, not a test.
+        const { assert!(LANE_WIDTH > LABEL_GAP) };
         assert!(
             p.edges.iter().all(|edge| {
                 edge.from_display.abs_diff(edge.to_display) != 1
