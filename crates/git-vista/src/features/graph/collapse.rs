@@ -1625,19 +1625,38 @@ mod tests {
     }
 
     #[test]
-    fn an_edge_that_ends_on_the_marker_gets_one_lane_of_bulge_capped_at_the_outer_lane() {
+    fn an_edge_that_ends_on_the_marker_gets_one_lane_of_bulge_not_the_outer_lane() {
         // At an endpoint row the curve has left its lane by less than one lane,
-        // so the allowance is +1 — and never past the outer lane, which is where
-        // the curve is heading rather than where it is.
+        // so the allowance is +1 rather than the full outer lane — that +1 is
+        // the whole difference between this branch and the pass-through branch
+        // above, which takes `hi` outright.
+        //
+        // The endpoint that lands ON the marker is a folded row, and a folded
+        // endpoint now sits in the marker's own lane (#575 / ADR 0098) instead
+        // of keeping its raw lane. So the lane the +1 is measured from is the
+        // MARKER's, and the reach the label must clear comes from the *visible*
+        // end reaching toward it. Written with that end out at lane 5, because
+        // an all-lane-0 fixture would make this assertion return the marker's
+        // own lane — indistinguishable from `a_marker_with_nothing_crossing_it`
+        // and therefore proof of nothing.
+        //
+        // One consequence worth recording: `min(.., hi)` can no longer bind at a
+        // marker row. It bound only when the folded endpoint's raw lane was at
+        // or past the outer lane, and after #575 that endpoint is always the
+        // marker's lane, which is by construction the lowest of the two.
         let (rows, _) = folded_with_a_marker_at_slot_one();
         let edges = vec![Edge {
             from_row: 0,
-            from_lane: 0,
+            from_lane: 5,
             to_row: 1,
             to_lane: 4,
         }];
         let p = project(&rows, &edges, true, &HashSet::new());
-        assert_eq!(marker_label_lane(&p, &[], 1, 0), 4, "capped, not 5");
+        assert_eq!(
+            marker_label_lane(&p, &[], 1, 0),
+            1,
+            "one lane of bulge off the marker's own lane, not the outer lane 5"
+        );
     }
 
     #[test]
