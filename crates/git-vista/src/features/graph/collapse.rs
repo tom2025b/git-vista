@@ -72,9 +72,10 @@ pub enum DisplayItem {
     },
 }
 
-/// An edge with both endpoints already resolved to display-space indices.
-/// Lanes copy through from the source `Edge` unchanged — collapsing moves
-/// rows vertically, never between lanes.
+/// An edge with both endpoints resolved to display-space coordinates.
+/// A visible commit keeps the source [`Edge`]'s routing lane. A commit hidden
+/// inside a [`DisplayItem::WipGroup`] instead takes the group's anchor lane, so
+/// the edge lands on the marker that now represents that endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DisplayEdge {
     pub from_display: usize,
@@ -488,11 +489,19 @@ pub fn project(
     }
 
     let display_of_row = |row: usize| row_display.get(row).copied().flatten();
+    let display_endpoint = |row: usize, raw_lane: usize| {
+        let display = display_of_row(row)?;
+        let lane = match items.get(display)? {
+            DisplayItem::Single { .. } => raw_lane,
+            DisplayItem::WipGroup { lane, .. } => *lane,
+        };
+        Some((display, lane))
+    };
     let display_edges = edges
         .iter()
         .filter_map(|e| {
-            let from_display = display_of_row(e.from_row)?;
-            let to_display = display_of_row(e.to_row)?;
+            let (from_display, from_lane) = display_endpoint(e.from_row, e.from_lane)?;
+            let (to_display, to_lane) = display_endpoint(e.to_row, e.to_lane)?;
             // Both endpoints inside the same folded run: the edge was
             // internal to it and has nothing left to connect.
             if from_display == to_display {
@@ -500,9 +509,9 @@ pub fn project(
             }
             Some(DisplayEdge {
                 from_display,
-                from_lane: e.from_lane,
+                from_lane,
                 to_display,
-                to_lane: e.to_lane,
+                to_lane,
             })
         })
         .collect();
@@ -518,6 +527,7 @@ pub fn project(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geometry::{LABEL_GAP, LANE_WIDTH};
     use git_vista_core::model::{CommitSummary, Oid};
 
     fn row(i: usize, summary: &str, parent: Option<&str>) -> GraphRow {
@@ -845,7 +855,7 @@ mod tests {
     }
 
     #[test]
-    fn edges_internal_to_a_folded_run_are_dropped() {
+    fn a3_edges_internal_to_a_folded_run_are_dropped() {
         let rows = vec![
             row(0, "feat: real work", Some("c1")),
             wip_row(1, 3, Some("c2")),
@@ -879,11 +889,10 @@ mod tests {
     }
 
     #[test]
-    fn edge_lanes_pass_through_unchanged() {
+    fn unfolded_edge_lanes_pass_through_unchanged() {
         let rows = vec![
             row(0, "feat: real work", Some("c1")),
-            wip_row(1, 2, Some("c2")),
-            wip_row(2, 1, None),
+            row(1, "docs: earlier real work", None),
         ];
         let edges = vec![Edge {
             from_row: 0,
@@ -894,6 +903,101 @@ mod tests {
         let p = project(&rows, &edges, true, &HashSet::new());
         assert_eq!(p.edges[0].from_lane, 3);
         assert_eq!(p.edges[0].to_lane, 7);
+    }
+
+    /// A repository-shaped graph containing both directions of the defect:
+    /// a visible commit whose parent is inside a folded run, and the run's
+    /// oldest member whose parent remains visible. The raw edge geometry
+    /// carries the far-right routing lanes seen in the failing repository,
+    /// while the display items themselves occupy only lanes 0 through 2.
+    fn folded_edge_repository_fixture() -> (Vec<GraphRow>, Vec<Edge>) {
+        let newest = row(0, "feat: visible child", Some("c1"));
+        let mut fold_anchor = wip_row(1, 2, Some("c2"));
+        fold_anchor.lane = 2;
+        let mut fold_tail = wip_row(2, 1, Some("c3"));
+        fold_tail.lane = 2;
+        let mut oldest = row(3, "docs: visible parent", None);
+        oldest.lane = 1;
+
+        let edges = vec![
+            // Visible child -> folded parent: catches a missing `to` remap.
+            Edge {
+                from_row: 0,
+                from_lane: 0,
+                to_row: 1,
+                to_lane: 40,
+            },
+            // Wholly inside the fold: A3 requires this to disappear.
+            Edge {
+                from_row: 1,
+                from_lane: 2,
+                to_row: 2,
+                to_lane: 40,
+            },
+            // Folded child -> visible parent: independently catches a missing
+            // `from` remap.
+            Edge {
+                from_row: 2,
+                from_lane: 41,
+                to_row: 3,
+                to_lane: 1,
+            },
+        ];
+
+        (vec![newest, fold_anchor, fold_tail, oldest], edges)
+    }
+
+    fn item_lane(item: &DisplayItem, rows: &[GraphRow]) -> usize {
+        match *item {
+            DisplayItem::Single { row_index } => rows[row_index].lane,
+            DisplayItem::WipGroup { lane, .. } => lane,
+        }
+    }
+
+    #[test]
+    fn a1_crossing_fold_edges_stay_within_the_visible_lane_high_water() {
+        let (rows, edges) = folded_edge_repository_fixture();
+        let p = project(&rows, &edges, true, &HashSet::new());
+
+        let visible_lane_count = p
+            .items
+            .iter()
+            .map(|item| item_lane(item, &rows))
+            .max()
+            .map_or(0, |lane| lane + 1);
+        assert_eq!(visible_lane_count, 3, "fixture occupies lanes 0 through 2");
+        assert_eq!(p.edges.len(), 2, "the internal edge is dropped");
+        assert!(
+            p.edges
+                .iter()
+                .all(|edge| { edge.from_lane.abs_diff(edge.to_lane) <= visible_lane_count }),
+            "a projected edge escaped {visible_lane_count} visible lanes: {:?}",
+            p.edges
+        );
+    }
+
+    #[test]
+    fn a2_adjacent_display_edges_do_not_reach_the_commit_text_column() {
+        let (rows, edges) = folded_edge_repository_fixture();
+        let p = project(&rows, &edges, true, &HashSet::new());
+
+        // This fixture's rightmost visible lane is 2. Its text starts only
+        // LABEL_GAP=18px after that lane, while another lane is
+        // LANE_WIDTH=34px away. Therefore an edge leaving lane 0 with a delta
+        // of 3 reaches past the visible graph and into the text column. A
+        // one- or two-lane turn remains ordinary graph geometry.
+        const TEXT_COLUMN_CROSSING_LANE_DELTA: usize = 3;
+        // The premise the delta above rests on, checked at compile time: a
+        // plain `assert!` over two constants is a clippy error, not a test.
+        const { assert!(LANE_WIDTH > LABEL_GAP) };
+        assert!(
+            p.edges.iter().all(|edge| {
+                edge.from_display.abs_diff(edge.to_display) != 1
+                    || edge.from_lane.abs_diff(edge.to_lane) < TEXT_COLUMN_CROSSING_LANE_DELTA
+            }),
+            "an adjacent-row edge reaches the text column: {:?}",
+            p.edges
+        );
     }
 
     /// The paired positive: with collapse OFF the same input keeps every
@@ -1521,19 +1625,38 @@ mod tests {
     }
 
     #[test]
-    fn an_edge_that_ends_on_the_marker_gets_one_lane_of_bulge_capped_at_the_outer_lane() {
+    fn an_edge_that_ends_on_the_marker_gets_one_lane_of_bulge_not_the_outer_lane() {
         // At an endpoint row the curve has left its lane by less than one lane,
-        // so the allowance is +1 — and never past the outer lane, which is where
-        // the curve is heading rather than where it is.
+        // so the allowance is +1 rather than the full outer lane — that +1 is
+        // the whole difference between this branch and the pass-through branch
+        // above, which takes `hi` outright.
+        //
+        // The endpoint that lands ON the marker is a folded row, and a folded
+        // endpoint now sits in the marker's own lane (#575 / ADR 0098) instead
+        // of keeping its raw lane. So the lane the +1 is measured from is the
+        // MARKER's, and the reach the label must clear comes from the *visible*
+        // end reaching toward it. Written with that end out at lane 5, because
+        // an all-lane-0 fixture would make this assertion return the marker's
+        // own lane — indistinguishable from `a_marker_with_nothing_crossing_it`
+        // and therefore proof of nothing.
+        //
+        // One consequence worth recording: `min(.., hi)` can no longer bind at a
+        // marker row. It bound only when the folded endpoint's raw lane was at
+        // or past the outer lane, and after #575 that endpoint is always the
+        // marker's lane, which is by construction the lowest of the two.
         let (rows, _) = folded_with_a_marker_at_slot_one();
         let edges = vec![Edge {
             from_row: 0,
-            from_lane: 0,
+            from_lane: 5,
             to_row: 1,
             to_lane: 4,
         }];
         let p = project(&rows, &edges, true, &HashSet::new());
-        assert_eq!(marker_label_lane(&p, &[], 1, 0), 4, "capped, not 5");
+        assert_eq!(
+            marker_label_lane(&p, &[], 1, 0),
+            1,
+            "one lane of bulge off the marker's own lane, not the outer lane 5"
+        );
     }
 
     #[test]
