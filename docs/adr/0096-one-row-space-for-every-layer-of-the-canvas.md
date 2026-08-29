@@ -185,7 +185,16 @@ Two mutations, breaking differently, both `caught`:
 | M1 | `display_row: anchor_row` — the mechanism removed | **caught**, 4 tests red |
 | M2 | remap only anchors that are folded *away*, leave the rest raw — the mechanism weakened | **caught**, 3 tests red; the folded-anchor case survives, which is what makes it a different break |
 
-`cargo test` cannot reach `render/stubs.rs` at all — it is wasm-gated, and the host tests say nothing about whether the layer asks `place_stubs`. Two browser specs in `ci/browser/tests/wip-collapse.spec.mjs` close that seam against the real DOM: folded, the fixture's `base` stub must hang exactly half a row above the dot of the commit it is anchored on; after the topbar toggle it must follow that commit down to its new row, which is the assertion that pins the repaint signal rather than the placement.
+`cargo test` cannot reach `render/stubs.rs` at all — it is wasm-gated, and the host tests say nothing about whether the layer asks `place_stubs`. Two browser specs in `ci/browser/tests/wip-collapse.spec.mjs` close that seam against the real DOM: folded, the fixture's `base` stub must hang exactly half a row above the dot of the commit it is anchored on; after the topbar toggle it must follow that commit down to its new row.
+
+Those two were run against a deliberately broken build as well, in a detached worktree so the main tree was never dirty — because a browser spec that has never been seen red is worth no more than a host test that has never been seen red:
+
+| | Negative control | Result |
+|---|---|---|
+| NC1 | `place_stubs` returns raw rows (the pre-fix layer, reaching the DOM) | **1 failed**, 16 passed — the folded spec goes red; the toggle spec cannot see this mutation, because unfolded the two indices coincide |
+| NC2 | `display_epoch.get()` removed from the `stubs` closure | **2 failed**, 15 passed — the layer never re-runs after the projection lands, so it draws from `DisplayProjection::default()` and no stub appears at all |
+
+NC2 is the one worth keeping in mind: the stub layer is eager, `display` starts as `default()`, and the projection arrives in an effect. Reading only `stub_epoch` — a *paging* signal — leaves the layer holding an empty projection on first paint and stale geometry after every toggle.
 
 ```mermaid
 ---
@@ -217,6 +226,14 @@ flowchart TD
     class M1,M2 mutation
     class KEY4 legendbox
 ```
+
+## Related records
+
+[ADR 0075](0075-a-wip-run-is-a-chain-not-a-neighbourhood.md) gave folding its shape and, with it, the second row space this record is about — a run is a chain, its members need not be adjacent, and what leaves display space is decided per chain rather than per neighbour.
+
+[ADR 0076](0076-one-fixture-catalogue-in-rust.md) is why the browser proof cost almost nothing: the `base` branch this fix is verified against was already in the shared Rust fixture, sitting on the oldest commit, below the run. No fixture change was needed to reproduce a defect measured at 59 crossings on the real repository.
+
+[#571](https://github.com/tom2025b/git-vista/issues/571) carries the residual: the fold marker's own label is drawn hugging its dot and consults no occupancy, so four crossings survive on three markers. It is the same class of defect one layer over, and it is recorded rather than quietly fixed alongside this one.
 
 ---
 
