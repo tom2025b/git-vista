@@ -235,6 +235,70 @@ pub fn place_stubs(projection: &DisplayProjection, anchor_rows: &[usize]) -> Vec
         .collect()
 }
 
+/// A branch stub as the label column has to see it (#573): which display slot
+/// it hangs over, how far right its own column reaches, and how far up its
+/// cascade steps.
+///
+/// Deliberately not [`PlacedStub`]: that type answers "where is this stub
+/// drawn", which is all the stub layer needs. This one answers "what does it
+/// cover", which is a question about somebody else's row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StubOverhang {
+    pub display_row: usize,
+    pub lane: usize,
+    pub depth: usize,
+}
+
+/// The rightmost lane anything drawn reaches at display slot `display_row` —
+/// the answer a fold marker's label needs in order to start clear of it (#573).
+///
+/// Same over-approximation of the S-curve as
+/// [`crate::features::graph::core`]'s `apply_edge_occupancy`, and for the same
+/// reason: at an endpoint row the curve is still within a lane of that
+/// endpoint, and on a row strictly between it can be anywhere between the two.
+/// A stub covers its own slot and the ⌈(depth+1)/2⌉ slots above it, because its
+/// cascade steps upward half a row at a time.
+///
+/// Computed in **display** space, over the projection's own edges and over
+/// stubs already placed by [`place_stubs`]. That is what makes it able to
+/// answer for a marker at all: a marker stands for a whole run, so there is no
+/// single raw row whose occupancy describes it, and the raw rows that *did*
+/// receive the widening are the folded-away members that are no longer drawn.
+///
+/// Returns `marker_lane` itself when nothing crosses the slot, so a caller can
+/// tell "clear" from "pushed" and leave an unobstructed marker where it was.
+pub fn marker_label_lane(
+    projection: &DisplayProjection,
+    stubs: &[StubOverhang],
+    display_row: usize,
+    marker_lane: usize,
+) -> usize {
+    let mut lane = marker_lane;
+    for e in &projection.edges {
+        let (top, bottom) = e.span();
+        if display_row < top || display_row > bottom {
+            continue;
+        }
+        let hi = e.from_lane.max(e.to_lane);
+        let reach = if display_row == e.from_display {
+            (e.from_lane + 1).min(hi)
+        } else if display_row == e.to_display {
+            (e.to_lane + 1).min(hi)
+        } else {
+            hi
+        };
+        lane = lane.max(reach);
+    }
+    for s in stubs {
+        // `[anchor - up ..= anchor]`, written so the subtraction cannot wrap.
+        let up = (s.depth + 2) / 2;
+        if display_row <= s.display_row && display_row + up >= s.display_row {
+            lane = lane.max(s.lane);
+        }
+    }
+    lane
+}
+
 /// True when `newer` and `older` are consecutive members of one foldable run:
 /// both WIP checkpoints, same lane, `older` is `newer`'s *sole* parent, and
 /// neither is itself a merge commit. Both parent-count checks matter: the
@@ -1517,5 +1581,115 @@ mod tests {
                 None => panic!("a placed stub names a slot that exists"),
             }
         }
+    }
+
+    /// One real commit, a folded pair, then two more real commits — so display
+    /// slot 1 is a marker with slots on both sides of it, which is what an edge
+    /// has to span in order to cross it.
+    fn folded_with_a_marker_at_slot_one() -> (Vec<GraphRow>, Vec<Edge>) {
+        let rows = vec![
+            row(0, "feat: newest", Some("c1")),
+            wip_row(1, 2, Some("c2")),
+            wip_row(2, 1, Some("c3")),
+            row(3, "feat: middle", Some("c4")),
+            row(4, "docs: oldest", None),
+        ];
+        (rows, Vec::new())
+    }
+
+    #[test]
+    fn a_marker_with_nothing_crossing_it_keeps_its_own_lane() {
+        // The "clear" answer has to be distinguishable, or every marker in every
+        // graph shifts right for no reason.
+        let (rows, edges) = folded_with_a_marker_at_slot_one();
+        let p = project(&rows, &edges, true, &HashSet::new());
+        assert_eq!(marker_label_lane(&p, &[], 1, 0), 0);
+    }
+
+    #[test]
+    fn an_edge_passing_through_a_marker_pushes_its_label_past_the_outer_lane() {
+        // Raw rows 0 -> 3 straddle the folded pair, so in display space the edge
+        // spans slots 0 -> 2 and passes strictly through the marker at slot 1.
+        // A row strictly between two endpoints takes the outer lane, because the
+        // curve can be anywhere between them there.
+        let (rows, _) = folded_with_a_marker_at_slot_one();
+        let edges = vec![Edge {
+            from_row: 0,
+            from_lane: 0,
+            to_row: 3,
+            to_lane: 5,
+        }];
+        let p = project(&rows, &edges, true, &HashSet::new());
+        assert_eq!(p.edges.len(), 1, "the edge survives the fold");
+        assert_eq!(marker_label_lane(&p, &[], 1, 0), 5);
+    }
+
+    #[test]
+    fn an_edge_that_ends_on_the_marker_gets_one_lane_of_bulge_capped_at_the_outer_lane() {
+        // At an endpoint row the curve has left its lane by less than one lane,
+        // so the allowance is +1 — and never past the outer lane, which is where
+        // the curve is heading rather than where it is.
+        let (rows, _) = folded_with_a_marker_at_slot_one();
+        let edges = vec![Edge {
+            from_row: 0,
+            from_lane: 0,
+            to_row: 1,
+            to_lane: 4,
+        }];
+        let p = project(&rows, &edges, true, &HashSet::new());
+        assert_eq!(marker_label_lane(&p, &[], 1, 0), 4, "capped, not 5");
+    }
+
+    #[test]
+    fn a_stub_hanging_over_a_marker_pushes_its_label_past_the_stub_column() {
+        // A stub ring sits half a row above its anchor, so a stub anchored one
+        // slot BELOW the marker still hangs over the marker's row. Stub columns
+        // start past the commit lane high-water, so this is the case that moves
+        // a label furthest.
+        let (rows, edges) = folded_with_a_marker_at_slot_one();
+        let p = project(&rows, &edges, true, &HashSet::new());
+        let over = StubOverhang {
+            display_row: 2,
+            lane: 9,
+            depth: 0,
+        };
+        assert_eq!(marker_label_lane(&p, &[over], 1, 0), 9);
+    }
+
+    #[test]
+    fn a_stub_whose_cascade_does_not_reach_the_marker_leaves_it_alone() {
+        // The paired negative: without it the assertion above passes just as
+        // happily against a rule that lets every stub in the graph push every
+        // marker, which would indent them all to the far right.
+        let (rows, edges) = folded_with_a_marker_at_slot_one();
+        let p = project(&rows, &edges, true, &HashSet::new());
+        let far = StubOverhang {
+            display_row: 3,
+            lane: 9,
+            depth: 0,
+        };
+        assert_eq!(marker_label_lane(&p, &[far], 1, 0), 0);
+        // A deeper cascade steps further up, and then it does reach.
+        let deep = StubOverhang {
+            display_row: 3,
+            lane: 9,
+            depth: 3,
+        };
+        assert_eq!(marker_label_lane(&p, &[deep], 1, 0), 9);
+    }
+
+    #[test]
+    fn a_marker_never_moves_left_of_its_own_lane() {
+        // An edge in a lane to the LEFT of the marker says nothing about where
+        // the label may start; the marker's own dot is always the floor.
+        let (rows, _) = folded_with_a_marker_at_slot_one();
+        let edges = vec![Edge {
+            from_row: 0,
+            from_lane: 0,
+            to_row: 3,
+            to_lane: 0,
+        }];
+        let p = project(&rows, &edges, true, &HashSet::new());
+        assert_eq!(marker_label_lane(&p, &[], 1, 4), 4);
     }
 }
