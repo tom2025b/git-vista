@@ -1415,3 +1415,349 @@ mod tests {
         }
     }
 }
+
+// TEMPORARY diagnostic — measures the real repository, deleted before the PR.
+#[cfg(test)]
+mod real_repo_diag {
+    use super::*;
+    use git_vista_core::layout::replay::ReplayClassifier;
+    use git_vista_core::layout::stream::{canonicalize_edges, strip_resolved_edges, StreamLayout};
+    use git_vista_core::model::{CommitSummary, FrameStub, GitRef, Oid, RefKind};
+    use std::process::Command;
+
+    const ROW_HEIGHT: f64 = 56.0;
+    const LANE_WIDTH: f64 = 34.0;
+    const PAD_X: f64 = 28.0;
+    const PAD_Y: f64 = 28.0;
+    const LABEL_GAP: f64 = 18.0;
+
+    fn node_cx(lane: usize) -> f64 {
+        PAD_X + lane as f64 * LANE_WIDTH
+    }
+    fn node_cy(row: usize) -> f64 {
+        PAD_Y + row as f64 * ROW_HEIGHT
+    }
+    fn stub_node_cy(anchor_row: usize, depth: usize) -> f64 {
+        node_cy(anchor_row) - (depth as f64 + 1.0) * (ROW_HEIGHT / 2.0).trunc()
+    }
+
+    fn git(args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn occupancy(rows: &[GraphRow], edges: &[Edge], stubs: &[(usize, usize, usize)]) -> Vec<usize> {
+        let mut occ: Vec<usize> = rows.iter().map(|r| r.lane).collect();
+        if occ.is_empty() {
+            return occ;
+        }
+        let last = occ.len() - 1;
+        for e in edges {
+            let (top, bot) = if e.from_row <= e.to_row {
+                (e.from_row, e.to_row)
+            } else {
+                (e.to_row, e.from_row)
+            };
+            let hi = e.from_lane.max(e.to_lane);
+            for (r, occ_r) in occ
+                .iter_mut()
+                .enumerate()
+                .take(bot.min(last) + 1)
+                .skip(top.min(last))
+            {
+                let lane = if r == e.from_row {
+                    (e.from_lane + 1).min(hi)
+                } else if r == e.to_row {
+                    (e.to_lane + 1).min(hi)
+                } else {
+                    hi
+                };
+                *occ_r = (*occ_r).max(lane);
+            }
+        }
+        // apply_stub_occupancy: (anchor_row, depth, lane)
+        for &(anchor_row, depth, lane) in stubs {
+            let up = (depth + 2) / 2;
+            let top = anchor_row.saturating_sub(up);
+            for occ_r in occ.iter_mut().take(anchor_row.min(last) + 1).skip(top) {
+                *occ_r = (*occ_r).max(lane);
+            }
+        }
+        occ
+    }
+
+    /// Rightmost x the cubic reaches inside the horizontal band `[y_lo, y_hi]`.
+    fn max_x_in_band(x1: f64, y1: f64, x2: f64, y2: f64, y_lo: f64, y_hi: f64) -> Option<f64> {
+        let ym = ((y1 + y2) / 2.0).trunc();
+        let mut best: Option<f64> = None;
+        for i in 0..=4000 {
+            let t = i as f64 / 4000.0;
+            let mt = 1.0 - t;
+            let (b0, b1, b2, b3) = (mt * mt * mt, 3.0 * mt * mt * t, 3.0 * mt * t * t, t * t * t);
+            let y = b0 * y1 + (b1 + b2) * ym + b3 * y2;
+            if y < y_lo || y > y_hi {
+                continue;
+            }
+            let x = (b0 + b1) * x1 + (b2 + b3) * x2;
+            best = Some(best.map_or(x, |b: f64| b.max(x)));
+        }
+        best
+    }
+
+    fn row_of_item(it: &DisplayItem) -> usize {
+        match *it {
+            DisplayItem::Single { row_index } => row_index,
+            DisplayItem::WipGroup {
+                anchor_row_index, ..
+            } => anchor_row_index,
+        }
+    }
+
+    /// Every (display row, display EDGE) pair where the drawn edge reaches into
+    /// that row's label — with a fold marker's label taken as its own dot's hug
+    /// (`build_wip_group`), not as the occupancy-derived column a commit gets.
+    fn edge_crossings(
+        rows: &[GraphRow],
+        p: &DisplayProjection,
+        text_x: &[f64],
+    ) -> Vec<(f64, usize, String)> {
+        let mut hits = Vec::new();
+        for de in &p.edges {
+            let (x1, y1) = (node_cx(de.from_lane), node_cy(de.from_display));
+            let (x2, y2) = (node_cx(de.to_lane), node_cy(de.to_display));
+            let (top, bottom) = de.span();
+            for d in top..=bottom {
+                let Some(item) = p.items.get(d) else { continue };
+                let cy = node_cy(d);
+                let Some(x) = max_x_in_band(x1, y1, x2, y2, cy - 12.0, cy + 12.0) else {
+                    continue;
+                };
+                let (tx, what) = match *item {
+                    DisplayItem::Single { row_index } => (
+                        text_x[row_index],
+                        rows[row_index].commit.summary.chars().take(40).collect::<String>(),
+                    ),
+                    DisplayItem::WipGroup { lane, count, .. } => (
+                        node_cx(lane) + 15.0,
+                        format!("MARKER: {count} WIP commits"),
+                    ),
+                };
+                if x > tx + 2.0 {
+                    hits.push((x - tx, d, what));
+                }
+            }
+        }
+        hits
+    }
+
+    #[test]
+    #[ignore]
+    fn measure_real_repo() {
+        // ---- refs, in the reader's own order: HEAD first, then the ref store.
+        let head_oid = git(&["rev-parse", "HEAD"]).trim().to_string();
+        let head_branch = git(&["symbolic-ref", "--quiet", "--short", "HEAD"])
+            .trim()
+            .to_string();
+        let mut refs = vec![GitRef {
+            name: "HEAD".to_string(),
+            kind: RefKind::Head,
+            target: Oid(head_oid.clone()),
+        }];
+        for line in git(&[
+            "for-each-ref",
+            "--format=%(refname)\t%(objectname)\t%(*objectname)",
+        ])
+        .lines()
+        {
+            let mut f = line.split('\t');
+            let (Some(full), Some(obj)) = (f.next(), f.next()) else {
+                continue;
+            };
+            let peeled = f.next().unwrap_or("");
+            let target = Oid(if peeled.is_empty() { obj } else { peeled }.to_string());
+            let (kind, name) = if let Some(s) = full.strip_prefix("refs/heads/") {
+                (RefKind::Branch, s.to_string())
+            } else if let Some(s) = full.strip_prefix("refs/remotes/") {
+                if s.ends_with("/HEAD") {
+                    continue;
+                }
+                (RefKind::RemoteBranch, s.to_string())
+            } else if let Some(s) = full.strip_prefix("refs/tags/") {
+                (RefKind::Tag, s.to_string())
+            } else {
+                continue;
+            };
+            refs.push(GitRef { name, kind, target });
+        }
+
+        // ---- rows and edges, from the same lane walk the server runs.
+        let log = git(&[
+            "log",
+            "--all",
+            "--date-order",
+            "--pretty=format:%H %P%x1f%s%x1f%ct",
+        ]);
+        let mut summaries: Vec<CommitSummary> = Vec::new();
+        let mut ids: HashSet<String> = HashSet::new();
+        for line in log.lines() {
+            let mut parts = line.split('\x1f');
+            let id_part = parts.next().unwrap_or("");
+            let subject = parts.next().unwrap_or("");
+            let ct: i64 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
+            let mut it = id_part.split_whitespace();
+            let Some(id) = it.next() else { continue };
+            let parents: Vec<Oid> = it.map(|p| Oid(p.to_string())).collect();
+            ids.insert(id.to_string());
+            summaries.push(CommitSummary {
+                id: Oid(id.to_string()),
+                parents,
+                summary: subject.to_string(),
+                author: "diag".to_string(),
+                time: ct,
+            });
+        }
+        let mut stream = StreamLayout::new(Some(Oid(head_oid)));
+        for c in summaries {
+            stream.push(c, |p: &Oid| ids.contains(&p.0));
+        }
+        let chunk = stream.finish();
+        let mut rows = chunk.rows;
+        let mut edges = strip_resolved_edges(chunk.resolved_edges);
+        canonicalize_edges(&rows, &mut edges);
+
+        // ---- stubs, from the same classifier the page handler runs.
+        let mut classifier = ReplayClassifier::new(
+            &refs,
+            if head_branch.is_empty() {
+                None
+            } else {
+                Some(head_branch.as_str())
+            },
+        );
+        let mut frame_stubs: Vec<FrameStub> = Vec::new();
+        for row in rows.iter_mut() {
+            frame_stubs.extend(classifier.decorate(row, true));
+        }
+        let row_of: std::collections::HashMap<&Oid, usize> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (&r.commit.id, i))
+            .collect();
+        // (anchor_row, anchor_lane, stub_lane, depth, name)
+        let resolved: Vec<(usize, usize, usize, usize, String)> = frame_stubs
+            .iter()
+            .filter_map(|s| {
+                let anchor_row = *row_of.get(&s.anchor_commit)?;
+                Some((
+                    anchor_row,
+                    rows[anchor_row].lane,
+                    chunk.lane_count + s.lane_offset,
+                    s.depth,
+                    s.name.clone(),
+                ))
+            })
+            .collect();
+
+        let occ_stubs: Vec<(usize, usize, usize)> =
+            resolved.iter().map(|s| (s.0, s.3, s.2)).collect();
+        let occ = occupancy(&rows, &edges, &occ_stubs);
+        let text_x: Vec<f64> = occ.iter().map(|&l| node_cx(l) + LABEL_GAP).collect();
+
+        eprintln!(
+            "rows={} edges={} lane_count={} stubs={} max_stub_lane={} max_stub_x={:.0}px",
+            rows.len(),
+            edges.len(),
+            chunk.lane_count,
+            resolved.len(),
+            resolved.iter().map(|s| s.2).max().unwrap_or(0),
+            node_cx(resolved.iter().map(|s| s.2).max().unwrap_or(0))
+        );
+
+        for (label, enabled, projected) in [
+            ("unfolded", false, false),
+            ("FOLDED (today)", true, false),
+            ("FOLDED + display-space stubs", true, true),
+        ] {
+            let p = project(&rows, &edges, enabled, &HashSet::new());
+            let mut hits: Vec<(f64, usize, usize, String, String)> = Vec::new();
+            for (anchor_raw, anchor_lane, stub_lane, depth, name) in &resolved {
+                let anchor_row = &if projected {
+                    match p.display_of_row(*anchor_raw) {
+                        Some(d) => d,
+                        None => continue,
+                    }
+                } else {
+                    *anchor_raw
+                };
+                let (sx, sy) = (node_cx(*stub_lane), stub_node_cy(*anchor_row, *depth));
+                let (ax, ay) = if *depth == 0 {
+                    (node_cx(*anchor_lane), node_cy(*anchor_row))
+                } else {
+                    (
+                        node_cx(stub_lane - 1),
+                        stub_node_cy(*anchor_row, depth - 1),
+                    )
+                };
+                let (lo, hi) = (sy.min(ay), sy.max(ay));
+                let first = (((lo - PAD_Y - 12.0) / ROW_HEIGHT).floor().max(0.0)) as usize;
+                let last = (((hi - PAD_Y + 12.0) / ROW_HEIGHT).ceil().max(0.0)) as usize;
+                for d in first..=last.min(p.items.len().saturating_sub(1)) {
+                    let raw = row_of_item(&p.items[d]);
+                    let cy = node_cy(d);
+                    let Some(x) = max_x_in_band(ax, ay, sx, sy, cy - 12.0, cy + 12.0) else {
+                        continue;
+                    };
+                    // A folded marker draws its own label hugging its dot
+                    // (`build_wip_group`), never through `text_x`.
+                    let tx = match p.items[d] {
+                        DisplayItem::Single { .. } => text_x[raw],
+                        DisplayItem::WipGroup { lane, .. } => node_cx(lane) + 15.0,
+                    };
+                    if x > tx + 2.0 {
+                        hits.push((
+                            x - tx,
+                            d,
+                            raw,
+                            name.clone(),
+                            rows[raw].commit.summary.chars().take(44).collect(),
+                        ));
+                    }
+                }
+            }
+            let ec = edge_crossings(&rows, &p, &text_x);
+            let markers_struck_by_edges = ec
+                .iter()
+                .filter(|h| h.2.starts_with("MARKER"))
+                .count();
+            eprintln!(
+                "{label}: EDGE crossings total={} of which marker labels={}",
+                ec.len(),
+                markers_struck_by_edges
+            );
+            for h in ec.iter().take(4) {
+                eprintln!("   edge over={:.0}px display_row={} {:?}", h.0, h.1, h.2);
+            }
+            hits.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            let mut rows_hit: Vec<usize> = hits.iter().map(|h| h.2).collect();
+            rows_hit.sort_unstable();
+            rows_hit.dedup();
+            eprintln!(
+                "{label}: items={} stub_text_crossings={} distinct_rows_struck={}",
+                p.items.len(),
+                hits.len(),
+                rows_hit.len()
+            );
+            for h in hits.iter().take(6) {
+                eprintln!(
+                    "   over={:.0}px display_row={} raw_row={} stub={:?} struck: {:?}",
+                    h.0, h.1, h.2, h.3, h.4
+                );
+            }
+        }
+    }
+}
