@@ -1,745 +1,414 @@
-#!/usr/bin/env bash
-# dev — shared developer commands for git-vista, so both Claude accounts (and Tom)
-# run the project's rituals identically and can always resume half-finished work.
-#
-# The point of this script is durability: sessions run out of tokens mid-milestone,
-# so the rule is COMMIT WORK-IN-PROGRESS OFTEN (`dev wip`) — every push is a
-# checkpoint on GitHub that any later session, on either account, can resume from
-# (`dev resume`). Uncommitted work is the only work that gets lost.
-#
-#   dev gate              run the full CI gate (fmt, clippy x2, test, trunk build, browser)
-#   dev browser [filter]  render-path browser tests (what cargo test cannot reach)
-#   dev verify            the sandbox checks gate does NOT run: escape report, census
-#                          both directions, mutants apply, no leaked daemon
-#   dev roadmap           print milestones + open issues, grouped by M-band
-#   dev roadmap-page      regenerate design-docs/roadmap.html from live GitHub data
-#   dev start <issue#>    branch off fresh main for an issue (feature/mX.YY-slug)
-#   dev wip [message]     checkpoint: add + commit (as Claude_Max) + push
-#   dev resume [issue#]   show branch state, WIP commits, and handoff.md
-#   dev signin            reprint the sign-in link(s) for the running server
-#   dev doctor            diagnose listener/session/tunnel state without secrets
-#   dev serve [path]      start the loopback-only server (delegates to ./gv)
-#   dev testbed <ref> [port]  isolated worktree + own port, for a HUMAN to drive
-#                          the real app at <ref> while work continues here —
-#                          proves it works, not just that tests pass
-#   dev handoff           open/print handoff.md (the running "what's done / next" note)
-#   dev report            at-a-glance repo health: branches, merge status, WIP
-#                          commits, lines of code by crate (rex-check pattern)
-#
-# handoff.md is gitignored on purpose (local working note); the DURABLE record is
-# the WIP git commits. Keep handoff.md current as you work so a fresh session — or
-# the other account — can pick up exactly where you left off.
-set -euo pipefail
+# Git-Vista
 
-REPO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-cd "$REPO"
+Git-Vista is a professional, touch-first visual Git client for one developer
+using an iPad to work with real repositories on Linux. The browser is the
+portable UI platform; Rust, Axum, `gix`, System Git, Leptos, and WebAssembly
+provide the native repository service and adaptive client.
 
-# Author identity for commits this script makes: name distinguishes Claude's
-# commits from Tom's in `git log`; the noreply email dodges GitHub's GH007.
-GIT_AS=(-c user.name=Claude_Max -c user.email=262510778+tom2025b@users.noreply.github.com)
+**V1 is complete.** Its foundation — one typed, reviewable planner every write
+passes through, serialized per-repository mutations, policy-bounded Git process
+execution, and an operation journal that makes recovery provable rather than
+assumed — landed first. The daily-driver line on top of it (working-tree status,
+diffs, staging, commit/amend/hook/signing, remotes, tags, an installable PWA)
+followed and is now closed out.
 
-die() { echo "dev: $*" >&2; exit 1; }
+**V2 is under way rather than proposed.** The stash drawer, the shared conflict
+model, and the first history-editing operations have shipped; worktrees, forge
+integration and the teaching layer have not. See [Status](#status) for what is
+actually in the code, and treat the ADR index as the tiebreaker over any prose
+in this file.
 
-# Trunk 0.21 treats NO_COLOR as a boolean flag but rejects the conventional
-# NO_COLOR=1 value. Keep no-colour behavior while passing Trunk an explicit,
-# accepted option; this mirrors the production `gv` launcher.
-trunk_build() {
-  if [[ ${NO_COLOR+x} ]]; then
-    ( cd crates/git-vista && env -u NO_COLOR trunk build --color never )
-  else
-    ( cd crates/git-vista && trunk build )
-  fi
-}
+> **Current security boundary:** the server binds `127.0.0.1:8080` and requires
+> a single-use bootstrap, HttpOnly session, CSRF, and strict Host/Origin checks.
+> An **opt-in** LAN listener exists behind `--lan` / `GIT_VISTA_LAN_IP` — off
+> unless explicitly asked for, and an arbitrary bind override is still refused.
+> Remote access is expected to arrive over a private network the operator
+> already trusts (an SSH forward, or a tailnet), not by widening the listener.
+> Every mutation — from the browser or from an MCP agent — is planned,
+> serialized per repository, and journaled before it runs; see
+> [the security model](docs/SECURITY_MODEL.md) and the ADR index below for how.
 
-# The gate's actual work. Split out from cmd_gate so the wrapper can capture the
-# whole transcript without changing what runs or in what order.
-#
-# This function DEPENDS on errexit being on, and cannot enforce that itself —
-# a function inherits whatever the caller's shell state is. `cmd_gate` has to
-# turn errexit off around the recording pipeline (see the comment there), so it
-# re-arms it explicitly for this subshell: `( set -e; gate_body )`. Between
-# 2026-08-19 and #434 it did not, and the consequence was total — every step ran
-# regardless of the last one's failure, and the gate could not fail at all.
-# If you change how this function is invoked, `a_failing_step_fails_the_gate` in
-# ci/gate_errexit_test.sh is the thing that will notice.
-gate_body() {
-  echo "dev: running the CI gate (fmt → clippy → wasm-clippy → test → trunk build → browser)…"
-  echo "── fmt ─────────────────────────────────────────────"
-  cargo fmt --all -- --check
-  echo "── clippy (native) ─────────────────────────────────"
-  cargo clippy --workspace --all-targets -- -D warnings
-  echo "── clippy (wasm32) ─────────────────────────────────"
-  cargo clippy -p git-vista --target wasm32-unknown-unknown --all-targets -- -D warnings
-  echo "── test ────────────────────────────────────────────"
-  cargo test --workspace
-  echo "── trunk build ─────────────────────────────────────"
-  trunk_build
-  cmd_browser
-  echo "dev: ✅ gate green"
-}
+## Screenshots
 
-# Where the gatehouse binary lives, if it is installed at all.
-gatehouse_bin() {
-  command -v gatehouse-mcp 2>/dev/null && return 0
-  [[ -x "$HOME/projects/gatehouse-mcp/target/debug/gatehouse-mcp" ]] \
-    && echo "$HOME/projects/gatehouse-mcp/target/debug/gatehouse-mcp" && return 0
-  return 1
-}
+Captured from Git-Vista browsing its own repository.
 
-# dev gate — the CI gate, with its result recorded as evidence.
-#
-# # Gatehouse is evidence, never enforcement
-#
-# Recording must NEVER change whether the gate passed. Every gatehouse call is
-# allowed to fail, and every failure path ends with the gate's own exit code
-# propagated unchanged. What a recording failure must not be is SILENT: an
-# unrecorded run prints a conspicuous banner, because "green with no evidence"
-# and "green" look identical afterwards and that is the whole problem this
-# exists to solve.
-#
-# # Two phases, because gatehouse must observe the start itself
-#
-# `begin` runs before the gate and lets gatehouse read HEAD and the working tree
-# for itself; `finish` runs after and lets it read them again. A single call at
-# the end could only take this script's word for the starting state. See
-# gatehouse-mcp/src/evidence.rs.
-cmd_gate() {
-  local gh log rid rc digest
-  log=$(mktemp -t gv-gate-XXXXXX.log)
-  rid=""
+![The commit graph](docs/screenshots/01-graph.png)
 
-  if gh=$(gatehouse_bin); then
-    # A begin that fails leaves rid empty and the gate runs anyway.
-    rid=$("$gh" begin --repo "$REPO" -- ./dev gate 2>/dev/null) || rid=""
-  fi
+*History reads top-to-bottom, one colour per lane, with branch and remote-ref
+labels attached to the commits they actually point at. Runs of automated
+checkpoint commits collapse into a single "13 WIP commits" marker so hand-written
+history stays legible — the fold is a display choice, nothing is rewritten. The
+graph is virtualised: this repository is ~3,400 commits and the DOM holds only
+what is on screen.*
 
-  # The gate itself. `set +e` here keeps a failing gate from aborting THIS
-  # function before the finish call below records the result; the real code is
-  # recovered from PIPESTATUS.
-  #
-  # `set -e` INSIDE the subshell is not redundant with line 32's
-  # `set -euo pipefail` — it undoes the `set +e` immediately above, which the
-  # subshell would otherwise inherit. Without it (#434, 2026-08-19 to
-  # 2026-08-22) every step of `gate_body` ran regardless of the previous one's
-  # failure, the function reached its own `echo "dev: ✅ gate green"`, and
-  # PIPESTATUS[0] was that echo's 0 — so the gate could not fail, and gatehouse
-  # recorded a `verified: true` for a commit that could not compile.
-  #
-  # This is the line the header comment above means by "Recording must NEVER
-  # change whether the gate passed". Recording is why `set +e` is here at all;
-  # `set -e` is what keeps that from costing the verdict.
-  set +e
-  ( set -e; gate_body ) 2>&1 | tee "$log"
-  rc=${PIPESTATUS[0]}
-  set -e
+![A commit's diff, full screen](docs/screenshots/02-diff.png)
 
-  if [[ -n "$rid" ]]; then
-    # The digest covers the COMBINED transcript, in the order it was produced —
-    # which is what `2>&1 | tee` captures. Recorded as `combined` so a later
-    # comparison knows what it is comparing.
-    digest=$(sha256sum "$log" | cut -d" " -f1)
-    if ! "$gh" finish --repo "$REPO" --run-id "$rid" --exit "$rc" \
-         --sha256 "$digest" --streams combined \
-         --check fmt --check clippy-native --check clippy-wasm \
-         --check test --check trunk-build --check browser 2>/dev/null; then
-      echo ""
-      echo "⚠️  UNRECORDED: the gate ran but gatehouse could not record its result."
-      echo "    The gate's own verdict above stands. Nothing downstream may treat"
-      echo "    this commit as verified — there is no evidence for it."
-    fi
-  else
-    echo ""
-    echo "⚠️  UNRECORDED: no gate evidence was written (gatehouse unavailable)."
-    echo "    The gate's own verdict above stands. Nothing downstream may treat"
-    echo "    this commit as verified — there is no evidence for it."
-  fi
+*Opening a commit shows its message, a per-file summary, and the unified diff.
+Files Git-Vista cannot render as text are labelled `binary` and left alone rather
+than printed as noise. Any view can be sent straight to a PDF.*
 
-  rm -f "$log"
-  return "$rc"
-}
+![The commit action menu](docs/screenshots/03-commit-actions.png)
 
-# dev browser — the render-path tests `cargo test` structurally cannot reach.
-#
-# `cargo test` never compiles code behind `#[cfg(target_arch = "wasm32")]`, and
-# every UI defect found in August 2026 lived exactly there — each beside a fully
-# green gate. The Rust suite proves the pure core is correct; this proves it is
-# reached. See ci/browser/README.md.
-#
-# Part of `dev gate`, deliberately. A suite built to catch code that nothing
-# calls is worthless if nothing calls the suite — that is the same orphaning
-# failure one level up, and it was caught in adversarial review of this very
-# harness.
-#
-# Fail-closed, matching `dev verify`'s posture: a missing prerequisite is a
-# FAILURE with instructions, never a silent skip. A skipped browser check reads
-# identically to a passing one in a gate log, which is how the defects it exists
-# to catch survived in the first place.
-# Playwright refuses to start on anything older than this (#469).
-BROWSER_NODE_MIN_MAJOR=20
+*Every write available on a commit, in one menu — branch, tag, revert, undo,
+compare, checkout. Operations that cannot succeed on this commit are shown
+greyed out **with the reason** ("Only available on the current HEAD commit")
+instead of being hidden or failing after the click.*
 
-# The bin directory of a node new enough for Playwright, or nothing.
-#
-# "a node exists" and "a node that will work exists" are different questions,
-# and only the second one matters here. On this box a bare `node` is v18.19.1
-# while a v24 sits under nvm — so this prefers whatever `node` already resolves
-# to and falls back to the newest nvm install, rather than making a too-old
-# system node something the operator has to replace before testing anything.
-browser_node_bin() {
-  local candidate major
-  while IFS= read -r candidate; do
-    [[ -n $candidate && -x $candidate ]] || continue
-    major="$("$candidate" -v 2>/dev/null)" || continue
-    major="${major#v}"
-    major="${major%%.*}"
-    [[ $major =~ ^[0-9]+$ ]] || continue
-    if (( major >= BROWSER_NODE_MIN_MAJOR )); then
-      dirname "$candidate"
-      return 0
-    fi
-  done < <(
-    command -v node 2>/dev/null || true
-    ls -d "$HOME"/.local/share/nvm/*/bin/node \
-          "$HOME"/.nvm/versions/node/*/bin/node 2>/dev/null | sort -V -r
-  )
-  return 1
-}
+![The activity panel](docs/screenshots/04-activity.png)
 
-cmd_browser() {
-  echo "── browser (render path) ───────────────────────────"
-  local on_path node_bin
-  on_path="$(command -v node 2>/dev/null || true)"
-  if ! node_bin="$(browser_node_bin)"; then
-    if [[ -z $on_path ]]; then
-      die "browser tests need node >= $BROWSER_NODE_MIN_MAJOR (none found). Install it, or run the rest with 'dev gate' on a host that has it."
-    fi
-    die "browser tests need node >= $BROWSER_NODE_MIN_MAJOR — Playwright refuses anything older, and '$on_path' is $("$on_path" -v 2>/dev/null || echo 'an unreadable version'). Install a newer node, or put one on PATH ahead of it; an nvm install under ~/.local/share/nvm or ~/.nvm is found automatically."
-  fi
-  # run.sh reaches `npx` and `npm`, not only `node`, so the whole toolchain has
-  # to come from the install this guard actually inspected — checking one
-  # binary and then running a different one is the shape of the bug above.
-  local -x PATH="$node_bin:$PATH"
-  if [[ ! -d ~/.cache/ms-playwright ]]; then
-    die "browser tests need a Playwright browser: npx playwright install chromium"
-  fi
-  # `dev gate` has already run trunk_build, so dist exists; the server binary is
-  # NOT a by-product of `cargo test`, so build it explicitly.
-  cargo build -p git-vista-server
-  ./ci/browser/run.sh "$@"
-}
+*The operation journal. Every mutation is recorded before it runs — including
+the ones made in a terminal, tagged `terminal`, because standard Git stays
+authoritative and Git-Vista observes it rather than owning it. Entries that can
+be safely undone offer an Undo button; the rest do not.*
 
-# dev verify — the sandbox-specific checks `dev gate` does NOT run.
-#
-# `dev gate` proves the workspace builds and its tests pass. It does not prove the
-# escape battery actually *proved* anything: a case can report `capability-absent`,
-# the census can drift from the cases it mirrors, a mutant patch can stop applying,
-# and every one of those leaves `cargo test` green. Six times in M1.13b a test was
-# green while proving nothing; these are the checks that catch that class.
-#
-# Run this before closing a sandbox issue or marking a PR ready. Fail-closed
-# throughout: a missing file or an unreadable report is a FAIL, never a skip.
-cmd_verify() {
-  local fails=0
-  local report="${GV_ESCAPE_REPORT:-/tmp/gv-verify-report.txt}"
-  rm -f "$report"
+![The four-pane conflict view](docs/screenshots/05-conflict-panes.png)
 
-  echo "dev: sandbox verification (the checks gate does not run)…"
+*A conflicted file, showing all three index stages beside the working-tree
+result. This one is an add/add conflict: both sides created the file, so there
+is no common ancestor, and the Base pane says **"Not present on this side"** — an
+empty box there would claim an ancestor existed and was blank, which is a false
+statement about the repository. `Take ours`, `Take theirs` and `Delete file`
+resolve the whole file; the result pane is deliberately read-only.*
 
-  echo "── 1. escape battery + report ──────────────────────"
-  GV_ESCAPE_REPORT="$report" cargo test -p git-vista-server \
-    -- escape_suite hook_mode_suite escape_contract || { echo "  ✗ battery failed"; fails=$((fails+1)); }
+## Product Direction
 
-  echo "── 2. every case reported 'contained' ──────────────"
-  if [[ ! -s $report ]]; then
-    echo "  ✗ \$GV_ESCAPE_REPORT is missing or empty — no case ran, or the variable did"
-    echo "    not reach the test process. An unset variable must fail closed (R5)."
-    fails=$((fails+1))
-  else
-    local total contained
-    total=$(wc -l < "$report")
-    contained=$(grep -c 'result=contained' "$report" || true)
-    if [[ $total -eq $contained ]]; then
-      echo "  ✓ $contained/$total contained"
-    else
-      echo "  ✗ $contained/$total contained — the rest:"
-      grep -v 'result=contained' "$report" | sed 's/^/      /'
-      fails=$((fails+1))
-    fi
-  fi
+- Professional Git client first; teaching is a major layer, not the base product.
+- iPad, finger, and Apple Pencil as primary design inputs.
+- Local-first and single-user, with no required Git-Vista cloud account.
+- Git-Vista runs beside repositories on Linux. Remote access arrives over a
+  network the operator already trusts — an SSH forward, or a private tailnet —
+  never by exposing the listener.
+- One frontend for iPad, Linux, macOS, Windows, touchscreens, and large displays.
+- Standard Git remains authoritative and interoperable with terminal workflows.
 
-  echo "── 3. census == report, BOTH directions ────────────"
-  # Equality, not a floor: a renamed case must break the build rather than
-  # silently shrinking what the gate covers.
-  local census=docs/sandbox/escape-census.txt
-  if [[ -s $report && -f $census ]]; then
-    if diff <(grep -oE 'case=[^ ]+' "$report" | sed 's/^case=//' | sort -u) \
-            <(grep -v '^\s*#' "$census" | grep -v '^\s*$' | sort -u) > /tmp/gv-census.diff; then
-      echo "  ✓ census matches the report"
-    else
-      echo "  ✗ census and report disagree (< report only, > census only):"
-      sed 's/^/      /' /tmp/gv-census.diff
-      fails=$((fails+1))
-    fi
-  else
-    echo "  ✗ cannot compare — report or $census missing"; fails=$((fails+1))
-  fi
+## Documentation
 
-  echo "── 4. mutants registered and applying ──────────────"
-  local n_files n_array
-  n_files=$(find ci/mutants -maxdepth 1 -name '*.patch' 2>/dev/null | wc -l)
-  n_array=$(grep -oP 'readonly -a mutants=\(\K[^)]*' ci/mutation-matrix.sh 2>/dev/null | wc -w)
-  if [[ $n_files -eq $n_array && $n_files -gt 0 ]]; then
-    echo "  ✓ $n_files patches == $n_array registered"
-  else
-    echo "  ✗ $n_files patch files vs $n_array in the mutants array"; fails=$((fails+1))
-  fi
-  local bad=0
-  for p in ci/mutants/*.patch; do
-    [[ -e $p ]] || continue
-    patch -p1 --forward --fuzz=0 --dry-run < "$p" > /dev/null 2>&1 || { echo "  ✗ does not apply: $p"; bad=1; }
-  done
-  [[ $bad -eq 0 ]] && echo "  ✓ all patches apply at --fuzz=0" || fails=$((fails+1))
+- [Architecture Decision Records](docs/adr/) — the numbered, dated record of
+  every decision expensive to reverse (64 so far, 0001–0064). This is where
+  implemented behavior is authoritative; start here before trusting a claim in
+  a prose doc below against the running code.
+- [Future vision](docs/FUTURE_VISION.md) — proposed, not current.
+- [V2 architecture](docs/V2_ARCHITECTURE.md) — proposed, not current.
+- [Git client roadmap](docs/GIT_CLIENT_ROADMAP.md) — proposed, not current.
+- [iPad interaction design](docs/IPAD_DESIGN.md)
+- [Remote Linux architecture](docs/REMOTE_ARCHITECTURE.md)
+- [Security model](docs/SECURITY_MODEL.md)
+- [Feature and competitive matrix](docs/FEATURE_MATRIX.md) — proposed baseline,
+  not current.
 
-  echo "── 5. no leaked git daemon ─────────────────────────"
-  if pgrep -x git-daemon > /dev/null; then
-    echo "  ✗ a git-daemon survived a test run — it squats port 9418 and will"
-    echo "    poison the next run. Kill it BY PID (never 'pkill -f')."
-    fails=$((fails+1))
-  else
-    echo "  ✓ none"
-  fi
+`DESIGN.md` preserves the prototype's phased implementation history. The
+future-vision, V2-architecture, roadmap, and feature-matrix documents under
+`docs/` are proposed direction, not claims about the current code — treat an
+ADR or the code itself as the tiebreaker whenever one of them looks ahead of
+what has actually shipped. Agent prompts, session handoffs, and running
+project memory are local working material and are intentionally excluded from
+the repository's public-facing docs.
 
-  echo
-  if [[ $fails -eq 0 ]]; then
-    echo "dev: ✅ sandbox verification green"
-  else
-    echo "dev: ❌ $fails check(s) failed" >&2
-    exit 1
-  fi
-}
+## Workspace layout
 
-cmd_roadmap() {
-  command -v gh >/dev/null || die "gh CLI not found"
-  echo "=== Milestones (progress) ==="
-  gh api "repos/{owner}/{repo}/milestones?state=all&per_page=50" \
-    --jq 'sort_by(.title) | .[] | "  \(.title)  —  \(.closed_issues) done / \(.open_issues) open"'
-  echo
-  echo "=== Open issues (next up first) ==="
-  gh api "repos/{owner}/{repo}/issues?state=open&per_page=100" \
-    --jq 'map(select(.pull_request == null)) | sort_by(.number) | .[] | "  #\(.number)  \(.title)"' \
-    | head -20
-}
+The workspace has six crates:
 
-# dev roadmap-page — regenerate design-docs/roadmap.html (a self-contained
-# HTML page, not a git-tracked file) from live GitHub milestone + merged-PR
-# data. The generator (tools/roadmap_page.py) is the tracked artifact; its
-# output is disposable — rerun any time for a fresh snapshot with a new
-# timestamp. See `python3 tools/roadmap_page.py --help` for flags
-# (--open, --out, --review, --selftest).
-cmd_roadmap_page() {
-  python3 tools/roadmap_page.py "$@"
-}
+```
+git-vista/
+├── Cargo.toml                    # workspace root
+├── rust-toolchain.toml           # stable toolchain + wasm32 target
+├── gv                            # launcher: rebuild the SPA + serve a repo
+└── crates/
+    ├── git-vista-core/           # wasm-safe domain model + pure shared logic
+    ├── git-vista-protocol/       # versioned HTTP contract: protocol negotiation,
+    │                             #   API error envelope, request-id, wire DTOs
+    ├── git-vista-git/            # native git reading via gix (native-only)
+    ├── git-vista-server/         # axum HTTP backend
+    │   └── src/                  # routes, planner, journal, contract
+    │                             #   middleware, sandboxed Git execution, state
+    ├── git-vista-mcp/            # MCP stdio bridge: agents drive git-vista
+    │                             #   through the same HTTP API the browser uses
+    └── git-vista/                # the Leptos wasm UI (bin: git-vista-ui)
+        ├── index.html            # Trunk entry point
+        ├── styles.css
+        └── src/                  # feature, rendering, gesture, and state modules
+```
 
-cmd_start() {
-  local issue="${1:-}"
-  [[ -n "$issue" ]] || die "usage: dev start <issue#>"
-  command -v gh >/dev/null || die "gh CLI not found"
-  local title mnum rest slug branch
-  title="$(gh issue view "$issue" --json title --jq .title)" || die "no issue #$issue"
-  # `|| true`: under `set -e`, a title with no M-number (e.g. "170a — ..." or
-  # "153a — ...", both real titles among the M2 sub-issues filed 2026-07-31)
-  # makes `grep` exit 1 with no match, which kills the script here before it
-  # ever reaches the `${mnum:-issue-$issue}` fallback three lines down — the
-  # fallback that was clearly meant to handle exactly this case. `mnum` ends
-  # up empty either way; only the *script surviving* to use that fallback was
-  # broken.
-  mnum="$(grep -oiE 'M[0-9]+\.[0-9]+' <<<"$title" | head -1 | tr '[:upper:]' '[:lower:]' || true)"
-  rest="$(sed -E 's/^M[0-9]+\.[0-9]+ *//I' <<<"$title")"
-  slug="$(tr '[:upper:]' '[:lower:]' <<<"$rest" | tr -cs '[:lower:]0-9' '-' | sed 's/^-//; s/-$//' | cut -c1-40 | sed 's/-$//')"
-  branch="feature/${mnum:-issue-$issue}-${slug}"
-  echo "dev: issue #$issue — $title"
-  echo "dev: branching $branch off fresh main…"
-  git checkout main -q
-  git pull --ff-only origin main -q
-  git checkout -b "$branch"
-  echo "dev: on $branch. First thing: seed handoff.md and 'dev wip' early + often."
-}
+`git-vista-protocol` is the **transport contract**, separated from the domain
+model so the wire format versions independently: the server and the wasm frontend
+both depend on it, while `git-vista-core` stays free of transport concerns. See
+[ADR 0002](docs/adr/0002-versioned-api-contract.md).
 
-cmd_wip() {
-  local msg="${*:-}"
-  [[ -n "$msg" ]] || msg="wip: checkpoint $(git rev-parse --abbrev-ref HEAD)"
-  local branch; branch="$(git rev-parse --abbrev-ref HEAD)"
-  [[ "$branch" != "main" ]] || die "refuse to WIP-commit on main — 'dev start <issue#>' first"
-  # Emptiness must be tested with `status --porcelain`, not `diff`: `git diff` only
-  # reports TRACKED files, so a checkpoint whose only change was a brand-new file
-  # (a fresh plan, spec or module) looked "clean" and was silently never committed.
-  # --porcelain counts untracked files too, and still honours .gitignore.
-  if [[ -z "$(git status --porcelain)" ]]; then
-    echo "dev: nothing to commit; pushing branch to be safe…"
-  else
-    git add -A
-    git "${GIT_AS[@]}" commit --no-verify -m "$msg"
-  fi
-  git push -u origin "$branch"
-  echo "dev: ✅ checkpoint pushed — this session's work is now safe to resume."
-}
+`git-vista-git` is kept **separate** from `git-vista-core` on purpose: gix reads a
+filesystem repo and can't compile for wasm, so keeping it out of `core` lets the
+browser frontend depend on a clean, wasm-safe core. Both the server and the UI
+share `git-vista-core`'s types, so the same structs flow from the git walker
+through JSON into the UI with no duplication.
 
-cmd_resume() {
-  local branch; branch="$(git rev-parse --abbrev-ref HEAD)"
-  git fetch -q origin 2>/dev/null || true
-  echo "=== branch: $branch ==="
-  echo "=== commits on this branch (not yet on main) ==="
-  git log --oneline --format='  %h %an %s' main.."$branch" 2>/dev/null || echo "  (none / branch is main)"
-  echo "=== uncommitted changes (would be lost on token-out — 'dev wip' them!) ==="
-  git status --short || true
-  # The "did it all but never merged" catch: work can be complete on a branch /
-  # in an open PR while you're sitting on a clean main and think nothing's pending.
-  echo "=== OPEN PRs (done-but-unmerged? merge + close the issue!) ==="
-  if command -v gh >/dev/null; then
-    gh pr list --state open --json number,title,headRefName \
-      --jq '.[] | "  #\(.number)  \(.title)  [\(.headRefName)]"' 2>/dev/null || echo "  (gh error)"
-  else
-    echo "  (gh not available)"
-  fi
-  echo "=== local branches with commits not on main (unfinished work?) ==="
-  # Process substitution (not a pipe) + `if`, so an all-clean tree can't trip
-  # `set -euo pipefail` and skip the handoff section below.
-  while read -r b; do
-    [[ "$b" == "main" ]] && continue
-    n="$(git rev-list --count "main..$b" 2>/dev/null || echo 0)"
-    if [[ "$n" -gt 0 ]]; then echo "  $b (+$n ahead of main)"; fi
-  done < <(git for-each-ref --format='%(refname:short)' refs/heads)
-  echo "=== handoff.md ==="
-  if [[ -f handoff.md ]]; then cat handoff.md; else echo "  (no handoff.md — create one with the plan + checklist)"; fi
-}
+`git-vista-mcp` is kept **separate from `git-vista-server`** on purpose too: it
+links `git-vista-protocol` and `git-vista-core` for the shared wire types but
+never the server crate, so an agent talking MCP reaches the repository only
+through the same loopback HTTP API and the same reviewable planner the browser
+uses — never a shell, never raw argv. A dependency-graph test proves the write
+path is structurally unreachable from this crate, not merely unrouted. See
+[ADR 0046](docs/adr/0046-mcp-plan-tool-surface.md).
 
-cmd_report() {
-  git fetch -q origin 2>/dev/null || true
+V2 will split pure domain, versioned protocol, graph, repository application,
+and forge concerns further as those boundaries earn their own crates.
 
-  echo "=== git-vista — repo health ==="
-  echo "$(date -Is)"
-  echo
+## Architecture
 
-  echo "── branches (origin) ──────────────────────────────"
-  local total merged open
-  total="$(git for-each-ref --format='%(refname:short)' refs/remotes/origin/ | grep -vc '/HEAD$' || true)"
-  merged="$(git branch -r --merged origin/main | grep -v '\->' | wc -l)"
-  open=$((total - merged))
-  echo "  total:  $total"
-  echo "  merged: $merged"
-  echo "  open:   $open"
-  echo
+```
+  browser (SPA, wasm)                                  git-vista-server (native)
+  ────────────────────                HTTP             ─────────────────────────
+  fetch  /api/commits, /api/status  ─────────────────▶  reads: walk_history,
+  fetch  /api/diff/{id}, /api/file  ─────────────────▶  status, diff, activity  ─┐
+                                                                                  │ gix reads
+  POST   /api/plan                  ─────────────────▶  shared planner:         ─┤ the repo
+         { operation, targets }                          typed operation        ─┤ on the
+                                     ◀─────────────────   → reviewable Plan       │ filesystem
+  POST   /api/{commit,branch,merge,                                             ─┤
+         push,pull,fetch,tag,       ─────────────────▶  execute: serialized     ─┤ system git
+         amend-commit,checkout,…}                         per-repo, journaled,     (shell,
+                                                            bounded git exec       sandboxed)
+                                     ◀─────────────────   → result / undo ref    ─┘
 
-  echo "── open branches (not yet merged into main) ────────"
-  git branch -r --no-merged origin/main | grep -v '\->' | sed 's/^ */  /'
-  echo
+  MCP agent (stdio)  ──git-vista-mcp──▶  same loopback HTTP API, same planner,
+                                          read tools + build-only plan tools
+                                          (execution is a separate, later stage)
+```
 
-  echo "── WIP / auto-checkpoint commits, all branches ─────"
-  local wips
-  wips="$(git log --all --oneline --grep='^wip(' -i | wc -l)"
-  echo "  $wips total"
-  echo "  by branch:"
-  git for-each-ref --format='%(refname:short)' refs/remotes/origin/ | grep -v '/HEAD$' | while read -r b; do
-    c="$(git log "$b" --oneline --grep='^wip(' -i 2>/dev/null | wc -l)"
-    [[ "$c" -gt 0 ]] && printf '    %-55s %s\n' "$b" "$c"
-  done
-  echo
+Every write — whatever the caller — goes through the one shared planner
+described in [ADR 0016](docs/adr/0016-shared-write-planner.md): build a typed
+`Plan` from a closed operation vocabulary
+([ADR 0015](docs/adr/0015-typed-operation-vocabulary-and-plan-schema.md)),
+then execute it, serialized per repository, against a policy-bounded Git
+process, with a durable operation journal behind it
+([ADR 0019](docs/adr/0019-serialized-mutations-per-repository.md),
+[ADR 0021](docs/adr/0021-durable-operation-journal-and-recovery-refs.md)).
+The server serves both the WASM bundle and same-origin API on `:8080`.
 
-  echo "── lines of Rust, by crate ──────────────────────────"
-  local grand=0
-  for d in crates/*/; do
-    local name n
-    name="$(basename "$d")"
-    n="$(find "$d" -name '*.rs' -not -path '*/target/*' -exec cat {} + 2>/dev/null | wc -l)"
-    grand=$((grand + n))
-    printf '  %-22s %6d\n' "$name" "$n"
-  done
-  printf '  %-22s %6d\n' "total" "$grand"
-  echo
+## Current Features
 
-  echo "── main, by ISO week, from day 1 ────────────────────"
-  # Single `git log --numstat` pass, not one invocation per week: a commit
-  # line ('@@'-prefixed) sets the current week, and every numstat line that
-  # follows it (until the next '@@') belongs to that commit — the same
-  # interleaving `git log --numstat --pretty=format:...` always produces, so
-  # this needs no per-commit lookups. Reversed then printed high-to-low so
-  # the accumulation is oldest-first but the report reads newest-first.
-  git log main --reverse --pretty=format:'@@%x09%ad%x09%s' --date=format:'%G-W%V' --numstat | awk -F'\t' '
-    /^@@/ {
-      wk = $2
-      is_wip = ($3 ~ /^wip\(/) ? 1 : 0
-      if (!(wk in seen)) { seen[wk] = 1; order[++n] = wk }
-      commits[wk]++
-      if (!is_wip) real[wk]++
-      next
-    }
-    NF == 3 { ins[wk] += ($1 == "-" ? 0 : $1); del[wk] += ($2 == "-" ? 0 : $2) }
-    END {
-      for (i = n; i >= 1; i--) {
-        w = order[i]
-        printf "  %-9s %4d commits (%3d real)   +%-6d -%-5d\n", \
-          w, commits[w], real[w], ins[w] + 0, del[w] + 0
-      }
-    }
-  '
-  echo
+- Vertical commit graph with robust lane assignment (branches, merges, octopus).
+- Pan & zoom via **Pointer Events** — drag to pan, wheel to zoom on desktop,
+  one-finger drag + two-finger pinch on iPad/Safari.
+- Stable **per-branch colours**, and HEAD / branch / tag badges beside commits.
+- Commit labels (message · short hash · author · local date), with **level of
+  detail** (text hidden when zoomed out) and **viewport virtualization** (only
+  on-screen rows are rendered, for large histories).
+- **GitHub links** on commits/refs when the repo has a `github.com` origin — only
+  for pushed objects, so a link never 404s.
+- **Commit detail panel**: "View details" opens a side panel with the full
+  message body and both author & committer signatures; parent hashes are
+  clickable to walk up the history.
+- **Open URL**: paste a public `https://`/`http://`/`git://` URL to clone it
+  into the persistent clones store, then choose Visualize (read-only) or
+  Active mode. Clones survive a restart and stay listed in the picker until
+  deleted.
+- **Controls & shortcuts**: drag/one-finger to pan, wheel/pinch to zoom, plus
+  keyboard shortcuts on desktop and the iPad Magic Keyboard — `+`/`-` zoom, `0`
+  resets the view, `r` refreshes, `Esc` closes the open menu/panel. A **Reset
+  view** button recenters the camera for pure touch/trackpad use.
+- Working-tree summary, stage-all/unstage-all, commit diffs, file viewing,
+  branch checkout, rebase gating, activity history, contextual undo, and graph
+  printing.
+- **Write actions** from the graph's context menu, each confirmed in an
+  iPad-safe in-app modal and each running through the shared planner: create
+  branch, commit, **amend**, merge, **fetch, pull, push**, delete branch,
+  create/list/delete **tags**.
+- **MCP agent bridge** (`git-vista-mcp`): an agent gets read tools (graph,
+  commit detail, diff, activity, status, repository selection) plus 23
+  build-only `plan_<operation>` tools — it can ask "what would this operation
+  do" and get back risk, preconditions, and affected refs with nothing
+  touching the repository. Submitting an approved plan for execution is a
+  separate, later stage. See
+  [ADR 0046](docs/adr/0046-mcp-plan-tool-surface.md).
 
-  echo "── merged PRs, last 7 days ──────────────────────────"
-  if command -v gh >/dev/null; then
-    gh pr list --state merged --limit 60 --json number,title,mergedAt \
-      --jq '.[] | select(.mergedAt > (now - 7*86400 | todate)) | "  \(.mergedAt | .[0:10])  #\(.number)  \(.title)"' \
-      | sort
-  else
-    echo "  (gh not available)"
-  fi
-}
+See the [feature matrix](docs/FEATURE_MATRIX.md) for the target/current split
+(the matrix predates the M2 work above and is due a refresh; the ADR index is
+the current source of truth in the meantime).
 
-cmd_signin() { ./gv --token; }
-cmd_doctor() { ./gv doctor; }
-cmd_serve()  { ./gv "$@"; }
+## Prerequisites
 
-# dev testbed <ref> [port] — stand up an isolated, human-drivable copy of the app
-# at <ref>, on its own port, in its own worktree, without disturbing whatever is
-# already running.
-#
-# Why this exists: `dev gate` proves the tests pass. It does NOT prove the app
-# works — a green suite over a broken feature is a real failure mode this project
-# has already hit (a push test passed against a literal IP while DNS inside the
-# sandbox was dead). The only cure is a human driving the actual UI. This makes
-# that cheap enough to do before every merge instead of never.
-#
-# What it buys beyond "just test it": a NAMED, REPRODUCIBLE anchor. When
-# something breaks later, "it worked at <sha>, driven by hand on <date>" is the
-# difference between a five-minute bisect and an afternoon of archaeology.
-#
-# Isolation is by construction, not by discipline: separate worktree (own source,
-# own target/), separate port, separate branch. Nothing the main tree does can
-# reach it. That is why this is a worktree and not a container — the code is our
-# own at our own commit, so the only boundaries needed are filesystem and port,
-# both of which git and a const already give us.
-# testbed_target_for <repo-root> <port> — where this port's testbed build goes.
-#
-# The isolation itself (one target dir per port, never shared with the main
-# tree) is argued at length inside cmd_testbed. This decides only the LOCATION,
-# and it is a separate function so `ci/testbed_target_test.sh` can drive the
-# real code instead of a copy of it.
-#
-# $REPO/target is a symlink onto the scratch SSD, but a sibling
-# `target-testbed-$port` in the repo root is NOT — so every testbed cold-built
-# 3+ GB onto the spinning system disk while looking correctly configured
-# (measured 2026-08-23: 5.8 GB across two ports on /dev/mapper/vgmint-root).
-# Follow the main tree by reading where its symlink points, rather than
-# hardcoding a mount path that a later disk swap would silently invalidate.
-#
-# THE `== /*` TEST IS THE SAFETY MECHANISM, not decoration. A dangling symlink
-# (the SSD unplugged) makes `readlink -f` print nothing, so `dirname ""` is "."
-# — and "." IS a directory, so a bare `-n && -d` guard passes and the build
-# lands in whatever directory the operator happened to be standing in. The
-# unmounted disk is the entire reason this fallback exists, so it is the one
-# case it must not get wrong. Requiring an absolute path is what rules "." out,
-# and it rules out a relative link for the same reason: relative to the repo
-# root is not relative to the CWD, and only the CWD is what would be used.
-#
-# Reading the LINK TEXT rather than `readlink -f` is a deliberate but SECONDARY
-# choice — it does not depend on the disk being attached to produce an answer at
-# all. Mutation-proven 2026-08-23 and worth recording honestly: swapping in
-# `readlink -f` alone SURVIVED, because the `== /*` test catches its empty
-# output anyway. Removing `== /*` was caught, three assertions red. Do not read
-# the link-text choice as the thing keeping the build out of your CWD.
-#
-# A missing cache disk is a slower build, never a failure.
-testbed_target_for() {
-  local repo="$1" port="$2" cargo_root=""
-  [[ -L $repo/target ]] && cargo_root="$(dirname "$(readlink "$repo/target")")"
-  if [[ $cargo_root == /* && -d $cargo_root ]]; then
-    echo "$cargo_root/git-vista-testbed-$port"
-  else
-    echo "$repo/target-testbed-$port"
-  fi
-}
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install trunk
+```
 
-cmd_testbed() {
-  local ref="${1:-main}" port="${2:-8081}"
-  local dir="$REPO-testbed-$port"
-  local branch="testbed/$(echo "$ref" | tr '/' '-')-$(date +%Y%m%d-%H%M)"
+A working `git` on `PATH` (the server shells out to it for writes and clones); the
+history read itself uses `gix`'s pure-Rust reader.
 
-  [[ -e $dir ]] && die "$dir already exists — remove it or pick another port (dev testbed <ref> <port>)"
-  git rev-parse --verify "$ref" >/dev/null 2>&1 || die "unknown ref: $ref"
-  if ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q .; then
-    die "port $port is already in use — pick another (dev testbed <ref> <port>)"
-  fi
+## Running
 
-  local sha; sha="$(git rev-parse --short "$ref")"
-  echo "dev: testbed for $ref ($sha) on port $port"
-  git worktree add "$dir" -b "$branch" "$ref"
+The normal path is the `gv` launcher: it builds the WASM SPA and server before
+replacing the previous process, then points the server at a repository.
 
-  # The port is a compile-time const (state.rs) because the server is
-  # deliberately loopback-only — no env override exists, by design. Rewriting it
-  # here is safe precisely because this worktree is a dead end: its branch is
-  # never merged, so the edit cannot escape into main.
-  local state="$dir/crates/git-vista-server/src/state.rs"
-  sed -i "s/pub(crate) const PORT: u16 = 8080;/pub(crate) const PORT: u16 = $port;/" "$state"
-  grep -q "const PORT: u16 = $port;" "$state" || die "could not retarget PORT in $state"
+```sh
+./gv                  # visualise the CURRENT directory's repo
+./gv ~/code/myproj    # visualise another repo by path
+```
 
-  # `gv` carries the port too, and retargeting the server without retargeting it
-  # is worse than not retargeting either — the testbed then LOOKS driveable while
-  # every sign-in path points somewhere else. `gv` probes $PORT for a live
-  # server, mints the one-time token against it, prints the setup URL, and prints
-  # the iPad tunnel instructions. Left at 8080, all four of those address
-  # whatever is running in the MAIN tree: `dev signin` in a testbed hands you a
-  # link that signs you in to the production server, and the testbed you meant to
-  # drive is never reached. Same dead-end-branch argument as state.rs above makes
-  # the edit safe.
-  local gvbin="$dir/gv"
-  sed -i "s/^PORT=8080$/PORT=$port/" "$gvbin"
-  grep -q "^PORT=$port$" "$gvbin" || die "could not retarget PORT in $gvbin"
+Then open the **sign-in link** it prints:
 
-  # Give the testbed its OWN state directory, and export it so everything
-  # downstream inherits it — `gv`'s own LOG_DIR/TOKEN_FILE/PID_FILE, and the
-  # server `gv` spawns, which resolves the same XDG_STATE_HOME (state.rs).
-  #
-  # Without this, main tree and testbed share
-  # $XDG_STATE_HOME/git-vista/bootstrap.token. Each server mints its own token
-  # at startup into that one path, so whichever started LAST owns the file and
-  # the other's sign-in link is dead — including the iPad session already open
-  # against 8080. That is not hypothetical: it is what broke sign-in on
-  # 2026-08-05, and the diagnosis cost more than the fix. Same dead-end-branch
-  # argument as the PORT rewrites above makes the edit safe.
-  local statedir="$dir/.state"
-  mkdir -p "$statedir"
-  sed -i "s|^LOG_DIR=|export XDG_STATE_HOME=\"$statedir\"\nLOG_DIR=|" "$gvbin"
-  grep -q "^export XDG_STATE_HOME=\"$statedir\"$" "$gvbin" \
-    || die "could not isolate XDG_STATE_HOME in $gvbin"
+```
+gv: sign in on the iPad/browser by opening this one-time link:
+gv:   http://localhost:8080/#s=<token>
+```
 
-  # Each testbed gets its OWN target dir, keyed by port. It is NOT shared with
-  # the main tree.
-  #
-  # An earlier version of this script shared $REPO/target, on the argument that
-  # cargo keys artifacts by compilation fingerprint and the retargeted PORT const
-  # makes the testbed's git-vista-server distinct. That argument is true, and it
-  # is not sufficient — it covers exactly one crate. Every OTHER workspace crate
-  # (git-vista-protocol, git-vista-core, git-vista-git) has the same name, the
-  # same version, and the same workspace-relative path in both trees while
-  # holding DIFFERENT source. Cargo reused the main tree's copies.
-  #
-  # Measured 2026-08-06, building the #232 testbed at 387c8cd:
-  #
-  #   error[E0432]: unresolved import `git_vista_protocol::OperationByKeyResponse`
-  #   error[E0004]: non-exhaustive patterns: `FetchFailureKind::CredentialHelperBlocked` not covered
-  #
-  # Both impossible from the testbed's own source: its protocol crate DOES export
-  # OperationByKeyResponse and does NOT define CredentialHelperBlocked — while
-  # the main tree's is the exact inverse, and `cargo metadata` insisted the
-  # testbed resolved its own crate. It was compiling against main's.
-  #
-  # The failure mode this creates is the one this command exists to prevent: a
-  # testbed that LOOKS like the ref you asked for while linking another tree's
-  # crates, so a human device pass certifies a binary that was never built from
-  # the branch under test. A slow honest build beats a fast lying one.
-  #
-  # Keyed by port, not deleted with the worktree, so a repeat testbed on the same
-  # port still gets a warm cache — most of the cost back, none of the collision.
-  # Teardown of the dir is a deliberate, separate step (printed below).
-  #
-  # Debug, not --release: this build exists to be driven by a human for a few
-  # minutes, not to be fast at runtime. Optimizing it is the tail wagging the dog.
-  #
-  # WHERE it lives is testbed_target_for's job — see that function.
-  local testbed_target
-  testbed_target="$(testbed_target_for "$REPO" "$port")"
-  if [[ -d $testbed_target ]]; then
-    echo "dev: reusing this port's own cache at $testbed_target (debug)"
-  else
-    echo "dev: cold build in $testbed_target (debug) — first testbed on this port,"
-    echo "dev: so every dependency compiles from scratch. Expect 10-25 minutes."
-    # An older build for this same port on the system disk is not reused: the
-    # move is deliberate. Say so, rather than letting the cold build look like a
-    # regression.
-    [[ -d $REPO/target-testbed-$port ]] \
-      && echo "dev: (an older cache for this port sits at $REPO/target-testbed-$port on the system disk — safe to delete)"
-  fi
-  ( cd "$dir" && env CARGO_TARGET_DIR="$testbed_target" \
-      trunk build --config crates/git-vista/Trunk.toml )
-  ( cd "$dir" && env CARGO_TARGET_DIR="$testbed_target" \
-      cargo build -p git-vista-server )
+- on this machine: open that complete link in the browser.
+- from an iPad: forward local port `8080` through SSH to `127.0.0.1:8080` on the
+  Linux host, then open the link (the tunnel makes `localhost:8080` on the iPad the
+  server).
 
-  # Prove the binary is the one we meant, rather than trusting the build. The
-  # PORT const is compiled in; a binary that does not bind $port is a binary
-  # from another tree, and the whole point of the isolation above is that this
-  # can be asserted instead of assumed.
-  local built="$testbed_target/debug/git-vista-server"
-  [[ -x $built ]] || die "build produced no binary at $built"
+The link carries a one-time token in the URL *fragment* — it never reaches the
+server or any log. Opening it exchanges the token for an HttpOnly, `SameSite=Strict`
+session cookie; the app then works normally. The token is **single-use** and
+expires; `./gv --token` prints a fresh localhost link for the running server.
+Each browser/device needs a newly printed link because a successful exchange
+consumes it. The complete `#s=...` fragment is required; the token is not a
+password to paste into the app. Until a browser signs in, the app shows a
+"Connect to git-vista" screen and the API answers `401`.
 
-  cat <<EOF
+Every mutating request additionally carries a per-session CSRF token, and the
+server validates `Origin`/`Host` against loopback plus the content type on top of
+the session — see [ADR 0004](docs/adr/0004-loopback-sessions.md) and
+[the security model](docs/SECURITY_MODEL.md).
 
-dev: testbed ready.
-  ref     $ref ($sha)
-  branch  $branch   (dead end — never merge this)
-  dir     $dir
-  port    $port
+Opening `http://127.0.0.1:8080/` directly in Safari without a tunnel will not
+work: on the iPad, `127.0.0.1` means the iPad itself.
 
-Start it, then get the sign-in link:
-  cd $dir && env XDG_STATE_HOME=$statedir $built <repo-to-open> &
-  cd $dir && ./dev signin
+Direct LAN access is deliberately disabled. `./gv --lan` is rejected, and the
+server also refuses a non-loopback `GIT_VISTA_BIND_ADDR` override. This keeps the
+plain-HTTP Git control surface off Wi-Fi, VPN, container, and public interfaces.
 
-The XDG_STATE_HOME above is REQUIRED, not decorative. This testbed's \`gv\` is
-already pinned to $statedir, so 'dev signin' here is correct on its own — but
-a server started WITHOUT that env writes its bootstrap token to the shared
-$HOME/.local/state/git-vista/ instead, clobbering whatever is running on 8080.
-That is what killed the iPad session on 2026-08-05.
+### SSH tunnel workflow and diagnostics
 
-NOTE the binary path: this build used CARGO_TARGET_DIR=$testbed_target, so
-there is no $dir/target/ at all. Use the full path above.
+Start Git-Vista normally on Linux so it remains loopback-only:
 
-Nothing the main tree builds can disturb this binary any more — that isolation
-is the point of the per-port target dir, and is why the path is long.
+```sh
+./gv /absolute/path/to/repository
+./gv doctor
+```
 
-If the server exits immediately with "Address already in use", the binary is
-NOT this one: its PORT const is $port, so it cannot collide with 8080. Check
-which binary you launched before assuming the port is occupied.
+In the iPad SSH client, configure a **local** forward from iPad port `8080` to
+Linux `127.0.0.1:8080`. The command-line equivalent on another client is:
 
-Open the repo in VISUALIZE mode for a true read-only session.
+```sh
+ssh -N -L 8080:127.0.0.1:8080 linux-user@linux-host
+```
 
-Fetch/pull against a PRIVATE remote will fail for a reason unrelated to
-whatever you are testing: the git credential helper is \`gh\`, and the sandbox
-denies ~/.config/gh. Point the repo under test at a local file:// remote, or a
-public one, before concluding a network feature is broken.
+With the tunnel connected, run `./gv --token` on Linux and open its complete
+`http://localhost:8080/#s=...` link on the iPad. Here `localhost` deliberately
+means the iPad end of the forward. If the tunnel drops, reconnect the same
+forward and reload: the Git-Vista session cookie remains valid until its own
+idle expiry. Generate a new link only if the browser session itself is gone.
 
-Tear down when finished:
-  git worktree remove --force $dir
-  git branch -D $branch               # testbed branches only — see below
-  rm -rf $testbed_target              # only if you want the disk back; keeping
-                                      # it makes the next testbed on this port fast
+`./gv doctor` prints the actual bind address, health and protocol versions,
+launch/catalog roots, token age and permissions, process ownership, and the safe
+tunnel recipe. It never prints the token, cookies, or CSRF value. It reports a
+security error if port 8080 is ever observed on a non-loopback listener.
 
-The project's standing rule is that branches are NEVER deleted, so that the
-history of the codebase stays walkable. Tom carved testbed branches out of
-that rule explicitly (2026-07-31): "testbed repos dont matter they are temp by
-nature". They are dead ends by construction — a rewritten PORT const, never
-merged, never referenced. The carve-out is ONLY for testbed/* branches; every
-other branch in this repo is still permanent.
-EOF
-}
-cmd_handoff() {
-  [[ -f handoff.md ]] && { cat handoff.md; exit 0; }
-  echo "dev: no handoff.md yet. Create it with: the goal, a [ ]/[x] checklist, and 'next step'."
-}
+### Optional systemd user service
 
-case "${1:-}" in
-  gate)    shift; cmd_gate "$@" ;;
-  browser) shift; cmd_browser "$@" ;;
-  verify)  shift; cmd_verify "$@" ;;
-  roadmap) shift; cmd_roadmap "$@" ;;
-  roadmap-page) shift; cmd_roadmap_page "$@" ;;
-  start)   shift; cmd_start "$@" ;;
-  wip)     shift; cmd_wip "$@" ;;
-  resume)  shift; cmd_resume "$@" ;;
-  signin)  shift; cmd_signin "$@" ;;
-  doctor)  shift; cmd_doctor "$@" ;;
-  serve)   shift; cmd_serve "$@" ;;
-  testbed) shift; cmd_testbed "$@" ;;
-  handoff) shift; cmd_handoff "$@" ;;
-  report)  shift; cmd_report "$@" ;;
-  ""|-h|--help|help)
-    sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
-    ;;
-  *) die "unknown command: $1 (try: dev help)" ;;
-esac
+For a server that survives terminal and SSH-client closure under the user's
+service manager, build/install the binary and adapt the supplied example:
+
+```sh
+cargo build --release -p git-vista-server
+install -Dm755 target/release/git-vista-server ~/.local/bin/git-vista-server
+mkdir -p ~/.config/systemd/user
+cp contrib/systemd/git-vista.service ~/.config/systemd/user/
+# Edit WorkingDirectory and the final repository argument in ExecStart.
+systemctl --user daemon-reload
+systemctl --user enable --now git-vista.service
+systemctl --user status git-vista.service
+```
+
+The example remains loopback-only. Use `systemctl --user restart/stop
+git-vista.service` for a supervised process; `gv` deliberately refuses to kill a
+port occupant it does not own. `gv --token` and `gv doctor` still work because
+the service and launcher share the same per-user state directory. See [Remote
+Linux Architecture](docs/REMOTE_ARCHITECTURE.md) for the target session and
+tunnel design.
+
+Under the hood that's just:
+
+```sh
+( cd crates/git-vista && trunk build )        # build the wasm bundle into dist/
+cargo run -p git-vista-server -- <repo-path>  # serve SPA + API on :8080
+```
+
+Frontend-only iteration (no API, no real data) still works with
+`cd crates/git-vista && trunk serve`.
+
+## Tests
+
+These are the exact commands CI runs, in the order it runs them (`./dev gate`
+runs all five):
+
+```sh
+cargo fmt --all -- --check                                # formatting is clean
+cargo clippy --workspace --all-targets -- -D warnings     # strict clippy (native)
+cargo clippy -p git-vista --target wasm32-unknown-unknown --all-targets -- -D warnings
+cargo test --workspace                                    # headless test suite
+cd crates/git-vista && trunk build                        # the real wasm bundle
+```
+
+The core and Git crates include headless tests and repository fixtures;
+`git-vista-server` additionally carries planner, journal, sandbox, and
+contract-suite coverage. V2 requires additional route-policy, browser, and
+real-device coverage described in the architecture documents.
+
+### Toolchain and terminal colour
+
+The toolchain is pinned by [`rust-toolchain.toml`](rust-toolchain.toml): stable
+Rust plus the `wasm32-unknown-unknown` target, so `rustup` selects the right
+compiler automatically. The strict clippy pass runs twice — once for the native
+host across the whole workspace, and once for the configured wasm32 target scoped
+to the frontend crate, because `git-vista-git` (gix) and `git-vista-server`
+(axum/tokio) are native-only and don't compile for wasm.
+
+Diagnostic colour follows the standard `NO_COLOR` / `CARGO_TERM_COLOR`
+conventions. CI pins `CARGO_TERM_COLOR=always` so logs keep colour; set
+`NO_COLOR=1` (or `CARGO_TERM_COLOR=never`) locally for plain output when capturing
+a `--check` diff or a lint log into a file.
+
+## Status
+
+**M1 — V1 Foundation** is complete (39 issues shipped, 0 open): repository
+identity, protocol negotiation, catalog isolation, loopback sessions, the
+typed operation vocabulary and shared planner, serialized per-repository
+mutations, a bounded and sandboxed Git process policy, and a durable
+operation journal with recovery refs have all landed and shipped.
+
+**M2 — Daily Driver: Status to Push [V1]** is **complete** (0 open). Working-tree
+status and diff UI, file/hunk/partial staging, guarded discard, the full
+commit/hook/signing path, remote and upstream management, tags, and the
+installable PWA all landed. With M1 and M2 both closed, the V1 line is done.
+
+**M3 — Parallel Work & Recovery** is in progress (1 shipped, 5 open). The stash
+drawer is complete: list, inspect, push, apply, pop, drop and branch-from-stash,
+each planned and journaled, with conflicts entering the shared resolution model
+rather than being discarded. Linked worktrees are the substantial piece still
+outstanding.
+
+**M4 — History Editing** is in progress (2 shipped, 4 open). Force-with-lease
+carries advisories a reviewer sees before approving; a two-endpoint comparison
+now states *which* comparison it is (two-dot or three-dot) rather than leaving
+two different questions indistinguishable; and conflicts have a single model
+across merge, rebase, cherry-pick, revert, stash and pull, because git leaves an
+identical index state for all six. Cherry-pick and merge-revert are on a branch
+at the time of writing — reverting a merge commit was previously impossible, as
+git refuses without being told which parent is the mainline and there was
+nowhere to carry that answer.
+
+**M5 — Investigation & Forges** is part-shipped (3 shipped, 3 open). **M6**
+(teaching semantics) remains a single issue. M7 was retired and M8 deleted as
+never-started.
+
+[ADR 0049](docs/adr/0049-v1-scope-freeze.md) records the V1 scope freeze —
+eighteen never-started issues closed as won't-do, each with an explicit return
+condition — and is the place to check before assuming anything described only in
+`FUTURE_VISION.md`, `V2_ARCHITECTURE.md`, or `GIT_CLIENT_ROADMAP.md` is still
+intended as written.
+
+64 ADRs (`docs/adr/`, numbered 0001–0064) now record the project's architectural
+decisions in order. Treat that index, not this README's prose, as the living
+record of what has actually shipped — this file is periodically true, the ADRs
+are continuously true.
