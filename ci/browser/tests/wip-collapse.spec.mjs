@@ -339,3 +339,71 @@ test.describe('#478 two diverged chains whose checkpoints interleave', () => {
     expect(spans.filter(([from, to]) => to < from)).toHaveLength(0)
   })
 })
+
+// #571: the stub layer is placed by DISPLAY slot, like every other layer.
+//
+// `resolved_stubs` answers in raw row indices, because that is the space the
+// aggregate keeps. Folding separates raw from display space, and a stub drawn at
+// its raw anchor row sits one row lower for every checkpoint folded above it. A
+// stub connector rises only half a row while crossing from the anchor's lane to
+// the stub's own column — and stub columns start past the commit lane
+// high-water — so the mis-placed line is near-horizontal and lands across an
+// unrelated commit's subject text. Measured on git-vista's own history: 0 such
+// crossings unfolded, 59 folded.
+//
+// `cargo test` cannot reach any of this: `render/stubs.rs` is wasm-gated, and the
+// host test in `collapse.rs` proves only that `place_stubs` computes the right
+// slot, never that the layer asks it.
+test.describe('#571 branch stubs are placed in display space', () => {
+  // `stub_node_cy(row, 0)` is half a row above the anchor dot, and the name
+  // label sits 4px below the ring's centre (`render/stubs.rs`).
+  const RING_RISE = 28
+  const LABEL_BASELINE_DROP = 4
+
+  /** The y the `base` stub's label is actually drawn at. */
+  async function stubLabelY(page) {
+    const label = page.locator('.stub-label', { hasText: 'base' })
+    await expect(label, 'the fixture leaves `base` on the oldest commit, which renders as a stub')
+      .toHaveCount(1)
+    return Number(await label.getAttribute('y'))
+  }
+
+  /** The y of the dot at display slot `i` — read from the DOM, not computed. */
+  async function dotCy(page, i) {
+    return Number(await page.locator(`.node-hit[data-row-index="${i}"]`).getAttribute('cy'))
+  }
+
+  test('folded, the stub hangs over its anchor commit and not over its raw row', async ({
+    page,
+  }) => {
+    await openApp(page)
+    await expect(page.locator('.wip-group')).toHaveCount(1)
+    await expect(page.locator('.graph-row')).toHaveCount(EXPECTED_DISPLAY_ROWS)
+
+    // `base` is on the fixture's oldest commit, which sits BELOW the folded run
+    // — so its raw row and its display slot differ by exactly the checkpoints
+    // folded above it.
+    const anchor = await dotCy(page, EXPECTED_DISPLAY_ROWS - 1)
+    expect(await stubLabelY(page)).toBe(anchor - RING_RISE + LABEL_BASELINE_DROP)
+
+    // The same statement in the terms of the defect: drawn at its raw row the
+    // ring would be WIP_RUN_COUNT - 1 rows further down, off the bottom of a
+    // graph that no longer has rows there.
+    const rawRowY = anchor + (WIP_RUN_COUNT - 1) * 56
+    expect(await stubLabelY(page)).not.toBe(rawRowY - RING_RISE + LABEL_BASELINE_DROP)
+  })
+
+  test('unfolding moves the stub down onto the row its anchor now occupies', async ({ page }) => {
+    // The paired positive, and the one that pins the repaint: the stub layers
+    // are eager, so they only move when something tells them to. Reading only
+    // `stub_epoch` (a paging signal) leaves them frozen at the folded geometry
+    // after the toggle, which is a stub drawn against a row that has moved.
+    await openApp(page)
+    await page.getByRole('button', { name: /WIP: folded/ }).click()
+    await expect(page.locator('.wip-group')).toHaveCount(0)
+    await expect(page.locator('.graph-row')).toHaveCount(EXPECTED_EXPANDED_ROWS)
+
+    const anchor = await dotCy(page, EXPECTED_EXPANDED_ROWS - 1)
+    expect(await stubLabelY(page)).toBe(anchor - RING_RISE + LABEL_BASELINE_DROP)
+  })
+})
