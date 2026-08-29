@@ -184,6 +184,57 @@ impl DisplayProjection {
     }
 }
 
+/// A branch stub placed in display space (#571).
+///
+/// A stub is anchored on a *commit*, but every other layer of the canvas is
+/// drawn against a *display slot*: [`crate::render::build_node`] and both label
+/// tiers take the index of the item they are building and never the raw row
+/// inside it. Folding is what makes the two disagree — a folded run's members
+/// leave display space while keeping their raw row indices — so a stub drawn at
+/// its raw anchor row sits one row too low for every checkpoint folded above it.
+///
+/// That offset is not cosmetic. A stub's connector is near-horizontal by
+/// construction ([`crate::geometry::stub_path`]): it rises half a row while
+/// crossing from the anchor's lane to the stub's own column, and stub columns
+/// start past the *commit* lane high-water. Measured on this repository's own
+/// history, they reach lane 123 — x = 4210px — so a connector drawn against the
+/// wrong row is a thin coloured line running the width of the canvas straight
+/// through an unrelated commit's subject text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlacedStub {
+    /// Index into the resolved-stub list this was placed from, so the caller can
+    /// pair the slot back up with the stub's own lane, colour and depth without
+    /// this module having to know what a resolved stub is.
+    pub index: usize,
+    /// The display slot the stub hangs over: the slot showing its anchor commit.
+    pub display_row: usize,
+}
+
+/// Place resolved stubs into display space — `anchor_rows[i]` is stub `i`'s raw
+/// anchor row, and each result carries the display slot showing that commit.
+///
+/// A stub whose anchor is folded away lands on the fold's marker rather than
+/// being dropped: the marker *is* the slot showing that commit, the branch still
+/// exists, and beside the marker is where a user would look for it.
+///
+/// A stub whose anchor has no slot at all is dropped, exactly as
+/// [`crate::features::graph::core::LoadedHistory::resolved_stubs`] drops one
+/// whose anchor commit is not loaded. There is nowhere to hang it, and falling
+/// back to the raw index would put it on some other commit's row — which is the
+/// defect this function exists to prevent, not a graceful degradation of it.
+pub fn place_stubs(projection: &DisplayProjection, anchor_rows: &[usize]) -> Vec<PlacedStub> {
+    anchor_rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &anchor_row)| {
+            Some(PlacedStub {
+                index,
+                display_row: projection.display_of_row(anchor_row)?,
+            })
+        })
+        .collect()
+}
+
 /// True when `newer` and `older` are consecutive members of one foldable run:
 /// both WIP checkpoints, same lane, `older` is `newer`'s *sole* parent, and
 /// neither is itself a merge commit. Both parent-count checks matter: the
@@ -1375,5 +1426,96 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// The projection every stub test below hangs off: one real commit, a run of
+    /// three checkpoints, one real commit underneath. Folded, that is three
+    /// display slots for five raw rows — so raw and display row indices differ
+    /// for everything below the run, which is the whole point.
+    fn folded_with_a_run_in_the_middle() -> (Vec<GraphRow>, DisplayProjection) {
+        let rows = vec![
+            row(0, "feat: newest real work", Some("c1")),
+            wip_row(1, 3, Some("c2")),
+            wip_row(2, 2, Some("c3")),
+            wip_row(3, 1, Some("c4")),
+            row(4, "docs: oldest real work", None),
+        ];
+        let p = project(&rows, &[], true, &HashSet::new());
+        assert_eq!(p.items.len(), 3, "one real, one marker, one real");
+        (rows, p)
+    }
+
+    #[test]
+    fn a_stub_below_a_fold_hangs_over_the_slot_showing_its_anchor() {
+        // The defect, stated as a property rather than as a coordinate: a stub
+        // anchored on raw row 4 must be drawn against the slot that is showing
+        // raw row 4. Drawn at its raw index it would be two slots below the
+        // bottom of the graph, and its near-horizontal connector would be laid
+        // across whatever commit happens to be down there.
+        let (_rows, p) = folded_with_a_run_in_the_middle();
+        let placed = place_stubs(&p, &[4]);
+        assert_eq!(placed.len(), 1);
+        let slot = placed[0].display_row;
+        assert_eq!(
+            p.items.get(slot),
+            Some(&DisplayItem::Single { row_index: 4 }),
+            "a stub must hang over the slot showing its own anchor commit"
+        );
+        assert_ne!(
+            slot, 4,
+            "the raw row index is not a display slot once a run folds"
+        );
+    }
+
+    #[test]
+    fn a_stub_anchored_inside_a_fold_hangs_over_that_folds_marker() {
+        // The branch has not stopped existing because its commit was folded
+        // away. The marker is the slot showing that commit, so that is where
+        // the ring belongs — dropping the stub would lose a branch from the
+        // canvas entirely.
+        let (rows, p) = folded_with_a_run_in_the_middle();
+        let placed = place_stubs(&p, &[2]);
+        assert_eq!(placed.len(), 1);
+        let Some(&DisplayItem::WipGroup { lane, .. }) = p.items.get(placed[0].display_row) else {
+            panic!("a folded anchor's slot is the run's marker");
+        };
+        assert_eq!(
+            lane, rows[2].lane,
+            "the marker stands in the folded row's lane"
+        );
+    }
+
+    #[test]
+    fn a_stub_whose_anchor_has_no_slot_is_dropped_not_relocated() {
+        // `resolved_stubs` already drops a stub whose anchor commit is not
+        // loaded; this is the same posture one layer down. Falling back to the
+        // raw index here would put the ring on an unrelated commit's row, which
+        // is the defect, not a graceful degradation of it.
+        let (_rows, p) = folded_with_a_run_in_the_middle();
+        assert!(place_stubs(&p, &[9]).is_empty());
+    }
+
+    #[test]
+    fn every_placed_stub_hangs_over_a_slot_that_shows_its_own_anchor() {
+        // Read back through `items` rather than through `display_of_row`, so the
+        // assertion does not simply re-run the mapping it is checking.
+        let (rows, p) = folded_with_a_run_in_the_middle();
+        let anchors = [0_usize, 1, 2, 3, 4];
+        let placed = place_stubs(&p, &anchors);
+        assert_eq!(placed.len(), anchors.len());
+        for stub in placed {
+            let anchor = anchors[stub.index];
+            match p.items.get(stub.display_row) {
+                Some(&DisplayItem::Single { row_index }) => assert_eq!(row_index, anchor),
+                Some(&DisplayItem::WipGroup { lane, .. }) => {
+                    assert!(
+                        is_wip_checkpoint(&rows[anchor].commit.summary),
+                        "only a checkpoint is ever folded into a marker"
+                    );
+                    assert_eq!(lane, rows[anchor].lane, "a run's members share its lane");
+                }
+                None => panic!("a placed stub names a slot that exists"),
+            }
+        }
     }
 }
