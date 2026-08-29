@@ -407,3 +407,50 @@ test.describe('#571 branch stubs are placed in display space', () => {
     expect(await stubLabelY(page)).toBe(anchor - RING_RISE + LABEL_BASELINE_DROP)
   })
 })
+
+// #573: a fold marker's label starts clear of what crosses its own slot.
+//
+// `build_wip_group` used to draw `⋯ N WIP commits ⋯` at `node_cx(lane) +
+// NODE_RADIUS + 8` — hugging its dot, consulting no occupancy — so anything
+// passing through the marker's display row was drawn across its label. Measured
+// on git-vista's own history, folded: 113 display edges and 4 stub connectors
+// reached into a marker label, and none reached into a commit's.
+//
+// The fixture reproduces the stub half exactly: `base` sits on the oldest
+// commit, one slot below the marker, and a stub ring hangs half a row above its
+// anchor — so it covers the marker's row. Its column is allocated past the
+// commit lane high-water, which is why the label has to move at all.
+test.describe('#573 a fold marker label clears its own slot', () => {
+  // `marker_label_x`: past the occupied lane by LABEL_GAP, the same column a
+  // commit row would get for the same occupancy.
+  const LABEL_GAP = 18
+
+  test('the marker label starts past the stub column hanging over it', async ({ page }) => {
+    await openApp(page)
+    await expect(page.locator('.wip-group')).toHaveCount(1)
+
+    const stub = page.locator('circle[aria-label="base — new branch, no commits yet"]')
+    await expect(stub, 'the fixture leaves `base` on the oldest commit').toHaveCount(1)
+    const stubCx = Number(await stub.getAttribute('cx'))
+
+    const label = page.locator('.wip-group-label')
+    await expect(label).toHaveCount(1)
+    const labelX = Number(await label.getAttribute('x'))
+
+    expect(labelX).toBe(stubCx + LABEL_GAP)
+    // Stated again as the property, not the coordinate: the label may not begin
+    // to the left of the column the stub occupies.
+    expect(labelX).toBeGreaterThan(stubCx)
+  })
+
+  test('the marker dot itself does not move', async ({ page }) => {
+    // The paired negative. Pushing the LABEL clear is the fix; pushing the
+    // marker's dot would move the graph column and break every row around it,
+    // and an assertion on the label alone cannot tell the two apart.
+    await openApp(page)
+    const dot = page.locator('.wip-group .node-hit')
+    await expect(dot).toHaveCount(1)
+    const firstRow = page.locator('.node-hit[data-row-index="0"]')
+    expect(Number(await dot.getAttribute('cx'))).toBe(Number(await firstRow.getAttribute('cx')))
+  })
+})
