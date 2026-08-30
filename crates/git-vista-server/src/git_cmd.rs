@@ -675,12 +675,31 @@ async fn drain_stdout(mut stdout: tokio::process::ChildStdout) -> Vec<u8> {
     }
 }
 
-/// Declares `NetworkNeed::Local` for the same reason [`git_output`] does: all
-/// three production call sites are `/api/diff`'s `diff` reads
-/// (`--name-status`, `--numstat`, `--patch`), none of which can reach a
-/// remote. `/api/file` used to be two more (`cat-file -t` then `git show`)
-/// until #221 folded them into [`git_cat_file_batch`]'s single held-open
-/// process.
+/// Declares `NetworkNeed::Local` for the same reason [`git_output`] does: no
+/// production call site can reach a remote. There are **eight**, counted by
+/// grepping `git_stdout_capped(` across `crates/`, then discarding this
+/// declaration itself and the six `#[cfg(test)]` hits (`content_suite.rs` and
+/// the four cap tests at the foot of this file). The "three" this comment used
+/// to claim was four short *before* #546 added the eighth:
+///
+/// * three in `handlers::read::commit_diff_for_repo` — `/api/diff`'s
+///   `--name-status`, `--numstat` and `--patch` reads;
+/// * `handlers::read::worktree_status_v2_for_repo` — `/api/status/v2`'s
+///   `status --porcelain=v2 --branch -z`;
+/// * `handlers::read::staging_diff_for_repo` — `/api/staging/diff`;
+/// * `handlers::read::spec_diff_for_repo` — `/api/diff/spec`;
+/// * [`git_stdout`] below, the fail-safe wrapper that pins
+///   [`DEFAULT_GIT_STDOUT_CAP`] for a caller that has not reasoned about size
+///   (itself `#[allow(dead_code)]` — it has no callers of its own yet);
+/// * `worktree_census`'s `worktree list --porcelain` (M11.01, #546), which
+///   has no route on it yet either.
+///
+/// `/api/file` used to be two more (`cat-file -t` then `git show`) until #221
+/// folded them into [`git_cat_file_batch`]'s single held-open process.
+///
+/// Only the first three are load-bearing for `bounded_read.rs`'s structural
+/// scan, which extracts `commit_diff_for_repo`/`file_at_commit_for_repo`'s
+/// bodies alone and is deliberately blind to the rest of the file.
 pub(crate) async fn git_stdout_capped(
     repo: &Path,
     args: &[String],
