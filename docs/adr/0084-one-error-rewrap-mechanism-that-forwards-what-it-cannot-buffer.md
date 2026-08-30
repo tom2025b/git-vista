@@ -1,7 +1,9 @@
 # 0084 — One error-rewrap mechanism, and it forwards what it cannot buffer
 
 - **Status:** Accepted — implemented and tested; exact-sized asynchronous
-  success-body provenance deferred; browser leg unrun
+  success-body readiness fixed by #540 (see below); the broader typed-body
+  provenance this section originally called "the robust fix" is still
+  deferred; browser leg unrun
 - **Date:** 2026-08-26
 - **Issue:** [#336](https://github.com/tom2025b/git-vista/issues/336). A #323 successor.
 - **Handoff:** `docs/handoffs/2026-08-26/CLOUD-1-issue-336-collapse-route-local.md`.
@@ -168,14 +170,24 @@ nothing. The first version of this function did exactly that, and its test
 caught it.
 
 An exact size is a byte-count promise, **not a readiness promise**. A generic
-body may report `exact() == Some(2)` and still yield those bytes asynchronously;
-the current relabeler would await it before returning the response headers. No
-current route has that shape: hand-serialized write results are in-memory
-`String` bodies, while the SSE route reports no exact size. The robust fix is
-explicit typed-body provenance (or typed responses at the planner/handler
-boundary), not another guess from generic transport metadata. That
-cross-cutting return-type change is deferred rather than folded into this
-already-wide PR; the outside-review report records the gap for a follow-up.
+body may report `exact() == Some(2)` and still yield those bytes asynchronously.
+No current route has that shape: hand-serialized write results are in-memory
+`String` bodies, while the SSE route reports no exact size. That gap — filed as
+[#540](https://github.com/tom2025b/git-vista/issues/540) rather than fixed
+inside this already-wide PR — was closed separately: `relabel_json_success` no
+longer treats the declared length as proof the data is ready. Each frame is
+read through `split_at_limit_when_ready`, which polls it under a
+`Duration::ZERO` `tokio::time::timeout`; a frame that is not available the
+instant it is polled classifies the whole body `NotReady` and it is forwarded
+exactly as built, the same as a body whose length was never known. This is a
+narrower fix than the one first proposed here: it stops the concrete harm
+(awaiting a body that is not actually ready) without threading provenance
+through the ~30 operation kinds that share `(StatusCode, String)`. Explicit
+typed-body provenance (or typed responses at the planner/handler boundary)
+remains the more thorough answer to the underlying ambiguity — the middleware
+still infers "safe to look at" from `size_hint` rather than being told — and
+that cross-cutting return-type change is still deferred, recorded here as
+before.
 
 ### What the collapse removes
 
