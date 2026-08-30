@@ -35,6 +35,7 @@ use crate::features::diff::rows::{flatten, row_heights};
 use crate::features::diff::selection::DiffSelection;
 use crate::features::diff::staging_view::staging_body;
 use crate::features::graph::core::{GraphCore, RenderCtx};
+use crate::features::readiness::core::{is_viewer_busy, DocIdentity, FetchOutcome};
 use crate::features::shell::signals::Shell;
 use crate::features::status::signals::StatusResource;
 use crate::icons::icon_set;
@@ -244,6 +245,18 @@ pub fn viewer_view(
                 ViewerDoc::Conflict { path } => format!("Conflict — {path}"),
             };
             let which_for_body = which.clone();
+            // #387: the readiness signal, cloned off before `which_for_body`
+            // moves into `body` below. Recomputed from the SAME two facts
+            // `body`'s own match reads (what's open, what the resource
+            // settled on) — see `viewer_doc_identity`/`doc_result_outcome`
+            // for the (data-only) reduction and `is_viewer_busy` for the
+            // actual decision, which is host-tested in
+            // `features/readiness/core.rs`.
+            let which_for_busy = which_for_body.clone();
+            let is_busy = move || {
+                let outcome = doc_result_outcome(doc.get().flatten().as_ref());
+                is_viewer_busy(&viewer_doc_identity(&which_for_busy), &outcome)
+            };
             let body = move || match doc.get().flatten() {
                 None => view! { <p class="detail-status">"Loading…"</p> }.into_view(),
                 Some(DocResult::Diff(Err(e)))
@@ -316,7 +329,10 @@ pub fn viewer_view(
                 }
             };
             view! {
-                <div class="viewer-modal print-surface">
+                <div
+                    class="viewer-modal print-surface"
+                    aria-busy=move || is_busy().to_string()
+                >
                     <div class="viewer-head">
                         <span class="viewer-title">
                             <span class="nf ctx-icon">{ic.modified}</span>
@@ -385,6 +401,52 @@ enum DocResult {
     Spec(Result<SpecDiff, String>),
     /// All four panes of one conflicted path (M4.31a, #428).
     Conflict(Result<ConflictPanes, String>),
+}
+
+/// Reduce the currently-open document to the identity
+/// [`is_viewer_busy`] compares (#387) — data-only marshalling from
+/// [`ViewerDoc`], no decision of its own. See
+/// `features/readiness/core.rs`'s module doc for why this conversion, not
+/// the predicate it feeds, is the part only the browser leg proves.
+fn viewer_doc_identity(which: &ViewerDoc) -> DocIdentity {
+    match which {
+        ViewerDoc::Diff { id } => DocIdentity::Diff { id: id.clone() },
+        ViewerDoc::File { id, path } => DocIdentity::File {
+            id: id.clone(),
+            path: path.clone(),
+        },
+        ViewerDoc::Staging { .. } => DocIdentity::Staging,
+        ViewerDoc::Spec { spec } => DocIdentity::Spec { spec: spec.clone() },
+        ViewerDoc::Conflict { path } => DocIdentity::Conflict { path: path.clone() },
+    }
+}
+
+/// Reduce the viewer resource's resolved value to the same identity
+/// granularity `viewer_doc_identity` produces — same rule: data-only, no
+/// decision. Exhaustive over [`DocResult`] (no wildcard arm), on purpose:
+/// a new `DocResult` variant added here without a matching arm fails the
+/// build instead of silently reading as settled.
+fn doc_result_outcome(result: Option<&DocResult>) -> FetchOutcome {
+    match result {
+        None => FetchOutcome::Pending,
+        Some(DocResult::Diff(Err(_)))
+        | Some(DocResult::File(Err(_)))
+        | Some(DocResult::Staging(Err(_)))
+        | Some(DocResult::Spec(Err(_)))
+        | Some(DocResult::Conflict(Err(_))) => FetchOutcome::Err,
+        Some(DocResult::Diff(Ok(d))) => FetchOutcome::Ok(DocIdentity::Diff { id: d.id.clone() }),
+        Some(DocResult::File(Ok(f))) => FetchOutcome::Ok(DocIdentity::File {
+            id: f.id.clone(),
+            path: f.path.clone(),
+        }),
+        Some(DocResult::Staging(Ok(_))) => FetchOutcome::Ok(DocIdentity::Staging),
+        Some(DocResult::Spec(Ok(d))) => FetchOutcome::Ok(DocIdentity::Spec {
+            spec: d.spec.clone(),
+        }),
+        Some(DocResult::Conflict(Ok(panes))) => FetchOutcome::Ok(DocIdentity::Conflict {
+            path: panes.path.clone(),
+        }),
+    }
 }
 
 /// The viewer title for an explicit source/target diff (M2.16, #69).
