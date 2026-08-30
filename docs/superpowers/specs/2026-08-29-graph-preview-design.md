@@ -27,9 +27,10 @@ graph *would* have, plus what changed — as data, renderable by any surface.
 
 - **A1.** `preview(repo, plan)` returns a hypothetical `Vec<GraphRow>` + `Vec<Edge>`
   laid out by the existing `StreamLayout`, for revert, cherry-pick and merge.
-- **A2.** The real repository is **byte-for-byte unchanged**: no new objects, no ref
-  moved, no worktree, no index write. Asserted by a test that counts objects and
-  compares every ref before and after.
+- **A2.** The real repository is **unchanged**: no new object under
+  `<commondir>/objects`, no ref moved, no worktree, no index write, and the scratch
+  store removed on drop. Asserted by a test that counts objects, compares every ref
+  before and after, and asserts the scratch directory is gone.
 - **A3.** A merge that would conflict returns `Conflict { paths }` — a real answer,
   not an error and not a guessed graph.
 - **A4.** An operation the plumbing cannot express returns `Unsupported`. It never
@@ -62,8 +63,20 @@ That is the whole safety argument, and it is a measurement rather than a claim.
 
 `#457` commits the terminal UI to drawing "from the lanes core already computes".
 A preview computed in the wasm frontend could never serve that surface: it would be
-written twice and drift twice. So the preview is a function in `git-vista-git`,
-returning plain data, and every surface is a renderer of it.
+written twice and drift twice. So the preview returns plain data from **below** every
+renderer, and each surface is a renderer of it.
+
+**Amended 2026-08-30 — this section originally said "a function in `git-vista-git`",
+and that was wrong against the code.** `git-vista-git` is a pure-`gix` crate that
+never spawns a process; it carries its own `ALLOWED_GIT_CRATE_SPAWN_SITES` allowlist
+precisely to keep it that way. The sanctioned `git merge-tree --write-tree` path
+already exists one crate over, in `git-vista-server/src/activity.rs`
+(`revert_would_conflict`, #327), already allowlisted in `argv_boundary.rs`, already
+running through the sealed sandbox launcher. The original reasoning is untouched by
+the correction — it argues against putting the preview in the **frontend**, not
+against putting it in the **server** — and M10's own milestone text settles the rest:
+"gv, the browser, MCP and a TUI are all clients of one server", so gv-tui consumes
+this over HTTP either way. The split that follows is the corrected placement.
 
 ```mermaid
 ---
@@ -95,6 +108,65 @@ flowchart TD
     class W,TUI,PR surface
     class KEY legendbox
 ```
+
+### 4.1b The three-crate split
+
+| Half | Crate | Why there |
+|---|---|---|
+| Temp object store, `merge-tree`, `commit-tree`, the git-version gate | `git-vista-server` | The only crate allowed to spawn git, and the only one holding the sandbox launcher |
+| Lay out before + after, derive `Vec<Change>` | `git-vista-core` | Pure, wasm-safe, no repository — this is `StreamLayout`'s own neighbourhood |
+| `PreviewOutcome`, `Change` | `git-vista-protocol` | A6 puts them on the wire; house rule applies — **no `#[serde(default)]` on added fields**, a payload from an older build must fail loudly at the version gate rather than decode as an empty answer |
+
+The pure half is testable with no repository at all: lay out two commit lists and
+diff them. It is therefore independent of every sandbox question below.
+
+### 4.1c The sandbox grant decides where the temp store lives — measured
+
+`git_cmd::git_output(repo, args)` builds its Landlock policy in
+`sandbox::policy_for(repo, read_only, need)`, and that policy grants exactly
+**`repo` and its resolved `commondir` read-write, plus `$HOME` read-only**. Nothing
+else on the filesystem is reachable by the child.
+
+Two consequences, both measured on this host on 2026-08-30:
+
+1. **`policy_for` does not enforce the managed root.** Its own doc comment says so,
+   and names the reason: ~40 unit tests spawn git against a throwaway
+   `tempfile::tempdir()` with no catalog registration. The containment check lives at
+   `state::resolve_target`, on the HTTP mutation path. So pointing a spawn at a
+   scratch repository is not refused *per se*.
+2. **But a scratch store in `/tmp` cannot work anyway.** Its
+   `objects/info/alternates` would point at the served repository's object
+   directory — a path outside every grant the policy built from the scratch dir.
+   Landlock denies the read; the preview would fail for a reason that has nothing to
+   do with git.
+
+**So the temp store lives at `<commondir>/gv-preview-<id>/`**, inside the read-write
+grant the policy already builds, with `objects/info/alternates` pointing at
+`<commondir>/objects` beside it. The spawn passes the **real repository** as `repo`
+(so the grant is built from it) and selects the scratch store with `--git-dir`.
+One grant, no new sandbox policy, no security-boundary change.
+
+**A read-only repository has no read-write grant at all**, so no scratch store can be
+created there. What `preview()` returns in that case is a decision the ADR must
+settle: it is not `Unsupported { operation }` — the operation is fine, the
+*repository* is. See §9b.
+
+#### The mechanism, re-measured on today's `main`
+
+Run against `8ef604d1` on 2026-08-30, not carried over from the 08-29 numbers:
+
+```
+real .git/objects files before : 19,228
+merge-tree --write-tree        : rc=0, tree af2aa307…
+commit-tree                    : rc=0, commit cef7204e…
+real .git/objects files after  : 19,228     <- unchanged
+scratch store: cat-file -t cef7204e…        -> commit
+real repo:    cat-file -t cef7204e…         -> fatal: could not get object info
+```
+
+The hypothetical commit exists, is laid out, and is invisible to the repository it
+was computed from. That is the safety argument, still a measurement rather than a
+claim.
 
 ### 4.2 The vocabulary
 
@@ -140,6 +212,26 @@ fail. For each applicable fixture repository:
 A predicted graph that differs from the real one fails here, which is the only place
 the difference can be caught before a user sees it.
 
+#### What A5 compares — and the trap it must not fall into (added 2026-08-30)
+
+A real `git revert` and this feature's `commit-tree` produce **different OIDs** for
+the same logical result: different committer timestamp, different default message.
+Asserting OID equality makes A5 permanently red; asserting loosely makes it a green
+test that proves nothing — the failure shape this repository has now paid for six
+times. So A5 compares, exactly:
+
+- the **parent topology** of every row (each commit's parent OIDs, in order),
+- the **lane assignment** and **row order** of every row,
+- with the hypothetical commit's OID mapped onto the real one by position, never by
+  identity.
+
+Pinning `GIT_AUTHOR_DATE` and `GIT_COMMITTER_DATE` on **both** sides is what makes
+even that comparison stable, and whether those survive the sandbox launcher's env
+handling is a fact to measure, not assume.
+
+`GraphRow.color` and `GraphRow.on_remote` must also be given a defined value for a
+hypothetical commit, or parity will differ for reasons that are not the mechanism.
+
 ### Mutation proof
 
 Two mutations minimum, breaking differently, per the standing rule:
@@ -175,6 +267,17 @@ Yes — one is warranted. This decides a contract: **a preview is computed by re
 against the real object store, and refuses rather than models.** That is expensive to
 reverse and easy for a later session to "optimise" into a simulation.
 
+## 9b. What the ADR must settle (added 2026-08-30)
+
+1. **A read-only repository.** No read-write grant, so no scratch store. `Graph` is
+   impossible, `Conflict` is untrue, and `Unsupported { operation }` is a lie about
+   which thing is unsupported. Either a fourth arm or a reason on the existing one.
+2. **`color` and `on_remote` for a commit that does not exist.** Whatever is chosen
+   must be chosen once and asserted, because A5 compares these fields.
+3. **The git-version floor.** `merge-tree --write-tree` needs git >= 2.38;
+   `SUPPORTED_VERSIONS.md` floors at 2.32. The gate must degrade to `Unsupported`,
+   and where that check runs (once at boot, or per call) is a decision.
+
 ## 9. Open question for the owner
 
 The first slice renders in the **web canvas**, because that renderer exists today.
@@ -185,3 +288,6 @@ lazygit user got a web feature first.
 ---
 
 **Signed:** max · 2026-08-29T09:30:00-04:00
+**Amended:** max · 2026-08-30T17:20:00-04:00 — placement corrected to the three-crate
+split, the sandbox grant constraint added (§4.1c), A2 tightened, A5's comparison
+pinned, and §9b opened. The 08-29 measurement was re-run on `8ef604d1`.
