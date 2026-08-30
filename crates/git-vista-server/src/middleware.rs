@@ -574,9 +574,27 @@ fn prepend_frame(first: Result<Frame<Bytes>, axum::Error>, mut rest: Body) -> Bo
 /// This delegates frame polling to the wrapped body untouched and overrides
 /// only `size_hint`, so it changes nothing about what bytes are produced or
 /// when — only what the body *claims* about its own length.
+///
+/// **`size_hint` describes what REMAINS, not what the body started with.**
+/// That is `http_body::Body`'s contract, and the first version of this type
+/// broke it: it stored the original total once and returned it forever, so
+/// after a 7-byte body had handed over 6 bytes it still answered `Some(7)`
+/// instead of `Some(1)`. Every read was correct at construction — which is
+/// exactly why a check made before any frame was polled found nothing wrong.
+/// `remaining` is therefore decremented as data frames go past.
 struct KnownSizeBody {
     inner: Body,
-    exact: u64,
+    /// Bytes still to come, or `None` once the wrapped body has proven its
+    /// own declared length was a lie.
+    ///
+    /// A body that yields MORE than it promised has invalidated the very
+    /// claim this wrapper exists to carry forward. Saturating at zero would
+    /// keep asserting an exact size — `Some(0)` — while more bytes were still
+    /// arriving, which is the original defect in a new costume: a confident
+    /// answer that is false. Going to `None` says the honest thing instead:
+    /// the length was known, the body contradicted it, and it is not known
+    /// any more.
+    remaining: Option<u64>,
 }
 
 impl HttpBody for KnownSizeBody {
@@ -587,7 +605,19 @@ impl HttpBody for KnownSizeBody {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_frame(cx)
+        let this = self.get_mut();
+        let polled = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
+        // Only DATA frames consume declared length. Trailers carry no bytes
+        // the `Content-Length` this hint feeds would ever count, so a trailer
+        // frame must leave `remaining` alone.
+        if let std::task::Poll::Ready(Some(Ok(frame))) = &polled {
+            if let Some(data) = frame.data_ref() {
+                this.remaining = this
+                    .remaining
+                    .and_then(|left| left.checked_sub(data.len() as u64));
+            }
+        }
+        polled
     }
 
     fn is_end_stream(&self) -> bool {
@@ -595,7 +625,11 @@ impl HttpBody for KnownSizeBody {
     }
 
     fn size_hint(&self) -> SizeHint {
-        SizeHint::with_exact(self.exact)
+        match self.remaining {
+            Some(left) => SizeHint::with_exact(left),
+            // Unknown, not zero: see `remaining`.
+            None => SizeHint::default(),
+        }
     }
 }
 
@@ -621,7 +655,7 @@ fn rejoin(head: Bytes, rest: Option<Body>, original_exact: Option<u64>) -> Body 
     match original_exact {
         Some(exact) => Body::new(KnownSizeBody {
             inner: joined,
-            exact,
+            remaining: Some(exact),
         }),
         None => joined,
     }
@@ -1581,7 +1615,1413 @@ mod tests {
              byte remains"
         );
     }
+    /// What a [`ScriptedBody`] does on its next poll.
+    ///
+    /// The first version of this fixture could only yield ready data and a
+    /// trailer. That shape is exactly why six mutations survived an
+    /// adversarial pass: a wrapper that mishandles `Pending`, an error frame,
+    /// or a frame arriving *after* some state transition cannot be caught by a
+    /// body that never produces one.
+    #[derive(Debug)]
+    struct MarkerBodyError;
 
+    impl std::fmt::Display for MarkerBodyError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("marker body failure")
+        }
+    }
+
+    impl std::error::Error for MarkerBodyError {}
+
+    enum Step {
+        Data(&'static [u8]),
+        /// Yields `Poll::Pending` exactly once, then continues to the next
+        /// step. Consumes no bytes and supplies no evidence either way.
+        PendingOnce,
+        Error,
+        MarkerError,
+        Trailers,
+        EmptyTrailers,
+    }
+
+    /// A test body that plays a scripted sequence of frame shapes.
+    ///
+    /// It exists because `Body::from("abcdefg")` is `Full<Bytes>` and yields
+    /// **exactly one** frame — asserted, not assumed, by
+    /// `body_from_a_str_yields_exactly_one_frame` below. A drain loop over a
+    /// one-frame body runs once: first frame *is* last frame, so it can only
+    /// check two endpoints.
+    struct ScriptedBody {
+        steps: VecDeque<Step>,
+        pending_fired: bool,
+    }
+
+    impl ScriptedBody {
+        fn new(steps: Vec<Step>) -> Self {
+            Self {
+                steps: steps.into_iter().collect(),
+                pending_fired: false,
+            }
+        }
+
+        fn data(chunks: &[&'static [u8]]) -> Self {
+            Self::new(chunks.iter().map(|c| Step::Data(c)).collect())
+        }
+    }
+
+    impl HttpBody for ScriptedBody {
+        type Data = Bytes;
+        type Error = axum::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            let this = self.get_mut();
+            // Loops so that a spent `PendingOnce` ADVANCES to the next step
+            // rather than ending the stream. Getting this wrong made the very
+            // first run of the Pending test fail on its own continuation — the
+            // fixture, not the code under test.
+            loop {
+                match this.steps.front() {
+                    None => return Poll::Ready(None),
+                    Some(Step::PendingOnce) if !this.pending_fired => {
+                        this.pending_fired = true;
+                        // Deliberately does NOT register the waker: every test
+                        // that drives this path polls it by hand.
+                        return Poll::Pending;
+                    }
+                    Some(Step::PendingOnce) => {
+                        // Already yielded its one Pending — drop it and carry
+                        // on to whatever it was standing in front of.
+                        this.steps.pop_front();
+                        this.pending_fired = false;
+                        continue;
+                    }
+                    Some(_) => {
+                        return match this.steps.pop_front().expect("checked non-empty") {
+                            Step::Data(d) => {
+                                Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(d)))))
+                            }
+                            Step::PendingOnce => unreachable!("handled above"),
+                            Step::Error => Poll::Ready(Some(Err(axum::Error::new(
+                                std::io::Error::other("scripted body failure"),
+                            )))),
+                            Step::MarkerError => {
+                                Poll::Ready(Some(Err(axum::Error::new(MarkerBodyError))))
+                            }
+                            Step::Trailers => {
+                                let mut trailers = HeaderMap::new();
+                                trailers.insert("x-checksum", HeaderValue::from_static("ok"));
+                                Poll::Ready(Some(Ok(Frame::trailers(trailers))))
+                            }
+                            Step::EmptyTrailers => {
+                                Poll::Ready(Some(Ok(Frame::trailers(HeaderMap::new()))))
+                            }
+                        };
+                    }
+                }
+            }
+        }
+
+        fn is_end_stream(&self) -> bool {
+            self.steps.is_empty()
+        }
+    }
+
+    /// A legal trailer-only body: zero DATA bytes remain, but one metadata
+    /// frame is still pending. An exact-zero hint is byte accounting, not EOF.
+    struct ExactZeroTrailerBody {
+        yielded: bool,
+    }
+
+    impl HttpBody for ExactZeroTrailerBody {
+        type Data = Bytes;
+        type Error = axum::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            let this = self.get_mut();
+            if this.yielded {
+                return Poll::Ready(None);
+            }
+            this.yielded = true;
+            let mut trailers = HeaderMap::new();
+            let mut first = HeaderValue::from_static("zero-data");
+            first.set_sensitive(true);
+            trailers.append("x-checksum", first);
+            trailers.append("x-checksum", HeaderValue::from_static("second-value"));
+            trailers.insert(
+                "x-opaque",
+                HeaderValue::from_bytes(b"opaque\xfa")
+                    .expect("opaque bytes are legal in an HTTP header value"),
+            );
+            trailers.insert("x-empty", HeaderValue::from_static(""));
+            Poll::Ready(Some(Ok(Frame::trailers(trailers))))
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::with_exact(0)
+        }
+    }
+
+    /// A body that records the waker supplied by its caller before returning
+    /// `Pending`. Unlike [`ScriptedBody`], this exercises the liveness half of
+    /// the `poll_frame` contract: forwarding `Pending` is insufficient if the
+    /// wrapper substituted a waker that can never wake the real task.
+    struct WakerProbeBody {
+        captured: Arc<Mutex<Option<std::task::Waker>>>,
+    }
+
+    impl HttpBody for WakerProbeBody {
+        type Data = Bytes;
+        type Error = axum::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            *self
+                .get_mut()
+                .captured
+                .lock()
+                .expect("the waker probe lock is not poisoned") = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    struct CountingWake(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl std::task::Wake for CountingWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Poll a body once, by hand, with a no-op waker.
+    ///
+    /// Needed because `Pending` is unreachable through `.frame().await` — the
+    /// await simply suspends, and the test can never observe the state the
+    /// wrapper is in at that moment. Mutation N3 (clearing the size hint on a
+    /// single `Pending`) survived precisely because nothing could look here.
+    fn poll_once(body: &mut KnownSizeBody) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        Pin::new(body).poll_frame(&mut cx)
+    }
+
+    /// The precondition the drain test depends on, asserted rather than
+    /// believed: a `Body::from(&str)` really is a single frame. If a future
+    /// axum/http-body ever splits it, this fails and tells you why the
+    /// multi-frame fixture exists.
+    #[tokio::test]
+    async fn body_from_a_str_yields_exactly_one_frame() {
+        let mut body = Body::from("abcdefg");
+        let mut frames = 0;
+        while let Some(f) = std::pin::Pin::new(&mut body).frame().await {
+            f.expect("no errors");
+            frames += 1;
+        }
+        assert_eq!(
+            frames, 1,
+            "Body::from(&str) is Full<Bytes> and yields one frame — the reason \
+             `ScriptedBody` exists"
+        );
+    }
+
+    /// `KnownSizeBody` must report what REMAINS, not what the body started
+    /// with — `http_body::Body`'s actual contract, and the thing the first
+    /// version of this wrapper got wrong.
+    ///
+    /// **Every expected value below is a LITERAL**, never `total - seen`.
+    /// Computing the expectation with the same arithmetic the implementation
+    /// uses is how an assertion quietly becomes `f(x) == f(x)`; the numbers
+    /// here are worked out by hand from the fixture's own chunk sizes.
+    ///
+    /// Three frames, so the loop genuinely iterates: 3 + 2 + 2 = 7 bytes,
+    /// giving four observation points — 7 before anything, then 4, 2, 0. A
+    /// wrapper that held its total until the last frame (the mutation that
+    /// survived the first version of this test) dies on the very first
+    /// intermediate check.
+    #[tokio::test]
+    async fn a_known_size_body_reports_what_remains_not_what_it_started_with() {
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::data(&[b"abc", b"de", b"fg"])),
+            remaining: Some(7),
+        };
+
+        let expected_after_each_frame = [Some(4u64), Some(2), Some(0)];
+
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(7),
+            "before anything is polled, all 7 bytes still remain"
+        );
+
+        let mut seen_frames = 0usize;
+        while let Some(frame) = std::pin::Pin::new(&mut body).frame().await {
+            frame.expect("the fixture yields no errors");
+            assert_eq!(
+                body.size_hint().exact(),
+                expected_after_each_frame[seen_frames],
+                "after frame {} the remaining count is wrong",
+                seen_frames + 1
+            );
+            seen_frames += 1;
+        }
+        assert_eq!(
+            seen_frames, 3,
+            "precondition: the fixture must really deliver three separate \
+             frames, or this test degrades to the endpoint check it replaced"
+        );
+        let hint = body.size_hint();
+        assert_eq!(
+            hint.exact(),
+            Some(0),
+            "observing EOF must not erase a correct exact-zero remainder"
+        );
+        assert_eq!(hint.lower(), 0);
+        assert_eq!(hint.upper(), Some(0));
+        assert!(
+            matches!(poll_once(&mut body), Poll::Ready(None)),
+            "after the first EOF, every later poll must keep returning Ready(None)"
+        );
+        assert!(
+            matches!(poll_once(&mut body), Poll::Ready(None)),
+            "EOF remains fused across repeated polls"
+        );
+    }
+
+    /// A one-byte remainder reached by subtraction is still an exact claim,
+    /// not an accounting failure. Construction-time `Some(1)` coverage cannot
+    /// detect an off-by-one transition that discards this state only after a
+    /// frame has been consumed.
+    #[tokio::test]
+    async fn a_data_frame_can_leave_exactly_one_byte_remaining() {
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::data(&[b"abc", b"x"])),
+            remaining: Some(4),
+        };
+
+        let first = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the three-byte frame remains")
+            .expect("the frame is not an error")
+            .into_data()
+            .expect("the frame is data");
+        assert_eq!(first, Bytes::from_static(b"abc"));
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), Some(1));
+        assert_eq!(hint.lower(), 1);
+        assert_eq!(hint.upper(), Some(1));
+
+        let last = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the final byte remains")
+            .expect("the frame is not an error")
+            .into_data()
+            .expect("the frame is data");
+        assert_eq!(last, Bytes::from_static(b"x"));
+        assert_eq!(body.size_hint().exact(), Some(0));
+    }
+
+    /// Byte accounting must use the full platform frame length. A 64-KiB
+    /// frame sits exactly one past `u16::MAX`, so narrowing `usize` before the
+    /// subtraction would wrap its consumed length to zero.
+    #[tokio::test]
+    async fn a_large_data_frame_uses_its_full_length() {
+        let frame_len = u16::MAX as usize + 1;
+        let mut body = KnownSizeBody {
+            inner: Body::from(Bytes::from(vec![b'x'; frame_len])),
+            remaining: Some(frame_len as u64),
+        };
+
+        let data = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the large frame remains")
+            .expect("the large frame is not an error")
+            .into_data()
+            .expect("the frame carries data");
+        assert_eq!(data.len(), frame_len);
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(0),
+            "all 65,536 bytes must be subtracted without integer narrowing"
+        );
+    }
+
+    /// Exact body lengths are `u64`; neither reporting nor decrementing a
+    /// valid remainder may silently narrow it through a 32-bit counter.
+    #[tokio::test]
+    async fn a_known_size_body_preserves_remainders_above_u32() {
+        let initial = u64::from(u32::MAX) + 2;
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::new(vec![Step::Data(b"x")])),
+            remaining: Some(initial),
+        };
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(4_294_967_297),
+            "the initial u64 remainder must be advertised exactly"
+        );
+
+        let data = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the one-byte frame remains")
+            .expect("the frame is not an error")
+            .into_data()
+            .expect("the frame carries data");
+        assert_eq!(data, Bytes::from_static(b"x"));
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(4_294_967_296),
+            "subtracting one byte must retain the full u64 remainder"
+        );
+    }
+
+    /// HTTP body sizes count octets, not Unicode scalar values. A valid UTF-8
+    /// payload therefore still consumes its full byte length.
+    #[tokio::test]
+    async fn a_multibyte_data_frame_counts_bytes_not_characters() {
+        let payload = "é".as_bytes();
+        assert_eq!(payload.len(), 2, "precondition: UTF-8 uses two bytes here");
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::new(vec![Step::Data(payload)])),
+            remaining: Some(payload.len() as u64),
+        };
+
+        let data = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the multibyte frame remains")
+            .expect("the multibyte frame is not an error")
+            .into_data()
+            .expect("the frame carries data");
+        assert_eq!(data.as_ref(), payload, "payload bytes must be unchanged");
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(0),
+            "both UTF-8 bytes must be consumed"
+        );
+    }
+
+    /// An empty DATA frame is still a frame, not an end-of-stream marker, and
+    /// it consumes zero declared bytes. A wrapper that launders it into
+    /// `Ready(None)` hides every later frame; one that merely invalidates the
+    /// hint also invents evidence that the inner body never supplied.
+    #[tokio::test]
+    async fn an_empty_data_frame_is_forwarded_without_consuming_length() {
+        for (remaining, after_one_byte) in [(Some(3), Some(2)), (Some(0), None), (None, None)] {
+            let mut body = KnownSizeBody {
+                inner: Body::new(ScriptedBody::new(vec![Step::Data(b""), Step::Data(b"x")])),
+                remaining,
+            };
+
+            let empty = std::pin::Pin::new(&mut body)
+                .frame()
+                .await
+                .expect("an empty data frame is not EOF")
+                .expect("no error")
+                .into_data()
+                .expect("the first frame is data");
+            assert!(empty.is_empty(), "precondition: the first frame is empty");
+            assert_eq!(
+                body.size_hint().exact(),
+                remaining,
+                "zero bytes consumed must preserve accounting state {remaining:?}"
+            );
+
+            let data = std::pin::Pin::new(&mut body)
+                .frame()
+                .await
+                .expect("data after an empty frame remains reachable")
+                .expect("no error")
+                .into_data()
+                .expect("the second frame is data");
+            assert_eq!(data, Bytes::from_static(b"x"));
+            assert_eq!(
+                body.size_hint().exact(),
+                after_one_byte,
+                "the later byte must still be counted in state {remaining:?}"
+            );
+        }
+    }
+
+    /// The trailer invariant, which the production code asserts in a comment
+    /// and — until now — no test held.
+    ///
+    /// Reachable in production: `BodyRemainder::Trailers(rest)` is rejoined
+    /// with `original_exact` on the error path. A trailer carries no bytes the
+    /// `Content-Length` this hint feeds would ever count, so it must leave
+    /// `remaining` untouched.
+    #[tokio::test]
+    async fn a_trailer_frame_does_not_decrement_the_remaining_count() {
+        let mut body = KnownSizeBody {
+            // Leave two bytes deliberately outstanding before the trailer.
+            // A zero-at-trailer fixture cannot distinguish "left unchanged"
+            // from the wrong implementation "force to zero".
+            inner: Body::new(ScriptedBody::new(vec![Step::Data(b"ab"), Step::Trailers])),
+            remaining: Some(4),
+        };
+
+        let first = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("a data frame")
+            .expect("no error");
+        assert!(first.is_data(), "precondition: first frame carries data");
+        assert_eq!(body.size_hint().exact(), Some(2), "2 data bytes consumed");
+
+        let second = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("a trailer frame")
+            .expect("no error");
+        assert!(
+            second.is_trailers(),
+            "precondition: the fixture must actually yield a trailer, or this \
+             test proves nothing about trailers"
+        );
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(2),
+            "a trailer carries no counted bytes, so it must not move the \
+            nonzero remaining count"
+        );
+    }
+
+    /// An empty trailer map is still an observable frame. It must not be
+    /// confused with EOF, and forwarding it must not hide a later frame.
+    #[tokio::test]
+    async fn an_empty_trailer_frame_is_forwarded_across_accounting_states() {
+        for (remaining, after_one_byte) in [(Some(7), Some(6)), (Some(0), None), (None, None)] {
+            let mut body = KnownSizeBody {
+                inner: Body::new(ScriptedBody::new(vec![
+                    Step::EmptyTrailers,
+                    Step::Data(b"x"),
+                ])),
+                remaining,
+            };
+
+            let trailers = std::pin::Pin::new(&mut body)
+                .frame()
+                .await
+                .expect("an empty trailer frame is not EOF")
+                .expect("the empty trailer frame is not an error")
+                .into_trailers()
+                .expect("the first frame carries trailers");
+            assert!(trailers.is_empty(), "precondition: trailer map is empty");
+            assert_eq!(body.size_hint().exact(), remaining);
+
+            let data = std::pin::Pin::new(&mut body)
+                .frame()
+                .await
+                .expect("data after an empty trailer remains reachable")
+                .expect("the later data frame is not an error")
+                .into_data()
+                .expect("the second frame carries data");
+            assert_eq!(data, Bytes::from_static(b"x"));
+            assert_eq!(body.size_hint().exact(), after_one_byte);
+        }
+    }
+
+    /// An inner exact-zero hint means only that no DATA bytes remain. It does
+    /// not prove that trailers are absent, so the wrapper must still poll and
+    /// forward a trailer-only body.
+    #[tokio::test]
+    async fn an_inner_exact_zero_hint_does_not_hide_trailers() {
+        let inner = Body::new(ExactZeroTrailerBody { yielded: false });
+        assert_eq!(
+            inner.size_hint().exact(),
+            Some(0),
+            "precondition: the inner body truthfully advertises zero DATA bytes"
+        );
+        let mut body = KnownSizeBody {
+            inner,
+            remaining: Some(0),
+        };
+        assert!(
+            !body.is_end_stream(),
+            "exact zero counts DATA bytes; the pending trailer keeps the stream open"
+        );
+
+        let trailers = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("exact zero must not be mistaken for clean EOF")
+            .expect("trailers are not an error")
+            .into_trailers()
+            .expect("the pending frame is trailers");
+        let values: Vec<_> = trailers
+            .get_all("x-checksum")
+            .iter()
+            .map(|value| value.to_str().expect("static trailer values are text"))
+            .collect();
+        assert_eq!(values, ["zero-data", "second-value"]);
+        let sensitivities: Vec<_> = trailers
+            .get_all("x-checksum")
+            .iter()
+            .map(HeaderValue::is_sensitive)
+            .collect();
+        assert_eq!(
+            sensitivities,
+            [true, false],
+            "delegation must preserve each HeaderValue sensitivity flag in order"
+        );
+        assert_eq!(
+            trailers
+                .get("x-opaque")
+                .expect("the opaque trailer remains")
+                .as_bytes(),
+            b"opaque\xfa",
+            "delegation must preserve legal non-UTF-8 header bytes"
+        );
+        assert_eq!(body.size_hint().exact(), Some(0));
+    }
+
+    /// Trailer delegation is independent of byte-accounting state. Rich
+    /// metadata must retain duplicate values, per-value sensitivity, opaque
+    /// bytes, and order at positive, exhausted, and invalidated remainders.
+    #[tokio::test]
+    async fn trailer_metadata_is_preserved_across_accounting_states() {
+        for remaining in [Some(7), Some(0), None] {
+            let mut body = KnownSizeBody {
+                inner: Body::new(ExactZeroTrailerBody { yielded: false }),
+                remaining,
+            };
+            let trailers = std::pin::Pin::new(&mut body)
+                .frame()
+                .await
+                .expect("the rich trailer frame is not EOF")
+                .expect("the rich trailer frame is not an error")
+                .into_trailers()
+                .expect("the frame carries trailers");
+            let values: Vec<_> = trailers
+                .get_all("x-checksum")
+                .iter()
+                .map(|value| value.to_str().expect("checksum values are text"))
+                .collect();
+            assert_eq!(values, ["zero-data", "second-value"], "at {remaining:?}");
+            let sensitivities: Vec<_> = trailers
+                .get_all("x-checksum")
+                .iter()
+                .map(HeaderValue::is_sensitive)
+                .collect();
+            assert_eq!(sensitivities, [true, false], "at {remaining:?}");
+            assert_eq!(
+                trailers
+                    .get("x-opaque")
+                    .expect("the opaque trailer remains")
+                    .as_bytes(),
+                b"opaque\xfa",
+                "at {remaining:?}"
+            );
+            assert_eq!(
+                trailers
+                    .get("x-empty")
+                    .expect("the empty-valued trailer remains")
+                    .as_bytes(),
+                b"",
+                "at {remaining:?}"
+            );
+            assert_eq!(
+                trailers.len(),
+                4,
+                "no trailer fields may be injected or removed at {remaining:?}"
+            );
+            assert!(
+                !trailers.contains_key("x-known-size-body"),
+                "delegation must not inject wrapper-specific trailer fields"
+            );
+            assert_eq!(body.size_hint().exact(), remaining);
+        }
+    }
+
+    /// The companion case, and the reason `remaining` is an `Option` rather
+    /// than a saturating counter: a wrapped body that yields MORE than its
+    /// declared length has disproved the claim this wrapper carries.
+    ///
+    /// Asserts the full shape of the hint, not merely that `exact()` is
+    /// `None`: `exact()` also returns `None` for any range with unequal
+    /// bounds, so checking it alone would accept a hint that still asserted,
+    /// say, "between 2 and 9 bytes". Unknown means lower 0, upper None.
+    #[tokio::test]
+    async fn a_body_that_overruns_its_declared_length_stops_claiming_one() {
+        let mut body = KnownSizeBody {
+            // THREE chunks, not two. The first crosses the declared boundary
+            // directly (2 promised, 3 delivered), and the later frames prove
+            // that invalidating the hint neither stops polling nor lets a
+            // confident exact claim reappear.
+            inner: Body::new(ScriptedBody::data(&[b"abc", b"de", b"f"])),
+            remaining: Some(2),
+        };
+
+        let first = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the boundary-crossing frame remains")
+            .expect("no error");
+        assert_eq!(
+            first.into_data().expect("the crossing frame is data"),
+            Bytes::from_static(b"abc"),
+            "the wrapper delegates the crossing frame byte-for-byte"
+        );
+        let hint = body.size_hint();
+        assert_eq!(
+            hint.exact(),
+            None,
+            "a body that outran its own declared length must stop claiming an \
+             exact size — an exact claim that is false is the defect this type \
+             exists to avoid"
+        );
+        assert_eq!(hint.lower(), 0, "unknown means no lower bound is promised");
+        assert_eq!(
+            hint.upper(),
+            None,
+            "crossing the boundary inside one frame must invalidate the hint \
+             immediately, never saturate at an exact zero"
+        );
+
+        let second = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the first post-invalidation frame remains")
+            .expect("no error");
+        assert_eq!(
+            second.into_data().expect("the first later frame is data"),
+            Bytes::from_static(b"de"),
+            "hint invalidation must not corrupt later payload bytes"
+        );
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), None, "unknown must stay unknown");
+        assert_eq!(hint.lower(), 0, "unknown keeps a zero lower bound");
+        assert_eq!(hint.upper(), None, "unknown keeps no upper bound");
+
+        let third = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the second post-invalidation frame remains")
+            .expect("no error");
+        assert_eq!(
+            third.into_data().expect("the second later frame is data"),
+            Bytes::from_static(b"f"),
+            "every post-invalidation frame is delegated byte-for-byte"
+        );
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), None, "later data cannot restore exactness");
+        assert_eq!(hint.lower(), 0, "unknown keeps a zero lower bound");
+        assert_eq!(hint.upper(), None, "unknown keeps no upper bound");
+
+        assert!(
+            std::pin::Pin::new(&mut body).frame().await.is_none(),
+            "precondition: the fixture delivered exactly three frames"
+        );
+    }
+
+    /// Invalidating a false exact-size claim is permanent. Even if the inner
+    /// body later reports exact zero because its own frame was drained, that
+    /// hint cannot erase the wrapper's direct evidence that the declaration
+    /// was wrong; reaching EOF cannot convert unknown back to exact zero.
+    #[tokio::test]
+    async fn an_invalidated_hint_stays_unknown_through_inner_eof() {
+        let mut body = KnownSizeBody {
+            inner: Body::from("abc"),
+            remaining: Some(2),
+        };
+
+        let data = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the boundary-crossing frame remains")
+            .expect("the frame is not an error")
+            .into_data()
+            .expect("the frame is data");
+        assert_eq!(data, Bytes::from_static(b"abc"));
+        assert_eq!(
+            body.inner.size_hint().exact(),
+            Some(0),
+            "precondition: the drained Full body now advertises exact zero"
+        );
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), None, "the false claim stays invalidated");
+        assert_eq!(hint.lower(), 0);
+        assert_eq!(hint.upper(), None);
+
+        assert!(
+            std::pin::Pin::new(&mut body).frame().await.is_none(),
+            "the inner body reaches explicit EOF"
+        );
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), None, "EOF cannot restore exactness");
+        assert_eq!(hint.lower(), 0);
+        assert_eq!(hint.upper(), None);
+        assert!(
+            body.inner.is_end_stream(),
+            "precondition: the overrun inner body is now ended"
+        );
+        assert!(
+            body.is_end_stream(),
+            "unknown byte accounting cannot suppress the inner terminal state"
+        );
+    }
+
+    /// Invalidating the byte-count hint does not invalidate non-DATA frame
+    /// semantics. A trailer after an overrun remains observable with its exact
+    /// metadata, and the hint remains unknown before and after it.
+    #[tokio::test]
+    async fn trailers_after_an_overrun_are_preserved() {
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::new(vec![Step::Data(b"abc"), Step::Trailers])),
+            remaining: Some(2),
+        };
+
+        let data = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the boundary-crossing frame remains")
+            .expect("no error")
+            .into_data()
+            .expect("the first frame is data");
+        assert_eq!(data, Bytes::from_static(b"abc"));
+        assert_eq!(body.size_hint().exact(), None);
+
+        let trailers = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("trailers after an overrun are not EOF")
+            .expect("trailers are not an error")
+            .into_trailers()
+            .expect("the second frame carries trailers");
+        assert_eq!(
+            trailers.get("x-checksum"),
+            Some(&HeaderValue::from_static("ok")),
+            "the wrapper must preserve exact trailer metadata"
+        );
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), None, "a trailer cannot restore exactness");
+        assert_eq!(hint.lower(), 0, "unknown keeps a zero lower bound");
+        assert_eq!(hint.upper(), None, "unknown keeps no upper bound");
+    }
+
+    /// N1, and the worst of them: `is_end_stream` is not cosmetic metadata.
+    ///
+    /// Hyper checks it before retaining a response body — its HTTP/1
+    /// dispatcher drops the body receiver when it returns true, and its HTTP/2
+    /// server sends an end-stream response instead of building body state. A
+    /// wrapper that wrongly answers `true` therefore makes a non-empty
+    /// response go out **bodyless**: silent data loss, strictly worse than the
+    /// wrong size hint this type was written to fix.
+    ///
+    /// `KnownSizeBody` delegates the method correctly and always has. Nothing
+    /// asserted it, so the constant-`true` mutation passed every test.
+    #[tokio::test]
+    async fn a_known_size_body_with_bytes_left_is_not_end_of_stream() {
+        let mut body = KnownSizeBody {
+            // One byte is the smallest nonzero boundary. A predicate that
+            // invents EOF only at `Some(1)` must be just as observable as a
+            // constant-true implementation.
+            inner: Body::new(ScriptedBody::data(&[b"x"])),
+            remaining: Some(1),
+        };
+        assert!(
+            !body.is_end_stream(),
+            "a body with bytes still to come must not report end-of-stream — \
+             Hyper would suppress the payload entirely"
+        );
+        let data = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the queued one-byte frame proves the lifecycle precondition")
+            .expect("the queued frame is not an error")
+            .into_data()
+            .expect("the queued frame is data");
+        assert_eq!(data, Bytes::from_static(b"x"));
+        assert_eq!(body.size_hint().exact(), Some(0));
+    }
+
+    /// N2, the same method in the other direction: the wrapper must DELEGATE
+    /// this answer, never invent one. A constant `false` is also wrong, and
+    /// also passed everything.
+    #[tokio::test]
+    async fn a_known_size_body_delegates_end_of_stream_to_the_inner_body() {
+        let mut body = KnownSizeBody {
+            inner: Body::from("x"),
+            // Deliberately disagree with the one-byte inner body. If this were
+            // `Some(1)`, draining the inner would make both `is_end_stream`
+            // and `remaining == Some(0)` true at once, so the wrong
+            // conjunction of those independent states would pass.
+            remaining: Some(9),
+        };
+        assert!(
+            !body.is_end_stream(),
+            "precondition: a Full<Bytes> with its one frame still pending is \
+             not yet at end of stream"
+        );
+        while std::pin::Pin::new(&mut body).frame().await.is_some() {}
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(8),
+            "precondition: the byte hint remains nonzero after the inner ends"
+        );
+        assert!(
+            body.is_end_stream(),
+            "once the inner body is drained the wrapper must say so — the \
+             answer belongs to `inner`, and this type only ever forwards it"
+        );
+
+        let mut unknown_hint_body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::data(&[b"x"])),
+            remaining: Some(1),
+        };
+        assert_eq!(
+            unknown_hint_body.inner.size_hint().exact(),
+            None,
+            "precondition: ScriptedBody keeps the default unknown byte hint"
+        );
+        let data = std::pin::Pin::new(&mut unknown_hint_body)
+            .frame()
+            .await
+            .expect("the unknown-hint body yields its frame")
+            .expect("the frame is not an error")
+            .into_data()
+            .expect("the frame is data");
+        assert_eq!(data, Bytes::from_static(b"x"));
+        assert_eq!(unknown_hint_body.size_hint().exact(), Some(0));
+        assert!(
+            unknown_hint_body.inner.is_end_stream(),
+            "precondition: the scripted inner lifecycle is now ended"
+        );
+        assert!(
+            unknown_hint_body.is_end_stream(),
+            "delegation cannot be gated on either wrapper accounting or the inner byte hint"
+        );
+    }
+
+    /// A spent or invalidated size hint is an accounting state, not a stream
+    /// lifecycle state. The inner body may still have an overrun frame,
+    /// trailers, or an error queued after the declared byte count reaches
+    /// zero. Hyper consults `is_end_stream` before polling those frames, so
+    /// deriving this answer from `remaining` would silently discard them.
+    ///
+    /// This kills the mutation `remaining == Some(0) || inner.is_end_stream()`:
+    /// the first frame spends the declared two bytes while two frames remain.
+    /// The second frame then invalidates the hint while one frame remains,
+    /// pinning the same invariant after `remaining` becomes `None`.
+    #[tokio::test]
+    async fn a_spent_or_invalidated_hint_does_not_end_the_inner_stream() {
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::data(&[b"ab", b"cde", b"f"])),
+            remaining: Some(2),
+        };
+
+        let exact = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the exact-length frame remains")
+            .expect("no error");
+        assert_eq!(exact.data_ref().map(Bytes::len), Some(2));
+        assert_eq!(body.size_hint().exact(), Some(0));
+        assert!(
+            !body.is_end_stream(),
+            "spending the declared byte count must not hide an overrun frame"
+        );
+
+        let overrun = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the overrun frame remains")
+            .expect("no error");
+        assert_eq!(overrun.data_ref().map(Bytes::len), Some(3));
+        assert_eq!(body.size_hint().exact(), None);
+        assert!(
+            !body.is_end_stream(),
+            "invalidating the hint must not hide a later frame either"
+        );
+
+        let after_invalidation = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the post-invalidation frame remains")
+            .expect("no error");
+        assert_eq!(after_invalidation.data_ref().map(Bytes::len), Some(1));
+    }
+
+    /// N3: a `Pending` poll consumes no bytes and contradicts nothing, so it
+    /// must leave the remaining count exactly where it was.
+    ///
+    /// Unreachable through `.frame().await`, which simply suspends — so this
+    /// polls by hand with a no-op waker. That blind spot is the entire reason
+    /// the mutation survived.
+    #[tokio::test]
+    async fn a_pending_poll_does_not_disturb_the_remaining_count() {
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::new(vec![
+                Step::PendingOnce,
+                Step::Data(b"abc"),
+            ])),
+            remaining: Some(3),
+        };
+        assert!(
+            matches!(poll_once(&mut body), Poll::Pending),
+            "precondition: the fixture must actually return Pending here, or \
+             this test proves nothing about Pending"
+        );
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(3),
+            "Pending consumed no bytes, so all 3 must still be promised"
+        );
+
+        assert!(matches!(poll_once(&mut body), Poll::Ready(Some(Ok(_)))));
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(0),
+            "and the data frame that followed still counts normally"
+        );
+    }
+
+    /// The wrapper must pass the caller's actual context through to its inner
+    /// body. Returning the inner `Pending` while polling it with a no-op waker
+    /// looks correct in a hand-polled test, but the real future can then sleep
+    /// forever because its wakeup was registered against nobody.
+    #[test]
+    fn a_pending_inner_body_receives_the_callers_waker() {
+        for remaining in [Some(3), Some(0), None] {
+            let captured = Arc::new(Mutex::new(None));
+            let mut body = KnownSizeBody {
+                inner: Body::new(WakerProbeBody {
+                    captured: Arc::clone(&captured),
+                }),
+                remaining,
+            };
+            let wake_count_a = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let wake_count_b = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let caller_a =
+                std::task::Waker::from(Arc::new(CountingWake(Arc::clone(&wake_count_a))));
+            let caller_b =
+                std::task::Waker::from(Arc::new(CountingWake(Arc::clone(&wake_count_b))));
+            let mut cx_a = Context::from_waker(&caller_a);
+
+            assert!(matches!(
+                Pin::new(&mut body).poll_frame(&mut cx_a),
+                Poll::Pending
+            ));
+            assert_eq!(
+                body.size_hint().exact(),
+                remaining,
+                "Pending must preserve the accounting state under test"
+            );
+            let first_waker = captured
+                .lock()
+                .expect("the waker probe lock is not poisoned")
+                .take()
+                .expect("the inner body must receive a waker before returning Pending");
+            assert!(
+                first_waker.will_wake(&caller_a) && !first_waker.will_wake(&caller_b),
+                "KnownSizeBody must forward the caller's waker in state \
+                 {remaining:?}, not substitute an inert context"
+            );
+            first_waker.wake_by_ref();
+            assert_eq!(
+                wake_count_a.load(Ordering::Relaxed),
+                1,
+                "waking through the inner body's captured waker in state \
+                 {remaining:?} must reach the caller"
+            );
+            assert_eq!(wake_count_b.load(Ordering::Relaxed), 0);
+
+            let mut cx_b = Context::from_waker(&caller_b);
+            assert!(matches!(
+                Pin::new(&mut body).poll_frame(&mut cx_b),
+                Poll::Pending
+            ));
+            let replacement_waker = captured
+                .lock()
+                .expect("the waker probe lock is not poisoned")
+                .take()
+                .expect("the inner body must receive the replacement waker");
+            assert!(
+                replacement_waker.will_wake(&caller_b) && !replacement_waker.will_wake(&caller_a),
+                "a second poll in state {remaining:?} must replace a stale \
+                 caller waker"
+            );
+            replacement_waker.wake_by_ref();
+            assert_eq!(wake_count_a.load(Ordering::Relaxed), 1);
+            assert_eq!(wake_count_b.load(Ordering::Relaxed), 1);
+            assert_eq!(body.size_hint().exact(), remaining);
+        }
+    }
+
+    /// Reaching the declared byte count says nothing about whether the inner
+    /// body is ready to yield its terminal trailers. `Pending` after exact
+    /// DATA must remain `Pending`; laundering it into EOF would make the next
+    /// frame unreachable even though the byte accounting looked complete.
+    #[test]
+    fn a_pending_poll_after_size_exhaustion_is_not_end_of_stream() {
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::new(vec![
+                Step::Data(b"ab"),
+                Step::PendingOnce,
+                Step::Trailers,
+            ])),
+            remaining: Some(2),
+        };
+
+        let Poll::Ready(Some(Ok(data))) = poll_once(&mut body) else {
+            panic!("the exact-length data frame must arrive first");
+        };
+        assert_eq!(data.data_ref().map(Bytes::len), Some(2));
+        assert_eq!(body.size_hint().exact(), Some(0));
+
+        assert!(
+            matches!(poll_once(&mut body), Poll::Pending),
+            "Pending after exact exhaustion is not clean EOF"
+        );
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(0),
+            "Pending consumes no bytes at the boundary"
+        );
+
+        let Poll::Ready(Some(Ok(trailers))) = poll_once(&mut body) else {
+            panic!("the trailers after Pending must remain reachable");
+        };
+        assert!(trailers.is_trailers(), "the final frame carries trailers");
+    }
+
+    /// Backpressure remains backpressure after an overrun invalidates the
+    /// exact-size hint. Unknown byte accounting does not end the inner body,
+    /// and a `Pending` poll must not hide a trailer that arrives next.
+    #[test]
+    fn a_pending_poll_after_an_overrun_preserves_later_trailers() {
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::new(vec![
+                Step::Data(b"abc"),
+                Step::PendingOnce,
+                Step::Trailers,
+            ])),
+            remaining: Some(2),
+        };
+
+        let Poll::Ready(Some(Ok(data))) = poll_once(&mut body) else {
+            panic!("the boundary-crossing frame must arrive first");
+        };
+        assert_eq!(data.data_ref().map(Bytes::len), Some(3));
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), None, "the overrun invalidates exactness");
+        assert_eq!(hint.lower(), 0);
+        assert_eq!(hint.upper(), None);
+
+        assert!(
+            matches!(poll_once(&mut body), Poll::Pending),
+            "Pending after an overrun is not clean EOF"
+        );
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), None, "Pending cannot restore exactness");
+        assert_eq!(hint.lower(), 0);
+        assert_eq!(hint.upper(), None);
+
+        let Poll::Ready(Some(Ok(trailers))) = poll_once(&mut body) else {
+            panic!("trailers after post-overrun Pending remain reachable");
+        };
+        let trailers = trailers
+            .into_trailers()
+            .expect("the final frame carries trailers");
+        assert_eq!(
+            trailers.get("x-checksum"),
+            Some(&HeaderValue::from_static("ok"))
+        );
+        assert_eq!(body.size_hint().exact(), None);
+    }
+
+    /// Consecutive `Pending` polls are ordinary asynchronous backpressure, not
+    /// evidence that the stream ended. Each consumes zero bytes, and later
+    /// data must remain reachable no matter how many times readiness pauses.
+    #[test]
+    fn consecutive_pending_polls_remain_pending_and_preserve_later_data() {
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::new(vec![
+                Step::PendingOnce,
+                Step::PendingOnce,
+                Step::Data(b"x"),
+            ])),
+            remaining: Some(1),
+        };
+
+        assert!(matches!(poll_once(&mut body), Poll::Pending));
+        assert_eq!(body.size_hint().exact(), Some(1));
+        assert!(
+            matches!(poll_once(&mut body), Poll::Pending),
+            "a second consecutive Pending is not EOF"
+        );
+        assert_eq!(body.size_hint().exact(), Some(1));
+
+        let Poll::Ready(Some(Ok(data))) = poll_once(&mut body) else {
+            panic!("data after consecutive Pending polls remains reachable");
+        };
+        assert_eq!(data.data_ref().map(Bytes::len), Some(1));
+        assert_eq!(body.size_hint().exact(), Some(0));
+    }
+
+    /// N4: an error frame must reach the caller as an error.
+    ///
+    /// Turning it into a clean `Ready(None)` converts a transport failure into
+    /// a silent truncation — the response looks complete and is not. An
+    /// existing test proves the middleware preserves errors generally, but its
+    /// fixture has no exact size, so `rejoin` never wraps it in
+    /// `KnownSizeBody` and this seam went unexercised.
+    #[tokio::test]
+    async fn an_error_frame_is_not_laundered_into_a_clean_end_of_stream() {
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::new(vec![Step::Data(b"ab"), Step::Error])),
+            remaining: Some(9),
+        };
+        let data = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("data comes first")
+            .expect("the first frame is not an error")
+            .into_data()
+            .expect("the first frame is data");
+        assert_eq!(data, Bytes::from_static(b"ab"));
+        assert_eq!(body.size_hint().exact(), Some(7));
+
+        let error = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the error frame is not clean EOF")
+            .expect_err("the second frame remains an error");
+        assert_eq!(
+            error.to_string(),
+            "scripted body failure",
+            "the wrapper must preserve the original error identity"
+        );
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(7),
+            "an error frame consumes no bytes and must not rewrite the hint"
+        );
+    }
+
+    /// Once a DATA overrun invalidates the exact-size hint, the wrapper must
+    /// still delegate the next transport error. `remaining == None` means
+    /// only that byte accounting became unknown; treating it as a terminal
+    /// stream state would silently turn this error into a successful EOF.
+    #[tokio::test]
+    async fn an_error_after_an_overrun_is_not_laundered_into_eof() {
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::new(vec![Step::Data(b"abc"), Step::Error])),
+            remaining: Some(2),
+        };
+
+        let data = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the boundary-crossing frame remains")
+            .expect("the first frame is not an error")
+            .into_data()
+            .expect("the first frame is data");
+        assert_eq!(data, Bytes::from_static(b"abc"));
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), None, "the overrun invalidates exactness");
+        assert_eq!(hint.lower(), 0);
+        assert_eq!(hint.upper(), None);
+
+        let error = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("an error after an overrun is not clean EOF")
+            .expect_err("the second frame remains an error");
+        assert_eq!(error.to_string(), "scripted body failure");
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), None, "an error cannot restore exactness");
+        assert_eq!(hint.lower(), 0);
+        assert_eq!(hint.upper(), None);
+    }
+
+    /// Delivering every declared byte does not make a later transport error
+    /// optional. The size hint describes DATA only; an error queued after an
+    /// exact-length frame must still reach the caller with its identity intact
+    /// and must not perturb the zero remaining count.
+    #[tokio::test]
+    async fn an_error_after_exact_data_is_not_laundered_into_eof() {
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::new(vec![Step::Data(b"ab"), Step::Error])),
+            remaining: Some(2),
+        };
+
+        let data = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the exact-length frame remains")
+            .expect("the first frame is not an error")
+            .into_data()
+            .expect("the first frame is data");
+        assert_eq!(data, Bytes::from_static(b"ab"));
+        assert_eq!(body.size_hint().exact(), Some(0));
+
+        let error = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("an error after exact DATA is not clean EOF")
+            .expect_err("the second frame remains an error");
+        assert_eq!(
+            error.to_string(),
+            "scripted body failure",
+            "the wrapper must preserve the original transport error"
+        );
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(0),
+            "an error frame consumes no declared bytes"
+        );
+    }
+
+    /// Equal display text does not make two errors interchangeable. The
+    /// wrapper promises untouched frame delegation, including the concrete
+    /// source type callers may downcast for recovery or classification.
+    #[tokio::test]
+    async fn an_error_frame_preserves_its_underlying_type() {
+        for remaining in [Some(7), Some(0), None] {
+            let mut body = KnownSizeBody {
+                inner: Body::new(ScriptedBody::new(vec![Step::MarkerError])),
+                remaining,
+            };
+
+            let error = std::pin::Pin::new(&mut body)
+                .frame()
+                .await
+                .expect("the marker error is not clean EOF")
+                .expect_err("the frame remains an error");
+            assert_eq!(error.to_string(), "marker body failure");
+            let mut current: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+            let mut marker_found = false;
+            while let Some(candidate) = current {
+                if candidate.downcast_ref::<MarkerBodyError>().is_some() {
+                    marker_found = true;
+                    break;
+                }
+                current = candidate.source();
+            }
+            assert!(
+                marker_found,
+                "the wrapper must preserve the concrete error in its source chain at {remaining:?}"
+            );
+            assert_eq!(
+                body.size_hint().exact(),
+                remaining,
+                "an error cannot rewrite accounting state"
+            );
+        }
+    }
+
+    /// The opposite direction, which the first version of this fix left
+    /// undefended: a body that yields FEWER bytes than it declared.
+    ///
+    /// The wrapper cannot detect this while frames are still arriving — a
+    /// short body and a slow one look identical until the stream ends. What it
+    /// must not do is keep promising the shortfall AFTER end-of-stream, since
+    /// by then the promise is unfulfillable. Documenting the current behaviour
+    /// honestly: `remaining` stays at the undelivered count, and the honest
+    /// reading is that this hint was wrong from the start because the wrapped
+    /// body lied. Pinned so a future change here is deliberate rather than
+    /// accidental.
+    #[tokio::test]
+    async fn an_underrunning_body_is_recorded_as_it_actually_behaves() {
+        let mut body = KnownSizeBody {
+            inner: Body::new(ScriptedBody::data(&[b"ab"])),
+            remaining: Some(9),
+        };
+        let mut delivered = 0usize;
+        while let Some(frame) = std::pin::Pin::new(&mut body).frame().await {
+            if let Some(data) = frame.expect("no errors").data_ref() {
+                delivered += data.len();
+            }
+        }
+        assert_eq!(delivered, 2, "precondition: the body really does underrun");
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(7),
+            "current behaviour, pinned deliberately: 9 were promised, 2 \
+             arrived, and the wrapper still reports the 7 that never came. \
+             This is a faithful echo of the wrapped body's own false claim, \
+             not an independent one — but a caller reading it after \
+             end-of-stream is being told about bytes that will never arrive. \
+             If this is ever changed to report unknown, change it here first"
+        );
+    }
+
+    /// A fully buffered body has no unread remainder, but passing through
+    /// `rejoin` must still preserve the exact length it advertised before the
+    /// split. Routing this arm through a frame-level stream preserves bytes
+    /// while silently downgrading the hint to unknown.
+    #[tokio::test]
+    async fn rejoin_preserves_a_known_exact_size_without_a_remainder() {
+        let body = rejoin(Bytes::from_static(b"abc"), None, Some(3));
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), Some(3));
+        assert_eq!(hint.lower(), 3);
+        assert_eq!(hint.upper(), Some(3));
+
+        let bytes = axum::body::to_bytes(body, 4)
+            .await
+            .expect("the buffered body remains readable");
+        assert_eq!(bytes, Bytes::from_static(b"abc"));
+    }
+
+    /// With no unread remainder, the buffered prefix is the complete observed
+    /// body even when the producer never offered an original exact hint.
+    /// Routing those bytes back through a frame stream would retain payload
+    /// while unnecessarily discarding their now-known length.
+    #[tokio::test]
+    async fn rejoin_uses_observed_length_without_an_original_hint() {
+        let body = rejoin(Bytes::from_static(b"abc"), None, None);
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), Some(3));
+        assert_eq!(hint.lower(), 3);
+        assert_eq!(hint.upper(), Some(3));
+
+        let bytes = axum::body::to_bytes(body, 4)
+            .await
+            .expect("the fully observed body remains readable");
+        assert_eq!(bytes, Bytes::from_static(b"abc"));
+    }
+
+    /// Once the split has reached EOF, the buffered prefix is the complete
+    /// body and its observed length is stronger evidence than the original
+    /// producer's claim. The no-remainder fast path must not re-wrap these
+    /// bytes with a stale, false `original_exact` value.
+    #[tokio::test]
+    async fn rejoin_uses_observed_length_when_no_remainder_exists() {
+        for claimed in [0, 9] {
+            let mut body = rejoin(Bytes::from_static(b"ab"), None, Some(claimed));
+            assert_eq!(
+                body.size_hint().exact(),
+                Some(2),
+                "the fully observed body is two bytes, not the stale claim {claimed}"
+            );
+
+            let data = std::pin::Pin::new(&mut body)
+                .frame()
+                .await
+                .expect("the buffered frame remains")
+                .expect("the buffered frame is not an error")
+                .into_data()
+                .expect("the buffered frame is data");
+            assert_eq!(data, Bytes::from_static(b"ab"));
+            assert_eq!(body.size_hint().exact(), Some(0));
+        }
+    }
     /// #515 defect 1: `rejoin` must not silently downgrade a body with a known
     /// exact length to unknown length just because classifying it required
     /// splitting it into a bytes-in-hand prefix plus an unread remainder.
@@ -1625,9 +3065,126 @@ mod tests {
             "the rejoined body must still report the original body's exact \
              length rather than acquiring StreamBody's unknown-length default"
         );
+        // N1 at the real seam: Hyper consults this before deciding whether the
+        // response has a body at all.
+        assert!(
+            !resp.body().is_end_stream(),
+            "a non-empty rejoined body must not claim end-of-stream — Hyper \
+             would send the response bodyless"
+        );
         // The size-hint fix must not have disturbed the bytes it was already
         // proven (above) to deliver whole.
         assert_eq!(body_string(resp).await.len() as u64, expected_total);
+    }
+
+    /// `None` means the original body was genuinely streaming and made no
+    /// exact-length claim. Defaulting that absence to zero is not conservative:
+    /// Hyper can turn `Some(0)` into `Content-Length: 0` and suppress the
+    /// nonempty frames that follow before polling gets a chance to invalidate
+    /// the lie.
+    #[tokio::test]
+    async fn rejoin_does_not_invent_zero_for_an_unknown_length() {
+        let rest = Body::from_stream(async_stream::stream! {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"def"));
+        });
+        assert_eq!(
+            rest.size_hint().exact(),
+            None,
+            "precondition: the remainder is a genuine unknown-length stream"
+        );
+
+        let body = rejoin(Bytes::from_static(b"abc"), Some(rest), None);
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), None, "unknown must not default to exact zero");
+        assert_eq!(hint.lower(), 0, "unknown has no positive lower bound");
+        assert_eq!(hint.upper(), None, "unknown has no upper bound");
+
+        let bytes = axum::body::to_bytes(body, 16)
+            .await
+            .expect("the rejoined stream remains readable");
+        assert_eq!(bytes, Bytes::from_static(b"abcdef"));
+    }
+
+    /// An empty observed prefix does not make an unknown streaming body empty.
+    /// A trailer-only remainder is a legal zero-DATA stream, and rejoin must
+    /// preserve both its unknown byte hint and its metadata frame.
+    #[tokio::test]
+    async fn rejoin_preserves_an_unknown_trailer_only_remainder() {
+        let rest = Body::new(ScriptedBody::new(vec![Step::Trailers]));
+        let mut body = rejoin(Bytes::new(), Some(rest), None);
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), None);
+        assert_eq!(hint.lower(), 0);
+        assert_eq!(hint.upper(), None);
+
+        let trailers = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the unknown trailer remainder is not EOF")
+            .expect("the trailer is not an error")
+            .into_trailers()
+            .expect("the remainder carries trailers");
+        assert_eq!(
+            trailers.get("x-checksum"),
+            Some(&HeaderValue::from_static("ok"))
+        );
+        assert_eq!(body.size_hint().exact(), None);
+    }
+
+    /// An empty prefix is an optimization opportunity, not permission to skip
+    /// restoring the original exact hint. A zero-byte body may still carry
+    /// trailers, so `rest` is present even though `head` is empty; returning
+    /// that stream directly would downgrade exact zero to unknown.
+    #[tokio::test]
+    async fn rejoin_restores_a_known_size_when_the_head_is_empty() {
+        let rest = Body::new(ScriptedBody::new(vec![Step::Trailers]));
+        assert_eq!(
+            rest.size_hint().exact(),
+            None,
+            "precondition: the frame-level trailer stream has no exact hint"
+        );
+
+        let mut body = rejoin(Bytes::new(), Some(rest), Some(0));
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(0),
+            "the original zero-byte claim must survive the empty-head arm"
+        );
+        let trailers = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the trailer remainder remains")
+            .expect("trailers are not an error")
+            .into_trailers()
+            .expect("the remainder carries trailers");
+        assert_eq!(trailers.get("x-checksum").unwrap(), "ok");
+        assert_eq!(body.size_hint().exact(), Some(0));
+    }
+
+    /// An empty prefix can also precede an error before any declared DATA was
+    /// observed. It does not prove that the original exact claim was zero;
+    /// the empty-head arm must restore any known value and still delegate the
+    /// remainder's original error.
+    #[tokio::test]
+    async fn rejoin_restores_a_nonzero_size_when_the_head_is_empty() {
+        let rest = Body::new(ScriptedBody::new(vec![Step::MarkerError]));
+        let mut body = rejoin(Bytes::new(), Some(rest), Some(7));
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), Some(7));
+        assert_eq!(hint.lower(), 7);
+        assert_eq!(hint.upper(), Some(7));
+
+        let error = std::pin::Pin::new(&mut body)
+            .frame()
+            .await
+            .expect("the empty-head remainder is not clean EOF")
+            .expect_err("the remainder's marker error is preserved");
+        assert_eq!(error.to_string(), "marker body failure");
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(7),
+            "an error consumes none of the declared bytes"
+        );
     }
 
     /// #336, the other half: an over-cap body that is genuinely plain text is

@@ -55,8 +55,10 @@ pub fn visible_edges(display: StoredValue<DisplayProjection>, range: (usize, usi
 /// on that would take the whole canvas down, so an edge whose endpoints aren't
 /// both loaded simply draws nothing until the page owning them lands.
 ///
-/// A group takes its anchor member's identity for this colour lookup (#374) —
-/// arbitrary but consistent, matching `build_wip_group`'s own choice.
+/// A group takes its anchor member's identity for this colour lookup (#374).
+/// The collapse projection likewise moves a folded endpoint onto the anchor's
+/// marker lane, so colour and position now resolve the same visible object
+/// (ADR 0098).
 pub fn build_edge(
     ctx: StoredValue<RenderCtx>,
     display: StoredValue<DisplayProjection>,
