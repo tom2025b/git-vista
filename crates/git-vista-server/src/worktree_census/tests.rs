@@ -25,6 +25,36 @@ fn current_of(siblings: &[WorktreeSibling]) -> Vec<&WorktreeSibling> {
     siblings.iter().filter(|s| s.is_current).collect()
 }
 
+/// `git worktree add <side>/<name>` on a fresh branch of the same name, and
+/// the id `gix` gives that worktree **while it still exists** — the
+/// independent witness the correlation tests below anchor on (the same trick
+/// `a_missing_siblings_id_survives_its_own_deletion` uses, hoisted so more
+/// than one worktree can be witnessed per fixture).
+fn add_linked(repo: &Path, side: &Path, name: &str) -> (PathBuf, String) {
+    let path = side.join(name);
+    fx::run(repo, &["branch", name]);
+    fx::run(repo, &["worktree", "add", path.to_str().unwrap(), name]);
+    let id = git_vista_git::read_handle(&path)
+        .unwrap()
+        .worktree
+        .to_string();
+    (path, id)
+}
+
+/// The `<repo>/.git/worktrees/<name>` administrative directory git creates for
+/// a linked worktree — the directory whose `gitdir` file
+/// `correlate_missing_admin_dir` reads, and the one that survives deletion of
+/// the working tree.
+fn admin_dir(repo: &Path, name: &str) -> PathBuf {
+    let dir = repo.join(".git").join("worktrees").join(name);
+    assert!(
+        dir.is_dir(),
+        "fixture is wrong: no admin directory at {}",
+        dir.display()
+    );
+    dir
+}
+
 fn observed(census: WorktreeCensus) -> Vec<WorktreeSibling> {
     match census {
         WorktreeCensus::Observed { siblings } => siblings,
@@ -272,6 +302,120 @@ async fn a_missing_siblings_id_survives_its_own_deletion() {
     );
 }
 
+/// The correlation in `correlate_missing_admin_dir` is by **`gitdir` content**,
+/// and its doc comment says so in as many words ("exact, not a naming guess").
+/// Every fixture above has exactly one linked worktree, so "read each admin
+/// entry's `gitdir` and match it against the porcelain path" and "take the
+/// first admin entry `read_dir` hands back" are indistinguishable in all of
+/// them — the claim is defended by the fixture's arity, not by a test.
+///
+/// Here there are **two** linked worktrees and only one is deleted, so the
+/// admin root holds two entries while exactly one row is `Missing`. The
+/// `Missing` row must carry the *deleted* worktree's id — captured by `gix`
+/// before the deletion, an independent witness — and must not carry the
+/// survivor's.
+///
+/// Deterministic-failure note, kept honest: `read_dir` order is the
+/// filesystem's business, so a first-entry-wins mutation would still guess
+/// right here roughly half the time.
+/// `two_missing_rows_each_keep_their_own_admin_entrys_id` below is the leg
+/// that cannot be got right by luck — read the two together.
+#[tokio::test]
+async fn a_missing_rows_id_comes_from_its_own_gitdir_not_a_surviving_siblings() {
+    let (_dir, repo) = seeded();
+    let side = tempfile::tempdir().unwrap();
+    let (gone, gone_id) = add_linked(&repo, side.path(), "gone");
+    let (_survivor, survivor_id) = add_linked(&repo, side.path(), "survivor");
+    assert_ne!(
+        gone_id, survivor_id,
+        "fixture is wrong: two linked worktrees must have distinct ids"
+    );
+
+    std::fs::remove_dir_all(&gone).unwrap();
+
+    let siblings = observed(worktree_census(&repo, false, &allow_all).await);
+    assert_eq!(siblings.len(), 3, "main, the survivor, and the gone one");
+
+    let missing: Vec<&WorktreeSibling> = siblings
+        .iter()
+        .filter(|s| s.serviceable == Serviceable::Missing)
+        .collect();
+    assert_eq!(
+        missing.len(),
+        1,
+        "only the deleted worktree is Missing; the survivor is still there"
+    );
+    let missing = missing[0];
+    assert_eq!(missing.name, "gone");
+    assert_eq!(
+        missing.id, gone_id,
+        "the Missing row must carry the id of the worktree that vanished"
+    );
+    assert_ne!(
+        missing.id, survivor_id,
+        "and must never be handed the surviving sibling's admin entry instead"
+    );
+
+    // The survivor is untouched: still live, still its own id.
+    let live = siblings
+        .iter()
+        .find(|s| s.name == "survivor")
+        .expect("the surviving linked worktree");
+    assert_eq!(live.serviceable, Serviceable::Yes);
+    assert_eq!(live.id, survivor_id);
+}
+
+/// The same claim, in the arrangement no `read_dir` ordering can pass by luck:
+/// **two** linked worktrees, **both** deleted, so the census resolves two
+/// `Missing` rows against two surviving admin entries in one call.
+///
+/// "Take the first admin entry" hands the *same* directory to both rows, so
+/// the two ids come out equal — and at most one of them could be right. Only
+/// a per-row `gitdir` match can give each row the id its own worktree had
+/// while it existed, which is what the two `gix` witnesses captured before the
+/// deletions pin.
+#[tokio::test]
+async fn two_missing_rows_each_keep_their_own_admin_entrys_id() {
+    let (_dir, repo) = seeded();
+    let side = tempfile::tempdir().unwrap();
+    let (alpha, alpha_id) = add_linked(&repo, side.path(), "alpha");
+    let (beta, beta_id) = add_linked(&repo, side.path(), "beta");
+    assert_ne!(alpha_id, beta_id, "fixture is wrong: ids must differ");
+
+    std::fs::remove_dir_all(&alpha).unwrap();
+    std::fs::remove_dir_all(&beta).unwrap();
+
+    let siblings = observed(worktree_census(&repo, false, &allow_all).await);
+    let missing: Vec<&WorktreeSibling> = siblings
+        .iter()
+        .filter(|s| s.serviceable == Serviceable::Missing)
+        .collect();
+    assert_eq!(missing.len(), 2, "both deleted worktrees are Missing rows");
+
+    let alpha_row = missing
+        .iter()
+        .find(|s| s.name == "alpha")
+        .expect("a row for alpha");
+    let beta_row = missing
+        .iter()
+        .find(|s| s.name == "beta")
+        .expect("a row for beta");
+
+    assert_ne!(
+        alpha_row.id, beta_row.id,
+        "two Missing rows sharing one id means the correlation stopped \
+         correlating and started taking whatever `read_dir` returned first"
+    );
+    assert_eq!(
+        alpha_row.id, alpha_id,
+        "alpha's row must carry alpha's own pre-deletion id"
+    );
+    assert_eq!(
+        beta_row.id, beta_id,
+        "beta's row must carry beta's own pre-deletion id"
+    );
+}
+
 /// A fresh, commit-less repository's own (main) worktree has an unborn
 /// branch: git reports `HEAD 000…0`, its null-oid sentinel, which must not be
 /// passed through as though it named a real commit (`history::HeadState`'s
@@ -359,6 +503,142 @@ async fn a_truncated_worktree_list_is_refused_not_parsed_into_a_short_census() {
     );
 }
 
+/// The **production** ceiling, exercised through the entry point that owns it.
+///
+/// `a_truncated_worktree_list_is_refused_not_parsed_into_a_short_census` above
+/// supplies its own caps (1, then 8 KiB) to `worktree_census_capped`, so it
+/// never observes `WORKTREE_LIST_STDOUT_CAP` at all: raising that constant to
+/// `usize::MAX` — restoring precisely the unbounded read this module went
+/// through `git_stdout_capped` to remove — leaves every other test in this
+/// file green. This one calls `worktree_census`, which takes no cap, and makes
+/// real git print more than the constant allows.
+///
+/// Doing that cheaply uses git's own porcelain: a locked worktree's **reason**
+/// is printed verbatim on the record's `locked <reason>` line (verified by
+/// hand against git 2.53 — a 100-byte reason printed 100 bytes, and a 9 MiB
+/// one printed a 9,437,563-byte stream in 10 ms). The reason is stored in
+/// `<common>/worktrees/<name>/locked`, which is the file
+/// `git worktree lock --reason` writes, so growing that one file past the
+/// ceiling produces a genuinely oversized stream **from real git**. The
+/// alternative — enough linked worktrees to total 8 MiB of records — is
+/// tens of thousands of checkouts, which is why the cap went untested here in
+/// the first place.
+///
+/// Two legs, and both are load-bearing:
+///   * the ceiling must be a finite, reachable byte count. A `usize::MAX`
+///     "cap" is not a cap, and the test refuses to pretend it can allocate a
+///     stream that exceeds it.
+///   * the same repository, with the oversized reason removed, censuses
+///     normally — which is what proves the refusal came from the size rather
+///     than from a fixture git could not read at all.
+#[tokio::test]
+async fn the_production_census_refuses_a_stream_larger_than_its_own_ceiling() {
+    let Some(over) = WORKTREE_LIST_STDOUT_CAP
+        .checked_add(1)
+        .filter(|n| *n <= 64 * 1024 * 1024)
+    else {
+        panic!(
+            "WORKTREE_LIST_STDOUT_CAP is {WORKTREE_LIST_STDOUT_CAP} bytes — a \
+             ceiling no `git worktree list --porcelain` stream could ever reach \
+             is not a ceiling, and `worktree_census` would be reading git's \
+             stdout unbounded"
+        );
+    };
+
+    let (_dir, repo) = seeded();
+    let side = tempfile::tempdir().unwrap();
+    let (linked, _linked_id) = add_linked(&repo, side.path(), "linked");
+    fx::run(
+        &repo,
+        &[
+            "worktree",
+            "lock",
+            linked.to_str().unwrap(),
+            "--reason",
+            "placeholder",
+        ],
+    );
+
+    // git wrote the lock reason here; grow it past the census's own ceiling.
+    // Not via `--reason` itself: an argument that long is rejected before git
+    // ever runs (measured — `execve` of `git worktree lock --reason <9 MiB>`
+    // fails `E2BIG`, "Argument list too long"), so the reason is written to
+    // git's own file, in git's own format, and git reads it back.
+    let lock_file = admin_dir(&repo, "linked").join("locked");
+    assert!(
+        lock_file.is_file(),
+        "`git worktree lock --reason` must have written {}",
+        lock_file.display()
+    );
+    std::fs::write(&lock_file, "x".repeat(over)).unwrap();
+
+    let reason = failed(worktree_census(&repo, false, &allow_all).await);
+    assert!(
+        reason.contains("truncated"),
+        "the production ceiling must refuse an oversized stream, and say why: {reason}"
+    );
+
+    // The paired positive: same repository, reason gone, healthy census.
+    std::fs::remove_file(&lock_file).unwrap();
+    let siblings = observed(worktree_census(&repo, false, &allow_all).await);
+    assert_eq!(
+        siblings.len(),
+        2,
+        "the same repository under the same production cap must census normally \
+         once the oversized reason is gone"
+    );
+}
+
+/// The exactly-one-current guard (`current_count != 1`), reached rather than
+/// merely defended by construction — issue #546's acceptance asks for a test
+/// that asserts *exactly* one, not "at least one", and a refusal branch no
+/// test can enter is a branch nobody knows works.
+///
+/// No porcelain is fabricated here: the stream is real git's, produced from a
+/// repository whose administrative bookkeeping has been corrupted the way a
+/// half-finished `git worktree move`, a hand-edited `gitdir`, or a restored
+/// backup can corrupt it. `<common>/worktrees/alpha/gitdir` is repointed at
+/// **beta**'s working tree, and git then prints beta's path twice (verified by
+/// hand against git 2.53: three records, two of them naming beta, neither
+/// flagged `prunable`). Censused from beta, both of those records resolve
+/// through `read_repo_facts` to beta's own worktree id, so two rows claim to
+/// be the served worktree.
+///
+/// The healthy control runs first, on the same fixture before the corruption,
+/// so a failure here cannot be the fixture simply refusing to census.
+#[tokio::test]
+async fn two_rows_resolving_to_the_served_worktree_is_refused_not_reported() {
+    let (_dir, repo) = seeded();
+    let side = tempfile::tempdir().unwrap();
+    let (_alpha, _alpha_id) = add_linked(&repo, side.path(), "alpha");
+    let (beta, _beta_id) = add_linked(&repo, side.path(), "beta");
+
+    // Control: censused from beta, this repository is healthy and has exactly
+    // one current row.
+    let healthy = observed(worktree_census(&beta, false, &allow_all).await);
+    assert_eq!(healthy.len(), 3);
+    assert_eq!(current_of(&healthy).len(), 1);
+
+    // Corrupt alpha's admin entry so it names beta's working tree. git reads
+    // this file to decide what path to print for that record, so porcelain now
+    // lists beta twice.
+    std::fs::write(
+        admin_dir(&repo, "alpha").join("gitdir"),
+        format!("{}/.git\n", beta.display()),
+    )
+    .unwrap();
+
+    let reason = failed(worktree_census(&beta, false, &allow_all).await);
+    assert!(
+        reason.contains("resolved 2 entries"),
+        "the guard must name how many rows claimed to be current: {reason}"
+    );
+    assert!(
+        reason.contains("exactly one is required"),
+        "and must say that exactly one — not at least one — is the rule: {reason}"
+    );
+}
+
 #[tokio::test]
 async fn a_path_that_is_not_a_git_repository_fails_the_census() {
     let dir = tempfile::tempdir().unwrap();
@@ -384,10 +664,24 @@ async fn expose_paths_gates_the_path_field() {
 // Enrichment unit tests
 //
 // The porcelain parser itself — `parse_worktree_porcelain`, its record type
-// and its ten unit tests — moved to `git-vista-protocol`'s `worktree` module,
-// beside `status.rs`/`diff.rs`'s parsers and the DTOs it produces. What is
-// left here is the half that needs the machine: the `HEAD 000…0` sentinel
-// that must never be passed through as a `CommitOid`.
+// and its **eleven** unit tests — moved to `git-vista-protocol`'s `worktree`
+// module, beside `status.rs`/`diff.rs`'s parsers and the DTOs it produces.
+// Eleven, counted rather than remembered: `git show HEAD~1:` on this file
+// lists `parses_a_well_formed_multi_record_stream`,
+// `tolerates_a_missing_trailing_blank_line`,
+// `a_bare_record_has_no_head_or_branch`,
+// `an_attribute_before_any_worktree_line_is_an_error`,
+// `a_second_worktree_line_without_a_blank_terminator_is_an_error`,
+// `an_unrecognized_attribute_is_an_error_not_a_skip`,
+// `branch_and_detached_together_is_an_error`,
+// `a_non_bare_record_missing_head_is_an_error`,
+// `a_record_naming_neither_branch_nor_detached_is_an_error`,
+// `a_bare_record_carrying_head_is_an_error` and
+// `empty_input_parses_to_no_records`, and every one of them is now in
+// `git-vista-protocol/src/worktree.rs`'s own `mod tests`.
+//
+// What is left here is the half that needs the machine: the `HEAD 000…0`
+// sentinel that must never be passed through as a `CommitOid`.
 // ---------------------------------------------------------------------------
 
 #[test]

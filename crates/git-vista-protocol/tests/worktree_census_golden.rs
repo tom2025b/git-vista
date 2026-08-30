@@ -21,6 +21,16 @@
 //! fixture deserializes into exactly the values built here, and re-serializing
 //! reproduces the fixture byte for byte.
 //!
+//! The `repository`/`id` values are **UUID-shaped**, matching `dto_v1.json`'s
+//! own convention (`11111111-1111-5111-8111-111111111111`: a repeated digit,
+//! the `5` version nibble and the `8` RFC-4122 variant nibble in place). That
+//! is what production actually emits — both fields are the `Display` form of a
+//! `git-vista-core` `RepositoryId`/`WorktreeId`, each a v5 UUID
+//! (`identity.rs`'s `Uuid::new_v5`), rendered hyphenated with no prefix. A
+//! fixture carrying an invented `r-…`/`w-…` shape would pin a wire form no
+//! client will ever be handed, and would let a change that broke id rendering
+//! sail through this file.
+//!
 //! A wire change here is deliberate: regenerate with
 //! `REGEN_GOLDEN=1 cargo test -p git-vista-protocol --test worktree_census_golden`,
 //! review the diff, and record the protocol implications (M1.02 rules).
@@ -77,8 +87,8 @@ struct WorktreeCensusGoldenSet {
 
 fn golden_set() -> WorktreeCensusGoldenSet {
     let current = WorktreeSibling {
-        repository: "r-1111111111111111".to_string(),
-        id: "w-1111111111111111".to_string(),
+        repository: "11111111-1111-5111-8111-111111111111".to_string(),
+        id: "22222222-2222-5222-8222-222222222222".to_string(),
         name: "git-vista".to_string(),
         path: Some("/home/user/projects/git-vista".to_string()),
         branch: Some(branch("main")),
@@ -90,8 +100,8 @@ fn golden_set() -> WorktreeCensusGoldenSet {
         serviceable: Serviceable::Yes,
     };
     let locked_no_path = WorktreeSibling {
-        repository: "r-1111111111111111".to_string(),
-        id: "w-2222222222222222".to_string(),
+        repository: "11111111-1111-5111-8111-111111111111".to_string(),
+        id: "33333333-3333-5333-8333-333333333333".to_string(),
         name: "git-vista-m11".to_string(),
         path: None,
         branch: Some(branch("feature/m11-worktrees")),
@@ -103,8 +113,8 @@ fn golden_set() -> WorktreeCensusGoldenSet {
         serviceable: Serviceable::Yes,
     };
     let outside_allowed_roots = WorktreeSibling {
-        repository: "r-1111111111111111".to_string(),
-        id: "w-3333333333333333".to_string(),
+        repository: "11111111-1111-5111-8111-111111111111".to_string(),
+        id: "44444444-4444-5444-8444-444444444444".to_string(),
         name: "git-vista-codex".to_string(),
         path: Some("/home/user/gv/variants/git-vista-codex".to_string()),
         branch: Some(branch("codex/65-sheet-wiring")),
@@ -116,8 +126,8 @@ fn golden_set() -> WorktreeCensusGoldenSet {
         serviceable: Serviceable::OutsideAllowedRoots,
     };
     let missing = WorktreeSibling {
-        repository: "r-1111111111111111".to_string(),
-        id: "w-4444444444444444".to_string(),
+        repository: "11111111-1111-5111-8111-111111111111".to_string(),
+        id: "55555555-5555-5555-8555-555555555555".to_string(),
         name: "git-vista-testbed".to_string(),
         path: Some("/home/user/projects/git-vista-testbed".to_string()),
         branch: Some(branch("testbed/main-20260817-2219")),
@@ -129,8 +139,8 @@ fn golden_set() -> WorktreeCensusGoldenSet {
         serviceable: Serviceable::Missing,
     };
     let detached = WorktreeSibling {
-        repository: "r-1111111111111111".to_string(),
-        id: "w-5555555555555555".to_string(),
+        repository: "11111111-1111-5111-8111-111111111111".to_string(),
+        id: "66666666-6666-5666-8666-666666666666".to_string(),
         name: "git-vista-detached".to_string(),
         path: Some("/home/user/projects/git-vista-detached".to_string()),
         branch: None,
@@ -142,8 +152,8 @@ fn golden_set() -> WorktreeCensusGoldenSet {
         serviceable: Serviceable::Yes,
     };
     let bare = WorktreeSibling {
-        repository: "r-1111111111111111".to_string(),
-        id: "w-6666666666666666".to_string(),
+        repository: "11111111-1111-5111-8111-111111111111".to_string(),
+        id: "77777777-7777-5777-8777-777777777777".to_string(),
         name: "git-vista.git".to_string(),
         path: Some("/home/user/projects/git-vista.git".to_string()),
         branch: None,

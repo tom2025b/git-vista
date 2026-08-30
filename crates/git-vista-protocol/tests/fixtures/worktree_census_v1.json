@@ -1,7 +1,7 @@
 {
   "current": {
-    "repository": "r-1111111111111111",
-    "id": "w-1111111111111111",
+    "repository": "11111111-1111-5111-8111-111111111111",
+    "id": "22222222-2222-5222-8222-222222222222",
     "name": "git-vista",
     "path": "/home/user/projects/git-vista",
     "branch": "main",
@@ -15,8 +15,8 @@
     }
   },
   "locked_no_path": {
-    "repository": "r-1111111111111111",
-    "id": "w-2222222222222222",
+    "repository": "11111111-1111-5111-8111-111111111111",
+    "id": "33333333-3333-5333-8333-333333333333",
     "name": "git-vista-m11",
     "branch": "feature/m11-worktrees",
     "head": "cccccccccccccccccccccccccccccccccccccccc",
@@ -29,8 +29,8 @@
     }
   },
   "outside_allowed_roots": {
-    "repository": "r-1111111111111111",
-    "id": "w-3333333333333333",
+    "repository": "11111111-1111-5111-8111-111111111111",
+    "id": "44444444-4444-5444-8444-444444444444",
     "name": "git-vista-codex",
     "path": "/home/user/gv/variants/git-vista-codex",
     "branch": "codex/65-sheet-wiring",
@@ -44,8 +44,8 @@
     }
   },
   "missing": {
-    "repository": "r-1111111111111111",
-    "id": "w-4444444444444444",
+    "repository": "11111111-1111-5111-8111-111111111111",
+    "id": "55555555-5555-5555-8555-555555555555",
     "name": "git-vista-testbed",
     "path": "/home/user/projects/git-vista-testbed",
     "branch": "testbed/main-20260817-2219",
@@ -59,8 +59,8 @@
     }
   },
   "detached": {
-    "repository": "r-1111111111111111",
-    "id": "w-5555555555555555",
+    "repository": "11111111-1111-5111-8111-111111111111",
+    "id": "66666666-6666-5666-8666-666666666666",
     "name": "git-vista-detached",
     "path": "/home/user/projects/git-vista-detached",
     "branch": null,
@@ -74,8 +74,8 @@
     }
   },
   "bare": {
-    "repository": "r-1111111111111111",
-    "id": "w-6666666666666666",
+    "repository": "11111111-1111-5111-8111-111111111111",
+    "id": "77777777-7777-5777-8777-777777777777",
     "name": "git-vista.git",
     "path": "/home/user/projects/git-vista.git",
     "branch": null,
@@ -92,8 +92,8 @@
     "kind": "observed",
     "siblings": [
       {
-        "repository": "r-1111111111111111",
-        "id": "w-1111111111111111",
+        "repository": "11111111-1111-5111-8111-111111111111",
+        "id": "22222222-2222-5222-8222-222222222222",
         "name": "git-vista",
         "path": "/home/user/projects/git-vista",
         "branch": "main",
@@ -107,8 +107,8 @@
         }
       },
       {
-        "repository": "r-1111111111111111",
-        "id": "w-2222222222222222",
+        "repository": "11111111-1111-5111-8111-111111111111",
+        "id": "33333333-3333-5333-8333-333333333333",
         "name": "git-vista-m11",
         "branch": "feature/m11-worktrees",
         "head": "cccccccccccccccccccccccccccccccccccccccc",
@@ -121,8 +121,8 @@
         }
       },
       {
-        "repository": "r-1111111111111111",
-        "id": "w-3333333333333333",
+        "repository": "11111111-1111-5111-8111-111111111111",
+        "id": "44444444-4444-5444-8444-444444444444",
         "name": "git-vista-codex",
         "path": "/home/user/gv/variants/git-vista-codex",
         "branch": "codex/65-sheet-wiring",
@@ -136,8 +136,8 @@
         }
       },
       {
-        "repository": "r-1111111111111111",
-        "id": "w-4444444444444444",
+        "repository": "11111111-1111-5111-8111-111111111111",
+        "id": "55555555-5555-5555-8555-555555555555",
         "name": "git-vista-testbed",
         "path": "/home/user/projects/git-vista-testbed",
         "branch": "testbed/main-20260817-2219",
@@ -151,8 +151,8 @@
         }
       },
       {
-        "repository": "r-1111111111111111",
-        "id": "w-5555555555555555",
+        "repository": "11111111-1111-5111-8111-111111111111",
+        "id": "66666666-6666-5666-8666-666666666666",
         "name": "git-vista-detached",
         "path": "/home/user/projects/git-vista-detached",
         "branch": null,
@@ -166,8 +166,8 @@
         }
       },
       {
-        "repository": "r-1111111111111111",
-        "id": "w-6666666666666666",
+        "repository": "11111111-1111-5111-8111-111111111111",
+        "id": "77777777-7777-5777-8777-777777777777",
         "name": "git-vista.git",
         "path": "/home/user/projects/git-vista.git",
         "branch": null,
