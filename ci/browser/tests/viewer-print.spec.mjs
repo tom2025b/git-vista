@@ -32,9 +32,15 @@ async function openViewer(page) {
   await page.getByRole('button', { name: 'Expand Full Diff' }).click()
   const body = page.locator('.viewer-body')
   await expect(body).toBeVisible({ timeout: OPEN_BUDGET_MS })
-  await expect
-    .poll(async () => (await body.textContent())?.length ?? 0, { timeout: OPEN_BUDGET_MS })
-    .toBeGreaterThan(100)
+  // #387: `aria-busy` on `.viewer-modal` is the app's own readiness signal —
+  // false exactly when the body has painted real content rather than the
+  // "Loading…" placeholder (`features/readiness/core.rs::is_viewer_busy`).
+  // This used to poll `body.textContent().length > 100`, a guess calibrated
+  // to "Loading…" being short; the real signal replaces the guess rather
+  // than tightening it.
+  await expect(page.locator('.viewer-modal')).toHaveAttribute('aria-busy', 'false', {
+    timeout: OPEN_BUDGET_MS,
+  })
 }
 
 /** Rows mounted inside `.viewer-body`, and the height of the spacer divs.

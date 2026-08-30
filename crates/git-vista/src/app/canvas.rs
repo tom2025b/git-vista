@@ -720,9 +720,21 @@ pub(super) fn graph_canvas(
                     // onto the row window) — but they are no longer static: reading
                     // `stub_epoch` here is what repaints them at their new columns
                     // when a page raises the lane high-water.
-                    {move || { stub_epoch.get(); render::stub_icons(ctx, nerd_icons) }}
+                    {move || {
+                        stub_epoch.get();
+                        // Folding moves stubs, not just paging does (#571): the
+                        // layer is placed in display space, so it repaints when
+                        // the projection changes as well as when a page shifts
+                        // the lane high-water.
+                        display_epoch.get();
+                        render::stub_icons(ctx, display, nerd_icons)
+                    }}
                 </g>
-                {move || { stub_epoch.get(); render::stubs(ctx, shell, moved) }}
+                {move || {
+                    stub_epoch.get();
+                    display_epoch.get();
+                    render::stubs(ctx, display, shell, moved)
+                }}
             </g>
         </svg>
         // The paging affordance (M1.10, #63). A sibling of the `<svg>`, never a
