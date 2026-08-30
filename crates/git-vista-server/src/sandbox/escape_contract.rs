@@ -2327,6 +2327,24 @@ fn ci_preflight_host_meets_the_declared_minimum() {
                     "secret_read_denied reads it as its SECRET and declares expect_baseline \
                      Errno(0), so it must exist and be readable with no sandbox applied",
                 ),
+                // #188. The composite action provisions this and HOST_SETUP_TOKENS
+                // asserts the action still mentions it — but this preflight, whose
+                // whole job is to name a missing prerequisite BEFORE any case runs,
+                // did not check it. The asymmetry cost exactly what this list exists
+                // to prevent, on 2026-08-30: the file went missing, the preflight
+                // PASSED, and `secret_read_denied` and `ssh_known_hosts_carveout`
+                // both died with "proved NOTHING — baseline wanted errno 0 got 2",
+                // whose own text then sent the reader hunting a harness defect that
+                // did not exist. `run_case`'s message already anticipated this and
+                // says what to do: "If the cause turns out to be a prerequisite the
+                // preflight does not yet name, add it THERE — do not silence this."
+                (
+                    ".ssh/id_ed25519",
+                    "secret_read_denied's SECRET and ssh_known_hosts_carveout's SSHKEY leg \
+                     (#188) both declare expect_baseline Errno(0) for it, so an absent file \
+                     makes both baselines return ENOENT and both cases hard-fail having \
+                     proved nothing about containment",
+                ),
             ] {
                 let path = home.join(rel);
                 // Read a byte rather than stat: the baseline leg's `open` +
