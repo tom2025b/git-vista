@@ -13,8 +13,6 @@ use git_vista_core::model::{BranchStub, Edge, Graph};
 // Geometry of the graph, in SVG user units (px).
 pub const ROW_HEIGHT: i32 = 56; // vertical gap between commits
 pub const LANE_WIDTH: i32 = 34; // horizontal gap between lanes
-                                // Used only by the wasm-only `app` view, so it reads as dead on host/test builds.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub const NODE_RADIUS: i32 = 7;
 pub const PAD_X: i32 = 28;
 pub const PAD_Y: i32 = 28;
@@ -184,6 +182,28 @@ pub fn edge_path(e: &Edge) -> String {
     } else {
         let ym = (y1 + y2) / 2;
         format!("M {x1} {y1} C {x1} {ym}, {x2} {ym}, {x2} {y2}")
+    }
+}
+
+/// Left edge of a fold marker's `⋯ N WIP commits ⋯` label (#573).
+///
+/// A commit row's label starts past everything drawn at that row, because
+/// `label_occupancy` widens it for every edge passing through and every stub
+/// ring hanging over. A marker had no such column: it hugged its own dot, and
+/// so anything crossing its display row was drawn across its label. Measured on
+/// this repository, folded: **113** display edges and **4** stub connectors
+/// reached into a marker's label, and not one reached into a commit's.
+///
+/// `occupied_lane` is that missing answer, computed in display space by
+/// [`crate::features::graph::collapse::marker_label_lane`]. When nothing
+/// crosses the slot it equals the marker's own lane and the label keeps its
+/// hug, so a graph with no crossings looks exactly as it did.
+pub fn marker_label_x(marker_lane: usize, occupied_lane: usize) -> i32 {
+    let hug = node_cx(marker_lane) + NODE_RADIUS + 8;
+    if occupied_lane > marker_lane {
+        hug.max(node_cx(occupied_lane) + LABEL_GAP)
+    } else {
+        hug
     }
 }
 
@@ -817,5 +837,29 @@ mod tests {
         // Geometry is complete and untouched by the orphan.
         assert_eq!(history.text_x().len(), history.rows.len());
         assert_eq!(history.label_occupancy(), [0, 0, 0]);
+    }
+
+    #[test]
+    fn an_unobstructed_marker_label_keeps_hugging_its_own_dot() {
+        // The clear case must be byte-identical to the old behaviour, or every
+        // marker in every graph moves the day this lands.
+        assert_eq!(marker_label_x(0, 0), node_cx(0) + NODE_RADIUS + 8);
+        assert_eq!(marker_label_x(3, 3), node_cx(3) + NODE_RADIUS + 8);
+    }
+
+    #[test]
+    fn an_obstructed_marker_label_starts_past_the_occupied_lane() {
+        // Same column a commit row would get for the same occupancy, so a
+        // pushed marker lines up with the rows around it instead of landing at
+        // some marker-only offset.
+        assert_eq!(marker_label_x(0, 5), node_cx(5) + LABEL_GAP);
+        assert!(marker_label_x(0, 5) > marker_label_x(0, 0));
+    }
+
+    #[test]
+    fn an_occupied_lane_left_of_the_marker_never_pulls_its_label_back() {
+        // `marker_label_lane` cannot return less than the marker's own lane, but
+        // this function must not depend on that to stay correct.
+        assert_eq!(marker_label_x(6, 2), node_cx(6) + NODE_RADIUS + 8);
     }
 }

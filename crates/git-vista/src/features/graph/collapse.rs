@@ -72,9 +72,10 @@ pub enum DisplayItem {
     },
 }
 
-/// An edge with both endpoints already resolved to display-space indices.
-/// Lanes copy through from the source `Edge` unchanged — collapsing moves
-/// rows vertically, never between lanes.
+/// An edge with both endpoints resolved to display-space coordinates.
+/// A visible commit keeps the source [`Edge`]'s routing lane. A commit hidden
+/// inside a [`DisplayItem::WipGroup`] instead takes the group's anchor lane, so
+/// the edge lands on the marker that now represents that endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DisplayEdge {
     pub from_display: usize,
@@ -181,6 +182,121 @@ impl DisplayProjection {
     pub fn display_of_row(&self, row_index: usize) -> Option<usize> {
         self.row_display.get(row_index).copied().flatten()
     }
+}
+
+/// A branch stub placed in display space (#571).
+///
+/// A stub is anchored on a *commit*, but every other layer of the canvas is
+/// drawn against a *display slot*: [`crate::render::build_node`] and both label
+/// tiers take the index of the item they are building and never the raw row
+/// inside it. Folding is what makes the two disagree — a folded run's members
+/// leave display space while keeping their raw row indices — so a stub drawn at
+/// its raw anchor row sits one row too low for every checkpoint folded above it.
+///
+/// That offset is not cosmetic. A stub's connector is near-horizontal by
+/// construction ([`crate::geometry::stub_path`]): it rises half a row while
+/// crossing from the anchor's lane to the stub's own column, and stub columns
+/// start past the *commit* lane high-water. Measured on this repository's own
+/// history, they reach lane 123 — x = 4210px — so a connector drawn against the
+/// wrong row is a thin coloured line running the width of the canvas straight
+/// through an unrelated commit's subject text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlacedStub {
+    /// Index into the resolved-stub list this was placed from, so the caller can
+    /// pair the slot back up with the stub's own lane, colour and depth without
+    /// this module having to know what a resolved stub is.
+    pub index: usize,
+    /// The display slot the stub hangs over: the slot showing its anchor commit.
+    pub display_row: usize,
+}
+
+/// Place resolved stubs into display space — `anchor_rows[i]` is stub `i`'s raw
+/// anchor row, and each result carries the display slot showing that commit.
+///
+/// A stub whose anchor is folded away lands on the fold's marker rather than
+/// being dropped: the marker *is* the slot showing that commit, the branch still
+/// exists, and beside the marker is where a user would look for it.
+///
+/// A stub whose anchor has no slot at all is dropped, exactly as
+/// [`crate::features::graph::core::LoadedHistory::resolved_stubs`] drops one
+/// whose anchor commit is not loaded. There is nowhere to hang it, and falling
+/// back to the raw index would put it on some other commit's row — which is the
+/// defect this function exists to prevent, not a graceful degradation of it.
+pub fn place_stubs(projection: &DisplayProjection, anchor_rows: &[usize]) -> Vec<PlacedStub> {
+    anchor_rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &anchor_row)| {
+            Some(PlacedStub {
+                index,
+                display_row: projection.display_of_row(anchor_row)?,
+            })
+        })
+        .collect()
+}
+
+/// A branch stub as the label column has to see it (#573): which display slot
+/// it hangs over, how far right its own column reaches, and how far up its
+/// cascade steps.
+///
+/// Deliberately not [`PlacedStub`]: that type answers "where is this stub
+/// drawn", which is all the stub layer needs. This one answers "what does it
+/// cover", which is a question about somebody else's row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StubOverhang {
+    pub display_row: usize,
+    pub lane: usize,
+    pub depth: usize,
+}
+
+/// The rightmost lane anything drawn reaches at display slot `display_row` —
+/// the answer a fold marker's label needs in order to start clear of it (#573).
+///
+/// Same over-approximation of the S-curve as
+/// [`crate::features::graph::core`]'s `apply_edge_occupancy`, and for the same
+/// reason: at an endpoint row the curve is still within a lane of that
+/// endpoint, and on a row strictly between it can be anywhere between the two.
+/// A stub covers its own slot and the ⌈(depth+1)/2⌉ slots above it, because its
+/// cascade steps upward half a row at a time.
+///
+/// Computed in **display** space, over the projection's own edges and over
+/// stubs already placed by [`place_stubs`]. That is what makes it able to
+/// answer for a marker at all: a marker stands for a whole run, so there is no
+/// single raw row whose occupancy describes it, and the raw rows that *did*
+/// receive the widening are the folded-away members that are no longer drawn.
+///
+/// Returns `marker_lane` itself when nothing crosses the slot, so a caller can
+/// tell "clear" from "pushed" and leave an unobstructed marker where it was.
+pub fn marker_label_lane(
+    projection: &DisplayProjection,
+    stubs: &[StubOverhang],
+    display_row: usize,
+    marker_lane: usize,
+) -> usize {
+    let mut lane = marker_lane;
+    for e in &projection.edges {
+        let (top, bottom) = e.span();
+        if display_row < top || display_row > bottom {
+            continue;
+        }
+        let hi = e.from_lane.max(e.to_lane);
+        let reach = if display_row == e.from_display {
+            (e.from_lane + 1).min(hi)
+        } else if display_row == e.to_display {
+            (e.to_lane + 1).min(hi)
+        } else {
+            hi
+        };
+        lane = lane.max(reach);
+    }
+    for s in stubs {
+        // `[anchor - up ..= anchor]`, written so the subtraction cannot wrap.
+        let up = (s.depth + 2) / 2;
+        if display_row <= s.display_row && display_row + up >= s.display_row {
+            lane = lane.max(s.lane);
+        }
+    }
+    lane
 }
 
 /// True when `newer` and `older` are consecutive members of one foldable run:
@@ -373,11 +489,19 @@ pub fn project(
     }
 
     let display_of_row = |row: usize| row_display.get(row).copied().flatten();
+    let display_endpoint = |row: usize, raw_lane: usize| {
+        let display = display_of_row(row)?;
+        let lane = match items.get(display)? {
+            DisplayItem::Single { .. } => raw_lane,
+            DisplayItem::WipGroup { lane, .. } => *lane,
+        };
+        Some((display, lane))
+    };
     let display_edges = edges
         .iter()
         .filter_map(|e| {
-            let from_display = display_of_row(e.from_row)?;
-            let to_display = display_of_row(e.to_row)?;
+            let (from_display, from_lane) = display_endpoint(e.from_row, e.from_lane)?;
+            let (to_display, to_lane) = display_endpoint(e.to_row, e.to_lane)?;
             // Both endpoints inside the same folded run: the edge was
             // internal to it and has nothing left to connect.
             if from_display == to_display {
@@ -385,9 +509,9 @@ pub fn project(
             }
             Some(DisplayEdge {
                 from_display,
-                from_lane: e.from_lane,
+                from_lane,
                 to_display,
-                to_lane: e.to_lane,
+                to_lane,
             })
         })
         .collect();
@@ -403,6 +527,7 @@ pub fn project(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geometry::{LABEL_GAP, LANE_WIDTH};
     use git_vista_core::model::{CommitSummary, Oid};
 
     fn row(i: usize, summary: &str, parent: Option<&str>) -> GraphRow {
@@ -730,7 +855,7 @@ mod tests {
     }
 
     #[test]
-    fn edges_internal_to_a_folded_run_are_dropped() {
+    fn a3_edges_internal_to_a_folded_run_are_dropped() {
         let rows = vec![
             row(0, "feat: real work", Some("c1")),
             wip_row(1, 3, Some("c2")),
@@ -764,11 +889,10 @@ mod tests {
     }
 
     #[test]
-    fn edge_lanes_pass_through_unchanged() {
+    fn unfolded_edge_lanes_pass_through_unchanged() {
         let rows = vec![
             row(0, "feat: real work", Some("c1")),
-            wip_row(1, 2, Some("c2")),
-            wip_row(2, 1, None),
+            row(1, "docs: earlier real work", None),
         ];
         let edges = vec![Edge {
             from_row: 0,
@@ -779,6 +903,101 @@ mod tests {
         let p = project(&rows, &edges, true, &HashSet::new());
         assert_eq!(p.edges[0].from_lane, 3);
         assert_eq!(p.edges[0].to_lane, 7);
+    }
+
+    /// A repository-shaped graph containing both directions of the defect:
+    /// a visible commit whose parent is inside a folded run, and the run's
+    /// oldest member whose parent remains visible. The raw edge geometry
+    /// carries the far-right routing lanes seen in the failing repository,
+    /// while the display items themselves occupy only lanes 0 through 2.
+    fn folded_edge_repository_fixture() -> (Vec<GraphRow>, Vec<Edge>) {
+        let newest = row(0, "feat: visible child", Some("c1"));
+        let mut fold_anchor = wip_row(1, 2, Some("c2"));
+        fold_anchor.lane = 2;
+        let mut fold_tail = wip_row(2, 1, Some("c3"));
+        fold_tail.lane = 2;
+        let mut oldest = row(3, "docs: visible parent", None);
+        oldest.lane = 1;
+
+        let edges = vec![
+            // Visible child -> folded parent: catches a missing `to` remap.
+            Edge {
+                from_row: 0,
+                from_lane: 0,
+                to_row: 1,
+                to_lane: 40,
+            },
+            // Wholly inside the fold: A3 requires this to disappear.
+            Edge {
+                from_row: 1,
+                from_lane: 2,
+                to_row: 2,
+                to_lane: 40,
+            },
+            // Folded child -> visible parent: independently catches a missing
+            // `from` remap.
+            Edge {
+                from_row: 2,
+                from_lane: 41,
+                to_row: 3,
+                to_lane: 1,
+            },
+        ];
+
+        (vec![newest, fold_anchor, fold_tail, oldest], edges)
+    }
+
+    fn item_lane(item: &DisplayItem, rows: &[GraphRow]) -> usize {
+        match *item {
+            DisplayItem::Single { row_index } => rows[row_index].lane,
+            DisplayItem::WipGroup { lane, .. } => lane,
+        }
+    }
+
+    #[test]
+    fn a1_crossing_fold_edges_stay_within_the_visible_lane_high_water() {
+        let (rows, edges) = folded_edge_repository_fixture();
+        let p = project(&rows, &edges, true, &HashSet::new());
+
+        let visible_lane_count = p
+            .items
+            .iter()
+            .map(|item| item_lane(item, &rows))
+            .max()
+            .map_or(0, |lane| lane + 1);
+        assert_eq!(visible_lane_count, 3, "fixture occupies lanes 0 through 2");
+        assert_eq!(p.edges.len(), 2, "the internal edge is dropped");
+        assert!(
+            p.edges
+                .iter()
+                .all(|edge| { edge.from_lane.abs_diff(edge.to_lane) <= visible_lane_count }),
+            "a projected edge escaped {visible_lane_count} visible lanes: {:?}",
+            p.edges
+        );
+    }
+
+    #[test]
+    fn a2_adjacent_display_edges_do_not_reach_the_commit_text_column() {
+        let (rows, edges) = folded_edge_repository_fixture();
+        let p = project(&rows, &edges, true, &HashSet::new());
+
+        // This fixture's rightmost visible lane is 2. Its text starts only
+        // LABEL_GAP=18px after that lane, while another lane is
+        // LANE_WIDTH=34px away. Therefore an edge leaving lane 0 with a delta
+        // of 3 reaches past the visible graph and into the text column. A
+        // one- or two-lane turn remains ordinary graph geometry.
+        const TEXT_COLUMN_CROSSING_LANE_DELTA: usize = 3;
+        // The premise the delta above rests on, checked at compile time: a
+        // plain `assert!` over two constants is a clippy error, not a test.
+        const { assert!(LANE_WIDTH > LABEL_GAP) };
+        assert!(
+            p.edges.iter().all(|edge| {
+                edge.from_display.abs_diff(edge.to_display) != 1
+                    || edge.from_lane.abs_diff(edge.to_lane) < TEXT_COLUMN_CROSSING_LANE_DELTA
+            }),
+            "an adjacent-row edge reaches the text column: {:?}",
+            p.edges
+        );
     }
 
     /// The paired positive: with collapse OFF the same input keeps every
@@ -1271,5 +1490,225 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// The projection every stub test below hangs off: one real commit, a run of
+    /// three checkpoints, one real commit underneath. Folded, that is three
+    /// display slots for five raw rows — so raw and display row indices differ
+    /// for everything below the run, which is the whole point.
+    fn folded_with_a_run_in_the_middle() -> (Vec<GraphRow>, DisplayProjection) {
+        let rows = vec![
+            row(0, "feat: newest real work", Some("c1")),
+            wip_row(1, 3, Some("c2")),
+            wip_row(2, 2, Some("c3")),
+            wip_row(3, 1, Some("c4")),
+            row(4, "docs: oldest real work", None),
+        ];
+        let p = project(&rows, &[], true, &HashSet::new());
+        assert_eq!(p.items.len(), 3, "one real, one marker, one real");
+        (rows, p)
+    }
+
+    #[test]
+    fn a_stub_below_a_fold_hangs_over_the_slot_showing_its_anchor() {
+        // The defect, stated as a property rather than as a coordinate: a stub
+        // anchored on raw row 4 must be drawn against the slot that is showing
+        // raw row 4. Drawn at its raw index it would be two slots below the
+        // bottom of the graph, and its near-horizontal connector would be laid
+        // across whatever commit happens to be down there.
+        let (_rows, p) = folded_with_a_run_in_the_middle();
+        let placed = place_stubs(&p, &[4]);
+        assert_eq!(placed.len(), 1);
+        let slot = placed[0].display_row;
+        assert_eq!(
+            p.items.get(slot),
+            Some(&DisplayItem::Single { row_index: 4 }),
+            "a stub must hang over the slot showing its own anchor commit"
+        );
+        assert_ne!(
+            slot, 4,
+            "the raw row index is not a display slot once a run folds"
+        );
+    }
+
+    #[test]
+    fn a_stub_anchored_inside_a_fold_hangs_over_that_folds_marker() {
+        // The branch has not stopped existing because its commit was folded
+        // away. The marker is the slot showing that commit, so that is where
+        // the ring belongs — dropping the stub would lose a branch from the
+        // canvas entirely.
+        let (rows, p) = folded_with_a_run_in_the_middle();
+        let placed = place_stubs(&p, &[2]);
+        assert_eq!(placed.len(), 1);
+        let Some(&DisplayItem::WipGroup { lane, .. }) = p.items.get(placed[0].display_row) else {
+            panic!("a folded anchor's slot is the run's marker");
+        };
+        assert_eq!(
+            lane, rows[2].lane,
+            "the marker stands in the folded row's lane"
+        );
+    }
+
+    #[test]
+    fn a_stub_whose_anchor_has_no_slot_is_dropped_not_relocated() {
+        // `resolved_stubs` already drops a stub whose anchor commit is not
+        // loaded; this is the same posture one layer down. Falling back to the
+        // raw index here would put the ring on an unrelated commit's row, which
+        // is the defect, not a graceful degradation of it.
+        let (_rows, p) = folded_with_a_run_in_the_middle();
+        assert!(place_stubs(&p, &[9]).is_empty());
+    }
+
+    #[test]
+    fn every_placed_stub_hangs_over_a_slot_that_shows_its_own_anchor() {
+        // Read back through `items` rather than through `display_of_row`, so the
+        // assertion does not simply re-run the mapping it is checking.
+        let (rows, p) = folded_with_a_run_in_the_middle();
+        let anchors = [0_usize, 1, 2, 3, 4];
+        let placed = place_stubs(&p, &anchors);
+        assert_eq!(placed.len(), anchors.len());
+        for stub in placed {
+            let anchor = anchors[stub.index];
+            match p.items.get(stub.display_row) {
+                Some(&DisplayItem::Single { row_index }) => assert_eq!(row_index, anchor),
+                Some(&DisplayItem::WipGroup { lane, .. }) => {
+                    assert!(
+                        is_wip_checkpoint(&rows[anchor].commit.summary),
+                        "only a checkpoint is ever folded into a marker"
+                    );
+                    assert_eq!(lane, rows[anchor].lane, "a run's members share its lane");
+                }
+                None => panic!("a placed stub names a slot that exists"),
+            }
+        }
+    }
+
+    /// One real commit, a folded pair, then two more real commits — so display
+    /// slot 1 is a marker with slots on both sides of it, which is what an edge
+    /// has to span in order to cross it.
+    fn folded_with_a_marker_at_slot_one() -> (Vec<GraphRow>, Vec<Edge>) {
+        let rows = vec![
+            row(0, "feat: newest", Some("c1")),
+            wip_row(1, 2, Some("c2")),
+            wip_row(2, 1, Some("c3")),
+            row(3, "feat: middle", Some("c4")),
+            row(4, "docs: oldest", None),
+        ];
+        (rows, Vec::new())
+    }
+
+    #[test]
+    fn a_marker_with_nothing_crossing_it_keeps_its_own_lane() {
+        // The "clear" answer has to be distinguishable, or every marker in every
+        // graph shifts right for no reason.
+        let (rows, edges) = folded_with_a_marker_at_slot_one();
+        let p = project(&rows, &edges, true, &HashSet::new());
+        assert_eq!(marker_label_lane(&p, &[], 1, 0), 0);
+    }
+
+    #[test]
+    fn an_edge_passing_through_a_marker_pushes_its_label_past_the_outer_lane() {
+        // Raw rows 0 -> 3 straddle the folded pair, so in display space the edge
+        // spans slots 0 -> 2 and passes strictly through the marker at slot 1.
+        // A row strictly between two endpoints takes the outer lane, because the
+        // curve can be anywhere between them there.
+        let (rows, _) = folded_with_a_marker_at_slot_one();
+        let edges = vec![Edge {
+            from_row: 0,
+            from_lane: 0,
+            to_row: 3,
+            to_lane: 5,
+        }];
+        let p = project(&rows, &edges, true, &HashSet::new());
+        assert_eq!(p.edges.len(), 1, "the edge survives the fold");
+        assert_eq!(marker_label_lane(&p, &[], 1, 0), 5);
+    }
+
+    #[test]
+    fn an_edge_that_ends_on_the_marker_gets_one_lane_of_bulge_not_the_outer_lane() {
+        // At an endpoint row the curve has left its lane by less than one lane,
+        // so the allowance is +1 rather than the full outer lane — that +1 is
+        // the whole difference between this branch and the pass-through branch
+        // above, which takes `hi` outright.
+        //
+        // The endpoint that lands ON the marker is a folded row, and a folded
+        // endpoint now sits in the marker's own lane (#575 / ADR 0098) instead
+        // of keeping its raw lane. So the lane the +1 is measured from is the
+        // MARKER's, and the reach the label must clear comes from the *visible*
+        // end reaching toward it. Written with that end out at lane 5, because
+        // an all-lane-0 fixture would make this assertion return the marker's
+        // own lane — indistinguishable from `a_marker_with_nothing_crossing_it`
+        // and therefore proof of nothing.
+        //
+        // One consequence worth recording: `min(.., hi)` can no longer bind at a
+        // marker row. It bound only when the folded endpoint's raw lane was at
+        // or past the outer lane, and after #575 that endpoint is always the
+        // marker's lane, which is by construction the lowest of the two.
+        let (rows, _) = folded_with_a_marker_at_slot_one();
+        let edges = vec![Edge {
+            from_row: 0,
+            from_lane: 5,
+            to_row: 1,
+            to_lane: 4,
+        }];
+        let p = project(&rows, &edges, true, &HashSet::new());
+        assert_eq!(
+            marker_label_lane(&p, &[], 1, 0),
+            1,
+            "one lane of bulge off the marker's own lane, not the outer lane 5"
+        );
+    }
+
+    #[test]
+    fn a_stub_hanging_over_a_marker_pushes_its_label_past_the_stub_column() {
+        // A stub ring sits half a row above its anchor, so a stub anchored one
+        // slot BELOW the marker still hangs over the marker's row. Stub columns
+        // start past the commit lane high-water, so this is the case that moves
+        // a label furthest.
+        let (rows, edges) = folded_with_a_marker_at_slot_one();
+        let p = project(&rows, &edges, true, &HashSet::new());
+        let over = StubOverhang {
+            display_row: 2,
+            lane: 9,
+            depth: 0,
+        };
+        assert_eq!(marker_label_lane(&p, &[over], 1, 0), 9);
+    }
+
+    #[test]
+    fn a_stub_whose_cascade_does_not_reach_the_marker_leaves_it_alone() {
+        // The paired negative: without it the assertion above passes just as
+        // happily against a rule that lets every stub in the graph push every
+        // marker, which would indent them all to the far right.
+        let (rows, edges) = folded_with_a_marker_at_slot_one();
+        let p = project(&rows, &edges, true, &HashSet::new());
+        let far = StubOverhang {
+            display_row: 3,
+            lane: 9,
+            depth: 0,
+        };
+        assert_eq!(marker_label_lane(&p, &[far], 1, 0), 0);
+        // A deeper cascade steps further up, and then it does reach.
+        let deep = StubOverhang {
+            display_row: 3,
+            lane: 9,
+            depth: 3,
+        };
+        assert_eq!(marker_label_lane(&p, &[deep], 1, 0), 9);
+    }
+
+    #[test]
+    fn a_marker_never_moves_left_of_its_own_lane() {
+        // An edge in a lane to the LEFT of the marker says nothing about where
+        // the label may start; the marker's own dot is always the floor.
+        let (rows, _) = folded_with_a_marker_at_slot_one();
+        let edges = vec![Edge {
+            from_row: 0,
+            from_lane: 0,
+            to_row: 3,
+            to_lane: 0,
+        }];
+        let p = project(&rows, &edges, true, &HashSet::new());
+        assert_eq!(marker_label_lane(&p, &[], 1, 4), 4);
     }
 }

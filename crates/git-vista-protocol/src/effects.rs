@@ -295,7 +295,8 @@ impl GitOperation {
 /// `policy_for` dispatches on (Task 8 / D3): the tier is a property of *what
 /// the operation does*, not of the repository — with the single exception of
 /// operator trust, which is a property of the repository and overrides both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NetworkNeed {
     /// The subcommand talks to a remote (`push`/`fetch`/`clone`/`ls-remote`).
     /// Only the `Network` tier can serve it (a namespace breaks push, F3).
