@@ -1,4 +1,4 @@
-# ADR 0092 — A lesson's payload is a transport-side mirror of `Explanation`, never a second source of what a plan means
+# ADR 0093 — A lesson's payload is a transport-side mirror of `Explanation`, never a second source of what a plan means
 
 **Status:** Accepted — implemented and tested
 **Date:** 2026-08-26

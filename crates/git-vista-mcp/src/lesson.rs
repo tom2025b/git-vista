@@ -1,5 +1,5 @@
 //! `get_lesson` — a read tool that turns a plan into structured teaching data
-//! (M12/CLOUD-4, #450; ADR 0092).
+//! (M12/CLOUD-4, #450; ADR 0093).
 //!
 //! # Structured lesson DATA, not HTML
 //!
