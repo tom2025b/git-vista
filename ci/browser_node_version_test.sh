@@ -42,6 +42,43 @@ repo_root="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 work="$(mktemp -d -t gv-browser-node-XXXXXX)"
 trap 'rm -rf "$work"' EXIT
 
+# A system PATH with every real `node`/`npm`/`npx` removed, so scenario 4 can
+# state "no node at all" as a FACT about the environment it built rather than a
+# hope about the host's.
+#
+# Why this exists: scenario 4 used to run with PATH="$bin:/usr/bin:/bin" and
+# simply not install a node shim. On a host with node in /usr/bin — which is
+# most hosts, and is this one — `command -v node` then found the SYSTEM node,
+# the guard correctly let the run proceed, and the test reported
+# "the guard let 'cargo build' run with no node present at all". That is a
+# false accusation against working code: the premise was never established, and
+# the failure named the mechanism instead of the missing precondition. The
+# sandbox escape battery's CI preflight already draws this distinction
+# correctly (see crates/git-vista-server/src/sandbox/escape_contract.rs) — "this
+# runner was not set up" must never arrive disguised as "the thing under test is
+# broken". This is that discipline, applied here.
+#
+# A symlink farm rather than a curated list of needed utilities: `dev` and
+# run.sh reach for a moving set of coreutils, and a curated list silently rots
+# into a PATH that is missing something unrelated, which fails as a confusing
+# guard error rather than as "you forgot to symlink sort".
+sysbin="$work/sysbin"
+mkdir -p "$sysbin"
+for d in /usr/bin /bin /usr/local/bin; do
+  [[ -d $d ]] || continue
+  for f in "$d"/*; do
+    b="${f##*/}"
+    case "$b" in node|npm|npx|nodejs|corepack) continue ;; esac
+    [[ -e "$sysbin/$b" ]] || ln -s "$f" "$sysbin/$b" 2>/dev/null || true
+  done
+done
+if PATH="$sysbin" command -v node >/dev/null 2>&1; then
+  echo "FAIL: could not build a node-free PATH — $(PATH="$sysbin" command -v node) is still reachable." >&2
+  echo "      Scenario 4 cannot state its premise on this host, so it refuses to render a verdict" >&2
+  echo "      about the guard rather than blame the guard for the harness's own gap." >&2
+  exit 1
+fi
+
 fail() {
   echo "FAIL: $*" >&2
   echo "--- transcript ---" >&2
@@ -83,7 +120,10 @@ EOF
   rm -f "$work"/reached-*
   out="$work/out-$version.txt"
   set +e
-  ( cd "$repo_root" && HOME="$home" PATH="$bin:/usr/bin:/bin" bash ./dev browser ) > "$out" 2>&1
+  # ${SYS_PATH:-} lets scenario 4 substitute the node-free farm built above;
+  # every other scenario installs its own node shim in $bin and is unaffected by
+  # whatever the host happens to carry.
+  ( cd "$repo_root" && HOME="$home" PATH="$bin:${SYS_PATH:-/usr/bin:/bin}" bash ./dev browser ) > "$out" 2>&1
   rc=$?
   set -e
 }
@@ -161,7 +201,10 @@ EOF
   rm -f "$work"/reached-* "$work/cargo-path"
   out="$work/out-nvm.txt"
   set +e
-  ( cd "$repo_root" && HOME="$home" PATH="$bin:/usr/bin:/bin" bash ./dev browser ) > "$out" 2>&1
+  # ${SYS_PATH:-} lets scenario 4 substitute the node-free farm built above;
+  # every other scenario installs its own node shim in $bin and is unaffected by
+  # whatever the host happens to carry.
+  ( cd "$repo_root" && HOME="$home" PATH="$bin:${SYS_PATH:-/usr/bin:/bin}" bash ./dev browser ) > "$out" 2>&1
   rc=$?
   set -e
 }
@@ -184,7 +227,10 @@ resolved_npx="$(PATH="$exported_path" command -v npx || true)"
   || fail "with the exported PATH, npx resolves to '$resolved_npx', not the accepted toolchain's $nvm_bin/npx (#469)"
 
 # ── 4. No node at all: the original not-found path must survive ──
-run_with_node ""
+#
+# SYS_PATH is the node-free farm, so "absent" is a property of the environment
+# this test constructed, not an accident of the host's packaging.
+SYS_PATH="$sysbin" run_with_node ""
 
 [[ $rc -ne 0 ]] \
   || fail "dev browser exited 0 with no node at all"
