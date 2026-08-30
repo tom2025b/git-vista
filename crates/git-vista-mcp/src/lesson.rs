@@ -43,6 +43,7 @@ use git_vista_protocol::{
 };
 use serde::Serialize;
 
+use crate::plan_tools::{exposure_of, Exposure};
 use crate::tools::ToolError;
 
 /// The `get_lesson` half of `tools/list`.
@@ -75,7 +76,7 @@ pub(crate) fn lesson_tool_catalog() -> Vec<serde_json::Value> {
 
 /// One heading in the lesson — the wire mirror of
 /// [`git_vista_protocol::Topic`]. A plain re-listing, not a reinterpretation:
-/// seven variants there, seven names here.
+/// six variants there (`explain.rs`'s `pub enum Topic`), six names here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum LessonTopic {
@@ -170,6 +171,41 @@ pub(crate) fn to_lesson(explanation: &Explanation) -> Lesson {
     }
 }
 
+/// The exclusion list, enforced on this surface too.
+///
+/// # Why this is not a guard for an impossible state
+///
+/// `get_lesson`'s `plan` argument is **caller-supplied JSON**, not a value
+/// this process built. Nothing upstream inspects it: `tools::call_tool`
+/// dispatches `"get_lesson"` straight to [`get_lesson`], and
+/// `tools::reject_undeclared_arguments` only compares argument *names*
+/// against the schema — this tool's `plan` property is declared
+/// `{"type": "object"}` with no `properties` block, so that walk returns
+/// early and never reads the operation. And unlike `plan_tools`, this tool
+/// makes no request, so the server-side re-validation `execute_plan` relies
+/// on never happens either.
+///
+/// That was measured, not argued: before this check existed, a hand-built
+/// `Plan` carrying `GitOperation::ResolveConflict` returned a full
+/// six-section lesson from [`get_lesson`] — the #84 conflict-resolution
+/// exclusion, explained by the very surface that refuses to plan it.
+///
+/// So the same classification `plan_tools::check_exposure` applies when
+/// BUILDING a plan is applied here when EXPLAINING one. It is the identical
+/// [`exposure_of`] table — one source, not a second copy that could drift —
+/// and it covers #84 (conflict resolution), #77 (the stash drawer), #153
+/// ([`git_vista_protocol::GitOperation::ResetTestRepo`]) and the sequence
+/// controls without re-listing any of them here.
+fn refuse_unexposed_operation(plan: &Plan) -> Result<(), ToolError> {
+    match exposure_of(&plan.operation) {
+        Exposure::Tool(_) => Ok(()),
+        Exposure::Excluded(reason) => Err(ToolError::Execution(format!(
+            "`get_lesson` will not explain an operation that is deliberately not \
+             available through MCP: {reason}"
+        ))),
+    }
+}
+
 /// Run the `get_lesson` tool: parse the given `plan` argument, explain it
 /// locally (no network call — see the module doc), and return its lesson.
 pub(crate) fn get_lesson(args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
@@ -178,6 +214,7 @@ pub(crate) fn get_lesson(args: &serde_json::Value) -> Result<serde_json::Value, 
         .ok_or_else(|| ToolError::Execution("missing required argument `plan`".to_string()))?;
     let plan: Plan = serde_json::from_value(plan_value.clone())
         .map_err(|e| ToolError::Execution(format!("`plan` is not a valid Plan: {e}")))?;
+    refuse_unexposed_operation(&plan)?;
 
     let explanation = git_vista_protocol::explain(&plan);
     let lesson = to_lesson(&explanation);
@@ -406,20 +443,6 @@ mod tests {
     }
 
     #[test]
-    fn get_lesson_never_emits_html_or_a_bare_string() {
-        // #450's acceptance criterion 2, checked mechanically rather than by
-        // eye: nothing in the result is prose. Every fact value is an
-        // object or a plain typed scalar (an enum tag) — never a `String`
-        // containing markup or a rendered sentence.
-        let result = get_lesson(&serde_json::json!({ "plan": rich_plan() })).unwrap();
-        let text = serde_json::to_string(&result).unwrap();
-        assert!(
-            !text.contains('<'),
-            "result contains what looks like markup: {text}"
-        );
-    }
-
-    #[test]
     fn a_missing_plan_argument_is_a_local_execution_error() {
         match get_lesson(&serde_json::json!({})) {
             Err(ToolError::Execution(msg)) => assert!(msg.contains("plan")),
@@ -433,5 +456,617 @@ mod tests {
             Err(ToolError::Execution(msg)) => assert!(msg.contains("not a valid Plan")),
             other => panic!("expected Execution, got {other:?}"),
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // (a) The exclusion list, enforced here too — #84, #77, #153, ADR 0046.
+    //
+    // These are not hypothetical: the probe recorded in
+    // `refuse_unexposed_operation`'s doc comment ran on this branch before
+    // the gate existed and got a full six-section lesson back for a
+    // `ResolveConflict` plan.
+    // ---------------------------------------------------------------------
+
+    /// One plan per *reason* the MCP surface excludes an operation, so the
+    /// refusal is proven for each family rather than for one lucky variant.
+    fn excluded_plans() -> Vec<(&'static str, Plan)> {
+        let base = |op: GitOperation| Plan {
+            repository: RepositoryToken::new("repo-1").unwrap(),
+            worktree: WorktreeToken::new("wt-1").unwrap(),
+            generation: GenerationToken::new("1").unwrap(),
+            operation: op,
+            operation_hash: OperationHash::new("d".repeat(64)).unwrap(),
+            issued_at: UnixSeconds(1),
+            expires_at: UnixSeconds(300),
+            risk: RiskLevel::Destructive,
+            preconditions: Vec::new(),
+            expected_ref_changes: Vec::new(),
+            recovery: RecoveryStrategy::NotNeeded,
+            advisories: Vec::new(),
+        };
+        vec![
+            (
+                // #84 / ADR 0064 d7: whole-side conflict resolution.
+                "resolve_conflict",
+                base(GitOperation::ResolveConflict {
+                    path: WorktreePath::new("src/main.rs").unwrap(),
+                    resolution: git_vista_protocol::conflict::Resolution::TakeOurs,
+                }),
+            ),
+            (
+                // #77: the stash drawer, addressed by a positional selector.
+                "push_stash",
+                base(GitOperation::PushStash {
+                    message: None,
+                    keep_index: false,
+                    include_untracked: false,
+                }),
+            ),
+            (
+                // #153: the test-harness fixture restore.
+                "reset_test_repo",
+                base(GitOperation::ResetTestRepo),
+            ),
+            (
+                // The sequence controls: the same unseen-content judgement.
+                "sequence_abort",
+                base(GitOperation::SequenceAbort),
+            ),
+        ]
+    }
+
+    #[test]
+    fn get_lesson_refuses_an_operation_the_plan_surface_does_not_expose() {
+        for (label, plan) in excluded_plans() {
+            match get_lesson(&serde_json::json!({ "plan": plan })) {
+                Err(ToolError::Execution(msg)) => {
+                    assert!(
+                        msg.contains("deliberately not available through MCP"),
+                        "{label}: refused, but not as an exclusion: {msg}"
+                    );
+                    // The refusal carries `exposure_of`'s own stated reason
+                    // through, rather than a generic "no". Checked against
+                    // the classification's payload, not against a copy of
+                    // the wording pasted into this test.
+                    let Exposure::Excluded(reason) = exposure_of(&plan.operation) else {
+                        panic!("{label} is not classified Excluded — fixture is stale");
+                    };
+                    assert!(
+                        msg.contains(reason),
+                        "{label}: refusal dropped exposure_of's reason\n  got: {msg}\n want: {reason}"
+                    );
+                }
+                other => panic!("{label}: expected an exclusion refusal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_exclusion_gate_still_explains_every_exposed_operation() {
+        // The other half, and the reason the test above cannot pass by
+        // refusing everything: every representative plan names an operation
+        // `exposure_of` classifies `Tool`, and every one still gets a
+        // six-section lesson.
+        for (label, plan) in representative_plans() {
+            assert!(
+                matches!(exposure_of(&plan.operation), Exposure::Tool(_)),
+                "{label}: fixture is not an exposed operation"
+            );
+            let lesson = get_lesson(&serde_json::json!({ "plan": plan }))
+                .unwrap_or_else(|e| panic!("{label}: exposed operation refused: {e:?}"));
+            assert_eq!(lesson["sections"].as_array().unwrap().len(), 6, "{label}");
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // (b) Grafted from #560: the plan-anchored fidelity check.
+    //
+    // `every_lesson_fact_matches_the_explanation_it_was_built_from` above
+    // anchors on `explain()`'s own output, so it proves "to_lesson mirrors
+    // explain" — a real property, but not #450's invariant. THIS test
+    // anchors on the `Plan`'s own serialized fields instead, in BOTH
+    // directions: no lesson fact that the plan does not carry, and no plan
+    // field that the lesson drops.
+    // ---------------------------------------------------------------------
+
+    fn base_plan(operation: GitOperation, risk: RiskLevel, recovery: RecoveryStrategy) -> Plan {
+        Plan {
+            repository: RepositoryToken::new("11111111-1111-5111-8111-111111111111").unwrap(),
+            worktree: WorktreeToken::new("22222222-2222-5222-8222-222222222222").unwrap(),
+            generation: GenerationToken::new("12345678901234567890").unwrap(),
+            operation,
+            operation_hash: OperationHash::new("a".repeat(64)).unwrap(),
+            issued_at: UnixSeconds(1_753_300_000),
+            expires_at: UnixSeconds(1_753_300_300),
+            risk,
+            preconditions: Vec::new(),
+            expected_ref_changes: Vec::new(),
+            advisories: Vec::new(),
+            recovery,
+        }
+    }
+
+    /// `create_branch`: a `RefAbsent` precondition, one ref change.
+    fn create_branch_plan() -> Plan {
+        let mut p = base_plan(
+            GitOperation::CreateBranch {
+                name: BranchName::new("feature/idea").unwrap(),
+                at: oid(1),
+            },
+            RiskLevel::Reversible,
+            RecoveryStrategy::DeleteCreatedBranch {
+                name: BranchName::new("feature/idea").unwrap(),
+            },
+        );
+        p.preconditions = vec![Precondition::RefAbsent {
+            ref_name: RefName::new("refs/heads/feature/idea").unwrap(),
+        }];
+        p.expected_ref_changes = vec![RefChange {
+            ref_name: RefName::new("refs/heads/feature/idea").unwrap(),
+            before: RefState::Absent,
+            after: RefState::At(oid(1)),
+        }];
+        p
+    }
+
+    /// `push_branch` carrying TWO advisories — content nothing about the
+    /// operation alone implies, so this plan can only be explained correctly
+    /// if the lesson comes from THIS `Plan` and not from a value
+    /// reconstructed from the operation.
+    fn push_branch_plan_with_advisories() -> Plan {
+        let mut p = base_plan(
+            GitOperation::PushBranch {
+                branch: BranchName::new("main").unwrap(),
+                remote: RemoteName::new("origin").unwrap(),
+                set_upstream: false,
+                force: git_vista_protocol::ForcePublish::None,
+            },
+            RiskLevel::Remote,
+            RecoveryStrategy::Irrecoverable,
+        );
+        p.preconditions = vec![
+            Precondition::RemoteConfigured {
+                remote: RemoteName::new("origin").unwrap(),
+            },
+            Precondition::RefExists {
+                ref_name: RefName::new("refs/heads/main").unwrap(),
+            },
+        ];
+        p.expected_ref_changes = vec![RefChange {
+            ref_name: RefName::new("refs/remotes/origin/main").unwrap(),
+            before: RefState::At(oid(4)),
+            after: RefState::At(oid(2)),
+        }];
+        p.advisories = vec![
+            Advisory::DefaultBranchPush {
+                branch: BranchName::new("main").unwrap(),
+                remote: RemoteName::new("origin").unwrap(),
+            },
+            Advisory::DefaultBranchUnknown {
+                reason: "no refs/remotes/origin/HEAD".to_string(),
+            },
+        ];
+        p
+    }
+
+    /// `force_delete_branch`: destructive, `RecreateBranch` recovery.
+    fn force_delete_branch_plan() -> Plan {
+        let mut p = base_plan(
+            GitOperation::ForceDeleteBranch {
+                branch: BranchName::new("feature/abandoned").unwrap(),
+            },
+            RiskLevel::Destructive,
+            RecoveryStrategy::RecreateBranch {
+                name: BranchName::new("feature/abandoned").unwrap(),
+                at: oid(6),
+            },
+        );
+        p.preconditions = vec![Precondition::RefAt {
+            ref_name: RefName::new("refs/heads/feature/abandoned").unwrap(),
+            oid: oid(6),
+        }];
+        p.expected_ref_changes = vec![RefChange {
+            ref_name: RefName::new("refs/heads/feature/abandoned").unwrap(),
+            before: RefState::At(oid(6)),
+            after: RefState::Absent,
+        }];
+        p
+    }
+
+    /// `fetch_remote`: `Safe` risk but `NetworkNeed::Remote` — the case
+    /// proving risk and reach are independent axes.
+    fn fetch_remote_plan() -> Plan {
+        let mut p = base_plan(
+            GitOperation::FetchRemote {
+                remote: RemoteName::new("origin").unwrap(),
+            },
+            RiskLevel::Safe,
+            RecoveryStrategy::NotNeeded,
+        );
+        p.preconditions = vec![Precondition::RemoteConfigured {
+            remote: RemoteName::new("origin").unwrap(),
+        }];
+        p
+    }
+
+    /// `merge_branch`: the only fixture with a non-`Untouched` worktree
+    /// effect and a `Computed` ref change.
+    fn merge_branch_plan() -> Plan {
+        let mut p = base_plan(
+            GitOperation::MergeBranch {
+                branch: BranchName::new("feature/idea").unwrap(),
+            },
+            RiskLevel::Reversible,
+            RecoveryStrategy::ResetRef {
+                ref_name: RefName::new("refs/heads/main").unwrap(),
+                to: oid(2),
+            },
+        );
+        p.preconditions = vec![
+            Precondition::BranchCheckedOut {
+                branch: BranchName::new("main").unwrap(),
+            },
+            Precondition::RefAt {
+                ref_name: RefName::new("refs/heads/main").unwrap(),
+                oid: oid(2),
+            },
+        ];
+        p.expected_ref_changes = vec![RefChange {
+            ref_name: RefName::new("refs/heads/main").unwrap(),
+            before: RefState::At(oid(2)),
+            after: RefState::Computed,
+        }];
+        p
+    }
+
+    fn unstage_all_plan() -> Plan {
+        base_plan(
+            GitOperation::UnstageAll,
+            RiskLevel::Safe,
+            RecoveryStrategy::NotNeeded,
+        )
+    }
+
+    /// The fixture battery the plan-anchored checks below run over. Keyed by
+    /// the same label [`DERIVED`] uses, so a fixture added without a table
+    /// row fails loudly instead of being skipped.
+    fn representative_plans() -> Vec<(&'static str, Plan)> {
+        vec![
+            ("create_branch", create_branch_plan()),
+            ("push_branch", push_branch_plan_with_advisories()),
+            ("force_delete_branch", force_delete_branch_plan()),
+            ("fetch_remote", fetch_remote_plan()),
+            ("merge_branch", merge_branch_plan()),
+            ("stage_all", stage_all_plan()),
+            ("unstage_all", unstage_all_plan()),
+        ]
+    }
+
+    fn section<'a>(lesson: &'a serde_json::Value, topic: &str) -> &'a [serde_json::Value] {
+        lesson["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["topic"] == topic)
+            .unwrap_or_else(|| panic!("no {topic} section in {lesson}"))["facts"]
+            .as_array()
+            .unwrap()
+    }
+
+    /// The `value` payloads of every fact adjacently tagged `kind`.
+    fn facts_of_kind<'a>(facts: &'a [serde_json::Value], kind: &str) -> Vec<&'a serde_json::Value> {
+        facts
+            .iter()
+            .filter(|f| f["kind"] == kind)
+            .map(|f| &f["value"])
+            .collect()
+    }
+
+    #[test]
+    fn no_lesson_fact_lacks_a_plan_field_and_no_plan_field_lacks_a_lesson_fact() {
+        for (label, plan) in representative_plans() {
+            let lesson = get_lesson(&serde_json::json!({ "plan": plan })).unwrap();
+            let plan_json = serde_json::to_value(&plan).unwrap();
+
+            let must_be_true_first = section(&lesson, "must_be_true_first");
+            let what_moves = section(&lesson, "what_moves");
+            let how_to_undo = section(&lesson, "how_to_undo");
+            let worth_knowing = section(&lesson, "worth_knowing");
+
+            // Preconditions: both directions.
+            let lesson_preconditions = facts_of_kind(must_be_true_first, "precondition");
+            let plan_preconditions = plan_json["preconditions"].as_array().unwrap();
+            assert_eq!(
+                lesson_preconditions.len(),
+                plan_preconditions.len(),
+                "{label}: precondition count disagrees with the plan"
+            );
+            for p in plan_preconditions {
+                assert!(
+                    lesson_preconditions.contains(&p),
+                    "{label}: lesson omits plan precondition {p}"
+                );
+            }
+
+            // Ref changes: both directions.
+            let lesson_ref_moves = facts_of_kind(what_moves, "ref_moves");
+            let plan_ref_changes = plan_json["expected_ref_changes"].as_array().unwrap();
+            assert_eq!(
+                lesson_ref_moves.len(),
+                plan_ref_changes.len(),
+                "{label}: ref-change count disagrees with the plan"
+            );
+            for r in plan_ref_changes {
+                assert!(
+                    lesson_ref_moves.contains(&r),
+                    "{label}: lesson omits plan ref change {r}"
+                );
+            }
+
+            // Advisories: both directions.
+            let lesson_advisories = facts_of_kind(worth_knowing, "advisory");
+            let plan_advisories = plan_json["advisories"].as_array().unwrap();
+            assert_eq!(
+                lesson_advisories.len(),
+                plan_advisories.len(),
+                "{label}: advisory count disagrees with the plan"
+            );
+            for a in plan_advisories {
+                assert!(
+                    lesson_advisories.contains(&a),
+                    "{label}: lesson omits plan advisory {a}"
+                );
+            }
+
+            // Recovery: exactly one fact, exactly the plan's own value.
+            let lesson_recovery = facts_of_kind(how_to_undo, "recovery");
+            assert_eq!(
+                lesson_recovery.len(),
+                1,
+                "{label}: recovery must appear exactly once"
+            );
+            assert_eq!(
+                lesson_recovery[0], &plan_json["recovery"],
+                "{label}: lesson's recovery disagrees with the plan's"
+            );
+
+            // Risk: exactly one fact, exactly the plan's own value, leading
+            // the section.
+            let lesson_risk = facts_of_kind(worth_knowing, "risk");
+            assert_eq!(
+                lesson_risk.len(),
+                1,
+                "{label}: risk must appear exactly once"
+            );
+            assert_eq!(
+                lesson_risk[0], &plan_json["risk"],
+                "{label}: lesson's risk disagrees with the plan's"
+            );
+            assert!(
+                worth_knowing[0]["kind"] == "risk",
+                "{label}: worth_knowing must lead with risk"
+            );
+        }
+    }
+
+    #[test]
+    fn the_plan_anchored_fidelity_check_is_not_vacuous() {
+        // Every "both directions" loop above is a no-op over an empty
+        // vector. If no fixture carries a precondition, a ref change or an
+        // advisory, that test degenerates into three length assertions of
+        // `0 == 0` and proves nothing.
+        let plans: Vec<Plan> = representative_plans().into_iter().map(|(_, p)| p).collect();
+        let preconditions: usize = plans.iter().map(|p| p.preconditions.len()).sum();
+        let ref_changes: usize = plans.iter().map(|p| p.expected_ref_changes.len()).sum();
+        let advisories: usize = plans.iter().map(|p| p.advisories.len()).sum();
+        assert!(
+            preconditions > 0,
+            "no representative plan carries a precondition"
+        );
+        assert!(
+            ref_changes > 0,
+            "no representative plan carries a ref change"
+        );
+        assert!(advisories > 0, "no representative plan carries an advisory");
+    }
+
+    // ---------------------------------------------------------------------
+    // (b) Grafted from #560: the derived third of the payload.
+    //
+    // `worktree`, `index` and `remote` are the three facts with NO plan
+    // field to trace back to — `explain` derives them from the operation. So
+    // they get a hand-written table instead: computing the expectation by
+    // calling `worktree_effect()`/`index_effect()`/`network_need_for_operation`
+    // would assert f(x) == f(x).
+    // ---------------------------------------------------------------------
+
+    /// `(label, worktree, index, remote)` — written by reading what each
+    /// operation DOES, never by running the derivation.
+    const DERIVED: &[(&str, &str, &str, &str)] = &[
+        ("create_branch", "untouched", "untouched", "local"),
+        ("push_branch", "untouched", "untouched", "remote"),
+        ("force_delete_branch", "untouched", "untouched", "local"),
+        ("fetch_remote", "untouched", "untouched", "remote"),
+        ("merge_branch", "may_conflict", "rebuilt", "local"),
+        ("stage_all", "untouched", "entries_staged", "local"),
+        ("unstage_all", "untouched", "entries_unstaged", "local"),
+    ];
+
+    #[test]
+    fn derived_facts_match_the_independent_table() {
+        for (label, plan) in representative_plans() {
+            let (_, want_worktree, want_index, want_remote) = DERIVED
+                .iter()
+                .find(|(t, ..)| *t == label)
+                .unwrap_or_else(|| panic!("no DERIVED row for {label}"));
+            let lesson = get_lesson(&serde_json::json!({ "plan": plan })).unwrap();
+            let index_and_worktree = section(&lesson, "index_and_worktree");
+            let remote = section(&lesson, "remote");
+
+            assert_eq!(
+                facts_of_kind(index_and_worktree, "worktree"),
+                vec![&serde_json::json!(*want_worktree)],
+                "{label}: worktree effect"
+            );
+            assert_eq!(
+                facts_of_kind(index_and_worktree, "index"),
+                vec![&serde_json::json!(*want_index)],
+                "{label}: index effect"
+            );
+            assert_eq!(
+                facts_of_kind(remote, "remote"),
+                vec![&serde_json::json!(*want_remote)],
+                "{label}: network need"
+            );
+        }
+    }
+
+    #[test]
+    fn the_derived_table_exercises_every_variant_it_claims_to() {
+        // Anti-vacuity: a table of seven identical rows would agree with a
+        // wire mapping stubbed the same way. Every distinct label used above
+        // must appear at least once, so a future edit dropping the last row
+        // that exercises one fails loudly here rather than silently
+        // narrowing the check.
+        for want in ["untouched", "may_conflict"] {
+            assert!(
+                DERIVED.iter().any(|(_, w, ..)| *w == want),
+                "no row has worktree {want}"
+            );
+        }
+        for want in ["untouched", "rebuilt", "entries_staged", "entries_unstaged"] {
+            assert!(
+                DERIVED.iter().any(|(_, _, i, _)| *i == want),
+                "no row has index {want}"
+            );
+        }
+        for want in ["local", "remote"] {
+            assert!(
+                DERIVED.iter().any(|(_, _, _, n)| *n == want),
+                "no row has remote {want}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // (c) The replacement for `get_lesson_never_emits_html_or_a_bare_string`.
+    //
+    // That test asserted only that the serialized result contains no `'<'`.
+    // An English sentence passes it. An empty payload passes it. A payload
+    // of nulls passes it. This one asserts over the actual mechanism.
+    // ---------------------------------------------------------------------
+
+    /// Fact kinds whose `value` is a tagged OBJECT, with the tag field that
+    /// object must carry. Straight from each type's own `#[serde(tag = ...)]`
+    /// in `git-vista-protocol` (`RefChange` is a plain struct, so its
+    /// required key is a field name).
+    const OBJECT_FACTS: &[(&str, &str)] = &[
+        ("precondition", "check"),
+        ("ref_moves", "ref_name"),
+        ("recovery", "strategy"),
+        ("advisory", "kind"),
+    ];
+
+    /// Fact kinds whose `value` is a bare string, and the CLOSED set of
+    /// strings each may be. Transcribed from the enums themselves —
+    /// `WorktreeEffect`/`IndexEffect`/`NetworkNeed` in `effects.rs`,
+    /// `RiskLevel` in `plan.rs`, all `rename_all = "snake_case"`.
+    const SCALAR_FACT_VOCABULARY: &[(&str, &[&str])] = &[
+        (
+            "worktree",
+            &[
+                "untouched",
+                "files_rewritten",
+                "files_removed",
+                "may_conflict",
+                "rewritten_if_checked_out",
+            ],
+        ),
+        (
+            "index",
+            &[
+                "untouched",
+                "entries_staged",
+                "entries_unstaged",
+                "stages_resolved",
+                "rebuilt",
+                "may_gain_conflict_stages",
+                "rebuilt_if_checked_out",
+            ],
+        ),
+        ("remote", &["local", "remote"]),
+        ("risk", &["safe", "reversible", "destructive", "remote"]),
+    ];
+
+    #[test]
+    fn every_lesson_fact_value_is_typed_data_never_prose() {
+        let mut seen_kinds = std::collections::BTreeSet::new();
+        for (label, plan) in representative_plans() {
+            let lesson = get_lesson(&serde_json::json!({ "plan": plan })).unwrap();
+            for section in lesson["sections"].as_array().unwrap() {
+                for fact in section["facts"].as_array().unwrap() {
+                    let kind = fact["kind"]
+                        .as_str()
+                        .unwrap_or_else(|| panic!("{label}: fact has no `kind` tag: {fact}"));
+                    let value = &fact["value"];
+                    seen_kinds.insert(kind.to_string());
+
+                    if let Some((_, tag)) = OBJECT_FACTS.iter().find(|(k, _)| *k == kind) {
+                        let object = value.as_object().unwrap_or_else(|| {
+                            panic!("{label}: `{kind}` value is not an object: {value}")
+                        });
+                        assert!(
+                            object.contains_key(*tag),
+                            "{label}: `{kind}` object has no `{tag}` discriminator: {value}"
+                        );
+                        continue;
+                    }
+
+                    let (_, vocabulary) = SCALAR_FACT_VOCABULARY
+                        .iter()
+                        .find(|(k, _)| *k == kind)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "{label}: `{kind}` is not a classified fact kind — a new \
+                                 LessonFact variant must be added to one of the two tables \
+                                 above before this test can vouch for it"
+                            )
+                        });
+                    let text = value.as_str().unwrap_or_else(|| {
+                        panic!("{label}: `{kind}` value is not a string: {value}")
+                    });
+                    assert!(
+                        vocabulary.contains(&text),
+                        "{label}: `{kind}` value `{text}` is outside its closed vocabulary \
+                         {vocabulary:?} — a rendered sentence or an invented label"
+                    );
+                }
+            }
+        }
+
+        // Anti-vacuity, two ways. Without these the whole test passes over a
+        // lesson with zero sections, or over one that only ever emits the
+        // three derived scalars.
+        for want in [
+            "precondition",
+            "ref_moves",
+            "worktree",
+            "index",
+            "remote",
+            "recovery",
+            "advisory",
+            "risk",
+        ] {
+            assert!(
+                seen_kinds.contains(want),
+                "no representative plan ever produced a `{want}` fact, so this test \
+                 never checked one"
+            );
+        }
+        assert_eq!(
+            seen_kinds.len(),
+            8,
+            "an unclassified fact kind reached the wire: {seen_kinds:?}"
+        );
     }
 }
