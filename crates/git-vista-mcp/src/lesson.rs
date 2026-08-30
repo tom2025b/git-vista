@@ -762,8 +762,56 @@ mod tests {
             .collect()
     }
 
+    /// # Exactly which of `Plan`'s fields this covers — five of twelve
+    ///
+    /// `Plan` has **twelve** fields. This test checks the **five** that
+    /// `explain` copies verbatim out of the plan — `preconditions`,
+    /// `expected_ref_changes`, `advisories`, `recovery` and `risk` — in both
+    /// directions.
+    ///
+    /// The other seven are out of scope here, and naming them is the point:
+    /// a test called "no plan field lacks a lesson fact" would be claiming
+    /// twelve while checking five, which is how a reader concludes a gap is
+    /// closed when it is not.
+    ///
+    /// - `operation` reaches a lesson only *derived*, as the worktree, index
+    ///   and remote facts. That is
+    ///   [`derived_facts_match_the_independent_table`]'s job, against a
+    ///   hand-written table, not this test's.
+    /// - `repository`, `worktree`, `generation`, `operation_hash`,
+    ///   `issued_at` and `expires_at` are the plan's envelope — identity,
+    ///   integrity and expiry. `explain` never reads one, so no
+    ///   `ExplanationFact` variant can carry one and there is nothing here
+    ///   to compare them against.
+    ///
+    /// # Order is part of the contract, so these are sequences, not sets
+    ///
+    /// A lesson is teaching material read top to bottom, and the plan's own
+    /// ordering is its reading order: `merge_branch` states
+    /// `BranchCheckedOut` before `RefAt` because which branch you are on
+    /// comes before where it points. `explain` already treats fact order as
+    /// meaningful and says why in its own doc — risk leads `WorthKnowing`,
+    /// worktree precedes index — so a mirror that preserved membership while
+    /// shuffling sequence would be re-ordering a lesson's sentences behind
+    /// the reader's back.
+    ///
+    /// A `contains` check cannot see that, and did not: adding `.rev()` to
+    /// `plan.preconditions.iter()` inside `explain` left all thirteen lesson
+    /// tests green. These are `assert_eq!` over sequences for that reason,
+    /// and `.rev()` on either `plan.preconditions` or `plan.advisories` now
+    /// turns this test red.
+    ///
+    /// **The ref-change leg of that claim is not yet falsifiable, and saying
+    /// so is the point.** `.rev()` on `plan.expected_ref_changes.iter()`
+    /// still passes, because no plan `git-vista-server`'s planner can build
+    /// carries more than one ref change — every arm of `planner::shape`
+    /// produces at most a single `RefChange`, so reversing that list is a
+    /// no-op and no fixture here can have two. The assertion is written as a
+    /// sequence anyway: it is the same contract, it costs nothing, and it
+    /// starts biting the day an operation moves two refs. It is not
+    /// evidence today.
     #[test]
-    fn no_lesson_fact_lacks_a_plan_field_and_no_plan_field_lacks_a_lesson_fact() {
+    fn the_five_plan_authored_fields_reach_the_lesson_intact_and_in_the_plans_own_order() {
         for (label, plan) in representative_plans() {
             let lesson = get_lesson(&serde_json::json!({ "plan": plan })).unwrap();
             let plan_json = serde_json::to_value(&plan).unwrap();
@@ -773,50 +821,41 @@ mod tests {
             let how_to_undo = section(&lesson, "how_to_undo");
             let worth_knowing = section(&lesson, "worth_knowing");
 
-            // Preconditions: both directions.
+            // Preconditions: both directions, in the plan's own order.
             let lesson_preconditions = facts_of_kind(must_be_true_first, "precondition");
-            let plan_preconditions = plan_json["preconditions"].as_array().unwrap();
+            let plan_preconditions: Vec<&serde_json::Value> = plan_json["preconditions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .collect();
             assert_eq!(
-                lesson_preconditions.len(),
-                plan_preconditions.len(),
-                "{label}: precondition count disagrees with the plan"
+                lesson_preconditions, plan_preconditions,
+                "{label}: the lesson's preconditions are not the plan's own, in the \
+                 plan's own order"
             );
-            for p in plan_preconditions {
-                assert!(
-                    lesson_preconditions.contains(&p),
-                    "{label}: lesson omits plan precondition {p}"
-                );
-            }
 
-            // Ref changes: both directions.
+            // Ref changes: both directions, in the plan's own order.
             let lesson_ref_moves = facts_of_kind(what_moves, "ref_moves");
-            let plan_ref_changes = plan_json["expected_ref_changes"].as_array().unwrap();
+            let plan_ref_changes: Vec<&serde_json::Value> = plan_json["expected_ref_changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .collect();
             assert_eq!(
-                lesson_ref_moves.len(),
-                plan_ref_changes.len(),
-                "{label}: ref-change count disagrees with the plan"
+                lesson_ref_moves, plan_ref_changes,
+                "{label}: the lesson's ref changes are not the plan's own, in the \
+                 plan's own order"
             );
-            for r in plan_ref_changes {
-                assert!(
-                    lesson_ref_moves.contains(&r),
-                    "{label}: lesson omits plan ref change {r}"
-                );
-            }
 
-            // Advisories: both directions.
+            // Advisories: both directions, in the plan's own order.
             let lesson_advisories = facts_of_kind(worth_knowing, "advisory");
-            let plan_advisories = plan_json["advisories"].as_array().unwrap();
+            let plan_advisories: Vec<&serde_json::Value> =
+                plan_json["advisories"].as_array().unwrap().iter().collect();
             assert_eq!(
-                lesson_advisories.len(),
-                plan_advisories.len(),
-                "{label}: advisory count disagrees with the plan"
+                lesson_advisories, plan_advisories,
+                "{label}: the lesson's advisories are not the plan's own, in the \
+                 plan's own order"
             );
-            for a in plan_advisories {
-                assert!(
-                    lesson_advisories.contains(&a),
-                    "{label}: lesson omits plan advisory {a}"
-                );
-            }
 
             // Recovery: exactly one fact, exactly the plan's own value.
             let lesson_recovery = facts_of_kind(how_to_undo, "recovery");
@@ -851,10 +890,11 @@ mod tests {
 
     #[test]
     fn the_plan_anchored_fidelity_check_is_not_vacuous() {
-        // Every "both directions" loop above is a no-op over an empty
-        // vector. If no fixture carries a precondition, a ref change or an
-        // advisory, that test degenerates into three length assertions of
-        // `0 == 0` and proves nothing.
+        // Every "both directions" comparison above is `[] == []` when no
+        // fixture carries the field. If no representative plan has a
+        // precondition, a ref change or an advisory, that test degenerates
+        // into three assertions of `0 == 0` and proves nothing — including
+        // nothing about order, since an empty sequence cannot be reversed.
         let plans: Vec<Plan> = representative_plans().into_iter().map(|(_, p)| p).collect();
         let preconditions: usize = plans.iter().map(|p| p.preconditions.len()).sum();
         let ref_changes: usize = plans.iter().map(|p| p.expected_ref_changes.len()).sum();
@@ -1067,6 +1107,168 @@ mod tests {
             seen_kinds.len(),
             8,
             "an unclassified fact kind reached the wire: {seen_kinds:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // (c2) The other leg of #450's "never emits HTML or a bare string".
+    //
+    // `every_lesson_fact_value_is_typed_data_never_prose` above proves each
+    // fact `value` has the right SHAPE — a tagged object carrying its
+    // discriminator, or a scalar drawn from a closed vocabulary. It never
+    // looks INSIDE an object, and it never looks at a key it was not told
+    // about. So the criterion survived two breaks intact:
+    //
+    //   * markup or a rendered sentence in a string nested inside any
+    //     `OBJECT_FACTS` payload, and
+    //   * a rendered string added BESIDE the keys every other test reads —
+    //     a `"heading"` on each section, a `"sentence"` on each fact. Every
+    //     other test in this file reads only `topic`, `kind` and `value`, so
+    //     an extra sibling key is invisible to all of them.
+    //
+    // Replacing the old `'<'`-free assertion with a shape check alone would
+    // have left this criterion covered by nothing while reading as covered.
+    // This test walks EVERY string a lesson carries, wherever it sits.
+    // ---------------------------------------------------------------------
+
+    /// Substrings that make a string markup rather than a value. Applied to
+    /// every string in the payload with no exception — the declared
+    /// free-text field below included, because #450 says no HTML, and being
+    /// free text is not permission to emit tags or entities.
+    const MARKUP_NEEDLES: &[&str] = &["<", ">", "&#", "&lt", "&gt", "&amp", "`", "**"];
+
+    /// The ONLY strings a lesson may spell with whitespace in them, as
+    /// `(fact kind, dotted path inside the fact object)`.
+    ///
+    /// `Advisory::DefaultBranchUnknown`'s `reason` is human prose by design
+    /// — its own doc in `plan.rs` says it "is for a human reading the plan,
+    /// never for a caller to match on" — and it is the *plan's* prose,
+    /// carried through verbatim, not a sentence this tool composed.
+    ///
+    /// Everything else a lesson can carry is a machine token: a ref name, a
+    /// branch name, a remote name, an oid, a worktree path, or a
+    /// `snake_case` enum name. None of those can contain a space, which is
+    /// what makes "contains whitespace" a mechanical stand-in for "reads as
+    /// a rendered sentence" rather than a guess.
+    const FREE_TEXT: &[(&str, &str)] = &[("advisory", "value.reason")];
+
+    /// Every string reachable in `value`, paired with its dotted path below
+    /// `path`. Recursive on purpose: a fact's payload nests (`ref_moves`
+    /// carries two `RefState` objects of its own), and a check that stopped
+    /// at the top level would be the same blind spot again one layer down.
+    fn strings_under(value: &serde_json::Value, path: &str, out: &mut Vec<(String, String)>) {
+        match value {
+            serde_json::Value::String(s) => out.push((path.to_string(), s.clone())),
+            serde_json::Value::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    strings_under(item, &format!("{path}[{i}]"), out);
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                for (key, field) in fields {
+                    strings_under(field, &format!("{path}.{key}"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn no_string_a_lesson_carries_is_markup_or_a_rendered_sentence() {
+        let assert_no_markup = |label: &str, at: &str, text: &str| {
+            for needle in MARKUP_NEEDLES {
+                assert!(
+                    !text.contains(needle),
+                    "{label}: {at} carries markup ({needle:?}): {text:?} — a lesson is \
+                     data, and a renderer is the only thing entitled to produce markup"
+                );
+            }
+        };
+        let assert_no_prose = |label: &str, at: &str, text: &str| {
+            assert!(
+                !text.chars().any(char::is_whitespace),
+                "{label}: {at} contains whitespace, so it reads as a rendered sentence \
+                 rather than a value: {text:?} — if it is genuinely free text the plan \
+                 itself carries, declare it in FREE_TEXT and say why there"
+            );
+        };
+
+        let mut checked = 0usize;
+        let mut free_text_checked = 0usize;
+
+        for (label, plan) in representative_plans() {
+            let lesson = get_lesson(&serde_json::json!({ "plan": plan })).unwrap();
+
+            // Anything hung off the lesson root other than `sections`.
+            for (key, value) in lesson.as_object().unwrap() {
+                if key == "sections" {
+                    continue;
+                }
+                let mut found = Vec::new();
+                strings_under(value, key, &mut found);
+                for (path, text) in found {
+                    assert_no_markup(label, &path, &text);
+                    assert_no_prose(label, &path, &text);
+                    checked += 1;
+                }
+            }
+
+            for section in lesson["sections"].as_array().unwrap() {
+                // Anything hung off a section other than `facts` — its
+                // `topic`, and a rendered `"heading"` if one is ever added.
+                for (key, value) in section.as_object().unwrap() {
+                    if key == "facts" {
+                        continue;
+                    }
+                    let mut found = Vec::new();
+                    strings_under(value, key, &mut found);
+                    for (path, text) in found {
+                        let at = format!("section.{path}");
+                        assert_no_markup(label, &at, &text);
+                        assert_no_prose(label, &at, &text);
+                        checked += 1;
+                    }
+                }
+
+                // Every key of every fact — `kind`, `value`, and anything
+                // else that ever appears beside them.
+                for fact in section["facts"].as_array().unwrap() {
+                    let kind = fact["kind"]
+                        .as_str()
+                        .unwrap_or_else(|| panic!("{label}: fact has no `kind` tag: {fact}"));
+                    for (key, value) in fact.as_object().unwrap() {
+                        let mut found = Vec::new();
+                        strings_under(value, key, &mut found);
+                        for (path, text) in found {
+                            let at = format!("{kind}.{path}");
+                            assert_no_markup(label, &at, &text);
+                            checked += 1;
+                            if FREE_TEXT.contains(&(kind, path.as_str())) {
+                                free_text_checked += 1;
+                                continue;
+                            }
+                            assert_no_prose(label, &at, &text);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Anti-vacuity, two ways. Without the first, a lesson of zero
+        // sections passes this and proves nothing; without the second, a
+        // FREE_TEXT entry could name a field no fixture ever reaches, so the
+        // exemption would sit unexercised and unfalsifiable.
+        assert!(
+            checked >= 100,
+            "only {checked} strings were inspected — the fixtures no longer produce a \
+             payload large enough for this check to mean anything"
+        );
+        assert_eq!(
+            free_text_checked, 1,
+            "expected exactly one declared free-text string across the fixtures \
+             (push_branch's DefaultBranchUnknown advisory `reason`), found \
+             {free_text_checked} — either FREE_TEXT names a field nothing reaches, or \
+             a fixture changed"
         );
     }
 }
