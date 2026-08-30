@@ -19,10 +19,12 @@
 //! # No new sandbox tier, no new grant
 //!
 //! `git worktree list --porcelain` reaches git through
-//! [`crate::git_cmd::git_output`], declaring `NetworkNeed::Local` — the same
-//! arity and the same tier `handlers::read::worktree_status` already uses for
-//! `git status --porcelain=v2 --branch`. The argv's first non-flag token is
-//! `worktree`, which is absent from `sandbox::REMOTE_SUBCOMMANDS`, so
+//! [`crate::git_cmd::git_stdout_capped`], which declares `NetworkNeed::Local`
+//! — the same helper and the same tier
+//! `handlers::read::worktree_status_v2_for_repo` already uses for
+//! `git status --porcelain=v2 --branch -z`, including its posture on a cap
+//! hit (refuse, never parse a truncated stream). The argv's first non-flag
+//! token is `worktree`, which is absent from `sandbox::REMOTE_SUBCOMMANDS`, so
 //! `sandbox::reconcile_need` agrees with `Local` and the existing repo-scoped
 //! grant `sandbox::policy_for` already computed for every other read on this
 //! repository covers it. No new argv shape, no new grant path.
@@ -53,38 +55,44 @@
 //! "outside the allowed roots" test needs no dependency on what any other
 //! test happened to register first.
 //!
-//! # Why the 2.32 floor rules out `-z`
+//! # The pure parse lives in `git-vista-protocol`, not here
 //!
-//! `git worktree list --porcelain` has a `-z` form that NUL-terminates
-//! records instead of newline-terminates them, which is the safer contract
-//! for a path that could contain a literal newline. It is not used here:
-//! git-scm's manual for 2.31 documents `list`, `--porcelain`, and
-//! `-v`/`--verbose` and says nothing about `-z` at all; 2.32 has no distinct
-//! page of its own on git-scm.com at all (its URL redirects to 2.31's); the
-//! *current* manual documents `-z`. Taken together, `-z` was added to
-//! `worktree list` at some later version, after this project's documented
-//! git floor (`docs/SUPPORTED_VERSIONS.md`, "Git: 2.32 or later") — so it
-//! isn't used here. Parsing the newline-terminated form inherits git's own
-//! limitation at that floor: a
-//! worktree path containing a literal newline cannot be parsed unambiguously.
-//! That is a fact about the porcelain contract at the supported floor, not a
-//! defect introduced by [`parse_worktree_porcelain`].
-//!
-//! The one place that limitation could bite silently — quoting — does not
-//! apply to anything this module keeps. The manual documents that *only* the
-//! lock reason is quoted/escaped (`core.quotePath`-style) when it contains
-//! unusual characters and `-z` is not used; [`WorktreeSibling`] has no reason
-//! field (the spec's struct doesn't carry one, and nothing here needs it), so
-//! the parser only ever needs to recognise the `locked`/`prunable` label
-//! itself, never interpret the escaping of the text after it.
+//! [`git_vista_protocol::parse_worktree_porcelain`] turns git's stdout into
+//! [`git_vista_protocol::WorktreeListRecord`]s; this module keeps only the
+//! two halves that need the machine — the **spawn** above and the
+//! **enrichment** below (identity resolution via `gix`, the allowed-roots
+//! fence, and the `HEAD 000…0` sentinel that must not become a `CommitOid`).
+//! That is the split `handlers::read` already uses for status: it calls
+//! `git_vista_protocol::parse_porcelain_v2_z` rather than owning a porcelain
+//! parser of its own. The protocol module's own doc carries the porcelain
+//! contract itself — in particular why the 2.32 git floor rules `-z` out, and
+//! why the newline-terminated form's one ambiguity (a path containing a
+//! literal newline) is git's limitation at that floor rather than a defect in
+//! the parser.
 
 use std::path::{Path, PathBuf};
 
 use git_vista_core::identity::WorktreeId;
 use git_vista_git::{read_repo_facts, RepoFacts};
-use git_vista_protocol::{BranchName, CommitOid, Serviceable, WorktreeCensus, WorktreeSibling};
+use git_vista_protocol::{
+    parse_worktree_porcelain, BranchName, CommitOid, Serviceable, WorktreeCensus,
+    WorktreeListRecord, WorktreeSibling,
+};
 
-use crate::git_cmd::git_output;
+use crate::git_cmd::{git_output, git_stdout_capped};
+
+/// The label `git_stdout_capped` logs a failure under. Not a route — nothing
+/// exposes this census yet (M11.03's job) — so it names the read itself, in
+/// the same `/api/…`-shaped slot every other call site fills.
+const WORKTREE_LIST_ENDPOINT: &str = "worktree census";
+
+/// Upper bound on `git worktree list --porcelain`'s stdout. 8 MiB: the same
+/// ceiling `handlers::read`'s `STATUS_V2_STDOUT_CAP` uses (itself
+/// `git_cmd::DEFAULT_GIT_STDOUT_CAP`'s fail-safe value), and for the same
+/// reason — it is far past any real repository's worktree list, so a hit means
+/// something has gone wrong rather than that a legitimate read was clipped. A
+/// hit is a `CensusFailed`, never a best-effort parse; see the call site.
+const WORKTREE_LIST_STDOUT_CAP: usize = 8 * 1024 * 1024;
 
 /// Read and resolve the worktree census for the repository at `repo` (the
 /// worktree currently being served).
@@ -98,22 +106,66 @@ pub(crate) async fn worktree_census(
     expose_paths: bool,
     path_is_allowed: &dyn Fn(&Path) -> bool,
 ) -> WorktreeCensus {
+    worktree_census_capped(
+        repo,
+        expose_paths,
+        path_is_allowed,
+        WORKTREE_LIST_STDOUT_CAP,
+    )
+    .await
+}
+
+/// [`worktree_census`] with the stdout ceiling passed in rather than baked in
+/// — the same split, for the same reason, that
+/// `handlers::read::worktree_status_v2_for_repo` makes for
+/// `STATUS_V2_STDOUT_CAP`: the refusal-on-truncation branch is only reachable
+/// from a test if the test can pick a cap small enough to hit, and
+/// constructing 8 MiB of real `git worktree list` output (tens of thousands of
+/// linked worktrees) to exercise it is not a test anyone would run.
+async fn worktree_census_capped(
+    repo: &Path,
+    expose_paths: bool,
+    path_is_allowed: &dyn Fn(&Path) -> bool,
+    stdout_cap: usize,
+) -> WorktreeCensus {
     let current = match read_repo_facts(repo) {
         Ok(facts) => facts,
         Err(e) => return fail(format!("couldn't read this repository's own identity: {e}")),
     };
 
-    let output = match git_output(repo, &["worktree", "list", "--porcelain"]).await {
-        Ok(o) => o,
-        Err(e) => return fail(format!("couldn't run `git worktree list`: {e}")),
-    };
-    if !output.status.success() {
+    let args = [
+        "worktree".to_string(),
+        "list".to_string(),
+        "--porcelain".to_string(),
+    ];
+    // `git_stdout_capped`, not `git_output`: this stdout grows with the number
+    // of worktrees, which is client-influenced (anyone who can `git worktree
+    // add` in the served repository adds a record) and unbounded by anything
+    // this process controls. `git_output` reads to EOF with no ceiling at all.
+    // A non-zero exit is already folded into the `Err` arm here, so the
+    // separate `status.success()` check the uncapped form needed is gone.
+    let (stdout, truncated) =
+        match git_stdout_capped(repo, &args, WORKTREE_LIST_ENDPOINT, stdout_cap).await {
+            Ok(pair) => pair,
+            Err((_status, message)) => {
+                return fail(format!("`git worktree list --porcelain` failed: {message}"))
+            }
+        };
+    if truncated {
+        // Refused, never parsed — the same call `worktree_status_v2_for_repo`
+        // makes for `git status --porcelain=v2`, and for the same reason: a cut
+        // stream can end mid-record, and the parser cannot tell that from a
+        // record that genuinely ended there. Parsing the prefix would drop
+        // whole worktrees from a census that claims to be complete, which is
+        // precisely the silent omission `CensusFailed` exists to prevent (spec
+        // §1, "the enumeration ITSELF is fallible"). A `CensusFailed` says
+        // "nothing was established"; a short `Observed` would lie.
         return fail(format!(
-            "`git worktree list --porcelain` failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            "`git worktree list --porcelain` printed more than {stdout_cap} bytes; \
+             a truncated stream is refused, never parsed"
         ));
     }
-    let text = match std::str::from_utf8(&output.stdout) {
+    let text = match std::str::from_utf8(&stdout) {
         Ok(s) => s,
         Err(_) => {
             return fail("`git worktree list --porcelain` did not print valid UTF-8".to_string())
@@ -178,19 +230,24 @@ fn fail(reason: String) -> WorktreeCensus {
 #[allow(clippy::too_many_arguments)]
 async fn resolve_sibling(
     repo: &Path,
-    raw: &RawRecord,
+    raw: &WorktreeListRecord,
     current: &RepoFacts,
     expose_paths: bool,
     path_is_allowed: &dyn Fn(&Path) -> bool,
     common_dir_cache: &mut Option<PathBuf>,
 ) -> Result<WorktreeSibling, String> {
+    // `raw.path` is the string git printed; the parser (now in
+    // `git-vista-protocol`, which touches no filesystem) deliberately leaves it
+    // a `String`. This is the one place it becomes a path.
+    let raw_path = Path::new(raw.path.as_str());
+
     let (worktree_id, repository_id, root_for_fence) = if raw.prunable {
         // `prunable` is git's own flag; whether it means "the directory is
         // really gone" (Serviceable::Missing) or something milder (e.g. an
         // `--expire`-style staleness reason on a directory that still opens)
         // is decided by trying the live path first. Only a failure to open it
         // falls back to admin-directory correlation.
-        match read_repo_facts(&raw.path) {
+        match read_repo_facts(raw_path) {
             Ok(facts) => (
                 facts.handle.worktree,
                 facts.handle.repository,
@@ -199,11 +256,11 @@ async fn resolve_sibling(
             Err(_) => {
                 let common_dir = get_common_dir(repo, common_dir_cache).await?;
                 let admin_dir =
-                    correlate_missing_admin_dir(&common_dir, &raw.path).ok_or_else(|| {
+                    correlate_missing_admin_dir(&common_dir, raw_path).ok_or_else(|| {
                         format!(
                             "`{}` is reported prunable but no admin worktree entry under \
                              `{}` names it — can't derive a stable identity for it",
-                            raw.path.display(),
+                            raw.path,
                             common_dir.display()
                         )
                     })?;
@@ -212,7 +269,7 @@ async fn resolve_sibling(
             }
         }
     } else {
-        match read_repo_facts(&raw.path) {
+        match read_repo_facts(raw_path) {
             Ok(facts) => (
                 facts.handle.worktree,
                 facts.handle.repository,
@@ -221,7 +278,7 @@ async fn resolve_sibling(
             Err(e) => {
                 return Err(format!(
                     "`git worktree list` reports `{}` as live, but it couldn't be read: {e}",
-                    raw.path.display()
+                    raw.path
                 ))
             }
         }
@@ -243,21 +300,21 @@ async fn resolve_sibling(
     let name = root_for_fence
         .as_deref()
         .map(display_name)
-        .unwrap_or_else(|| display_name(&raw.path));
+        .unwrap_or_else(|| display_name(raw_path));
 
     let branch = match (&raw.branch_ref, raw.detached, raw.bare) {
         (Some(r), false, false) => {
             let short = r.strip_prefix("refs/heads/").ok_or_else(|| {
                 format!(
                     "`{}`'s `branch` line names `{r}`, not a `refs/heads/` ref",
-                    raw.path.display()
+                    raw.path
                 )
             })?;
             let name = BranchName::new(short).map_err(|e| {
                 format!(
                     "`{}`'s checked-out branch `{short}` doesn't fit this app's \
                      branch-name contract: {e}",
-                    raw.path.display()
+                    raw.path
                 )
             })?;
             Some(name)
@@ -265,12 +322,13 @@ async fn resolve_sibling(
         (None, _, _) => None,
         (Some(_), true, _) | (Some(_), _, true) => {
             // Ruled out by the parser's own mutual-exclusion check in
-            // `RawRecordBuilder::apply_line` — kept as a named error rather
+            // `git_vista_protocol::parse_worktree_porcelain` — kept as a
+            // named error rather
             // than `unreachable!()` so a future change to that check fails
             // loudly here instead of panicking.
             return Err(format!(
                 "`{}` names both a branch and detached/bare",
-                raw.path.display()
+                raw.path
             ));
         }
     };
@@ -281,7 +339,7 @@ async fn resolve_sibling(
         Some(hex) => Some(CommitOid::new(hex.clone()).map_err(|e| {
             format!(
                 "`{}`'s `HEAD` line (`{hex}`) isn't a commit id this app accepts: {e}",
-                raw.path.display()
+                raw.path
             )
         })?),
     };
@@ -290,7 +348,7 @@ async fn resolve_sibling(
         repository: repository_id.to_string(),
         id: worktree_id.to_string(),
         name,
-        path: expose_paths.then(|| raw.path.display().to_string()),
+        path: expose_paths.then(|| raw.path.clone()),
         branch,
         head,
         is_current,
@@ -414,213 +472,6 @@ fn correlate_missing_admin_dir(common_dir: &Path, sibling_path: &Path) -> Option
         }
     }
     found
-}
-
-// ---------------------------------------------------------------------------
-// Parsing `git worktree list --porcelain` (no `-z` — see module doc)
-// ---------------------------------------------------------------------------
-
-/// One fully-parsed `git worktree list --porcelain` record, before identity
-/// resolution. Every field here is exactly what git printed — no filesystem
-/// access, no fence check.
-#[derive(Debug)]
-struct RawRecord {
-    path: PathBuf,
-    head_hex: Option<String>,
-    branch_ref: Option<String>,
-    detached: bool,
-    bare: bool,
-    locked: bool,
-    prunable: bool,
-}
-
-/// Parse the complete stdout of `git worktree list --porcelain`.
-///
-/// Strict by design (the brief's own rule, and this codebase's established
-/// posture for a fact that must never be silently dropped —
-/// `RecoveryClass::CheckFailed` on an unrecognised ref shape,
-/// `HeadState::Unresolvable`): every line must be either the start of a
-/// record (`worktree <path>`) or a recognised attribute of the
-/// currently-open record. Anything else — an attribute before any `worktree`
-/// line, a second `worktree` line before the first record's blank-line
-/// terminator, an unrecognised label, a value-shape git could never actually
-/// produce — is a hard error, not a skipped line. A dropped worktree is
-/// indistinguishable from one that never existed; a census that claims
-/// completeness may not do that silently.
-fn parse_worktree_porcelain(text: &str) -> Result<Vec<RawRecord>, String> {
-    let mut records = Vec::new();
-    let mut current: Option<RawRecordBuilder> = None;
-
-    for line in text.split('\n') {
-        if line.is_empty() {
-            if let Some(builder) = current.take() {
-                records.push(builder.finish()?);
-            }
-            // A blank line with no record open carries no data to lose — the
-            // leading/trailing artifact of `str::split('\n')` on git's own
-            // (also blank-line-terminated) stream. Tolerated rather than
-            // treated as "an unrecognised line", since there is nothing here
-            // that could be silently dropped.
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("worktree ") {
-            if current.is_some() {
-                return Err(format!(
-                    "a new `worktree` line (`{line}`) appeared before the previous \
-                     record's blank-line terminator"
-                ));
-            }
-            if rest.is_empty() {
-                return Err("a `worktree` line named an empty path".to_string());
-            }
-            current = Some(RawRecordBuilder::new(PathBuf::from(rest)));
-        } else {
-            let builder = current
-                .as_mut()
-                .ok_or_else(|| format!("line `{line}` appeared before any `worktree` line"))?;
-            builder.apply_line(line)?;
-        }
-    }
-    if let Some(builder) = current.take() {
-        records.push(builder.finish()?);
-    }
-    Ok(records)
-}
-
-#[derive(Default)]
-struct RawRecordBuilder {
-    path: PathBuf,
-    head_hex: Option<String>,
-    branch_ref: Option<String>,
-    detached: bool,
-    bare: bool,
-    locked: bool,
-    prunable: bool,
-}
-
-impl RawRecordBuilder {
-    fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            ..Self::default()
-        }
-    }
-
-    /// Whether a `branch`/`detached`/`bare` line has already been set — those
-    /// three are mutually exclusive within one record.
-    fn head_shape_taken(&self) -> bool {
-        self.branch_ref.is_some() || self.detached || self.bare
-    }
-
-    fn apply_line(&mut self, line: &str) -> Result<(), String> {
-        let (label, rest) = match line.split_once(' ') {
-            Some((l, r)) => (l, Some(r)),
-            None => (line, None),
-        };
-        match label {
-            "HEAD" => {
-                let value = rest.ok_or_else(|| "`HEAD` line has no value".to_string())?;
-                if self.head_hex.is_some() {
-                    return Err(format!(
-                        "`{}` has more than one `HEAD` line",
-                        self.path.display()
-                    ));
-                }
-                self.head_hex = Some(value.to_string());
-            }
-            "branch" => {
-                let value = rest.ok_or_else(|| "`branch` line has no value".to_string())?;
-                if self.head_shape_taken() {
-                    return Err(format!(
-                        "`{}`'s `branch` line conflicts with an earlier \
-                         `branch`/`detached`/`bare` line",
-                        self.path.display()
-                    ));
-                }
-                self.branch_ref = Some(value.to_string());
-            }
-            "detached" => {
-                if rest.is_some() {
-                    return Err("`detached` takes no value".to_string());
-                }
-                if self.head_shape_taken() {
-                    return Err(format!(
-                        "`{}`'s `detached` line conflicts with an earlier \
-                         `branch`/`detached`/`bare` line",
-                        self.path.display()
-                    ));
-                }
-                self.detached = true;
-            }
-            "bare" => {
-                if rest.is_some() {
-                    return Err("`bare` takes no value".to_string());
-                }
-                if self.head_shape_taken() {
-                    return Err(format!(
-                        "`{}`'s `bare` line conflicts with an earlier \
-                         `branch`/`detached`/`bare` line",
-                        self.path.display()
-                    ));
-                }
-                self.bare = true;
-            }
-            "locked" => {
-                if self.locked {
-                    return Err(format!(
-                        "`{}` has more than one `locked` line",
-                        self.path.display()
-                    ));
-                }
-                self.locked = true;
-                // The reason (`rest`) is discarded on purpose — `WorktreeSibling`
-                // carries no reason field (see the protocol module's doc), so
-                // there is nothing here that needs the `-z`/quoting distinction
-                // the manual documents for that text.
-            }
-            "prunable" => {
-                if self.prunable {
-                    return Err(format!(
-                        "`{}` has more than one `prunable` line",
-                        self.path.display()
-                    ));
-                }
-                self.prunable = true;
-            }
-            other => return Err(format!("unrecognised worktree-list attribute `{other}`")),
-        }
-        Ok(())
-    }
-
-    fn finish(self) -> Result<RawRecord, String> {
-        if self.bare {
-            if self.head_hex.is_some() {
-                return Err(format!(
-                    "`{}` is `bare` but also carries a `HEAD` line",
-                    self.path.display()
-                ));
-            }
-        } else if self.head_hex.is_none() {
-            return Err(format!(
-                "`{}` has no `HEAD` line and is not `bare`",
-                self.path.display()
-            ));
-        } else if !self.detached && self.branch_ref.is_none() {
-            return Err(format!(
-                "`{}` names neither a `branch` nor `detached`",
-                self.path.display()
-            ));
-        }
-        Ok(RawRecord {
-            path: self.path,
-            head_hex: self.head_hex,
-            branch_ref: self.branch_ref,
-            detached: self.detached,
-            bare: self.bare,
-            locked: self.locked,
-            prunable: self.prunable,
-        })
-    }
 }
 
 #[cfg(test)]

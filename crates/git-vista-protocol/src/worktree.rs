@@ -18,6 +18,45 @@
 //! `git-vista-server`'s `worktree_census` module for the query that builds
 //! this type from a live repository.
 //!
+//! # The parser lives here too, beside the types it produces
+//!
+//! [`parse_worktree_porcelain`] turns `git worktree list --porcelain`'s
+//! stdout into [`WorktreeListRecord`]s — a pure `&str -> Result<Vec<_>>`
+//! function with no filesystem and no process, exactly like
+//! [`crate::status::parse_porcelain_v2_z`] and
+//! [`crate::diff::parse_unified_diff`] next door. That is this codebase's
+//! established split for a read-side feature: the pure parse is a protocol
+//! concern (it *is* the wire contract with git), and the server keeps only
+//! what needs the machine — the spawn, the identity lookup, and the
+//! allowed-roots fence. `git-vista-server::handlers::read` calls
+//! `parse_porcelain_v2_z` rather than owning a status parser of its own, and
+//! `worktree_census` calls this one on the same terms.
+//!
+//! # Why the 2.32 floor rules out `-z`
+//!
+//! `git worktree list --porcelain` has a `-z` form that NUL-terminates
+//! records instead of newline-terminating them, which is the safer contract
+//! for a path that could contain a literal newline. It is not used here:
+//! git-scm's manual for 2.31 documents `list`, `--porcelain`, and
+//! `-v`/`--verbose` and says nothing about `-z` at all; 2.32 has no distinct
+//! page of its own on git-scm.com (its URL redirects to 2.31's); the
+//! *current* manual documents `-z`. Taken together, `-z` was added to
+//! `worktree list` at some later version, after this project's documented
+//! git floor (`docs/SUPPORTED_VERSIONS.md`, "Git: 2.32 or later") — so it
+//! isn't used here. Parsing the newline-terminated form inherits git's own
+//! limitation at that floor: a worktree path containing a literal newline
+//! cannot be parsed unambiguously. That is a fact about the porcelain
+//! contract at the supported floor, not a defect introduced by
+//! [`parse_worktree_porcelain`].
+//!
+//! The one place that limitation could bite silently — quoting — does not
+//! apply to anything this module keeps. The manual documents that *only* the
+//! lock reason is quoted/escaped (`core.quotePath`-style) when it contains
+//! unusual characters and `-z` is not used; [`WorktreeSibling`] has no reason
+//! field (the spec's struct doesn't carry one, and nothing here needs it), so
+//! the parser only ever needs to recognise the `locked`/`prunable` label
+//! itself, never interpret the escaping of the text after it.
+//!
 //! # Why this crate, not `git-vista-core`
 //!
 //! Every id here is the **opaque string form** of a `git-vista-core` id
@@ -194,6 +233,225 @@ pub enum WorktreeCensus {
     CensusFailed { reason: String },
 }
 
+// ---------------------------------------------------------------------------
+// Parsing `git worktree list --porcelain` (no `-z` — see the module doc)
+// ---------------------------------------------------------------------------
+
+/// One fully-parsed `git worktree list --porcelain` record, before identity
+/// resolution. Every field here is **exactly what git printed** — no
+/// filesystem access, no fence check, no interpretation. Turning one of these
+/// into a [`WorktreeSibling`] is the native server's job: it needs the
+/// filesystem (to derive a [`WorktreeSibling::id`] and to decide
+/// [`Serviceable`]) and this crate has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeListRecord {
+    /// The `worktree <path>` line's value, verbatim. A `String`, not a
+    /// `PathBuf`: this crate is wasm-safe and touches no filesystem, so the
+    /// bytes git printed stay bytes until the native server turns them into
+    /// a path.
+    pub path: String,
+    /// The `HEAD <oid>` line's value, verbatim — **including** git's
+    /// all-zero null-oid sentinel for an unborn branch, which this parser
+    /// deliberately does not normalise away (that is the caller's decision;
+    /// see [`WorktreeSibling::head`]). `None` only for a `bare` record.
+    pub head_hex: Option<String>,
+    /// The `branch <ref>` line's value, verbatim and **unstripped** —
+    /// `refs/heads/main`, not `main`. Whether a non-`refs/heads/` ref is
+    /// acceptable is a contract question for the caller, not a parse
+    /// question. `None` for `detached` and for `bare`.
+    pub branch_ref: Option<String>,
+    /// The `detached` line was present.
+    pub detached: bool,
+    /// The `bare` line was present — see [`WorktreeSibling::bare`].
+    pub bare: bool,
+    /// The `locked` line was present (its optional reason text is discarded;
+    /// see [`WorktreeSibling::locked`]).
+    pub locked: bool,
+    /// The `prunable` line was present (its optional reason text is
+    /// discarded; see [`WorktreeSibling::prunable`]).
+    pub prunable: bool,
+}
+
+/// Parse the complete stdout of `git worktree list --porcelain`.
+///
+/// Strict by design (the brief's own rule, and this codebase's established
+/// posture for a fact that must never be silently dropped —
+/// `RecoveryClass::CheckFailed` on an unrecognised ref shape,
+/// `HeadState::Unresolvable`): every line must be either the start of a
+/// record (`worktree <path>`) or a recognised attribute of the
+/// currently-open record. Anything else — an attribute before any `worktree`
+/// line, a second `worktree` line before the first record's blank-line
+/// terminator, an unrecognised label, a value-shape git could never actually
+/// produce — is a hard error, not a skipped line. A dropped worktree is
+/// indistinguishable from one that never existed; a census that claims
+/// completeness may not do that silently.
+pub fn parse_worktree_porcelain(text: &str) -> Result<Vec<WorktreeListRecord>, String> {
+    let mut records = Vec::new();
+    let mut current: Option<RecordBuilder> = None;
+
+    for line in text.split('\n') {
+        if line.is_empty() {
+            if let Some(builder) = current.take() {
+                records.push(builder.finish()?);
+            }
+            // A blank line with no record open carries no data to lose — the
+            // leading/trailing artifact of `str::split('\n')` on git's own
+            // (also blank-line-terminated) stream. Tolerated rather than
+            // treated as "an unrecognised line", since there is nothing here
+            // that could be silently dropped.
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("worktree ") {
+            if current.is_some() {
+                return Err(format!(
+                    "a new `worktree` line (`{line}`) appeared before the previous \
+                     record's blank-line terminator"
+                ));
+            }
+            if rest.is_empty() {
+                return Err("a `worktree` line named an empty path".to_string());
+            }
+            current = Some(RecordBuilder::new(rest.to_string()));
+        } else {
+            let builder = current
+                .as_mut()
+                .ok_or_else(|| format!("line `{line}` appeared before any `worktree` line"))?;
+            builder.apply_line(line)?;
+        }
+    }
+    if let Some(builder) = current.take() {
+        records.push(builder.finish()?);
+    }
+    Ok(records)
+}
+
+#[derive(Default)]
+struct RecordBuilder {
+    path: String,
+    head_hex: Option<String>,
+    branch_ref: Option<String>,
+    detached: bool,
+    bare: bool,
+    locked: bool,
+    prunable: bool,
+}
+
+impl RecordBuilder {
+    fn new(path: String) -> Self {
+        Self {
+            path,
+            ..Self::default()
+        }
+    }
+
+    /// Whether a `branch`/`detached`/`bare` line has already been set — those
+    /// three are mutually exclusive within one record.
+    fn head_shape_taken(&self) -> bool {
+        self.branch_ref.is_some() || self.detached || self.bare
+    }
+
+    fn apply_line(&mut self, line: &str) -> Result<(), String> {
+        let (label, rest) = match line.split_once(' ') {
+            Some((l, r)) => (l, Some(r)),
+            None => (line, None),
+        };
+        match label {
+            "HEAD" => {
+                let value = rest.ok_or_else(|| "`HEAD` line has no value".to_string())?;
+                if self.head_hex.is_some() {
+                    return Err(format!("`{}` has more than one `HEAD` line", self.path));
+                }
+                self.head_hex = Some(value.to_string());
+            }
+            "branch" => {
+                let value = rest.ok_or_else(|| "`branch` line has no value".to_string())?;
+                if self.head_shape_taken() {
+                    return Err(format!(
+                        "`{}`'s `branch` line conflicts with an earlier \
+                         `branch`/`detached`/`bare` line",
+                        self.path
+                    ));
+                }
+                self.branch_ref = Some(value.to_string());
+            }
+            "detached" => {
+                if rest.is_some() {
+                    return Err("`detached` takes no value".to_string());
+                }
+                if self.head_shape_taken() {
+                    return Err(format!(
+                        "`{}`'s `detached` line conflicts with an earlier \
+                         `branch`/`detached`/`bare` line",
+                        self.path
+                    ));
+                }
+                self.detached = true;
+            }
+            "bare" => {
+                if rest.is_some() {
+                    return Err("`bare` takes no value".to_string());
+                }
+                if self.head_shape_taken() {
+                    return Err(format!(
+                        "`{}`'s `bare` line conflicts with an earlier \
+                         `branch`/`detached`/`bare` line",
+                        self.path
+                    ));
+                }
+                self.bare = true;
+            }
+            "locked" => {
+                if self.locked {
+                    return Err(format!("`{}` has more than one `locked` line", self.path));
+                }
+                self.locked = true;
+                // The reason (`rest`) is discarded on purpose — `WorktreeSibling`
+                // carries no reason field (see the protocol module's doc), so
+                // there is nothing here that needs the `-z`/quoting distinction
+                // the manual documents for that text.
+            }
+            "prunable" => {
+                if self.prunable {
+                    return Err(format!("`{}` has more than one `prunable` line", self.path));
+                }
+                self.prunable = true;
+            }
+            other => return Err(format!("unrecognised worktree-list attribute `{other}`")),
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<WorktreeListRecord, String> {
+        if self.bare {
+            if self.head_hex.is_some() {
+                return Err(format!(
+                    "`{}` is `bare` but also carries a `HEAD` line",
+                    self.path
+                ));
+            }
+        } else if self.head_hex.is_none() {
+            return Err(format!(
+                "`{}` has no `HEAD` line and is not `bare`",
+                self.path
+            ));
+        } else if !self.detached && self.branch_ref.is_none() {
+            return Err(format!(
+                "`{}` names neither a `branch` nor `detached`",
+                self.path
+            ));
+        }
+        Ok(WorktreeListRecord {
+            path: self.path,
+            head_hex: self.head_hex,
+            branch_ref: self.branch_ref,
+            detached: self.detached,
+            bare: self.bare,
+            locked: self.locked,
+            prunable: self.prunable,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,5 +581,91 @@ mod tests {
         assert_ne!(failed_json, empty_json);
         assert_eq!(failed_json["kind"], "census_failed");
         assert_eq!(empty_json["kind"], "observed");
+    }
+
+    // -----------------------------------------------------------------------
+    // `parse_worktree_porcelain` — moved here with the parser it exercises
+    // (it was `git-vista-server::worktree_census`'s until M11.01 landed the
+    // pure half in this crate, beside `status.rs`/`diff.rs`'s parsers).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parses_a_well_formed_multi_record_stream() {
+        let text = "worktree /tmp/main\nHEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbranch refs/heads/main\n\nworktree /tmp/side\nHEAD bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nbranch refs/heads/feature\nlocked reason with spaces\nprunable\n\n";
+        let records = parse_worktree_porcelain(text).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].path, "/tmp/main");
+        assert_eq!(records[0].branch_ref.as_deref(), Some("refs/heads/main"));
+        assert!(!records[0].locked);
+        assert!(records[1].locked);
+        assert!(records[1].prunable);
+    }
+
+    #[test]
+    fn tolerates_a_missing_trailing_blank_line() {
+        let text = "worktree /tmp/main\nHEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ndetached";
+        let records = parse_worktree_porcelain(text).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].detached);
+    }
+
+    #[test]
+    fn a_bare_record_has_no_head_or_branch() {
+        let text = "worktree /tmp/hub.git\nbare\n";
+        let records = parse_worktree_porcelain(text).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].bare);
+        assert_eq!(records[0].head_hex, None);
+    }
+
+    #[test]
+    fn an_attribute_before_any_worktree_line_is_an_error() {
+        let text = "HEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+        assert!(parse_worktree_porcelain(text).is_err());
+    }
+
+    #[test]
+    fn a_second_worktree_line_without_a_blank_terminator_is_an_error() {
+        let text = "worktree /tmp/main\nworktree /tmp/side\n";
+        assert!(parse_worktree_porcelain(text).is_err());
+    }
+
+    #[test]
+    fn an_unrecognized_attribute_is_an_error_not_a_skip() {
+        let text = "worktree /tmp/main\nHEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbranch refs/heads/main\nsomething-new value\n";
+        let err = parse_worktree_porcelain(text).unwrap_err();
+        assert!(err.contains("something-new"));
+    }
+
+    #[test]
+    fn branch_and_detached_together_is_an_error() {
+        let text = "worktree /tmp/main\nHEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbranch refs/heads/main\ndetached\n";
+        assert!(parse_worktree_porcelain(text).is_err());
+    }
+
+    #[test]
+    fn a_non_bare_record_missing_head_is_an_error() {
+        let text = "worktree /tmp/main\nbranch refs/heads/main\n";
+        assert!(parse_worktree_porcelain(text).is_err());
+    }
+
+    #[test]
+    fn a_record_naming_neither_branch_nor_detached_is_an_error() {
+        let text = "worktree /tmp/main\nHEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+        assert!(parse_worktree_porcelain(text).is_err());
+    }
+
+    #[test]
+    fn a_bare_record_carrying_head_is_an_error() {
+        let text = "worktree /tmp/hub.git\nbare\nHEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+        assert!(parse_worktree_porcelain(text).is_err());
+    }
+
+    #[test]
+    fn empty_input_parses_to_no_records() {
+        // The caller (`git-vista-server`'s `worktree_census`) is what turns
+        // zero records into a `CensusFailed` — the parser itself just reports
+        // what it saw.
+        assert_eq!(parse_worktree_porcelain("").unwrap().len(), 0);
     }
 }

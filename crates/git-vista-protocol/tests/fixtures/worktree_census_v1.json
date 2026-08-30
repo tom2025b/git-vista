@@ -1,0 +1,189 @@
+{
+  "current": {
+    "repository": "r-1111111111111111",
+    "id": "w-1111111111111111",
+    "name": "git-vista",
+    "path": "/home/user/projects/git-vista",
+    "branch": "main",
+    "head": "b7a947f8011f10fa6362e0ec96d9d766ca1f92a6",
+    "is_current": true,
+    "locked": false,
+    "prunable": false,
+    "bare": false,
+    "serviceable": {
+      "kind": "yes"
+    }
+  },
+  "locked_no_path": {
+    "repository": "r-1111111111111111",
+    "id": "w-2222222222222222",
+    "name": "git-vista-m11",
+    "branch": "feature/m11-worktrees",
+    "head": "cccccccccccccccccccccccccccccccccccccccc",
+    "is_current": false,
+    "locked": true,
+    "prunable": false,
+    "bare": false,
+    "serviceable": {
+      "kind": "yes"
+    }
+  },
+  "outside_allowed_roots": {
+    "repository": "r-1111111111111111",
+    "id": "w-3333333333333333",
+    "name": "git-vista-codex",
+    "path": "/home/user/gv/variants/git-vista-codex",
+    "branch": "codex/65-sheet-wiring",
+    "head": "dddddddddddddddddddddddddddddddddddddddd",
+    "is_current": false,
+    "locked": false,
+    "prunable": false,
+    "bare": false,
+    "serviceable": {
+      "kind": "outside_allowed_roots"
+    }
+  },
+  "missing": {
+    "repository": "r-1111111111111111",
+    "id": "w-4444444444444444",
+    "name": "git-vista-testbed",
+    "path": "/home/user/projects/git-vista-testbed",
+    "branch": "testbed/main-20260817-2219",
+    "head": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "is_current": false,
+    "locked": false,
+    "prunable": true,
+    "bare": false,
+    "serviceable": {
+      "kind": "missing"
+    }
+  },
+  "detached": {
+    "repository": "r-1111111111111111",
+    "id": "w-5555555555555555",
+    "name": "git-vista-detached",
+    "path": "/home/user/projects/git-vista-detached",
+    "branch": null,
+    "head": "ffffffffffffffffffffffffffffffffffffffff",
+    "is_current": false,
+    "locked": false,
+    "prunable": false,
+    "bare": false,
+    "serviceable": {
+      "kind": "yes"
+    }
+  },
+  "bare": {
+    "repository": "r-1111111111111111",
+    "id": "w-6666666666666666",
+    "name": "git-vista.git",
+    "path": "/home/user/projects/git-vista.git",
+    "branch": null,
+    "head": null,
+    "is_current": false,
+    "locked": false,
+    "prunable": false,
+    "bare": true,
+    "serviceable": {
+      "kind": "yes"
+    }
+  },
+  "observed": {
+    "kind": "observed",
+    "siblings": [
+      {
+        "repository": "r-1111111111111111",
+        "id": "w-1111111111111111",
+        "name": "git-vista",
+        "path": "/home/user/projects/git-vista",
+        "branch": "main",
+        "head": "b7a947f8011f10fa6362e0ec96d9d766ca1f92a6",
+        "is_current": true,
+        "locked": false,
+        "prunable": false,
+        "bare": false,
+        "serviceable": {
+          "kind": "yes"
+        }
+      },
+      {
+        "repository": "r-1111111111111111",
+        "id": "w-2222222222222222",
+        "name": "git-vista-m11",
+        "branch": "feature/m11-worktrees",
+        "head": "cccccccccccccccccccccccccccccccccccccccc",
+        "is_current": false,
+        "locked": true,
+        "prunable": false,
+        "bare": false,
+        "serviceable": {
+          "kind": "yes"
+        }
+      },
+      {
+        "repository": "r-1111111111111111",
+        "id": "w-3333333333333333",
+        "name": "git-vista-codex",
+        "path": "/home/user/gv/variants/git-vista-codex",
+        "branch": "codex/65-sheet-wiring",
+        "head": "dddddddddddddddddddddddddddddddddddddddd",
+        "is_current": false,
+        "locked": false,
+        "prunable": false,
+        "bare": false,
+        "serviceable": {
+          "kind": "outside_allowed_roots"
+        }
+      },
+      {
+        "repository": "r-1111111111111111",
+        "id": "w-4444444444444444",
+        "name": "git-vista-testbed",
+        "path": "/home/user/projects/git-vista-testbed",
+        "branch": "testbed/main-20260817-2219",
+        "head": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "is_current": false,
+        "locked": false,
+        "prunable": true,
+        "bare": false,
+        "serviceable": {
+          "kind": "missing"
+        }
+      },
+      {
+        "repository": "r-1111111111111111",
+        "id": "w-5555555555555555",
+        "name": "git-vista-detached",
+        "path": "/home/user/projects/git-vista-detached",
+        "branch": null,
+        "head": "ffffffffffffffffffffffffffffffffffffffff",
+        "is_current": false,
+        "locked": false,
+        "prunable": false,
+        "bare": false,
+        "serviceable": {
+          "kind": "yes"
+        }
+      },
+      {
+        "repository": "r-1111111111111111",
+        "id": "w-6666666666666666",
+        "name": "git-vista.git",
+        "path": "/home/user/projects/git-vista.git",
+        "branch": null,
+        "head": null,
+        "is_current": false,
+        "locked": false,
+        "prunable": false,
+        "bare": true,
+        "serviceable": {
+          "kind": "yes"
+        }
+      }
+    ]
+  },
+  "census_failed": {
+    "kind": "census_failed",
+    "reason": "`git worktree list --porcelain` failed: fatal: not a git repository"
+  }
+}

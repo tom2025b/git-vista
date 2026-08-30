@@ -33,7 +33,10 @@
 //!   every string-shaped wire value is checked in exactly one place.
 //! - [`worktree`] — the read-only worktree census (M11.01, #546):
 //!   [`WorktreeSibling`], [`Serviceable`] (the app's fence, kept separate from
-//!   git's own `locked`/`prunable` flags), and the fallible [`WorktreeCensus`].
+//!   git's own `locked`/`prunable` flags), the fallible [`WorktreeCensus`],
+//!   and [`parse_worktree_porcelain`] — the pure `git worktree list
+//!   --porcelain` parser, sitting beside its own wire types the same way
+//!   [`parse_porcelain_v2_z`] and [`parse_unified_diff`] do.
 //!
 //! ## Why a separate crate
 //!
@@ -127,4 +130,6 @@ pub use version::{
     IDEMPOTENCY_HEADER, MAX_CLIENT_PROTOCOL, MIN_CLIENT_PROTOCOL, OPERATION_HEADER,
     PROTOCOL_HEADER, PROTOCOL_QUERY, PROTOCOL_VERSION, REQUEST_ID_HEADER,
 };
-pub use worktree::{Serviceable, WorktreeCensus, WorktreeSibling};
+pub use worktree::{
+    parse_worktree_porcelain, Serviceable, WorktreeCensus, WorktreeListRecord, WorktreeSibling,
+};

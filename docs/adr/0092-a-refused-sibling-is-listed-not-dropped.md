@@ -168,12 +168,59 @@ outside its own tests (`#[cfg_attr(not(test), allow(dead_code))]`, matching
 `conflicts`'s own attribute) and touches no route table, so
 `route_authz`'s structural gate has nothing new to classify.
 
+## Decision 9 — The pure parser lives in `git-vista-protocol` too; the server keeps only the spawn and the enrichment
+
+`parse_worktree_porcelain` and its `WorktreeListRecord` sit in
+`crates/git-vista-protocol/src/worktree.rs`, beside the wire types they feed,
+not in the server. That is this codebase's established shape for a read-side
+feature and not a new idea: `parse_porcelain_v2_z` lives in
+`git-vista-protocol/src/status.rs` and `parse_unified_diff` in
+`git-vista-protocol/src/diff.rs`, and `git-vista-server`'s
+`handlers/read.rs` **calls** them rather than owning a parser of its own.
+
+The line is "does it need the machine?". The parse does not — it is
+`&str -> Result<Vec<WorktreeListRecord>, String>`, no filesystem, no process,
+no catalog — so it belongs with the contract it implements, where it is
+unit-testable from a string and compiles for wasm along with the rest of the
+crate. Everything that *does* need the machine stays in
+`git-vista-server/src/worktree_census.rs`: the sandboxed spawn, the `gix`
+identity lookup (`read_repo_facts` / the `Missing` row's admin-directory
+correlation), the allowed-roots fence, and the `HEAD 000…0` sentinel that
+must not become a `CommitOid`.
+
+One consequence is deliberate: `WorktreeListRecord::path` is a `String`, not a
+`PathBuf`. `git-vista-protocol` is wasm-safe and touches no filesystem, and
+the bytes git printed are not a path until something with a filesystem says
+so — the server converts exactly once, in `resolve_sibling`.
+
+## Decision 10 — The spawn is capped, and a truncated stream is refused rather than parsed
+
+`git worktree list --porcelain` is read through
+`git_cmd::git_stdout_capped` under an 8 MiB ceiling
+(`WORKTREE_LIST_STDOUT_CAP`), not the uncapped `git_output`. The stdout grows
+with the number of worktrees, and anyone who can `git worktree add` in the
+served repository adds a record; `git_output` reads to EOF with no ceiling at
+all.
+
+On a cap hit the census is `CensusFailed`, never a best-effort parse of the
+prefix. This is the same call and the same posture
+`handlers::read::worktree_status_v2_for_repo` already takes for
+`git status --porcelain=v2 --branch -z` under `STATUS_V2_STDOUT_CAP` (also
+8 MiB), and for the same reason: a cut stream can end mid-record, the parser
+cannot tell that from a record that genuinely ended there, and a short
+`Observed` would be exactly the silent omission this whole design exists to
+prevent. The ceiling is a parameter of the inner
+`worktree_census_capped` — the same hoist `worktree_status_v2_for_repo`
+makes — so the refusal branch is reachable from a test with a one-byte cap
+instead of eight megabytes of fabricated porcelain.
+
 ## Consequences
 
 **No new sandbox tier or grant.** `git worktree list --porcelain`'s argv
 first token, `worktree`, is absent from `sandbox::REMOTE_SUBCOMMANDS`, so the
-declared `NetworkNeed::Local` (the same arity `handlers::read::worktree_status`
-already uses) agrees with the argv cross-check and reuses the existing
+declared `NetworkNeed::Local` (which `git_cmd::git_stdout_capped` states for
+every one of its callers, `handlers::read`'s status-v2 and diff reads
+included) agrees with the argv cross-check and reuses the existing
 repo-scoped grant. Resolving a sibling's identity — including one outside the
 allowed roots — runs through `git_vista_git::read_repo_facts`, the exact
 function `Catalog::register` already calls *before* its own allowed-roots

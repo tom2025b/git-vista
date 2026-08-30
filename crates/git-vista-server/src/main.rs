@@ -103,13 +103,17 @@ mod state;
 // precondition's, not this issue's. See docs/superpowers/specs/
 // m3.23-worktrees.md §1.
 //
-// Unlike `conflicts` (whose `allow(dead_code)` sits on the `mod` line because
-// nothing in it has a caller at all), only the public entry point
-// `worktree_census` gets the attribute, on itself — its internal helpers
-// (`correlate_missing_admin_dir`, `common_dir`, `is_null_oid`, the parser)
-// are each called from within the module, so a future edit that orphans one
-// of them should still trip clippy's dead-code lint rather than being
-// silently exempted by a blanket module-level attribute.
+// The `allow(dead_code)` sits on the entry point `worktree_census` itself, not
+// on this `mod` line — deliberately narrower than `conflicts` above. Its
+// internal helpers (`correlate_missing_admin_dir`, `common_dir`,
+// `is_null_oid`, `display_name`) are each called from within the module, so a
+// future edit that orphans one should still trip the dead-code lint rather
+// than being exempted by a blanket module-level attribute. (`conflicts`' own
+// module-level attribute is a leftover from when *it* was staged this way; it
+// has had real callers since — `conflicts::scan` from `planner/conflict_exec.rs`
+// and `handlers/conflicts.rs`, `conflicts::continuation` from
+// `planner/sequence_exec.rs` and `planner/stash.rs` — so the contrast is with
+// where the attribute sits, not with whether that module is reached.)
 mod worktree_census;
 // M1.13b (#66): the single owner of TCP port 9418 in the test binary. Three
 // tests across `sandbox::escape_suite` and `planner::contract_suite` need that

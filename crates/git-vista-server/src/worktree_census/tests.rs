@@ -224,6 +224,54 @@ async fn prunable_with_a_gone_directory_reads_missing_and_keeps_a_stable_id() {
     );
 }
 
+/// The id a `Serviceable::Missing` row carries is the **right** id, checked
+/// against a value derived a completely different way.
+///
+/// `prunable_with_a_gone_directory_reads_missing_and_keeps_a_stable_id` above
+/// only proves two consecutive censuses agree with each other — two reads of
+/// one derivation, which would stay green if that derivation were wrong. This
+/// one anchors on an independent witness: `git_vista_git::read_handle` opens
+/// the worktree with `gix` *while it still exists* and hashes the git dir gix
+/// itself resolved, whereas the census (after the deletion, with gix unable to
+/// open anything) reaches the same directory through
+/// `correlate_missing_admin_dir` — reading every `<common>/worktrees/*/gitdir`
+/// file and matching its recorded path against the porcelain's. Two unrelated
+/// routes to the same admin directory; if the correlation picked the wrong
+/// entry, guessed a name, or silently fell back to the served worktree's own
+/// id, this fails and the stability test would not.
+#[tokio::test]
+async fn a_missing_siblings_id_survives_its_own_deletion() {
+    let (_dir, repo) = seeded();
+    let side = tempfile::tempdir().unwrap();
+    let linked = side.path().join("linked");
+    fx::run(&repo, &["branch", "feature"]);
+    fx::run(
+        &repo,
+        &["worktree", "add", linked.to_str().unwrap(), "feature"],
+    );
+
+    // The independent witness, captured while the directory is still there.
+    let id_before_deletion = git_vista_git::read_handle(&linked).unwrap().worktree;
+    // And a negative control: it must not merely equal the served worktree's
+    // own id, which is what a lazy fallback would produce.
+    let current_id = git_vista_git::read_handle(&repo).unwrap().worktree;
+    assert_ne!(
+        id_before_deletion, current_id,
+        "fixture is wrong: a linked worktree must not share the main one's id"
+    );
+
+    std::fs::remove_dir_all(&linked).unwrap();
+
+    let siblings = observed(worktree_census(&repo, false, &allow_all).await);
+    let missing = siblings.iter().find(|s| !s.is_current).unwrap();
+    assert_eq!(missing.serviceable, Serviceable::Missing);
+    assert_eq!(
+        missing.id,
+        id_before_deletion.to_string(),
+        "a Missing row must carry the id the worktree had while it existed"
+    );
+}
+
 /// A fresh, commit-less repository's own (main) worktree has an unborn
 /// branch: git reports `HEAD 000…0`, its null-oid sentinel, which must not be
 /// passed through as though it named a real commit (`history::HeadState`'s
@@ -279,6 +327,38 @@ async fn a_bare_hub_admin_entry_is_reported_as_bare_with_no_branch_or_head() {
     assert_eq!(current.branch.as_ref().map(|b| b.as_str()), Some("main"));
 }
 
+/// A truncated `git worktree list --porcelain` is **refused**, never parsed —
+/// the same posture `handlers::read::worktree_status_v2_for_repo` takes on a
+/// `STATUS_V2_STDOUT_CAP` hit, and the reason the read went through
+/// `git_stdout_capped` instead of the uncapped `git_output` at all.
+///
+/// The cap is passed in (production uses `WORKTREE_LIST_STDOUT_CAP`, 8 MiB) so
+/// this can hit it with a real repository instead of fabricating megabytes of
+/// porcelain. One byte is below the shortest possible record, so git's own
+/// output is guaranteed to exceed it.
+///
+/// The paired positive matters as much as the refusal: the *same* repository,
+/// read with a cap that is not hit, is a healthy `Observed`. Without that leg
+/// this test would still pass if the census had simply become unable to read
+/// anything at all.
+#[tokio::test]
+async fn a_truncated_worktree_list_is_refused_not_parsed_into_a_short_census() {
+    let (_dir, repo) = seeded();
+
+    let reason = failed(worktree_census_capped(&repo, false, &allow_all, 1).await);
+    assert!(
+        reason.contains("truncated"),
+        "a cap hit must say so, not masquerade as some other failure: {reason}"
+    );
+
+    let siblings = observed(worktree_census_capped(&repo, false, &allow_all, 8 * 1024).await);
+    assert_eq!(
+        siblings.len(),
+        1,
+        "the same repository under an unhit cap must still census normally"
+    );
+}
+
 #[tokio::test]
 async fn a_path_that_is_not_a_git_repository_fails_the_census() {
     let dir = tempfile::tempdir().unwrap();
@@ -301,7 +381,13 @@ async fn expose_paths_gates_the_path_field() {
 }
 
 // ---------------------------------------------------------------------------
-// Parser unit tests
+// Enrichment unit tests
+//
+// The porcelain parser itself — `parse_worktree_porcelain`, its record type
+// and its ten unit tests — moved to `git-vista-protocol`'s `worktree` module,
+// beside `status.rs`/`diff.rs`'s parsers and the DTOs it produces. What is
+// left here is the half that needs the machine: the `HEAD 000…0` sentinel
+// that must never be passed through as a `CommitOid`.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -311,83 +397,4 @@ fn is_null_oid_matches_exactly_40_or_64_zeros() {
     assert!(!is_null_oid(&"0".repeat(39)));
     assert!(!is_null_oid(&format!("{}1", "0".repeat(39))));
     assert!(!is_null_oid(&"a".repeat(40)));
-}
-
-#[test]
-fn parses_a_well_formed_multi_record_stream() {
-    let text = "worktree /tmp/main\nHEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbranch refs/heads/main\n\nworktree /tmp/side\nHEAD bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nbranch refs/heads/feature\nlocked reason with spaces\nprunable\n\n";
-    let records = parse_worktree_porcelain(text).unwrap();
-    assert_eq!(records.len(), 2);
-    assert_eq!(records[0].path, PathBuf::from("/tmp/main"));
-    assert_eq!(records[0].branch_ref.as_deref(), Some("refs/heads/main"));
-    assert!(!records[0].locked);
-    assert!(records[1].locked);
-    assert!(records[1].prunable);
-}
-
-#[test]
-fn tolerates_a_missing_trailing_blank_line() {
-    let text = "worktree /tmp/main\nHEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ndetached";
-    let records = parse_worktree_porcelain(text).unwrap();
-    assert_eq!(records.len(), 1);
-    assert!(records[0].detached);
-}
-
-#[test]
-fn a_bare_record_has_no_head_or_branch() {
-    let text = "worktree /tmp/hub.git\nbare\n";
-    let records = parse_worktree_porcelain(text).unwrap();
-    assert_eq!(records.len(), 1);
-    assert!(records[0].bare);
-    assert_eq!(records[0].head_hex, None);
-}
-
-#[test]
-fn an_attribute_before_any_worktree_line_is_an_error() {
-    let text = "HEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
-    assert!(parse_worktree_porcelain(text).is_err());
-}
-
-#[test]
-fn a_second_worktree_line_without_a_blank_terminator_is_an_error() {
-    let text = "worktree /tmp/main\nworktree /tmp/side\n";
-    assert!(parse_worktree_porcelain(text).is_err());
-}
-
-#[test]
-fn an_unrecognized_attribute_is_an_error_not_a_skip() {
-    let text = "worktree /tmp/main\nHEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbranch refs/heads/main\nsomething-new value\n";
-    let err = parse_worktree_porcelain(text).unwrap_err();
-    assert!(err.contains("something-new"));
-}
-
-#[test]
-fn branch_and_detached_together_is_an_error() {
-    let text = "worktree /tmp/main\nHEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbranch refs/heads/main\ndetached\n";
-    assert!(parse_worktree_porcelain(text).is_err());
-}
-
-#[test]
-fn a_non_bare_record_missing_head_is_an_error() {
-    let text = "worktree /tmp/main\nbranch refs/heads/main\n";
-    assert!(parse_worktree_porcelain(text).is_err());
-}
-
-#[test]
-fn a_record_naming_neither_branch_nor_detached_is_an_error() {
-    let text = "worktree /tmp/main\nHEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
-    assert!(parse_worktree_porcelain(text).is_err());
-}
-
-#[test]
-fn a_bare_record_carrying_head_is_an_error() {
-    let text = "worktree /tmp/hub.git\nbare\nHEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
-    assert!(parse_worktree_porcelain(text).is_err());
-}
-
-#[test]
-fn empty_input_parses_to_no_records() {
-    // The caller (`worktree_census`) is what turns zero records into a
-    // `CensusFailed` — the parser itself just reports what it saw.
-    assert_eq!(parse_worktree_porcelain("").unwrap().len(), 0);
 }
