@@ -2521,6 +2521,16 @@ fn every_git_write_route_reaches_the_planner() {
         // `submit_execute` block right after the `build_only` one below
         // checks this route's own chain.
         ("/api/execute-plan", "execute_plan"),
+        // M10.08 (#576, ADR 0099): the graph a Plan would produce. A POST, and
+        // deliberately NOT a git write: it mints no plan, builds no mutating
+        // argv, and must never reach any execution entry point. Its git work
+        // is `merge-tree`/`commit-tree` run against a throwaway object store
+        // whose only writable target is itself, so the repository it names is
+        // byte-for-byte unchanged (asserted by `preview::suite`'s A2). No
+        // funnel row below, for the same reason `/api/plan` has none — and,
+        // like `/api/plan`, the inverse requirement is stated and checked, in
+        // the `preview_is_read_only` block after the `build_only` one.
+        ("/api/preview", "preview_plan"),
         // M3.25 (#78): executing one past operation's recovery. A git write —
         // it reaches the planner — but not a funnel row below, because it
         // enters through `plan_and_execute_recovery` rather than
@@ -2745,6 +2755,39 @@ fn every_git_write_route_reaches_the_planner() {
     // would pass vacuously. The two positive `contains` assertions just made
     // are that proof — they read real call sites out of the same blanked
     // string the negatives are checked against.
+
+    // The preview row (M10.08, #576): the same inverse requirement as the
+    // build-only block above, for the one route that runs git and still
+    // changes nothing. `POST /api/preview` must reach `preview(` — its whole
+    // job — and must reach no execution entry point at all. A preview that
+    // grew a call to the executor would run the operation it was asked to
+    // draw, which is the single worst thing this endpoint could do.
+    //
+    // Scanned through `code_only` for the same two reasons the block above
+    // records, and the forbidden names carry no trailing `(` for the third:
+    // `plan_and_execute_in(` does not contain `plan_and_execute(`.
+    let preview_src = crate::argv_boundary::code_only(&source("src/handlers/preview.rs"));
+    let preview_body = fn_body(&preview_src, "preview_plan");
+    for forbidden in [
+        "plan_and_execute",
+        "submit_plan",
+        "planner::execute",
+        "build_plan_only",
+    ] {
+        assert!(
+            !preview_body.contains(forbidden),
+            "src/handlers/preview.rs::preview_plan calls {forbidden} — \
+             POST /api/preview draws a picture and runs nothing (#576)"
+        );
+    }
+    // The positive half, which is also what proves the four negatives above
+    // are not passing vacuously against a string `code_only` blanked.
+    assert!(
+        preview_body.contains("preview(&repo, &plan)"),
+        "src/handlers/preview.rs::preview_plan no longer calls the preview \
+         itself — the route must answer from `crate::preview`, not from a \
+         second derivation"
+    );
 
     // The submit-execute chain (M2.23e, #249): `execute_plan` is the second
     // funnel entry point, alongside `plan_and_execute` — it must reach

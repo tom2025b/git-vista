@@ -75,6 +75,12 @@ mod operations;
 // GitOperation and this module builds/validates/executes its reviewable Plan —
 // the only place a mutating git argv is constructed.
 mod planner;
+// M10.08 (#576, ADR 0099): the graph preview — draw the repository as it
+// *would* be after a Plan, writing nothing to it. Real git computes the answer
+// in a throwaway object store inside the repository's own commondir, whose
+// `objects/info/alternates` lets it read every object and write none of them
+// back. Refuses (`Unsupported`/`Unavailable`) rather than modelling.
+mod preview;
 // Per-source-IP sign-in rate limiting for the LAN listener (ADR 0005, #122).
 mod ratelimit;
 // M3.25 (#78): the Recovery Center — a browsable history of this app's own
@@ -150,6 +156,7 @@ use handlers::conflicts::{
 use handlers::discard::{delete_untracked_paths, discard_tracked_paths};
 use handlers::fetch::fetch_remote;
 use handlers::plan::{execute_plan, plan_operation};
+use handlers::preview::preview_plan;
 use handlers::protocol::protocol_info;
 use handlers::pull::pull_branch;
 use handlers::read::{
@@ -656,6 +663,16 @@ fn api_router(
             // immediately above — a plan submission is itself a mutation, and
             // a LAN visualize session must never reach it either (ADR 0005).
             .route("/api/execute-plan", post(execute_plan))
+            // M10.08 (#576, ADR 0099): the graph a Plan would produce, drawn
+            // by real git in a throwaway object store and written nowhere.
+            // Registered here with the writes rather than with the reads, for
+            // the same two reasons `/api/plan` is: it takes a Plan body, which
+            // only a POST can carry, and a LAN visualize session must never
+            // reach the plan-review surface at all (ADR 0005). It refuses
+            // nothing on mode, though — a read-only repository gets the named
+            // `Unavailable { RepositoryReadOnly }` answer instead of a 403;
+            // see the handler's own module doc.
+            .route("/api/preview", post(preview_plan))
             // M2.20f (#232): what operation id was admitted for an
             // idempotency key, readable while the operation it names may
             // still be running — closes the race where `POST /api/fetch`

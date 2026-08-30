@@ -67,6 +67,7 @@ pub mod status;
 mod broken;
 mod conflict;
 mod content;
+mod divergent;
 mod seeded;
 
 pub use broken::{broken_head, unrunnable};
@@ -78,4 +79,5 @@ pub use content::{
     binary_blob, four_mode, on_disk_len, path_battery, pathological_content, write_rows,
     BIG_TEXT_APPEND, BIG_TEXT_BYTES, BINARY_SENTINEL,
 };
+pub use divergent::{cherry_pick_clean, cherry_pick_conflict, merge_clean_two_branch};
 pub use seeded::{empty, seeded, seeded_dated, seeded_files, Fixture, PINNED_DATE};

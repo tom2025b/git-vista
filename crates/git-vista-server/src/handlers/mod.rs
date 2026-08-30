@@ -27,6 +27,10 @@
 //!   * [`plan`] — `POST /api/plan` (#248): build a reviewable `Plan` and hand
 //!     it back unexecuted — the only endpoint that mints a plan without
 //!     running it, and the one the MCP `plan_*` tools sit on.
+//!   * [`preview`] — `POST /api/preview` (#576, ADR 0099): the graph that
+//!     `Plan` would produce, computed by real git against the real objects in
+//!     a throwaway store and written nowhere. The picture half of the same
+//!     review roundtrip `plan` opens in words.
 //!
 //! Since M1.06b (#143) the write handlers don't run git themselves: each
 //! validates its request, builds one typed `GitOperation` (#142), and hands it
@@ -59,6 +63,8 @@ pub(crate) mod pull;
 pub(crate) mod operations;
 // M2.23d (#248, ADR 0046): build one reviewable Plan and return it, run nothing.
 pub(crate) mod plan;
+// M10.08 (#576, ADR 0099): the graph one Plan would produce, run nothing.
+pub(crate) mod preview;
 pub(crate) mod protocol;
 pub(crate) mod read;
 pub(crate) mod rebase;

@@ -41,7 +41,7 @@ use crate::seeded::{empty, Fixture};
 ///
 /// Each shape seeds only the path it is about: a conflict fixture carrying
 /// unrelated extra files is a fixture whose status output nobody predicted.
-fn base_commit(repo: &std::path::Path, files: &[(&str, &[u8])]) {
+pub(crate) fn base_commit(repo: &std::path::Path, files: &[(&str, &[u8])]) {
     for (name, content) in files {
         git::write(repo, name, content);
     }
@@ -53,7 +53,7 @@ fn base_commit(repo: &std::path::Path, files: &[(&str, &[u8])]) {
 ///
 /// Reads `git ls-files -u`, which is git's own view — the fixture never asserts
 /// its shape by calling the code that built it.
-fn stages_of(repo: &std::path::Path, path: &str) -> Vec<u8> {
+pub(crate) fn stages_of(repo: &std::path::Path, path: &str) -> Vec<u8> {
     let listing = git::out(repo, &["ls-files", "-u", "--", path]);
     let mut stages: Vec<u8> = listing
         .lines()

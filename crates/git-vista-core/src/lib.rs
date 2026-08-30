@@ -15,6 +15,11 @@
 //! - [`diff`]     — commit-diff types + the name-status/numstat parsers.
 //! - [`activity`] — activity-feed types, reflog-message parsing, feed assembly.
 //! - [`net`]      — user-facing wording for network-level fetch failures.
+//! - [`preview`]  — laying out a history that does not exist yet (M10.08, #576):
+//!   the same commit list plus a hypothetical commit, laid out through the same
+//!   [`layout`] engine, and the lane shifts between the two halves. Takes no
+//!   repository at all — [`layout::stream::StreamLayout`] asks for a commit and
+//!   a membership predicate, never an object database.
 //! - [`seed`]     — test-repo seed parsing + reset planning ("Reset Test Repo").
 //! - [`virtualize`] — the windowed-list primitive (M2.16, #69c): item heights
 //!   and a scroll offset in, the visible render range out. Knows nothing
@@ -41,6 +46,7 @@ pub mod identity;
 pub mod layout;
 pub mod model;
 pub mod net;
+pub mod preview;
 pub mod seed;
 pub mod status;
 pub mod virtualize;
