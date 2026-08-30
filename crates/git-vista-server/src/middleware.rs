@@ -1579,9 +1579,7 @@ mod tests {
     /// hint also invents evidence that the inner body never supplied.
     #[tokio::test]
     async fn an_empty_data_frame_is_forwarded_without_consuming_length() {
-        for (remaining, after_one_byte) in
-            [(Some(3), Some(2)), (Some(0), None), (None, None)]
-        {
+        for (remaining, after_one_byte) in [(Some(3), Some(2)), (Some(0), None), (None, None)] {
             let mut body = KnownSizeBody {
                 inner: Body::new(ScriptedBody::new(vec![Step::Data(b""), Step::Data(b"x")])),
                 remaining,
@@ -1664,9 +1662,7 @@ mod tests {
     /// confused with EOF, and forwarding it must not hide a later frame.
     #[tokio::test]
     async fn an_empty_trailer_frame_is_forwarded_across_accounting_states() {
-        for (remaining, after_one_byte) in
-            [(Some(7), Some(6)), (Some(0), None), (None, None)]
-        {
+        for (remaining, after_one_byte) in [(Some(7), Some(6)), (Some(0), None), (None, None)] {
             let mut body = KnownSizeBody {
                 inner: Body::new(ScriptedBody::new(vec![
                     Step::EmptyTrailers,
@@ -2213,8 +2209,7 @@ mod tests {
                 .take()
                 .expect("the inner body must receive the replacement waker");
             assert!(
-                replacement_waker.will_wake(&caller_b)
-                    && !replacement_waker.will_wake(&caller_a),
+                replacement_waker.will_wake(&caller_b) && !replacement_waker.will_wake(&caller_a),
                 "a second poll in state {remaining:?} must replace a stale \
                  caller waker"
             );
