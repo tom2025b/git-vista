@@ -4,6 +4,12 @@
 //! Split out of `render.rs`. [`stubs`] draws the whole cascade (connectors, then
 //! rings + hit targets) GitHub-network-graph style; [`stub_icons`] draws the
 //! branch glyph beside each ring in the same toggleable layer as the node icons.
+//!
+//! **Both layers draw in DISPLAY row space, never in raw row space (#571).**
+//! `resolved_stubs` answers in raw rows, because that is the space the aggregate
+//! keeps; every other layer of the canvas is placed by display slot. Folding is
+//! what separates the two, so each stub's anchor row is put through
+//! [`place_stubs`] before any geometry is computed from it.
 
 use leptos::*;
 use wasm_bindgen::JsCast;
@@ -15,6 +21,7 @@ use crate::state::MenuData;
 use crate::text::truncate;
 use git_vista_core::color::{branch_color, MERGE_FILL};
 
+use crate::features::graph::collapse::{place_stubs, DisplayProjection};
 use crate::features::graph::core::RenderCtx;
 
 /// A stub's branch-name label is truncated past this (the full name stays in
@@ -30,20 +37,27 @@ const MAX_STUB_NAME_CHARS: usize = 24;
 ///
 /// Only *resolved* stubs (M1.10, #63): a `FrameStub` whose anchor commit isn't
 /// loaded has no row and no lane, so there is nowhere to draw it.
-pub fn stub_icons(ctx: StoredValue<RenderCtx>, nerd_icons: RwSignal<bool>) -> View {
+pub fn stub_icons(
+    ctx: StoredValue<RenderCtx>,
+    display: StoredValue<DisplayProjection>,
+    nerd_icons: RwSignal<bool>,
+) -> View {
     let ic = icon_set(nerd_icons.get());
     ctx.with_value(|c| {
-        c.loaded
-            .resolved_stubs()
+        let resolved = c.loaded.resolved_stubs();
+        let anchors: Vec<usize> = resolved.iter().map(|s| s.anchor_row).collect();
+        display
+            .with_value(|d| place_stubs(d, &anchors))
             .iter()
-            .map(|s| {
+            .map(|placed| {
+                let s = &resolved[placed.index];
                 // Same colour rule as the stub's own line/ring: the branch
                 // name's stable colour.
                 let color = branch_color(s.stub.color);
                 view! {
                     <text
                         x=node_cx(s.lane) - NODE_RADIUS - 5
-                        y=stub_node_cy(s.anchor_row, s.stub.depth) + 4
+                        y=stub_node_cy(placed.display_row, s.stub.depth) + 4
                         text-anchor="end"
                         class="nf node-icon"
                         fill=color
@@ -67,7 +81,12 @@ pub fn stub_icons(ctx: StoredValue<RenderCtx>, nerd_icons: RwSignal<bool>) -> Vi
 /// handful — one per commit-less new branch — and their cascade fans *upward*
 /// off the anchor commit, so they don't map onto the row window as cleanly as
 /// nodes/edges/labels; rendering them all is cheap and avoids that edge case.
-pub fn stubs(ctx: StoredValue<RenderCtx>, shell: Shell, moved: StoredValue<bool>) -> View {
+pub fn stubs(
+    ctx: StoredValue<RenderCtx>,
+    display: StoredValue<DisplayProjection>,
+    shell: Shell,
+    moved: StoredValue<bool>,
+) -> View {
     // Two passes: every connector path first, then every ring + hit target. A
     // cascade's deeper connector starts exactly at the previous tip's centre
     // (and the first at the anchor commit's), so drawn interleaved it would
@@ -77,11 +96,17 @@ pub fn stubs(ctx: StoredValue<RenderCtx>, shell: Shell, moved: StoredValue<bool>
     // Resolved once for both passes: `resolved_stubs` places each stub against
     // the aggregate's current lane high-water, so the two passes can't disagree.
     let resolved = ctx.with_value(|c| c.loaded.resolved_stubs());
-    let paths = resolved
+    // Placed once for both passes as well, and for the same reason: a ring and
+    // the connector that reaches it must never disagree about which row the
+    // stub hangs over (#571).
+    let anchors: Vec<usize> = resolved.iter().map(|s| s.anchor_row).collect();
+    let placed = display.with_value(|d| place_stubs(d, &anchors));
+    let paths = placed
         .iter()
-        .map(|s| {
+        .map(|placed| {
+            let s = &resolved[placed.index];
             let color = branch_color(s.stub.color);
-            let d = stub_path(s.anchor_lane, s.anchor_row, s.lane, s.stub.depth);
+            let d = stub_path(s.anchor_lane, placed.display_row, s.lane, s.stub.depth);
             view! {
                 <path
                     d=d
@@ -94,15 +119,16 @@ pub fn stubs(ctx: StoredValue<RenderCtx>, shell: Shell, moved: StoredValue<bool>
             }
         })
         .collect_view();
-    let tips = ctx.with_value(|c| resolved
+    let tips = ctx.with_value(|c| placed
         .iter()
-        .map(|s| {
+        .map(|placed| {
+            let s = &resolved[placed.index];
             // The branch name's stable colour — the same colour this branch's
             // line will wear once it owns commits, so committing on the stub
             // reads as the stub growing into its line.
             let color = branch_color(s.stub.color);
             let sx = node_cx(s.lane);
-            let sy = stub_node_cy(s.anchor_row, s.stub.depth);
+            let sy = stub_node_cy(placed.display_row, s.stub.depth);
             let name = s.stub.name.clone();
 
             // The stub is a *branch*, not the commit it happens to sit on, so its
