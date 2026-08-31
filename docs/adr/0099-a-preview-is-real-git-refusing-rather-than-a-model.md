@@ -115,8 +115,20 @@ git. Inside `commondir` there is exactly one grant and no new policy.
 The spawn passes the **real repository** as `repo`, so the grant is built from
 it, and selects the store with `--git-dir=<abs>`. `sandbox::network_need` skips
 that as a bare flag and classifies `merge-tree`/`commit-tree`/`show` as
-`NetworkNeed::Local`. **No security-boundary change; nothing under `sandbox/`
-was edited.**
+`NetworkNeed::Local`.
+
+**Amended 2026-08-31 — this paragraph used to end "No security-boundary
+change; nothing under `sandbox/` was edited." That was true when written and
+false by the time anyone read it.** The branch adds **247 lines** under
+`crates/git-vista-server/src/sandbox/`: `spawn.rs` (+169/-5) gained the
+repository-geometry environment scrub that closes audit finding 1 — an
+inherited `GIT_OBJECT_DIRECTORY` redirected preview writes into the real
+object store, measured, objects went 9 to 10 — and `clone_live.rs` (+83) gained
+an `#[ignore]`d live-fetch probe. The scrub *is* a security-boundary change and
+is the most load-bearing fix on this branch. A reviewer who trusted the old
+sentence would have skipped the two files that most needed reading, which is
+exactly why an ADR asserting "nothing was edited" is worse than one that says
+nothing at all.
 
 ```mermaid
 ---
@@ -373,17 +385,23 @@ repository object-for-object only in its new commit.
 reserves lane 0 and seeds colour slot 0 from the ref slice it is handed, so a
 `ref_moves` entry that matched nothing puts the hypothetical commit in lane 1
 with a synthetic colour — a confidently wrong picture drawn from correct data.
-`lay_out_preview` reports **three** ways the `after` graph can disagree with
+`lay_out_preview` reports **four** ways the `after` graph can disagree with
 a real run: two that a caller gets wrong (`unmatched_ref_moves`,
-`added_without_ref_moves`) and one that a **correct** caller produces —
-`added_claimed_by_no_branch`. On a detached HEAD the operation moves `HEAD`
+`added_without_ref_moves`) and two that a **correct** caller produces —
+`added_claimed_by_no_branch` and `added_time_tied`. On a detached HEAD the operation moves `HEAD`
 alone; `assign_branch_colors` seeds only from `is_branch()` refs; so the
 hypothetical row falls into the `~<short oid>` synthetic fallback — a colour
 keyed on an object id that does not exist yet, against a real run whose
 object id is a different one. Five chances in six of differing.
 
-This module treats **any of the three** as `CheckFailed` rather than
-returning the damaged graph. Returning it is not an option.
+This module treats **any of the four** as `CheckFailed` rather than
+returning the damaged graph. The fourth is the same-second ordering tie: when
+the hypothetical commit shares its committer second with a commit the heap
+actually reaches beside it, row order is decided by comparing object id
+strings, and this commit's id is one a real run will never write. Unlike the
+third it resolves itself a second later, and the refusal says so.
+*Amended 2026-08-31, audit finding 6 — this section counted three for two
+commits after the fourth shipped.* Returning it is not an option.
 `a_detached_head_refuses_rather_than_colouring_a_commit_no_branch_claims`
 pins the refusal, and `the_refusal_says_detached_only_when_head_really_is_detached`
 pins that the reason names the state actually found — a single constant

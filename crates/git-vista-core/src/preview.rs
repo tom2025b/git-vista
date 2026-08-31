@@ -223,7 +223,7 @@ pub struct PreviewInput {
 
 /// The two layouts and what differs between them.
 ///
-/// # The three report fields are read together, and they are not independent
+/// # The four report fields are read together, and they are not independent
 ///
 /// **The claim this doc used to make — "a correct preview has *both*
 /// empty/false" — was false, and false in the direction that hid a real
@@ -256,11 +256,16 @@ pub struct PreviewInput {
 /// while a detached-HEAD preview sets `added_claimed_by_no_branch` with
 /// `unmatched_ref_moves` empty.
 ///
-/// A preview whose `after` graph a real run would reproduce has all **three**
-/// clear. That is an accurate statement of what these fields cover and not a
-/// claim that nothing else can go wrong: `added.time` is a fourth precondition
-/// with no field at all, stated on [`PreviewInput::added`] and deliberately not
-/// enforced.
+/// A preview whose `after` graph a real run would reproduce has all **four**
+/// clear.
+///
+/// The fourth, [`added_time_tied`](Self::added_time_tied), was for one round a
+/// precondition with no field at all — `added.time` was documented on
+/// [`PreviewInput::added`] and deliberately not enforced. It has a field now,
+/// and `preview::refusal_for` refuses on it like the other three. This
+/// paragraph said otherwise for two commits after that stopped being true,
+/// which is the drift these docs keep shipping: an outside auditor found it,
+/// not the round that created it.
 ///
 /// Derives `Debug` so a comparison test that disagrees can print what it got.
 #[derive(Debug, Clone)]
@@ -381,22 +386,31 @@ pub struct PreviewLayout {
     /// The preview and a real run commonly share a one-second git timestamp,
     /// so this is an ordinary path rather than an exotic one.
     ///
-    /// # The check is conservative in one direction only
+    /// # It is measured, not modelled — and this paragraph used to say otherwise
     ///
-    /// In-window **ancestors** of `added` are excluded, and that exclusion is a
-    /// proof rather than a heuristic: a commit reachable from `added` through
-    /// in-window parents has `pending_children >= 1` until `added` is emitted,
-    /// so it is never in the heap at the same time as `added` and its oid is
-    /// never compared with `added`'s. Without the exclusion this field would be
-    /// true for the ordinary "commit, then immediately preview a revert" case,
-    /// where the only same-second commit is `added`'s own parent.
+    /// The condition is exact: [`crate::layout::topo_order_with_id_ties`] runs
+    /// the same walk `layout_with_refs` runs, over the same list, and reports
+    /// which ids it decided by comparing id strings. An id comparison happens
+    /// in exactly one circumstance — two entries in the heap at the same
+    /// instant carrying the same second — and that is a fact about the walk's
+    /// state, not about the input. Nothing outside the walk can know it.
     ///
-    /// Everything else that shares the second is flagged, including commits the
-    /// heap would never actually have compared because some other child still
-    /// blocked them. That direction is a needless refusal, never a wrong
-    /// picture, and computing the exact condition would mean either teaching
-    /// `stable_topo_order` to report its own comparisons or writing its tie
-    /// logic out a second time here, where the two copies could drift.
+    /// The first version approximated it with "is this same-second commit an
+    /// in-window ancestor of `added`?", which is sound and strictly too narrow:
+    /// a commit blocked behind any *other* unemitted child also never reaches
+    /// the heap beside `added`, and was refused anyway. This paragraph argued
+    /// that measuring instead would mean "either teaching `stable_topo_order`
+    /// to report its own comparisons or writing its tie logic out a second time
+    /// here, where the two copies could drift". The second objection is right.
+    /// The first is not, and it is what shipped: one walk, one heap, one key, a
+    /// flag deciding only whether the walk records what it observed. There is
+    /// no second copy to drift because there is no second copy.
+    ///
+    /// Pinned by `a_same_second_commit_the_heap_never_reaches_is_not_refused`,
+    /// whose two halves differ in one number — the blocking child's committer
+    /// time — and go red on opposite sides. **Restoring the ancestor predicate
+    /// to make this comment true again reddens that test**, which is the
+    /// intended relationship between the two.
     pub added_time_tied: bool,
 }
 
