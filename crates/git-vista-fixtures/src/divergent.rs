@@ -46,6 +46,34 @@
 //! is visibly — not just technically — wrong. This is what the design's §5
 //! (the A5 parity test) asks for: fixtures where a wrong answer looks
 //! different from a right one.
+//!
+//! **One shape below is a deliberate, stated exception.**
+//! [`fast_forward_merge_ff_false`] needs `main` to be a plain ancestor of
+//! `feature` — that *is* "fast-forwardable" — so `main` cannot also have
+//! commits of its own past the branch point without stopping being that
+//! shape. Its own doc comment explains where the depth goes instead.
+//!
+//! # Why some shapes also pin `merge.ff` in the repository's own local config
+//!
+//! [`fast_forward_merge_ff_false`] and [`divergent_merge_ff_only`] exist
+//! because a preview or a model that decides "will this fast-forward" from
+//! ancestry alone is answering a question git itself does not always answer
+//! that way: `merge.ff` changes what `git merge` actually does on the same
+//! topology. [`crate::git`]'s module doc explains why every builder here
+//! pins `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` to `/dev/null` — so a
+//! fixture's *default* behaviour cannot depend on a developer's own
+//! `~/.gitconfig`. Local, per-repository config is a different layer: it is
+//! measured below, not assumed, to survive that override and to be read both
+//! by an ordinary `git -C <repo> merge` and by `git-vista-server`'s own
+//! preview spawn (`git_cmd::sandboxed` builds its child with `-C <repo>`,
+//! never with a config override of its own). A fixture whose shape depends on
+//! it must therefore set it on itself, in its own `.git/config` — which is
+//! also why [`clone_onto_with_config`] exists: a plain `git clone` does
+//! **not** copy the source repository's local config (measured, 2026-08-30 —
+//! a `merge.ff` value visible on the fixture is simply absent from
+//! `git config --local --get merge.ff` in a fresh clone), so a builder that
+//! wants its own claim proved on a disposable clone, the same way every other
+//! builder here does, has to carry the value across explicitly.
 
 use crate::conflict::{base_commit, stages_of};
 use crate::git;
@@ -93,6 +121,30 @@ fn clone_onto(repo: &std::path::Path, onto: &str) -> (tempfile::TempDir, std::pa
         git::run(&clone, &["branch", short, remote]);
     }
 
+    (scratch, clone)
+}
+
+/// Set `key = value` in `repo`'s own **local** `.git/config` — see the module
+/// doc's "Why some shapes also pin `merge.ff`" section for why this is the
+/// one config layer a fixture built through [`crate::git`] can both reach and
+/// rely on.
+fn set_local_config(repo: &std::path::Path, key: &str, value: &str) {
+    git::run(repo, &["config", "--local", key, value]);
+}
+
+/// [`clone_onto`], then copy each `(key, value)` into the clone's own local
+/// config — because `git clone` does not do that for you. See the module
+/// doc's "Why some shapes also pin `merge.ff`" section for the measurement
+/// this relies on.
+fn clone_onto_with_config(
+    repo: &std::path::Path,
+    onto: &str,
+    config: &[(&str, &str)],
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    let (scratch, clone) = clone_onto(repo, onto);
+    for (key, value) in config {
+        set_local_config(&clone, key, value);
+    }
     (scratch, clone)
 }
 
@@ -208,6 +260,238 @@ pub fn merge_clean_two_branch() -> Fixture {
     (dir, repo)
 }
 
+/// `main`, two commits deep, with `feature` branched off its tip and two
+/// commits **strictly ahead** of it — the shape `git merge` would ordinarily
+/// resolve as a fast-forward, just moving `main`'s ref — except this
+/// repository's own local `merge.ff` is `false`, so a real merge refuses to
+/// fast-forward and writes a genuine two-parent commit instead.
+///
+/// ## Why this is not `merge_clean_two_branch`
+///
+/// [`merge_clean_two_branch`] is two branches that have *each* moved past
+/// their shared base — neither is an ancestor of the other, so **no**
+/// `merge.ff` setting changes what a real merge does there: a merge commit
+/// was already the only possible outcome. This fixture is the opposite
+/// topology, the one a `merge.ff` setting can actually change the outcome
+/// of: `main` never moves past the branch point, so `feature` is strictly
+/// ahead and a default-configured `git merge` would just move `main`'s ref.
+///
+/// ## Why `main` has no commits of its own after the branch point
+///
+/// The module doc's "give both sides real depth" rule cannot hold here: a
+/// fast-forwardable pair means `main` is an ancestor of `feature`, which by
+/// definition means `main` has **zero** commits past the point `feature`
+/// diverged from — a `main` with commits of its own there would not be an
+/// ancestor of `feature` any more, and this would quietly become
+/// `merge_clean_two_branch` again. The depth the module doc asks for is
+/// given **before** the branch point instead: `main` is two commits deep
+/// (`root`, `main: second commit`) when `feature` branches off it and adds
+/// two more of its own, so the graph still has real width above the join —
+/// it is only `main`'s *branch-local* depth, past the point that matters
+/// here, that is necessarily zero.
+///
+/// ## What git actually put on disk
+///
+/// Four commits: `root`, `main: second commit` (both on `main`, which never
+/// moves again after this), then `feature` branches off and adds
+/// `feature: add one.txt` and `feature: add two.txt`. `merge.ff=false` is
+/// written into this repository's own local `.git/config` — see the module
+/// doc's "Why some shapes also pin `merge.ff`" section for why that is the
+/// layer that survives this crate's `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`
+/// overrides.
+///
+/// ## Why it matters
+///
+/// A preview or a model that decides "fast-forward vs. real merge" purely
+/// from ancestry — `merge-base(head, tip) == head` — is *confidently wrong*
+/// on exactly this repository. Measured, 2026-08-30, on a throwaway
+/// repository built this same way: with `merge.ff=false` set locally, a real
+/// `git merge --no-edit feature` from `main` printed "Merge made by the
+/// 'ort' strategy", added one commit to `main`, and gave that new tip **two**
+/// parents — not the zero-commit ref move an ancestry-only classifier would
+/// draw.
+pub fn fast_forward_merge_ff_false() -> Fixture {
+    let (dir, repo) = empty();
+    git::write(&repo, "root.txt", b"root\n");
+    git::run(&repo, &["add", "-A"]);
+    git::run(&repo, &["commit", "-q", "-m", "root"]);
+    git::write(&repo, "main-second.txt", b"main second commit\n");
+    git::run(&repo, &["add", "-A"]);
+    git::run(&repo, &["commit", "-q", "-m", "main: second commit"]);
+
+    git::run(&repo, &["checkout", "-q", "-b", "feature"]);
+    git::write(&repo, "feature-one.txt", b"feature work one\n");
+    git::run(&repo, &["add", "-A"]);
+    git::run(&repo, &["commit", "-q", "-m", "feature: add one.txt"]);
+    git::write(&repo, "feature-two.txt", b"feature work two\n");
+    git::run(&repo, &["add", "-A"]);
+    git::run(&repo, &["commit", "-q", "-m", "feature: add two.txt"]);
+
+    git::run(&repo, &["checkout", "-q", "main"]);
+    set_local_config(&repo, "merge.ff", "false");
+
+    assert_eq!(
+        git::out(&repo, &["rev-list", "--count", "main"]),
+        "2",
+        "main must be root + one commit, and must never move again, or this is not \
+         a fast-forwardable pair"
+    );
+    assert_eq!(
+        git::out(&repo, &["rev-list", "--count", "feature"]),
+        "4",
+        "feature must be main's two commits plus two more of its own, or there is \
+         no width above the join"
+    );
+    assert_eq!(
+        git::out(&repo, &["merge-base", "main", "feature"]),
+        git::out(&repo, &["rev-parse", "main"]),
+        "main must be an ancestor of feature, or this is not fast-forwardable at all"
+    );
+
+    // Read back the value actually on disk, rather than hard-coding "false"
+    // a second time here: a mutation that changed what `set_local_config`
+    // above wrote must be caught by this readback, not silently bypassed by
+    // a verification step that assumes its own answer.
+    let configured_ff = git::out(&repo, &["config", "--local", "--get", "merge.ff"]);
+    assert_eq!(
+        configured_ff, "false",
+        "merge.ff must be set to false on the fixture itself, or its whole claim is unproven"
+    );
+
+    let feature_tip = git::out(&repo, &["rev-parse", "feature"]);
+    let (_scratch, clone) = clone_onto_with_config(&repo, "main", &[("merge.ff", &configured_ff)]);
+    assert!(
+        git::try_run(&clone, &["merge", "--no-edit", "feature"]),
+        "a fast-forwardable merge must still succeed with merge.ff=false — \
+         it is refused as a fast-forward, not blocked outright"
+    );
+    let merged = git::out(&clone, &["rev-parse", "main"]);
+    assert_ne!(
+        merged, feature_tip,
+        "merge.ff=false must produce a NEW commit rather than moving main to \
+         feature's own oid — that is the whole discriminator this fixture exists to prove"
+    );
+    assert_eq!(
+        parent_count(&clone, "main"),
+        2,
+        "a refused fast-forward is a real two-parent merge commit"
+    );
+
+    assert!(
+        !repo.join(".git/MERGE_HEAD").exists(),
+        "the fixture handed back must stay pre-merge: the merge above ran on a clone"
+    );
+    (dir, repo)
+}
+
+/// Two branches, `main` and `rival`, each two commits past a shared base,
+/// touching disjoint files — a real 3-way merge would succeed cleanly under
+/// git's defaults — except this repository's own local `merge.ff` is `only`,
+/// so a real merge **refuses outright** rather than writing that commit.
+///
+/// ## Why this is not a config twist on `merge_clean_two_branch`
+///
+/// [`merge_clean_two_branch`]'s own contract — a real merge of this topology
+/// succeeds — is used elsewhere for the plain clean-merge case and must not
+/// start depending on which config value happens to be set when a caller
+/// reaches for it. This is a separate builder, with its own files and its
+/// own commits, that proves the opposite claim on the same *kind* of
+/// topology: divergent, disjoint files, would merge cleanly under git's
+/// defaults, and still refuses once `merge.ff=only` is set, because neither
+/// branch is an ancestor of the other and `only` accepts nothing but a
+/// fast-forward.
+///
+/// ## What git actually put on disk
+///
+/// Five commits: one base (`shared-b.txt`), two on `main`
+/// (`main-alpha-b.txt`, `main-beta-b.txt`), two on `rival` (`rival-one.txt`,
+/// `rival-two.txt`). `merge.ff=only` is written into this repository's own
+/// local `.git/config`.
+///
+/// ## Why it matters
+///
+/// A preview or a model that decides "will this merge succeed" purely from
+/// "the files don't overlap" is *confidently wrong* here. Measured,
+/// 2026-08-30, on a throwaway repository built this same way: with
+/// `merge.ff=only` set locally, a real `git merge --no-edit rival` from
+/// `main` exited `128` with "Not possible to fast-forward, aborting" and
+/// moved nothing — not the clean merge commit a content-only classifier
+/// would draw.
+pub fn divergent_merge_ff_only() -> Fixture {
+    let (dir, repo) = empty();
+    base_commit(&repo, &[("shared-b.txt", b"shared\n")]);
+
+    git::run(&repo, &["checkout", "-q", "-b", "rival"]);
+    git::write(&repo, "rival-one.txt", b"rival work one\n");
+    git::run(&repo, &["add", "-A"]);
+    git::run(&repo, &["commit", "-q", "-m", "rival: add one.txt"]);
+    git::write(&repo, "rival-two.txt", b"rival work two\n");
+    git::run(&repo, &["add", "-A"]);
+    git::run(&repo, &["commit", "-q", "-m", "rival: add two.txt"]);
+
+    git::run(&repo, &["checkout", "-q", "main"]);
+    git::write(&repo, "main-alpha-b.txt", b"main work alpha\n");
+    git::run(&repo, &["add", "-A"]);
+    git::run(&repo, &["commit", "-q", "-m", "main: add alpha.txt"]);
+    git::write(&repo, "main-beta-b.txt", b"main work beta\n");
+    git::run(&repo, &["add", "-A"]);
+    git::run(&repo, &["commit", "-q", "-m", "main: add beta.txt"]);
+    set_local_config(&repo, "merge.ff", "only");
+
+    assert_eq!(
+        git::out(&repo, &["rev-list", "--count", "main"]),
+        "3",
+        "main must be base + two commits, or the graph has no width to get wrong"
+    );
+    assert_eq!(
+        git::out(&repo, &["rev-list", "--count", "rival"]),
+        "3",
+        "rival must be base + two commits, for the same reason"
+    );
+    let merge_base = git::out(&repo, &["merge-base", "main", "rival"]);
+    assert_ne!(
+        merge_base,
+        git::out(&repo, &["rev-parse", "main"]),
+        "main must not be an ancestor of rival, or merge.ff=only would accept the merge"
+    );
+    assert_ne!(
+        merge_base,
+        git::out(&repo, &["rev-parse", "rival"]),
+        "rival must not be an ancestor of main either — neither side may be a fast-forward"
+    );
+
+    // Read back the value actually on disk, rather than hard-coding "only" a
+    // second time here — see the identical note in
+    // `fast_forward_merge_ff_false` for why.
+    let configured_ff = git::out(&repo, &["config", "--local", "--get", "merge.ff"]);
+    assert_eq!(
+        configured_ff, "only",
+        "merge.ff must be set to only on the fixture itself, or its whole claim is unproven"
+    );
+
+    let (_scratch, clone) = clone_onto_with_config(&repo, "main", &[("merge.ff", &configured_ff)]);
+    let main_before = git::out(&clone, &["rev-parse", "main"]);
+    assert!(
+        !git::try_run(&clone, &["merge", "--no-edit", "rival"]),
+        "merge.ff=only must refuse a merge that is not a fast-forward"
+    );
+    assert_eq!(
+        git::out(&clone, &["rev-parse", "main"]),
+        main_before,
+        "a refused merge must move nothing"
+    );
+    assert!(
+        !clone.join(".git/MERGE_HEAD").exists(),
+        "merge.ff=only refuses before ever starting a merge — there is no MERGE_HEAD to abort"
+    );
+
+    assert!(
+        !repo.join(".git/MERGE_HEAD").exists(),
+        "the fixture handed back must stay pre-merge: the attempt above ran on a clone"
+    );
+    (dir, repo)
+}
+
 /// A branch `topic`, two commits deep from a shared base, whose tip edits a
 /// **different region of the same file** `main`'s own tip already edited —
 /// a genuine three-way merge, not an add of an untouched path, and it applies
@@ -248,6 +532,15 @@ pub fn merge_clean_two_branch() -> Fixture {
 /// a graph whose shape — or whose verdict — is visibly wrong, rather than
 /// accidentally correct because the only path in play was one nothing else
 /// could have touched.
+///
+/// It is also one half of a pair a **tree-comparing** A5 test needs, and
+/// [`cherry_pick_already_applied`] is the other: here, the merged tree is a
+/// real combination of two non-overlapping edits and is provably *not* equal
+/// to `main`'s own tree; there, both sides make the identical edit and the
+/// merged tree is provably *equal* to `main`'s own tree. A test that asserts
+/// tree identity only against one of the two would still pass a preview that
+/// always answers "different" (or always "same") — the pair is what makes a
+/// wrong tree comparison visible in either direction.
 pub fn cherry_pick_clean() -> Fixture {
     let (dir, repo) = empty();
     let ancestor: String = (1..=10).map(|n| format!("line {n}\n")).collect();
@@ -290,6 +583,145 @@ pub fn cherry_pick_clean() -> Fixture {
     assert!(
         !repo.join(".git/CHERRY_PICK_HEAD").exists(),
         "the fixture handed back must stay pre-pick: verify() runs on a clone, not here"
+    );
+    (dir, repo)
+}
+
+/// A branch `topic`, whose tip edits one line of a file — but `main`'s own
+/// tip has **already made the identical edit**, independently, in its own
+/// commit. Cherry-picking `topic`'s tip onto `main` is not "clean" the way
+/// [`cherry_pick_clean`] is: `git cherry-pick` computes an empty patch,
+/// refuses to create a commit, and leaves the repository **mid-sequence**.
+///
+/// ## Why this needs its own topology, not a flag on `cherry_pick_clean`
+///
+/// The discriminator here is not a git setting — it is a **fact about the
+/// two trees**: does the tree a merge of this pick would write already equal
+/// `main`'s current tree? [`cherry_pick_clean`] is built so that fact is
+/// false (the two edits are eight lines apart, so they combine into
+/// something neither side already has); this fixture is built so it is
+/// true — both sides make the *exact same* edit — which is a different
+/// commit graph, not a setting toggled on the same one.
+///
+/// ## What git actually put on disk
+///
+/// `target.txt` starts at the base with ten lines. `topic` has two commits
+/// past base: an unrelated `topic-applied-setup.txt`, then a rewrite of
+/// line 9. `main` has two commits past base: an unrelated
+/// `main-applied-setup.txt`, then the **identical** rewrite of line 9 —
+/// independently authored, not cherry-picked from `topic`.
+///
+/// Measured, 2026-08-30, against this exact shape: `git merge-tree
+/// --write-tree --merge-base=<topic's parent> <main> <topic>` exits `0` (no
+/// conflict) and writes a tree **byte-identical to `main`'s own current
+/// tree** — the fact this builder asserts below, read from git's own
+/// `rev-parse <tree>` output, never from how the builder thinks it built the
+/// commits. A checker that reads "exit 0" alone as "clean, draw an added
+/// commit" would draw a hypothetical commit that changes nothing, for a real
+/// operation that refuses.
+///
+/// A real `git cherry-pick --quiet <topic>` on `main`, separately measured on
+/// a clone: exits non-zero, prints "The previous cherry-pick is now empty,
+/// possibly due to conflict resolution", leaves `.git/CHERRY_PICK_HEAD` on
+/// disk, and leaves the working tree clean (`git status --porcelain` empty)
+/// — a real mid-sequence state a user must resolve with `--skip`,
+/// `--allow-empty`, or `--abort`, not the clean added row a tree-blind
+/// checker would draw.
+///
+/// ## Why it matters
+///
+/// This is the fixture the design's §5 tree-parity discriminator needs and
+/// did not have: something whose cherry-pick handling never compares the
+/// merged tree against `HEAD`'s own tree passes every other cherry-pick
+/// fixture in this catalogue and still has nothing here to catch it drawing
+/// a confidently wrong "added" row for an operation that git itself refuses.
+pub fn cherry_pick_already_applied() -> Fixture {
+    let (dir, repo) = empty();
+    let ancestor: String = (1..=10).map(|n| format!("line {n}\n")).collect();
+    base_commit(&repo, &[("target.txt", ancestor.as_bytes())]);
+    let edited = ancestor.replace("line 9\n", "line 9 edited identically\n");
+
+    git::run(&repo, &["checkout", "-q", "-b", "topic"]);
+    git::write(&repo, "topic-applied-setup.txt", b"topic setup\n");
+    git::run(&repo, &["add", "-A"]);
+    git::run(&repo, &["commit", "-q", "-m", "topic: setup"]);
+    git::write(&repo, "target.txt", edited.as_bytes());
+    git::run(&repo, &["commit", "-q", "-am", "topic: edit line nine"]);
+
+    git::run(&repo, &["checkout", "-q", "main"]);
+    git::write(&repo, "main-applied-setup.txt", b"main setup\n");
+    git::run(&repo, &["add", "-A"]);
+    git::run(&repo, &["commit", "-q", "-m", "main: unrelated setup"]);
+    git::write(&repo, "target.txt", edited.as_bytes());
+    git::run(
+        &repo,
+        &[
+            "commit",
+            "-q",
+            "-am",
+            "main: independently made the identical edit",
+        ],
+    );
+
+    assert_eq!(
+        git::out(&repo, &["rev-list", "--count", "topic"]),
+        "3",
+        "topic must be base + two commits, matching the depth the other cherry-pick shapes carry"
+    );
+    assert_eq!(
+        git::out(&repo, &["rev-list", "--count", "main"]),
+        "3",
+        "main must have equal depth, for the same reason"
+    );
+    assert_eq!(
+        parent_count(&repo, "topic"),
+        1,
+        "topic's tip must be an ordinary single-parent commit, or git cherry-pick needs -m"
+    );
+
+    let pick = git::out(&repo, &["rev-parse", "topic"]);
+    let pick_parent = git::out(&repo, &["rev-parse", "topic^"]);
+    let main_tip = git::out(&repo, &["rev-parse", "main"]);
+    let merge_base_flag = format!("--merge-base={pick_parent}");
+    let raw = git::out(
+        &repo,
+        &[
+            "merge-tree",
+            "-z",
+            "--write-tree",
+            &merge_base_flag,
+            &main_tip,
+            &pick,
+        ],
+    );
+    // `-z`'s clean-case stdout is `<tree oid>\0` — one record, NUL-terminated,
+    // exactly as `git_vista_server::preview::parse_merge_tree_tree` reads it.
+    let tree = raw.split('\u{0}').next().unwrap_or_default().to_string();
+    let main_tree = git::out(&repo, &["rev-parse", "main^{tree}"]);
+    assert_eq!(
+        tree, main_tree,
+        "the whole discriminator: the tree a merge of this pick would write must already be \
+         main's own current tree, or this fixture is just cherry_pick_clean again"
+    );
+
+    let (_scratch, clone) = clone_onto(&repo, "main");
+    let ok = git::try_run(&clone, &["cherry-pick", "--quiet", &pick]);
+    assert!(
+        !ok,
+        "an already-applied pick must refuse — git has nothing left to commit"
+    );
+    assert!(
+        clone.join(".git/CHERRY_PICK_HEAD").exists(),
+        "a refused already-applied pick still leaves the repository mid-sequence"
+    );
+    assert!(
+        git::out(&clone, &["status", "--porcelain"]).is_empty(),
+        "the working tree is clean — the patch really is empty, not merely unresolved"
+    );
+
+    assert!(
+        !repo.join(".git/CHERRY_PICK_HEAD").exists(),
+        "the fixture handed back must stay pre-pick: the attempt above ran on a clone"
     );
     (dir, repo)
 }
@@ -375,6 +807,94 @@ pub fn cherry_pick_conflict() -> Fixture {
     assert!(
         !repo.join(".git/CHERRY_PICK_HEAD").exists(),
         "the fixture handed back must stay pre-pick: verify_conflict() runs on a clone, not here"
+    );
+    (dir, repo)
+}
+
+/// A branch `incoming`, two commits deep from a shared base, whose tip edits
+/// the exact same line of the exact same file `main`'s own tip already
+/// edited — merging `incoming` into `main` conflicts. The `git merge` twin of
+/// [`cherry_pick_conflict`].
+///
+/// ## What git actually put on disk
+///
+/// Both `main` and `incoming` branch from one base commit holding
+/// `shared.txt` at three lines. Each side first makes an unrelated commit,
+/// then rewrites `shared.txt`'s middle line to a different value — the same
+/// modify/modify shape [`crate::conflict::conflict_modify_modify`] documents,
+/// reached here by a pre-merge repository and a real `git merge` run against
+/// a disposable clone, rather than by leaving the conflict on the fixture
+/// itself.
+///
+/// ## Why it matters
+///
+/// Before this fixture there was no conflicting-merge shape in this
+/// catalogue provable **pre-merge**: [`cherry_pick_conflict`] proves
+/// `GitOperation::CherryPick` refuses correctly, and
+/// [`crate::conflict::conflict_modify_modify`] proves what a conflict looks
+/// like once git has already stopped mid-merge, but nothing proved what a
+/// preview of `GitOperation::MergeBranch` must do when the merge it is asked
+/// to draw would conflict: report `Conflict`, never a guessed clean graph. A
+/// checker whose conflict detection is wired only to `merge-tree`'s exit code
+/// on the revert/cherry-pick paths, and never exercised on a real
+/// `git merge`, would pass every other fixture in the catalogue and still
+/// draw a clean graph for this repository.
+pub fn merge_conflict() -> Fixture {
+    let (dir, repo) = empty();
+    base_commit(
+        &repo,
+        &[("shared.txt", b"line one\nline two\nline three\n")],
+    );
+
+    git::run(&repo, &["checkout", "-q", "-b", "incoming"]);
+    git::write(&repo, "incoming-setup.txt", b"incoming setup\n");
+    git::run(&repo, &["add", "-A"]);
+    git::run(&repo, &["commit", "-q", "-m", "incoming: unrelated setup"]);
+    git::write(
+        &repo,
+        "shared.txt",
+        b"line one\nline two edited by incoming\nline three\n",
+    );
+    git::run(&repo, &["commit", "-q", "-am", "incoming: edit line two"]);
+
+    git::run(&repo, &["checkout", "-q", "main"]);
+    git::write(&repo, "main-conflict-setup.txt", b"main setup\n");
+    git::run(&repo, &["add", "-A"]);
+    git::run(&repo, &["commit", "-q", "-m", "main: unrelated setup"]);
+    git::write(
+        &repo,
+        "shared.txt",
+        b"line one\nline two edited by main\nline three\n",
+    );
+    git::run(&repo, &["commit", "-q", "-am", "main: edit line two"]);
+
+    assert_eq!(
+        git::out(&repo, &["rev-list", "--count", "incoming"]),
+        "3",
+        "incoming must be base + two commits, matching the depth the other conflict shapes carry"
+    );
+    assert_eq!(
+        git::out(&repo, &["rev-list", "--count", "main"]),
+        "3",
+        "main must have equal depth, or this is a degenerate one-row conflict"
+    );
+
+    let (_scratch, clone) = clone_onto(&repo, "main");
+    let ok = git::try_run(&clone, &["merge", "--no-edit", "incoming"]);
+    assert!(!ok, "both sides edited the same line and must conflict");
+    assert!(
+        clone.join(".git/MERGE_HEAD").exists(),
+        "a conflicted merge must leave MERGE_HEAD on disk, in the clone"
+    );
+    assert_eq!(
+        stages_of(&clone, "shared.txt"),
+        vec![1, 2, 3],
+        "a modify/modify merge conflict carries all three stages"
+    );
+
+    assert!(
+        !repo.join(".git/MERGE_HEAD").exists(),
+        "the fixture handed back must stay pre-merge: the attempt above ran on a clone"
     );
     (dir, repo)
 }
@@ -524,5 +1044,155 @@ mod tests {
         let _ = git::try_run(&clone, &["cherry-pick", "--quiet", &pick]);
         assert!(clone.join(".git/CHERRY_PICK_HEAD").exists());
         assert!(!clone.join(".git/MERGE_HEAD").exists());
+    }
+
+    /// Pins `fast_forward_merge_ff_false`: a real merge here writes a
+    /// two-parent commit rather than moving `main`'s ref.
+    ///
+    /// Two mutations that must turn this red, in different ways (both caught
+    /// inside the builder — see the note above):
+    /// - **removes the mechanism**: drop the `set_local_config(&repo,
+    ///   "merge.ff", "false")` line (or change `"false"` to `"true"`). A real
+    ///   merge on the clone now fast-forwards: `merged` equals `feature_tip`,
+    ///   and the builder's `assert_ne!(merged, feature_tip, ...)` panics with
+    ///   "must produce a NEW commit".
+    /// - **weakens it**: drop `main: second commit`, leaving `main` a single
+    ///   commit. The fast-forward is still refused, but the builder's own
+    ///   `rev-list --count main == "2"` assertion panics first, with a
+    ///   different message, before the merge is ever attempted.
+    #[test]
+    fn fast_forward_merge_ff_false_refuses_the_fast_forward_and_stays_pre_merge() {
+        let (_dir, repo) = fast_forward_merge_ff_false();
+        assert!(!repo.join(".git/MERGE_HEAD").exists());
+        assert_eq!(
+            git::out(&repo, &["config", "--local", "--get", "merge.ff"]),
+            "false"
+        );
+        let main_before = git::out(&repo, &["rev-parse", "main"]);
+        let feature_tip = git::out(&repo, &["rev-parse", "feature"]);
+        let (_scratch, clone) = clone_onto_with_config(&repo, "main", &[("merge.ff", "false")]);
+        assert!(git::try_run(&clone, &["merge", "--no-edit", "feature"]));
+        let merged = git::out(&clone, &["rev-parse", "main"]);
+        assert_ne!(merged, feature_tip, "must not have fast-forwarded");
+        assert_ne!(
+            merged, main_before,
+            "must have moved from where main started"
+        );
+        assert_eq!(parent_count(&clone, "main"), 2);
+    }
+
+    /// Pins `divergent_merge_ff_only`: a real merge here is refused outright,
+    /// and `main` does not move at all.
+    ///
+    /// Two mutations that must turn this red, in different ways (caught
+    /// inside the builder):
+    /// - **removes the mechanism**: change `"only"` to `"true"` (or drop the
+    ///   `set_local_config` call). The clone's merge now succeeds, and the
+    ///   builder's `assert!(!git::try_run(...))` panics with "must refuse a
+    ///   merge that is not a fast-forward".
+    /// - **weakens it**: drop `rival: add two.txt`, leaving `rival` one
+    ///   commit from base. `merge.ff=only` still refuses the merge (the
+    ///   topology is still divergent), but the builder's own
+    ///   `rev-list --count rival == "3"` assertion panics first, with a
+    ///   different message, before the merge is ever attempted.
+    #[test]
+    fn divergent_merge_ff_only_refuses_the_merge_and_stays_pre_merge() {
+        let (_dir, repo) = divergent_merge_ff_only();
+        assert!(!repo.join(".git/MERGE_HEAD").exists());
+        assert_eq!(
+            git::out(&repo, &["config", "--local", "--get", "merge.ff"]),
+            "only"
+        );
+        let (_scratch, clone) = clone_onto_with_config(&repo, "main", &[("merge.ff", "only")]);
+        let before = git::out(&clone, &["rev-parse", "main"]);
+        assert!(!git::try_run(&clone, &["merge", "--no-edit", "rival"]));
+        assert_eq!(git::out(&clone, &["rev-parse", "main"]), before);
+        assert!(!clone.join(".git/MERGE_HEAD").exists());
+    }
+
+    /// Pins `cherry_pick_already_applied`: the merged tree already equals
+    /// `main`'s own tree, and a real cherry-pick refuses with nothing to
+    /// commit while still leaving `CHERRY_PICK_HEAD` behind.
+    ///
+    /// Three mutations were run, because the first one tried does not land
+    /// where it looks like it should — recorded here so the discriminator's
+    /// own line is not left unproven:
+    /// - **removes the mechanism, and actually fires the discriminator**:
+    ///   make `main`'s edit land on **line 2** instead of line 9 (`topic`
+    ///   still edits line 9). The two edits are eight lines apart, so
+    ///   `merge-tree` now exits `0` and writes a tree holding *both* edits —
+    ///   which is no longer `main`'s own tree (that only has the line-2
+    ///   edit). This is the mutation that actually panics on this builder's
+    ///   `assert_eq!(tree, main_tree, ...)` line, with "the whole
+    ///   discriminator". Measured, 2026-08-30.
+    /// - **removes the mechanism a different way, but is caught earlier**:
+    ///   make `main`'s edit differ from `topic`'s **on the same line** (e.g.
+    ///   `"line 9 edited differently\n"`). Both sides now touch line 9
+    ///   differently from a shared base, so `merge-tree` reports a
+    ///   **conflict** (exit `1`) instead of writing a tree —
+    ///   [`crate::git::out`]'s own generic assertion panics first, with
+    ///   "git … failed", before this builder's tree-identity line is ever
+    ///   reached. Kept here because it is still a real, caught mutation, and
+    ///   because an earlier draft of this comment claimed it landed on the
+    ///   tree-identity assertion — measured, and it does not; the line-2
+    ///   variant above is the one that does.
+    /// - **weakens it**: drop `topic: setup`, leaving `topic` one commit from
+    ///   base. The tree-identity claim still holds, but the builder's own
+    ///   `rev-list --count topic == "3"` assertion panics first, with a
+    ///   different message, before the merge-tree call is ever made.
+    #[test]
+    fn cherry_pick_already_applied_computes_a_no_op_tree_and_stays_pre_pick() {
+        let (_dir, repo) = cherry_pick_already_applied();
+        assert!(!repo.join(".git/CHERRY_PICK_HEAD").exists());
+        let pick = git::out(&repo, &["rev-parse", "topic"]);
+        let pick_parent = git::out(&repo, &["rev-parse", "topic^"]);
+        let main_tip = git::out(&repo, &["rev-parse", "main"]);
+        let merge_base_flag = format!("--merge-base={pick_parent}");
+        let raw = git::out(
+            &repo,
+            &[
+                "merge-tree",
+                "-z",
+                "--write-tree",
+                &merge_base_flag,
+                &main_tip,
+                &pick,
+            ],
+        );
+        let tree = raw.split('\u{0}').next().unwrap_or_default().to_string();
+        assert_eq!(tree, git::out(&repo, &["rev-parse", "main^{tree}"]));
+
+        let (_scratch, clone) = clone_onto(&repo, "main");
+        assert!(!git::try_run(&clone, &["cherry-pick", "--quiet", &pick]));
+        assert!(clone.join(".git/CHERRY_PICK_HEAD").exists());
+        assert!(git::out(&clone, &["status", "--porcelain"]).is_empty());
+    }
+
+    /// Pins `merge_conflict`: the fixture is pre-merge, and a real merge of
+    /// `incoming` into `main` on a clone genuinely conflicts, leaving
+    /// `MERGE_HEAD` and all three index stages — the `git merge` twin of the
+    /// cherry-pick-conflict test above.
+    ///
+    /// Two mutations that must turn this red, in different ways (both caught
+    /// inside the builder):
+    /// - **removes the mechanism**: make `incoming` edit a line `main` never
+    ///   touched (append a fourth line instead of rewriting line two). The
+    ///   clone's merge now succeeds, and the builder's `assert!(!ok, ...)`
+    ///   panics with "must conflict".
+    /// - **weakens it**: drop `incoming: unrelated setup`, leaving `incoming`
+    ///   one commit from base. The merge still conflicts, but the builder's
+    ///   own `rev-list --count incoming == "3"` assertion panics first, with
+    ///   a different message, before the merge is ever attempted.
+    #[test]
+    fn merge_conflict_conflicts_for_real_and_stays_pre_merge() {
+        let (_dir, repo) = merge_conflict();
+        assert!(!repo.join(".git/MERGE_HEAD").exists());
+
+        let (_scratch, clone) = clone_onto(&repo, "main");
+        let ok = git::try_run(&clone, &["merge", "--no-edit", "incoming"]);
+        assert!(!ok, "expected the merge to fail with a conflict");
+        assert!(clone.join(".git/MERGE_HEAD").exists());
+        assert!(!clone.join(".git/CHERRY_PICK_HEAD").exists());
+        assert_eq!(stages_of(&clone, "shared.txt"), vec![1, 2, 3]);
     }
 }

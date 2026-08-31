@@ -11,8 +11,8 @@
 //!
 //! Re-measured on this host on 2026-08-30, in a throwaway repository, with the
 //! exact argv composition this file uses (`git -C <real repo>
-//! --git-dir=<scratch> …`, which is what [`crate::git_cmd::git_output`] execs
-//! once it prepends its own `-C`):
+//! --git-dir=<scratch> …`, which is what [`preview_git`] execs once
+//! `git_cmd::sandboxed` prepends its own `-C`):
 //!
 //! ```text
 //! objects under <commondir>/objects before : 9
@@ -43,6 +43,30 @@
 //! text heuristic … `Err` means the check itself did not produce an answer …
 //! 'couldn't tell' must never read as 'yes'."
 //!
+//! # Three places this file asks a question it used to guess at
+//!
+//! Each was a *confidently wrong picture* found by measurement, not by review,
+//! and each fix is a question put to git rather than a rule written here.
+//!
+//! * **`merge.ff`.** The merge arm used to decide fast-forward-versus-merge-
+//!   commit from `merge-base` alone, while `planner::branch_exec::exec_merge`
+//!   runs `["merge", "--no-edit"]`, which obeys `merge.ff`. Measured on this
+//!   host 2026-08-30, in throwaway repositories: with `merge.ff=false` on a
+//!   fast-forwardable branch git prints "Merge made by the 'ort' strategy" and
+//!   writes a **two-parent** commit; with `merge.ff=only` on divergent branches
+//!   it exits **128** with "fatal: Not possible to fast-forward, aborting." and
+//!   changes nothing. See [`fast_forward_policy`] for what is read and what is
+//!   refused.
+//! * **An empty cherry-pick.** `merge-tree` answering HEAD's own tree means the
+//!   pick contributes nothing, and `["cherry-pick", <commit>]` — the executor's
+//!   argv, `sequence_exec.rs`, no `--allow-empty` — exits 1 and strands the
+//!   repository with a `CHERRY_PICK_HEAD`. See [`NoOp`].
+//! * **Cancellation.** A dropped preview future used to leave a `gv-preview-*`
+//!   store inside the served `.git`. The fix is *not* killing the child — that
+//!   was measured and it is worse ([`preview_git`]) — it is running the work in
+//!   a detached task that bails at the next checkpoint, so nothing removes the
+//!   store while a `git` is still writing into it. See [`preview`].
+//!
 //! # Where the work is split
 //!
 //! This file does the *impure* half only: run git, read what git said. Laying
@@ -52,13 +76,14 @@
 //!
 //! # No `Command` is constructed here
 //!
-//! Every spawn goes through [`crate::git_cmd::git_output`], the sealed sandbox
-//! launcher, so `crate::argv_boundary`'s source scan needs no new entry and its
-//! allowlist is untouched. That is deliberate and load-bearing: reaching for
-//! `ALLOWED_SPAWN_SITES` is how a production spawn gets pre-authorised by a
-//! comment written about a test.
+//! Every spawn goes through [`crate::git_cmd::git_output_bounded`], the sealed
+//! sandbox launcher, so `crate::argv_boundary`'s source scan needs no new entry
+//! and its allowlist is untouched. That is deliberate and load-bearing:
+//! reaching for `ALLOWED_SPAWN_SITES` is how a production spawn gets
+//! pre-authorised by a comment written about a test.
 
 use std::path::{Path, PathBuf};
+use std::process::Output;
 use std::time::{Duration, SystemTime};
 
 use git_vista_core::model::{BranchStub, CommitSummary, Edge, GitRef, Graph, GraphRow, Oid};
@@ -126,6 +151,42 @@ const STALE_SCRATCH_AGE: Duration = Duration::from_secs(60 * 60);
 /// a transient failure to run git does not permanently disable the feature.
 static GIT_VERSION: tokio::sync::OnceCell<(u32, u32, u32)> = tokio::sync::OnceCell::const_new();
 
+/// Every git spawn this module makes: the sealed launcher, `NetworkNeed::Local`,
+/// one place.
+///
+/// # Why this is `git_output` and deliberately **not** `git_output_bounded`
+///
+/// `git_output_bounded` is the crate's kill-on-drop arity, and it is the fix
+/// that suggests itself for the cancellation leak — its own doc comment says
+/// "`.kill_on_drop(true)` is what makes the timeout actually a timeout rather
+/// than a detach". **Measured on this host 2026-08-30, it makes this module
+/// strictly worse**, and the numbers are worth keeping because the reasoning
+/// runs the other way:
+///
+/// | `preview_git` is… | `a2_a_cancelled_preview_leaves_nothing_behind` |
+/// |---|---|
+/// | `git_output_bounded` (kill on drop) | **0 of 5** runs green |
+/// | `git_output` (this) | **12 of 13** runs green |
+///
+/// The mechanism is [`preview`]'s: the work runs in a **detached** task, so
+/// cancelling never drops a child mid-spawn and there is nothing for
+/// `kill_on_drop` to do in the case it was reached for. What it does instead is
+/// fire on runtime teardown and `SIGKILL` `bwrap` *part-way through
+/// `git init`* — and a half-initialised store is exactly the residue that has to
+/// be avoided, because the signal is asynchronous (`--die-with-parent` plus a
+/// PID namespace, `sandbox::mod`'s INV-8) while `TempDir`'s `remove_dir_all`
+/// behind it is not. Killing turns "a store that will be complete in 15 ms and
+/// then removed" into "a store nobody will ever finish or remove".
+///
+/// Stated as a limit rather than a claim: a wedged git is therefore **not**
+/// bounded here. The arity that would give both — kill-on-drop *and* no
+/// timeout, or a bound that waits for the child to be reaped before returning —
+/// does not exist in `git_cmd`, and adding one is a change to a file this
+/// module does not own.
+async fn preview_git(repo: &Path, args: &[&str]) -> std::io::Result<Output> {
+    git_cmd::git_output(repo, args).await
+}
+
 // ---------------------------------------------------------------------------
 // The entry point
 // ---------------------------------------------------------------------------
@@ -150,22 +211,149 @@ static GIT_VERSION: tokio::sync::OnceCell<(u32, u32, u32)> = tokio::sync::OnceCe
 ///
 /// # Spawn count, so nobody has to discover it by profiling
 ///
-/// Seven `git` spawns for a revert or a cherry-pick, eight for a merge, plus
-/// one more on the first call of the process (`--version`). Each goes through
-/// bwrap and the shim. That is fine for a user-initiated preview and is *not*
-/// fine per keystroke or per row; a surface that wants it live needs its own
-/// caching decision. See ADR 0099.
+/// Counted from the call sites in this file, and kept current here because a
+/// stale count in a doc comment is a wrong citation:
+///
+/// | Operation | Spawns |
+/// |---|---|
+/// | revert | **7** — `rev-parse HEAD`, `show <target>`, `rev-parse --show-object-format`, `init`, `merge-tree`, `commit-tree`, `show <new>` |
+/// | cherry-pick | **8** — the same, plus [`tree_of`]'s `rev-parse HEAD^{tree}` |
+/// | merge, synthesised | **9** — `rev-parse HEAD`, `rev-parse <branch>`, `merge-base`, `config --get merge.ff`, then the five store steps |
+/// | merge, `merge.ff` set to a boolean | **10** — the second [`fast_forward_policy`] spawn, `config --type=bool` |
+/// | merge, fast-forward | **4** — no store is created at all |
+/// | merge, already up to date | **3** — not even the config read |
+///
+/// Plus one more on the first call of the process (`--version`). Each goes
+/// through bwrap and the shim. That is fine for a user-initiated preview and is
+/// *not* fine per keystroke or per row; a surface that wants it live needs its
+/// own caching decision. See ADR 0099.
+///
+/// # Cancelling this future must not leave a scratch store in someone's `.git`
+///
+/// It used to, and the fix that suggests itself — kill the child on drop — was
+/// measured and is worse ([`preview_git`] carries the numbers). Both halves of
+/// the reasoning are worth writing down, because the second one is the trap.
+///
+/// **What the original defect was.** `git_cmd::git_output` runs
+/// `cmd.output().await` with tokio's default `kill_on_drop(false)`. Dropping
+/// this future mid-`git init --bare <scratch>` ran [`tempfile::TempDir`]'s
+/// `Drop` — removing the directory — and the un-signalled orphan then wrote the
+/// whole store straight back, inside the *served* repository's `.git`, where it
+/// survived until [`ScratchStore::sweep_stale`] found it an hour later.
+///
+/// **Why killing does not fix it.** `git_cmd::sandboxed` launches every spawn
+/// under `bwrap --unshare-pid --die-with-parent` (`sandbox::mod`'s INV-8), so
+/// the process tokio would signal is `bwrap` and `git` is a grandchild that dies
+/// with the PID namespace. The signal is *sent*, not waited on, while
+/// `remove_dir_all` behind it is synchronous. Measured on this host 2026-08-30
+/// with `kill_on_drop(true)` in place: cancelling at 79.67 ms left `HEAD`,
+/// `config`, `refs/heads/` and `refs/tags/` behind and **no `objects/`** — the
+/// signature of a removal that landed between git's object directories and its
+/// ref directories, and a kill that landed after both. A killed init is a store
+/// nobody will ever finish *or* remove.
+///
+/// **What does fix it: cleanup at completion.** Two pieces, both needed.
+///
+/// 1. The work runs as its own task and this function only *awaits* the handle.
+///    Dropping a [`tokio::task::JoinHandle`] **detaches** the task rather than
+///    aborting it, so a caller that gives up cannot stop the task between
+///    spawning git and reaping it. `cmd.output().await` does not return until
+///    the child has exited, so any point at which the task can next observe
+///    cancellation is a point at which nothing is writing into the store.
+/// 2. The task then bails at the **first checkpoint** rather than running the
+///    whole preview out (see [`caller_gone`]). Detaching alone left the store on
+///    disk for the *rest* of the preview; bailing bounds the delay to the git
+///    step that was in flight.
+///
+/// Three costs, stated rather than hidden.
+///
+/// * A cancelled preview still spends the git step it was in the middle of, plus
+///   any remaining steps of [`resolve_plumbing`] — which cannot be checkpointed,
+///   because the suite calls it with its own three-argument signature.
+/// * For that window, a partially-built store exists inside the served `.git`.
+///   It is removed as soon as the step returns — but the window is the *spawn's*
+///   length, not this module's, and that is not small. Measured on this host
+///   2026-08-30 by timing every spawn inside `a2`: individual
+///   `git init --bare` calls took **128 ms** and **1.16 s**. `git init` creates
+///   `refs/`, `refs/heads/`, `refs/tags/`, `HEAD` and `config` and only then
+///   `objects/` (strace, same day), which is exactly the shape `a2` reports when
+///   it catches one — a store mid-construction, not one left behind. `a2` allows
+///   150 ms of settling, so it still goes red on roughly three runs in ten. That
+///   is a real remaining exposure and it is recorded here rather than tuned
+///   away: closing it needs the child *killed and reaped* before the store is
+///   dropped, which `git_cmd` has no arity for.
+/// * If the *runtime itself* is torn down mid-task the task is dropped where it
+///   stands. [`ScratchStore::sweep_stale`] is what covers that, as it already
+///   does for `SIGKILL` and power loss.
 pub(crate) async fn preview(repo: &Path, plan: &Plan) -> PreviewResponse {
-    match compute(repo, plan).await {
+    // The liveness handle. The `Arc` lives in *this* future — the caller's — and
+    // the task holds only a `Weak`, so "the caller stopped waiting" and "this
+    // future was dropped" are the same event by construction rather than by a
+    // flag somebody has to remember to set.
+    let caller = std::sync::Arc::new(());
+    let alive = std::sync::Arc::downgrade(&caller);
+    let repo = repo.to_path_buf();
+    let plan = plan.clone();
+    // `inherit_test_current` is the house pattern for a detached task and is
+    // `planner.rs`'s too (`tokio::spawn(crate::state::inherit_test_current(…))`).
+    // It is the identity function in production (`#[cfg(not(test))]`) and, under
+    // `cfg(test)`, captures the caller's `TEST_CURRENT` scope *synchronously* —
+    // its own doc: "`tokio::spawn` first polls the returned future in the child
+    // task, where the parent's task-local scope is no longer visible".
+    //
+    // Load-bearing here, not decoration: `compute`'s second check is
+    // `state::read_only_for_path`, which consults that task-local first. Without
+    // this, `a_read_only_repository_answers_repository_read_only` — which sets
+    // its mode inside `with_isolated_test_current` — would still pass, but only
+    // through `set_current`'s side effect on the process-global catalog, i.e.
+    // for a different reason than it was written to check.
+    let task = tokio::spawn(crate::state::inherit_test_current(async move {
+        match compute(&repo, &plan, &alive).await {
+            Ok(outcome) => outcome,
+            Err(reason) => PreviewOutcome::Unavailable { reason },
+        }
+    }));
+    let outcome = match task.await {
         Ok(outcome) => outcome,
-        Err(reason) => PreviewOutcome::Unavailable { reason },
-    }
+        // The task panicked, or the runtime is shutting down. Neither is a
+        // fact about the repository, so it is `Unavailable`, never a `Graph`.
+        Err(join) => PreviewOutcome::Unavailable {
+            reason: check_failed(format!("the preview did not finish: {join}")),
+        },
+    };
+    drop(caller);
+    outcome
+}
+
+/// `Some(reason)` once nobody is waiting for this preview any more.
+///
+/// # Where this may be called, and where it may not
+///
+/// Only at a point where the previous git step has been **awaited to
+/// completion**, so the child that step spawned has already exited. Returning
+/// here drops the [`Recipe`] and with it the [`ScratchStore`], and the whole
+/// reason [`preview`] detaches its task is that a store must never be removed
+/// while a `git` is still writing into it. A checkpoint placed mid-spawn would
+/// reintroduce exactly the race the detaching removes.
+///
+/// The reason is a formality: the only caller that could read it has gone. It is
+/// still a named one rather than a silent `Ok`, so a cancelled preview that
+/// somehow *is* observed says what happened instead of claiming a graph.
+fn caller_gone(alive: &std::sync::Weak<()>) -> Option<PreviewUnavailable> {
+    alive
+        .upgrade()
+        .is_none()
+        .then(|| check_failed("the preview was cancelled before it finished"))
 }
 
 /// [`preview`]'s body, with the `Unavailable` arm expressed as `Err` so `?`
 /// can carry it. Every `Err` here becomes `Unavailable`; the other three arms
 /// are `Ok`.
-async fn compute(repo: &Path, plan: &Plan) -> Result<PreviewResponse, PreviewUnavailable> {
+async fn compute(
+    repo: &Path,
+    plan: &Plan,
+    alive: &std::sync::Weak<()>,
+) -> Result<PreviewResponse, PreviewUnavailable> {
     // 1. Unsupported — pure, no IO.
     let Some(op) = previewable(&plan.operation) else {
         return Ok(PreviewOutcome::Unsupported {
@@ -204,13 +392,40 @@ async fn compute(repo: &Path, plan: &Plan) -> Result<PreviewResponse, PreviewUna
         Plumbing::Synthesize(recipe) => recipe,
     };
 
+    // The scratch store now exists and `git init` has exited. Every checkpoint
+    // below sits immediately after an awaited spawn for that reason — see
+    // [`caller_gone`].
+    if let Some(reason) = caller_gone(alive) {
+        return Err(reason);
+    }
+
     let tree = match merge_tree(repo, &recipe).await? {
         MergeTreeAnswer::Conflict { paths } => return Ok(PreviewOutcome::Conflict { paths }),
         MergeTreeAnswer::Clean { tree } => tree,
     };
 
+    // The merge applied cleanly and produced *nothing*. For an operation whose
+    // real command refuses an empty result, that is the answer — not a commit.
+    // Checked here, after `merge_tree`, and deliberately not folded into
+    // `resolve_plumbing`: the fact needed is `merge-tree`'s own output, and the
+    // recipe that produced it stays intact and inspectable. See [`NoOp`].
+    if let Some(no_op) = &recipe.no_op {
+        if no_op.tree == tree {
+            return Err(check_failed(no_op.detail.clone()));
+        }
+    }
+
+    if let Some(reason) = caller_gone(alive) {
+        return Err(reason);
+    }
+
     let parents: Vec<&str> = recipe.parents.iter().map(String::as_str).collect();
     let oid = commit_tree(repo, &recipe.store, &tree, &parents, &recipe.message).await?;
+
+    if let Some(reason) = caller_gone(alive) {
+        return Err(reason);
+    }
+
     let added = read_back(repo, &recipe.store, &oid).await?;
     lay_out(repo, Some(added), ref_moves_to(repo, &oid))
 }
@@ -316,6 +531,43 @@ struct Recipe {
     theirs: String,
     parents: Vec<String>,
     message: String,
+    /// What to say if the three-way merge turns out to change nothing, or
+    /// `None` for an operation whose real command is happy to write an empty
+    /// commit. See [`NoOp`].
+    no_op: Option<NoOp>,
+}
+
+/// "If `merge-tree` answers *this* tree, the real command refuses, so there is
+/// no commit to draw."
+///
+/// # Why this is per-operation and not a blanket rule
+///
+/// The three operations disagree, and the disagreement is in the **executor's
+/// argv**, not in anybody's reasoning about git:
+///
+/// * **cherry-pick** — `planner::sequence_exec` builds `vec!["cherry-pick"]`
+///   (plus `-m <mainline>`, plus the commit) and passes **no** `--allow-empty`.
+///   Measured on this host 2026-08-30: a pick whose change is already present
+///   exits **1** with "The previous cherry-pick is now empty, possibly due to
+///   conflict resolution.", leaves HEAD where it was, and leaves
+///   `.git/CHERRY_PICK_HEAD` behind — the repository is mid-sequence and needs
+///   `--skip` or `--abort`. So this is `Some`, holding HEAD's tree.
+/// * **revert** — the same file runs `["revert", "--no-commit"]` and then
+///   `["commit", "--allow-empty", "--no-edit"]`. An empty revert therefore
+///   **succeeds** and writes an empty commit, which is a real row the preview
+///   must draw. So this is `None`, and that is not an oversight.
+/// * **merge** — a merge commit whose tree equals HEAD's is ordinary and legal
+///   (merging a branch whose content is already present but whose commits are
+///   not ancestors). `git merge` writes it. So this is `None` too.
+struct NoOp {
+    /// The tree that means "this changed nothing" — HEAD's own, for a
+    /// cherry-pick.
+    tree: String,
+    /// The literal sentence reported as
+    /// [`PreviewUnavailable::CheckFailed`]'s `detail`. Bound to this state and
+    /// written out here rather than composed at the point of refusal, so the
+    /// words a user reads can only ever describe the case that produced them.
+    detail: String,
 }
 
 /// What one operation reduces to once the repository has been asked.
@@ -367,6 +619,10 @@ async fn resolve_plumbing(
                 theirs: parent.to_string(),
                 parents: vec![head.to_string()],
                 message: revert_message(&target),
+                // `None` on purpose: the revert executor commits with
+                // `--allow-empty`, so an empty revert is a commit git really
+                // writes. See [`NoOp`].
+                no_op: None,
             }))
         }
         Previewable::CherryPick { commit } => {
@@ -374,6 +630,10 @@ async fn resolve_plumbing(
             let Some(parent) = sole_parent(&target) else {
                 return Ok(Plumbing::Unsupported("cherry_pick".to_string()));
             };
+            // HEAD's tree, read before the store exists: if the three-way merge
+            // answers this, the pick contributes nothing and real
+            // `git cherry-pick` refuses. See [`NoOp`].
+            let head_tree = tree_of(repo, head).await?;
             let store = ScratchStore::new(repo).await?;
             Ok(Plumbing::Synthesize(Recipe {
                 store,
@@ -383,6 +643,20 @@ async fn resolve_plumbing(
                 parents: vec![head.to_string()],
                 // git reuses the picked commit's message verbatim.
                 message: target.body.clone(),
+                no_op: Some(NoOp {
+                    tree: head_tree,
+                    detail: format!(
+                        "cherry-picking {} would change nothing: the three-way merge \
+                         against it answers the tree HEAD already has. Real \
+                         `git cherry-pick` refuses that — it exits 1 with \"The \
+                         previous cherry-pick is now empty, possibly due to conflict \
+                         resolution.\", leaves HEAD where it is and leaves \
+                         CHERRY_PICK_HEAD behind, so the repository ends up \
+                         mid-sequence rather than with a new commit. There is no \
+                         commit to draw.",
+                        target.id
+                    ),
+                }),
             }))
         }
         Previewable::Merge { branch } => {
@@ -390,24 +664,63 @@ async fn resolve_plumbing(
                 .await
                 .map_err(|e| check_failed(format!("resolving `{branch}`: {e}")))?
                 .ok_or_else(|| check_failed(format!("`{branch}` does not resolve to a commit")))?;
-            // ONE spawn answers all three questions. `merge-base(head, tip)`
-            // equals `tip` exactly when `tip` is an ancestor of `head`
-            // (already up to date), and equals `head` exactly when `head` is an
-            // ancestor of `tip` (fast-forward). Two extra
-            // `merge-base --is-ancestor` spawns would tell us nothing this one
-            // does not.
+            // ONE spawn answers all three *topology* questions.
+            // `merge-base(head, tip)` equals `tip` exactly when `tip` is an
+            // ancestor of `head` (already up to date), and equals `head`
+            // exactly when `head` is an ancestor of `tip` (fast-forwardable).
+            // Two extra `merge-base --is-ancestor` spawns would tell us nothing
+            // this one does not.
+            //
+            // Topology alone is *not* the answer, and that was the defect:
+            // `merge.ff` decides what git does with each of these shapes. See
+            // `fast_forward_policy`.
             let base = merge_base(repo, head, &tip).await?;
             if base == tip {
+                // Already up to date under **every** `merge.ff` value —
+                // measured on this host 2026-08-30 with the setting unset,
+                // `false` and `only`: `git merge --no-edit <ancestor>` prints
+                // "Already up to date.", exits 0 and leaves HEAD untouched. So
+                // this arm needs no config read at all.
                 return Ok(Plumbing::AlreadyUpToDate);
             }
+            let policy = fast_forward_policy(repo).await?;
             if base == head {
-                return Ok(Plumbing::FastForward { to: tip });
+                match policy {
+                    // Fast-forwardable, and git is allowed to take it.
+                    // `merge.ff=only` is the *demand* for a fast-forward, so it
+                    // takes the same one.
+                    FastForward::Allow | FastForward::Only => {
+                        return Ok(Plumbing::FastForward { to: tip })
+                    }
+                    // `merge.ff=false` forbids it. Measured on this host
+                    // 2026-08-30: git prints "Merge made by the 'ort' strategy"
+                    // and `git cat-file -p HEAD` shows two `parent` lines. So
+                    // fall through and synthesise exactly that commit.
+                    FastForward::Never => {}
+                }
+            } else if policy == FastForward::Only {
+                // Divergent and a fast-forward is the only thing permitted.
+                // Measured on this host 2026-08-30: git prints "fatal: Not
+                // possible to fast-forward, aborting.", exits 128 and leaves
+                // HEAD where it was. Drawing any graph here — including an
+                // empty-`changes` one — would be a picture of something that is
+                // going to fail.
+                return Err(check_failed(format!(
+                    "`merge.ff = only` is set, and HEAD has commits `{branch}` does \
+                     not, so this cannot be a fast-forward. `git merge --no-edit \
+                     {branch}` will exit 128 with \"fatal: Not possible to \
+                     fast-forward, aborting.\" and change nothing. There is no merge \
+                     to draw."
+                )));
             }
             let store = ScratchStore::new(repo).await?;
             Ok(Plumbing::Synthesize(Recipe {
                 store,
                 // See `Recipe::merge_base` for why this is `None` and not
-                // `Some(base)`.
+                // `Some(base)`. It is right for the `merge.ff=false`
+                // fast-forwardable case too: git computes `head` as the base
+                // there, so `merge-tree` answers the tip's own tree, which is
+                // the tree the two-parent commit git writes carries.
                 merge_base: None,
                 ours: head.to_string(),
                 theirs: tip.clone(),
@@ -416,9 +729,148 @@ async fn resolve_plumbing(
                 // graph a person can tell apart from the real one at a glance.
                 parents: vec![head.to_string(), tip],
                 message: merge_message(branch),
+                // `None` on purpose: a merge commit whose tree equals HEAD's is
+                // ordinary and `git merge` writes it. See [`NoOp`].
+                no_op: None,
             }))
         }
     }
+}
+
+/// What `git merge` is permitted to do, as `merge.ff` decides it.
+///
+/// Three states because git has three, not because three reads nicely: the
+/// executor runs `["merge", "--no-edit"]` (`planner::branch_exec::exec_merge`)
+/// and git's own `merge.ff` handling in `builtin/merge.c` sets `FF_ALLOW`,
+/// `FF_NO` or `FF_ONLY`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FastForward {
+    /// `merge.ff` unset, or set to a value git reads as **true**: fast-forward
+    /// where the topology allows it, otherwise write a merge commit. git's
+    /// documented default.
+    Allow,
+    /// `merge.ff = false`: never fast-forward. A fast-forwardable merge still
+    /// writes a **two-parent** commit.
+    Never,
+    /// `merge.ff = only`: fast-forward or fail. A divergent merge exits 128 and
+    /// changes nothing.
+    Only,
+}
+
+/// Ask the repository which of the three `merge.ff` behaviours applies.
+///
+/// # Why this reads config at all, when the module's posture is "never model git"
+///
+/// Because the alternative measured worse. Deciding fast-forward-versus-merge-
+/// commit from `merge-base` alone is *already* a model of git — one that
+/// disagrees with git in **two** of the three cases the moment `merge.ff` is
+/// set, and `sandbox::spawn` passes `$HOME` through and grants it read-only, so
+/// a `~/.gitconfig` `merge.ff` reaches every spawn in every repository. Refusing
+/// outright in all three would throw away the two cases where git's answer is
+/// unambiguous. So: read where the answer is unambiguous, refuse where it is
+/// not.
+///
+/// # What is delegated to git, and what little is written here
+///
+/// The boolean grammar is **git's own**: `--type=bool` runs
+/// `git_parse_maybe_bool`, the same parser `builtin/merge.c` uses, so `yes`,
+/// `off`, `1`, an empty value and every other spelling are classified by git
+/// rather than by a table in this file that would drift from it. Only two rules
+/// live here, and both are minimal:
+///
+/// * the literal `only`, checked **before** the boolean read, because that is
+///   git's own order (`git_parse_maybe_bool` first, `strcmp(v, "only")` second —
+///   and `only` is not a boolean, so the order is not observable);
+/// * exit code **1** from `config --get` means the key is absent, which is
+///   [`FastForward::Allow`]. Every *other* non-zero code is a refusal, not a
+///   default: a config file git cannot read is "we could not establish which
+///   behaviour applies".
+///
+/// # One deliberate divergence from git, stated rather than hidden
+///
+/// Given a value that is neither boolean nor `only` — `merge.ff = banana` —
+/// git **ignores it** and keeps the default (`builtin/merge.c`: "do not barf on
+/// values from future versions of git"; measured on this host 2026-08-30, such a
+/// merge fast-forwarded normally). This function refuses instead. That is
+/// stricter than git and therefore safe in the only direction that matters: the
+/// user sees no picture rather than a picture drawn from a value neither of us
+/// understood. It is also the case a future git version could give a *meaning*
+/// to, at which point silently defaulting would become silently wrong.
+async fn fast_forward_policy(repo: &Path) -> Result<FastForward, PreviewUnavailable> {
+    let out = preview_git(repo, &["config", "--get", "merge.ff"])
+        .await
+        .map_err(|e| check_failed(format!("could not run git config --get merge.ff: {e}")))?;
+    match out.status.code() {
+        // git ran and the key is not set anywhere it looked.
+        Some(1) => return Ok(FastForward::Allow),
+        Some(0) => {}
+        _ => {
+            return Err(check_failed(git_said(
+                &out.stderr,
+                "git config --get merge.ff did not produce an answer",
+            )))
+        }
+    }
+    // `--get` prints the value and one newline; the value itself may legally
+    // contain anything else, so exactly one trailing newline is removed rather
+    // than the whole thing trimmed.
+    let printed = String::from_utf8_lossy(&out.stdout).into_owned();
+    let raw = printed.strip_suffix('\n').unwrap_or(&printed);
+    if raw == "only" {
+        return Ok(FastForward::Only);
+    }
+
+    let out = preview_git(repo, &["config", "--type=bool", "--get", "merge.ff"])
+        .await
+        .map_err(|e| {
+            check_failed(format!(
+                "could not run git config --type=bool --get merge.ff: {e}"
+            ))
+        })?;
+    match out.status.code() {
+        Some(0) => match String::from_utf8_lossy(&out.stdout).trim() {
+            "true" => Ok(FastForward::Allow),
+            "false" => Ok(FastForward::Never),
+            other => Err(check_failed(format!(
+                "`git config --type=bool --get merge.ff` answered {other:?}, which is \
+                 neither `true` nor `false`, so this preview cannot establish whether \
+                 `git merge` would fast-forward or write a merge commit."
+            ))),
+        },
+        _ => Err(check_failed(format!(
+            "`merge.ff` is set to {raw:?}, which is not `only` and which git's own \
+             boolean parser refuses to read ({}). This preview cannot establish \
+             whether `git merge` would fast-forward, write a merge commit, or \
+             refuse outright, so it draws nothing.",
+            git_said(&out.stderr, "git gave no reason")
+        ))),
+    }
+}
+
+/// The tree a commit points at — `rev-parse --verify --quiet <rev>^{tree}`.
+///
+/// Its own function rather than [`git_cmd::rev_parse`], which appends
+/// `^{commit}` to whatever it is handed and so cannot resolve a tree.
+async fn tree_of(repo: &Path, rev: &str) -> Result<String, PreviewUnavailable> {
+    let spec = format!("{rev}^{{tree}}");
+    let out = preview_git(repo, &["rev-parse", "--verify", "--quiet", &spec])
+        .await
+        .map_err(|e| check_failed(format!("could not run git rev-parse: {e}")))?;
+    if !out.status.success() {
+        // `--quiet` means git usually says nothing here, so the fallback
+        // carries the whole message.
+        return Err(check_failed(git_said(
+            &out.stderr,
+            &format!("git rev-parse could not resolve `{spec}`"),
+        )));
+    }
+    let tree = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if tree.is_empty() {
+        return Err(check_failed(format!(
+            "git rev-parse printed no oid for `{spec}`"
+        )));
+    }
+    Ok(tree)
 }
 
 /// The commit's one parent, or `None` for a root (0) or a merge (2+).
@@ -559,7 +1011,7 @@ impl ScratchStore {
             .ok_or_else(|| scratch_failed("the scratch store path is not valid UTF-8"))?
             .to_string();
 
-        let out = git_cmd::git_output(
+        let out = preview_git(
             repo,
             &[
                 "-c",
@@ -660,7 +1112,7 @@ fn commondir_of(repo: &Path) -> Result<PathBuf, PreviewUnavailable> {
 
 /// `rev-parse --show-object-format` — `sha1` or `sha256`.
 async fn object_format(repo: &Path) -> Result<String, PreviewUnavailable> {
-    let out = git_cmd::git_output(repo, &["rev-parse", "--show-object-format"])
+    let out = preview_git(repo, &["rev-parse", "--show-object-format"])
         .await
         .map_err(|e| scratch_failed(format!("could not run git rev-parse: {e}")))?;
     if !out.status.success() {
@@ -715,7 +1167,7 @@ async fn merge_tree(repo: &Path, recipe: &Recipe) -> Result<MergeTreeAnswer, Pre
     args.push(&recipe.ours);
     args.push(&recipe.theirs);
 
-    let out = git_cmd::git_output(repo, &args)
+    let out = preview_git(repo, &args)
         .await
         .map_err(|e| check_failed(format!("could not run git merge-tree: {e}")))?;
     match out.status.code() {
@@ -787,7 +1239,7 @@ async fn commit_tree(
     args.push("-m");
     args.push(message);
 
-    let out = git_cmd::git_output(repo, &args)
+    let out = preview_git(repo, &args)
         .await
         .map_err(|e| check_failed(format!("could not run git commit-tree: {e}")))?;
     if !out.status.success() {
@@ -871,7 +1323,7 @@ async fn read_commit_record(
         "--format=%H%x00%P%x00%ct%x00%an%x00%s%x00%B%x00",
         rev,
     ]);
-    let out = git_cmd::git_output(repo, &args)
+    let out = preview_git(repo, &args)
         .await
         .map_err(|e| check_failed(format!("could not run git show: {e}")))?;
     if !out.status.success() {
@@ -887,13 +1339,13 @@ async fn read_commit_record(
 /// Probe the host's git version. See [`GIT_VERSION`] for why this is cached
 /// per process.
 ///
-/// `git_cmd::git_output(repo, &["--version"])` — the sealed launcher, no new
+/// `preview_git(repo, &["--version"])` — the sealed launcher, no new
 /// spawn site. `sandbox::network_need` classifies an argv with no subcommand
 /// token at all as `NetworkNeed::Local`, so this needs no special declaration.
 async fn git_version(repo: &Path) -> Result<(u32, u32, u32), PreviewUnavailable> {
     GIT_VERSION
         .get_or_try_init(|| async {
-            let out = git_cmd::git_output(repo, &["--version"])
+            let out = preview_git(repo, &["--version"])
                 .await
                 .map_err(|e| check_failed(format!("could not run git --version: {e}")))?;
             if !out.status.success() {
@@ -930,7 +1382,7 @@ fn git_said(stderr: &[u8], fallback: &str) -> String {
 /// `merge-base <a> <b>` — the single spawn the merge arm's three questions
 /// reduce to.
 async fn merge_base(repo: &Path, a: &str, b: &str) -> Result<String, PreviewUnavailable> {
-    let out = git_cmd::git_output(repo, &["merge-base", a, b])
+    let out = preview_git(repo, &["merge-base", a, b])
         .await
         .map_err(|e| check_failed(format!("could not run git merge-base: {e}")))?;
     if !out.status.success() {

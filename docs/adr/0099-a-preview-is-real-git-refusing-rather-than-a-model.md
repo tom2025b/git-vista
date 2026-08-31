@@ -58,8 +58,13 @@ flowchart TD
 ```
 
 The mechanism that makes "run it" safe was measured before it was designed, and
-re-measured on `8ef604d1` on 2026-08-30 with the exact argv composition the code
-uses. A throwaway **bare** repository whose `objects/info/alternates` names the
+re-measured on `8ef604d1` on 2026-08-30 with the exact argv composition the
+code uses — **provenance flagged, not re-verified, in the 2026-08-30 later
+round**: `8ef604d1` is `docs(#551): M12 decision spec …`, a commit unrelated
+to #576 or `preview.rs`, so this citation is wrong and the measurement itself
+was not re-run to confirm the underlying claim still holds; only the fact of
+the wrong hash is established here. A throwaway **bare** repository whose
+`objects/info/alternates` names the
 served repository's object directory can read every object that repository has
 and writes only into itself:
 
@@ -147,13 +152,64 @@ objects and go red for exactly the reason the design works. The acceptance test
 therefore counts under `<commondir>/objects` specifically, compares every ref
 before and after, and asserts no `gv-preview-*` directory survives.
 
-Cleanup is `tempfile::TempDir`'s `Drop`, which covers the return, the `?` and
-the panic — but **not** `SIGKILL` or a power loss. So `ScratchStore::new` sweeps
-stale `gv-preview-*` siblings older than an hour first. The sweep only ever
-considers directories whose name carries the prefix this module chose, and only
-removes ones older than the bound; an entry whose age cannot be read is left
-alone. "We could not tell how old it is" is not grounds to delete something
-inside someone's repository.
+Cleanup is `tempfile::TempDir`'s `Drop`, which fires on the return, the `?`,
+the panic — **and a dropped future** (a request timeout, a client
+disconnecting mid-preview, the handler's future being cancelled). That is a
+wider set than an earlier draft of this section claimed, and the width
+matters: `Drop` firing is **not the same as the store going away cleanly**.
+
+`ScratchStore::new`'s `git init` spawn goes through `git_cmd::git_output`,
+which does not set `kill_on_drop(true)` — confirmed by reading both
+`git_output_for` (a plain `cmd.output().await`, no kill flag set) and
+`sandbox::spawn::command_async` (`kill_on_drop` is "left to the caller", its
+own doc comment says so) on `8f4b7bb3` (this branch's own #576 commit) on
+2026-08-30. So when the surrounding
+future is dropped while that spawn is in flight, `dir: tempfile::TempDir` (a
+local inside `ScratchStore::new`, not yet moved into a `Self` anyone holds) is
+dropped and its `Drop` removes the directory — but the orphaned `git init`
+child is not killed. If it is still writing when the directory disappears
+under it, it recreates the directory, and there is now no Rust value anywhere
+that owns it: `Drop` already ran once and will not run again.
+
+**This is not a peer of `SIGKILL` or a power loss.** Those are rare, abnormal
+cases. A dropped future during the `git init` spawn is a *routine* one — an
+ordinary request timeout, a client that navigates away — and the current
+design does not cover it either. `git_cmd::git_output_bounded` already exists
+for exactly this reason, on a different call site (`git tag -s`'s
+`gpg`/`gpg-agent` hazard): it sets `.kill_on_drop(true)` so that "the future is
+dropped" and "the child dies with it" are the same event. Closing this gap
+here would mean routing `ScratchStore::new`'s spawns through an arity that
+does the same — not designed here (this ADR does not own `preview.rs`), but
+named as what closing it needs.
+
+The stale sweep (`ScratchStore::sweep_stale`, removing `gv-preview-*` siblings
+older than an hour) is the only backstop today, for **every** leak this
+section describes, this one included. It only ever considers directories
+whose name carries the prefix this module chose, and only removes ones older
+than the bound; an entry whose age cannot be read is left alone. "We could not
+tell how old it is" is not grounds to delete something inside someone's
+repository.
+
+**That backstop is not a time bound on the leak — it is conditional on a
+future event that may never happen.** `sweep_stale` runs from exactly one
+place: the top of `ScratchStore::new`, which is called only on the
+`Synthesize` path (a revert, a cherry-pick, or a merge that is neither a
+fast-forward nor already up to date). `FastForward` and `AlreadyUpToDate`
+never construct a `ScratchStore` and so never sweep. So a leaked directory is
+removed by the *next* preview against the same repository that creates a
+store, once it is older than the bound — and if no such preview ever runs
+again on that repository (every later preview is a fast-forward, or nobody
+previews it again at all), the directory persists indefinitely. "An hour" is
+the age at which a sweep, if one runs, will remove it — not a guarantee that
+one runs.
+
+**The same false enumeration is repeated verbatim in the code**, in two
+places this ADR does not own: `STALE_SCRATCH_AGE`'s doc comment and
+`ScratchStore`'s own struct doc, both in
+`crates/git-vista-server/src/preview.rs`, both currently reading "the return,
+the `?` and the panic … does not survive a `SIGKILL`" with no mention of a
+dropped future. Correcting this document without correcting those comments
+would leave the lie in the place a maintainer is more likely to read next.
 
 The prefix is named rather than `tempfile`'s default `.tmpXXXXXX` for a reason
 worth stating: a sweep matching a prefix nothing produces is **inert**, and a
@@ -370,8 +426,27 @@ when two branches have more than one. Passing a single `git merge-base` answer
 would produce a tree `git merge` would not produce on a criss-cross history — a
 confidently wrong picture, the one failure §4.3 exists to make impossible. So
 `Recipe::merge_base` is an `Option`, `None` for `MergeBranch`, and git does what
-git would do. Revert and cherry-pick *are* synthetic three-way merges with a
-stated base, so they still pass one.
+git would do **for the merge-base computation specifically**. Revert and
+cherry-pick *are* synthetic three-way merges with a stated base, so they still
+pass one.
+
+**"git does what git would do" does not extend to `merge.ff`, and that is a
+measured gap, not a hedge.** `resolve_plumbing`'s `Previewable::Merge` arm
+classifies `AlreadyUpToDate` / `FastForward` / `Synthesize` from
+`merge-base(head, tip)` alone; it reads no git config. The real executor
+(`planner/branch_exec.rs`'s `exec_merge`) runs `git merge --no-edit`, which
+**does** read `merge.ff` — a setting `sandbox/spawn.rs` passes `$HOME` through
+for, read-only, into every spawn, in every repository. Measured on
+2026-08-30, in throwaway repositories: with `merge.ff=false` set on an
+otherwise fast-forwardable pair, the preview's `FastForward` arm draws a
+straight line with no new commit, while `git merge --no-edit` actually prints
+"Merge made by the 'ort' strategy" and writes a real two-parent commit; with
+`merge.ff=only` set on a divergent pair, the preview's `Synthesize` arm draws
+a clean merge commit, while `git merge --no-edit` exits `128` with "Not
+possible to fast-forward, aborting" and does nothing at all. Both are exactly
+the failure §4.3 exists to make impossible — a plausible graph that quietly
+differs from what the command will actually do — and neither is hedged
+anywhere else in this document. See Consequences.
 
 ### Two `merge-base --is-ancestor` spawns to detect fast-forward
 
@@ -393,6 +468,17 @@ commit by position instead.
 
 ## Consequences
 
+- **`resolve_plumbing`'s `MergeBranch` arm does not read `merge.ff`, and this
+  is a measured correctness defect, not an unexercised edge.** See the
+  "Pass `--merge-base` for `MergeBranch` too" alternative above for the two
+  measurements: a fast-forwardable pair with `merge.ff=false` draws a
+  no-commit fast-forward while the real merge writes a two-parent commit, and
+  a divergent pair with `merge.ff=only` draws a clean merge commit while the
+  real merge refuses outright with exit `128`. This is not a gap in test
+  coverage — the classification logic itself never inspects the config that
+  changes the answer. `git-vista-fixtures` carries fixtures for both cases
+  (`fast_forward_merge_ff_false`, `divergent_merge_ff_only`) as of this
+  correction; closing the defect in `preview.rs` itself is out of scope here.
 - **A2's guarantee is exactly "no new object under `<commondir>/objects`"**, and
   a scratch *directory* does appear under `commondir` for the life of a call.
   Anyone tightening that assertion must count under `objects`, not `commondir`.
@@ -453,6 +539,17 @@ commit by position instead.
   default specifically so the stale sweep is not inert.
 - The route was wired rather than deferred, because deferring would have left
   `RepositoryReadOnly` reachable only from a test.
+- **2026-08-30, later round:** three independent reviewers ran, rather than
+  reasoned about, this document's claims and found the §3 cleanup enumeration
+  false by omission (a dropped future during the `git init` spawn leaks, and
+  is a routine case, not a peer of `SIGKILL`/power-loss) and the A5
+  Verification row overstated as "the merge matches reality" what was in fact
+  one row's parent identity and order on one fixture. Both corrected in place
+  rather than left standing next to the evidence that contradicts them. The
+  `merge.ff` gap (§"Pass `--merge-base` for `MergeBranch` too") and the
+  cherry-pick-tree-identity gap (Verification, "Not verified") were measured
+  in the same round and added as named, un-closed defects — this document
+  does not own `preview.rs` and did not attempt to fix either.
 
 ---
 
@@ -471,9 +568,44 @@ committed yet. Every pair below was executed and the stated verdict observed:
 | **A2** — nothing written, nothing left | delete the `alternates` write | `mem::forget` the `TempDir` | caught; **different assertions** — 1 fails at `expect_graph` (`CheckFailed`), 2 passes the object/ref checks and fails only on the surviving `gv-preview-j9LoII` |
 | **A3** — a conflict is an answer | classify exit 1 as `Clean` | read past `-z`'s empty record | caught; 1 returns a `Graph`, 2 reports `atab.txt` and `atab.txt\n` beside the real path |
 | **A4** — `Unsupported` is the default | `_ => Some(Merge)` | `operation_name` → constant | caught; 1 draws a graph for a rebase, 2 keeps the arm and fails the literal name |
-| **A5** — the merge matches reality | drop the second parent | transpose the parents | caught; 1 fails on row 0's commit, 2 on row 0's parent order |
+| **A5** — the merge's *parent identity and order* match reality, on `merge_clean_two_branch` only | drop the second parent | transpose the parents | caught; 1 fails on row 0's commit, 2 on row 0's parent order — see the correction below the table for what this row does **not** cover |
 | **Object format** | drop `--object-format` | hardcode `sha256` | caught; 1 fails the SHA-256 test, 2 passes it and takes **seven SHA-1 tests** down instead |
 | **The route runs nothing** | `preview_plan` calls `plan_and_execute` | the needle stops matching a real call | caught; different assertion lines in `contract_suite` |
+
+**Correction to the A5 row, from a later review round (2026-08-30): the
+headline "the merge matches reality" overstated what was proven.** Three
+independent reviewers, each running rather than reasoning, established that
+`assert_parity` (the function backing every A5 case, including this one)
+never compares the hypothetical commit's **tree**, never compares **edges**,
+and never compares **refs or colour** — all confirmed by mutating the
+production code and watching the whole `git-vista-server` suite, all 1064
+tests, stay green:
+
+- a revert preview that reverts nothing passes every A5 test;
+- a merge preview that merges nothing passes all of them — and because
+  `theirs == ours` can never conflict under that break, **every** conflicting
+  merge would draw a clean graph, with nothing in the suite to notice;
+- dropping every edge from both graphs in the same run keeps the whole binary
+  green;
+- row-position parity — which row a commit lands on — is genuinely pinned
+  only on the **cherry-pick** leg, because the revert and merge after-windows
+  each have exactly one topologically-ready commit, so there is no second
+  candidate for the stable-sort tiebreak to place wrong;
+- there was, at the time this ADR was first written, **no conflicting-merge
+  fixture or test at all** — A3 covered cherry-pick conflicts only, and
+  nothing exercised `PreviewOutcome::Conflict` reached through
+  `GitOperation::MergeBranch`.
+
+What the A5 table row above *is* true of, narrowly: on `main`'s specific
+fast-forward-then-diverge topology, `assert_parity` does compare the
+hypothetical commit's own two parent ids, in order, against what the row's
+context expects. It does not follow from that one row that "the merge matches
+reality" in any broader sense, and this document should not have implied it
+did. `git-vista-fixtures` now carries `merge_conflict` (a pre-merge, provably
+conflicting shape) and `cherry_pick_already_applied` (a shape whose merged
+tree is provably identical to `HEAD`'s) for a later round to build the missing
+tree/edge/ref/colour and conflicting-merge assertions against; whether
+`preview_suite.rs` uses them is that round's to report, not this one's.
 
 **One mutation survived and the test was fixed.** The first version of
 `parse_merge_tree_conflicts`' suite asserted the stop-at-the-empty-record rule
@@ -497,6 +629,16 @@ wrong; the test could not express the failure it claimed to pin.
   classification and its inverse requirement are pinned by source scans; no test
   drives the endpoint through the router.
 - A6, the web canvas. Not in this slice; no frontend file was touched.
+- **`resolve_plumbing`'s cherry-pick arm never compares the merged tree
+  against `HEAD`'s own tree.** Measured, 2026-08-30: a cherry-pick whose
+  change is already present on the target branch computes `merge-tree` exit
+  `0` with a tree identical to `HEAD`'s, and this code would draw it as a
+  clean added commit; the real `git cherry-pick --quiet` on the same
+  repository exits non-zero with "The previous cherry-pick is now empty",
+  leaves `.git/CHERRY_PICK_HEAD` on disk, and leaves the working tree clean —
+  a mid-sequence state a user must resolve, not the row a tree-blind checker
+  would draw. `git-vista-fixtures::cherry_pick_already_applied` proves this
+  exact shape; nothing in `preview.rs` reads it yet.
 
 ---
 

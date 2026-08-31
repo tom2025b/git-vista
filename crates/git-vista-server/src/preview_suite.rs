@@ -44,8 +44,77 @@
 //! commit is the only ready commit in its `after` window and therefore has no
 //! competitor to tie with; `cherry_pick_conflict` is used because a conflict
 //! is never laid out at all.
+//!
+//! # What three independent verifiers found green here, and what changed
+//!
+//! An earlier round of this suite was fully green while the preview could not
+//! tell computing the right answer from computing nothing. Every item below was
+//! *measured* by mutating the production code and watching the suite stay
+//! green, not reasoned about:
+//!
+//! * A revert preview that reverted nothing, and a merge preview that merged
+//!   nothing, passed every test — because nothing compared the hypothetical
+//!   commit's **tree**. [`assert_tree_matches_the_real_run`] does, on all three
+//!   legs, and each comparison is paired with an `assert_ne!` proving the
+//!   oracle's own tree actually moved. An equality between two copies of HEAD's
+//!   tree is not evidence.
+//! * Dropping every edge from both graphs kept the whole binary green —
+//!   `assert_parity` never looked at `edges`. It does now, and asserts the real
+//!   run's edge set is non-empty first, because `[] == []` is the same
+//!   vacuous pass in a different position.
+//! * Refs (the branch badges) and `color` were likewise never compared.
+//! * Row position was decidable on the cherry-pick leg only: the revert and
+//!   merge `after` windows each had exactly one topologically-ready commit, so
+//!   a hypothetical commit stamped at time 0 could not change the order.
+//!   [`revert_shape_with_a_competitor_tip`] and [`merge_shape_with_a_competitor_tip`]
+//!   add an independent branch tip dated [`LONG_AGO`], so "newest first" has
+//!   something to be newest *than*.
+//! * There was no conflicting-**merge** test at all; A3 covered cherry-pick
+//!   alone, and the merge leg is where a wrong answer is most dangerous.
+//!
+//! # `git_dir_manifest`, and why it is stronger than an object count
+//!
+//! The A2 tests above count files under `<commondir>/objects`. That is the
+//! acceptance criterion, but it cannot see a ref file rewritten, a `config`
+//! edited, a `logs/HEAD` appended to, or a scratch directory that survived with
+//! a different name. [`git_dir_manifest`] hashes **every byte of every file**
+//! under the whole common directory, so "changed nothing" means changed
+//! nothing. Keep it that way: softening it back into a count is how the weaker
+//! version was arrived at the first time.
+//!
+//! # `merge.ff` — the tests that are expected to be RED
+//!
+//! [`resolve_plumbing`]'s merge arm reads no git config, while the executor
+//! (`planner::branch_exec::exec_merge`) runs `["merge", "--no-edit"]`, which
+//! obeys `merge.ff`. Measured in throwaway repositories on this host,
+//! 2026-08-30: with `merge.ff=false` a fast-forwardable merge produces a
+//! **two-parent commit** (`git cat-file -p HEAD` shows two `parent` lines),
+//! and with `merge.ff=only` a divergent merge exits **128** with "Not possible
+//! to fast-forward, aborting" and moves nothing. The preview draws a linear
+//! history for the first and a clean merge commit for the second. The two
+//! `merge_ff_` tests below pin what real git does; they go red until the arm
+//! learns to read the config.
+//!
+//! # The four RED tests in this file, and why each one stays
+//!
+//! A red test here is a finding. None of them may be deleted, narrowed or
+//! `#[ignore]`d to make the suite green — that is exactly what happened to the
+//! byte-level A2 tests once already.
+//!
+//! | Test | What real git does | What the preview does |
+//! |---|---|---|
+//! | `merge_ff_false_must_preview_the_two_parent_commit_git_actually_writes` | writes a two-parent commit | draws a fast-forward, adds nothing |
+//! | `merge_ff_only_must_not_draw_a_merge_git_refuses_to_make` | exits 128, changes nothing | draws a clean merge commit |
+//! | `a_cherry_pick_that_is_already_applied_must_not_be_drawn_as_a_clean_commit` | exits 1, leaves `CHERRY_PICK_HEAD` | draws an empty commit as an ordinary addition |
+//! | `a2_a_cancelled_preview_leaves_nothing_behind` | — | leaves a `gv-preview-*` store inside the served `.git` |
+//!
+//! The first three are the merge/pick arms not asking questions they have the
+//! answers to; the fourth is `git_output`'s `kill_on_drop(false)`. Each test's
+//! own doc comment carries the measurement and the two mutations to check the
+//! fix against.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use git_vista_core::layout::layout_with_refs;
 use git_vista_core::model::{Graph, Oid};
@@ -122,16 +191,123 @@ fn cherry_pick_shape() -> (TempDir, PathBuf) {
 
 /// `main`, and a `behind` branch pointing at an ancestor of it. Merging
 /// `behind` into `main` is already up to date; merging `main` into `behind` is
-/// a fast-forward.
+/// a fast-forward — **when `merge.ff` allows it**, which is why this fixture
+/// pins it.
+///
+/// # Why `merge.ff = true` is written into the fixture's own config
+///
+/// `git_vista_fixtures::git` builds a fixture with `GIT_CONFIG_GLOBAL` and
+/// `GIT_CONFIG_SYSTEM` pointed at `/dev/null`, but neither the preview nor the
+/// executor spawns that way: `sandbox::spawn` passes `$HOME` through and grants
+/// it read-only, so a developer's own `~/.gitconfig` reaches every `git` the
+/// server runs. `merge.ff = false` is a common setting, and under it `git merge
+/// --no-edit` on this shape writes a **two-parent commit** rather than
+/// fast-forwarding (measured on this host, 2026-08-30). A fast-forward test
+/// that did not pin the setting would therefore assert the wrong thing on such
+/// a machine and the right thing on CI. Pinned locally, the shape means what
+/// its name says everywhere.
 fn fast_forward_shape() -> (TempDir, PathBuf) {
     let dir = TempDir::new().expect("tempdir");
     let repo = dir.path().join("repo");
     git::init(&repo);
+    git::run(&repo, &["config", "merge.ff", "true"]);
     git::write(&repo, "a.txt", b"one\n");
     commit_old(&repo, "add a");
     git::run(&repo, &["branch", "behind"]);
     git::write(&repo, "b.txt", b"two\n");
     commit_old(&repo, "add b");
+    (dir, repo)
+}
+
+/// [`revert_shape`] plus an independent branch tip, so the `after` window has
+/// **two** topologically-ready commits and row order is decidable.
+///
+/// # Why the competitor is needed at all
+///
+/// `stable_topo_order` emits ready commits newest-first. In `revert_shape`'s
+/// `after` window the hypothetical revert is the only ready commit, so it takes
+/// row 0 whatever its timestamp says — a preview that stamped it at the epoch
+/// would still be laid out identically and no assertion in this suite could
+/// see it. `side` branches off the first commit and is dated [`LONG_AGO`], so
+/// it is ready from the start and is the thing the revert has to be newer than.
+fn revert_shape_with_a_competitor_tip() -> (TempDir, PathBuf) {
+    let dir = TempDir::new().expect("tempdir");
+    let repo = dir.path().join("repo");
+    git::init(&repo);
+    git::write(&repo, "a.txt", b"one\n");
+    commit_old(&repo, "add a");
+
+    git::run(&repo, &["checkout", "-q", "-b", "side"]);
+    git::write(&repo, "side.txt", b"side\n");
+    commit_old(&repo, "side work");
+
+    git::run(&repo, &["checkout", "-q", "main"]);
+    git::write(&repo, "b.txt", b"two\n");
+    commit_old(&repo, "add b");
+    git::write(&repo, "c.txt", b"three\n");
+    commit_old(&repo, "add c");
+    (dir, repo)
+}
+
+/// `main` and `feature` diverged from a shared base, **plus** an independent
+/// `side` tip — all dated [`LONG_AGO`] — so the merge commit's row is decided
+/// by its timestamp rather than by being the only candidate.
+///
+/// Built here rather than taken from `git_vista_fixtures::merge_clean_two_branch`
+/// for the reason in the module doc: that shape's commits are stamped *now*, so
+/// a competitor tip added to it would tie with the hypothetical commit on time
+/// and the oid tiebreak — which differs between the preview and the real run by
+/// construction — would decide row 0.
+fn merge_shape_with_a_competitor_tip() -> (TempDir, PathBuf) {
+    let dir = TempDir::new().expect("tempdir");
+    let repo = dir.path().join("repo");
+    git::init(&repo);
+    git::write(&repo, "shared.txt", b"base\n");
+    commit_old(&repo, "base");
+
+    git::run(&repo, &["checkout", "-q", "-b", "feature"]);
+    git::write(&repo, "feature-one.txt", b"one\n");
+    commit_old(&repo, "feature: one");
+
+    git::run(&repo, &["checkout", "-q", "-b", "side", "main"]);
+    git::write(&repo, "side.txt", b"side\n");
+    commit_old(&repo, "side work");
+
+    git::run(&repo, &["checkout", "-q", "main"]);
+    git::write(&repo, "main-alpha.txt", b"alpha\n");
+    commit_old(&repo, "main: alpha");
+    (dir, repo)
+}
+
+/// `main` and `feature` editing the **same line** of the same file from a
+/// shared base: merging `feature` into `main` is a real conflict.
+///
+/// Deliberately not "two branches that add different files": that merges
+/// cleanly under a correct implementation *and* under most broken ones, so it
+/// could not tell them apart.
+fn merge_conflict_shape() -> (TempDir, PathBuf) {
+    let dir = TempDir::new().expect("tempdir");
+    let repo = dir.path().join("repo");
+    git::init(&repo);
+    let base: String = (1..=10).map(|n| format!("line {n}\n")).collect();
+    git::write(&repo, "target.txt", base.as_bytes());
+    commit_old(&repo, "base");
+
+    git::run(&repo, &["checkout", "-q", "-b", "feature"]);
+    git::write(
+        &repo,
+        "target.txt",
+        base.replace("line 5\n", "line 5 by feature\n").as_bytes(),
+    );
+    commit_old(&repo, "feature: edit line 5");
+
+    git::run(&repo, &["checkout", "-q", "main"]);
+    git::write(
+        &repo,
+        "target.txt",
+        base.replace("line 5\n", "line 5 by main\n").as_bytes(),
+    );
+    commit_old(&repo, "main: edit line 5");
     (dir, repo)
 }
 
@@ -211,6 +387,45 @@ fn layout_of(repo: &Path) -> Graph {
     layout_with_refs(commits, refs, head_branch.as_deref())
 }
 
+/// Assert that a repository's row 0 is decided by the newest commit's
+/// **timestamp** rather than by topology alone.
+///
+/// The check is direct: lay the repository out, rewrite the row-0 commit's
+/// `time` to the epoch, lay it out again through the same function, and
+/// require a *different* commit in row 0. If the same one stays there, the
+/// window has only one topologically-ready commit and a preview that stamped
+/// its hypothetical commit at time 0 would be laid out identically — which is
+/// exactly the hole the two `..._row_is_decided_by_its_timestamp` tests exist
+/// to close, and it would close nothing without this.
+fn assert_row_zero_is_decided_by_time(repo: &Path) {
+    let commits =
+        git_vista_git::walk_history(repo, PREVIEW_HISTORY_LIMIT).expect("walk the history");
+    let refs = git_vista_git::read_refs(repo).expect("read the refs");
+    let head_branch = git_vista_git::read_head_branch(repo);
+
+    let as_built = layout_with_refs(commits.clone(), refs.clone(), head_branch.as_deref());
+    let newest = as_built.rows[0].commit.id.clone();
+
+    let restamped: Vec<CommitSummary> = commits
+        .into_iter()
+        .map(|mut c| {
+            if c.id == newest {
+                c.time = 0;
+            }
+            c
+        })
+        .collect();
+    let with_epoch = layout_with_refs(restamped, refs, head_branch.as_deref());
+
+    assert_ne!(
+        with_epoch.rows[0].commit.id,
+        newest,
+        "row 0 held {} whether its time was the real one or the epoch, so this \
+         shape cannot tell a correctly-stamped preview from one stamped at 0",
+        newest.short()
+    );
+}
+
 /// Build the real reviewable [`Plan`] the production caller would hand
 /// [`preview`], rather than a hand-assembled one that could drift from it.
 ///
@@ -280,6 +495,106 @@ fn scratch_dirs(commondir: &Path) -> Vec<String> {
         .collect();
     found.sort();
     found
+}
+
+/// A byte-level manifest of **everything** under `commondir`: one sorted line
+/// per entry, carrying the relative path, the file's length and a digest of its
+/// contents.
+///
+/// # Why this and not the object count beside it
+///
+/// [`object_file_count`] answers A2's literal wording — "no new object under
+/// `<commondir>/objects`" — and is blind to everything else in a `.git`: a ref
+/// file rewritten in place at the same length, a `config` edited, a `logs/HEAD`
+/// appended to, an `index` refreshed, or a scratch store that survived under a
+/// name [`scratch_dirs`] does not recognise. Hashing every byte means "changed
+/// nothing" is the claim being tested, rather than "did not change one
+/// particular counter".
+///
+/// Directories are listed too (with a `/` suffix and no digest) so an empty
+/// leftover directory is visible; an unreadable entry is recorded as such
+/// rather than skipped, because a file this cannot read is exactly the kind of
+/// thing that should show up in a diff instead of vanishing from both sides.
+fn git_dir_manifest(commondir: &Path) -> Vec<String> {
+    fn digest(bytes: &[u8]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        // `DefaultHasher::new()` is documented as constructed with fixed keys,
+        // so two manifests taken in one process are comparable. (`RandomState`,
+        // which `HashMap` uses, is the seeded one — deliberately not that.)
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        hasher.finish()
+    }
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            out.push(format!(
+                "{}/ <unreadable directory>",
+                dir.strip_prefix(root).unwrap_or(dir).display()
+            ));
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => {
+                    out.push(format!("{rel}/"));
+                    walk(root, &path, out);
+                }
+                Ok(t) if t.is_symlink() => {
+                    let target = std::fs::read_link(&path)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|e| format!("<unreadable link: {e}>"));
+                    out.push(format!("{rel} -> {target}"));
+                }
+                Ok(_) => match std::fs::read(&path) {
+                    Ok(bytes) => out.push(format!(
+                        "{rel} len={} hash={:016x}",
+                        bytes.len(),
+                        digest(&bytes)
+                    )),
+                    Err(e) => out.push(format!("{rel} <unreadable: {e}>")),
+                },
+                Err(e) => out.push(format!("{rel} <no file type: {e}>")),
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(commondir, commondir, &mut out);
+    out.sort();
+    out
+}
+
+/// The lines that differ between two [`git_dir_manifest`] snapshots, marked
+/// `-` (gone) and `+` (arrived). Empty means byte-identical.
+fn manifest_diff(before: &[String], after: &[String]) -> Vec<String> {
+    let mut diff: Vec<String> = before
+        .iter()
+        .filter(|line| !after.contains(line))
+        .map(|line| format!("- {line}"))
+        .collect();
+    diff.extend(
+        after
+            .iter()
+            .filter(|line| !before.contains(line))
+            .map(|line| format!("+ {line}")),
+    );
+    diff
+}
+
+/// How many `parent` lines `rev`'s raw commit object records — git's own view,
+/// read the way `git_vista_fixtures::divergent` reads it, rather than inferred
+/// from what a command was expected to do.
+fn parent_count(repo: &Path, rev: &str) -> usize {
+    git::out(repo, &["cat-file", "-p", rev])
+        .lines()
+        .take_while(|line| !line.is_empty())
+        .filter(|line| line.starts_with("parent "))
+        .count()
 }
 
 /// The two halves of a `Graph` outcome, re-materialised as core [`Graph`]s so
@@ -436,6 +751,509 @@ async fn a2_the_scratch_store_is_removed_on_the_conflict_path_too() {
     );
     assert_eq!(object_file_count(&commondir), objects_before);
     assert_eq!(refs_snapshot(&repo), refs_before);
+}
+
+/// Take the two `git status` reads that *warm the index* out of the way before
+/// a manifest is captured.
+///
+/// `git status` refreshes `.git/index` and rewrites it when a stat entry is
+/// racy — which every file in a just-built fixture is, having been written in
+/// the same second as the index. A manifest taken before that write and
+/// compared with one taken after would report a changed `index` and blame the
+/// preview for it. Two reads, because the first is the one that does the
+/// rewriting and the second proves it has settled.
+fn warm_the_index(repo: &Path) -> String {
+    let first = git::out(repo, &["status", "--porcelain=v2", "--branch"]);
+    let second = git::out(repo, &["status", "--porcelain=v2", "--branch"]);
+    assert_eq!(first, second, "two consecutive status reads must agree");
+    second
+}
+
+/// **A2, byte for byte.** A revert preview changes **no byte** anywhere under
+/// the common git directory, and leaves the worktree where it found it.
+///
+/// # Why this exists beside the object count above
+///
+/// `a2_a_preview_writes_no_object_moves_no_ref_and_leaves_no_scratch_directory`
+/// counts files under `<commondir>/objects` and snapshots the refs. That is A2's
+/// literal wording and it is blind to a `config` edited, a `logs/HEAD`
+/// appended to, a ref rewritten in place, or a leftover directory whose name
+/// `scratch_dirs` does not match. [`git_dir_manifest`] hashes every byte of
+/// every file, so the claim under test is the one the feature actually makes:
+/// the served repository never learns the preview happened.
+///
+/// A stricter version of this test was written once, and deleted mid-session to
+/// take the suite from red to green. It is back, and it is not to be softened
+/// into a count.
+///
+/// # Two mutations
+///
+/// 1. **Removes the mechanism** — `std::mem::forget` the `ScratchStore` (or
+///    `TempDir::into_path`). The store's whole directory tree survives and the
+///    diff names every file in it, dozens of `+` lines.
+/// 2. **Weakens it** — drop the `objects/info/alternates` write in
+///    `ScratchStore::new` and instead have the preview run `merge-tree` against
+///    the real git dir. The scratch directory is still cleaned up, so mutation
+///    1's `+` lines never appear; what goes red is the *changed* `objects/…`
+///    entries, a `~`-shaped diff of pairs, in a different part of the message.
+#[tokio::test]
+async fn a2_a_revert_preview_changes_no_byte_under_the_git_directory() {
+    let (_dir, repo) = revert_shape();
+    let commondir = commondir_of(&repo).expect("resolve the commondir");
+    let head = git::out(&repo, &["rev-parse", "HEAD"]);
+    let plan = plan_for(
+        &repo,
+        GitOperation::RevertCommit {
+            commit: CommitOid::new(head).expect("a full hex oid"),
+        },
+    )
+    .await;
+
+    let worktree_before = warm_the_index(&repo);
+    let before = git_dir_manifest(&commondir);
+    assert!(
+        before.len() > 20,
+        "a real `.git` has far more than 20 entries; a manifest this small \
+         means the walk found nothing and the diff below would be vacuous \
+         (got {})",
+        before.len()
+    );
+
+    let outcome = preview(&repo, &plan).await;
+    let after = git_dir_manifest(&commondir);
+    let worktree_after = git::out(&repo, &["status", "--porcelain=v2", "--branch"]);
+
+    // Unwrapped *after* the manifests are taken, so a preview that refused
+    // still has its "nothing changed" checked — and so the reason is reported
+    // before the byte diff, which would otherwise be the confusing failure.
+    let (_graph, _changes) = expect_graph(outcome);
+    let diff = manifest_diff(&before, &after);
+    assert!(
+        diff.is_empty(),
+        "a revert preview changed bytes under the git directory:\n{}",
+        diff.join("\n")
+    );
+    assert_eq!(
+        worktree_before, worktree_after,
+        "a preview must not touch the worktree either"
+    );
+    assert_eq!(scratch_dirs(&commondir), Vec::<String>::new());
+}
+
+/// **A2, byte for byte, merge.** The same claim on the merge leg, which creates
+/// a two-parent commit in the scratch store and is the arm with the most git
+/// steps.
+///
+/// # Two mutations
+///
+/// 1. **Removes the mechanism** — `std::mem::forget` the store: the whole
+///    scratch tree shows up as `+` lines.
+/// 2. **Weakens it** — have `commit_tree` omit the `--git-dir=<scratch>` flag.
+///    The commit is then written into the served repository's own object
+///    database, no directory is left behind, and the diff is a handful of new
+///    `objects/…` entries instead — the exact failure A2 exists to catch, in a
+///    different shape from mutation 1.
+#[tokio::test]
+async fn a2_a_merge_preview_changes_no_byte_under_the_git_directory() {
+    let (_dir, repo) = git_vista_fixtures::merge_clean_two_branch();
+    let commondir = commondir_of(&repo).expect("resolve the commondir");
+    let plan = plan_for(
+        &repo,
+        GitOperation::MergeBranch {
+            branch: BranchName::new("feature").expect("a valid branch name"),
+        },
+    )
+    .await;
+
+    warm_the_index(&repo);
+    let before = git_dir_manifest(&commondir);
+    let outcome = preview(&repo, &plan).await;
+    let after = git_dir_manifest(&commondir);
+
+    let (_graph, _changes) = expect_graph(outcome);
+    let diff = manifest_diff(&before, &after);
+    assert!(
+        diff.is_empty(),
+        "a merge preview changed bytes under the git directory:\n{}",
+        diff.join("\n")
+    );
+    assert_eq!(scratch_dirs(&commondir), Vec::<String>::new());
+}
+
+/// **A2, byte for byte, the conflict path.** A preview that ends in
+/// `Conflict` returns early, after the store exists — the exit path most likely
+/// to skip cleanup.
+///
+/// # Two mutations
+///
+/// 1. **Removes the mechanism** — `std::mem::forget` the recipe (and so the
+///    store) in `compute`'s `Conflict` arm. The scratch tree survives and the
+///    diff names it.
+/// 2. **Weakens it** — return the conflict from inside `merge_tree` before the
+///    `Recipe` is dropped *and* leak the temp dir there. The store survives
+///    too, but the outcome assertion above it still passes, so the failure
+///    arrives at the diff rather than at the `match` — the same directory,
+///    reached down a different path.
+#[tokio::test]
+async fn a2_a_conflicting_preview_changes_no_byte_under_the_git_directory() {
+    let (_dir, repo) = git_vista_fixtures::cherry_pick_conflict();
+    let commondir = commondir_of(&repo).expect("resolve the commondir");
+    let topic = git::out(&repo, &["rev-parse", "topic"]);
+    let plan = plan_for(
+        &repo,
+        GitOperation::CherryPick {
+            commit: CommitOid::new(topic).expect("a full hex oid"),
+        },
+    )
+    .await;
+
+    warm_the_index(&repo);
+    let before = git_dir_manifest(&commondir);
+    let outcome = preview(&repo, &plan).await;
+    let after = git_dir_manifest(&commondir);
+
+    assert!(
+        matches!(outcome, PreviewOutcome::Conflict { .. }),
+        "expected Conflict, got {outcome:?}"
+    );
+    let diff = manifest_diff(&before, &after);
+    assert!(
+        diff.is_empty(),
+        "a conflicting preview changed bytes under the git directory:\n{}",
+        diff.join("\n")
+    );
+    assert_eq!(scratch_dirs(&commondir), Vec::<String>::new());
+}
+
+/// **A2, cancellation.** A preview whose future is *dropped* part-way through
+/// leaves nothing behind either.
+///
+/// # This is RED, and it is a finding, not a broken test
+///
+/// `ScratchStore::new` awaits `git init --bare <scratch>` through
+/// `git_cmd::git_output`, whose `git_output_for` does `cmd.output().await` with
+/// tokio's default `kill_on_drop(false)`. Dropping the future here *does* run
+/// `TempDir::drop` and remove the directory — and the orphaned `git init` is
+/// not signalled, so it goes on to write the store back. `git_cmd` already has
+/// `git_output_bounded`, which sets `kill_on_drop(true)` and closes stdin, and
+/// its doc comment spells out why: "`.kill_on_drop(true)` is what makes the
+/// timeout actually a timeout rather than a detach". This is the arm that does
+/// not use it.
+///
+/// Measured on this host, 2026-08-30, by running this test: cancelling inside
+/// the window in which `git init` is the outstanding await leaves a
+/// `gv-preview-*` directory inside the served repository's `.git` — in the
+/// runs recorded here carrying `objects/`, `objects/info`, `objects/pack` and,
+/// when the cancellation lands a little later, `HEAD`, `config`, `refs/heads`
+/// and `refs/tags` as well. It survives until `sweep_stale` finds it an hour
+/// later. Three consecutive runs reproduced it at 42.5 ms, 40.8 ms and
+/// 40.2 ms, against a whole preview of ~105 ms.
+///
+/// **The window is a few milliseconds wide, and the sweep is aimed at it
+/// deliberately.** A geometric ladder over the whole call (200 µs, 500 µs,
+/// 1 ms, … 256 ms) — which is how this was first written — reproduces
+/// **nothing**: every rung lands either before the store exists or after the
+/// preview has cleaned up after itself. That version of this test was green
+/// while the defect was present, which is the exact failure this suite exists
+/// to stop making. A 2 ms sweep hit it on one rung of thirty. So the sampler
+/// below measures when a store first appears and the sweep steps through that
+/// region in **0.5 ms** increments, starting well before it.
+///
+/// # Two instruments, both proved non-inert before they are trusted
+///
+/// The verdict is "nothing was left behind", and a detector that could not see
+/// a leftover store would return that verdict for free. So a store is
+/// **planted** first and both `scratch_dirs` and `git_dir_manifest` are
+/// required to name it, then it is removed. And the sampler establishes that a
+/// store is genuinely observable mid-flight — otherwise a cancellation that
+/// never got that far would leave nothing behind for the trivial reason that
+/// nothing was ever there. The sampler writes what it saw into shared state
+/// rather than returning it, because an aborted `JoinHandle` yields a
+/// `JoinError` and anything carried in its return value is lost. (The earlier
+/// draft of this test did return it, and would have failed on its own sampler
+/// assertion whatever the code under test did.)
+///
+/// # Two mutations, once the arm is fixed
+///
+/// 1. **Removes the mechanism** — go back to `cmd.output()` without
+///    `kill_on_drop`. The orphan rewrites the store and `leaked` names every
+///    timeout in the `git init` window.
+/// 2. **Weakens it** — keep the kill-on-drop spawn but `std::mem::forget` the
+///    `TempDir`. No orphan is involved at all, yet the directory still
+///    survives — a leak from the other end of the same lifetime, reported at
+///    **every** timeout rather than only those inside that window, and the
+///    completed calls leak too.
+#[tokio::test]
+async fn a2_a_cancelled_preview_leaves_nothing_behind() {
+    let (_dir, repo) = revert_shape();
+    let commondir = commondir_of(&repo).expect("resolve the commondir");
+    let head = git::out(&repo, &["rev-parse", "HEAD"]);
+    let plan = plan_for(
+        &repo,
+        GitOperation::RevertCommit {
+            commit: CommitOid::new(head).expect("a full hex oid"),
+        },
+    )
+    .await;
+    warm_the_index(&repo);
+    let before = git_dir_manifest(&commondir);
+
+    // ---- the detector, proved non-inert before it is trusted --------------
+    //
+    // This test's whole verdict is "nothing was left behind". A detector that
+    // could not see a leftover store would return that verdict for free. So
+    // one is planted, both instruments are required to name it, and it is
+    // removed again.
+    let planted = commondir.join(format!("{SCRATCH_PREFIX}planted-detector-check"));
+    std::fs::create_dir_all(planted.join("objects")).expect("plant a store");
+    std::fs::write(planted.join("HEAD"), b"ref: refs/heads/main\n").expect("plant a file");
+    assert_eq!(
+        scratch_dirs(&commondir),
+        vec![format!("{SCRATCH_PREFIX}planted-detector-check")],
+        "`scratch_dirs` must see a planted store, or its silence below means \
+         nothing"
+    );
+    assert!(
+        !manifest_diff(&before, &git_dir_manifest(&commondir)).is_empty(),
+        "the manifest must see a planted store, or its silence below means \
+         nothing"
+    );
+    std::fs::remove_dir_all(&planted).expect("remove the planted store");
+    assert_eq!(scratch_dirs(&commondir), Vec::<String>::new());
+    assert_eq!(
+        manifest_diff(&before, &git_dir_manifest(&commondir)),
+        Vec::<String>::new()
+    );
+
+    // ---- when, within a preview, is a store on disk? ----------------------
+    let seen: Arc<Mutex<Vec<(u128, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let started = std::time::Instant::now();
+    {
+        let seen = Arc::clone(&seen);
+        let watched = commondir.clone();
+        let sampler = tokio::spawn(async move {
+            loop {
+                for dir in scratch_dirs(&watched) {
+                    let mut seen = seen.lock().expect("the sampler's lock");
+                    if !seen.iter().any(|(_, d)| *d == dir) {
+                        seen.push((started.elapsed().as_micros(), dir));
+                    }
+                }
+                tokio::time::sleep(Duration::from_micros(50)).await;
+            }
+        });
+        let _ = preview(&repo, &plan).await;
+        sampler.abort();
+        let _ = sampler.await;
+    }
+    let whole_preview = started.elapsed();
+    let observed = seen.lock().expect("the sampler's lock").clone();
+    println!("a whole preview took {whole_preview:?}; the sampler saw {observed:?}");
+    assert!(
+        !observed.is_empty(),
+        "the sampler never saw a scratch store mid-flight, so the cancellation \
+         sweep below would be cancelling nothing that could leak one"
+    );
+    let first_seen =
+        Duration::from_micros(u64::try_from(observed[0].0).expect("a sane elapsed time"));
+
+    // ---- cancel across the window where a store exists --------------------
+    //
+    // The leak needs the cancellation to land while `git init` is the
+    // outstanding await, and that window is only a few milliseconds wide:
+    // measured on this host, a sweep in 2 ms steps hit it on **one** of its 30
+    // rungs, and the geometric ladder this test was first written with
+    // (200 µs, 500 µs, 1 ms, … 256 ms) hit it on none at all and reported the
+    // repository clean while the defect was present. So the steps are 0.5 ms
+    // and the band straddles the moment the sampler first saw a store.
+    let mut timeouts: Vec<Duration> = Vec::new();
+    let base = first_seen.saturating_sub(Duration::from_millis(14));
+    for step in 0..60u32 {
+        timeouts.push(base + Duration::from_micros(u64::from(step) * 500));
+    }
+    // A coarse safety net for a leak that would need a much earlier or much
+    // later cancellation than the `git init` window. Kept deliberately, and
+    // stated honestly: **these four do not fire on this host.** They are here
+    // so a different failure shape is not missed by a sweep tuned to one, not
+    // as evidence of anything today.
+    for micros in [200u64, 2_000, 16_000, 512_000] {
+        timeouts.push(Duration::from_micros(micros));
+    }
+
+    let mut leaked: Vec<(Duration, Vec<String>, Vec<String>)> = Vec::new();
+    for limit in timeouts {
+        let completed = tokio::time::timeout(limit, preview(&repo, &plan))
+            .await
+            .is_ok();
+        // Long enough for any orphaned child to finish whatever it was doing:
+        // what matters is what survives once everything has settled, not what
+        // is momentarily on disk.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let dirs = scratch_dirs(&commondir);
+        let diff = manifest_diff(&before, &git_dir_manifest(&commondir));
+        println!(
+            "cancelled at {limit:?}: completed={completed} dirs={} diff={}",
+            dirs.len(),
+            diff.len()
+        );
+        // Sweep the residue away before the next iteration, so an entry in
+        // `leaked` names the cancellation that actually produced it rather
+        // than inheriting the previous one's leftovers. This is the test
+        // tidying up after the code under test; it is not a fix.
+        for dir in &dirs {
+            let _ = std::fs::remove_dir_all(commondir.join(dir));
+        }
+        if !dirs.is_empty() || !diff.is_empty() {
+            leaked.push((limit, dirs, diff));
+            // One reproduction is the whole verdict, and stopping here keeps a
+            // failing run short. A run that finds nothing does the full sweep.
+            break;
+        }
+    }
+    assert!(
+        leaked.is_empty(),
+        "a cancelled preview left residue inside the served repository \
+         (timeout, surviving directories, byte diff):\n{leaked:#?}"
+    );
+}
+
+/// **A2, linked worktree.** A preview driven from a linked worktree changes no
+/// byte of the **main** git directory.
+///
+/// Nobody else raised this case, and it is the one where the scratch store is
+/// furthest from the repository the caller handed in: `commondir_of` resolves a
+/// linked worktree to the *main* `.git`, so the store — and therefore the
+/// cleanup — happens somewhere the caller never named.
+///
+/// # Two mutations
+///
+/// 1. **Removes the mechanism** — `std::mem::forget` the store: the leftover
+///    tree appears in the main `.git`, which is the worst place for it, and the
+///    diff and the `scratch_dirs` assertion both name it.
+/// 2. **Weakens it** — resolve the store's home with a second
+///    `rev-parse --git-dir` instead of `sandbox::repo_paths::resolve`. That
+///    answers `<main>/.git/worktrees/wt`, not the commondir, so the store is
+///    created outside the read-write grant the policy built and `git init`
+///    fails; the outcome stops being a `Graph` and `expect_graph` names the
+///    reason, leaving the byte diff untouched.
+#[tokio::test]
+async fn a2_a_preview_in_a_linked_worktree_touches_the_main_git_directory_not_at_all() {
+    let (_dir, repo) = revert_shape();
+    let main_commondir = commondir_of(&repo).expect("resolve the commondir");
+
+    let worktree = repo
+        .parent()
+        .expect("the fixture repository has a parent directory")
+        .join("wt");
+    git::run(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "wtbranch",
+            worktree.to_str().expect("a utf-8 path"),
+        ],
+    );
+    let worktree_commondir = commondir_of(&worktree).expect("resolve the worktree's commondir");
+    assert_eq!(
+        worktree_commondir, main_commondir,
+        "a linked worktree must resolve to the MAIN common directory, or this \
+         test is watching a directory the preview was never going to use"
+    );
+
+    let head = git::out(&worktree, &["rev-parse", "HEAD"]);
+    let plan = plan_for(
+        &worktree,
+        GitOperation::RevertCommit {
+            commit: CommitOid::new(head).expect("a full hex oid"),
+        },
+    )
+    .await;
+
+    warm_the_index(&worktree);
+    let before = git_dir_manifest(&main_commondir);
+    let outcome = preview(&worktree, &plan).await;
+    let after = git_dir_manifest(&main_commondir);
+
+    let (_graph, _changes) = expect_graph(outcome);
+    let diff = manifest_diff(&before, &after);
+    assert!(
+        diff.is_empty(),
+        "a preview run from a linked worktree changed bytes in the MAIN git \
+         directory:\n{}",
+        diff.join("\n")
+    );
+    assert_eq!(
+        scratch_dirs(&main_commondir),
+        Vec::<String>::new(),
+        "no store may be left in the main git directory"
+    );
+}
+
+/// The two instruments the A2 byte tests rest on both see a leftover scratch
+/// store — proved here once, permanently, rather than assumed by four tests
+/// whose verdict is "nothing changed".
+///
+/// A detector that could not see a leak returns that verdict for free, and a
+/// suite of such tests is green for the same reason a correct one is. So a
+/// store is planted with the name and the shape `ScratchStore::new` produces,
+/// both instruments are required to name it, and it is removed again.
+///
+/// # Two mutations
+///
+/// 1. **Removes the mechanism** — have [`git_dir_manifest`] return
+///    `Vec::new()`. The manifest assertion goes red; `scratch_dirs` still
+///    passes, so the two are not one instrument wearing two hats.
+/// 2. **Weakens it** — have `git_dir_manifest` record only the relative path
+///    and drop the length and digest. The planted *directory* is still seen, so
+///    this test stays green — and `a2_a_revert_preview_changes_no_byte_…` would
+///    stop noticing a file rewritten in place, which is why the digest is in
+///    the manifest and why this pair is written as "remove" and "narrow"
+///    rather than as two removals.
+#[test]
+fn the_manifest_and_the_scratch_sweep_both_notice_a_planted_store() {
+    let (_dir, repo) = revert_shape();
+    let commondir = commondir_of(&repo).expect("resolve the commondir");
+    let before = git_dir_manifest(&commondir);
+    assert!(
+        before.len() > 20,
+        "a real `.git` has far more than 20 entries; got {}",
+        before.len()
+    );
+
+    let planted = commondir.join(format!("{SCRATCH_PREFIX}planted"));
+    std::fs::create_dir_all(planted.join("objects").join("info")).expect("plant a store");
+    std::fs::write(planted.join("HEAD"), b"ref: refs/heads/main\n").expect("plant a file");
+
+    assert_eq!(
+        scratch_dirs(&commondir),
+        vec![format!("{SCRATCH_PREFIX}planted")],
+        "`scratch_dirs` must name a directory carrying the prefix the module \
+         itself uses"
+    );
+    let diff = manifest_diff(&before, &git_dir_manifest(&commondir));
+    assert!(
+        diff.contains(&format!("+ {SCRATCH_PREFIX}planted/")),
+        "the manifest must name the planted directory itself: {diff:?}"
+    );
+    assert!(
+        diff.iter()
+            .any(|line| line.starts_with(&format!("+ {SCRATCH_PREFIX}planted/HEAD len=21 hash="))),
+        "the manifest must carry each file's length and a digest of its \
+         contents, or a file rewritten in place at the same length is \
+         invisible to it: {diff:?}"
+    );
+
+    std::fs::remove_dir_all(&planted).expect("remove the planted store");
+    assert_eq!(scratch_dirs(&commondir), Vec::<String>::new());
+    assert_eq!(
+        manifest_diff(&before, &git_dir_manifest(&commondir)),
+        Vec::<String>::new(),
+        "with the plant removed the manifest must be byte-identical again, or \
+         it is reporting noise and every A2 diff above is unreadable"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -659,10 +1477,62 @@ fn assert_parity(after: &Graph, real: &Graph, before: &Graph, what: &str) {
             "{what}: commit {} is placed differently",
             actual.commit.id.short()
         );
+        // The badges beside the row. The hypothetical commit's own refs name
+        // the hypothetical oid, so the targets go through `map` exactly as the
+        // parent list does; everything else — the name, the kind, the order —
+        // must match outright, because those are what the user reads.
+        let predicted_refs: Vec<GitRef> = predicted
+            .refs
+            .iter()
+            .map(|r| {
+                let mut r = r.clone();
+                r.target = map(&r.target);
+                r
+            })
+            .collect();
+        assert_eq!(
+            predicted_refs, actual.refs,
+            "{what}: row {} carries different ref badges",
+            actual.row
+        );
+        assert_eq!(
+            predicted.color,
+            actual.color,
+            "{what}: commit {} is painted with a different palette slot",
+            actual.commit.id.short()
+        );
     }
     assert_eq!(
         after.lane_count, real.lane_count,
         "{what}: the gutter widths differ"
+    );
+
+    // ---- the two non-trivial facts the comparisons above rest on ----------
+    //
+    // Both are asserted about the ORACLE (`real`), never about the preview: an
+    // equality between two empty vectors passes while the mechanism it claims
+    // to check is gone, which is exactly how "dropping every edge from both
+    // graphs" survived this function before.
+    assert!(
+        real.rows.len() > 1,
+        "{what}: a one-row layout cannot show a placement mistake — the \
+         fixture is too small to prove anything"
+    );
+    assert!(
+        !real.edges.is_empty(),
+        "{what}: the real layout drew no edges at all, so comparing edge sets \
+         would compare two empty vectors and pass whatever the preview did"
+    );
+    assert!(
+        real.rows.iter().any(|r| !r.refs.is_empty()),
+        "{what}: no row in the real layout carries a ref badge, so the badge \
+         comparison above is vacuous"
+    );
+    assert_eq!(
+        after.edges, real.edges,
+        "{what}: the lines drawn between rows differ — edges are (row, lane) \
+         pairs on both sides, so they compare directly and a missing or \
+         misrouted connector shows up here"
     );
 }
 
@@ -769,53 +1639,309 @@ async fn a5_a_previewed_merge_matches_a_real_merge() {
     assert_parity(&graph.after, &real, &before_layout, "merge");
 }
 
+/// The tree `merge-tree` computes for `op`, through the **same**
+/// `previewable` → `resolve_plumbing` → `merge_tree` path [`compute`] takes.
+///
+/// Recomputed here rather than read out of the returned outcome because the
+/// scratch store is dropped by the time `preview()` returns and
+/// `PreviewOutcome` carries no tree oid. That limit is real and is stated in
+/// the module doc: this pins the recipe, not the wiring between the recipe and
+/// `commit_tree`.
+async fn predicted_tree(repo: &Path, op: &GitOperation) -> String {
+    let head = git::out(repo, &["rev-parse", "HEAD"]);
+    let previewable = previewable(op).expect("the operation must be previewable");
+    let plumbing = resolve_plumbing(repo, &previewable, &head)
+        .await
+        .expect("resolve the plumbing");
+    let Plumbing::Synthesize(recipe) = plumbing else {
+        panic!("this operation must synthesize a commit for its tree to exist");
+    };
+    match merge_tree(repo, &recipe).await.expect("merge-tree ran") {
+        MergeTreeAnswer::Clean { tree } => tree,
+        other => panic!("expected a clean merge, got {other:?}"),
+    }
+}
+
+/// The previewed tree is the tree the real command writes — and the real
+/// command's tree is not HEAD's.
+///
+/// # Why the second half is the load-bearing one
+///
+/// `assert_eq!(predicted, real)` is satisfied when **both** are simply HEAD's
+/// own tree, which is exactly what "a revert that reverts nothing" and "a merge
+/// that merges nothing" produce. Verified by mutation: with that pairing
+/// missing, a preview computing no merge at all passed every test in this file.
+/// So the oracle is checked for non-triviality first, against HEAD's tree read
+/// before anything ran.
+///
+/// A tree is the one value comparable across the two runs: it hashes content,
+/// while the commit that wraps it hashes the time it was written.
+async fn assert_tree_matches_the_real_run(
+    repo: &Path,
+    op: &GitOperation,
+    real_command: &[&str],
+    what: &str,
+) {
+    let head_tree_before = git::out(repo, &["rev-parse", "HEAD^{tree}"]);
+    let predicted = predicted_tree(repo, op).await;
+
+    let (_scratch, copy) = copy_of(repo);
+    git::run(&copy, real_command);
+    let real_tree = git::out(&copy, &["rev-parse", "HEAD^{tree}"]);
+
+    assert_ne!(
+        real_tree,
+        head_tree_before,
+        "{what}: `git {}` left HEAD's tree untouched, so comparing a predicted \
+         tree against it would pass for a preview that computed nothing — this \
+         fixture cannot prove what the test claims",
+        real_command.join(" ")
+    );
+    assert_eq!(
+        predicted,
+        real_tree,
+        "{what}: the previewed tree must be the tree `git {}` actually writes",
+        real_command.join(" ")
+    );
+}
+
+/// **A5, revert, content.** The previewed revert really removes what the
+/// reverted commit added.
+///
+/// # Two mutations
+///
+/// 1. **Removes the mechanism** — set the revert recipe's `theirs` to `head`
+///    instead of the target's parent. The three-way merge then has nothing to
+///    apply, `merge-tree` answers HEAD's own tree, and the `assert_eq!` goes
+///    red naming two different tree oids.
+/// 2. **Weakens it** — set `merge_base: None` so git computes its own base.
+///    A tree is still produced and the graph shape is unchanged, but it is the
+///    tree of a merge rather than of a revert, so the same equality goes red
+///    with a *different* pair of oids — and the shape tests all stay green,
+///    which is the point of having this test at all.
+#[tokio::test]
+async fn a5_a_previewed_revert_writes_the_tree_a_real_revert_writes() {
+    let (_dir, repo) = revert_shape();
+    let head = git::out(&repo, &["rev-parse", "HEAD"]);
+    let op = GitOperation::RevertCommit {
+        commit: CommitOid::new(head.clone()).expect("a full hex oid"),
+    };
+    assert_tree_matches_the_real_run(&repo, &op, &["revert", "--no-edit", &head], "revert").await;
+}
+
 /// The cherry-pick really carries the picked commit's *content* across, not
 /// just its shape.
 ///
 /// The shape comparison above cannot see this: a preview that used the picked
 /// commit as its own merge base would produce a commit with the right parents
-/// in the right lane whose tree was simply HEAD's. So the hypothetical
-/// commit's tree is compared against the real cherry-pick's tree — the one
-/// value that is identical across the two runs even though the commit oids are
-/// not, because a tree hashes content and not time.
+/// in the right lane whose tree was simply HEAD's.
+///
+/// # Two mutations
+///
+/// 1. **Removes the mechanism** — use the picked commit itself as
+///    `merge_base`. The pick contributes nothing, the predicted tree is HEAD's,
+///    and the equality goes red.
+/// 2. **Weakens it** — swap `ours` and `theirs`. A real three-way merge still
+///    runs and still answers a tree, but it is the reverse merge's tree, so the
+///    equality goes red on a different oid than mutation 1 produces.
 #[tokio::test]
 async fn a5_cherry_pick_actually_moves_the_content() {
     let (_dir, repo) = cherry_pick_shape();
     let topic = git::out(&repo, &["rev-parse", "topic"]);
+    let op = GitOperation::CherryPick {
+        commit: CommitOid::new(topic.clone()).expect("a full hex oid"),
+    };
+    assert_tree_matches_the_real_run(&repo, &op, &["cherry-pick", &topic], "cherry-pick").await;
+}
+
+/// **A5, merge, content.** The previewed merge really unions the two branches'
+/// trees.
+///
+/// This is the leg the verifiers found most dangerous: with no tree comparison,
+/// a merge preview whose `theirs` equalled `ours` passed all thirty tests — and
+/// since a branch can never conflict with itself, **every** conflicting merge
+/// would have been drawn as a clean graph under that break.
+///
+/// # Two mutations
+///
+/// 1. **Removes the mechanism** — set the merge recipe's `theirs` to `head`.
+///    `merge-tree` merges HEAD with itself, answers HEAD's tree, and the
+///    equality goes red.
+/// 2. **Weakens it** — set `merge_base: Some(head)`. git then treats HEAD as
+///    the base, so the merged tree becomes the *other* branch's tree rather
+///    than the union of both — a different wrong oid, from a different cause.
+#[tokio::test]
+async fn a5_a_previewed_merge_writes_the_tree_a_real_merge_writes() {
+    let (_dir, repo) = git_vista_fixtures::merge_clean_two_branch();
+    let op = GitOperation::MergeBranch {
+        branch: BranchName::new("feature").expect("a valid branch name"),
+    };
+    assert_tree_matches_the_real_run(
+        &repo,
+        &op,
+        &["merge", "-q", "--no-edit", "feature"],
+        "merge",
+    )
+    .await;
+}
+
+/// **A5, revert, row order.** The same parity as
+/// `a5_a_previewed_revert_matches_a_real_revert`, on a shape where the
+/// hypothetical commit's **timestamp** is what puts it in row 0.
+///
+/// `revert_shape`'s `after` window has exactly one topologically-ready commit,
+/// so its row order is forced by topology alone and a bogus timestamp is
+/// invisible there. Here `side` is ready from the start and dated
+/// [`LONG_AGO`], so "newest first" has to actually decide.
+///
+/// # Two mutations
+///
+/// 1. **Removes the mechanism** — build the added `CommitSummary` with
+///    `time: 0` instead of the value `read_back` read out of the store. The
+///    hypothetical commit sorts below `side work` and the row assertion names
+///    the swap.
+/// 2. **Weakens it** — read the **author** time (`%at`) rather than the
+///    committer time (`%ct`) in `read_commit_record`'s format string. On this
+///    fixture both are "now", so row 0 is still right and this test stays
+///    green — while `parse_commit_record_reads_six_fields_and_the_committer_time`
+///    goes red on the literal `1_788_127_876`. Different mechanism, different
+///    test, which is why the pair is written this way rather than as two
+///    timestamp breaks that land here.
+#[tokio::test]
+async fn a5_the_previewed_reverts_row_is_decided_by_its_timestamp() {
+    let (_dir, repo) = revert_shape_with_a_competitor_tip();
+    let head = git::out(&repo, &["rev-parse", "HEAD"]);
+    let before_layout = layout_of(&repo);
+    assert!(
+        before_layout
+            .rows
+            .iter()
+            .filter(|r| r.commit.parents.len() <= 1)
+            .count()
+            >= 2,
+        "the fixture must offer a competitor tip, or row order is forced by \
+         topology and this test proves nothing about time"
+    );
 
     let plan = plan_for(
         &repo,
-        GitOperation::CherryPick {
-            commit: CommitOid::new(topic.clone()).expect("a full hex oid"),
+        GitOperation::RevertCommit {
+            commit: CommitOid::new(head.clone()).expect("a full hex oid"),
         },
     )
     .await;
-    // Recompute the tree through the same recipe the preview used, in a store
-    // of this test's own, so the tree oid can be read before the store is
-    // dropped.
-    let head = git::out(&repo, &["rev-parse", "HEAD"]);
-    let op = previewable(&plan.operation).expect("cherry-pick is previewable");
-    let plumbing = resolve_plumbing(&repo, &op, &head)
-        .await
-        .expect("resolve the plumbing");
-    let Plumbing::Synthesize(recipe) = plumbing else {
-        panic!("a clean cherry-pick must synthesize a commit");
-    };
-    let predicted_tree = match merge_tree(&repo, &recipe).await.expect("merge-tree ran") {
-        MergeTreeAnswer::Clean { tree } => tree,
-        other => panic!("expected a clean merge, got {other:?}"),
-    };
+    let (graph, _) = expect_graph(preview(&repo, &plan).await);
 
     let (_scratch, copy) = copy_of(&repo);
-    git::run(&copy, &["cherry-pick", &topic]);
-    let real_tree = git::out(&copy, &["rev-parse", "HEAD^{tree}"]);
+    git::run(&copy, &["revert", "--no-edit", &head]);
+    let real = layout_of(&copy);
 
     assert_eq!(
-        predicted_tree, real_tree,
-        "the previewed tree must be the tree a real cherry-pick writes — a \
-         tree hashes content, so this is comparable across two runs whose \
-         commit oids can never be"
+        real.rows[0].commit.summary, "Revert \"add c\"",
+        "the oracle must really put the new commit in row 0, or the parity \
+         below could hold with the timestamp ignored"
     );
+    assert_row_zero_is_decided_by_time(&copy);
+    assert_parity(
+        &graph.after,
+        &real,
+        &before_layout,
+        "revert with competitor",
+    );
+}
+
+/// **A5, merge, row order.** As above, for the merge leg.
+///
+/// # Two mutations
+///
+/// 1. **Removes the mechanism** — `time: 0` for the added commit, as in the
+///    revert case: the merge commit sorts below `side work` and row 0 changes.
+/// 2. **Weakens it** — transpose the merge recipe's `parents` to `[tip, head]`.
+///    The timestamp is untouched so row 0 is still the merge commit, but the
+///    parent-topology assertion and the lane placement of the two chains go
+///    red instead.
+#[tokio::test]
+async fn a5_the_previewed_merges_row_is_decided_by_its_timestamp() {
+    let (_dir, repo) = merge_shape_with_a_competitor_tip();
+    let before_layout = layout_of(&repo);
+
+    let plan = plan_for(
+        &repo,
+        GitOperation::MergeBranch {
+            branch: BranchName::new("feature").expect("a valid branch name"),
+        },
+    )
+    .await;
+    let (graph, _) = expect_graph(preview(&repo, &plan).await);
+
+    let (_scratch, copy) = copy_of(&repo);
+    git::run(&copy, &["merge", "-q", "--no-edit", "feature"]);
+    let real = layout_of(&copy);
+
+    assert_eq!(
+        parent_count(&copy, "HEAD"),
+        2,
+        "the oracle must really be a two-parent merge commit"
+    );
+    assert_eq!(
+        real.rows[0].commit.summary, "Merge branch 'feature'",
+        "the oracle must really put the merge commit in row 0, ahead of the \
+         competitor tip, or the parity below could hold with time ignored"
+    );
+    assert_row_zero_is_decided_by_time(&copy);
+    assert_parity(&graph.after, &real, &before_layout, "merge with competitor");
+}
+
+/// **A3, merge.** A merge that would conflict answers `Conflict { paths }`,
+/// naming the file — there was no such test at all before, and the merge arm is
+/// where a wrongly-clean answer does the most damage.
+///
+/// The oracle runs first: real `git merge --no-edit` on a copy must actually
+/// fail and leave the path conflicted. Without that, a preview reporting a
+/// conflict on a shape that merges cleanly would look correct.
+///
+/// # Two mutations
+///
+/// 1. **Removes the mechanism** — classify `Some(1)` as
+///    `MergeTreeAnswer::Clean` in `merge_tree`. The preview draws a graph for a
+///    merge git refuses to make, and the `match` here names it.
+/// 2. **Weakens it** — set the merge recipe's `theirs` to `head`. HEAD merged
+///    with itself never conflicts, so `merge-tree` exits 0, the preview draws a
+///    clean merge commit and the same `match` goes red — but from a
+///    *plausible* graph rather than a misclassification, which is the failure
+///    the whole feature exists to prevent.
+#[tokio::test]
+async fn a3_a_conflicting_merge_answers_conflict_naming_the_file() {
+    let (_dir, repo) = merge_conflict_shape();
+
+    let (_scratch, copy) = copy_of(&repo);
+    assert!(
+        !git::try_run(&copy, &["merge", "--no-edit", "feature"]),
+        "the fixture must really conflict under real git, or this test's \
+         expectation is not git's"
+    );
+    assert!(
+        git::out(&copy, &["diff", "--name-only", "--diff-filter=U"])
+            .lines()
+            .any(|line| line == "target.txt"),
+        "real git must leave `target.txt` unmerged"
+    );
+
+    let plan = plan_for(
+        &repo,
+        GitOperation::MergeBranch {
+            branch: BranchName::new("feature").expect("a valid branch name"),
+        },
+    )
+    .await;
+    match preview(&repo, &plan).await {
+        PreviewOutcome::Conflict { paths } => assert_eq!(
+            paths,
+            vec!["target.txt".to_string()],
+            "the conflicted path must be the file itself, not git's prose"
+        ),
+        other => panic!("expected Conflict for a conflicting merge, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -906,6 +2032,269 @@ async fn a_fast_forward_merge_moves_the_refs_and_adds_no_commit() {
             to: Oid(tip),
         }),
         "HEAD moves with the branch it is attached to: {changes:?}"
+    );
+}
+
+/// `topic`'s edit is **already present** on `main`, byte for byte, from a
+/// separate commit. Cherry-picking `topic`'s tip therefore produces nothing.
+///
+/// Measured on this host, 2026-08-30: `git cherry-pick <topic>` prints "The
+/// previous cherry-pick is now empty", exits **1**, leaves HEAD where it was
+/// and leaves `.git/CHERRY_PICK_HEAD` behind — the repository is mid-sequence
+/// and needs `--skip` or `--abort`.
+fn cherry_pick_already_applied_shape() -> (TempDir, PathBuf) {
+    let dir = TempDir::new().expect("tempdir");
+    let repo = dir.path().join("repo");
+    git::init(&repo);
+    let base: String = (1..=10).map(|n| format!("line {n}\n")).collect();
+    let edited = base.replace("line 5\n", "line 5 edited\n");
+    git::write(&repo, "target.txt", base.as_bytes());
+    commit_old(&repo, "base");
+
+    git::run(&repo, &["checkout", "-q", "-b", "topic"]);
+    git::write(&repo, "target.txt", edited.as_bytes());
+    commit_old(&repo, "topic: edit line five");
+
+    git::run(&repo, &["checkout", "-q", "main"]);
+    git::write(&repo, "target.txt", edited.as_bytes());
+    commit_old(&repo, "main: the same edit, independently");
+    (dir, repo)
+}
+
+/// **A cherry-pick whose change is already applied.** Real `git cherry-pick`
+/// refuses and strands the repository mid-sequence, so there is no clean added
+/// commit to draw.
+///
+/// # Expected to be RED
+///
+/// `resolve_plumbing`'s `CherryPick` arm never compares the merged tree against
+/// HEAD's, so `merge-tree` answers HEAD's own tree, `commit-tree` wraps it in
+/// an **empty** commit and the preview draws it as an ordinary addition. What
+/// the user is shown is a tidy new row; what they get on pressing the button is
+/// exit 1, a `CHERRY_PICK_HEAD` and a repository they have to `--abort` out of.
+///
+/// The signal needed to refuse is already in hand and is asserted below: the
+/// tree `merge_tree` returns **equals** HEAD's tree, which is precisely the
+/// "this pick contributes nothing" fact. That assertion is not decoration — it
+/// is the evidence that the fix costs one comparison rather than a new spawn.
+///
+/// # What this asserts, and the design decision left open
+///
+/// Only that the outcome is **not a `Graph`**. Whether the right answer is
+/// `Unavailable { CheckFailed }`, `Unsupported`, or a fifth outcome that says
+/// "this operation would do nothing and then stop" is a contract decision for
+/// whoever fixes the arm. Asserting "no `Added` change" instead would be
+/// satisfied by routing this to a `Graph` with `changes: []`, which still tells
+/// the user the pick is a harmless no-op when it is in fact an error.
+///
+/// # Two mutations, once the arm is fixed
+///
+/// 1. **Removes the mechanism** — drop the tree-versus-HEAD comparison: the
+///    preview draws the empty commit again and this assertion names the
+///    `Graph`.
+/// 2. **Weakens it** — compare the merged tree against the *picked commit's*
+///    tree instead of HEAD's. That is a different question with a different
+///    answer, so the empty pick is not caught and the same assertion goes red
+///    — while `a5_cherry_pick_actually_moves_the_content` stays green, showing
+///    the two comparisons are not interchangeable.
+#[tokio::test]
+async fn a_cherry_pick_that_is_already_applied_must_not_be_drawn_as_a_clean_commit() {
+    let (_dir, repo) = cherry_pick_already_applied_shape();
+    let topic = git::out(&repo, &["rev-parse", "topic"]);
+    let head_tree = git::out(&repo, &["rev-parse", "HEAD^{tree}"]);
+
+    // The oracle: real git, on a copy.
+    let (_scratch, copy) = copy_of(&repo);
+    let head_before = git::out(&copy, &["rev-parse", "HEAD"]);
+    assert!(
+        !git::try_run(&copy, &["cherry-pick", &topic]),
+        "a pick whose change is already applied must fail under real git — if \
+         it succeeded, git's behaviour is not what this test was written \
+         against"
+    );
+    assert_eq!(
+        git::out(&copy, &["rev-parse", "HEAD"]),
+        head_before,
+        "the refused pick must leave HEAD where it was"
+    );
+    assert!(
+        copy.join(".git").join("CHERRY_PICK_HEAD").exists(),
+        "real git leaves the repository mid-sequence, which is the state a \
+         preview must not describe as a clean new commit"
+    );
+
+    let op = GitOperation::CherryPick {
+        commit: CommitOid::new(topic).expect("a full hex oid"),
+    };
+    assert_eq!(
+        predicted_tree(&repo, &op).await,
+        head_tree,
+        "the fact needed to refuse is already in hand: `merge-tree` answers \
+         HEAD's own tree, which is what 'this pick contributes nothing' looks \
+         like"
+    );
+
+    let plan = plan_for(&repo, op).await;
+    let outcome = preview(&repo, &plan).await;
+    assert!(
+        !matches!(outcome, PreviewOutcome::Graph { .. }),
+        "a pick that real git refuses, leaving CHERRY_PICK_HEAD behind, must \
+         not be drawn as a graph with a clean new commit; got {outcome:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `merge.ff` — what the executor will really do, which the preview does not ask
+// ---------------------------------------------------------------------------
+
+/// **`merge.ff = false`, fast-forwardable.** Real `git merge --no-edit` writes
+/// a **two-parent commit**; the preview must draw that commit.
+///
+/// # Expected to be RED until the merge arm reads the config
+///
+/// `resolve_plumbing`'s `Previewable::Merge` arm decides between
+/// `AlreadyUpToDate`, `FastForward` and `Synthesize` from `merge-base` alone
+/// and reads no git config at any point. `planner::branch_exec::exec_merge`
+/// runs `["merge", "--no-edit"]`, which obeys `merge.ff`. Measured in a
+/// throwaway repository on this host, 2026-08-30: with `merge.ff=false` on a
+/// fast-forwardable branch git printed "Merge made by the 'ort' strategy" and
+/// `git cat-file -p HEAD` showed two `parent` lines. The preview takes the
+/// `FastForward` arm and draws a linear history with nothing added.
+///
+/// That is the confidently-wrong picture ADR 0099 exists to make impossible,
+/// and `merge.ff = false` is a common setting that `sandbox::spawn` carries
+/// into every repository through `$HOME`.
+///
+/// # Two mutations, named against the arm once it is fixed
+///
+/// 1. **Removes the mechanism** — drop the `merge.ff` read entirely and go back
+///    to deciding on `merge-base` alone. The preview adds no commit and
+///    `assert_parity`'s "the preview must add exactly one commit" fires with an
+///    empty list.
+/// 2. **Weakens it** — read the config but treat any value other than `only` as
+///    permitting a fast-forward (i.e. handle `only` and ignore `false`). A
+///    commit is still not created here, so the failure lands on the same
+///    assertion — which is why that is deliberately **not** the second
+///    mutation. Take instead: read `merge.ff=false` and answer `Synthesize`
+///    with `parents: vec![head]`, a one-parent commit. One commit *is* added,
+///    so the count passes and the **parent-topology** assertion goes red
+///    instead, naming one parent where git wrote two.
+#[tokio::test]
+async fn merge_ff_false_must_preview_the_two_parent_commit_git_actually_writes() {
+    let (_dir, repo) = fast_forward_shape();
+    git::run(&repo, &["checkout", "-q", "behind"]);
+    git::run(&repo, &["config", "merge.ff", "false"]);
+    let before_layout = layout_of(&repo);
+
+    // The oracle: the executor's own argv, on a copy.
+    let (_scratch, copy) = copy_of(&repo);
+    assert_eq!(
+        git::out(&copy, &["config", "--get", "merge.ff"]),
+        "false",
+        "the copy must carry the setting, or the oracle below is not the case \
+         this test is about"
+    );
+    git::run(&copy, &["merge", "--no-edit", "main"]);
+    assert_eq!(
+        parent_count(&copy, "HEAD"),
+        2,
+        "with merge.ff=false a real merge writes a two-parent commit — if this \
+         fails, git's behaviour is not what this test was written against"
+    );
+    let real = layout_of(&copy);
+
+    let plan = plan_for(
+        &repo,
+        GitOperation::MergeBranch {
+            branch: BranchName::new("main").expect("a valid branch name"),
+        },
+    )
+    .await;
+    let (graph, changes) = expect_graph(preview(&repo, &plan).await);
+
+    assert_eq!(
+        changes
+            .iter()
+            .filter(|c| matches!(c, PreviewChange::Added { .. }))
+            .count(),
+        1,
+        "with merge.ff=false the merge creates a commit, so exactly one must \
+         be reported as added: {changes:?}"
+    );
+    assert_parity(&graph.after, &real, &before_layout, "merge.ff=false");
+}
+
+/// **`merge.ff = only`, divergent.** Real `git merge --no-edit` exits **128**
+/// and does nothing, so there is no graph to draw.
+///
+/// # Expected to be RED until the merge arm reads the config
+///
+/// Measured on this host, 2026-08-30: on two divergent branches with
+/// `merge.ff=only`, git printed "fatal: Not possible to fast-forward,
+/// aborting.", exited 128, and left HEAD exactly where it was. The preview
+/// takes the `Synthesize` arm and draws a clean merge commit — a picture of an
+/// operation that is going to fail.
+///
+/// # What this asserts, and the design decision it deliberately leaves open
+///
+/// Only that the outcome is **not a `Graph`**. Which refusal is right —
+/// `Unavailable { CheckFailed { detail } }` ("the check could not establish a
+/// merge") or `Unsupported { operation }` ("this can never be previewed") — is
+/// a contract decision for whoever fixes the arm, and picking one here would
+/// pin a choice this test has no standing to make.
+///
+/// It is deliberately **not** written as "no `Added` change": `AlreadyUpToDate`
+/// already returns a `Graph` with empty `changes`, so routing this case there
+/// would satisfy that weaker form while still telling the user the merge is a
+/// no-op when it is in fact an error.
+///
+/// # Two mutations, named against the arm once it is fixed
+///
+/// 1. **Removes the mechanism** — drop the `merge.ff` read: the preview
+///    synthesises a merge commit again and this assertion names the `Graph`.
+/// 2. **Weakens it** — read the config but route `only` to
+///    `Plumbing::AlreadyUpToDate` instead of a refusal. Nothing is added and no
+///    ref moves, so every "no commit was invented" check passes; the outcome is
+///    still a `Graph` and *this* assertion is the one that goes red.
+#[tokio::test]
+async fn merge_ff_only_must_not_draw_a_merge_git_refuses_to_make() {
+    let (_dir, repo) = merge_shape_with_a_competitor_tip();
+    git::run(&repo, &["config", "merge.ff", "only"]);
+
+    // The oracle first: prove real git refuses and moves nothing.
+    let (_scratch, copy) = copy_of(&repo);
+    let head_before = git::out(&copy, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        git::out(&copy, &["config", "--get", "merge.ff"]),
+        "only",
+        "the copy must carry the setting, or the oracle below is not the case \
+         this test is about"
+    );
+    assert!(
+        !git::try_run(&copy, &["merge", "--no-edit", "feature"]),
+        "with merge.ff=only a divergent merge must fail — if it succeeded, \
+         git's behaviour is not what this test was written against"
+    );
+    assert_eq!(
+        git::out(&copy, &["rev-parse", "HEAD"]),
+        head_before,
+        "the refused merge must leave HEAD where it was"
+    );
+
+    let plan = plan_for(
+        &repo,
+        GitOperation::MergeBranch {
+            branch: BranchName::new("feature").expect("a valid branch name"),
+        },
+    )
+    .await;
+    let outcome = preview(&repo, &plan).await;
+
+    assert!(
+        !matches!(outcome, PreviewOutcome::Graph { .. }),
+        "with merge.ff=only the merge exits 128 and changes nothing, so any \
+         graph at all is a picture of something that will not happen; got \
+         {outcome:?}"
     );
 }
 

@@ -79,5 +79,8 @@ pub use content::{
     binary_blob, four_mode, on_disk_len, path_battery, pathological_content, write_rows,
     BIG_TEXT_APPEND, BIG_TEXT_BYTES, BINARY_SENTINEL,
 };
-pub use divergent::{cherry_pick_clean, cherry_pick_conflict, merge_clean_two_branch};
+pub use divergent::{
+    cherry_pick_already_applied, cherry_pick_clean, cherry_pick_conflict, divergent_merge_ff_only,
+    fast_forward_merge_ff_false, merge_clean_two_branch, merge_conflict,
+};
 pub use seeded::{empty, seeded, seeded_dated, seeded_files, Fixture, PINNED_DATE};
