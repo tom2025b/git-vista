@@ -116,7 +116,7 @@ fn split(argv: &[std::ffi::OsString]) -> (&std::ffi::OsString, &[std::ffi::OsStr
 /// Pinned by `the_launcher_scrubs_gits_repository_geometry_environment`
 /// (which carries its own literal copy of these names, deliberately) and
 /// behaviourally by the preview suite's A2 environment test.
-const SCRUBBED_GIT_GEOMETRY_ENV: [&str; 9] = [
+const SCRUBBED_GIT_GEOMETRY_ENV: &[&str] = &[
     "GIT_DIR",
     "GIT_COMMON_DIR",
     "GIT_OBJECT_DIRECTORY",
