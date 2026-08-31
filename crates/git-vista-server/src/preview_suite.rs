@@ -4883,13 +4883,26 @@ fn history_wider_than_the_window() -> (TempDir, PathBuf) {
 /// see the wrapper's number is a repository wider than it, so the fixture
 /// builds one with `commit-tree` — no index, no working tree, one spawn each.
 ///
-/// # Mutation-proved two ways
+/// # Mutation-proved — and both mutations fail IDENTICALLY, on purpose
 ///
-/// 1. **Removes the mechanism** — the wrapper passes `usize::MAX`. The walk is
-///    unbounded, `after` carries every commit, and the count is 502 not 500.
+/// 1. **Removes the mechanism** — the wrapper passes `usize::MAX`.
 /// 2. **Weakens it** — the wrapper passes `PREVIEW_HISTORY_LIMIT + 1`, the
-///    auditor's own mutation. Off by exactly one, which is the shape that
-///    survived everything else.
+///    auditor's own mutation, off by exactly one.
+///
+/// Both go red at the *same* assertion with the *same* numbers, `left: 501`
+/// against `right: 500`. That is normally the sign of a weak proof, and here it
+/// is the opposite: after the single-binding refactor the wrapper holds exactly
+/// **one** number, so every corruption of it widens the walk and there is no
+/// second failure mode left to find. A mutation that left `before` correct
+/// while widening `after` is what the old two-literal shape allowed and this
+/// one cannot express.
+///
+/// The differently-failing pair lives in
+/// [`the_walk_and_the_after_cap_read_the_same_window`], where the cap and the
+/// walk are separate parameters and can still be broken apart — one reddens the
+/// after-cap assertion, the other the walk assertion. Read the two tests
+/// together: that one proves the uses agree, this one proves the number they
+/// agree on is the documented one.
 #[test]
 fn the_wrapper_hands_the_layout_the_window_it_documents() {
     let (_dir, repo) = history_wider_than_the_window();
