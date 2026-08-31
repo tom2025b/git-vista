@@ -343,9 +343,45 @@ repository object-for-object only in its new commit.
 reserves lane 0 and seeds colour slot 0 from the ref slice it is handed, so a
 `ref_moves` entry that matched nothing puts the hypothetical commit in lane 1
 with a synthetic colour — a confidently wrong picture drawn from correct data.
-`lay_out_preview` reports both ways a caller can get that wrong, and this
-module treats **either** as `CheckFailed` rather than returning the damaged
-graph. Returning it is not an option.
+`lay_out_preview` reports **three** ways the `after` graph can disagree with
+a real run: two that a caller gets wrong (`unmatched_ref_moves`,
+`added_without_ref_moves`) and one that a **correct** caller produces —
+`added_claimed_by_no_branch`. On a detached HEAD the operation moves `HEAD`
+alone; `assign_branch_colors` seeds only from `is_branch()` refs; so the
+hypothetical row falls into the `~<short oid>` synthetic fallback — a colour
+keyed on an object id that does not exist yet, against a real run whose
+object id is a different one. Five chances in six of differing.
+
+This module treats **any of the three** as `CheckFailed` rather than
+returning the damaged graph. Returning it is not an option.
+`a_detached_head_refuses_rather_than_colouring_a_commit_no_branch_claims`
+pins the refusal, and `the_refusal_says_detached_only_when_head_really_is_detached`
+pins that the reason names the state actually found — a single constant
+string would satisfy the first test and lie in the second.
+
+**The cost is stated rather than hidden.** On a detached HEAD — mid-bisect,
+or on a checked-out tag — revert, cherry-pick and merge-commit previews are
+**unavailable**, and #460's plan-review pane inherits that hole. A
+fast-forward, which adds no commit, still previews;
+`a_detached_head_still_previews_a_fast_forward_because_it_adds_no_commit` is
+the over-refusal tripwire, and it goes red the moment the guard is rewritten
+as "refuse when HEAD is detached" instead of "refuse when a commit was added
+that no branch claims".
+
+**Why this refuses rather than being fixed.** Colouring the detached case
+correctly means seeding the colour pass from the detached `HEAD` ref, which
+changes what a **real** run is painted too — a change to `layout/color.rs`,
+not to the preview. The recommended shape, for whoever takes it: seed from
+the `RefKind::Head` ref with key `"HEAD"`, leaving the synthetic fallback
+untouched; it is a no-op whenever HEAD's commit is already claimed by a
+branch. One trap to carry forward: in `assign_branch_colors`'s
+`seeds.sort_by_key`, a `Head`-kind ref computes the same `trunk_rank` as an
+ordinary local branch and then sorts by `tip_row`, so a detached HEAD at row
+0 could claim a local branch's chain out from under it — the HEAD seed must
+sort after **all** branches. The rejected alternative, "an unclaimed row
+inherits its first parent's colour", also fires for a merge's second parent
+whose first parent is already claimed, flattening a real side branch into
+trunk blue.
 
 Consequence a UI must know: **preview lane numbers do not match the live
 graph's.** The preview lays out one capped `walk_history(repo, 500)`; the live
