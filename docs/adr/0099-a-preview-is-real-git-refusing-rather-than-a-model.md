@@ -588,18 +588,38 @@ commit by position instead.
 ## Verification
 
 `buildlock cargo test -p git-vista-server --bin git-vista-server` →
-**1077 passed, 1 failed, 4 ignored**;
+**1080 passed, 0 failed, 4 ignored**;
 `buildlock cargo clippy -p git-vista-server --all-targets -- -D warnings` → clean.
-44 of those tests are `preview::suite`.
+46 of those tests are `preview::suite`.
 
-**The one failure is `a2_a_cancelled_preview_leaves_nothing_behind`, and it is
-carried red on purpose.** Its name claims more than it asserts: the caller-drop leak
-it was written for is fixed and measured fixed, but its pass condition is "residue
-cleared within 150 ms" and the runtime-teardown case above is genuinely not closed.
-Deleting it to reach a green tally is exactly what happened once already in this
-work — a block of five stricter A2 tests was removed mid-session and the suite went
-green by deletion — so it stays red and stated until it is either fixed or renamed to
-what it actually pins.
+**Corrected 2026-08-31.** This section previously read *1077 passed, 1 failed*, and
+said `a2_a_cancelled_preview_leaves_nothing_behind` was "carried red on purpose"
+because its pass condition was "residue cleared within 150 ms" while the
+runtime-teardown case stayed open. Two things about that were wrong, and the second
+one matters more than the tally.
+
+**The test is green, and it got there the right way.** The name was kept and the
+*assertion* was raised to meet it, rather than the name being lowered to meet the
+assertion. The fixed 150 ms sleep became a settle-wait — a 150 ms floor, then polling
+every 20 ms to a 10 s ceiling — so it now asserts that **nothing survives**, which is
+what its name says and what A2 requires. `SETTLE_CEILING` is sized off the measured
+spawn (`git init --bare` recorded at 128 ms and 1.16 s on this host); the slowest
+settle observed across five full-suite runs was 462 ms, and the figure is printed
+every run so drift stays visible.
+
+**The stated reason for the redness was wrong, and it was wrong in the direction that
+blames the wrong mechanism.** Teardown was never what made it red. The residue
+signature was `HEAD`, `config`, `refs/heads/` and `refs/tags/` with **no `objects/`
+at all**, appearing at 84–88 ms, on 3 of 3 runs under full-suite load and 0 of 5 in
+isolation. That is `git init` caught **part-way through its own work** — it creates
+the ref directories, `HEAD` and `config` before `objects/` — i.e. an in-flight spawn,
+not an abandoned store surviving a teardown. The runtime-teardown consequence
+recorded above remains true and remains open; it simply was not this failure.
+
+Deleting a red test to reach a green tally is what happened once already in this work
+— a block of five stricter A2 tests was removed mid-session and the suite went green
+by deletion. That is why the route to green here is recorded as carefully as the
+result.
 
 Mutations were run by hand (patch → run → restore), because
 `failure-atlas`'s `mutation_check` clones **HEAD** and none of these files are
@@ -646,8 +666,18 @@ reality" in any broader sense, and this document should not have implied it
 did. `git-vista-fixtures` now carries `merge_conflict` (a pre-merge, provably
 conflicting shape) and `cherry_pick_already_applied` (a shape whose merged
 tree is provably identical to `HEAD`'s) for a later round to build the missing
-tree/edge/ref/colour and conflicting-merge assertions against; whether
-`preview_suite.rs` uses them is that round's to report, not this one's.
+tree/edge/ref/colour and conflicting-merge assertions against.
+
+**That round has now run (2026-08-31).** All five previously-unconsumed fixtures are
+wired into `preview_suite.rs` — `cherry_pick_clean`, `cherry_pick_already_applied`,
+`merge_conflict`, `divergent_merge_ff_only` and `fast_forward_merge_ff_false` — and
+none was deleted. Every rewired test was **re-**mutation-proven on its new fixture,
+because swapping a fixture can silently cost a test its ability to express failure:
+breaking `fast_forward_policy`'s config read reddened the two `merge.ff` tests and the
+unparseable-value test; dropping the no-op refusal reddened the already-applied
+cherry-pick; classifying `merge-tree` exit 1 as clean reddened the conflicting-merge
+test. `assert_parity` now compares tree, edges, ref badges and colour, and asserts
+three non-triviality facts about the *oracle* before trusting it.
 
 **One mutation survived and the test was fixed.** The first version of
 `parse_merge_tree_conflicts`' suite asserted the stop-at-the-empty-record rule
@@ -680,8 +710,17 @@ wrong; the test could not express the failure it claimed to pin.
   leaves `.git/CHERRY_PICK_HEAD` on disk, and leaves the working tree clean —
   a mid-sequence state a user must resolve, not the row a tree-blind checker
   would draw. `git-vista-fixtures::cherry_pick_already_applied` proves this
-  exact shape; nothing in `preview.rs` reads it yet.
+  exact shape. **Precise as of 2026-08-31:** `preview_suite.rs` now drives
+  `a_cherry_pick_that_is_already_applied_must_not_be_drawn_as_a_clean_commit` off that
+  fixture, and the refusal it pins is implemented — so the *test* consumes it. The
+  sentence that remains true is narrower: no **production** path in `preview.rs` reads
+  the fixture, and none should, since fixtures are test-only. Stated this way so a
+  later reader does not go looking for the wrong half.
 
 ---
 
 **Signed:** max · 2026-08-30
+**Corrected:** max · 2026-08-31T01:40:00-04:00 — Verification tally and the reason for
+the one red test (it was an in-flight `git init`, not a teardown); the fixture round
+that was deferred has now run; and the `cherry_pick_already_applied` consumer sentence
+split into its test half and its production half.
