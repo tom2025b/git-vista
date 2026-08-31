@@ -517,6 +517,57 @@ fn scratch_dirs(commondir: &Path) -> Vec<String> {
     found
 }
 
+/// Serializes the tests that mutate `GIT_OBJECT_DIRECTORY` process-wide, the
+/// same discipline `sandbox::argv`'s `SSH_AUTH_SOCK_LOCK` applies to its
+/// variable: `std::env::set_var`/`remove_var` are shared mutable state under
+/// `cargo test`'s threads-in-one-process model.
+static GIT_OBJECT_DIRECTORY_LOCK: Mutex<()> = Mutex::new(());
+
+/// `GIT_OBJECT_DIRECTORY` redirected to `target` until the guard drops —
+/// restore happens on panic too, so a red assertion cannot leak the variable
+/// into the rest of the binary.
+///
+/// # The residual exposure, stated rather than hidden
+///
+/// The lock serializes only the tests that *take* it. Any unrelated test that
+/// spawns a git while this guard is alive inherits the variable — a fixture
+/// builder would write its objects into `target`. The window is one preview
+/// run; every snapshot and every fixture step in the tests using this guard is
+/// taken **outside** it, so the guard's holder is never the test that poisons
+/// itself. If this suite ever grows flaky with objects appearing in a fixture's
+/// ODB, this window is the first suspect.
+struct GitObjectDirectoryRedirect {
+    previous: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl GitObjectDirectoryRedirect {
+    fn to(target: &Path) -> Self {
+        let lock = GIT_OBJECT_DIRECTORY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("GIT_OBJECT_DIRECTORY");
+        // SAFETY: the lock above is the only sanctioned path to this variable
+        // in the binary, matching `sandbox::argv`'s pattern for
+        // `SSH_AUTH_SOCK`.
+        unsafe { std::env::set_var("GIT_OBJECT_DIRECTORY", target) };
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for GitObjectDirectoryRedirect {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            // SAFETY: still inside the lock held by `_lock`.
+            Some(v) => unsafe { std::env::set_var("GIT_OBJECT_DIRECTORY", v) },
+            None => unsafe { std::env::remove_var("GIT_OBJECT_DIRECTORY") },
+        }
+    }
+}
+
 /// A byte-level manifest of **everything** under `commondir`: one sorted line
 /// per entry, carrying the relative path, the file's length and a digest of its
 /// contents.
@@ -943,6 +994,94 @@ async fn a2_a_conflicting_preview_changes_no_byte_under_the_git_directory() {
         diff.join("\n")
     );
     assert_eq!(scratch_dirs(&commondir), Vec::<String>::new());
+}
+
+/// **A2, the environment.** An inherited `GIT_OBJECT_DIRECTORY` must not
+/// redirect the preview's writes into the served repository's own object
+/// database.
+///
+/// # Why this is a real inheritance and not an attack scenario
+///
+/// The sealed launcher deliberately passes the server's environment through
+/// (`sandbox::spawn`), and git honours `GIT_OBJECT_DIRECTORY` as the primary
+/// object database **regardless of `--git-dir`** — so every object-writing
+/// step in this module (`merge-tree --write-tree`, `commit-tree`) lands its
+/// objects wherever that variable points, not in the scratch store its argv
+/// named. Nothing hostile is required: git itself exports exactly this
+/// variable (with `GIT_ALTERNATE_OBJECT_DIRECTORIES`) into hooks during its
+/// receive-pack quarantine, so a server launched from inside a hook inherits
+/// the bypass by construction. Pointing it at the served repository's own
+/// `objects/` is the shape an independent audit of this branch ran on
+/// 2026-08-31: real object files went 2 → 3, the scratch store stayed at 0,
+/// and the "hypothetical" commit was readable from the real ODB. No ref moved,
+/// and A2 was violated anyway.
+///
+/// Snapshots are taken before the guard exists and re-read after it drops, so
+/// the instrumentation itself never runs under the redirected environment.
+///
+/// # Two mutations that make this red, failing differently
+///
+/// The invariant — inherited repository-geometry environment cannot redirect a
+/// sandboxed git — is pinned by this test *and* by
+/// `sandbox::spawn`'s `the_launcher_scrubs_gits_repository_geometry_environment`,
+/// and the two mutations split across the pair deliberately:
+///
+/// * **M1 — REMOVES the mechanism where it bites.** Delete
+///   `"GIT_OBJECT_DIRECTORY"` from `SCRUBBED_GIT_GEOMETRY_ENV` in
+///   `sandbox::spawn`. The preview writes its merge trees and hypothetical
+///   commit into the served ODB again and **this** test goes red at the
+///   object-count assertion, with the structural test red beside it.
+/// * **M2 — WEAKENS the family.** Delete `"GIT_INDEX_FILE"` from the same
+///   list. This test stays green — the preview never touches an index — and
+///   only the structural test goes red, naming the missing variable. That
+///   split is the point: a behavioural test alone would let the family erode
+///   one unexercised variable at a time.
+#[tokio::test]
+async fn a2_an_inherited_git_object_directory_cannot_redirect_preview_writes() {
+    let (_dir, repo) = revert_shape();
+    let commondir = commondir_of(&repo).expect("resolve the commondir");
+    let head = git::out(&repo, &["rev-parse", "HEAD"]);
+    let plan = plan_for(
+        &repo,
+        GitOperation::RevertCommit {
+            commit: CommitOid::new(head).expect("a full hex oid"),
+        },
+    )
+    .await;
+
+    let objects_before = object_file_count(&commondir);
+    let refs_before = refs_snapshot(&repo);
+    assert!(
+        objects_before > 0,
+        "the fixture must actually have objects, or the count proves nothing"
+    );
+
+    let outcome = {
+        let _redirect = GitObjectDirectoryRedirect::to(&commondir.join("objects"));
+        preview(&repo, &plan).await
+        // Guard drops here: the variable is restored before any assertion
+        // helper spawns another git.
+    };
+
+    let (_graph, _changes) = expect_graph(outcome);
+    assert_eq!(
+        object_file_count(&commondir),
+        objects_before,
+        "an inherited GIT_OBJECT_DIRECTORY redirected the preview's writes \
+         into the served repository's own object database — A2's 'the real \
+         repository is unchanged' does not say 'unless an environment \
+         variable was set'"
+    );
+    assert_eq!(
+        refs_snapshot(&repo),
+        refs_before,
+        "a preview must move no ref, environment notwithstanding"
+    );
+    assert_eq!(
+        scratch_dirs(&commondir),
+        Vec::<String>::new(),
+        "the scratch store must be gone whatever the environment said"
+    );
 }
 
 /// **A2, cancellation.** A preview whose future is *dropped* part-way through

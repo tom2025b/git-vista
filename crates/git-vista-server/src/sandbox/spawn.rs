@@ -269,6 +269,83 @@ mod tests {
         );
     }
 
+    /// The launcher scrubs git's repository-geometry environment from every
+    /// composed command — the fixed, reviewed list applied at construction,
+    /// variable by variable.
+    ///
+    /// The expected names are **written out here as literals**, deliberately
+    /// not read from `SCRUBBED_GIT_GEOMETRY_ENV`: a test that iterated the
+    /// same constant it verifies would follow a deletion silently and stay
+    /// green — asserting a mapping by calling the function that defines it,
+    /// which this repository has paid for before.
+    ///
+    /// The kept set is asserted too. `GIT_TERMINAL_PROMPT` and `GIT_EDITOR`
+    /// are set by `main.rs` and must reach git; `GIT_CONFIG_GLOBAL`/`_SYSTEM`
+    /// are the documented user-git-parity decision (`preview_suite.rs`'s
+    /// `fast_forward_shape` doc records that a developer's own config reaches
+    /// every git the server runs, and the fixtures pin their own). A scrub
+    /// that grew to swallow those would be a different change than the one
+    /// reviewed here.
+    ///
+    /// # Two mutations that make this red, failing differently
+    ///
+    /// * **M1 — REMOVES the mechanism where it bites.** Delete
+    ///   `"GIT_OBJECT_DIRECTORY"` from the production list: red here on that
+    ///   name, and red in `preview_suite`'s
+    ///   `a2_an_inherited_git_object_directory_cannot_redirect_preview_writes`
+    ///   at its object-count assertion — the behavioural half of the pair.
+    /// * **M2 — WEAKENS the family.** Delete `"GIT_INDEX_FILE"`: red here
+    ///   only, because no preview touches an index. The two failure surfaces
+    ///   are what stop the family eroding one unexercised variable at a time.
+    #[test]
+    fn the_launcher_scrubs_gits_repository_geometry_environment() {
+        let repo = std::path::PathBuf::from("/srv/repo");
+        let policy = production_policy(&repo);
+        let cmd = command_async(&policy, &repo, &["status", "--short"]);
+
+        let removed: std::collections::BTreeSet<std::ffi::OsString> = cmd
+            .0
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| v.is_none().then(|| k.to_os_string()))
+            .collect();
+
+        for var in [
+            "GIT_DIR",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_INDEX_FILE",
+            "GIT_WORK_TREE",
+            "GIT_NAMESPACE",
+            "GIT_GRAFT_FILE",
+            "GIT_SHALLOW_FILE",
+        ] {
+            assert!(
+                removed.contains(std::ffi::OsStr::new(var)),
+                "{var} is not scrubbed from the launched environment — an \
+                 inherited value redirects the repository geometry the argv \
+                 pinned (git exports GIT_OBJECT_DIRECTORY itself into \
+                 receive-pack hooks, so this is an ordinary inheritance, not \
+                 an attack)"
+            );
+        }
+
+        for var in [
+            "GIT_TERMINAL_PROMPT",
+            "GIT_EDITOR",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+        ] {
+            assert!(
+                !removed.contains(std::ffi::OsStr::new(var)),
+                "{var} is scrubbed, but it is deliberately kept: the first two \
+                 are set by main.rs for every child, and the config pair is \
+                 the documented user-git-parity decision"
+            );
+        }
+    }
+
     /// C10 hazard #1, as a tripwire rather than a review convention.
     ///
     /// `SandboxedCommand` exists so an argv cannot change after `sandbox_argv`
