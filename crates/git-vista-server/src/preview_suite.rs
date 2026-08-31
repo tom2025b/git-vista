@@ -517,56 +517,15 @@ fn scratch_dirs(commondir: &Path) -> Vec<String> {
     found
 }
 
-/// Serializes the tests that mutate `GIT_OBJECT_DIRECTORY` process-wide, the
-/// same discipline `sandbox::argv`'s `SSH_AUTH_SOCK_LOCK` applies to its
-/// variable: `std::env::set_var`/`remove_var` are shared mutable state under
-/// `cargo test`'s threads-in-one-process model.
-static GIT_OBJECT_DIRECTORY_LOCK: Mutex<()> = Mutex::new(());
-
-/// `GIT_OBJECT_DIRECTORY` redirected to `target` until the guard drops —
-/// restore happens on panic too, so a red assertion cannot leak the variable
-/// into the rest of the binary.
-///
-/// # The residual exposure, stated rather than hidden
-///
-/// The lock serializes only the tests that *take* it. Any unrelated test that
-/// spawns a git while this guard is alive inherits the variable — a fixture
-/// builder would write its objects into `target`. The window is one preview
-/// run; every snapshot and every fixture step in the tests using this guard is
-/// taken **outside** it, so the guard's holder is never the test that poisons
-/// itself. If this suite ever grows flaky with objects appearing in a fixture's
-/// ODB, this window is the first suspect.
-struct GitObjectDirectoryRedirect {
-    previous: Option<std::ffi::OsString>,
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-
-impl GitObjectDirectoryRedirect {
-    fn to(target: &Path) -> Self {
-        let lock = GIT_OBJECT_DIRECTORY_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let previous = std::env::var_os("GIT_OBJECT_DIRECTORY");
-        // SAFETY: the lock above is the only sanctioned path to this variable
-        // in the binary, matching `sandbox::argv`'s pattern for
-        // `SSH_AUTH_SOCK`.
-        unsafe { std::env::set_var("GIT_OBJECT_DIRECTORY", target) };
-        Self {
-            previous,
-            _lock: lock,
-        }
-    }
-}
-
-impl Drop for GitObjectDirectoryRedirect {
-    fn drop(&mut self) {
-        match self.previous.take() {
-            // SAFETY: still inside the lock held by `_lock`.
-            Some(v) => unsafe { std::env::set_var("GIT_OBJECT_DIRECTORY", v) },
-            None => unsafe { std::env::remove_var("GIT_OBJECT_DIRECTORY") },
-        }
-    }
-}
+/// The repository path handed to [`a2_env_redirect_driver`]'s child process.
+const A2_ENV_REPO_VAR: &str = "GV_A2_ENV_REDIRECT_REPO";
+/// The serialized [`Plan`] handed to the same child process.
+const A2_ENV_PLAN_VAR: &str = "GV_A2_ENV_REDIRECT_PLAN";
+/// The line the driver prints — only after the preview under the redirected
+/// environment answered `Graph` — that the outer test requires verbatim.
+/// Without it, a driver that ran nothing would hand the outer test a free
+/// green.
+const A2_ENV_SENTINEL: &str = "GV_A2_ENV_REDIRECT_OUTCOME=graph";
 
 /// A byte-level manifest of **everything** under `commondir`: one sorted line
 /// per entry, carrying the relative path, the file's length and a digest of its
@@ -1016,8 +975,27 @@ async fn a2_a_conflicting_preview_changes_no_byte_under_the_git_directory() {
 /// and the "hypothetical" commit was readable from the real ODB. No ref moved,
 /// and A2 was violated anyway.
 ///
-/// Snapshots are taken before the guard exists and re-read after it drops, so
-/// the instrumentation itself never runs under the redirected environment.
+/// # Why the preview runs in a second process
+///
+/// The redirect must reach the preview's spawns through *inheritance* — that
+/// is the defect — and the only way to inherit is to be in the environment of
+/// the process that spawns. An earlier version of this test set the variable
+/// process-wide (mutex-guarded, restore-on-drop, the `SSH_AUTH_SOCK_LOCK`
+/// discipline) and it was not shippable: measured 2026-08-31 in the parallel
+/// binary, sibling tests' *fixture builders* — raw unsandboxed `git`
+/// commands — inherited the variable during the window, wrote **22 foreign
+/// objects** into this test's ODB (turning its own assertion falsely red) and
+/// broke three sibling tests whose repositories lost their objects to the
+/// redirect. A lock only serializes the tests that take it.
+///
+/// So the redirected environment lives in a **child process**: this test
+/// re-executes the test binary, running only [the ignored driver below] with
+/// `GIT_OBJECT_DIRECTORY` set on that child's `Command` alone. The parent's
+/// environment is never touched, so no sibling can inherit anything. The
+/// driver runs the preview and prints [`A2_ENV_SENTINEL`] only if it answered
+/// `Graph`; the sentinel is required here, so a driver that ran nothing (or
+/// refused) cannot hand this test a vacuous green. Fixture, plan and every
+/// snapshot stay in this process, outside the redirect.
 ///
 /// # Two mutations that make this red, failing differently
 ///
@@ -1056,14 +1034,36 @@ async fn a2_an_inherited_git_object_directory_cannot_redirect_preview_writes() {
         "the fixture must actually have objects, or the count proves nothing"
     );
 
-    let outcome = {
-        let _redirect = GitObjectDirectoryRedirect::to(&commondir.join("objects"));
-        preview(&repo, &plan).await
-        // Guard drops here: the variable is restored before any assertion
-        // helper spawns another git.
-    };
+    let plan_json = serde_json::to_string(&plan).expect("a Plan serializes");
+    // The re-exec `Command` lives in the fixtures crate, not here:
+    // `argv_boundary`'s scan rightly refuses any non-`git` spawn in this
+    // crate, and the fixture layer is the established unsandboxed test-support
+    // trust level. See `git_vista_fixtures::reexec`'s module doc.
+    let output = git_vista_fixtures::reexec::run_ignored_test(
+        "preview::suite::a2_env_redirect_driver_runs_one_preview_under_the_variable",
+        &[
+            (
+                "GIT_OBJECT_DIRECTORY",
+                commondir.join("objects").as_os_str(),
+            ),
+            (A2_ENV_REPO_VAR, repo.as_os_str()),
+            (A2_ENV_PLAN_VAR, std::ffi::OsStr::new(&plan_json)),
+        ],
+    );
 
-    let (_graph, _changes) = expect_graph(outcome);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the driver process failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains(A2_ENV_SENTINEL),
+        "the driver never reported a Graph outcome, so no preview ran under \
+         the redirected environment and the assertions below would be \
+         vacuous:\n{stdout}"
+    );
+
     assert_eq!(
         object_file_count(&commondir),
         objects_before,
@@ -1082,6 +1082,40 @@ async fn a2_an_inherited_git_object_directory_cannot_redirect_preview_writes() {
         Vec::<String>::new(),
         "the scratch store must be gone whatever the environment said"
     );
+}
+
+/// The driver half of
+/// [`a2_an_inherited_git_object_directory_cannot_redirect_preview_writes`] —
+/// not a test of its own, which is what the `#[ignore]` says. The outer test
+/// re-executes this binary to run exactly this function in a process whose
+/// environment carries `GIT_OBJECT_DIRECTORY`; here it only deserializes the
+/// plan it was handed, runs the one preview, and prints [`A2_ENV_SENTINEL`]
+/// if — and only if — the answer was `Graph`.
+///
+/// Under a bare `cargo test -- --include-ignored` there is no harness, so
+/// this returns quietly instead of failing someone's full run. That is not a
+/// vacuous-green hazard: the invariant lives in the outer test, and a run
+/// that drove nothing prints no sentinel, which the outer test refuses.
+#[tokio::test]
+#[ignore = "driver for a2_an_inherited_git_object_directory_cannot_redirect_preview_writes; runs in its own process"]
+async fn a2_env_redirect_driver_runs_one_preview_under_the_variable() {
+    let Some(repo) = std::env::var_os(A2_ENV_REPO_VAR) else {
+        eprintln!("{A2_ENV_REPO_VAR} unset; this driver only means something when the outer test spawns it");
+        return;
+    };
+    let repo = PathBuf::from(repo);
+    let plan_json = std::env::var(A2_ENV_PLAN_VAR).expect("the outer test passes the plan");
+    let plan: Plan = serde_json::from_str(&plan_json).expect("the handed plan deserializes");
+    assert!(
+        std::env::var_os("GIT_OBJECT_DIRECTORY").is_some(),
+        "the outer test sets the redirect on this process; without it this \
+         driver would measure nothing"
+    );
+
+    match preview(&repo, &plan).await {
+        PreviewOutcome::Graph { .. } => println!("{A2_ENV_SENTINEL}"),
+        other => panic!("expected Graph under the redirected environment, got {other:?}"),
+    }
 }
 
 /// **A2, cancellation.** A preview whose future is *dropped* part-way through

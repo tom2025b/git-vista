@@ -47,14 +47,86 @@ fn full_argv(policy: &Policy, repo: &Path, args: &[&str]) -> Vec<std::ffi::OsStr
     argv
 }
 
-/// Configure a `std`-shaped command from an argv. The environment is not
-/// touched here: the server's own environment is what git should see, minus
-/// nothing — the sandbox is the boundary, not an env scrub. (Tests that need a
-/// stripped environment do it themselves; production wants the real one so
-/// `GIT_*` operational variables the server sets still reach git.)
+/// Split an argv into program and arguments.
 fn split(argv: &[std::ffi::OsString]) -> (&std::ffi::OsString, &[std::ffi::OsString]) {
     (&argv[0], &argv[1..])
 }
+
+/// Repository-geometry environment variables removed from **every** composed
+/// command, before the type seals it.
+///
+/// The launcher passes the server's environment through otherwise — that is
+/// still deliberate; `GIT_TERMINAL_PROMPT` and `GIT_EDITOR` are set by
+/// `main.rs` and must reach git — but this family is different in kind: each
+/// of these redirects *which repository geometry* git operates on, silently
+/// overriding the `-C <repo>` / `--git-dir=<...>` this module composed and
+/// `sandbox_argv` classified. `GIT_OBJECT_DIRECTORY` in particular names the
+/// primary object database **regardless of `--git-dir`**, which turned the
+/// preview's "writes only into its scratch store" into writes into the served
+/// repository's own ODB (#576's audit, reproduced in
+/// `preview_suite::a2_an_inherited_git_object_directory_cannot_redirect_preview_writes`).
+/// None of this needs hostility: git itself exports `GIT_OBJECT_DIRECTORY`
+/// and `GIT_ALTERNATE_OBJECT_DIRECTORIES` into hooks during its receive-pack
+/// quarantine, and `GIT_DIR` into most of them, so a server launched from
+/// inside a hook inherits the whole family by construction.
+///
+/// Variable by variable — every entry redirects a location the argv already
+/// pinned:
+///
+/// * `GIT_DIR` / `GIT_COMMON_DIR` — override repository discovery itself;
+///   every spawn would operate on some *other* repository than its `-C`.
+/// * `GIT_OBJECT_DIRECTORY` / `GIT_ALTERNATE_OBJECT_DIRECTORIES` — re-aim
+///   object reads and writes past the git dir the argv named.
+/// * `GIT_INDEX_FILE` — redirects every index write.
+/// * `GIT_WORK_TREE` — redirects the worktree.
+/// * `GIT_NAMESPACE` — silently rewrites every ref name under
+///   `refs/namespaces/`, so ref reads and updates target refs the caller
+///   never named.
+/// * `GIT_GRAFT_FILE` / `GIT_SHALLOW_FILE` — substitute ancestry: history
+///   walks and reachability answers come from a file outside the repository
+///   (`history.rs` manages `$GIT_DIR/shallow` deliberately, via git's own
+///   commands, never via this variable).
+///
+/// Deliberately **kept**, each for a stated reason:
+///
+/// * `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM` / `GIT_CONFIG_NOSYSTEM` and
+///   the `GIT_CONFIG_COUNT` family — they select *configuration*, not
+///   geometry: the same config the operator's own command-line git would
+///   read. The server's posture is user-git parity (`preview_suite.rs`'s
+///   `fast_forward_shape` doc records that a developer's `~/.gitconfig`
+///   reaches every git the server runs, and fixtures pin their own), and
+///   preview and execution inherit them identically, so neither can see a
+///   config the other did not.
+/// * `GIT_CEILING_DIRECTORIES` — can only make discovery *refuse*, never
+///   land somewhere else; a loud failure is the fail-closed direction.
+/// * `GIT_REPLACE_REF_BASE` / `GIT_NO_REPLACE_OBJECTS` — select a *view* of
+///   objects the repository itself carries, applied identically to every
+///   spawn; they redirect no write.
+/// * Everything else (`PATH`, `HOME`, …) — the sandbox is the boundary for
+///   those, exactly as before. A hostile parent environment is out of scope
+///   here (it already owns `PATH`); an *ordinary* inherited geometry
+///   variable breaking A2 is what this list closes.
+///
+/// The scrub happens at construction, as a fixed reviewed list — there is
+/// still no caller-facing `env` surface on [`SandboxedCommand`], so the seal
+/// argument is unchanged. `pinned_env_for_test`'s `env_clear()` wipes these
+/// removals first, so the escape battery's pinned profiles remain in full
+/// control of what their cases observe.
+///
+/// Pinned by `the_launcher_scrubs_gits_repository_geometry_environment`
+/// (which carries its own literal copy of these names, deliberately) and
+/// behaviourally by the preview suite's A2 environment test.
+const SCRUBBED_GIT_GEOMETRY_ENV: [&str; 9] = [
+    "GIT_DIR",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_INDEX_FILE",
+    "GIT_WORK_TREE",
+    "GIT_NAMESPACE",
+    "GIT_GRAFT_FILE",
+    "GIT_SHALLOW_FILE",
+];
 
 /// A composed launcher whose argv is **final**.
 ///
@@ -71,6 +143,12 @@ fn split(argv: &[std::ffi::OsString]) -> (&std::ffi::OsString, &[std::ffi::OsStr
 /// `env` is excluded for the same reason as `arg`: `GIT_DIR`, `GIT_SSH_COMMAND`
 /// and `GIT_EXTERNAL_DIFF` redirect or execute, so an environment appended
 /// after classification is an argv change wearing a different hat.
+///
+/// The *inherited* environment gets the complementary treatment:
+/// [`command_async`] removes the fixed [`SCRUBBED_GIT_GEOMETRY_ENV`] family at
+/// construction, so a variable the server's own parent exported cannot re-aim
+/// the geometry the argv pinned either. Neither direction gives a caller an
+/// environment surface.
 ///
 /// The setters consume and return `Self` so a call site still reads as one
 /// chain ending in `output()`/`spawn()`.
@@ -156,6 +234,9 @@ pub(crate) fn command_async(policy: &Policy, repo: &Path, args: &[&str]) -> Sand
     let (program, rest) = split(&argv);
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(rest);
+    for var in SCRUBBED_GIT_GEOMETRY_ENV {
+        cmd.env_remove(var);
+    }
     SandboxedCommand(cmd)
 }
 

@@ -62,6 +62,7 @@
 
 pub mod browser;
 pub mod git;
+pub mod reexec;
 pub mod status;
 
 mod broken;
