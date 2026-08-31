@@ -87,11 +87,29 @@
 //!
 //! # No `Command` is constructed here
 //!
-//! Every spawn goes through [`crate::git_cmd::git_output_bounded`], the sealed
-//! sandbox launcher, so `crate::argv_boundary`'s source scan needs no new entry
-//! and its allowlist is untouched. That is deliberate and load-bearing:
+//! Every spawn goes through [`crate::git_cmd::git_output`] — the sealed
+//! sandbox launcher, but deliberately **not** its kill-on-drop arity
+//! `git_output_bounded` — so `crate::argv_boundary`'s source scan needs no new
+//! entry and its allowlist is untouched. That is deliberate and load-bearing:
 //! reaching for `ALLOWED_SPAWN_SITES` is how a production spawn gets
 //! pre-authorised by a comment written about a test.
+//!
+//! `git_output_bounded` is the fix that suggests itself for the cancellation
+//! leak two paragraphs up, and it was tried: measured on this host
+//! 2026-08-30, kill-on-drop makes this module *worse* —
+//! `a2_a_cancelled_preview_leaves_nothing_behind` went from 12 of 13 runs
+//! green to 0 of 5, because `preview`'s work runs in a **detached** task, so
+//! `kill_on_drop` never meets a mid-spawn cancellation to abort; instead it
+//! fires on runtime teardown and `SIGKILL`s `bwrap` *part-way through `git
+//! init`*, turning "a store that will be complete in 15 ms and then removed"
+//! into "a store nobody will ever finish or remove". See [`preview_git`] for
+//! the full numbers and reasoning.
+//!
+//! The real cost of that choice: a git process this module starts and that
+//! wedges — in `merge-tree`, say — is **never killed or reaped**. There is no
+//! arity in `git_cmd` today that is both kill-on-drop *and* unbounded-safe
+//! against a detached task's cancellation; adding one is a change to a file
+//! this module does not own.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -1970,51 +1988,6 @@ fn ref_moves_to(repo: &Path, target: &str) -> Vec<(String, Oid)> {
     moves
 }
 
-/// Read the repository's real history and refs, hand them plus the
-/// hypothetical commit to the pure layout half, and package the two graphs.
-///
-/// # A damaged layout is `CheckFailed`, never a returned `Graph`
-///
-/// `lay_out_preview` reports **three** ways the `after` graph can disagree
-/// with what a real run would draw, and a preview a real run would reproduce
-/// has all three clear:
-///
-/// * `unmatched_ref_moves` — a `ref_moves` entry that named no ref, so the
-///   lane-0 reservation and the colour seeding both still read the old
-///   targets. A caller mistake, with a fix.
-/// * `added_without_ref_moves` — an `added` commit and an empty `ref_moves`.
-///   A caller mistake, with a fix.
-/// * `added_claimed_by_no_branch` — the general colour condition, and the only
-///   one of the three a *correct* caller can produce. On a detached HEAD
-///   [`ref_moves_to`] moves `"HEAD"` alone, `assign_branch_colors` seeds only
-///   from `is_branch()` refs, and the hypothetical row falls into the
-///   synthetic `~<short oid>` fallback — a colour keyed on an object id that
-///   does not exist yet. Neither side can repair it: a real run's commit has a
-///   different id, so no colour this function could choose is *knowably* the
-///   one git will draw — and a fixed slot would only make the preview differ
-///   from reality deliberately instead of accidentally.
-///
-/// Any of the three means the returned graph's lanes or colours are not the
-/// ones a real run produces. Returning it would be the exact failure §4.3
-/// exists to prevent, so it is not an option: this is "no fact", and it says
-/// so.
-///
-/// The order of the three checks is load-bearing. `added_without_ref_moves`
-/// **implies** `added_claimed_by_no_branch`, so testing the general condition
-/// first would make the narrower, actionable sentence unreachable and tell a
-/// caller who forgot the ref list that nothing can be done.
-///
-/// # What the third refusal costs, stated rather than hidden
-///
-/// A detached HEAD — mid-bisect, or on a checked-out tag — cannot preview a
-/// revert, a cherry-pick or a merge that writes a commit. It is a legitimate,
-/// common state, and the feature is simply unavailable there; #460's
-/// plan-review pane inherits that hole. A fast-forward merge still previews,
-/// because it adds no commit and so has no hypothetical row to colour
-/// (`a_detached_head_still_previews_a_fast_forward_because_it_adds_no_commit`).
-/// Closing the hole properly means giving the colour pass a seed for a
-/// detached HEAD, in `git_vista_core::layout::color` — which would change what
-/// a *real* run is painted too, and is why it is not done from here.
 /// Each `ref_moves` entry's **current** target, for `RefMoved.from`.
 ///
 /// Its own function so the match predicate can be unit-tested against a ref
@@ -2094,12 +2067,96 @@ fn refusal_for(layout: &PreviewLayout, detached: bool) -> Option<PreviewUnavaila
     None
 }
 
+/// Read the repository's real history and refs, hand them plus the
+/// hypothetical commit to the pure layout half, and package the two graphs.
+///
+/// # A damaged layout is `CheckFailed`, never a returned `Graph`
+///
+/// `lay_out_preview` reports **four** ways the `after` graph can disagree
+/// with what a real run would draw, and a preview a real run would reproduce
+/// has all four clear:
+///
+/// * `unmatched_ref_moves` — a `ref_moves` entry that named no ref, so the
+///   lane-0 reservation and the colour seeding both still read the old
+///   targets. A caller mistake, with a fix.
+/// * `added_without_ref_moves` — an `added` commit and an empty `ref_moves`.
+///   A caller mistake, with a fix.
+/// * `added_claimed_by_no_branch` — the general colour condition, and the only
+///   one of the three a *correct* caller can produce. On a detached HEAD
+///   [`ref_moves_to`] moves `"HEAD"` alone, `assign_branch_colors` seeds only
+///   from `is_branch()` refs, and the hypothetical row falls into the
+///   synthetic `~<short oid>` fallback — a colour keyed on an object id that
+///   does not exist yet. Neither side can repair it: a real run's commit has a
+///   different id, so no colour this function could choose is *knowably* the
+///   one git will draw — and a fixed slot would only make the preview differ
+///   from reality deliberately instead of accidentally.
+/// * `added_time_tied` — the hypothetical commit shares its committer second
+///   with an in-window commit that is not one of its own ancestors. The topo
+///   sort breaks a same-second tie by comparing object ids, and this commit's
+///   id is one a real run will not write, so which row lands on top is a coin
+///   flip rather than a fact. Unlike the third, it resolves itself a second
+///   later, and the sentence says so.
+///
+/// Any of the four means the returned graph's lanes or colours are not the
+/// ones a real run produces. Returning it would be the exact failure §4.3
+/// exists to prevent, so it is not an option: this is "no fact", and it says
+/// so.
+///
+/// The order of the four checks is load-bearing, and [`refusal_for`] is where
+/// it is enforced. `added_without_ref_moves` **implies**
+/// `added_claimed_by_no_branch`, so testing the general condition first would
+/// make the narrower, actionable sentence unreachable and tell a caller who
+/// forgot the ref list that nothing can be done. `added_time_tied` sits last
+/// because it is independent of the other three — they are all about which ref
+/// claims the new commit, it is about where the row lands — and a layout
+/// meeting both the third condition and the tie should report the third, which
+/// is the one that does not resolve on its own. That placement is pinned by
+/// `a_same_second_tie_refuses_rather_than_guessing_which_row_is_on_top`.
+///
+/// # What the third refusal costs, stated rather than hidden
+///
+/// A detached HEAD — mid-bisect, or on a checked-out tag — cannot preview a
+/// revert, a cherry-pick or a merge that writes a commit. It is a legitimate,
+/// common state, and the feature is simply unavailable there; #460's
+/// plan-review pane inherits that hole. A fast-forward merge still previews,
+/// because it adds no commit and so has no hypothetical row to colour
+/// (`a_detached_head_still_previews_a_fast_forward_because_it_adds_no_commit`).
+/// Closing the hole properly means giving the colour pass a seed for a
+/// detached HEAD, in `git_vista_core::layout::color` — which would change what
+/// a *real* run is painted too, and is why it is not done from here.
 fn lay_out(
     repo: &Path,
     added: Option<CommitSummary>,
     ref_moves: Vec<(String, Oid)>,
 ) -> Result<PreviewResponse, PreviewUnavailable> {
-    let before = git_vista_git::walk_history(repo, PREVIEW_HISTORY_LIMIT)
+    lay_out_within(repo, added, ref_moves, PREVIEW_HISTORY_LIMIT)
+}
+
+/// [`lay_out`], with the history window as a parameter.
+///
+/// # The window is ONE binding on purpose, and that is load-bearing
+///
+/// It is read twice — once to bound the walk, once as `history_limit` so the
+/// `after` list is truncated to the same width — and the whole of #576's
+/// finding 7 was those two numbers disagreeing: the walk read
+/// [`PREVIEW_HISTORY_LIMIT`] commits, the layout capped nothing, and prepending
+/// the hypothetical row returned `PREVIEW_HISTORY_LIMIT + 1` rows out of a
+/// window the caller had asked to be `PREVIEW_HISTORY_LIMIT` wide.
+///
+/// Passing one `window` rather than naming the constant twice is not tidiness.
+/// It makes that defect **unrepresentable**: there is no second literal to
+/// drift, so nobody can reintroduce it by editing one site and not the other.
+/// It also gives a test a window small enough to reach without building five
+/// hundred commits — see
+/// `the_walk_and_the_after_cap_read_the_same_window`, which is what pins the
+/// two uses to each other.
+fn lay_out_within(
+    repo: &Path,
+    added: Option<CommitSummary>,
+    ref_moves: Vec<(String, Oid)>,
+    window: usize,
+) -> Result<PreviewResponse, PreviewUnavailable> {
+    let before = git_vista_git::walk_history(repo, window)
         .map_err(|e| check_failed(format!("reading history: {e}")))?;
     let refs: Vec<GitRef> =
         git_vista_git::read_refs(repo).map_err(|e| check_failed(format!("reading refs: {e}")))?;
@@ -2118,7 +2175,7 @@ fn lay_out(
         head_branch,
         added,
         ref_moves: ref_moves.clone(),
-        history_limit: PREVIEW_HISTORY_LIMIT,
+        history_limit: window,
     });
 
     if let Some(refusal) = refusal_for(&layout, detached) {

@@ -516,8 +516,38 @@ boolean cases — and returns `Allow` / `Never` / `Only`. Two properties were th
 of doing it this way rather than reimplementing git's rules:
 
 - The value is read through the **same sandboxed path** the executor's merge is run
-  through, so the two cannot see different configs. A verifier tried to make them
-  diverge and could not.
+  through — `preview_git` and `run_git` are both `git_cmd::git_output_for(repo, args,
+  NetworkNeed::Local)`, so a single read of `merge.ff` cannot itself observe a
+  different config depending on which caller asked.
+
+*Amended 2026-08-31, audit finding 9.* The bullet above used to end "so the two
+cannot see different configs" — stated as if that closed the question. It does not:
+identical launchers still read `merge.ff` at two different **times**, once when the
+preview is built and again, later, when the user clicks execute, and nothing stopped
+the user from running `git config merge.ff <other value>` in between. Measured
+against the unfixed code: build a plan while `merge.ff` is unset, set it to `false`,
+execute — the plan still ran with the preview's stale answer. That is the same
+build-time/execute-time gap `generation_token` exists to close for every other
+input (HEAD, refs, stash, status), and `merge.ff` was not one of them.
+
+**Closed by folding `merge.ff` into `generation_token`.** `planner.rs`'s
+`merge_ff_digest_input` reads `git config --get merge.ff` through the identical
+sandboxed launcher named above, and its raw string (not `fast_forward_policy`'s
+resolved `Allow`/`Never`/`Only`, to avoid coupling the token to a preview-only type)
+is folded into the token unconditionally — not scoped to merge plans, since
+`generation_token` is also called for the reconnect token and the stash-pop re-check,
+neither of which has a `GitOperation` in scope. `enforce_fresh` then refuses
+execution, with "the repository changed", whenever the digest at execute time
+differs from the digest the plan was built against — including the case above,
+`merge.ff` unset at build and `false` at execute, and the symmetric `false` → `true`
+case. An unreadable config is tagged with the current second rather than treated as
+equal-to-anything, matching `stash_digest_input`'s existing discipline for the same
+situation.
+
+So: the two cannot see different configs **through the launcher** — that part was
+always true and is not what finding 9 was about — and now a config that changed
+**between build and execute** refuses rather than silently executing against the
+picture the user was shown. Before this fix, the second half was false.
 - The fast-forward decision exists in **exactly one place**. A second encoding of
   git's ff rules would drift from git the first time git changed them, which is the
   modelling failure this whole ADR is against.

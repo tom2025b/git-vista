@@ -4738,3 +4738,95 @@ fn a_same_second_tie_refuses_rather_than_guessing_which_row_is_on_top() {
         other => panic!("expected CheckFailed, got {other:?}"),
     }
 }
+
+/// **The walk and the `after` cap read the same window.** #576 finding 7 was
+/// those two numbers disagreeing: `lay_out` walked `PREVIEW_HISTORY_LIMIT`
+/// commits and then handed the layout no cap, so prepending the hypothetical
+/// row returned `PREVIEW_HISTORY_LIMIT + 1` rows out of a window the caller had
+/// asked to be `PREVIEW_HISTORY_LIMIT` wide.
+///
+/// # Why this test exists even though the pure core is already covered
+///
+/// `the_after_graph_is_bounded_by_the_window_the_caller_read` pins the
+/// mechanism inside [`lay_out_preview`], and it is a good test. It cannot see
+/// this defect. It passes `history_limit` in by hand, so it proves the core
+/// truncates when told to — not that the *server* tells it to, with the same
+/// number it walked. Putting `history_limit: usize::MAX` back into
+/// [`lay_out_within`] left that test, and every other test in this repository,
+/// green: measured as `survived` by `mutation_check` id 314 during the round
+/// that added the fix. This test is that gap closed, and it runs against
+/// production [`lay_out_within`] rather than against a hand-built input.
+///
+/// # Reaching the bound without five hundred commits
+///
+/// The real constant is 500, and a fixture that large is slow enough that
+/// nobody would keep it. Passing the window as a parameter — the reason
+/// [`lay_out_within`] exists — lets a three-commit repository exercise exactly
+/// the same two uses. That is a test-visibility argument, not a shortcut: the
+/// production path reads one binding twice, and the number it happens to hold
+/// is not what can go wrong.
+///
+/// # Two directions, so a constant answer cannot pass
+///
+/// At the cap the count must *stop* at the window; one under it, the added row
+/// must *grow* the graph by one. A `lay_out_within` that always returned the
+/// window would pass the first and fail the second, and one that never
+/// truncated would pass the second and fail the first.
+///
+/// # Mutation-proved two ways
+///
+/// 1. **Removes the mechanism** — `history_limit: window` becomes
+///    `history_limit: usize::MAX`, which is finding 7 restored exactly: the
+///    at-cap half reads three rows where it demanded two.
+/// 2. **Weakens it** — `walk_history(repo, window)` becomes
+///    `walk_history(repo, window + 1)`, so the two uses drift by one rather
+///    than by everything. The at-cap half still reads three rows against two,
+///    and the under-cap half still holds, which is what makes the first half
+///    the load-bearing assertion rather than the pair of them agreeing.
+#[test]
+fn the_walk_and_the_after_cap_read_the_same_window() {
+    let (_dir, repo) = revert_shape();
+    let head = git::out(&repo, &["rev-parse", "HEAD"]);
+
+    // At the cap: the window is narrower than the history, so the added row
+    // displaces the oldest one instead of being added to it.
+    let added = hypothetical('f', &head);
+    let target = added.id.clone();
+    let moves = ref_moves_to(&repo, &target.0);
+    let outcome = lay_out_within(&repo, Some(added), moves, 2)
+        .expect("an attached HEAD with both refs moved has an honest graph");
+    let PreviewOutcome::Graph { before, after, .. } = outcome else {
+        panic!("expected a graph, got {outcome:?}");
+    };
+    assert_eq!(
+        before.rows.len(),
+        2,
+        "the walk is bounded by the window the caller asked for"
+    );
+    assert_eq!(
+        after.rows.len(),
+        2,
+        "the after graph is bounded by the SAME window: the hypothetical row \
+         displaces the oldest commit rather than making a 2-commit window \
+         return 3 rows. This is #576 finding 7"
+    );
+
+    // One under the cap: nothing is truncated, so the added row is a real
+    // extra row. Without this half, an implementation that always returned
+    // `window` rows would pass.
+    let added = hypothetical('e', &head);
+    let target = added.id.clone();
+    let moves = ref_moves_to(&repo, &target.0);
+    let outcome = lay_out_within(&repo, Some(added), moves, 9)
+        .expect("an attached HEAD with both refs moved has an honest graph");
+    let PreviewOutcome::Graph { before, after, .. } = outcome else {
+        panic!("expected a graph, got {outcome:?}");
+    };
+    assert_eq!(before.rows.len(), 3, "the fixture has three commits");
+    assert_eq!(
+        after.rows.len(),
+        4,
+        "below the cap the added commit grows the graph, so the cap is a cap \
+         and not a fixed size"
+    );
+}

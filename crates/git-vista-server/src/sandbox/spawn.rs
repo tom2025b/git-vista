@@ -388,7 +388,8 @@ mod tests {
             .0
             .as_std()
             .get_envs()
-            .filter_map(|(k, v)| v.is_none().then(|| k.to_os_string()))
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_os_string())
             .collect();
 
         for var in [
