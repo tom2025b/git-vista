@@ -93,6 +93,7 @@
 //! reaching for `ALLOWED_SPAWN_SITES` is how a production spawn gets
 //! pre-authorised by a comment written about a test.
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::{Duration, SystemTime};
@@ -123,24 +124,86 @@ pub(crate) const MIN_GIT_FOR_PREVIEW: (u32, u32) = (2, 38);
 /// lane comparison is between two layouts of the same window.
 pub(crate) const PREVIEW_HISTORY_LIMIT: usize = 500;
 
-/// The scratch store's directory-name prefix.
+/// The scratch store's directory-name prefix — the sweep's **candidate
+/// filter**, and nothing more.
 ///
-/// It is a **named** prefix rather than `tempfile`'s default `.tmpXXXXXX` for
-/// one reason: [`ScratchStore::sweep_stale`] only ever deletes directories it
+/// It is a **named** prefix rather than `tempfile`'s default `.tmpXXXXXX` so
+/// that [`ScratchStore::sweep_stale`] has a cheap first question to ask before
+/// it opens anything: a sweep matching a prefix nothing produces is inert — it
+/// would never delete anything and a test that hand-created a stale directory
+/// would pass anyway, which is the shape of green-but-proves-nothing this
+/// repository has paid for repeatedly.
+///
+/// # A prefix is a public string, not proof of ownership
+///
+/// This doc comment used to claim the sweep "only ever deletes directories it
 /// can prove this module created, and it cannot prove that about a name it did
-/// not choose. A sweep matching a prefix nothing produces is inert — it would
-/// never delete anything and a test that hand-created a stale directory would
-/// pass anyway, which is the shape of green-but-proves-nothing this repository
-/// has paid for repeatedly.
+/// not choose". The second half was true and the first half was **not**: a
+/// name this module *did* choose is still a name anyone can write. Anything in
+/// `<commondir>` starting `gv-preview-` was deleted recursively once it aged
+/// past [`STALE_SCRATCH_AGE`] — a user's own `gv-preview-backup/`, another
+/// tool's directory, a still-running preview's store (audit finding 2, #576).
+///
+/// Validating the *shape* of the generated name would not have helped and was
+/// rejected on measurement, not taste: `tempfile-3.27.0` appends six
+/// `fastrand::alphanumeric()` characters, and `gv-preview-backup` is the
+/// prefix plus exactly six alphanumerics. The check passes; the backup still
+/// goes.
+///
+/// So the proof moved into the directory: [`STORE_MARKER`] holding
+/// [`STORE_MARKER_MAGIC`], written by [`ScratchStore::claim`] and by nothing
+/// else. The prefix says "this is the kind of thing we make"; the marker says
+/// "we made *this one*"; the marker's lease says "and it is still in use".
+/// Three independent gates, each refusing on its own — the same shape
+/// `sandbox::repo_paths` describes for its own two containment rules.
 const SCRATCH_PREFIX: &str = "gv-preview-";
 
-/// How old a `gv-preview-*` sibling must be before the sweep removes it.
+/// The file that proves a `gv-preview-*` directory is this module's.
+///
+/// Inert to git, verified on this host (git 2.43.0, 2026-08-31):
+/// `git -c init.templateDir= init -q --bare --object-format sha1` into a
+/// directory that already contains this file succeeds, leaves the file
+/// byte-identical, still creates no `hooks/`, and the store is accepted by
+/// `git --git-dir=` with `count-objects -v` reporting `garbage: 0`.
+const STORE_MARKER: &str = "gv-preview-store.lock";
+
+/// [`STORE_MARKER`]'s first bytes, compared **exactly**.
+///
+/// A prefix is a public string; this is a file this module wrote. The
+/// comparison is on the leading bytes rather than the whole file so the
+/// marker can carry a human-readable second line without the recognition
+/// rule depending on its wording.
+const STORE_MARKER_MAGIC: &[u8] = b"git-vista preview scratch store v1\n";
+
+/// How old a marked `gv-preview-*` sibling must be before the sweep removes
+/// it.
 ///
 /// [`tempfile::TempDir`] removes on drop — the return, the `?` and the panic —
 /// but not on `SIGKILL` or a power loss, so a stale store can survive inside
 /// the user's `.git`. An hour is comfortably longer than any preview and short
-/// enough that a crashed server's leftovers do not accumulate. The bound
-/// matters: without it, a *concurrent* preview's store would be a candidate.
+/// enough that a crashed server's leftovers do not accumulate.
+///
+/// # What this bound is for, now that it is not the liveness proof
+///
+/// It used to be the concurrency guard, and that was a category error: a
+/// timestamp is not a lease. A preview that runs for more than an hour is
+/// indistinguishable by age from one that died, so a second preview could reap
+/// a store that was in use *right now*. No value of this constant fixes that —
+/// shorter reaps live previews sooner, longer leaves crash residue for longer.
+/// [`ScratchStore::abandoned_store_lease`]'s advisory lock answers the
+/// liveness question instead, because the kernel releases an `flock` exactly
+/// when the process holding it goes away.
+///
+/// The bound stays, with two smaller and real jobs:
+///
+/// * **The create window.** [`ScratchStore::new`] creates the directory with
+///   `tempdir_in` and only then calls [`ScratchStore::claim`]. For those few
+///   microseconds the store exists with no marker and no lease. What protects
+///   it from another process's sweeper is that it is *fresh* — nothing this
+///   young is ever a candidate.
+/// * **A second, independent brake** in front of an irreversible operation.
+///   Both it and the marker must pass; either one refusing is enough to leave
+///   a directory alone.
 const STALE_SCRATCH_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// The git version, probed once per process.
@@ -196,6 +259,130 @@ static GIT_VERSION: tokio::sync::OnceCell<(u32, u32, u32)> = tokio::sync::OnceCe
 /// module does not own.
 async fn preview_git(repo: &Path, args: &[&str]) -> std::io::Result<Output> {
     git_cmd::git_output(repo, args).await
+}
+
+// ---------------------------------------------------------------------------
+// The target
+// ---------------------------------------------------------------------------
+
+/// A repository this preview may run against, **carrying the git-directory
+/// resolution that was already validated for it**.
+///
+/// # Why this type exists (audit finding 3, #576)
+///
+/// The request's target is validated once, at resolution time, against the
+/// server's managed root. `ScratchStore::new` then used to call a private
+/// `commondir_of` helper that resolved the geometry a *second* time, with
+/// `sandbox::repo_paths::resolve` — the containment-free resolver, whose own
+/// module doc says the managed-root check lives elsewhere — and handed the
+/// answer straight to `remove_dir_all`.
+///
+/// Two resolutions of the same `.git` are two different answers whenever
+/// anything can write to it in between, and `.git` is repository-writable. A
+/// concurrent process can swap a linked-worktree gitfile to another
+/// *self-consistent* commondir; the second resolution follows it, and the
+/// recursive delete runs there. This type ends that by construction: the
+/// commondir is resolved once, validated, and then **carried**. Nothing below
+/// the request boundary resolves anything, and
+/// `preview_resolves_the_commondir_in_exactly_one_place` is the tripwire that
+/// keeps it that way.
+///
+/// The asymmetry with `sandbox::policy_for`, which also re-resolves at every
+/// spawn, is deliberate and is why finding 3 was the destructive one: a spawn
+/// lands inside `bwrap` under a policy, whereas `remove_dir_all` is a bare
+/// syscall in the host server process with nothing in front of it.
+#[derive(Clone, Debug)]
+pub(crate) struct PreviewTarget {
+    repo: PathBuf,
+    commondir: PathBuf,
+}
+
+impl PreviewTarget {
+    /// The production constructor: resolve `repo`'s geometry and refuse unless
+    /// **both** halves lie inside a root the catalog allows.
+    ///
+    /// This is the multi-root check `sandbox::policy_for` performs at the
+    /// request-resolution layer — `repo_paths::resolve` composed with
+    /// `state::path_is_allowed` — rather than the single-root
+    /// `repo_paths::resolve_and_validate`, because the catalog can hold more
+    /// than one allowed root and the single-root wrapper cannot express that.
+    ///
+    /// # The residual this constructor does not close, stated plainly
+    ///
+    /// The correct shape is `state::resolve_target` handing back the
+    /// resolution it already checked, so the whole request resolves **once**;
+    /// `state.rs`'s own `read_only_for_path` doc already names "capturing …
+    /// alongside the path and threading that snapshot through" as the fix for
+    /// the sibling gap. That change is not in this diff (single-writer file
+    /// ownership), so the handler resolves the selection through
+    /// `state::resolve_target` and then this function resolves it a second
+    /// time.
+    ///
+    /// What that leaves open: a geometry swapped between those two calls is
+    /// followed. What it does **not** leave open, and what finding 3 was
+    /// about: the followed geometry is itself put through the full containment
+    /// check, and it is then carried — so the path `remove_dir_all` runs
+    /// against was validated by this request, and inside it only directories
+    /// carrying [`STORE_MARKER`] with a free lease can be removed at all.
+    pub(crate) fn in_managed_catalog(repo: &Path) -> Result<Self, PreviewUnavailable> {
+        let paths = crate::sandbox::repo_paths::resolve(repo).map_err(|e| {
+            scratch_failed(format!("resolving the repository's git directory: {e}"))
+        })?;
+        if !crate::state::path_is_allowed(&paths.gitdir)
+            || !crate::state::path_is_allowed(&paths.commondir)
+        {
+            return Err(scratch_failed(format!(
+                "{}'s git directory resolves outside the server's managed root",
+                repo.display()
+            )));
+        }
+        Ok(Self {
+            repo: repo.to_path_buf(),
+            commondir: paths.commondir,
+        })
+    }
+
+    /// The single-root analogue, for a caller that holds one root rather than
+    /// the catalog.
+    ///
+    /// Exactly the reason `repo_paths::resolve_and_validate` is "kept as its
+    /// own function anyway rather than folded away": a single fixed root is
+    /// the right shape for a hostile-geometry test. Every fixture in this
+    /// module's suite already owns its `TempDir`, so every test builds its
+    /// target through the *same* containment check production uses rather
+    /// than through a `#[cfg(test)]` bypass that would leave the suite
+    /// exercising a shape production never takes.
+    ///
+    /// No production caller today — the server always has the catalog — so it
+    /// carries the house `cfg_attr` rather than a `#[cfg(test)]`: it is
+    /// ordinary code, compiled and clippy-checked in every build, and the day
+    /// a single-root caller appears the attribute simply comes off.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn resolved_in(
+        repo: &Path,
+        managed_root: &Path,
+    ) -> Result<Self, PreviewUnavailable> {
+        let paths =
+            crate::sandbox::repo_paths::resolve_and_validate(repo, managed_root).map_err(|e| {
+                scratch_failed(format!("resolving the repository's git directory: {e}"))
+            })?;
+        Ok(Self {
+            repo: repo.to_path_buf(),
+            commondir: paths.commondir,
+        })
+    }
+
+    /// The repository path every git spawn is built from — unchanged from
+    /// before this type existed, so the sandbox grant is identical.
+    pub(crate) fn repo(&self) -> &Path {
+        &self.repo
+    }
+
+    /// The validated `<commondir>`: where the scratch store is created, and
+    /// the **only** directory [`ScratchStore::sweep_stale`] ever deletes from.
+    pub(crate) fn commondir(&self) -> &Path {
+        &self.commondir
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -294,16 +481,27 @@ async fn preview_git(repo: &Path, args: &[&str]) -> std::io::Result<Output> {
 ///   away: closing it needs the child *killed and reaped* before the store is
 ///   dropped, which `git_cmd` has no arity for.
 /// * If the *runtime itself* is torn down mid-task the task is dropped where it
-///   stands. [`ScratchStore::sweep_stale`] is what covers that, as it already
-///   does for `SIGKILL` and power loss.
-pub(crate) async fn preview(repo: &Path, plan: &Plan) -> PreviewResponse {
+///   stands. [`ScratchStore::sweep_stale`] covers that for a store this module
+///   finished creating — one that carries [`STORE_MARKER`] — as it does for
+///   `SIGKILL` and power loss.
+///
+///   It does **not** cover the orphan-rewrite residue described in the bullet
+///   above, and saying otherwise here would be a wrong citation in the place a
+///   maintainer reads next. A store that `TempDir::drop` removed and an
+///   unsignalled `git init` then wrote back has no marker in it — git does not
+///   write one — so the sweep will now leave it alone for ever. That is the
+///   deliberate trade of making ownership provable: the sweep reclaims only
+///   what it can prove it made, and this residue is not that. It is bounded
+///   (one directory per abnormal shutdown *during* a preview), it is inert,
+///   and it is named here rather than reclaimed by guessing.
+pub(crate) async fn preview(target: &PreviewTarget, plan: &Plan) -> PreviewResponse {
     // The liveness handle. The `Arc` lives in *this* future — the caller's — and
     // the task holds only a `Weak`, so "the caller stopped waiting" and "this
     // future was dropped" are the same event by construction rather than by a
     // flag somebody has to remember to set.
     let caller = std::sync::Arc::new(());
     let alive = std::sync::Arc::downgrade(&caller);
-    let repo = repo.to_path_buf();
+    let target = target.clone();
     let plan = plan.clone();
     // `inherit_test_current` is the house pattern for a detached task and is
     // `planner.rs`'s too (`tokio::spawn(crate::state::inherit_test_current(…))`).
@@ -319,7 +517,7 @@ pub(crate) async fn preview(repo: &Path, plan: &Plan) -> PreviewResponse {
     // through `set_current`'s side effect on the process-global catalog, i.e.
     // for a different reason than it was written to check.
     let task = tokio::spawn(crate::state::inherit_test_current(async move {
-        match compute(&repo, &plan, &alive).await {
+        match compute(&target, &plan, &alive).await {
             Ok(outcome) => outcome,
             Err(reason) => PreviewOutcome::Unavailable { reason },
         }
@@ -361,10 +559,15 @@ fn caller_gone(alive: &std::sync::Weak<()>) -> Option<PreviewUnavailable> {
 /// can carry it. Every `Err` here becomes `Unavailable`; the other three arms
 /// are `Ok`.
 async fn compute(
-    repo: &Path,
+    target: &PreviewTarget,
     plan: &Plan,
     alive: &std::sync::Weak<()>,
 ) -> Result<PreviewResponse, PreviewUnavailable> {
+    // Every git spawn below still takes the *repository* path, so the sandbox
+    // grant is built exactly as it was. Only the scratch store's home comes
+    // from the target, and it comes from the resolution the request validated.
+    let repo = target.repo();
+
     // 1. Unsupported — pure, no IO.
     let Some(op) = previewable(&plan.operation) else {
         return Ok(PreviewOutcome::Unsupported {
@@ -392,7 +595,7 @@ async fn compute(
         .map_err(|e| check_failed(format!("resolving HEAD: {e}")))?
         .ok_or_else(|| check_failed("HEAD does not resolve to a commit"))?;
 
-    let recipe = match resolve_plumbing(repo, &op, &head).await? {
+    let recipe = match resolve_plumbing(target, &op, &head).await? {
         Plumbing::Unsupported(what) => return Ok(PreviewOutcome::Unsupported { operation: what }),
         // A fast-forward creates no commit: only refs move. `added: None` is
         // exactly what `PreviewInput` documents for this case.
@@ -602,10 +805,15 @@ enum Plumbing {
 /// The scratch store is created here, once, and moved into the [`Recipe`] —
 /// the arms that create no commit never create a store at all.
 async fn resolve_plumbing(
-    repo: &Path,
+    // Named `preview_target` rather than `target` on purpose: three arms below
+    // bind a *commit* record called `target`, and a shadowed parameter handed
+    // to `ScratchStore::new` is exactly the sort of quiet mix-up this module
+    // would rather not leave available.
+    preview_target: &PreviewTarget,
     op: &Previewable,
     head: &str,
 ) -> Result<Plumbing, PreviewUnavailable> {
+    let repo = preview_target.repo();
     match op {
         Previewable::Revert { commit } => {
             let target = read_commit_record(repo, None, commit).await?;
@@ -617,7 +825,7 @@ async fn resolve_plumbing(
             let Some(parent) = sole_parent(&target) else {
                 return Ok(Plumbing::Unsupported("revert_commit".to_string()));
             };
-            let store = ScratchStore::new(repo).await?;
+            let store = ScratchStore::new(preview_target).await?;
             Ok(Plumbing::Synthesize(Recipe {
                 store,
                 // base = the commit being reverted, ours = HEAD, theirs = its
@@ -645,7 +853,7 @@ async fn resolve_plumbing(
             // answers this, the pick contributes nothing and real
             // `git cherry-pick` refuses. See [`NoOp`].
             let head_tree = tree_of(repo, head).await?;
-            let store = ScratchStore::new(repo).await?;
+            let store = ScratchStore::new(preview_target).await?;
             Ok(Plumbing::Synthesize(Recipe {
                 store,
                 merge_base: Some(parent.to_string()),
@@ -724,7 +932,7 @@ async fn resolve_plumbing(
                      to draw."
                 )));
             }
-            let store = ScratchStore::new(repo).await?;
+            let store = ScratchStore::new(preview_target).await?;
             Ok(Plumbing::Synthesize(Recipe {
                 store,
                 // See `Recipe::merge_base` for why this is `None` and not
@@ -958,11 +1166,46 @@ fn merge_message(branch: &str) -> String {
 /// `[dev-dependencies]`, for `sandbox::probe`'s boot fixture). [`tempfile::TempDir`]
 /// gives uniqueness under concurrent previews and RAII removal on every exit
 /// path — the return, the `?`, the panic. It does **not** survive a `SIGKILL`,
-/// which is why [`Self::sweep_stale`] runs first; and the prefix is named
-/// rather than `tempfile`'s default so the sweep has something it can prove it
-/// created. See [`SCRATCH_PREFIX`].
+/// which is why [`Self::sweep_stale`] exists at all.
+///
+/// # The marker and the lease
+///
+/// The prefix is only a candidate filter ([`SCRATCH_PREFIX`] says why it can
+/// never be more than that). Two facts a directory name cannot carry live
+/// inside the store instead:
+///
+/// * **Ownership** — [`STORE_MARKER`] holding [`STORE_MARKER_MAGIC`], written
+///   by [`Self::claim`] and by nothing else. It survives a `SIGKILL` and a
+///   power loss along with the rest of the store, which is exactly the residue
+///   the sweep exists for; a process-memory registry of "stores I created"
+///   would see none of it.
+/// * **Liveness** — an advisory `flock` on that same file, held for the whole
+///   life of the store. The kernel releases it when the owning process goes
+///   away, whatever the reason, so "abandoned" and "in use right now" stop
+///   being the same observation. See [`Self::abandoned_store_lease`].
+///
+/// `dir` is declared **before** `lease` and that is load-bearing: Rust drops
+/// fields in declaration order, so the directory is removed while the lease is
+/// still held and there is no instant at which a marked store sits on disk
+/// with its lease free while its owner is alive. The same ordering appears in
+/// reverse at creation — `create_new`, then `try_lock`, then write the magic —
+/// so a sweeper arriving mid-creation sees a zero-length file, which is not
+/// the magic, and leaves.
+///
+/// # A named limit
+///
+/// `flock` on Linux is host-local over NFS. Two git-vista servers on two
+/// different hosts sharing one `.git` over NFS would not see each other's
+/// leases and only [`STALE_SCRATCH_AGE`] would separate them. Two servers on
+/// one host are fully covered.
 struct ScratchStore {
     dir: tempfile::TempDir,
+    // Never read: it is held for its `Drop`, which is what releases the
+    // `flock`. Reading it would mean nothing; *holding* it is the whole
+    // mechanism, and the declaration order below `dir` is what makes the
+    // release happen after the directory is gone.
+    #[allow(dead_code)]
+    lease: std::fs::File,
 }
 
 impl ScratchStore {
@@ -1001,21 +1244,47 @@ impl ScratchStore {
     /// directory points at. Emptying it costs one argv pair; discovering the
     /// omission later costs a security review. Measured: with the flag, the
     /// store has no `hooks` directory at all.
-    async fn new(repo: &Path) -> Result<Self, PreviewUnavailable> {
-        let commondir = commondir_of(repo)?;
-        Self::sweep_stale(&commondir);
+    ///
+    /// # The step order, and why the sweep moved
+    ///
+    /// Object format, then `tempdir_in`, then [`Self::claim`], then
+    /// [`Self::sweep_stale`], then `git init`, then the alternates write. The
+    /// sweep used to run *first*; it now runs after this store exists and
+    /// holds its own lease, which is safe — the store is younger than
+    /// [`STALE_SCRATCH_AGE`] and leased, so it can never sweep itself — and is
+    /// necessary, because the sweep's home is now a fact carried on the target
+    /// rather than something this function looks up. The directory is still
+    /// created no earlier than it was before, so
+    /// `a2_a_cancelled_preview_leaves_nothing_behind`'s exposure window is
+    /// unchanged.
+    async fn new(target: &PreviewTarget) -> Result<Self, PreviewUnavailable> {
+        // The commondir the *request* validated. This function resolves
+        // nothing; see [`PreviewTarget`] for why that is the whole point.
+        let commondir = target.commondir();
+        let repo = target.repo();
 
         let format = object_format(repo).await?;
 
         let dir = tempfile::Builder::new()
             .prefix(SCRATCH_PREFIX)
-            .tempdir_in(&commondir)
+            .tempdir_in(commondir)
             .map_err(|e| {
                 scratch_failed(format!(
                     "could not create a scratch store in {}: {e}",
                     commondir.display()
                 ))
             })?;
+        // Claim it before anything else touches it. A failure here refuses the
+        // preview rather than falling back to an unleased store: an unleased
+        // store is one a concurrent sweeper could reap mid-preview once it
+        // aged past the bound, and an unmarked one leaks for ever.
+        let lease = Self::claim(dir.path()).map_err(|e| {
+            scratch_failed(format!(
+                "could not claim the scratch store in {}: {e}",
+                dir.path().display()
+            ))
+        })?;
+        Self::sweep_stale(commondir);
         let scratch = dir
             .path()
             .to_str()
@@ -1057,7 +1326,91 @@ impl ScratchStore {
             ))
         })?;
 
-        Ok(Self { dir })
+        Ok(Self { dir, lease })
+    }
+
+    /// Create `<dir>/gv-preview-store.lock`, take its lease, and only **then**
+    /// write the magic. Returns the lease; the caller must keep it for the
+    /// store's whole life.
+    ///
+    /// The ordering is the race-freedom argument, not a style choice:
+    ///
+    /// 1. `create_new` — `openat(O_CREAT|O_EXCL)`, so two processes cannot
+    ///    both believe they own this directory;
+    /// 2. `try_lock` — `flock(LOCK_EX|LOCK_NB)`, taken while the file is still
+    ///    empty;
+    /// 3. write the magic.
+    ///
+    /// There is therefore no instant at which the magic is on disk and the
+    /// lease is free while the owner is alive. A sweeper arriving between (1)
+    /// and (3) reads a zero-length file, which is not
+    /// [`STORE_MARKER_MAGIC`], and leaves.
+    ///
+    /// The second line is for a human who finds one of these after a crash. It
+    /// is deliberately outside the compared prefix, so rewording it can never
+    /// change what the sweep recognises.
+    ///
+    /// This is a plain `std::fs` write by the server process — the same class
+    /// as the `objects/info/alternates` write above it. No `Command::new`, no
+    /// change to `argv_boundary`, nothing under `sandbox/`.
+    fn claim(dir: &Path) -> std::io::Result<std::fs::File> {
+        let mut f = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .read(true)
+            .open(dir.join(STORE_MARKER))?;
+        f.try_lock().map_err(|e| match e {
+            std::fs::TryLockError::WouldBlock => std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "another process already holds this scratch store's lease",
+            ),
+            std::fs::TryLockError::Error(e) => e,
+        })?;
+        f.write_all(STORE_MARKER_MAGIC)?;
+        f.write_all(
+            b"created by git-vista's preview (#576). Safe to delete when no\n\
+              git-vista server is running.\n",
+        )?;
+        f.sync_all()?;
+        Ok(f)
+    }
+
+    /// `Some(lease)` when `candidate` is a store this module created and
+    /// nobody holds its lease. `None` — leave it alone — for every other
+    /// answer.
+    ///
+    /// Every step is an affirmative question, and every way of failing to
+    /// answer it is a refusal: marker missing, unreadable, not a regular file,
+    /// too short, wrong magic, lease held, lease unreadable. "I could not
+    /// tell" is never grounds to delete something inside someone's repository.
+    ///
+    /// The `is_file` check is an `fstat` on the **open fd**, not a `stat` on
+    /// the path, so it describes the file that was actually read.
+    ///
+    /// `Err(WouldBlock)` from `try_lock` is the interesting one: it means a
+    /// preview is using this store *right now*, however old the directory
+    /// looks. Measured on this host (rustc 1.96.1, 2026-08-31): a second fd on
+    /// the same file **in the same process** is refused with `WouldBlock`, so
+    /// concurrent previews inside one server — and inside one `cargo test`
+    /// process — protect each other with no self-exclusion special case; a
+    /// child's `flock -n` is refused; the lock is free the moment the owner's
+    /// `File` drops; and the lease is not inherited across `exec`, so an
+    /// orphaned `bwrap`/`git` cannot pin one for ever.
+    ///
+    /// The returned lease is held by the caller across `remove_dir_all`, so
+    /// two sweepers cannot race into the same tree.
+    fn abandoned_store_lease(candidate: &Path) -> Option<std::fs::File> {
+        let f = std::fs::File::open(candidate.join(STORE_MARKER)).ok()?;
+        if !f.metadata().ok()?.is_file() {
+            return None;
+        }
+        let mut head = vec![0u8; STORE_MARKER_MAGIC.len()];
+        (&f).read_exact(&mut head).ok()?;
+        if head != STORE_MARKER_MAGIC {
+            return None;
+        }
+        f.try_lock().ok()?;
+        Some(f)
     }
 
     /// The `--git-dir=<abs>` token.
@@ -1065,20 +1418,44 @@ impl ScratchStore {
         format!("--git-dir={}", self.dir.path().display())
     }
 
-    /// Remove `gv-preview-*` siblings older than [`STALE_SCRATCH_AGE`].
+    /// Reclaim abandoned scratch stores in `commondir` — and **only** those.
+    ///
+    /// `commondir` is the one the request validated, carried on
+    /// [`PreviewTarget`]. This function resolves nothing and must never be
+    /// given a path it looked up itself; that was audit finding 3, and the
+    /// `remove_dir_all` below is the reason it was the destructive one.
     ///
     /// Best-effort and entirely silent on failure: a sweep that refused to run
     /// would turn a leftover directory into a broken feature, which is worse
-    /// than the leftover. Two rules make it safe to run inside a user's `.git`:
+    /// than the leftover. It stays silent per entry too — it runs inside a
+    /// user's `.git` on every store-creating preview, and a log line per
+    /// sibling would be noise on the normal path. What a human who finds one
+    /// of these needs is written in the marker's own second line.
     ///
-    /// * it only considers **directories** whose file name starts with
-    ///   [`SCRATCH_PREFIX`] — a name this module chose, never one it found;
-    /// * it only removes one whose modification time is older than the bound,
-    ///   so a *concurrent* preview's store is never a candidate.
+    /// # Never delete is the default
     ///
-    /// An entry whose age cannot be read is left alone. "We could not tell how
-    /// old it is" is not grounds to delete something inside someone's
-    /// repository.
+    /// A directory is removed only when **all four** gates answer yes, cheapest
+    /// first:
+    ///
+    /// 1. its name starts with [`SCRATCH_PREFIX`] — the candidate filter, and
+    ///    nothing more than that;
+    /// 2. `DirEntry::metadata` says `is_dir()`. That call does **not** traverse
+    ///    symlinks (measured: a symlink named `gv-preview-evil` reports
+    ///    `is_dir == false`), so a planted link is skipped rather than
+    ///    followed;
+    /// 3. its mtime is readable and at least [`STALE_SCRATCH_AGE`] old;
+    /// 4. [`Self::abandoned_store_lease`] hands back a lease — the marker is
+    ///    there, its magic matches exactly, and nobody holds its lock.
+    ///
+    /// Anything else is a `continue`: unreadable directory, unreadable
+    /// metadata, unreadable mtime, marker missing or unreadable or not a
+    /// regular file, wrong or truncated magic, `WouldBlock`, any other lock
+    /// error. A failed `read_dir` on `commondir` returns having deleted
+    /// nothing.
+    ///
+    /// The lease is held across `remove_dir_all` — `drop(lease)` sits after
+    /// it, not before — so a second sweeper cannot delete the same tree
+    /// underneath the first.
     fn sweep_stale(commondir: &Path) {
         let Ok(entries) = std::fs::read_dir(commondir) else {
             return;
@@ -1103,22 +1480,16 @@ impl ScratchStore {
             if age < STALE_SCRATCH_AGE {
                 continue;
             }
-            let _ = std::fs::remove_dir_all(entry.path());
+            let path = entry.path();
+            // The only ownership test. A prefix is a public string; this is a
+            // file this module wrote, whose lease nobody holds.
+            let Some(lease) = Self::abandoned_store_lease(&path) else {
+                continue;
+            };
+            let _ = std::fs::remove_dir_all(&path);
+            drop(lease);
         }
     }
-}
-
-/// `<commondir>` for `repo`, from `sandbox::repo_paths::resolve` — **the same
-/// function `sandbox::policy_for` resolves it with**.
-///
-/// Deliberately not a second `rev-parse --git-common-dir`: the scratch store
-/// must sit inside the tree the policy actually granted, and two resolvers can
-/// disagree about a linked worktree. Reading `sandbox::repo_paths` is not
-/// editing it; nothing under `sandbox/` changes.
-fn commondir_of(repo: &Path) -> Result<PathBuf, PreviewUnavailable> {
-    crate::sandbox::repo_paths::resolve(repo)
-        .map(|paths| paths.commondir)
-        .map_err(|e| scratch_failed(format!("resolving the repository's git directory: {e}")))
 }
 
 /// `rev-parse --show-object-format` — `sha1` or `sha256`.

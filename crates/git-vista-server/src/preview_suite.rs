@@ -2,7 +2,7 @@
 //!
 //! Included from [`super`] with `#[path]`, so it is a **child** of
 //! `crate::preview` rather than a sibling and can see the module's private
-//! items (`ScratchStore`, `commondir_of`, `recipe` and the pure parsers). A
+//! items (`ScratchStore`, `PreviewTarget`, `recipe` and the pure parsers). A
 //! sibling `mod preview_suite;` in `main.rs` could not, and the tests that
 //! matter here are exactly the ones about private machinery.
 //!
@@ -519,6 +519,12 @@ fn scratch_dirs(commondir: &Path) -> Vec<String> {
 
 /// The repository path handed to [`a2_env_redirect_driver`]'s child process.
 const A2_ENV_REPO_VAR: &str = "GV_A2_ENV_REDIRECT_REPO";
+/// The managed root handed to the same child process.
+///
+/// The driver runs in a **fresh process** and knows only what it is told, so
+/// it is handed the root rather than inventing one. A test that guessed a root
+/// would be validating containment against a fact it made up.
+const A2_ENV_ROOT_VAR: &str = "GV_A2_ENV_REDIRECT_ROOT";
 /// The serialized [`Plan`] handed to the same child process.
 const A2_ENV_PLAN_VAR: &str = "GV_A2_ENV_REDIRECT_PLAN";
 /// The line the driver prints — only after the preview under the redirected
@@ -693,8 +699,10 @@ fn expect_graph(outcome: PreviewResponse) -> (Halves, Vec<PreviewChange>) {
 ///    stage of the test.
 #[tokio::test]
 async fn a2_a_preview_writes_no_object_moves_no_ref_and_leaves_no_scratch_directory() {
-    let (_dir, repo) = revert_shape();
-    let commondir = commondir_of(&repo).expect("resolve the commondir");
+    let (dir, repo) = revert_shape();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
+    let commondir = target.commondir().to_path_buf();
 
     let head = git::out(&repo, &["rev-parse", "HEAD"]);
     let objects_before = object_file_count(&commondir);
@@ -711,7 +719,7 @@ async fn a2_a_preview_writes_no_object_moves_no_ref_and_leaves_no_scratch_direct
         },
     )
     .await;
-    let outcome = preview(&repo, &plan).await;
+    let outcome = preview(&target, &plan).await;
 
     let (_graph, _changes) = expect_graph(outcome);
 
@@ -755,8 +763,10 @@ async fn a2_a_preview_writes_no_object_moves_no_ref_and_leaves_no_scratch_direct
 ///    which is a different failure surface than the one this test alone names.
 #[tokio::test]
 async fn a2_the_scratch_store_is_removed_on_the_conflict_path_too() {
-    let (_dir, repo) = git_vista_fixtures::cherry_pick_conflict();
-    let commondir = commondir_of(&repo).expect("resolve the commondir");
+    let (dir, repo) = git_vista_fixtures::cherry_pick_conflict();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
+    let commondir = target.commondir().to_path_buf();
     let objects_before = object_file_count(&commondir);
     let refs_before = refs_snapshot(&repo);
 
@@ -769,7 +779,7 @@ async fn a2_the_scratch_store_is_removed_on_the_conflict_path_too() {
     )
     .await;
 
-    match preview(&repo, &plan).await {
+    match preview(&target, &plan).await {
         PreviewOutcome::Conflict { .. } => {}
         other => panic!("expected Conflict, got {other:?}"),
     }
@@ -828,8 +838,10 @@ fn warm_the_index(repo: &Path) -> String {
 ///    entries, a `~`-shaped diff of pairs, in a different part of the message.
 #[tokio::test]
 async fn a2_a_revert_preview_changes_no_byte_under_the_git_directory() {
-    let (_dir, repo) = revert_shape();
-    let commondir = commondir_of(&repo).expect("resolve the commondir");
+    let (dir, repo) = revert_shape();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
+    let commondir = target.commondir().to_path_buf();
     let head = git::out(&repo, &["rev-parse", "HEAD"]);
     let plan = plan_for(
         &repo,
@@ -849,7 +861,7 @@ async fn a2_a_revert_preview_changes_no_byte_under_the_git_directory() {
         before.len()
     );
 
-    let outcome = preview(&repo, &plan).await;
+    let outcome = preview(&target, &plan).await;
     let after = git_dir_manifest(&commondir);
     let worktree_after = git::out(&repo, &["status", "--porcelain=v2", "--branch"]);
 
@@ -885,8 +897,10 @@ async fn a2_a_revert_preview_changes_no_byte_under_the_git_directory() {
 ///    different shape from mutation 1.
 #[tokio::test]
 async fn a2_a_merge_preview_changes_no_byte_under_the_git_directory() {
-    let (_dir, repo) = git_vista_fixtures::merge_clean_two_branch();
-    let commondir = commondir_of(&repo).expect("resolve the commondir");
+    let (dir, repo) = git_vista_fixtures::merge_clean_two_branch();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
+    let commondir = target.commondir().to_path_buf();
     let plan = plan_for(
         &repo,
         GitOperation::MergeBranch {
@@ -897,7 +911,7 @@ async fn a2_a_merge_preview_changes_no_byte_under_the_git_directory() {
 
     warm_the_index(&repo);
     let before = git_dir_manifest(&commondir);
-    let outcome = preview(&repo, &plan).await;
+    let outcome = preview(&target, &plan).await;
     let after = git_dir_manifest(&commondir);
 
     let (_graph, _changes) = expect_graph(outcome);
@@ -926,8 +940,10 @@ async fn a2_a_merge_preview_changes_no_byte_under_the_git_directory() {
 ///    reached down a different path.
 #[tokio::test]
 async fn a2_a_conflicting_preview_changes_no_byte_under_the_git_directory() {
-    let (_dir, repo) = git_vista_fixtures::cherry_pick_conflict();
-    let commondir = commondir_of(&repo).expect("resolve the commondir");
+    let (dir, repo) = git_vista_fixtures::cherry_pick_conflict();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
+    let commondir = target.commondir().to_path_buf();
     let topic = git::out(&repo, &["rev-parse", "topic"]);
     let plan = plan_for(
         &repo,
@@ -939,7 +955,7 @@ async fn a2_a_conflicting_preview_changes_no_byte_under_the_git_directory() {
 
     warm_the_index(&repo);
     let before = git_dir_manifest(&commondir);
-    let outcome = preview(&repo, &plan).await;
+    let outcome = preview(&target, &plan).await;
     let after = git_dir_manifest(&commondir);
 
     assert!(
@@ -1016,8 +1032,10 @@ async fn a2_a_conflicting_preview_changes_no_byte_under_the_git_directory() {
 ///   one unexercised variable at a time.
 #[tokio::test]
 async fn a2_an_inherited_git_object_directory_cannot_redirect_preview_writes() {
-    let (_dir, repo) = revert_shape();
-    let commondir = commondir_of(&repo).expect("resolve the commondir");
+    let (dir, repo) = revert_shape();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
+    let commondir = target.commondir().to_path_buf();
     let head = git::out(&repo, &["rev-parse", "HEAD"]);
     let plan = plan_for(
         &repo,
@@ -1047,6 +1065,7 @@ async fn a2_an_inherited_git_object_directory_cannot_redirect_preview_writes() {
                 commondir.join("objects").as_os_str(),
             ),
             (A2_ENV_REPO_VAR, repo.as_os_str()),
+            (A2_ENV_ROOT_VAR, dir.path().as_os_str()),
             (A2_ENV_PLAN_VAR, std::ffi::OsStr::new(&plan_json)),
         ],
     );
@@ -1104,6 +1123,11 @@ async fn a2_env_redirect_driver_runs_one_preview_under_the_variable() {
         return;
     };
     let repo = PathBuf::from(repo);
+    let root = PathBuf::from(
+        std::env::var_os(A2_ENV_ROOT_VAR).expect("the outer test passes the managed root"),
+    );
+    let target = PreviewTarget::resolved_in(&repo, &root)
+        .expect("the handed repository is inside the handed root");
     let plan_json = std::env::var(A2_ENV_PLAN_VAR).expect("the outer test passes the plan");
     let plan: Plan = serde_json::from_str(&plan_json).expect("the handed plan deserializes");
     assert!(
@@ -1112,7 +1136,7 @@ async fn a2_env_redirect_driver_runs_one_preview_under_the_variable() {
          driver would measure nothing"
     );
 
-    match preview(&repo, &plan).await {
+    match preview(&target, &plan).await {
         PreviewOutcome::Graph { .. } => println!("{A2_ENV_SENTINEL}"),
         other => panic!("expected Graph under the redirected environment, got {other:?}"),
     }
@@ -1233,8 +1257,10 @@ async fn a2_env_redirect_driver_runs_one_preview_under_the_variable() {
 /// quoted for it no longer does.
 #[tokio::test]
 async fn a2_a_cancelled_preview_leaves_nothing_behind() {
-    let (_dir, repo) = revert_shape();
-    let commondir = commondir_of(&repo).expect("resolve the commondir");
+    let (dir, repo) = revert_shape();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
+    let commondir = target.commondir().to_path_buf();
     let head = git::out(&repo, &["rev-parse", "HEAD"]);
     let plan = plan_for(
         &repo,
@@ -1290,7 +1316,7 @@ async fn a2_a_cancelled_preview_leaves_nothing_behind() {
                 tokio::time::sleep(Duration::from_micros(50)).await;
             }
         });
-        let _ = preview(&repo, &plan).await;
+        let _ = preview(&target, &plan).await;
         sampler.abort();
         let _ = sampler.await;
     }
@@ -1331,7 +1357,7 @@ async fn a2_a_cancelled_preview_leaves_nothing_behind() {
     let mut leaked: Vec<(Duration, Vec<String>, Vec<String>)> = Vec::new();
     let mut slowest_clear = Duration::ZERO;
     for limit in timeouts {
-        let completed = tokio::time::timeout(limit, preview(&repo, &plan))
+        let completed = tokio::time::timeout(limit, preview(&target, &plan))
             .await
             .is_ok();
         let (settled_after, dirs, diff) =
@@ -1425,8 +1451,8 @@ async fn wait_for_the_repository_to_settle(
 /// byte of the **main** git directory.
 ///
 /// Nobody else raised this case, and it is the one where the scratch store is
-/// furthest from the repository the caller handed in: `commondir_of` resolves a
-/// linked worktree to the *main* `.git`, so the store — and therefore the
+/// furthest from the repository the caller handed in: a linked worktree's
+/// validated commondir is the *main* `.git`, so the store — and therefore the
 /// cleanup — happens somewhere the caller never named.
 ///
 /// # Two mutations
@@ -1442,8 +1468,10 @@ async fn wait_for_the_repository_to_settle(
 ///    reason, leaving the byte diff untouched.
 #[tokio::test]
 async fn a2_a_preview_in_a_linked_worktree_touches_the_main_git_directory_not_at_all() {
-    let (_dir, repo) = revert_shape();
-    let main_commondir = commondir_of(&repo).expect("resolve the commondir");
+    let (dir, repo) = revert_shape();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
+    let main_commondir = target.commondir().to_path_buf();
 
     let worktree = repo
         .parent()
@@ -1460,7 +1488,12 @@ async fn a2_a_preview_in_a_linked_worktree_touches_the_main_git_directory_not_at
             worktree.to_str().expect("a utf-8 path"),
         ],
     );
-    let worktree_commondir = commondir_of(&worktree).expect("resolve the worktree's commondir");
+    // The worktree is created at `<root>/wt`, a sibling of the repository and
+    // still inside the fixture root, so it passes the same containment check
+    // production applies.
+    let worktree_target = PreviewTarget::resolved_in(&worktree, dir.path())
+        .expect("the linked worktree is inside the fixture root");
+    let worktree_commondir = worktree_target.commondir().to_path_buf();
     assert_eq!(
         worktree_commondir, main_commondir,
         "a linked worktree must resolve to the MAIN common directory, or this \
@@ -1478,7 +1511,7 @@ async fn a2_a_preview_in_a_linked_worktree_touches_the_main_git_directory_not_at
 
     warm_the_index(&worktree);
     let before = git_dir_manifest(&main_commondir);
-    let outcome = preview(&worktree, &plan).await;
+    let outcome = preview(&worktree_target, &plan).await;
     let after = git_dir_manifest(&main_commondir);
 
     let (_graph, _changes) = expect_graph(outcome);
@@ -1518,8 +1551,10 @@ async fn a2_a_preview_in_a_linked_worktree_touches_the_main_git_directory_not_at
 ///    rather than as two removals.
 #[test]
 fn the_manifest_and_the_scratch_sweep_both_notice_a_planted_store() {
-    let (_dir, repo) = revert_shape();
-    let commondir = commondir_of(&repo).expect("resolve the commondir");
+    let (dir, repo) = revert_shape();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
+    let commondir = target.commondir().to_path_buf();
     let before = git_dir_manifest(&commondir);
     assert!(
         before.len() > 20,
@@ -1584,7 +1619,9 @@ fn the_manifest_and_the_scratch_sweep_both_notice_a_planted_store() {
 ///    different message.
 #[tokio::test]
 async fn a3_a_conflicting_cherry_pick_answers_conflict_naming_the_file() {
-    let (_dir, repo) = git_vista_fixtures::cherry_pick_conflict();
+    let (dir, repo) = git_vista_fixtures::cherry_pick_conflict();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
     let topic = git::out(&repo, &["rev-parse", "topic"]);
     let plan = plan_for(
         &repo,
@@ -1594,7 +1631,7 @@ async fn a3_a_conflicting_cherry_pick_answers_conflict_naming_the_file() {
     )
     .await;
 
-    match preview(&repo, &plan).await {
+    match preview(&target, &plan).await {
         PreviewOutcome::Conflict { paths } => {
             assert_eq!(
                 paths,
@@ -1627,7 +1664,9 @@ async fn a3_a_conflicting_cherry_pick_answers_conflict_naming_the_file() {
 ///    passes; the literal name comparison is what goes red, once per case.
 #[tokio::test]
 async fn a4_operations_the_plumbing_cannot_express_answer_unsupported() {
-    let (_dir, repo) = revert_shape();
+    let (dir, repo) = revert_shape();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
     let head = git::out(&repo, &["rev-parse", "HEAD"]);
 
     let cases: Vec<(GitOperation, &str)> = vec![
@@ -1669,7 +1708,7 @@ async fn a4_operations_the_plumbing_cannot_express_answer_unsupported() {
 
     for (op, expected) in cases {
         let plan = plan_for(&repo, op.clone()).await;
-        match preview(&repo, &plan).await {
+        match preview(&target, &plan).await {
             PreviewOutcome::Unsupported { operation } => assert_eq!(
                 operation, expected,
                 "the reported name must be this operation's own wire tag"
@@ -1694,7 +1733,9 @@ async fn a4_operations_the_plumbing_cannot_express_answer_unsupported() {
 ///    on a different arm.
 #[tokio::test]
 async fn a4_reverting_a_merge_commit_is_unsupported_not_a_guessed_graph() {
-    let (_dir, repo) = git_vista_fixtures::merge_clean_two_branch();
+    let (dir, repo) = git_vista_fixtures::merge_clean_two_branch();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
     git::run(&repo, &["merge", "-q", "--no-edit", "feature"]);
     let merge_commit = git::out(&repo, &["rev-parse", "HEAD"]);
     assert_eq!(
@@ -1710,7 +1751,7 @@ async fn a4_reverting_a_merge_commit_is_unsupported_not_a_guessed_graph() {
         },
     )
     .await;
-    match preview(&repo, &plan).await {
+    match preview(&target, &plan).await {
         PreviewOutcome::Unsupported { operation } => assert_eq!(operation, "revert_commit"),
         other => panic!("expected Unsupported for a merge revert, got {other:?}"),
     }
@@ -1855,7 +1896,9 @@ fn assert_parity(after: &Graph, real: &Graph, before: &Graph, what: &str) {
 ///    before it can be returned; the mutation removes that refusal too.)
 #[tokio::test]
 async fn a5_a_previewed_revert_matches_a_real_revert() {
-    let (_dir, repo) = revert_shape();
+    let (dir, repo) = revert_shape();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
     let head = git::out(&repo, &["rev-parse", "HEAD"]);
     let before_layout = layout_of(&repo);
 
@@ -1866,7 +1909,7 @@ async fn a5_a_previewed_revert_matches_a_real_revert() {
         },
     )
     .await;
-    let (graph, _) = expect_graph(preview(&repo, &plan).await);
+    let (graph, _) = expect_graph(preview(&target, &plan).await);
 
     let (_scratch, copy) = copy_of(&repo);
     git::run(&copy, &["revert", "--no-edit", &head]);
@@ -1890,7 +1933,9 @@ async fn a5_a_previewed_revert_matches_a_real_revert() {
 ///    shape comparison, which is why both tests exist.
 #[tokio::test]
 async fn a5_a_previewed_cherry_pick_matches_a_real_cherry_pick() {
-    let (_dir, repo) = cherry_pick_shape();
+    let (dir, repo) = cherry_pick_shape();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
     let topic = git::out(&repo, &["rev-parse", "topic"]);
     let before_layout = layout_of(&repo);
 
@@ -1901,7 +1946,7 @@ async fn a5_a_previewed_cherry_pick_matches_a_real_cherry_pick() {
         },
     )
     .await;
-    let (graph, _) = expect_graph(preview(&repo, &plan).await);
+    let (graph, _) = expect_graph(preview(&target, &plan).await);
 
     let (_scratch, copy) = copy_of(&repo);
     git::run(&copy, &["cherry-pick", &topic]);
@@ -1924,7 +1969,9 @@ async fn a5_a_previewed_cherry_pick_matches_a_real_cherry_pick() {
 ///    first mutation's, on the same row.
 #[tokio::test]
 async fn a5_a_previewed_merge_matches_a_real_merge() {
-    let (_dir, repo) = git_vista_fixtures::merge_clean_two_branch();
+    let (dir, repo) = git_vista_fixtures::merge_clean_two_branch();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
     let before_layout = layout_of(&repo);
 
     let plan = plan_for(
@@ -1934,7 +1981,7 @@ async fn a5_a_previewed_merge_matches_a_real_merge() {
         },
     )
     .await;
-    let (graph, _) = expect_graph(preview(&repo, &plan).await);
+    let (graph, _) = expect_graph(preview(&target, &plan).await);
 
     let (_scratch, copy) = copy_of(&repo);
     git::run(&copy, &["merge", "-q", "--no-edit", "feature"]);
@@ -1951,10 +1998,11 @@ async fn a5_a_previewed_merge_matches_a_real_merge() {
 /// `PreviewOutcome` carries no tree oid. That limit is real and is stated in
 /// the module doc: this pins the recipe, not the wiring between the recipe and
 /// `commit_tree`.
-async fn predicted_tree(repo: &Path, op: &GitOperation) -> String {
+async fn predicted_tree(target: &PreviewTarget, op: &GitOperation) -> String {
+    let repo = target.repo();
     let head = git::out(repo, &["rev-parse", "HEAD"]);
     let previewable = previewable(op).expect("the operation must be previewable");
-    let plumbing = resolve_plumbing(repo, &previewable, &head)
+    let plumbing = resolve_plumbing(target, &previewable, &head)
         .await
         .expect("resolve the plumbing");
     let Plumbing::Synthesize(recipe) = plumbing else {
@@ -1981,13 +2029,14 @@ async fn predicted_tree(repo: &Path, op: &GitOperation) -> String {
 /// A tree is the one value comparable across the two runs: it hashes content,
 /// while the commit that wraps it hashes the time it was written.
 async fn assert_tree_matches_the_real_run(
-    repo: &Path,
+    target: &PreviewTarget,
     op: &GitOperation,
     real_command: &[&str],
     what: &str,
 ) {
+    let repo = target.repo();
     let head_tree_before = git::out(repo, &["rev-parse", "HEAD^{tree}"]);
-    let predicted = predicted_tree(repo, op).await;
+    let predicted = predicted_tree(target, op).await;
 
     let (_scratch, copy) = copy_of(repo);
     git::run(&copy, real_command);
@@ -2025,12 +2074,14 @@ async fn assert_tree_matches_the_real_run(
 ///    which is the point of having this test at all.
 #[tokio::test]
 async fn a5_a_previewed_revert_writes_the_tree_a_real_revert_writes() {
-    let (_dir, repo) = revert_shape();
+    let (dir, repo) = revert_shape();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
     let head = git::out(&repo, &["rev-parse", "HEAD"]);
     let op = GitOperation::RevertCommit {
         commit: CommitOid::new(head.clone()).expect("a full hex oid"),
     };
-    assert_tree_matches_the_real_run(&repo, &op, &["revert", "--no-edit", &head], "revert").await;
+    assert_tree_matches_the_real_run(&target, &op, &["revert", "--no-edit", &head], "revert").await;
 }
 
 /// The cherry-pick really carries the picked commit's *content* across, not
@@ -2064,12 +2115,14 @@ async fn a5_a_previewed_revert_writes_the_tree_a_real_revert_writes() {
 ///    equality goes red on a different oid than mutation 1 produces.
 #[tokio::test]
 async fn a5_cherry_pick_actually_moves_the_content() {
-    let (_dir, repo) = git_vista_fixtures::cherry_pick_clean();
+    let (dir, repo) = git_vista_fixtures::cherry_pick_clean();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
     let topic = git::out(&repo, &["rev-parse", "topic"]);
     let op = GitOperation::CherryPick {
         commit: CommitOid::new(topic.clone()).expect("a full hex oid"),
     };
-    assert_tree_matches_the_real_run(&repo, &op, &["cherry-pick", &topic], "cherry-pick").await;
+    assert_tree_matches_the_real_run(&target, &op, &["cherry-pick", &topic], "cherry-pick").await;
 }
 
 /// **A5, merge, content.** The previewed merge really unions the two branches'
@@ -2090,12 +2143,14 @@ async fn a5_cherry_pick_actually_moves_the_content() {
 ///    than the union of both — a different wrong oid, from a different cause.
 #[tokio::test]
 async fn a5_a_previewed_merge_writes_the_tree_a_real_merge_writes() {
-    let (_dir, repo) = git_vista_fixtures::merge_clean_two_branch();
+    let (dir, repo) = git_vista_fixtures::merge_clean_two_branch();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
     let op = GitOperation::MergeBranch {
         branch: BranchName::new("feature").expect("a valid branch name"),
     };
     assert_tree_matches_the_real_run(
-        &repo,
+        &target,
         &op,
         &["merge", "-q", "--no-edit", "feature"],
         "merge",
@@ -2127,7 +2182,9 @@ async fn a5_a_previewed_merge_writes_the_tree_a_real_merge_writes() {
 ///    timestamp breaks that land here.
 #[tokio::test]
 async fn a5_the_previewed_reverts_row_is_decided_by_its_timestamp() {
-    let (_dir, repo) = revert_shape_with_a_competitor_tip();
+    let (dir, repo) = revert_shape_with_a_competitor_tip();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
     let head = git::out(&repo, &["rev-parse", "HEAD"]);
     let before_layout = layout_of(&repo);
     assert!(
@@ -2148,7 +2205,7 @@ async fn a5_the_previewed_reverts_row_is_decided_by_its_timestamp() {
         },
     )
     .await;
-    let (graph, _) = expect_graph(preview(&repo, &plan).await);
+    let (graph, _) = expect_graph(preview(&target, &plan).await);
 
     let (_scratch, copy) = copy_of(&repo);
     git::run(&copy, &["revert", "--no-edit", &head]);
@@ -2180,7 +2237,9 @@ async fn a5_the_previewed_reverts_row_is_decided_by_its_timestamp() {
 ///    red instead.
 #[tokio::test]
 async fn a5_the_previewed_merges_row_is_decided_by_its_timestamp() {
-    let (_dir, repo) = merge_shape_with_a_competitor_tip();
+    let (dir, repo) = merge_shape_with_a_competitor_tip();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
     let before_layout = layout_of(&repo);
 
     let plan = plan_for(
@@ -2190,7 +2249,7 @@ async fn a5_the_previewed_merges_row_is_decided_by_its_timestamp() {
         },
     )
     .await;
-    let (graph, _) = expect_graph(preview(&repo, &plan).await);
+    let (graph, _) = expect_graph(preview(&target, &plan).await);
 
     let (_scratch, copy) = copy_of(&repo);
     git::run(&copy, &["merge", "-q", "--no-edit", "feature"]);
@@ -2240,7 +2299,9 @@ async fn a5_the_previewed_merges_row_is_decided_by_its_timestamp() {
 ///    the whole feature exists to prevent.
 #[tokio::test]
 async fn a3_a_conflicting_merge_answers_conflict_naming_the_file() {
-    let (_dir, repo) = git_vista_fixtures::merge_conflict();
+    let (dir, repo) = git_vista_fixtures::merge_conflict();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
 
     let (_scratch, copy) = copy_of(&repo);
     assert!(
@@ -2262,7 +2323,7 @@ async fn a3_a_conflicting_merge_answers_conflict_naming_the_file() {
         },
     )
     .await;
-    match preview(&repo, &plan).await {
+    match preview(&target, &plan).await {
         PreviewOutcome::Conflict { paths } => assert_eq!(
             paths,
             vec!["shared.txt".to_string()],
@@ -2292,7 +2353,9 @@ async fn a3_a_conflicting_merge_answers_conflict_naming_the_file() {
 ///    assertion goes red instead.
 #[tokio::test]
 async fn a_merge_that_is_already_up_to_date_adds_nothing_and_moves_no_ref() {
-    let (_dir, repo) = fast_forward_shape();
+    let (dir, repo) = fast_forward_shape();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
     let plan = plan_for(
         &repo,
         GitOperation::MergeBranch {
@@ -2300,7 +2363,7 @@ async fn a_merge_that_is_already_up_to_date_adds_nothing_and_moves_no_ref() {
         },
     )
     .await;
-    let (graph, changes) = expect_graph(preview(&repo, &plan).await);
+    let (graph, changes) = expect_graph(preview(&target, &plan).await);
 
     assert_eq!(
         changes,
@@ -2325,7 +2388,9 @@ async fn a_merge_that_is_already_up_to_date_adds_nothing_and_moves_no_ref() {
 ///    goes red because nothing is reported as having moved at all.
 #[tokio::test]
 async fn a_fast_forward_merge_moves_the_refs_and_adds_no_commit() {
-    let (_dir, repo) = fast_forward_shape();
+    let (dir, repo) = fast_forward_shape();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
     let tip = git::out(&repo, &["rev-parse", "main"]);
     let behind = git::out(&repo, &["rev-parse", "behind"]);
     git::run(&repo, &["checkout", "-q", "behind"]);
@@ -2337,7 +2402,7 @@ async fn a_fast_forward_merge_moves_the_refs_and_adds_no_commit() {
         },
     )
     .await;
-    let (_graph, changes) = expect_graph(preview(&repo, &plan).await);
+    let (_graph, changes) = expect_graph(preview(&target, &plan).await);
 
     assert!(
         !changes
@@ -2406,7 +2471,9 @@ async fn a_fast_forward_merge_moves_the_refs_and_adds_no_commit() {
 ///    the two comparisons are not interchangeable.
 #[tokio::test]
 async fn a_cherry_pick_that_is_already_applied_must_not_be_drawn_as_a_clean_commit() {
-    let (_dir, repo) = git_vista_fixtures::cherry_pick_already_applied();
+    let (dir, repo) = git_vista_fixtures::cherry_pick_already_applied();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
     let topic = git::out(&repo, &["rev-parse", "topic"]);
     let head_tree = git::out(&repo, &["rev-parse", "HEAD^{tree}"]);
 
@@ -2434,7 +2501,7 @@ async fn a_cherry_pick_that_is_already_applied_must_not_be_drawn_as_a_clean_comm
         commit: CommitOid::new(topic).expect("a full hex oid"),
     };
     assert_eq!(
-        predicted_tree(&repo, &op).await,
+        predicted_tree(&target, &op).await,
         head_tree,
         "the fact needed to refuse is already in hand: `merge-tree` answers \
          HEAD's own tree, which is what 'this pick contributes nothing' looks \
@@ -2442,7 +2509,7 @@ async fn a_cherry_pick_that_is_already_applied_must_not_be_drawn_as_a_clean_comm
     );
 
     let plan = plan_for(&repo, op).await;
-    let outcome = preview(&repo, &plan).await;
+    let outcome = preview(&target, &plan).await;
     assert!(
         !matches!(outcome, PreviewOutcome::Graph { .. }),
         "a pick that real git refuses, leaving CHERRY_PICK_HEAD behind, must \
@@ -2541,7 +2608,9 @@ fn assert_identical_layout(after: &Graph, real: &Graph, before: &Graph, what: &s
 ///    [`assert_identical_layout`] goes red on the badges.
 #[tokio::test]
 async fn merge_ff_unset_previews_the_fast_forward_git_actually_performs() {
-    let (_dir, repo) = git_vista_fixtures::fast_forward_merge_ff_unset();
+    let (dir, repo) = git_vista_fixtures::fast_forward_merge_ff_unset();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
 
     // The premise, read through the launcher the preview itself uses.
     let probe = preview_git(&repo, &["config", "--get", "merge.ff"])
@@ -2586,7 +2655,7 @@ async fn merge_ff_unset_previews_the_fast_forward_git_actually_performs() {
         },
     )
     .await;
-    let (graph, changes) = expect_graph(preview(&repo, &plan).await);
+    let (graph, changes) = expect_graph(preview(&target, &plan).await);
 
     assert!(
         !changes
@@ -2653,7 +2722,9 @@ async fn merge_ff_unset_previews_the_fast_forward_git_actually_performs() {
 ///    from being invisible.
 #[tokio::test]
 async fn merge_ff_set_to_an_unparseable_value_refuses_instead_of_defaulting() {
-    let (_dir, repo) = git_vista_fixtures::fast_forward_merge_ff_unset();
+    let (dir, repo) = git_vista_fixtures::fast_forward_merge_ff_unset();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
     git::run(&repo, &["config", "--local", "merge.ff", "banana"]);
 
     // The oracle: real git ignores the value and keeps its default.
@@ -2682,7 +2753,7 @@ async fn merge_ff_set_to_an_unparseable_value_refuses_instead_of_defaulting() {
         },
     )
     .await;
-    match preview(&repo, &plan).await {
+    match preview(&target, &plan).await {
         PreviewOutcome::Unavailable {
             reason: PreviewUnavailable::CheckFailed { detail },
         } => {
@@ -2750,7 +2821,9 @@ async fn merge_ff_set_to_an_unparseable_value_refuses_instead_of_defaulting() {
 ///    instead, naming one parent where git wrote two.
 #[tokio::test]
 async fn merge_ff_false_must_preview_the_two_parent_commit_git_actually_writes() {
-    let (_dir, repo) = git_vista_fixtures::fast_forward_merge_ff_false();
+    let (dir, repo) = git_vista_fixtures::fast_forward_merge_ff_false();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
     let before_layout = layout_of(&repo);
 
     // The oracle: the executor's own argv, on a copy.
@@ -2777,7 +2850,7 @@ async fn merge_ff_false_must_preview_the_two_parent_commit_git_actually_writes()
         },
     )
     .await;
-    let (graph, changes) = expect_graph(preview(&repo, &plan).await);
+    let (graph, changes) = expect_graph(preview(&target, &plan).await);
 
     assert_eq!(
         changes
@@ -2829,7 +2902,9 @@ async fn merge_ff_false_must_preview_the_two_parent_commit_git_actually_writes()
 ///    still a `Graph` and *this* assertion is the one that goes red.
 #[tokio::test]
 async fn merge_ff_only_must_not_draw_a_merge_git_refuses_to_make() {
-    let (_dir, repo) = git_vista_fixtures::divergent_merge_ff_only();
+    let (dir, repo) = git_vista_fixtures::divergent_merge_ff_only();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
 
     // The oracle first: prove real git refuses and moves nothing.
     let (_scratch, copy) = copy_of(&repo);
@@ -2858,7 +2933,7 @@ async fn merge_ff_only_must_not_draw_a_merge_git_refuses_to_make() {
         },
     )
     .await;
-    let outcome = preview(&repo, &plan).await;
+    let outcome = preview(&target, &plan).await;
 
     assert!(
         !matches!(outcome, PreviewOutcome::Graph { .. }),
@@ -2891,7 +2966,9 @@ async fn merge_ff_only_must_not_draw_a_merge_git_refuses_to_make() {
 ///    Active mode" — a different arm, a different message.
 #[tokio::test]
 async fn a_read_only_repository_answers_repository_read_only() {
-    let (_dir, repo) = revert_shape();
+    let (dir, repo) = revert_shape();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
     let head = git::out(&repo, &["rev-parse", "HEAD"]);
     let plan = plan_for(
         &repo,
@@ -2906,7 +2983,7 @@ async fn a_read_only_repository_answers_repository_read_only() {
     // cannot be clobbered by one either.
     let outcome = crate::state::with_isolated_test_current(async {
         crate::state::set_current(&repo, git_vista_protocol::RepoMode::Visualize);
-        preview(&repo, &plan).await
+        preview(&target, &plan).await
     })
     .await;
 
@@ -2922,7 +2999,9 @@ async fn a_read_only_repository_answers_repository_read_only() {
 /// "the check could not run", which is `CheckFailed`.
 #[tokio::test]
 async fn an_unborn_head_answers_check_failed_rather_than_a_graph() {
-    let (_dir, repo) = git_vista_fixtures::empty();
+    let (dir, repo) = git_vista_fixtures::empty();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
     // `empty()` has no commits, so there is no oid to name; any well-formed
     // one will do — the point is that HEAD does not resolve, which is checked
     // before the commit is ever looked up.
@@ -2933,7 +3012,7 @@ async fn an_unborn_head_answers_check_failed_rather_than_a_graph() {
         },
     )
     .await;
-    match preview(&repo, &plan).await {
+    match preview(&target, &plan).await {
         PreviewOutcome::Unavailable {
             reason: PreviewUnavailable::CheckFailed { detail },
         } => assert!(
@@ -3026,7 +3105,9 @@ fn would_be_layout(repo: &Path, added: CommitSummary) -> PreviewLayout {
 ///    `match` go red — the original defect class, restored.
 #[tokio::test]
 async fn a_detached_head_refuses_rather_than_colouring_a_commit_no_branch_claims() {
-    let (_dir, repo) = revert_shape();
+    let (dir, repo) = revert_shape();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
     let head = git::out(&repo, &["rev-parse", "HEAD"]);
     git::run(&repo, &["checkout", "-q", "--detach", "HEAD"]);
     assert!(
@@ -3073,7 +3154,7 @@ async fn a_detached_head_refuses_rather_than_colouring_a_commit_no_branch_claims
     )
     .await;
 
-    match preview(&repo, &plan).await {
+    match preview(&target, &plan).await {
         PreviewOutcome::Unavailable {
             reason: PreviewUnavailable::CheckFailed { detail },
         } => {
@@ -3165,7 +3246,9 @@ fn the_refusal_says_detached_only_when_head_really_is_detached() {
 /// detached" rather than "a commit was added that no branch claims".
 #[tokio::test]
 async fn a_detached_head_still_previews_a_fast_forward_because_it_adds_no_commit() {
-    let (_dir, repo) = fast_forward_shape();
+    let (dir, repo) = fast_forward_shape();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
     let tip = git::out(&repo, &["rev-parse", "main"]);
     let behind = git::out(&repo, &["rev-parse", "behind"]);
     git::run(&repo, &["checkout", "-q", "--detach", "behind"]);
@@ -3181,7 +3264,7 @@ async fn a_detached_head_still_previews_a_fast_forward_because_it_adds_no_commit
         },
     )
     .await;
-    let (_graph, changes) = expect_graph(preview(&repo, &plan).await);
+    let (_graph, changes) = expect_graph(preview(&target, &plan).await);
 
     assert!(
         !changes
@@ -3207,7 +3290,7 @@ async fn a_detached_head_still_previews_a_fast_forward_because_it_adds_no_commit
 #[test]
 fn a_directory_with_no_git_answers_scratch_store() {
     let dir = TempDir::new().expect("tempdir");
-    match commondir_of(dir.path()) {
+    match PreviewTarget::resolved_in(dir.path(), dir.path()) {
         Err(PreviewUnavailable::ScratchStore { detail }) => assert!(
             !detail.is_empty(),
             "the reason must carry git's own account of the failure"
@@ -3283,11 +3366,13 @@ fn the_version_gate_refuses_below_2_38_and_allows_2_38_itself() {
 ///    it the sweep silently stops matching anything.
 #[tokio::test]
 async fn the_scratch_store_lives_under_commondir_under_the_swept_prefix() {
-    let (_dir, repo) = revert_shape();
-    let commondir = commondir_of(&repo).expect("resolve the commondir");
+    let (dir, repo) = revert_shape();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
+    let commondir = target.commondir().to_path_buf();
 
     let path = {
-        let store = ScratchStore::new(&repo).await.expect("create the store");
+        let store = ScratchStore::new(&target).await.expect("create the store");
         let path = store.dir.path().to_path_buf();
         assert!(
             path.starts_with(&commondir),
@@ -3380,8 +3465,10 @@ async fn the_scratch_store_lives_under_commondir_under_the_swept_prefix() {
 ///    two.)
 #[tokio::test]
 async fn the_scratch_store_reads_a_sha256_repository_because_it_inherits_its_format() {
-    let (_dir, repo) = sha256_shape();
-    let commondir = commondir_of(&repo).expect("resolve the commondir");
+    let (dir, repo) = sha256_shape();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
+    let commondir = target.commondir().to_path_buf();
     let head = git::out(&repo, &["rev-parse", "HEAD"]);
     let objects_before = object_file_count(&commondir);
     let refs_before_raw = git::out(&repo, &["show-ref"]);
@@ -3390,7 +3477,7 @@ async fn the_scratch_store_reads_a_sha256_repository_because_it_inherits_its_for
         commit: CommitOid::new(head.clone()).expect("a 64-character hex oid"),
     })
     .expect("a revert is previewable");
-    let plumbing = resolve_plumbing(&repo, &op, &head)
+    let plumbing = resolve_plumbing(&target, &op, &head)
         .await
         .expect("the plumbing resolves");
     let Plumbing::Synthesize(recipe) = plumbing else {
@@ -3450,18 +3537,34 @@ fn the_sweep_removes_only_old_directories_it_named_itself() {
     let stale = commondir.join(format!("{SCRATCH_PREFIX}stale"));
     let young = commondir.join(format!("{SCRATCH_PREFIX}young"));
     let foreign = commondir.join("objects");
-    for d in [&stale, &young, &foreign] {
+    // Finding 2's own example: a directory the USER made, sharing the public
+    // prefix, holding something they care about. It is also exactly
+    // `tempfile`'s name shape — `gv-preview-` plus six alphanumerics — so a
+    // "validate the generated name" fix would let this through untouched.
+    let decoy = commondir.join(format!("{SCRATCH_PREFIX}backup"));
+    for d in [&stale, &young, &foreign, &decoy] {
         std::fs::create_dir_all(d).expect("create dir");
     }
-    // Age `stale` past the bound by rewriting its mtime.
+    let precious = decoy.join("precious.txt");
+    std::fs::write(&precious, b"the user's own bytes\n").expect("write the decoy's content");
+    // Mark the two directories this module would really have created, through
+    // the production helper — never hand-rolled, or the magic could drift and
+    // the sweep would silently stop matching what it writes.
+    for d in [&stale, &young] {
+        let lease = ScratchStore::claim(d).expect("claim the planted store");
+        drop(lease); // abandoned: the owner is "gone"
+    }
+    // Age `stale` and `decoy` past the bound by rewriting their mtimes.
     let long_ago = std::time::SystemTime::now() - STALE_SCRATCH_AGE - Duration::from_secs(60);
     filetime_set(&stale, long_ago);
+    filetime_set(&decoy, long_ago);
 
     ScratchStore::sweep_stale(commondir);
 
     assert!(
         !stale.exists(),
-        "a `gv-preview-*` directory older than the bound must be swept"
+        "a marked, unleased `gv-preview-*` directory older than the bound must \
+         be swept"
     );
     assert!(
         young.exists(),
@@ -3472,6 +3575,391 @@ fn the_sweep_removes_only_old_directories_it_named_itself() {
         foreign.exists(),
         "the sweep must never delete a directory it did not name"
     );
+    assert!(
+        decoy.exists(),
+        "a `gv-preview-*` directory this module never created must survive \
+         however old it is — a prefix is a PUBLIC string, not proof of \
+         ownership, and `{}` is a user's own backup directory",
+        decoy.display()
+    );
+    assert_eq!(
+        std::fs::read(&precious).ok().as_deref(),
+        Some(b"the user's own bytes\n".as_slice()),
+        "the sweep recursively deleted a foreign directory's contents: \
+         `remove_dir_all` inside a user's `.git`, keyed on a name anyone can \
+         write"
+    );
+}
+
+/// The instrument the two sweep tests rest on: a real store carries
+/// [`STORE_MARKER`] with the exact magic in it, and holds that file's lease
+/// for as long as it is alive.
+///
+/// The same role `the_manifest_and_the_scratch_sweep_both_notice_a_planted_store`
+/// plays for the A2 detectors. Without it, "the decoy survived" and "the live
+/// store survived" could both be true of a sweep that had simply stopped
+/// working, and nothing in the suite would say so.
+///
+/// # Two mutations, and why they must fail differently
+///
+/// 1. **Removes half the mechanism** — have `ScratchStore::claim` skip
+///    `try_lock`. The magic is still written, so the content assertions stay
+///    green; only the `WouldBlock` assertion goes red.
+/// 2. **Weakens the other half** — write a different magic string. The lease is
+///    still taken, so the `WouldBlock` assertion stays green; only the content
+///    assertion goes red.
+///
+/// The split is the point: ownership and liveness are two mechanisms, not one
+/// wearing two hats, and a test that could not tell them apart would let either
+/// rot while reporting the other.
+#[tokio::test]
+async fn the_scratch_store_carries_a_marker_and_holds_its_lease() {
+    let (dir, repo) = revert_shape();
+    let target = PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the root");
+
+    let marker = {
+        let store = ScratchStore::new(&target).await.expect("create the store");
+        let marker = store.dir.path().join(STORE_MARKER);
+
+        let meta = std::fs::metadata(&marker).expect("the store must carry its marker file");
+        assert!(
+            meta.is_file(),
+            "the marker must be a regular file — the sweep `fstat`s it on the \
+             open fd before believing anything it says"
+        );
+
+        let bytes = std::fs::read(&marker).expect("read the marker");
+        assert!(
+            bytes.starts_with(STORE_MARKER_MAGIC),
+            "the marker's first bytes must be exactly the magic the sweep \
+             compares against, or `sweep_stale` can never recognise a store \
+             this module created: got {:?}",
+            String::from_utf8_lossy(&bytes[..bytes.len().min(64)])
+        );
+        assert!(
+            bytes.len() > STORE_MARKER_MAGIC.len(),
+            "the marker must also say, in words, what it is and when it is \
+             safe to delete — a human who finds one after a crash has nothing \
+             else to go on"
+        );
+
+        let probe = std::fs::File::open(&marker).expect("open the marker again");
+        assert!(
+            matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "a live store must hold its marker's lease: without it, `age` is \
+             the only thing separating a running preview from an abandoned \
+             one, and a two-hour preview is indistinguishable from a corpse"
+        );
+        marker
+    };
+
+    assert!(
+        !marker.exists(),
+        "the marker goes with the store — the whole directory is removed on \
+         drop, while the lease is still held"
+    );
+}
+
+/// A store a preview is **using right now** is never swept, however old the
+/// directory looks.
+///
+/// This is the second half of finding 2 and it is not the same defect as the
+/// decoy above. A directory mtime is a timestamp, not a lease: a preview whose
+/// store was created more than [`STALE_SCRATCH_AGE`] ago is indistinguishable
+/// from an abandoned one by age alone, so a second preview — in this process
+/// or another — reaps a store that is in use. The store's own advisory lock on
+/// its marker is what tells the two apart, and the kernel releases it exactly
+/// when the owning process dies, which is the question the sweep is asking.
+///
+/// The mtime is forced past the bound deliberately rather than waiting an
+/// hour: the point is that age must stop being the answer.
+///
+/// # Two mutations
+///
+/// 1. **Removes the mechanism** — delete the `try_lock` gate from
+///    `abandoned_store_lease` so ownership alone decides. The store is marked
+///    and old, so it is swept and every assertion below fails at the first.
+/// 2. **Weakens it** — treat `Err(TryLockError::WouldBlock)` as "could not
+///    tell, delete anyway". The lock is still consulted, so the code still
+///    *looks* right; the live store is still deleted, and the failure arrives
+///    from a sweep that examined the lease and drew the opposite conclusion.
+#[tokio::test]
+async fn a_live_store_is_never_swept_however_old_it_looks() {
+    let (dir, repo) = revert_shape();
+    let target = PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the root");
+    let commondir = target.commondir().to_path_buf();
+
+    let store = ScratchStore::new(&target).await.expect("create the store");
+    let path = store.dir.path().to_path_buf();
+    let long_ago = std::time::SystemTime::now() - STALE_SCRATCH_AGE - Duration::from_secs(60);
+    filetime_set(&path, long_ago);
+
+    // A second preview starting up, in the same commondir, while the first is
+    // still running.
+    ScratchStore::sweep_stale(&commondir);
+
+    assert!(
+        path.exists(),
+        "a live preview's store was swept out from under it: `{}` is held by \
+         this test right now, and an mtime older than the bound is not \
+         evidence that anybody abandoned it",
+        path.display()
+    );
+    let alternates = std::fs::read_to_string(path.join("objects").join("info").join("alternates"))
+        .expect(
+            "the live store's alternates file must still be readable after a \
+             concurrent sweep — without it the store cannot see the served \
+             repository's objects at all",
+        );
+    assert_eq!(
+        alternates.trim(),
+        commondir.join("objects").display().to_string(),
+        "the sweep left a store that no longer names the served object \
+         directory"
+    );
+    assert!(
+        store.git_dir_flag().starts_with("--git-dir="),
+        "the store must still be usable as a git directory after the sweep"
+    );
+
+    // And once the owner really is gone, the same sweep does reclaim it — or
+    // the assertions above would be satisfied by a sweep that never deletes
+    // anything at all.
+    drop(store);
+    std::fs::create_dir_all(&path).expect("re-plant the abandoned store's directory");
+    let lease = ScratchStore::claim(&path).expect("mark it the way production does");
+    drop(lease);
+    filetime_set(&path, long_ago);
+    ScratchStore::sweep_stale(&commondir);
+    assert!(
+        !path.exists(),
+        "an abandoned, marked, unleased store older than the bound must still \
+         be reclaimed — otherwise this test is satisfied by a sweep that is \
+         simply inert"
+    );
+}
+
+#[tokio::test]
+async fn the_store_lands_in_the_commondir_the_request_validated_not_a_re_resolved_one() {
+    let (dir, repo) = revert_shape();
+    let root = dir.path();
+
+    let a = root.join("a");
+    git::run(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "abranch",
+            a.to_str().expect("utf-8"),
+        ],
+    );
+
+    let b = root.join("b");
+    git::init(&b);
+    git::write(&b, "x.txt", b"x\n");
+    commit_old(&b, "b one");
+    let bwt = root.join("bwt");
+    git::run(
+        &b,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "bbranch",
+            bwt.to_str().expect("utf-8"),
+        ],
+    );
+
+    // The request's target, validated once — this is the fact the whole fix
+    // carries.
+    let target = PreviewTarget::resolved_in(&a, root).expect("a is inside the fixture root");
+    let validated = target.commondir().to_path_buf();
+    let b_target = PreviewTarget::resolved_in(&bwt, root).expect("bwt is inside the fixture root");
+    let b_commondir = b_target.commondir().to_path_buf();
+    assert_ne!(validated, b_commondir, "the two geometries must differ");
+
+    // A store in B that a sweep WOULD reclaim if it ever ran there: prefix,
+    // marker, free lease, aged past the bound. Everything is affirmatively
+    // true except that this request never validated B.
+    let victim = b_commondir.join(format!("{SCRATCH_PREFIX}victim"));
+    std::fs::create_dir_all(&victim).expect("plant the victim");
+    let precious = victim.join("precious.txt");
+    std::fs::write(&precious, b"another repository's bytes\n").expect("write");
+    drop(ScratchStore::claim(&victim).expect("mark the victim the way production does"));
+    let long_ago = std::time::SystemTime::now() - STALE_SCRATCH_AGE - Duration::from_secs(60);
+    filetime_set(&victim, long_ago);
+
+    // The concurrent tamper: A's `.git` pointer now names a self-consistent
+    // linked-worktree geometry belonging to B, done with real git rather than
+    // argued about.
+    let stolen = std::fs::read(bwt.join(".git")).expect("read b's worktree pointer");
+    std::fs::write(a.join(".git"), &stolen).expect("swap a's pointer");
+    assert_eq!(
+        PreviewTarget::resolved_in(&a, root)
+            .expect("the tampered geometry still resolves")
+            .commondir(),
+        b_commondir,
+        "the tamper must actually redirect a re-resolution, or this test proves nothing"
+    );
+
+    // Whether the store can be built at all under a tampered geometry is not
+    // the claim; where it is allowed to delete is.
+    let _ = ScratchStore::new(&target).await;
+
+    assert!(
+        precious.exists(),
+        "the store's sweep followed a `.git` pointer swapped AFTER the request \
+         was validated and ran `remove_dir_all` in another repository"
+    );
+    assert_eq!(
+        scratch_dirs(&b_commondir),
+        vec![format!("{SCRATCH_PREFIX}victim")],
+        "nothing may be created or removed under a commondir this request never validated"
+    );
+}
+
+/// The deletion path resolves the repository's geometry **nowhere**: the only
+/// resolver call in the whole module is the one that builds a
+/// [`PreviewTarget`], and every consumer takes the answer it already carries.
+///
+/// A tripwire rather than a review convention, and the house pattern
+/// (`sandbox::spawn`'s `the_sandboxed_command_exposes_no_way_to_change_what_runs`,
+/// `sandbox::trust`'s `grant_is_unreachable_from_production_…`) is to assert it
+/// against the source text. The property is structural, so it cannot be seen
+/// from behaviour: re-introducing a second resolution is invisible until an
+/// attacker swaps a pointer between the two.
+///
+/// # Why the expected count is two, not one
+///
+/// The *place* is `impl PreviewTarget` — a single block, which is what the
+/// name means. It holds two constructors only because
+/// `state::resolve_target` still discards the resolution it validated, so the
+/// preview handler has to redo the multi-root check itself
+/// (`in_managed_catalog`) while the suite uses the single-root one
+/// (`resolved_in`). When `state.rs` grows a `ValidatedTarget` that carries
+/// `repo_paths::RepoPaths`, `in_managed_catalog` becomes
+/// `from_request(&ValidatedTarget)`, resolves nothing, and this expectation
+/// drops to one. Both are written as literals below so that day is a
+/// deliberate edit rather than a number someone bumped.
+///
+/// # Why the count is scoped, not global
+///
+/// `repo_paths::resolve` is a string *prefix* of `repo_paths::resolve_and_validate`,
+/// and this module's doc comments name both in prose. A naive whole-file count
+/// would move whenever someone writes a sentence, and a tripwire whose number
+/// drifts gets "fixed" by bumping the number. So comment lines are excluded and
+/// the surviving call is required to sit inside `impl PreviewTarget`.
+///
+/// # Two mutations
+///
+/// 1. **Removes the mechanism** — delete the `== 1` count assertion. A second
+///    `repo_paths::resolve` planted anywhere in the module then passes.
+/// 2. **Weakens it** — relax the count to `>= 1`. A re-introduced
+///    `commondir_of` helper called from `ScratchStore::new` goes unnoticed,
+///    which is precisely the code this test exists to keep deleted.
+#[test]
+fn preview_resolves_the_commondir_in_exactly_one_place() {
+    const SRC: &str = include_str!("preview.rs");
+
+    // Comment-aware: this module's own docs cite the deleted helper by name as
+    // history, and a tripwire that fired on a doc sentence would be "fixed" by
+    // deleting the history.
+    let helper_calls: Vec<&str> = SRC
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .filter(|l| l.contains("commondir_of"))
+        .collect();
+    assert!(
+        helper_calls.is_empty(),
+        "`commondir_of` is back in preview.rs. It re-resolved the repository's \
+         geometry a second time, below the request boundary and with the \
+         containment-free resolver, and its answer was handed straight to \
+         `remove_dir_all`. The validated commondir is carried on \
+         `PreviewTarget`; take it from there. Found: {helper_calls:?}"
+    );
+
+    let calls: Vec<(usize, &str)> = SRC
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim_start().starts_with("//"))
+        .filter(|(_, l)| l.contains("repo_paths::"))
+        .map(|(i, l)| (i + 1, l.trim()))
+        .collect();
+    // Literal expectations, one per case, in source order — never a count
+    // re-derived from whatever happens to be there. A third resolution fails
+    // the length check; a resolution that *moved* fails the containment check
+    // below; a resolution that changed shape fails these.
+    assert_eq!(
+        calls.len(),
+        2,
+        "preview.rs must resolve the repository's geometry in exactly the two \
+         constructors below and nowhere else. Every extra resolution is \
+         another chance to follow a `.git` pointer an attacker swapped after \
+         the request was validated, and this module ends that chain in a bare \
+         `remove_dir_all` with no sandbox in front of it. Found: {calls:?}"
+    );
+    assert!(
+        calls[0].1.contains("repo_paths::resolve(repo)"),
+        "the first resolution must be `in_managed_catalog`'s multi-root one: {:?}",
+        calls[0]
+    );
+    assert!(
+        calls[1]
+            .1
+            .contains("repo_paths::resolve_and_validate(repo, managed_root)"),
+        "the second must be `resolved_in`'s single-root one, which validates \
+         containment itself: {:?}",
+        calls[1]
+    );
+
+    let start = SRC.find("impl PreviewTarget {").expect(
+        "preview.rs no longer defines `impl PreviewTarget {` — if the \
+                 constructor moved, move this tripwire with it",
+    );
+    let block = &SRC[start..];
+    let end = block
+        .find("\n}\n")
+        .expect("unterminated `impl PreviewTarget` block");
+    let block = &block[..end];
+    let inside = block
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .filter(|l| l.contains("repo_paths::"))
+        .count();
+    assert_eq!(
+        inside,
+        calls.len(),
+        "every resolution must live in `impl PreviewTarget`, where a target is \
+         built and validated — not anywhere the store or the sweep can reach \
+         it. {} of {} are outside it.",
+        calls.len() - inside,
+        calls.len()
+    );
+
+    let store_start = SRC
+        .find("impl ScratchStore {")
+        .expect("preview.rs no longer defines `impl ScratchStore {`");
+    let store = &SRC[store_start..];
+    let store_end = store
+        .find("\n}\n")
+        .expect("unterminated `impl ScratchStore` block");
+    let store = &store[..store_end];
+    for (i, line) in store.lines().enumerate() {
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        assert!(
+            !line.contains("repo_paths::"),
+            "`impl ScratchStore` line {i} resolves the repository's geometry: \
+             {line}\nThe store is created in, and the sweep deletes from, the \
+             commondir the REQUEST validated. Resolving here re-opens the \
+             window the carried target closed."
+        );
+    }
 }
 
 /// Set a directory's modification time.
