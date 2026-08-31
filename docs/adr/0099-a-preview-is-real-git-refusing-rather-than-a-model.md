@@ -430,23 +430,41 @@ git would do **for the merge-base computation specifically**. Revert and
 cherry-pick *are* synthetic three-way merges with a stated base, so they still
 pass one.
 
-**"git does what git would do" does not extend to `merge.ff`, and that is a
-measured gap, not a hedge.** `resolve_plumbing`'s `Previewable::Merge` arm
-classifies `AlreadyUpToDate` / `FastForward` / `Synthesize` from
-`merge-base(head, tip)` alone; it reads no git config. The real executor
-(`planner/branch_exec.rs`'s `exec_merge`) runs `git merge --no-edit`, which
-**does** read `merge.ff` — a setting `sandbox/spawn.rs` passes `$HOME` through
-for, read-only, into every spawn, in every repository. Measured on
-2026-08-30, in throwaway repositories: with `merge.ff=false` set on an
-otherwise fast-forwardable pair, the preview's `FastForward` arm draws a
-straight line with no new commit, while `git merge --no-edit` actually prints
-"Merge made by the 'ort' strategy" and writes a real two-parent commit; with
-`merge.ff=only` set on a divergent pair, the preview's `Synthesize` arm draws
-a clean merge commit, while `git merge --no-edit` exits `128` with "Not
-possible to fast-forward, aborting" and does nothing at all. Both are exactly
-the failure §4.3 exists to make impossible — a plausible graph that quietly
-differs from what the command will actually do — and neither is hedged
-anywhere else in this document. See Consequences.
+**"git does what git would do" does not extend to `merge.ff`, and that is the one
+place this preview reads config rather than asking git.** `resolve_plumbing`'s
+`Previewable::Merge` arm originally classified `AlreadyUpToDate` / `FastForward` /
+`Synthesize` from `merge-base(head, tip)` alone and read no git config, while the
+real executor (`planner/branch_exec.rs`'s `exec_merge`) runs `git merge --no-edit`,
+which **does** obey `merge.ff` — a setting `sandbox/spawn.rs` passes `$HOME` through
+for, read-only, into every spawn, in every repository. Measured on 2026-08-30 in
+throwaway repositories: with `merge.ff=false` on an otherwise fast-forwardable pair
+the preview drew a straight line with no new commit while `git merge --no-edit`
+printed "Merge made by the 'ort' strategy" and wrote a real two-parent commit; with
+`merge.ff=only` on a divergent pair the preview drew a clean merge commit while
+`git merge --no-edit` exited `128` with "Not possible to fast-forward, aborting" and
+did nothing. Both are exactly the failure §4.3 exists to make impossible.
+
+**Closed in the same change set that records it.** `fast_forward_policy` asks the
+repository — `git config --get merge.ff`, then `git config --type=bool` for the
+boolean cases — and returns `Allow` / `Never` / `Only`. Two properties were the point
+of doing it this way rather than reimplementing git's rules:
+
+- The value is read through the **same sandboxed path** the executor's merge is run
+  through, so the two cannot see different configs. A verifier tried to make them
+  diverge and could not.
+- The fast-forward decision exists in **exactly one place**. A second encoding of
+  git's ff rules would drift from git the first time git changed them, which is the
+  modelling failure this whole ADR is against.
+
+**Where it still refuses rather than guesses.** A `merge.ff` value that is neither
+`only` nor boolean — `merge.ff = banana` — makes git *ignore the setting* and keep
+the default (`builtin/merge.c`, "do not barf on values from future versions of git";
+measured, such a merge fast-forwards normally). This preview returns
+`Unavailable { CheckFailed }` instead. That is deliberately **stricter than git**, in
+the only direction that is safe: the user sees no picture rather than a picture drawn
+from a value neither of us understood — and it is precisely the case a future git
+could give a meaning to, at which point silently defaulting would become silently
+wrong.
 
 ### Two `merge-base --is-ancestor` spawns to detect fast-forward
 
@@ -468,17 +486,23 @@ commit by position instead.
 
 ## Consequences
 
-- **`resolve_plumbing`'s `MergeBranch` arm does not read `merge.ff`, and this
-  is a measured correctness defect, not an unexercised edge.** See the
+- **The merge arm reads `merge.ff`, and that is the one config this preview reads.**
+  It was a measured correctness defect and it is closed; see the
   "Pass `--merge-base` for `MergeBranch` too" alternative above for the two
-  measurements: a fast-forwardable pair with `merge.ff=false` draws a
-  no-commit fast-forward while the real merge writes a two-parent commit, and
-  a divergent pair with `merge.ff=only` draws a clean merge commit while the
-  real merge refuses outright with exit `128`. This is not a gap in test
-  coverage — the classification logic itself never inspects the config that
-  changes the answer. `git-vista-fixtures` carries fixtures for both cases
-  (`fast_forward_merge_ff_false`, `divergent_merge_ff_only`) as of this
-  correction; closing the defect in `preview.rs` itself is out of scope here.
+  measurements and for why the read is a single call through the executor's own
+  sandboxed path rather than a reimplementation of git's rules. The cost of the
+  decision is that `preview.rs` now has one place that must track a git setting; the
+  mitigation is that an unrecognised value refuses instead of defaulting.
+- **The scratch store survives a runtime teardown, and only a runtime teardown.**
+  Dropping the caller's future is handled — measured across 260 cancellations in a
+  dense 0–130 ms sweep, in a plain repository and in a linked worktree, residue was
+  always cleared. What is *not* handled is the tokio runtime itself being torn down
+  mid-preview, which leaves a `gv-preview-*` directory inside the served `.git`.
+  That is the same class as `SIGKILL` and power loss — the process stops before any
+  cleanup can run — but unlike those it is reachable from an ordinary server
+  shutdown, so it is named here rather than folded into "abnormal termination". A
+  later sweep of stale `gv-preview-*` directories at startup would close it; nothing
+  in this change set does.
 - **A2's guarantee is exactly "no new object under `<commondir>/objects`"**, and
   a scratch *directory* does appear under `commondir` for the life of a call.
   Anyone tightening that assertion must count under `objects`, not `commondir`.
@@ -550,14 +574,32 @@ commit by position instead.
   cherry-pick-tree-identity gap (Verification, "Not verified") were measured
   in the same round and added as named, un-closed defects — this document
   does not own `preview.rs` and did not attempt to fix either.
+- **2026-08-30, round three, correcting the round above.** The `merge.ff` defect and
+  the cherry-pick-tree-identity gap were **closed** in `preview.rs` in the very change
+  set the round-two note called them un-closed in. That note was written by a lane
+  that ran *before* the repair lane and could not have known; two independent
+  verifiers then caught this document asserting, in the present tense, defects its own
+  commit had fixed. Corrected here rather than left standing. The lesson is an
+  ordering one and it belongs in the record: **a document lane must run after the code
+  lane it describes, never beside it.**
 
 ---
 
 ## Verification
 
-`buildlock cargo test -p git-vista-server` → **1064 passed, 0 failed**;
+`buildlock cargo test -p git-vista-server --bin git-vista-server` →
+**1077 passed, 1 failed, 4 ignored**;
 `buildlock cargo clippy -p git-vista-server --all-targets -- -D warnings` → clean.
-30 of those tests are `preview::suite`.
+44 of those tests are `preview::suite`.
+
+**The one failure is `a2_a_cancelled_preview_leaves_nothing_behind`, and it is
+carried red on purpose.** Its name claims more than it asserts: the caller-drop leak
+it was written for is fixed and measured fixed, but its pass condition is "residue
+cleared within 150 ms" and the runtime-teardown case above is genuinely not closed.
+Deleting it to reach a green tally is exactly what happened once already in this
+work — a block of five stricter A2 tests was removed mid-session and the suite went
+green by deletion — so it stays red and stated until it is either fixed or renamed to
+what it actually pins.
 
 Mutations were run by hand (patch → run → restore), because
 `failure-atlas`'s `mutation_check` clones **HEAD** and none of these files are
