@@ -885,3 +885,82 @@ async fn a_pop_will_not_drop_a_stash_whose_applied_changes_were_wiped() {
         "a standalone drop proves nothing extra and must still run: {body}"
     );
 }
+
+/// **Finding 9: `merge.ff` must move the generation.**
+///
+/// The preview reads `merge.ff` **live** on every call
+/// (`preview::fast_forward_policy`), and the merge executor runs
+/// `git merge --no-edit`, which obeys it live too. Between those two live
+/// reads sits an approved plan whose freshness token — the one thing standing
+/// between "the picture you approved" and "the operation that runs" — was
+/// computed from HEAD, every ref, `refs/stash` and the worktree status, and
+/// **not** from config.
+///
+/// So: preview a fast-forwardable merge with `merge.ff` unset and the graph
+/// shows a ref-only fast-forward that writes no commit. Set `merge.ff=false`
+/// before approving. No ref moved, no file changed, so the generation still
+/// matched and `enforce_fresh` said yes — and `git merge --no-edit` then wrote
+/// a two-parent commit that appears nowhere in the approved graph. Reversing
+/// `false` to `true` gives the inverse mismatch.
+///
+/// ADR 0099's claim that the preview and the executor cannot see different
+/// configs is what this refutes: they are two live reads with an unguarded
+/// window between them.
+///
+/// # Two mutations that make this red, failing differently
+///
+/// 1. **REMOVES the mechanism** — drop the `merge_ff` field from
+///    `generation_token`. The config write moves nothing, `enforce_fresh`
+///    returns `Ok`, and `unwrap_err` panics.
+/// 2. **WEAKENS the mechanism** — have `merge_ff_digest_input` fold the *key's
+///    presence* rather than its value (`"known"` instead of
+///    `"known\0<value>"`). Setting the key from unset to `false` still moves
+///    the token, so the first half stays green; the second half, which flips
+///    an already-set `false` to `true`, goes red.
+#[tokio::test]
+async fn a_merge_ff_change_between_build_and_execute_refuses_execution() {
+    let (_dir, repo) = git_vista_fixtures::fast_forward_merge_ff_unset();
+    let merge = || GitOperation::MergeBranch {
+        branch: git_vista_protocol::BranchName::new("feature").expect("a valid branch name"),
+    };
+
+    // The fixture's own contract: `merge.ff` is unset here, which is the state
+    // the preview would have drawn a fast-forward from.
+    assert!(
+        !std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&repo)
+            .args(["config", "--get", "merge.ff"])
+            .status()
+            .unwrap()
+            .success(),
+        "the fixture must start with merge.ff unset, or this test is about \
+         some other transition"
+    );
+
+    let (plan, observed) = build_plan(&repo, merge(), tokens()).await;
+    assert!(
+        enforce_fresh(&repo, &plan, &observed).await.is_ok(),
+        "an untouched repository must let its own fresh plan through, or the \
+         refusal below could be about anything"
+    );
+
+    // Nothing a ref, the stash or the worktree can see: only config.
+    run(&repo, &["config", "merge.ff", "false"]);
+    let (status, why) = enforce_fresh(&repo, &plan, &observed)
+        .await
+        .expect_err("merge.ff decides whether this plan's own operation writes a commit");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(why.contains("changed while this plan was pending"), "{why}");
+
+    // And the reverse direction: an already-set value changing is a change
+    // too. A digest that only noticed "the key exists now" would pass here.
+    let (plan, observed) = build_plan(&repo, merge(), tokens()).await;
+    assert!(enforce_fresh(&repo, &plan, &observed).await.is_ok());
+    run(&repo, &["config", "merge.ff", "true"]);
+    let (status, why) = enforce_fresh(&repo, &plan, &observed)
+        .await
+        .expect_err("false -> true flips the answer back and must invalidate too");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(why.contains("changed while this plan was pending"), "{why}");
+}

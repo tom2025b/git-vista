@@ -374,7 +374,11 @@ pub fn lay_out_preview(input: PreviewInput) -> PreviewLayout {
     for (name, new_target) in &ref_moves {
         let mut matched = false;
         for r in after_refs.iter_mut() {
-            if &r.name == name {
+            // Name **and** kind: `read_refs` flattens branches, remote branches
+            // and tags into one display namespace, so a legal repository with
+            // `refs/heads/main` and `refs/tags/main` offers two entries called
+            // "main" and only one of them is the ref this operation moves.
+            if &r.name == name && r.is_ref_moves_target() {
                 r.target = new_target.clone();
                 matched = true;
             }
@@ -1107,6 +1111,97 @@ mod tests {
             }
             other => panic!("expected LaneShifted, got {other:?}"),
         }
+    }
+
+    /// **A tag that shares a branch's display name must not be moved.**
+    ///
+    /// `read_refs` shortens local branches, remote branches and tags into ONE
+    /// display namespace (`git-vista-git/src/refs.rs`, the
+    /// `category_and_short_name` match): `refs/heads/main` and `refs/tags/main`
+    /// both arrive as `name: "main"`, told apart only by `kind`. The rewrite
+    /// loop matched on `name` alone and had no `break`, so a `ref_moves` entry
+    /// for the branch `main` rewrote the tag as well — and the after graph then
+    /// drew the tag badge on a commit real `git revert` would never move it to,
+    /// with every diagnostic field clear.
+    ///
+    /// `ref_moves` only ever names the checked-out local branch and `"HEAD"`
+    /// (the server's `ref_moves_to` is its sole production constructor), so
+    /// restricting the rewrite to `RefKind::Head`/`RefKind::Branch` changes
+    /// nothing for any list production actually builds.
+    ///
+    /// The assertion is on the **badges**, not on the predicate: a badge is
+    /// attached by target oid, so "the tag is still on commit `2`" is the
+    /// observable fact a user would see, and it is checked against literals.
+    ///
+    /// # Two mutations that make this red, failing differently
+    ///
+    /// * **M10a — REMOVES the mechanism.** Drop the kind filter from the
+    ///   rewrite loop. The tag moves onto `9`, so row 0 badges read
+    ///   `["HEAD", "main", "main"]` and row 2 loses its badge: red on both
+    ///   halves.
+    /// * **M10b — WEAKENS the mechanism.** Filter on `is_branch()` instead,
+    ///   which admits `RefKind::RemoteBranch` and — more to the point here —
+    ///   excludes `RefKind::Head`. The tag is left alone so the row-2
+    ///   assertion stays green, and the `HEAD` badge never leaves the old tip:
+    ///   red on row 0's badge list alone.
+    #[test]
+    fn the_ref_rewrite_leaves_a_tag_that_shares_a_branchs_display_name_alone() {
+        let before = vec![
+            commit('3', 300, &['2']),
+            commit('2', 200, &['1']),
+            commit('1', 100, &[]),
+        ];
+        // The legal collision: branch `main` on the tip, tag `main` two
+        // commits back. One display namespace, two different refs.
+        let refs = vec![
+            git_ref("HEAD", RefKind::Head, '3'),
+            git_ref("main", RefKind::Branch, '3'),
+            git_ref("main", RefKind::Tag, '2'),
+        ];
+
+        let out = lay_out_preview(PreviewInput {
+            before,
+            refs,
+            head_branch: Some("main".into()),
+            added: Some(commit('9', 400, &['3'])),
+            ref_moves: vec![("HEAD".into(), oid('9')), ("main".into(), oid('9'))],
+        });
+
+        assert_eq!(out.after.rows[0].commit.id, oid('9'));
+        assert_eq!(
+            badge_names(&out.after.rows, 0),
+            vec!["HEAD", "main"],
+            "HEAD and the BRANCH main moved onto the hypothetical commit — the \
+             tag did not, so exactly two badges belong here"
+        );
+        assert_eq!(
+            out.after.rows[0]
+                .refs
+                .iter()
+                .map(|r| r.kind.clone())
+                .collect::<Vec<_>>(),
+            vec![RefKind::Head, RefKind::Branch],
+            "and neither of them is the tag"
+        );
+
+        assert_eq!(out.after.rows[2].commit.id, oid('2'));
+        assert_eq!(
+            badge_names(&out.after.rows, 2),
+            vec!["main"],
+            "`git revert` moves the branch and HEAD and nothing else, so the \
+             tag must still be drawn on commit 2"
+        );
+        assert_eq!(
+            out.after.rows[2].refs[0].kind,
+            RefKind::Tag,
+            "and the badge left on commit 2 is the tag, not some other ref"
+        );
+
+        assert_eq!(
+            out.unmatched_ref_moves,
+            Vec::<String>::new(),
+            "both entries matched a ref of a movable kind"
+        );
     }
 
     /// The three change variants are told apart on the wire by their own tag,

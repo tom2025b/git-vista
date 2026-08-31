@@ -2015,6 +2015,24 @@ fn ref_moves_to(repo: &Path, target: &str) -> Vec<(String, Oid)> {
 /// Closing the hole properly means giving the colour pass a seed for a
 /// detached HEAD, in `git_vista_core::layout::color` — which would change what
 /// a *real* run is painted too, and is why it is not done from here.
+/// Each `ref_moves` entry's **current** target, for `RefMoved.from`.
+///
+/// Its own function so the match predicate can be unit-tested against a ref
+/// list in a chosen order: `read_refs` flattens `refs/heads/main` and
+/// `refs/tags/main` into one display name, and which of the two a name-only
+/// search reaches first is an accident of enumeration order rather than a
+/// decision anyone made.
+fn previous_targets(refs: &[GitRef], ref_moves: &[(String, Oid)]) -> Vec<(String, Oid)> {
+    ref_moves
+        .iter()
+        .filter_map(|(name, _)| {
+            refs.iter()
+                .find(|r| &r.name == name && r.is_ref_moves_target())
+                .map(|r| (name.clone(), r.target.clone()))
+        })
+        .collect()
+}
+
 fn lay_out(
     repo: &Path,
     added: Option<CommitSummary>,
@@ -2027,14 +2045,7 @@ fn lay_out(
     let head_branch = git_vista_git::read_head_branch(repo);
 
     // Captured before the move so `changes` can report both endpoints.
-    let previous: Vec<(String, Oid)> = ref_moves
-        .iter()
-        .filter_map(|(name, _)| {
-            refs.iter()
-                .find(|r| &r.name == name)
-                .map(|r| (name.clone(), r.target.clone()))
-        })
-        .collect();
+    let previous: Vec<(String, Oid)> = previous_targets(&refs, &ref_moves);
 
     let added_id = added.as_ref().map(|c| c.id.clone());
     // Captured before the move: the third guard's sentence names the state it
@@ -2050,9 +2061,11 @@ fn lay_out(
 
     if !layout.unmatched_ref_moves.is_empty() {
         return Err(check_failed(format!(
-            "the preview moved refs that this repository does not have: {:?} — \
-             the after graph's lanes and colours would not be the ones a real \
-             run produces, so there is no honest picture to return",
+            "the preview moved refs that this repository does not have as a \
+             branch or as HEAD: {:?} — a tag or remote-tracking ref of the same \
+             display name is a different ref and is not moved. The after \
+             graph's lanes and colours would not be the ones a real run \
+             produces, so there is no honest picture to return",
             layout.unmatched_ref_moves
         )));
     }

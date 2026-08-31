@@ -4539,3 +4539,75 @@ fn previewable_maps_three_operations_and_defaults_to_none() {
          correctly here without anyone editing this file"
     );
 }
+
+/// **`RefMoved.from` must report the moved BRANCH's old target, not a tag's.**
+///
+/// `read_refs` shortens `refs/heads/main` and `refs/tags/main` into the same
+/// display name (`git-vista-git/src/refs.rs`'s `category_and_short_name`
+/// match), and [`previous_targets`] searched that flat list by name alone. In a
+/// repository holding both, which entry the search reached first decided the
+/// oid the user was shown as the ref's *previous* position — an accident of
+/// enumeration order, not a decision.
+///
+/// Both orderings are exercised deliberately. Only one of them is reachable
+/// through `git_vista_git::read_refs` on this host (loose refs enumerate
+/// `refs/heads/…` before `refs/tags/…`, so the branch happens to win), which is
+/// precisely why the ordering must not be what decides: a packed-refs
+/// repository, a different `gix`, or a future reader is free to hand the list
+/// over the other way round and nothing here would notice.
+///
+/// # Two mutations that make this red, failing differently
+///
+/// * **M11a — REMOVES the mechanism.** Drop the kind filter from
+///   [`previous_targets`]. The tag-first case reports the tag's `2222…`: red on
+///   the first assertion, green on the second.
+/// * **M11b — WEAKENS the mechanism.** Filter on `is_branch()` instead, which
+///   excludes `RefKind::Head`. Both `main` cases stay green and the `"HEAD"`
+///   entry stops matching anything at all, so it vanishes from the result: red
+///   on the length assertions.
+#[test]
+fn ref_moved_from_reports_the_branch_old_target_not_a_same_named_tags() {
+    use git_vista_core::model::RefKind;
+
+    let git_ref = |name: &str, kind: RefKind, digit: char| GitRef {
+        name: name.to_string(),
+        kind,
+        target: Oid((0..40).map(|_| digit).collect()),
+    };
+    let new_target = Oid("9".repeat(40));
+    let moves = vec![
+        ("main".to_string(), new_target.clone()),
+        ("HEAD".to_string(), new_target.clone()),
+    ];
+
+    // Tag first — the discriminating order.
+    let tag_first = vec![
+        git_ref("main", RefKind::Tag, '2'),
+        git_ref("HEAD", RefKind::Head, '3'),
+        git_ref("main", RefKind::Branch, '3'),
+    ];
+    let got = previous_targets(&tag_first, &moves);
+    assert_eq!(
+        got,
+        vec![
+            ("main".to_string(), Oid("3".repeat(40))),
+            ("HEAD".to_string(), Oid("3".repeat(40))),
+        ],
+        "`main` moved as a branch, so its previous position is the BRANCH's \
+         old target — the tag on 2222… is a different ref that is not moving"
+    );
+
+    // Branch first — the order this host's reader happens to produce. Same
+    // answer, which is the point: order must not be load-bearing.
+    let branch_first = vec![
+        git_ref("HEAD", RefKind::Head, '3'),
+        git_ref("main", RefKind::Branch, '3'),
+        git_ref("main", RefKind::Tag, '2'),
+    ];
+    assert_eq!(
+        previous_targets(&branch_first, &moves),
+        got,
+        "the same repository read in a different ref order must give the same \
+         previous targets"
+    );
+}
