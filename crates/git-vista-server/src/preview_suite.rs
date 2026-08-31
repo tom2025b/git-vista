@@ -141,11 +141,25 @@
 //!
 //! # No test in this file is carried red, and none may be deleted to keep it so
 //!
-//! Four tests here were carried red as findings while the arms they pin were
-//! wrong: the two `merge_ff_` tests above, the already-applied cherry-pick, and
-//! `a2_a_cancelled_preview_leaves_nothing_behind`. All four now pass, and each
-//! carries its own measurement plus the two mutations that must turn it red
-//! again, in its own doc comment, under "Two mutations".
+//! **Six** tests here were carried red as findings while the arms they pin
+//! were wrong: the two `merge_ff_` tests above, the already-applied
+//! cherry-pick, `a2_a_cancelled_preview_leaves_nothing_behind`, and — added
+//! 2026-08-31, red before the guard they pin existed —
+//! `a_detached_head_refuses_rather_than_colouring_a_commit_no_branch_claims`
+//! and `the_refusal_says_detached_only_when_head_really_is_detached`. All six
+//! now pass, and each carries its own measurement plus the mutations that must
+//! turn it red again, in its own doc comment.
+//!
+//! The detached-HEAD pair is documented as a pair rather than two independent
+//! twos: **three** mutations run between them, and each was applied and
+//! measured (2026-08-31, by hand — `failure-atlas` clones `HEAD`, and this
+//! work is deliberately uncommitted while the parent session owns the index).
+//! Deleting the guard reddens both, at different assertions; dropping
+//! `is_branch()` from `added_claimed_by_no_branch` in
+//! `git_vista_core::preview` reddens the first one *earlier*, at the witness
+//! assertion, plus the core test; making the "HEAD is detached" sentence
+//! unconditional reddens only the second, which is the one place the
+//! difference between the two sentences is visible.
 //!
 //! A red test here is a finding, not a defect in the test. None may be deleted,
 //! narrowed or `#[ignore]`d to make the suite green — that is exactly what
@@ -2755,6 +2769,262 @@ async fn an_unborn_head_answers_check_failed_rather_than_a_graph() {
         ),
         other => panic!("expected Unavailable{{CheckFailed}}, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// The detached HEAD — the third report, and the refusal that reads it
+// ---------------------------------------------------------------------------
+
+/// A hypothetical commit whose oid is a literal, for the tests that ask what
+/// the layout would do with one. `digit` becomes the whole 40-hex oid, so
+/// `Oid::short` — the key `assign_branch_colors`'s synthetic fallback hashes —
+/// is distinct per digit and readable in a failure message.
+///
+/// `time` must be newer than **now**, not merely newer than [`LONG_AGO`]:
+/// `stable_topo_order` is a max-heap on `(time, Reverse(id))`, a real run
+/// stamps its commit "now", and the tests that compare against one need the
+/// hypothetical row to be row 0 without an oid tiebreak deciding it.
+/// `2_000_000_000` is 2033-05-18 — ahead of the 2020 fixture commits and of
+/// today. A reader running this after that date must raise it, and will see
+/// row 0 quietly change hands if they do not.
+fn hypothetical(digit: char, parent: &str) -> CommitSummary {
+    CommitSummary {
+        id: Oid((0..40).map(|_| digit).collect()),
+        parents: vec![Oid(parent.to_string())],
+        summary: "hypothetical".to_string(),
+        author: "Test".to_string(),
+        time: 2_000_000_000,
+    }
+}
+
+/// Lay a real repository's history out with `added` prepended, through the
+/// pure half directly — the same inputs [`lay_out`] builds, without its
+/// refusal. This is how a test can look at the graph the refusal exists to
+/// stop being returned.
+fn would_be_layout(repo: &Path, added: CommitSummary) -> PreviewLayout {
+    let target = added.id.0.clone();
+    lay_out_preview(PreviewInput {
+        before: git_vista_git::walk_history(repo, PREVIEW_HISTORY_LIMIT).expect("walk the history"),
+        refs: git_vista_git::read_refs(repo).expect("read the refs"),
+        head_branch: git_vista_git::read_head_branch(repo),
+        added: Some(added),
+        ref_moves: ref_moves_to(repo, &target),
+    })
+}
+
+/// **A detached HEAD refuses.** On a detached HEAD `ref_moves_to` moves
+/// `"HEAD"` and nothing else — `read_head_branch` is `None`, so there is no
+/// branch to move — and `assign_branch_colors` seeds only from `is_branch()`
+/// refs, which `RefKind::Head` is not. The hypothetical commit is therefore
+/// coloured by `stable_color_slot("~<its own short oid>")`: a hash of the one
+/// value a preview may never be compared on, because the preview's oid and the
+/// real run's differ by construction.
+///
+/// # The defect is measured here, on this repository, before the refusal is
+/// checked
+///
+/// The first half runs the pure layout twice over the *real* history and refs
+/// of a real detached repository, changing nothing but the hypothetical
+/// commit's oid, and the row-0 colour moves. That is the whole finding, in one
+/// assertion, on real git data — and it is what makes the refusal below mean
+/// something rather than passing on any repository that happens to fail.
+///
+/// `stable_color_slot` is `1 + fnv1a(key) % 6`, so an arbitrary pair of oids
+/// can collide onto one slot and make this arm green while the mechanism is
+/// broken. The two digits here were measured apart on this fixture; the
+/// `assert_ne!` is the guard that a later edit to either digit cannot make the
+/// arm vacuous without going red.
+///
+/// # The message is asserted by its words, not only by its variant
+///
+/// `CheckFailed { detail }` already carried two other sentences before this
+/// one, for two other states. A `detail` that reads "moved no ref" here would
+/// tell the user to fix something they did not do wrong, so the two other
+/// sentences are asserted **absent** as well as this one present.
+///
+/// # Two mutations that make this red, failing differently
+///
+/// 1. **Removes the mechanism** — delete the `added_claimed_by_no_branch`
+///    guard from [`lay_out`]. The preview answers `Graph` again and the
+///    `match` names it.
+/// 2. **Weakens it** — drop `is_branch()` from the field's computation in
+///    `lay_out_preview`, so the `"HEAD"` entry satisfies it. The flag goes
+///    false, the guard never fires, and both the witness assertion and the
+///    `match` go red — the original defect class, restored.
+#[tokio::test]
+async fn a_detached_head_refuses_rather_than_colouring_a_commit_no_branch_claims() {
+    let (_dir, repo) = revert_shape();
+    let head = git::out(&repo, &["rev-parse", "HEAD"]);
+    git::run(&repo, &["checkout", "-q", "--detach", "HEAD"]);
+    assert!(
+        git_vista_git::read_head_branch(&repo).is_none(),
+        "the fixture must really be detached, or every assertion below is about \
+         some other repository state"
+    );
+
+    // ---- the defect, on real git data --------------------------------------
+    let f = would_be_layout(&repo, hypothetical('f', &head));
+    let e = would_be_layout(&repo, hypothetical('e', &head));
+    assert_eq!(f.after.rows[0].commit.id.0, "f".repeat(40));
+    assert_eq!(e.after.rows[0].commit.id.0, "e".repeat(40));
+    assert_ne!(
+        f.after.rows[0].color, e.after.rows[0].color,
+        "the hypothetical row's colour moved with nothing but its oid, and a \
+         real run's oid is not either of these — that is what may not be drawn"
+    );
+
+    // ---- and it is the third report that says so, with the other two clear --
+    assert!(
+        f.added_claimed_by_no_branch,
+        "HEAD moved onto the hypothetical commit, but HEAD is RefKind::Head and \
+         assign_branch_colors does not seed from it"
+    );
+    assert_eq!(
+        f.unmatched_ref_moves,
+        Vec::<String>::new(),
+        "the \"HEAD\" entry matched a real ref: this caller made no naming \
+         mistake"
+    );
+    assert!(
+        !f.added_without_ref_moves,
+        "ref_moves was not empty either — both of the older reports are clear \
+         for a preview that is nonetheless not reproducible"
+    );
+
+    // ---- so the server must refuse, and say which state it found -----------
+    let plan = plan_for(
+        &repo,
+        GitOperation::RevertCommit {
+            commit: CommitOid::new(head).expect("a full hex oid"),
+        },
+    )
+    .await;
+
+    match preview(&repo, &plan).await {
+        PreviewOutcome::Unavailable {
+            reason: PreviewUnavailable::CheckFailed { detail },
+        } => {
+            assert!(
+                detail.contains("HEAD is detached"),
+                "the detail must name the state that was found, in words the \
+                 user can act on: {detail}"
+            );
+            assert!(
+                detail.contains("colour"),
+                "and what about the picture would have been wrong: {detail}"
+            );
+            assert!(
+                !detail.contains("moved no ref"),
+                "that is the `added_without_ref_moves` sentence, which names a \
+                 caller mistake this caller did not make: {detail}"
+            );
+            assert!(
+                !detail.contains("does not have"),
+                "that is the `unmatched_ref_moves` sentence, and every ref this \
+                 preview moved exists: {detail}"
+            );
+        }
+        other => {
+            panic!("expected Unavailable{{CheckFailed}} naming the detached HEAD, got {other:?}")
+        }
+    }
+}
+
+/// **The refusal is bound to the state it found, not to one fixed sentence.**
+///
+/// `added_claimed_by_no_branch` is the general condition; a detached HEAD is
+/// its one production cause. A caller that moves `"HEAD"` alone while HEAD is
+/// **attached** meets the same condition — every entry matches a real ref, the
+/// list is not empty, and still no branch claims the added commit — and must
+/// not be told "HEAD is detached", because it is not.
+///
+/// [`lay_out`] is called directly: `ref_moves_to` cannot produce this list on
+/// an attached HEAD, which is exactly why the sentence needs pinning here. A
+/// single constant string would satisfy the test above and lie in this one.
+///
+/// # Two mutations
+///
+/// 1. **Removes the mechanism** — delete the guard: `lay_out` returns `Ok` and
+///    `expect_err` panics.
+/// 2. **Weakens it** — emit the detached sentence unconditionally (drop the
+///    `head_branch.is_none()` arm). The variant is still `CheckFailed` and the
+///    test above still passes; this one goes red on the sentence, which is the
+///    only place the difference is visible.
+#[test]
+fn the_refusal_says_detached_only_when_head_really_is_detached() {
+    let (_dir, repo) = revert_shape();
+    let head = git::out(&repo, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        git_vista_git::read_head_branch(&repo).as_deref(),
+        Some("main"),
+        "this fixture's HEAD is attached, which is the whole point of the case"
+    );
+
+    let added = hypothetical('f', &head);
+    let target = added.id.clone();
+    let refused = lay_out(&repo, Some(added), vec![("HEAD".to_string(), target)])
+        .expect_err("no branch claims the added commit, so there is no honest graph");
+
+    match refused {
+        PreviewUnavailable::CheckFailed { detail } => {
+            assert!(
+                detail.contains("no branch"),
+                "the general condition is what was found, so it is what the \
+                 detail must name: {detail}"
+            );
+            assert!(
+                !detail.contains("HEAD is detached"),
+                "HEAD is attached to `main` in this repository — a sentence that \
+                 says otherwise is the message drifting free of the state: {detail}"
+            );
+        }
+        other => panic!("expected CheckFailed, got {other:?}"),
+    }
+}
+
+/// **The refusal must not swallow the operations it does not apply to.** A
+/// fast-forward adds no commit, so there is no hypothetical row to colour and
+/// nothing for `added_claimed_by_no_branch` to report — a detached HEAD
+/// previews it exactly as an attached one does.
+///
+/// Green before the guard existed and green after: it is the guard against
+/// over-refusal, and it goes red the moment the refusal is written as "HEAD is
+/// detached" rather than "a commit was added that no branch claims".
+#[tokio::test]
+async fn a_detached_head_still_previews_a_fast_forward_because_it_adds_no_commit() {
+    let (_dir, repo) = fast_forward_shape();
+    let tip = git::out(&repo, &["rev-parse", "main"]);
+    let behind = git::out(&repo, &["rev-parse", "behind"]);
+    git::run(&repo, &["checkout", "-q", "--detach", "behind"]);
+    assert!(
+        git_vista_git::read_head_branch(&repo).is_none(),
+        "the fixture must really be detached"
+    );
+
+    let plan = plan_for(
+        &repo,
+        GitOperation::MergeBranch {
+            branch: BranchName::new("main").expect("a valid branch name"),
+        },
+    )
+    .await;
+    let (_graph, changes) = expect_graph(preview(&repo, &plan).await);
+
+    assert!(
+        !changes
+            .iter()
+            .any(|c| matches!(c, PreviewChange::Added { .. })),
+        "a fast-forward creates no commit: {changes:?}"
+    );
+    assert!(
+        changes.contains(&PreviewChange::RefMoved {
+            ref_name: "HEAD".to_string(),
+            from: Oid(behind),
+            to: Oid(tip),
+        }),
+        "a detached HEAD moves itself and no branch, and that is still a fact \
+         the preview can state: {changes:?}"
+    );
 }
 
 /// A directory that is not a repository has no commondir, so there is nowhere

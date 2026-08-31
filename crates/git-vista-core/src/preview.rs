@@ -35,7 +35,11 @@
 //!    same field as item 1). Moving only `HEAD` does **not** — and on a
 //!    detached HEAD there is no branch to move, so no `ref_moves` list can
 //!    fix it. That case is unfixable here rather than merely unfixed, and is
-//!    reported: [`PreviewLayout::added_claimed_by_no_branch`].
+//!    reported: [`PreviewLayout::added_claimed_by_no_branch`]. The server's
+//!    `preview::lay_out` reads that report and answers `Unavailable
+//!    { CheckFailed }` — a detached HEAD gets no preview of any operation that
+//!    writes a commit, which is the price of not drawing a colour a real run
+//!    will not use.
 //! 3. **Row order is decided by commit *time*, not by list position.**
 //!    `stable_topo_order` is a max-heap on `(time, Reverse(id))` under the
 //!    topological constraint, so the hypothetical commit competes with every
@@ -289,6 +293,18 @@ pub struct PreviewLayout {
     /// deliberately rather than accidentally. So the pure half reports, and the
     /// caller decides whether to refuse.
     ///
+    /// **The caller in this repository refuses.** The server's
+    /// `preview::lay_out` turns this field into
+    /// `PreviewUnavailable::CheckFailed`, with a sentence bound to which of the
+    /// two causes it found — "HEAD is detached …" only when `head_branch`
+    /// really was `None`. That is the consumer this field waited a round for;
+    /// a preview of a revert, cherry-pick or merge-commit on a detached HEAD is
+    /// therefore *unavailable* rather than mis-coloured. Fixing it so a
+    /// detached HEAD previews **correctly** means giving `assign_branch_colors`
+    /// a seed for the detached `HEAD` ref, which changes what a *real* run is
+    /// painted as well, and so belongs in the colour pass rather than in either
+    /// half of this module.
+    ///
     /// # Colour only — the lane still agrees, in the detached-HEAD case
     ///
     /// `trunk_reserve_tip` reads local `main`/`master`/the checked-out branch.
@@ -328,7 +344,11 @@ pub struct PreviewLayout {
 /// None of the three report fields is a refusal: this function always returns
 /// both graphs. Whether a damaged `after` graph may be shown is the caller's
 /// decision. Making a report *fire* as a refusal therefore takes a consumer,
-/// and a field no consumer reads is a diagnosis nobody hears.
+/// and a field no consumer reads is a diagnosis nobody hears —
+/// `added_claimed_by_no_branch` was exactly that for one round: computed here,
+/// read by nothing but its own test, while a detached-HEAD preview shipped the
+/// graph it describes. All three now have the same consumer, the server's
+/// `preview::lay_out`, which refuses on any of them.
 ///
 /// Every row in both halves carries `on_remote: false`, because
 /// `StreamLayout::push` emits it and this pipeline is [`layout_with_refs`] and

@@ -43,7 +43,7 @@
 //! text heuristic … `Err` means the check itself did not produce an answer …
 //! 'couldn't tell' must never read as 'yes'."
 //!
-//! # Three places this file asks a question it used to guess at
+//! # Four places this file asks a question it used to guess at
 //!
 //! Each was a *confidently wrong picture* found by measurement, not by review,
 //! and each fix is a question put to git rather than a rule written here.
@@ -66,6 +66,17 @@
 //!   was measured and it is worse ([`preview_git`]) — it is running the work in
 //!   a detached task that bails at the next checkpoint, so nothing removes the
 //!   store while a `git` is still writing into it. See [`preview`].
+//! * **A detached HEAD.** `ref_moves_to` reads `read_head_branch`, which is
+//!   `None` when HEAD is detached, so the operation moves `"HEAD"` and nothing
+//!   else — and `assign_branch_colors` seeds only from `is_branch()` refs,
+//!   which `RefKind::Head` is not. Measured on this host 2026-08-31, in a
+//!   throwaway repository detached on its own tip: the revert preview returned
+//!   a `Graph` whose row 0 was painted slot 4, keyed on the hypothetical
+//!   commit's short oid, and the same layout run again with nothing changed
+//!   but that oid painted it a different slot. Colour is how this app tells
+//!   one line of work from another, so that is a wrong picture drawn from
+//!   correct data, and there is no colour the preview could choose instead —
+//!   a real run's commit id is not knowable here. [`lay_out`] refuses it.
 //!
 //! # Where the work is split
 //!
@@ -1561,13 +1572,46 @@ fn ref_moves_to(repo: &Path, target: &str) -> Vec<(String, Oid)> {
 ///
 /// # A damaged layout is `CheckFailed`, never a returned `Graph`
 ///
-/// `lay_out_preview` reports two distinct caller mistakes — a `ref_moves`
-/// entry that matched no ref (`unmatched_ref_moves`) and an `added` commit
-/// with no `ref_moves` at all (`added_without_ref_moves`) — and a correct
-/// preview has both clear. Either one means the `after` graph's lane and
-/// colour assignment disagree with what a real run would produce. Returning
-/// that graph would be the exact failure §4.3 exists to prevent, so it is not
-/// an option: this is "no fact", and it says so.
+/// `lay_out_preview` reports **three** ways the `after` graph can disagree
+/// with what a real run would draw, and a preview a real run would reproduce
+/// has all three clear:
+///
+/// * `unmatched_ref_moves` — a `ref_moves` entry that named no ref, so the
+///   lane-0 reservation and the colour seeding both still read the old
+///   targets. A caller mistake, with a fix.
+/// * `added_without_ref_moves` — an `added` commit and an empty `ref_moves`.
+///   A caller mistake, with a fix.
+/// * `added_claimed_by_no_branch` — the general colour condition, and the only
+///   one of the three a *correct* caller can produce. On a detached HEAD
+///   [`ref_moves_to`] moves `"HEAD"` alone, `assign_branch_colors` seeds only
+///   from `is_branch()` refs, and the hypothetical row falls into the
+///   synthetic `~<short oid>` fallback — a colour keyed on an object id that
+///   does not exist yet. Neither side can repair it: a real run's commit has a
+///   different id, so no colour this function could choose is *knowably* the
+///   one git will draw — and a fixed slot would only make the preview differ
+///   from reality deliberately instead of accidentally.
+///
+/// Any of the three means the returned graph's lanes or colours are not the
+/// ones a real run produces. Returning it would be the exact failure §4.3
+/// exists to prevent, so it is not an option: this is "no fact", and it says
+/// so.
+///
+/// The order of the three checks is load-bearing. `added_without_ref_moves`
+/// **implies** `added_claimed_by_no_branch`, so testing the general condition
+/// first would make the narrower, actionable sentence unreachable and tell a
+/// caller who forgot the ref list that nothing can be done.
+///
+/// # What the third refusal costs, stated rather than hidden
+///
+/// A detached HEAD — mid-bisect, or on a checked-out tag — cannot preview a
+/// revert, a cherry-pick or a merge that writes a commit. It is a legitimate,
+/// common state, and the feature is simply unavailable there; #460's
+/// plan-review pane inherits that hole. A fast-forward merge still previews,
+/// because it adds no commit and so has no hypothetical row to colour
+/// (`a_detached_head_still_previews_a_fast_forward_because_it_adds_no_commit`).
+/// Closing the hole properly means giving the colour pass a seed for a
+/// detached HEAD, in `git_vista_core::layout::color` — which would change what
+/// a *real* run is painted too, and is why it is not done from here.
 fn lay_out(
     repo: &Path,
     added: Option<CommitSummary>,
@@ -1590,6 +1634,9 @@ fn lay_out(
         .collect();
 
     let added_id = added.as_ref().map(|c| c.id.clone());
+    // Captured before the move: the third guard's sentence names the state it
+    // found, and "HEAD is detached" is a claim about *this* value.
+    let detached = head_branch.is_none();
     let layout: PreviewLayout = lay_out_preview(PreviewInput {
         before,
         refs,
@@ -1611,6 +1658,24 @@ fn lay_out(
             "the preview added a commit and moved no ref — the after graph's \
              lanes and colours would not be the ones a real run produces",
         ));
+    }
+    // Third, and last, because `added_without_ref_moves` implies this one: a
+    // guard placed above it would make the narrower, actionable sentence
+    // unreachable. Two sentences, because the condition has two causes and only
+    // one of them is a fact about HEAD.
+    if layout.added_claimed_by_no_branch {
+        return Err(check_failed(if detached {
+            "HEAD is detached, so this operation moves HEAD alone and no \
+             branch would point at the new commit. Its colour would be a hash \
+             of an object id that does not exist yet, while a real run's commit \
+             has a different id — the two would agree only by coincidence. \
+             There is no honest picture to return; re-run the preview on a \
+             branch."
+        } else {
+            "no branch would point at the previewed commit, so its colour would \
+             be a hash of an object id that does not exist yet — the after \
+             graph's colours would not be the ones a real run produces"
+        }));
     }
 
     let mut changes: Vec<PreviewChange> = Vec::new();
