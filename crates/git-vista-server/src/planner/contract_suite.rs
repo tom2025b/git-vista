@@ -2782,8 +2782,19 @@ fn every_git_write_route_reaches_the_planner() {
     }
     // The positive half, which is also what proves the four negatives above
     // are not passing vacuously against a string `code_only` blanked.
+    // Deliberately NOT pinning the argument spelling. This assertion read
+    // `preview(&repo, &plan)` until #576's audit round renamed the binding to
+    // `&target`, and the branch went red for a rename that changed nothing
+    // this guard claims to protect — the route still answered from
+    // `crate::preview`, and all four negatives above still held. A tripwire
+    // that trips on incidental spelling trains people to update the literal
+    // without reading it, which is how it stops catching the thing it is for.
+    // The claim is *which function answers the route*, so that is what is
+    // asserted; a blanked `code_only` still has no `preview(&` in it, so the
+    // anti-vacuity job the positive half does for the four negatives is
+    // unchanged.
     assert!(
-        preview_body.contains("preview(&repo, &plan)"),
+        preview_body.contains("preview(&"),
         "src/handlers/preview.rs::preview_plan no longer calls the preview \
          itself — the route must answer from `crate::preview`, not from a \
          second derivation"
