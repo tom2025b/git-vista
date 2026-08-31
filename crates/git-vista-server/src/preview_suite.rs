@@ -4830,3 +4830,97 @@ fn the_walk_and_the_after_cap_read_the_same_window() {
          and not a fixed size"
     );
 }
+
+/// A history strictly wider than [`PREVIEW_HISTORY_LIMIT`], built through
+/// `commit-tree` so it costs one spawn per commit and no working-tree churn.
+/// Every commit is dated [`LONG_AGO`], so the hypothetical commit is
+/// unambiguously newest and no same-second tie decides row 0.
+fn history_wider_than_the_window() -> (TempDir, PathBuf) {
+    let dir = TempDir::new().expect("tempdir");
+    let repo = dir.path().join("repo");
+    git::init(&repo);
+    git::write(&repo, "a.txt", b"one\n");
+    commit_old(&repo, "base");
+
+    let tree = git::out(&repo, &["rev-parse", "HEAD^{tree}"]);
+    let mut head = git::out(&repo, &["rev-parse", "HEAD"]);
+    // One past the cap, so the walk has something to leave out.
+    for n in 0..PREVIEW_HISTORY_LIMIT {
+        head = git::out(
+            &repo,
+            &["commit-tree", &tree, "-p", &head, "-m", &format!("c{n}")],
+        );
+    }
+    git::run(&repo, &["update-ref", "refs/heads/main", &head]);
+    git::run(&repo, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    (dir, repo)
+}
+
+/// **The window the WRAPPER asks for is the window the caller gets.**
+///
+/// [`the_walk_and_the_after_cap_read_the_same_window`] pins the two uses inside
+/// [`lay_out_within`] to each other, and it is mutation-proved. It cannot see
+/// this defect, because it calls `lay_out_within` with a window of its own and
+/// so never exercises [`lay_out`]'s choice of constant.
+///
+/// # The hole this closes, and why the last fix did not
+///
+/// #576 finding 7's second fix argued that passing one `window` binding made
+/// the defect unrepresentable. That was half right. It removed the drift
+/// *inside* `lay_out_within`, and left the wrapper's constant naked: changing
+/// `lay_out` to pass `PREVIEW_HISTORY_LIMIT + 1` makes the walk and the cap
+/// agree at 501 while the caller's contract still says 500, and the preview
+/// returns 501 rows out of a 500-wide window — finding 7 restored one level up.
+/// The complete 1,096-server and 158-core suites stayed green on it. Reported
+/// by an outside auditor, not found here.
+///
+/// # Why this one costs 500 spawns and is worth it
+///
+/// Nothing narrower can pin a constant. Any test that reads
+/// `PREVIEW_HISTORY_LIMIT` to check `PREVIEW_HISTORY_LIMIT` is comparing a
+/// value to itself, which this repository has shipped before and calls a
+/// compile-time check wearing a test's clothes. The only instrument that can
+/// see the wrapper's number is a repository wider than it, so the fixture
+/// builds one with `commit-tree` — no index, no working tree, one spawn each.
+///
+/// # Mutation-proved two ways
+///
+/// 1. **Removes the mechanism** — the wrapper passes `usize::MAX`. The walk is
+///    unbounded, `after` carries every commit, and the count is 502 not 500.
+/// 2. **Weakens it** — the wrapper passes `PREVIEW_HISTORY_LIMIT + 1`, the
+///    auditor's own mutation. Off by exactly one, which is the shape that
+///    survived everything else.
+#[test]
+fn the_wrapper_hands_the_layout_the_window_it_documents() {
+    let (_dir, repo) = history_wider_than_the_window();
+    let head = git::out(&repo, &["rev-parse", "HEAD"]);
+    assert!(
+        git_vista_git::walk_history(&repo, PREVIEW_HISTORY_LIMIT + 10)
+            .expect("walk the history")
+            .len()
+            > PREVIEW_HISTORY_LIMIT,
+        "the fixture must be WIDER than the window or this test cannot fail"
+    );
+
+    let added = hypothetical('f', &head);
+    let target = added.id.clone();
+    let moves = ref_moves_to(&repo, &target.0);
+    let outcome =
+        lay_out(&repo, Some(added), moves).expect("an attached HEAD with both refs moved");
+    let PreviewOutcome::Graph { before, after, .. } = outcome else {
+        panic!("expected a graph, got {outcome:?}");
+    };
+
+    assert_eq!(
+        before.rows.len(),
+        PREVIEW_HISTORY_LIMIT,
+        "the wrapper walks exactly the window it documents"
+    );
+    assert_eq!(
+        after.rows.len(),
+        PREVIEW_HISTORY_LIMIT,
+        "and hands the layout that SAME number, so the hypothetical row \
+         displaces the oldest commit instead of widening the window the \
+         caller asked for. This is #576 finding 7 at the wrapper"
+    );
+}
