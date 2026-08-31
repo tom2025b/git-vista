@@ -43,8 +43,23 @@
 //! 3. **Row order is decided by commit *time*, not by list position.**
 //!    `stable_topo_order` is a max-heap on `(time, Reverse(id))` under the
 //!    topological constraint, so the hypothetical commit competes with every
-//!    other branch tip in the window. See [`PreviewInput::added`]; this module
-//!    documents that dependency and deliberately does not paper over it.
+//!    other branch tip in the window. See [`PreviewInput::added`].
+//!
+//!    When the tie actually happens — the hypothetical commit sharing its
+//!    committer second with an in-window commit that is not one of its own
+//!    ancestors — the heap decides row order by comparing object ids, and this
+//!    commit's id is one a real run will not write. That is the same shape as
+//!    item 2 and gets the same treatment: it is reported,
+//!    [`PreviewLayout::added_time_tied`], and the server's
+//!    `preview::refusal_for` answers `Unavailable { CheckFailed }`. Unlike item
+//!    2 it resolves itself a second later, and the refusal's sentence says so.
+//!
+//!    Ancestors of the hypothetical commit are excluded from that scan on
+//!    purpose. An in-window ancestor keeps an unemitted child for as long as
+//!    `added` is in the heap, so `stable_topo_order` never reaches the oid
+//!    comparison for it — and without the exclusion the ordinary
+//!    commit-then-preview-a-revert path would refuse, since `added`'s own
+//!    parent shares its second constantly.
 
 use std::collections::{HashMap, HashSet};
 
@@ -392,11 +407,15 @@ pub struct PreviewLayout {
 ///
 /// 1. `before = layout_with_refs(input.before, input.refs, head_branch)`.
 /// 2. Build `after_refs` by rewriting every [`GitRef`] whose `name` matches an
-///    entry of `ref_moves` to that entry's new target, collecting unmatched
-///    names. **Before any layout call** — see [`PreviewInput::ref_moves`].
-/// 3. `after = layout_with_refs(added.into_iter().chain(before_commits),
-///    after_refs, head_branch)`. `head_branch` is unchanged: none of
-///    revert/cherry-pick/merge changes which branch is checked out.
+///    entry of `ref_moves` **and whose kind can be one** — `is_ref_moves_target`,
+///    so a tag or a remote-tracking ref sharing a branch's display name is left
+///    where it is. **Before any layout call** — see [`PreviewInput::ref_moves`].
+/// 3. `after = layout_with_refs(added.into_iter().chain(before)
+///    .take(history_limit), after_refs, head_branch)`. `head_branch` is
+///    unchanged: none of revert/cherry-pick/merge changes which branch is
+///    checked out. The `take` is not decoration: without it, prepending the
+///    hypothetical row to a `before` list the caller already capped returns
+///    `history_limit + 1` rows out of a `history_limit`-wide window.
 /// 4. `lane_shifts` = for each `after` row whose commit id appears in `before`,
 ///    emit a [`LaneShift`] when the lanes differ.
 /// 5. Report. [`PreviewLayout::added_claimed_by_no_branch`] is read off
@@ -405,14 +424,14 @@ pub struct PreviewLayout {
 ///    the inputs it was built from. Reading the pre-rewrite `refs` here would
 ///    report every correct attached-HEAD preview as damaged.
 ///
-/// None of the three report fields is a refusal: this function always returns
+/// None of the four report fields is a refusal: this function always returns
 /// both graphs. Whether a damaged `after` graph may be shown is the caller's
 /// decision. Making a report *fire* as a refusal therefore takes a consumer,
 /// and a field no consumer reads is a diagnosis nobody hears —
 /// `added_claimed_by_no_branch` was exactly that for one round: computed here,
 /// read by nothing but its own test, while a detached-HEAD preview shipped the
-/// graph it describes. All three now have the same consumer, the server's
-/// `preview::lay_out`, which refuses on any of them.
+/// graph it describes. All four now have the same consumer, the server's
+/// `preview::refusal_for`, which refuses on any of them.
 ///
 /// Every row in both halves carries `on_remote: false`, because
 /// `StreamLayout::push` emits it and this pipeline is [`layout_with_refs`] and
@@ -481,6 +500,14 @@ pub fn lay_out_preview(input: PreviewInput) -> PreviewLayout {
                     }
                 }
             }
+            // The ancestor exclusion is what keeps this from refusing the
+            // ordinary commit-then-preview-a-revert path, where `added`'s own
+            // parent shares its second constantly. ONE test stands here:
+            // `the_tie_report_fires_on_an_independent_commit_and_not_on_an_ancestor`
+            // in this file. NOT the server's A5 parity suite — measured, by
+            // mutation: every A5 fixture stamps its commits at 2020-01-01
+            // while the hypothetical is stamped now, so no A5 fixture can tie
+            // and all eight stay green with this clause forced true.
             before
                 .iter()
                 .any(|b| b.time == c.time && !ancestors.contains(&b.id))

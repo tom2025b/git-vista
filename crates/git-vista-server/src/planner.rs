@@ -1183,9 +1183,13 @@ async fn read_head_branch_blocking(repo: &Path) -> Option<String> {
 ///
 /// The three outcomes stay apart, same discipline as `Obs` everywhere else:
 /// a resolved oid, "there is no stash", and "the read failed". The last is
-/// deliberately UNIQUE per call, so a repository whose stash cannot be read
-/// invalidates every plan rather than silently digesting as "no stash" — the
-/// failure mode being a stale plan surviving a change nobody could see.
+/// deliberately tagged with the wall-clock **second**, so a repository whose
+/// stash cannot be read invalidates every plan rather than silently digesting
+/// as "no stash" — the failure mode being a stale plan surviving a change
+/// nobody could see. A second, not a call: [`crate::activity::now_secs`] is
+/// whole seconds, so two reads inside one second while the stash stays
+/// unreadable do digest identically. See [`merge_ff_digest_input`], which
+/// carries the same construction and spells out why that is benign here.
 async fn stash_digest_input(repo: &Path) -> String {
     match rev_parse_ref_unpeeled(repo, "refs/stash").await {
         Ok(Some(oid)) => format!("at\u{0}{oid}"),
@@ -1211,11 +1215,20 @@ async fn stash_digest_input(repo: &Path) -> String {
 /// The exit-code classification is `fast_forward_policy`'s own, deliberately:
 /// **1** is "git looked and the key is not set", **0** is "git looked and here
 /// is the value", and anything else — an unreadable config file, a git that
-/// could not be spawned — is neither. The last is tagged UNIQUE per call, the
-/// same discipline [`stash_digest_input`] uses: a repository whose config
-/// cannot be read invalidates every plan rather than digesting as "unset",
-/// because the failure mode being guarded is a stale plan surviving a change
-/// nobody could see.
+/// could not be spawned — is neither. The last is tagged with the wall-clock
+/// **second**, the same discipline [`stash_digest_input`] uses: a repository
+/// whose config cannot be read invalidates every plan rather than digesting as
+/// "unset", because the failure mode being guarded is a stale plan surviving a
+/// change nobody could see.
+///
+/// A second is not "per call", and the difference is worth stating rather than
+/// rounding off: [`crate::activity::now_secs`] is whole seconds, so a plan
+/// built and re-checked inside one second while the config stays unreadable
+/// digests identically both times and the plan is admitted. The direction is
+/// benign — the state genuinely did not change, and `fast_forward_policy`
+/// refuses to draw the preview at all while the config is unreadable — but a
+/// reader who took "unique per call" literally for some other input would be
+/// wrong, so it does not say that.
 ///
 /// One consequence, stated rather than left to be discovered: a config git
 /// cannot read makes every plan refuse with `enforce_fresh`'s "the repository
