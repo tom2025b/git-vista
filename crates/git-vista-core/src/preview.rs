@@ -61,7 +61,7 @@
 //!    commit-then-preview-a-revert path would refuse, since `added`'s own
 //!    parent shares its second constantly.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::layout::layout_with_refs;
 use crate::model::{CommitSummary, GitRef, Graph, Oid};
@@ -484,42 +484,23 @@ pub fn lay_out_preview(input: PreviewInput) -> PreviewLayout {
         None => false,
     };
 
-    // The fourth report, and the only one that is about row *order* rather
-    // than about which ref claims the new commit. See
-    // `PreviewLayout::added_time_tied` for why a tie cannot be resolved, only
-    // reported, and why in-window ancestors are excluded from the scan.
-    let added_time_tied = match added.as_ref() {
-        Some(c) => {
-            let by_id: HashMap<&Oid, &CommitSummary> = before.iter().map(|b| (&b.id, b)).collect();
-            let mut ancestors: HashSet<&Oid> = HashSet::new();
-            let mut stack: Vec<&Oid> = c.parents.iter().collect();
-            while let Some(p) = stack.pop() {
-                if let Some(parent) = by_id.get(p) {
-                    if ancestors.insert(&parent.id) {
-                        stack.extend(parent.parents.iter());
-                    }
-                }
-            }
-            // The ancestor exclusion is what keeps this from refusing the
-            // ordinary commit-then-preview-a-revert path, where `added`'s own
-            // parent shares its second constantly. ONE test stands here:
-            // `the_tie_report_fires_on_an_independent_commit_and_not_on_an_ancestor`
-            // in this file. NOT the server's A5 parity suite — measured, by
-            // mutation: every A5 fixture stamps its commits at 2020-01-01
-            // while the hypothetical is stamped now, so no A5 fixture can tie
-            // and all eight stay green with this clause forced true.
-            before
-                .iter()
-                .any(|b| b.time == c.time && !ancestors.contains(&b.id))
-        }
-        None => false,
-    };
-
+    let added_id_for_tie: Option<Oid> = added.as_ref().map(|c| c.id.clone());
     let after_commits: Vec<CommitSummary> =
         // `.take` bounds `after` only — see `PreviewInput::history_limit`. A
         // no-op whenever the caller's window is not full, and exactly the
         // oldest row when it is.
         added.into_iter().chain(before).take(history_limit).collect();
+    // The fourth report, and the only one about row *order* rather than about
+    // which ref claims the new commit. Measured, not modelled: the same walk
+    // `layout_with_refs` runs is asked which ids it decided by comparing id
+    // strings, over the exact list it is about to lay out. See
+    // `PreviewLayout::added_time_tied`.
+    let added_time_tied = match added_id_for_tie.as_ref() {
+        Some(id) => crate::layout::topo_order_with_id_ties(after_commits.clone())
+            .1
+            .contains(id),
+        None => false,
+    };
     let after_graph = layout_with_refs(after_commits, after_refs, head_branch.as_deref());
 
     let lane_shifts = {

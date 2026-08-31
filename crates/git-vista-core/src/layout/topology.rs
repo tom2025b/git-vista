@@ -12,7 +12,7 @@
 //! the layout entry points in the parent and that walk are the only callers.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use crate::model::{CommitSummary, GitRef, Oid};
 
@@ -25,6 +25,45 @@ use crate::model::{CommitSummary, GitRef, Oid};
 /// walker's queue produced, and that order shifted whenever the tip set
 /// changed, reshuffling the whole layout after unrelated operations.
 pub(super) fn stable_topo_order(commits: Vec<CommitSummary>) -> Vec<CommitSummary> {
+    walk(commits, false).0
+}
+
+/// [`stable_topo_order`], plus the ids whose row position was decided by
+/// comparing object id strings.
+///
+/// # Why this exists rather than a predicate that models the heap
+///
+/// An id comparison happens in exactly one circumstance: two entries sit in
+/// `ready` at the same moment carrying the same `time`, so the heap falls
+/// through to `Reverse(id)` to choose between them. That is a property of *this
+/// walk's* state at a particular instant, and nothing outside the walk can know
+/// it without reproducing the walk.
+///
+/// #576's preview needs the answer, because its hypothetical commit's id is one
+/// a real run will never write — so any row this comparison decides is a coin
+/// flip rather than a fact. The first attempt approximated it with "is this an
+/// in-window ancestor of the new commit", which is sound but strictly narrower
+/// than the real condition: a commit blocked behind any *other* unemitted child
+/// also never reaches the heap beside `added`, and was refused anyway. An
+/// outside auditor found that needless refusal.
+///
+/// The reason it was approximated rather than measured is written into
+/// `PreviewLayout::added_time_tied`: writing the tie logic out a second time
+/// would let the two copies drift. That objection is to **duplication**, and it
+/// is answered by construction here — [`stable_topo_order`] and this function
+/// are one walk with one heap and one key, and the flag only decides whether
+/// the observation is recorded. There is no second copy to drift.
+///
+/// The scan is skipped entirely when `want_ties` is false, so the ordinary
+/// graph path pays nothing for it.
+pub(crate) fn topo_order_with_id_ties(
+    commits: Vec<CommitSummary>,
+) -> (Vec<CommitSummary>, HashSet<Oid>) {
+    walk(commits, true)
+}
+
+/// The one walk. `want_ties` decides only whether it observes itself.
+fn walk(commits: Vec<CommitSummary>, want_ties: bool) -> (Vec<CommitSummary>, HashSet<Oid>) {
     let index: HashMap<Oid, usize> = commits
         .iter()
         .enumerate()
@@ -48,7 +87,23 @@ pub(super) fn stable_topo_order(commits: Vec<CommitSummary>) -> Vec<CommitSummar
         .map(|(i, c)| (c.time, Reverse(c.id.0.clone()), i))
         .collect();
     let mut order = Vec::with_capacity(commits.len());
-    while let Some((_, _, i)) = ready.pop() {
+    let mut id_ties: HashSet<Oid> = HashSet::new();
+    while let Some((t, _, i)) = ready.pop() {
+        if want_ties {
+            // Anything still ready carrying the same second was compared with
+            // the entry just popped, by id and nothing else. Both sides of that
+            // comparison had their row decided by it, so both are recorded.
+            let mut tied = false;
+            for (other_t, _, oi) in ready.iter() {
+                if *other_t == t {
+                    tied = true;
+                    id_ties.insert(commits[*oi].id.clone());
+                }
+            }
+            if tied {
+                id_ties.insert(commits[i].id.clone());
+            }
+        }
         order.push(i);
         for p in &commits[i].parents {
             if let Some(&pi) = index.get(p) {
@@ -62,13 +117,14 @@ pub(super) fn stable_topo_order(commits: Vec<CommitSummary>) -> Vec<CommitSummar
     // Git DAGs are acyclic, so every commit is emitted; keep the original list
     // as a safety net if something upstream ever handed us a cycle.
     if order.len() != commits.len() {
-        return commits;
+        return (commits, id_ties);
     }
     let mut slots: Vec<Option<CommitSummary>> = commits.into_iter().map(Some).collect();
-    order
+    let ordered = order
         .into_iter()
         .map(|i| slots[i].take().expect("each index emitted once"))
-        .collect()
+        .collect();
+    (ordered, id_ties)
 }
 
 /// Leftmost free (`None`) lane, growing the lane set only if none is free.
