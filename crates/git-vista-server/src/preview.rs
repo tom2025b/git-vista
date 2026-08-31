@@ -156,6 +156,22 @@ pub(crate) const PREVIEW_HISTORY_LIMIT: usize = 500;
 /// "we made *this one*"; the marker's lease says "and it is still in use".
 /// Three independent gates, each refusing on its own — the same shape
 /// `sandbox::repo_paths` describes for its own two containment rules.
+///
+/// # The marker is an accident boundary, NOT a security one
+///
+/// Worth being explicit about in a module that documents its reasoning this
+/// heavily, because a marker left to read as a security control would be a
+/// false claim. Anyone who can write `gv-preview-store.lock` inside
+/// `<commondir>` already has write access to the user's `.git` and does not
+/// need this feature to do damage; they could forge the magic at will. What
+/// the marker removes is the class finding 2 actually describes — a user's own
+/// `gv-preview-backup/`, another tool's directory, a still-running preview's
+/// store — none of which are attacks.
+///
+/// The security boundary is a different mechanism entirely: [`PreviewTarget`],
+/// which carries the commondir the request validated so the delete cannot be
+/// walked out of the managed root by a swapped pointer (finding 3). Two
+/// findings, two mechanisms, and saying which is which is the point.
 const SCRATCH_PREFIX: &str = "gv-preview-";
 
 /// The file that proves a `gv-preview-*` directory is this module's.

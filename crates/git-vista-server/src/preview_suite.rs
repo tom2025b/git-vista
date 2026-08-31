@@ -3542,11 +3542,22 @@ fn the_sweep_removes_only_old_directories_it_named_itself() {
     // `tempfile`'s name shape — `gv-preview-` plus six alphanumerics — so a
     // "validate the generated name" fix would let this through untouched.
     let decoy = commondir.join(format!("{SCRATCH_PREFIX}backup"));
-    for d in [&stale, &young, &foreign, &decoy] {
+    // A second decoy that *does* carry a file of the marker's name, holding
+    // somebody else's bytes. Without it, "the marker must exist" would pass
+    // this test while the magic comparison rotted away, and a lock file from
+    // any other tool would be read as a licence to `remove_dir_all`.
+    let impostor = commondir.join(format!("{SCRATCH_PREFIX}other1"));
+    for d in [&stale, &young, &foreign, &decoy, &impostor] {
         std::fs::create_dir_all(d).expect("create dir");
     }
     let precious = decoy.join("precious.txt");
     std::fs::write(&precious, b"the user's own bytes\n").expect("write the decoy's content");
+    let impostor_marker = impostor.join(STORE_MARKER);
+    std::fs::write(
+        &impostor_marker,
+        b"some other tool's lock file v9\nand more\n",
+    )
+    .expect("write the impostor's marker");
     // Mark the two directories this module would really have created, through
     // the production helper — never hand-rolled, or the magic could drift and
     // the sweep would silently stop matching what it writes.
@@ -3554,10 +3565,11 @@ fn the_sweep_removes_only_old_directories_it_named_itself() {
         let lease = ScratchStore::claim(d).expect("claim the planted store");
         drop(lease); // abandoned: the owner is "gone"
     }
-    // Age `stale` and `decoy` past the bound by rewriting their mtimes.
+    // Age the three that must be old past the bound by rewriting their mtimes.
     let long_ago = std::time::SystemTime::now() - STALE_SCRATCH_AGE - Duration::from_secs(60);
     filetime_set(&stale, long_ago);
     filetime_set(&decoy, long_ago);
+    filetime_set(&impostor, long_ago);
 
     ScratchStore::sweep_stale(commondir);
 
@@ -3582,12 +3594,107 @@ fn the_sweep_removes_only_old_directories_it_named_itself() {
          ownership, and `{}` is a user's own backup directory",
         decoy.display()
     );
+    assert!(
+        impostor.exists(),
+        "a `gv-preview-*` directory holding a file merely NAMED like the \
+         marker must survive: the magic is compared exactly, because \
+         `{}`'s presence proves nothing about who wrote it",
+        impostor_marker.display()
+    );
+    assert_eq!(
+        std::fs::read(&impostor_marker).ok().as_deref(),
+        Some(b"some other tool's lock file v9\nand more\n".as_slice()),
+        "the impostor's own file was rewritten or removed"
+    );
     assert_eq!(
         std::fs::read(&precious).ok().as_deref(),
         Some(b"the user's own bytes\n".as_slice()),
         "the sweep recursively deleted a foreign directory's contents: \
          `remove_dir_all` inside a user's `.git`, keyed on a name anyone can \
          write"
+    );
+}
+
+/// The **production** constructor validates containment itself, and carries
+/// the `commondir` rather than the `gitdir`.
+///
+/// Every other test in this file builds its target with
+/// [`PreviewTarget::resolved_in`], the single-root constructor. That leaves
+/// [`PreviewTarget::in_managed_catalog`] — the one the HTTP handler actually
+/// calls — exercised by nothing, which is the same hole a `#[cfg(test)]`
+/// bypass constructor would have opened: the suite would stop exercising the
+/// shape production depends on. Verified by running it: with the
+/// `path_is_allowed` guard deleted, every other test in this module still
+/// passed.
+///
+/// # Two mutations
+///
+/// 1. **Removes the mechanism** — delete the `path_is_allowed` guard from
+///    `in_managed_catalog`. The unregistered repository is accepted and the
+///    first half goes red; the second half stays green, because an allowed
+///    root was allowed either way.
+/// 2. **Weakens it** — carry `paths.gitdir` instead of `paths.commondir`. The
+///    guard still refuses the unregistered repository, so the first half stays
+///    green; the linked worktree's target then names
+///    `<main>/.git/worktrees/<id>` instead of `<main>/.git` and the second
+///    half goes red. A *plain* repository cannot tell those apart —
+///    `gitdir == commondir` there — which is why this test uses a worktree.
+#[test]
+fn the_catalog_constructor_refuses_an_unregistered_root_and_carries_the_commondir() {
+    // Half one: a repository under a root the catalog was never told about.
+    // The catalog is process-global and accumulates roots, but every root any
+    // test allows is its own `TempDir`, so a freshly created one can never be
+    // inside one of them.
+    let stranger = TempDir::new().expect("tempdir");
+    let outsider = stranger.path().join("repo");
+    git::init(&outsider);
+    match PreviewTarget::in_managed_catalog(&outsider) {
+        Err(PreviewUnavailable::ScratchStore { detail }) => assert!(
+            detail.contains("managed root"),
+            "the refusal must say what was wrong: {detail}"
+        ),
+        other => panic!(
+            "a repository under no allowed root must be refused before anything \
+             can be deleted inside it, got {other:?}"
+        ),
+    }
+
+    // Half two: an allowed root, and a linked worktree — the one geometry
+    // where carrying the gitdir instead of the commondir is visible.
+    let (dir, repo) = revert_shape();
+    let worktree = dir.path().join("wt");
+    git::run(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "catalogbranch",
+            worktree.to_str().expect("a utf-8 path"),
+        ],
+    );
+    crate::state::allow_repo_root(dir.path());
+
+    let target = PreviewTarget::in_managed_catalog(&worktree)
+        .expect("a worktree inside an allowed root is served");
+    let expected = repo
+        .join(".git")
+        .canonicalize()
+        .expect("the main git directory exists");
+    assert_eq!(
+        target.commondir(),
+        expected,
+        "the production constructor must carry the COMMONDIR — the store lives \
+         there and the sweep deletes there. A linked worktree's gitdir is \
+         `<main>/.git/worktrees/<id>`, which is inside the grant but is not \
+         where any of this happens."
+    );
+    assert_eq!(
+        target.repo(),
+        worktree,
+        "the repository path every git spawn is built from must be the one the \
+         caller asked about, unchanged"
     );
 }
 
@@ -3806,6 +3913,16 @@ async fn the_store_lands_in_the_commondir_the_request_validated_not_a_re_resolve
         "the tamper must actually redirect a re-resolution, or this test proves nothing"
     );
 
+    // A canary in the VALIDATED commondir, identical in every respect to the
+    // victim. It proves the sweep actually ran: without it, an early return
+    // anywhere in `ScratchStore::new` — a refused spawn under the tampered
+    // geometry, say — would leave the victim intact and this test green for a
+    // reason that has nothing to do with the fix.
+    let canary = validated.join(format!("{SCRATCH_PREFIX}canary"));
+    std::fs::create_dir_all(&canary).expect("plant the canary");
+    drop(ScratchStore::claim(&canary).expect("mark the canary"));
+    filetime_set(&canary, long_ago);
+
     // Whether the store can be built at all under a tampered geometry is not
     // the claim; where it is allowed to delete is.
     let _ = ScratchStore::new(&target).await;
@@ -3819,6 +3936,14 @@ async fn the_store_lands_in_the_commondir_the_request_validated_not_a_re_resolve
         scratch_dirs(&b_commondir),
         vec![format!("{SCRATCH_PREFIX}victim")],
         "nothing may be created or removed under a commondir this request never validated"
+    );
+    // Checked last so the two assertions above get to name the defect first;
+    // this one only answers "did the sweep run at all".
+    assert!(
+        !canary.exists(),
+        "the sweep never ran, so this test would have proved nothing about \
+         where it is allowed to run: `{}` is still there",
+        canary.display()
     );
 }
 
