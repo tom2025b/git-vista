@@ -182,17 +182,47 @@ here would mean routing `ScratchStore::new`'s spawns through an arity that
 does the same — not designed here (this ADR does not own `preview.rs`), but
 named as what closing it needs.
 
-The stale sweep (`ScratchStore::sweep_stale`, removing `gv-preview-*` siblings
-older than an hour) is the only backstop today, for **every** leak this
-section describes, this one included. It only ever considers directories
-whose name carries the prefix this module chose, and only removes ones older
-than the bound; an entry whose age cannot be read is left alone. "We could not
-tell how old it is" is not grounds to delete something inside someone's
-repository.
+The stale sweep (`ScratchStore::sweep_stale`) is the backstop for the crash
+residue — but **not for the orphan-rewrite leak above**, and this paragraph
+claimed otherwise until the audit round corrected it.
+
+*Amended 2026-08-31, audit findings 2 and 3.* The sweep used to consider any
+directory carrying the prefix and older than the bound. That was wrong: **a
+prefix is a public string.** A name this module chose is still a name anyone
+can write, so a user's own `gv-preview-backup/` was a candidate for
+`remove_dir_all` inside their `.git`. Validating the generated name's *shape*
+would not have helped, and was rejected on measurement rather than taste —
+`tempfile` appends six alphanumerics, and `gv-preview-backup` is the prefix
+plus exactly six alphanumerics.
+
+Ownership therefore moved into the directory. A store is removed only when
+**all four** gates answer yes: the name carries the prefix (a candidate
+filter, nothing more); `DirEntry::metadata` says `is_dir()`, which does not
+traverse symlinks; the mtime is readable and older than the bound; and
+`abandoned_store_lease` hands back a lease — `gv-preview-store.lock` is
+present, its magic matches exactly, and nobody holds its `flock`. Anything
+that cannot answer is a `continue`. "We could not tell" is not grounds to
+delete something inside someone's repository.
+
+The lease is what separates *abandoned* from *in use right now*, which an
+mtime never could: the kernel releases an `flock` exactly when the process
+holding it goes away.
+
+**The cost of making ownership provable, stated plainly:** the
+orphan-rewrite residue described just above carries no marker — `TempDir::drop`
+removed it and an unsignalled `git init` wrote it back, and git does not write
+our marker. So the sweep will now leave it alone for ever. It is bounded (one
+directory per abnormal shutdown *during* a preview) and inert, and it is named
+here rather than reclaimed by guessing. `preview.rs` says the same at its
+`preview` entry point.
 
 **That backstop is not a time bound on the leak — it is conditional on a
 future event that may never happen.** `sweep_stale` runs from exactly one
-place: the top of `ScratchStore::new`, which is called only on the
+place: inside `ScratchStore::new` — after `tempdir_in` and `claim`, not at the
+top of it, since the audit round made the sweep's home a fact carried on
+`PreviewTarget` rather than something the function looks up. The new store is
+younger than the bound and holds its own lease, so it can never sweep itself.
+`ScratchStore::new` is called only on the
 `Synthesize` path (a revert, a cherry-pick, or a merge that is neither a
 fast-forward nor already up to date). `FastForward` and `AlreadyUpToDate`
 never construct a `ScratchStore` and so never sweep. So a leaked directory is
@@ -536,9 +566,14 @@ commit by position instead.
   mid-preview, which leaves a `gv-preview-*` directory inside the served `.git`.
   That is the same class as `SIGKILL` and power loss — the process stops before any
   cleanup can run — but unlike those it is reachable from an ordinary server
-  shutdown, so it is named here rather than folded into "abnormal termination". A
-  later sweep of stale `gv-preview-*` directories at startup would close it; nothing
-  in this change set does.
+  shutdown, so it is named here rather than folded into "abnormal termination".
+  *Amended 2026-08-31:* this bullet used to say "a later sweep of stale
+  `gv-preview-*` directories at startup would close it". That is now **false**,
+  and deliberately so — since findings 2 and 3, the sweep removes only
+  directories carrying this module's marker, and a store `TempDir::drop`
+  removed and an orphaned `git init` wrote back has none. No sweep, at startup
+  or otherwise, may ever touch it. Closing this needs the spawn killed with its
+  future (`kill_on_drop`), not a wider sweep.
 - **A2's guarantee is exactly "no new object under `<commondir>/objects`"**, and
   a scratch *directory* does appear under `commondir` for the life of a call.
   Anyone tightening that assertion must count under `objects`, not `commondir`.

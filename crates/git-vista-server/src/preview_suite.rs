@@ -1189,8 +1189,17 @@ async fn a2_env_redirect_driver_runs_one_preview_under_the_variable() {
 /// the task is dropped where it stands and that store survives. Neither is
 /// covered here: this test drives cancellation, not shutdown. ADR 0099 records
 /// the teardown case as an open consequence in the same class as `SIGKILL` and
-/// power loss — `ScratchStore::sweep_stale` is what covers it — and records the
-/// transient window as a stated cost of the design.
+/// power loss, and records the transient window as a stated cost of the design.
+///
+/// *Corrected 2026-08-31 (audit findings 2/3):* this comment used to add
+/// "`ScratchStore::sweep_stale` is what covers it". That is no longer true and
+/// it contradicted `preview.rs`'s own statement at the `preview` entry point.
+/// The sweep now reclaims only directories carrying `STORE_MARKER`, and the
+/// teardown residue has none — `TempDir::drop` removed the store and an
+/// unsignalled orphan `git init` wrote it back, and git does not write our
+/// marker. `SIGKILL` and power loss are still covered, because those leave the
+/// marker on disk with the whole store; teardown-during-a-spawn is the one
+/// member of that class that is not.
 ///
 /// **The window is a few milliseconds wide, and the sweep is aimed at it
 /// deliberately.** A geometric ladder over the whole call (200 µs, 500 µs,
@@ -3683,10 +3692,7 @@ fn a_named_pipe_wearing_the_markers_name_cannot_wedge_the_sweep() {
         let _ = tx.send(());
     });
 
-    if rx
-        .recv_timeout(std::time::Duration::from_secs(20))
-        .is_err()
-    {
+    if rx.recv_timeout(std::time::Duration::from_secs(20)).is_err() {
         panic!(
             "`sweep_stale` never returned: the named pipe at `{}` wedged it. \
              `File::open` on a FIFO with no writer blocks for ever, so the \
