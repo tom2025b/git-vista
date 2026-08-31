@@ -792,16 +792,21 @@ const EXEMPT: &[(&str, &str)] = &[
     // the geometry.rs entries above, and says so explicitly.
     ("git-vista/src/features/graph/core.rs", "label_occupancy"),
     // layout/mod.rs's own doc on `layout()`: "Use layout_with_refs to also
-    // attach branch/tag/HEAD badges." Production (git-vista-server's
+    // attach branch/tag/HEAD badges." The *read* path (git-vista-server's
     // handlers/read.rs) builds graphs through `layout::stream::StreamLayout`
-    // exclusively (confirmed: no `layout(`/`layout_with_refs(` call anywhere
-    // under crates/git-vista-server or crates/git-vista-git outside their
-    // own #[cfg(test)] blocks). Both batch functions survive as the
+    // exclusively, so `layout` has no production caller and survives as the
     // differential-testing reference the streaming implementation is
     // checked against — `layout/tests/stream.rs` literally names its
     // `layout(...)` result `oracle`.
+    //
+    // `layout_with_refs` was exempted on the same grounds and is NOT any
+    // more: #576's graph preview calls it twice from
+    // `git_vista_core::preview::lay_out_preview`, once per half, because the
+    // preview needs the badge attachment the streaming path does not do.
+    // This test caught the drift the moment the branch wired it up, which is
+    // exactly what the exempt table is for — the entry is gone rather than
+    // re-argued.
     ("git-vista-core/src/layout/mod.rs", "layout"),
-    ("git-vista-core/src/layout/mod.rs", "layout_with_refs"),
     // sheet.rs's own module doc (lines 12-17): "nothing in this module is
     // consumed by crate::features::shell::signals yet... the model is
     // settled and tested; the sheet does not exist on screen. Wiring it is
