@@ -21,11 +21,21 @@
 //!    [`trunk_reserve_tip`](crate::layout::trunk_reserve_tip) reads
 //!    the ref slice it is handed. Refs that still name the old tip reserve
 //!    lane 0 for the wrong commit — see [`PreviewInput::ref_moves`].
-//! 2. **Colour slot 0 is claimed from the refs.**
-//!    `layout::color::assign_branch_colors` falls back to a key of
-//!    `~<the commit's own short hash>` for any commit no ref claims, so an
-//!    unclaimed hypothetical commit takes a colour slot derived from an oid
-//!    that by construction differs from the real one. Same fix, same field.
+//! 2. **Colour is claimed from the refs — and only from *branch* refs.**
+//!    `layout::color::assign_branch_colors` seeds from
+//!    `refs.iter().filter(|r| r.is_branch())`, and
+//!    [`GitRef::is_branch`](crate::model::GitRef::is_branch) is
+//!    `RefKind::Branch | RefKind::RemoteBranch` — **never** `RefKind::Head`.
+//!    Any commit no *branch* ref claims falls back to a key of
+//!    `~<the commit's own short hash>`, so an unclaimed hypothetical commit
+//!    takes a colour slot derived from an oid that by construction differs
+//!    from the real one.
+//!
+//!    Moving a **branch** onto it fixes that ([`PreviewInput::ref_moves`],
+//!    same field as item 1). Moving only `HEAD` does **not** — and on a
+//!    detached HEAD there is no branch to move, so no `ref_moves` list can
+//!    fix it. That case is unfixable here rather than merely unfixed, and is
+//!    reported: [`PreviewLayout::added_claimed_by_no_branch`].
 //! 3. **Row order is decided by commit *time*, not by list position.**
 //!    `stable_topo_order` is a max-heap on `(time, Reverse(id))` under the
 //!    topological constraint, so the hypothetical commit competes with every
@@ -139,30 +149,73 @@ pub struct PreviewInput {
     /// checked-out branch) points at. Hand it the old tip and the hypothetical
     /// commit at row 0 finds lane 0 taken and lands in lane 1 — while a real
     /// run of the operation, whose refs really did move, puts its new commit in
-    /// lane 0. The colouring pass has the same dependency one step later: a
-    /// commit no ref claims falls into `assign_branch_colors`'s synthetic
-    /// fallback, whose key is `~<the commit's own short hash>` — so an
-    /// unrewritten preview and the real commit get different colour slots for
-    /// no reason but their different oids.
+    /// lane 0. The colouring pass has a similar dependency one step later: a
+    /// commit no **branch** ref claims falls into `assign_branch_colors`'s
+    /// synthetic fallback, whose key is `~<the commit's own short hash>` — so
+    /// an unrewritten preview and the real commit get different colour slots
+    /// for no reason but their different oids.
     ///
     /// So the rewrite happens *here*, from this list, in one place, and
     /// [`PreviewLayout::unmatched_ref_moves`] reports any entry that matched
     /// nothing rather than letting it pass silently.
+    ///
+    /// # Necessary, and **not** sufficient
+    ///
+    /// The two passes do not read the same refs. `trunk_reserve_tip` reads
+    /// local `main`/`master`/the checked-out branch; `assign_branch_colors`
+    /// seeds from every ref where `is_branch()` holds. Neither reads
+    /// `RefKind::Head`. So a `ref_moves` list that moves `"HEAD"` and no
+    /// branch is applied faithfully, reports nothing here, and still leaves
+    /// the hypothetical commit in the synthetic colour fallback.
+    ///
+    /// On a detached HEAD that is not a caller mistake — the operation really
+    /// does move `HEAD` alone, and there is no branch for any list to name.
+    /// [`PreviewLayout::added_claimed_by_no_branch`] is the field that reports
+    /// it, and it is the general condition of which
+    /// [`PreviewLayout::added_without_ref_moves`] is one special case.
     pub ref_moves: Vec<(String, Oid)>,
 }
 
 /// The two layouts and what differs between them.
 ///
-/// # The two report fields are read together, not either/or
+/// # The three report fields are read together, and they are not independent
 ///
-/// [`unmatched_ref_moves`](Self::unmatched_ref_moves) and
-/// [`added_without_ref_moves`](Self::added_without_ref_moves) each name a
-/// different way the caller can have failed to point a ref at the hypothetical
-/// commit, and neither implies the other. A caller that supplies an `added`
-/// commit and a `ref_moves` list whose every entry matched nothing gets
-/// `added_without_ref_moves == false` — the list was not empty — and takes the
-/// full lane-1-plus-synthetic-colour damage anyway, reported only by
-/// `unmatched_ref_moves`. A correct preview has **both** empty/false.
+/// **The claim this doc used to make — "a correct preview has *both*
+/// empty/false" — was false, and false in the direction that hid a real
+/// defect.** A preview taken on a **detached HEAD** has
+/// [`unmatched_ref_moves`](Self::unmatched_ref_moves) empty and
+/// [`added_without_ref_moves`](Self::added_without_ref_moves) false, and its
+/// hypothetical row is still coloured by a hash of an object id that does not
+/// exist yet. Two clear fields were read as an exhaustiveness guarantee they
+/// never were.
+///
+/// What is actually true, field by field:
+///
+/// * `unmatched_ref_moves` non-empty: some `ref_moves` entry named no ref at
+///   all, so both the lane-0 reservation and the colour seeding still read the
+///   **old** targets. Always a caller mistake.
+/// * `added_without_ref_moves` **implies**
+///   [`added_claimed_by_no_branch`](Self::added_claimed_by_no_branch): an empty
+///   `ref_moves` list moves no branch onto the hypothetical commit, so no
+///   branch ref can claim it. The converse does not hold, which is why both
+///   fields exist — the implication runs one way only.
+/// * `added_claimed_by_no_branch` is the **general** colour condition, and the
+///   only one of the three that can be true while the caller did everything
+///   right. It is also the only one this module cannot tell the caller how to
+///   fix.
+///
+/// `unmatched_ref_moves` is independent of the other two in both directions: a
+/// caller that supplies an `added` commit and a `ref_moves` list whose every
+/// entry matched nothing gets `added_without_ref_moves == false` — the list was
+/// not empty — and takes the full lane-1-plus-synthetic-colour damage anyway,
+/// while a detached-HEAD preview sets `added_claimed_by_no_branch` with
+/// `unmatched_ref_moves` empty.
+///
+/// A preview whose `after` graph a real run would reproduce has all **three**
+/// clear. That is an accurate statement of what these fields cover and not a
+/// claim that nothing else can go wrong: `added.time` is a fourth precondition
+/// with no field at all, stated on [`PreviewInput::added`] and deliberately not
+/// enforced.
 ///
 /// Derives `Debug` so a comparison test that disagrees can print what it got.
 #[derive(Debug, Clone)]
@@ -180,11 +233,12 @@ pub struct PreviewLayout {
     /// rewrite fired — a rewrite that silently matched nothing is precisely the
     /// wrong-reason failure this field exists to catch.
     ///
-    /// Holds **only** unmatched ref names. The other way a caller can get the
-    /// rewrite wrong — supplying an `added` commit and no `ref_moves` at all —
-    /// has no name to report and gets its own field,
-    /// [`added_without_ref_moves`](Self::added_without_ref_moves), rather than
-    /// a sentinel string in here. One field, one meaning: a `Vec<String>`
+    /// Holds **only** unmatched ref names. The *other* ways the rewrite can
+    /// come out wrong — there are two more, not one — have no ref name to
+    /// report and get their own fields,
+    /// [`added_without_ref_moves`](Self::added_without_ref_moves) and
+    /// [`added_claimed_by_no_branch`](Self::added_claimed_by_no_branch), rather
+    /// than a sentinel string in here. One field, one meaning: a `Vec<String>`
     /// documented as "ref names that did not match" must not sometimes contain
     /// something that is not a ref name.
     pub unmatched_ref_moves: Vec<String>,
@@ -197,7 +251,58 @@ pub struct PreviewLayout {
     /// `false` for a fast-forward (`added: None`, refs move) and `false` for
     /// the degenerate no-op (`added: None`, `ref_moves` empty) — neither is a
     /// bug.
+    ///
+    /// Implies [`added_claimed_by_no_branch`](Self::added_claimed_by_no_branch)
+    /// and is strictly narrower than it; see that field.
     pub added_without_ref_moves: bool,
+    /// `true` when `added` is `Some` and, **after the rewrite**, no ref with
+    /// [`is_branch()`](crate::model::GitRef::is_branch) targets it.
+    ///
+    /// The hypothetical row's colour is then
+    /// `stable_color_slot("~<its own short oid>")` — a hash of the one value a
+    /// preview may never be compared on, because the preview's oid and the real
+    /// operation's oid differ by construction (committer date, default message).
+    ///
+    /// # Why this is a separate field and not folded into the one above
+    ///
+    /// `assign_branch_colors` seeds only from `RefKind::Branch` and
+    /// `RefKind::RemoteBranch`, never `RefKind::Head`. So a non-empty
+    /// `ref_moves` list that names `"HEAD"` alone clears
+    /// [`added_without_ref_moves`](Self::added_without_ref_moves), matches a
+    /// real ref (so clears [`unmatched_ref_moves`](Self::unmatched_ref_moves)),
+    /// and leaves the colour damage in place. On a **detached HEAD** that is
+    /// exactly the shape a correct caller produces: `read_refs` emits `"HEAD"`
+    /// as its own entry whether or not HEAD is on a branch, and a detached HEAD
+    /// moves that one ref and nothing else.
+    ///
+    /// # This one is reported because it cannot be repaired, not because the
+    /// caller erred
+    ///
+    /// The other two fields name mistakes with fixes: pass the display ref
+    /// names `read_refs` emitted, pass the branch the operation moves. This one
+    /// has no fix available to either side. A **real** run of the same
+    /// operation on a detached HEAD also lands in the synthetic fallback, keyed
+    /// on the *real* commit's short oid — an object id that does not exist
+    /// until the commit is made. There is therefore no colour the preview could
+    /// choose that would be the colour a real run draws, including a "defined"
+    /// one: picking any fixed slot would make the preview differ from reality
+    /// deliberately rather than accidentally. So the pure half reports, and the
+    /// caller decides whether to refuse.
+    ///
+    /// # Colour only — the lane still agrees, in the detached-HEAD case
+    ///
+    /// `trunk_reserve_tip` reads local `main`/`master`/the checked-out branch.
+    /// On a detached HEAD the preview's rewritten ref slice and the real
+    /// repository's refs hold the *same* branch targets (only `HEAD` moved and
+    /// `HEAD` is not read), so both sides reserve the same lane 0 and place the
+    /// hypothetical commit in the same lane. Colour is the whole of the
+    /// divergence — and a colour slot is a visible line colour, not an internal
+    /// number.
+    ///
+    /// That scoping is specific to the detached-HEAD shape. The general
+    /// condition can also be met by a caller that moves a branch onto some
+    /// *other* commit while adding one here, and lanes may then diverge too.
+    pub added_claimed_by_no_branch: bool,
 }
 
 /// Lay out `before`, then lay out the same history with `added` and
@@ -214,6 +319,16 @@ pub struct PreviewLayout {
 ///    revert/cherry-pick/merge changes which branch is checked out.
 /// 4. `lane_shifts` = for each `after` row whose commit id appears in `before`,
 ///    emit a [`LaneShift`] when the lanes differ.
+/// 5. Report. [`PreviewLayout::added_claimed_by_no_branch`] is read off
+///    `after_refs` — the **rewritten** slice, the one `layout_with_refs`
+///    actually saw — so it describes the graph that was returned rather than
+///    the inputs it was built from. Reading the pre-rewrite `refs` here would
+///    report every correct attached-HEAD preview as damaged.
+///
+/// None of the three report fields is a refusal: this function always returns
+/// both graphs. Whether a damaged `after` graph may be shown is the caller's
+/// decision. Making a report *fire* as a refusal therefore takes a consumer,
+/// and a field no consumer reads is a diagnosis nobody hears.
 ///
 /// Every row in both halves carries `on_remote: false`, because
 /// `StreamLayout::push` emits it and this pipeline is [`layout_with_refs`] and
@@ -251,6 +366,16 @@ pub fn lay_out_preview(input: PreviewInput) -> PreviewLayout {
 
     let added_without_ref_moves = added.is_some() && ref_moves.is_empty();
 
+    // Read off `after_refs`, not `refs`: the question is whether the slice
+    // `layout_with_refs` is about to be handed contains a branch that claims the
+    // hypothetical commit, and only `is_branch()` refs seed `assign_branch_colors`
+    // (a `RefKind::Head` entry named "HEAD" seeds nothing, which is the whole of
+    // the detached-HEAD case).
+    let added_claimed_by_no_branch = match added.as_ref() {
+        Some(c) => !after_refs.iter().any(|r| r.is_branch() && r.target == c.id),
+        None => false,
+    };
+
     let after_commits: Vec<CommitSummary> = added.into_iter().chain(before).collect();
     let after_graph = layout_with_refs(after_commits, after_refs, head_branch.as_deref());
 
@@ -283,6 +408,7 @@ pub fn lay_out_preview(input: PreviewInput) -> PreviewLayout {
         lane_shifts,
         unmatched_ref_moves,
         added_without_ref_moves,
+        added_claimed_by_no_branch,
     }
 }
 
@@ -324,6 +450,27 @@ mod tests {
     /// tip. `read_refs` emits HEAD first, and `attach_ref_badges` preserves
     /// that order, so badge assertions can be exact.
     fn linear_trunk() -> (Vec<CommitSummary>, Vec<GitRef>) {
+        let commits = vec![
+            commit('3', 300, &['2']),
+            commit('2', 200, &['1']),
+            commit('1', 100, &[]),
+        ];
+        let refs = vec![
+            git_ref("HEAD", RefKind::Head, '3'),
+            git_ref("main", RefKind::Branch, '3'),
+        ];
+        (commits, refs)
+    }
+
+    /// The same trunk, but **HEAD is detached** on its tip: `read_refs` still
+    /// emits a `RefKind::Head` entry named `"HEAD"` (it emits one whenever HEAD
+    /// resolves, branch or not), and `main` is a separate `RefKind::Branch`
+    /// entry on the same commit. The caller's `head_branch` is `None`, which is
+    /// what `read_head_branch` returns here.
+    ///
+    /// The server's `ref_moves_to` builds its list from `read_head_branch`, so
+    /// a detached HEAD moves exactly one ref: `"HEAD"`.
+    fn detached_at_trunk_tip() -> (Vec<CommitSummary>, Vec<GitRef>) {
         let commits = vec![
             commit('3', 300, &['2']),
             commit('2', 200, &['1']),
@@ -403,6 +550,12 @@ mod tests {
         );
         assert_eq!(out.unmatched_ref_moves, Vec::<String>::new());
         assert!(!out.added_without_ref_moves);
+        assert!(
+            !out.added_claimed_by_no_branch,
+            "`main` is a branch ref and the rewrite put it on the hypothetical \
+             commit — all three reports are clear, which is what makes this \
+             preview reproducible by a real run"
+        );
     }
 
     /// The invariant: a `ref_moves` entry that matched no ref is *named*, and
@@ -506,6 +659,156 @@ mod tests {
         assert!(
             !no_op.added_without_ref_moves,
             "nothing was added, so there is no commit missing a ref"
+        );
+    }
+
+    /// The invariant: `added_claimed_by_no_branch` is true exactly when no
+    /// **branch** ref in the rewritten slice targets the hypothetical commit —
+    /// which on a detached HEAD is what a *correct* caller produces, and which
+    /// the other two report fields do not notice.
+    ///
+    /// The two arms are the discrimination. A field that was simply always
+    /// `true` would pass the detached arm and fail the attached one; a field
+    /// that was always `false` fails the detached arm alone.
+    ///
+    /// # Why each arm is run twice, with two different hypothetical oids
+    ///
+    /// The property is not "the colour is wrong" — it is **oid-dependence**.
+    /// Asserting a single slot number proves nothing about dependence, so each
+    /// arm runs the identical input twice changing only the hypothetical
+    /// commit's oid, and the arms assert opposite answers: detached differs,
+    /// attached does not.
+    ///
+    /// `stable_color_slot` is `1 + fnv1a(name) % 6`, so an arbitrary pair of
+    /// oids can collide onto one slot and make the detached arm green while the
+    /// mechanism is broken. `'9'` and `'8'` are chosen because their synthetic
+    /// keys land apart and were checked: `stable_color_slot("~9999999") == 3`
+    /// and `stable_color_slot("~8888888") == 2`. Both literals are asserted
+    /// below, so swapping the digits for a colliding pair makes this test go
+    /// red rather than quietly vacuous.
+    ///
+    /// # Two mutations that make this red, failing differently
+    ///
+    /// * **M10a — REMOVES the mechanism.** Hard-code
+    ///   `added_claimed_by_no_branch: false` in `lay_out_preview`. Red on the
+    ///   detached arm — the case is silently drawn again — and **green** on the
+    ///   attached arm. Under-reporting.
+    /// * **M10b — WEAKENS the mechanism.** Compute the field from the
+    ///   pre-rewrite `refs` instead of `after_refs`. The detached arm stays
+    ///   green (no branch claims the commit either way) and the attached arm
+    ///   goes red: every correct attached-HEAD preview is now reported as
+    ///   damaged, because before the rewrite `main` still points at the old
+    ///   tip. Over-reporting — the opposite symptom, and the one that would
+    ///   turn a refusal into a refusal of everything.
+    ///
+    /// The two colour assertions in the detached arm witness the *defect* the
+    /// field reports; their mechanism lives in `layout/color.rs`, which this
+    /// lane does not own. Mutations there, named and not applied: seeding
+    /// `assign_branch_colors` from all refs rather than `is_branch()` ones
+    /// would make both runs slot 0 (red on both literals); keying the synthetic
+    /// fallback on the row index rather than the short oid would make both runs
+    /// one shared slot (red on the literals and on the inequality).
+    #[test]
+    fn a_detached_head_leaves_the_hypothetical_commit_claimed_by_no_branch() {
+        let detached = |digit: char| {
+            let (before, refs) = detached_at_trunk_tip();
+            lay_out_preview(PreviewInput {
+                before,
+                refs,
+                head_branch: None,
+                added: Some(commit(digit, 400, &['3'])),
+                // A detached HEAD moves exactly one ref, and it is not a branch.
+                ref_moves: vec![("HEAD".into(), oid(digit))],
+            })
+        };
+        let attached = |digit: char| {
+            let (before, refs) = detached_at_trunk_tip();
+            lay_out_preview(PreviewInput {
+                before,
+                refs,
+                head_branch: Some("main".into()),
+                added: Some(commit(digit, 400, &['3'])),
+                ref_moves: vec![("HEAD".into(), oid(digit)), ("main".into(), oid(digit))],
+            })
+        };
+
+        // --- detached: reported, and the two older fields stay clear ---
+        let nine = detached('9');
+        let eight = detached('8');
+
+        assert_eq!(nine.after.rows[0].commit.id, oid('9'));
+        assert_eq!(eight.after.rows[0].commit.id, oid('8'));
+
+        assert!(
+            nine.added_claimed_by_no_branch,
+            "HEAD moved onto the hypothetical commit but HEAD is RefKind::Head, \
+             which assign_branch_colors does not seed from"
+        );
+        assert!(eight.added_claimed_by_no_branch);
+
+        assert_eq!(
+            nine.unmatched_ref_moves,
+            Vec::<String>::new(),
+            "the \"HEAD\" entry matched a real ref, so the caller made no \
+             naming mistake — this is the field that used to be read as an \
+             all-clear"
+        );
+        assert!(
+            !nine.added_without_ref_moves,
+            "ref_moves was not empty, so this field is false too — both of the \
+             older fields are clear for a preview that is nonetheless wrong"
+        );
+
+        // The defect the field reports: same input, different oid, different
+        // colour. Literals, not a re-derivation.
+        assert_eq!(
+            nine.after.rows[0].color, 3,
+            "the synthetic fallback keyed on ~9999999"
+        );
+        assert_eq!(
+            eight.after.rows[0].color, 2,
+            "the synthetic fallback keyed on ~8888888"
+        );
+        assert_ne!(
+            nine.after.rows[0].color, eight.after.rows[0].color,
+            "the hypothetical row's colour moves with its oid — and the real \
+             run's oid is not this one"
+        );
+
+        // --- attached: not reported, and the colour does not move ---
+        let nine_attached = attached('9');
+        let eight_attached = attached('8');
+
+        assert!(
+            !nine_attached.added_claimed_by_no_branch,
+            "`main` is a RefKind::Branch and the rewrite put it on the \
+             hypothetical commit, so the trunk colour claims it"
+        );
+        assert!(!eight_attached.added_claimed_by_no_branch);
+
+        assert_eq!(
+            nine_attached.after.rows[0].color, 0,
+            "slot 0 is the trunk colour, and it is a pure function of the name \
+             `main` — not of any oid"
+        );
+        assert_eq!(eight_attached.after.rows[0].color, 0);
+
+        // --- the one-way implication the field docs claim ---
+        let (before, refs) = detached_at_trunk_tip();
+        let no_ref_moves = lay_out_preview(PreviewInput {
+            before,
+            refs,
+            head_branch: Some("main".into()),
+            added: Some(commit('9', 400, &['3'])),
+            ref_moves: Vec::new(),
+        });
+        assert!(no_ref_moves.added_without_ref_moves);
+        assert!(
+            no_ref_moves.added_claimed_by_no_branch,
+            "`added_without_ref_moves` implies this field — an empty ref_moves \
+             list moves no branch onto the commit, so no branch can claim it. \
+             A field that did not hold this would make the two reports \
+             contradict each other on one input"
         );
     }
 

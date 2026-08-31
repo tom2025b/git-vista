@@ -81,6 +81,7 @@ pub use content::{
 };
 pub use divergent::{
     cherry_pick_already_applied, cherry_pick_clean, cherry_pick_conflict, divergent_merge_ff_only,
-    fast_forward_merge_ff_false, merge_clean_two_branch, merge_conflict,
+    fast_forward_merge_ff_false, fast_forward_merge_ff_unset, merge_clean_two_branch,
+    merge_conflict,
 };
 pub use seeded::{empty, seeded, seeded_dated, seeded_files, Fixture, PINNED_DATE};

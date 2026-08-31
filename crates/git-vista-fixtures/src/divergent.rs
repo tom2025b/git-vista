@@ -74,6 +74,17 @@
 //! `git config --local --get merge.ff` in a fresh clone), so a builder that
 //! wants its own claim proved on a disposable clone, the same way every other
 //! builder here does, has to carry the value across explicitly.
+//!
+//! **And one shape pins the absence of it.**
+//! [`fast_forward_merge_ff_unset`] is the third of that set: same
+//! fast-forwardable topology as [`fast_forward_merge_ff_false`], with
+//! `merge.ff` written nowhere. It exists because two fixtures that each pin a
+//! *set* value leave the default — what nearly every real repository is in —
+//! resting on nothing, and a consumer whose unset arm answered "never
+//! fast-forward" would pass both of them. It asserts its own emptiness, on the
+//! fixture and on the clone, so a `set_local_config` call added to it later
+//! turns it red rather than quietly making it a fourth copy of the `false`
+//! case.
 
 use crate::conflict::{base_commit, stages_of};
 use crate::git;
@@ -375,6 +386,127 @@ pub fn fast_forward_merge_ff_false() -> Fixture {
         parent_count(&clone, "main"),
         2,
         "a refused fast-forward is a real two-parent merge commit"
+    );
+
+    assert!(
+        !repo.join(".git/MERGE_HEAD").exists(),
+        "the fixture handed back must stay pre-merge: the merge above ran on a clone"
+    );
+    (dir, repo)
+}
+
+/// The same fast-forwardable topology as [`fast_forward_merge_ff_false`], with
+/// **no `merge.ff` set at all** — the configuration nearly every real
+/// repository is in, and the one no other shape in this module covers.
+///
+/// ## Why an unset value needs a fixture of its own
+///
+/// Because "unset" is a value, and it is the one a reader is most likely to
+/// assume needs no test. [`fast_forward_merge_ff_false`] and
+/// [`divergent_merge_ff_only`] each pin a *set* value, so a consumer that read
+/// the config and got its **default** arm backwards — answering "never
+/// fast-forward" where git's documented default is "fast-forward where the
+/// topology allows it" — would satisfy both of them and be confidently wrong
+/// about every ordinary repository. That is not hypothetical: the default arm
+/// was measured unpinned on 2026-08-30, and inverting it changed nothing any
+/// test in this workspace could see.
+///
+/// ## What git actually put on disk
+///
+/// Four commits: `unset-root.txt` and `unset-main-second.txt` on `main` (which
+/// never moves again), then `feature` branches off `main`'s tip and adds
+/// `unset-feature-one.txt` and `unset-feature-two.txt`. `main` is therefore a
+/// plain ancestor of `feature`. **Nothing writes `merge.ff`**, and the builder
+/// asserts that — on the fixture *and* on the clone it verifies against — so a
+/// `set_local_config` call added here later cannot slip past unnoticed.
+///
+/// `main`'s branch-local depth past the branch point is necessarily zero, for
+/// the same reason [`fast_forward_merge_ff_false`]'s is: a pair where `main`
+/// had commits of its own there would not be fast-forwardable at all. The
+/// module doc's depth requirement is met before the branch point instead.
+///
+/// ## Why it matters
+///
+/// Measured on this host, 2026-08-30, on a clone of this shape with `merge.ff`
+/// unset at every layer: `git merge --no-edit feature` printed "Fast-forward",
+/// moved `main` to **`feature`'s own oid**, and created **no commit** — the
+/// commit count over all refs was identical before and after. Both halves are
+/// asserted below, and the oid equality is the load-bearing one: a merge that
+/// wrote a new commit would also leave `main` "moved", so counting commits
+/// alone would not tell the two apart.
+pub fn fast_forward_merge_ff_unset() -> Fixture {
+    let (dir, repo) = empty();
+    git::write(&repo, "unset-root.txt", b"root\n");
+    git::run(&repo, &["add", "-A"]);
+    git::run(&repo, &["commit", "-q", "-m", "root"]);
+    git::write(&repo, "unset-main-second.txt", b"main second commit\n");
+    git::run(&repo, &["add", "-A"]);
+    git::run(&repo, &["commit", "-q", "-m", "main: second commit"]);
+
+    git::run(&repo, &["checkout", "-q", "-b", "feature"]);
+    git::write(&repo, "unset-feature-one.txt", b"feature work one\n");
+    git::run(&repo, &["add", "-A"]);
+    git::run(&repo, &["commit", "-q", "-m", "feature: add one.txt"]);
+    git::write(&repo, "unset-feature-two.txt", b"feature work two\n");
+    git::run(&repo, &["add", "-A"]);
+    git::run(&repo, &["commit", "-q", "-m", "feature: add two.txt"]);
+
+    git::run(&repo, &["checkout", "-q", "main"]);
+
+    assert_eq!(
+        git::out(&repo, &["rev-list", "--count", "main"]),
+        "2",
+        "main must be root + one commit, and must never move again, or this is not \
+         a fast-forwardable pair"
+    );
+    assert_eq!(
+        git::out(&repo, &["rev-list", "--count", "feature"]),
+        "4",
+        "feature must be main's two commits plus two more of its own, or there is \
+         no width above the join"
+    );
+    assert_eq!(
+        git::out(&repo, &["merge-base", "main", "feature"]),
+        git::out(&repo, &["rev-parse", "main"]),
+        "main must be an ancestor of feature, or this is not fast-forwardable at all"
+    );
+
+    // The whole claim of this shape is a *negative*, so it is asserted rather
+    // than left implicit. `git config --get` exits non-zero when the key is
+    // absent, and `crate::git` runs every command with `GIT_CONFIG_GLOBAL` and
+    // `GIT_CONFIG_SYSTEM` at `/dev/null`, so this is "unset at every layer git
+    // can see here", not merely "unset locally".
+    assert!(
+        !git::try_run(&repo, &["config", "--get", "merge.ff"]),
+        "this shape is the UNSET case: merge.ff must not be set on the fixture at all"
+    );
+
+    let feature_tip = git::out(&repo, &["rev-parse", "feature"]);
+    let commits_before = git::out(&repo, &["rev-list", "--count", "--all"]);
+    // `clone_onto`, not `clone_onto_with_config`: passing no config is itself
+    // part of the assertion, and the clone is re-checked below so a value
+    // arriving from anywhere would be caught rather than silently verified.
+    let (_scratch, clone) = clone_onto(&repo, "main");
+    assert!(
+        !git::try_run(&clone, &["config", "--get", "merge.ff"]),
+        "the clone must be unset too, or the merge below is not the unset case"
+    );
+    assert!(
+        git::try_run(&clone, &["merge", "--no-edit", "feature"]),
+        "with merge.ff unset a fast-forwardable merge must succeed"
+    );
+    assert_eq!(
+        git::out(&clone, &["rev-parse", "main"]),
+        feature_tip,
+        "with merge.ff unset git moves main to feature's OWN oid — a new commit \
+         here would mean the default is not fast-forward, which is the whole \
+         discriminator this fixture exists to prove"
+    );
+    assert_eq!(
+        git::out(&clone, &["rev-list", "--count", "--all"]),
+        commits_before,
+        "a fast-forward writes no commit, so the clone must hold exactly the \
+         commits it started with"
     );
 
     assert!(
@@ -1079,6 +1211,50 @@ mod tests {
             "must have moved from where main started"
         );
         assert_eq!(parent_count(&clone, "main"), 2);
+    }
+
+    /// Pins `fast_forward_merge_ff_unset`: with `merge.ff` written nowhere, a
+    /// real merge moves `main` to `feature`'s own oid and writes no commit.
+    ///
+    /// The expected values here are **literals** — `"4"`, and `main == feature`
+    /// read as two separate `rev-parse` calls — rather than anything derived
+    /// from the builder, so this cannot agree with a builder that changed its
+    /// mind about what the shape is.
+    ///
+    /// Two mutations that must turn this red, in different ways (both caught
+    /// inside the builder — see the note above):
+    /// - **removes the mechanism**: add `set_local_config(&repo, "merge.ff",
+    ///   "false")` to the builder — the very line its twin has. The builder's
+    ///   own `assert!(!git::try_run(&repo, &["config", "--get", "merge.ff"]))`
+    ///   panics with "this shape is the UNSET case", before any merge is
+    ///   attempted.
+    /// - **weakens it**: give `main` a commit of its own after `feature`
+    ///   branches off, so the pair stops being fast-forwardable. `merge.ff` is
+    ///   still unset, so the emptiness assertion passes; the builder's
+    ///   `merge-base main feature == rev-parse main` assertion panics instead,
+    ///   with a different message.
+    #[test]
+    fn fast_forward_merge_ff_unset_fast_forwards_and_stays_pre_merge() {
+        let (_dir, repo) = fast_forward_merge_ff_unset();
+        assert!(!repo.join(".git/MERGE_HEAD").exists());
+        assert!(
+            !git::try_run(&repo, &["config", "--get", "merge.ff"]),
+            "merge.ff must be absent, which is the entire point of this shape"
+        );
+
+        let (_scratch, clone) = clone_onto(&repo, "main");
+        assert!(git::try_run(&clone, &["merge", "--no-edit", "feature"]));
+        assert_eq!(
+            git::out(&clone, &["rev-parse", "main"]),
+            git::out(&clone, &["rev-parse", "feature"]),
+            "the default is a fast-forward: main ends up AT feature, not merged with it"
+        );
+        assert_eq!(
+            git::out(&clone, &["rev-list", "--count", "--all"]),
+            "4",
+            "four commits before the merge and four after — a fast-forward writes none"
+        );
+        assert_eq!(parent_count(&clone, "main"), 1);
     }
 
     /// Pins `divergent_merge_ff_only`: a real merge here is refused outright,

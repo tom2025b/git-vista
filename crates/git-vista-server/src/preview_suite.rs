@@ -30,20 +30,48 @@
 //! about. A recursive copy of the repository directory is the same repository:
 //! same refs, same oids, same worktree, no `origin`.
 //!
-//! # Why several fixtures are built here rather than taken from the catalogue
+//! # Which fixtures come from the catalogue, and which are built here
+//!
+//! One rule decides it, and it is about the **oid tiebreak**, not about taste.
 //!
 //! `git_vista_fixtures::divergent` builds its commits with `git::run`, which
 //! stamps them **now**. `stable_topo_order` emits ready commits from a max-heap
-//! on `(time, Reverse(id))`, so a hypothetical commit stamped in the same
-//! second as an unrelated branch tip has its row decided by the oid tiebreak —
-//! and the hypothetical oid differs from the real one by construction. A5's
-//! two halves would then disagree about row 0 roughly half the time, for a
-//! reason that has nothing to do with the preview. The shapes built here pin
-//! their commits' dates in the past so the new commit is unambiguously newest.
-//! `merge_clean_two_branch` is used from the catalogue as-is because its merge
-//! commit is the only ready commit in its `after` window and therefore has no
-//! competitor to tie with; `cherry_pick_conflict` is used because a conflict
-//! is never laid out at all.
+//! on `(time, Reverse(id))`, so when two commits are ready at once with equal
+//! timestamps their order is decided by oid — and a hypothetical commit's oid
+//! differs from the real one by construction. A test that compares *positions*
+//! would then disagree about row 0 roughly half the time, for a reason that has
+//! nothing to do with the preview.
+//!
+//! So:
+//!
+//! * **A test that compares a layout, and whose operation adds a commit, builds
+//!   its shape here**, pinning every commit's date to [`LONG_AGO`] so the new
+//!   commit is unambiguously newest. That is [`revert_shape`],
+//!   [`cherry_pick_shape`], [`revert_shape_with_a_competitor_tip`],
+//!   [`merge_shape_with_a_competitor_tip`], plus [`fast_forward_shape`] and
+//!   [`sha256_shape`], which pin a `merge.ff` value and an object format
+//!   respectively.
+//! * **A test that compares an outcome, a tree, or a refusal takes the
+//!   catalogue shape**, because no layout is compared and none of the above
+//!   applies. That is `cherry_pick_conflict`, `merge_conflict`,
+//!   `cherry_pick_clean`, `cherry_pick_already_applied` and
+//!   `divergent_merge_ff_only`. Those shapes prove their own claims against a
+//!   real `git` on a disposable clone, which a shape built here does not, so
+//!   where both are usable the catalogue one is the stronger instrument.
+//!
+//! Two catalogue shapes *are* laid out, each for a stated reason rather than by
+//! exception:
+//!
+//! * `merge_clean_two_branch` and `fast_forward_merge_ff_false` — at every step
+//!   of their `after` window exactly **one** commit is ready, so there is never
+//!   a tie for the oid to break.
+//! * `fast_forward_merge_ff_unset` — a fast-forward adds **no** commit at all,
+//!   so there is no hypothetical oid in the comparison and both sides can be
+//!   required equal outright (see [`assert_identical_layout`]).
+//!
+//! `cherry_pick_shape` and `merge_shape_with_a_competitor_tip` therefore live
+//! on beside catalogue twins that look interchangeable and are not: the twins
+//! stamp *now*, and these two are the shapes the row-position tests need.
 //!
 //! # What three independent verifiers found green here, and what changed
 //!
@@ -82,36 +110,46 @@
 //! nothing. Keep it that way: softening it back into a count is how the weaker
 //! version was arrived at the first time.
 //!
-//! # `merge.ff` — the tests that are expected to be RED
+//! # `merge.ff` — four values, four tests, and one deliberate divergence
 //!
-//! [`resolve_plumbing`]'s merge arm reads no git config, while the executor
+//! [`resolve_plumbing`]'s merge arm reads `merge.ff` through
+//! [`fast_forward_policy`], because the executor
 //! (`planner::branch_exec::exec_merge`) runs `["merge", "--no-edit"]`, which
-//! obeys `merge.ff`. Measured in throwaway repositories on this host,
-//! 2026-08-30: with `merge.ff=false` a fast-forwardable merge produces a
-//! **two-parent commit** (`git cat-file -p HEAD` shows two `parent` lines),
-//! and with `merge.ff=only` a divergent merge exits **128** with "Not possible
-//! to fast-forward, aborting" and moves nothing. The preview draws a linear
-//! history for the first and a clean merge commit for the second. The two
-//! `merge_ff_` tests below pin what real git does; they go red until the arm
-//! learns to read the config.
+//! obeys it. Measured in throwaway repositories on this host, 2026-08-30, and
+//! reproduced as the oracle inside each test below:
 //!
-//! # The four RED tests in this file, and why each one stays
-//!
-//! A red test here is a finding. None of them may be deleted, narrowed or
-//! `#[ignore]`d to make the suite green — that is exactly what happened to the
-//! byte-level A2 tests once already.
-//!
-//! | Test | What real git does | What the preview does |
+//! | `merge.ff` | What real `git merge --no-edit` does | Test |
 //! |---|---|---|
-//! | `merge_ff_false_must_preview_the_two_parent_commit_git_actually_writes` | writes a two-parent commit | draws a fast-forward, adds nothing |
-//! | `merge_ff_only_must_not_draw_a_merge_git_refuses_to_make` | exits 128, changes nothing | draws a clean merge commit |
-//! | `a_cherry_pick_that_is_already_applied_must_not_be_drawn_as_a_clean_commit` | exits 1, leaves `CHERRY_PICK_HEAD` | draws an empty commit as an ordinary addition |
-//! | `a2_a_cancelled_preview_leaves_nothing_behind` | — | leaves a `gv-preview-*` store inside the served `.git` |
+//! | **unset** | fast-forwards; moves the ref to the branch's own oid, writes no commit | `merge_ff_unset_previews_the_fast_forward_git_actually_performs` |
+//! | `false` | writes a **two-parent commit** (`git cat-file -p HEAD` shows two `parent` lines) | `merge_ff_false_must_preview_the_two_parent_commit_git_actually_writes` |
+//! | `only`, divergent | exits **128**, "Not possible to fast-forward, aborting", moves nothing | `merge_ff_only_must_not_draw_a_merge_git_refuses_to_make` |
+//! | `banana` | **ignores it** and keeps the default — git does not barf on values from future versions | `merge_ff_set_to_an_unparseable_value_refuses_instead_of_defaulting` |
 //!
-//! The first three are the merge/pick arms not asking questions they have the
-//! answers to; the fourth is `git_output`'s `kill_on_drop(false)`. Each test's
-//! own doc comment carries the measurement and the two mutations to check the
-//! fix against.
+//! The unset row is the one that is easiest to leave untested and the one that
+//! matters most, because it is what nearly every repository is in. Every other
+//! fast-forwardable shape in this file writes `merge.ff = true` into its own
+//! config, so before its test existed, inverting
+//! [`fast_forward_policy`]'s key-absent arm from `Allow` to `Never` left the
+//! whole binary green (measured, 2026-08-30) — reintroducing the defect the
+//! `merge.ff` round was about, undetected.
+//!
+//! The last row is the one place this module is deliberately **stricter than
+//! git**: an unparseable value refuses rather than defaulting, so the user sees
+//! no picture instead of a picture drawn from a value neither party understood.
+//! That is a posture, recorded in ADR 0099, and its test is what stops someone
+//! "fixing" it to default with a green suite.
+//!
+//! # No test in this file is carried red, and none may be deleted to keep it so
+//!
+//! Four tests here were carried red as findings while the arms they pin were
+//! wrong: the two `merge_ff_` tests above, the already-applied cherry-pick, and
+//! `a2_a_cancelled_preview_leaves_nothing_behind`. All four now pass, and each
+//! carries its own measurement plus the two mutations that must turn it red
+//! again, in its own doc comment, under "Two mutations".
+//!
+//! A red test here is a finding, not a defect in the test. None may be deleted,
+//! narrowed or `#[ignore]`d to make the suite green — that is exactly what
+//! happened to the byte-level A2 tests once already.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -276,38 +314,6 @@ fn merge_shape_with_a_competitor_tip() -> (TempDir, PathBuf) {
     git::run(&repo, &["checkout", "-q", "main"]);
     git::write(&repo, "main-alpha.txt", b"alpha\n");
     commit_old(&repo, "main: alpha");
-    (dir, repo)
-}
-
-/// `main` and `feature` editing the **same line** of the same file from a
-/// shared base: merging `feature` into `main` is a real conflict.
-///
-/// Deliberately not "two branches that add different files": that merges
-/// cleanly under a correct implementation *and* under most broken ones, so it
-/// could not tell them apart.
-fn merge_conflict_shape() -> (TempDir, PathBuf) {
-    let dir = TempDir::new().expect("tempdir");
-    let repo = dir.path().join("repo");
-    git::init(&repo);
-    let base: String = (1..=10).map(|n| format!("line {n}\n")).collect();
-    git::write(&repo, "target.txt", base.as_bytes());
-    commit_old(&repo, "base");
-
-    git::run(&repo, &["checkout", "-q", "-b", "feature"]);
-    git::write(
-        &repo,
-        "target.txt",
-        base.replace("line 5\n", "line 5 by feature\n").as_bytes(),
-    );
-    commit_old(&repo, "feature: edit line 5");
-
-    git::run(&repo, &["checkout", "-q", "main"]);
-    git::write(
-        &repo,
-        "target.txt",
-        base.replace("line 5\n", "line 5 by main\n").as_bytes(),
-    );
-    commit_old(&repo, "main: edit line 5");
     (dir, repo)
 }
 
@@ -928,26 +934,52 @@ async fn a2_a_conflicting_preview_changes_no_byte_under_the_git_directory() {
 /// **A2, cancellation.** A preview whose future is *dropped* part-way through
 /// leaves nothing behind either.
 ///
-/// # This is RED, and it is a finding, not a broken test
+/// # What "leaves nothing behind" means here, and why it is not "within 150 ms"
 ///
-/// `ScratchStore::new` awaits `git init --bare <scratch>` through
-/// `git_cmd::git_output`, whose `git_output_for` does `cmd.output().await` with
-/// tokio's default `kill_on_drop(false)`. Dropping the future here *does* run
-/// `TempDir::drop` and remove the directory — and the orphaned `git init` is
-/// not signalled, so it goes on to write the store back. `git_cmd` already has
-/// `git_output_bounded`, which sets `kill_on_drop(true)` and closes stdin, and
-/// its doc comment spells out why: "`.kill_on_drop(true)` is what makes the
-/// timeout actually a timeout rather than a detach". This is the arm that does
-/// not use it.
+/// The defect this test was written for is fixed: `ScratchStore::new` used to
+/// await `git init --bare <scratch>` through a spawn that detached its child on
+/// drop, so cancelling ran `TempDir::drop`, removed the directory, and let the
+/// unsignalled orphan write the whole store straight back inside the served
+/// `.git`, where it survived until `sweep_stale` found it an hour later.
+/// `preview` now runs its work in a detached task and bails at the first
+/// checkpoint *after* an awaited spawn, so nothing is removed while a `git` is
+/// still writing into it and nothing is left once the step returns.
 ///
-/// Measured on this host, 2026-08-30, by running this test: cancelling inside
-/// the window in which `git init` is the outstanding await leaves a
-/// `gv-preview-*` directory inside the served repository's `.git` — in the
-/// runs recorded here carrying `objects/`, `objects/info`, `objects/pack` and,
-/// when the cancellation lands a little later, `HEAD`, `config`, `refs/heads`
-/// and `refs/tags` as well. It survives until `sweep_stale` finds it an hour
-/// later. Three consecutive runs reproduced it at 42.5 ms, 40.8 ms and
-/// 40.2 ms, against a whole preview of ~105 ms.
+/// **The bound this test used to assert was the wrong contract, and it made the
+/// test flaky rather than strict.** It slept a fixed 150 ms after each
+/// cancellation and called anything still on disk a leak. But the residue
+/// window is not a constant — it is the length of the *spawn that was in
+/// flight*, and `preview.rs`'s own doc records individual `git init --bare`
+/// calls on this host at **128 ms** and **1.16 s**. Measured 2026-08-30, this
+/// file: run alone the test passed 5 times out of 5, and run inside the full
+/// 1078-test binary it failed 3 times out of 3 — every failure the same shape,
+/// a store holding `HEAD`, `config`, `refs/heads/` and `refs/tags/` and
+/// **no `objects/`**, which is `git init` part-way through its own work (it
+/// creates the ref directories, `HEAD` and `config` before `objects/`), not a
+/// store anybody abandoned. With the wait below in place the same full-suite
+/// run is green — 4 runs of 4 — and the slowest cancellation in each cleared in
+/// **350.8 ms, 155.5 ms, 461.7 ms and 174.3 ms**. Every one of those is over
+/// the old fixed bound, and every one is a factor of twenty inside the
+/// ceiling; the run this test prints its own figure on each time, so the margin
+/// is visible rather than asserted.
+///
+/// So the test now waits for the repository to settle
+/// ([`wait_for_the_repository_to_settle`], floor [`SETTLE_FLOOR`], ceiling
+/// [`SETTLE_CEILING`]) and asserts what its name says: **nothing survives**.
+/// That is strictly the A2 criterion. It is not a weakening — every way of
+/// breaking the cleanup produces residue that never clears, so the ceiling is
+/// reached and the assertion fires; what the fixed sleep added was a race with
+/// the machine's load, which is not a property of `preview.rs`.
+///
+/// # The case this test does NOT cover, named rather than implied
+///
+/// A partially-built store exists inside the served `.git` for the life of the
+/// in-flight spawn, and if the tokio **runtime itself** is torn down mid-task
+/// the task is dropped where it stands and that store survives. Neither is
+/// covered here: this test drives cancellation, not shutdown. ADR 0099 records
+/// the teardown case as an open consequence in the same class as `SIGKILL` and
+/// power loss — `ScratchStore::sweep_stale` is what covers it — and records the
+/// transient window as a stated cost of the design.
 ///
 /// **The window is a few milliseconds wide, and the sweep is aimed at it
 /// deliberately.** A geometric ladder over the whole call (200 µs, 500 µs,
@@ -973,16 +1005,45 @@ async fn a2_a_conflicting_preview_changes_no_byte_under_the_git_directory() {
 /// draft of this test did return it, and would have failed on its own sampler
 /// assertion whatever the code under test did.)
 ///
-/// # Two mutations, once the arm is fixed
+/// # Two mutations, both run and both caught (2026-08-30, in a scratch clone)
 ///
-/// 1. **Removes the mechanism** — go back to `cmd.output()` without
-///    `kill_on_drop`. The orphan rewrites the store and `leaked` names every
-///    timeout in the `git init` window.
-/// 2. **Weakens it** — keep the kill-on-drop spawn but `std::mem::forget` the
-///    `TempDir`. No orphan is involved at all, yet the directory still
-///    survives — a leak from the other end of the same lifetime, reported at
-///    **every** timeout rather than only those inside that window, and the
-///    completed calls leak too.
+/// 1. **Removes the detachment** — replace `preview`'s
+///    `tokio::spawn(...)` + `task.await` with a direct `compute(...).await`, so
+///    the caller's future owns the work again. That is the original defect
+///    exactly: dropping it runs `TempDir::drop` mid-`git init` and the
+///    unsignalled orphan writes the store straight back. Caught at the first
+///    rung, 35.6 ms, with a `gv-preview-*` directory still present after
+///    [`SETTLE_CEILING`].
+/// 2. **Removes the removal** — return the store from `ScratchStore::new` as a
+///    `PathBuf` via `TempDir::into_path`, so nothing ever deletes it. No orphan
+///    and no signal is involved; the directory simply never goes away. Also
+///    caught at the first rung, and with **two** surviving directories rather
+///    than one, because every completed preview leaks as well.
+///
+/// The two break different mechanisms — a removal that races a live child, and
+/// a removal that never happens — and only the second is visible to a completed
+/// call. They land on the same assertion because this test has one verdict; the
+/// instruments that could fail separately (the planted detector, the sampler)
+/// are checked before it and are what stop that verdict being free.
+///
+/// # One mutation that SURVIVES, and why that is not a hole in this test
+///
+/// Swapping `preview_git` for `git_cmd::git_output_bounded` — kill-on-drop, the
+/// change that suggests itself as *the fix* — leaves this test green: measured
+/// 2026-08-30, 3 of 3 runs alone and the whole 1080-test binary green with it
+/// in place. That is correct, and it is worth stating rather than papering
+/// over. `preview` detaches its task, so a cancelled caller never drops a
+/// child and `kill_on_drop` has nothing to fire on *in this path*. What it does
+/// fire on is runtime teardown, which this test does not drive.
+///
+/// **The consequence is a correction to a citation, not to this test.**
+/// `preview_git`'s own doc comment carries a table — `git_output_bounded` "0 of
+/// 5 runs green" against `git_output`'s "12 of 13" — offered as evidence that
+/// kill-on-drop is strictly worse here. Those numbers were taken against this
+/// test's *old* fixed 150 ms settle, and under a wait that lets the in-flight
+/// spawn finish they do not reproduce: both arities leave nothing behind. The
+/// argument for `git_output` still stands on the teardown case; the measurement
+/// quoted for it no longer does.
 #[tokio::test]
 async fn a2_a_cancelled_preview_leaves_nothing_behind() {
     let (_dir, repo) = revert_shape();
@@ -1081,18 +1142,17 @@ async fn a2_a_cancelled_preview_leaves_nothing_behind() {
     }
 
     let mut leaked: Vec<(Duration, Vec<String>, Vec<String>)> = Vec::new();
+    let mut slowest_clear = Duration::ZERO;
     for limit in timeouts {
         let completed = tokio::time::timeout(limit, preview(&repo, &plan))
             .await
             .is_ok();
-        // Long enough for any orphaned child to finish whatever it was doing:
-        // what matters is what survives once everything has settled, not what
-        // is momentarily on disk.
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let dirs = scratch_dirs(&commondir);
-        let diff = manifest_diff(&before, &git_dir_manifest(&commondir));
+        let (settled_after, dirs, diff) =
+            wait_for_the_repository_to_settle(&commondir, &before).await;
+        slowest_clear = slowest_clear.max(settled_after);
         println!(
-            "cancelled at {limit:?}: completed={completed} dirs={} diff={}",
+            "cancelled at {limit:?}: completed={completed} settled_after={settled_after:?} \
+             dirs={} diff={}",
             dirs.len(),
             diff.len()
         );
@@ -1110,11 +1170,68 @@ async fn a2_a_cancelled_preview_leaves_nothing_behind() {
             break;
         }
     }
+    println!(
+        "the slowest cancellation took {slowest_clear:?} to leave the repository clean \
+         (floor {SETTLE_FLOOR:?}, ceiling {SETTLE_CEILING:?})"
+    );
     assert!(
         leaked.is_empty(),
-        "a cancelled preview left residue inside the served repository \
-         (timeout, surviving directories, byte diff):\n{leaked:#?}"
+        "a cancelled preview left residue inside the served repository after \
+         {SETTLE_CEILING:?} (timeout, surviving directories, byte diff):\n{leaked:#?}"
     );
+}
+
+/// How long [`wait_for_the_repository_to_settle`] waits before it first looks.
+///
+/// A floor, not a guess. Cancelling at 200 µs drops the caller's future *before*
+/// the detached task has created a store at all, so a check taken immediately
+/// would find the repository clean for the trivial reason that nothing had
+/// happened yet — and would then miss a store created 5 ms later. 150 ms is the
+/// value this test used as its whole settle period before it learned to wait,
+/// and it is kept as the floor for exactly the coverage it was giving.
+const SETTLE_FLOOR: Duration = Duration::from_millis(150);
+
+/// How long [`wait_for_the_repository_to_settle`] keeps waiting after the floor
+/// before it calls what it sees a leak.
+///
+/// Sized off the spawn, because the residue window *is* the spawn's length:
+/// `preview.rs`'s own doc records individual `git init --bare` calls taking
+/// **128 ms** and **1.16 s** on this host, and this suite runs 4-way parallel
+/// with 1077 other tests. Ten seconds is roughly eight times the slowest
+/// measured init and still finite, so a store that is genuinely abandoned —
+/// which is what every mutation of the cleanup mechanism produces — is reported
+/// rather than waited on forever.
+const SETTLE_CEILING: Duration = Duration::from_secs(10);
+
+/// Wait for a cancelled preview's residue to disappear, and report how long
+/// that took.
+///
+/// Returns `(elapsed, surviving directories, byte diff)`. An empty pair means
+/// the served repository is byte-identical to `before` again; a non-empty one
+/// means it still was not after [`SETTLE_CEILING`], which is the leak.
+///
+/// # Why this waits instead of sleeping a fixed 150 ms
+///
+/// Because "150 ms" is not the contract and never was — see
+/// [`a2_a_cancelled_preview_leaves_nothing_behind`]'s doc comment for the
+/// measurement that made that concrete.
+async fn wait_for_the_repository_to_settle(
+    commondir: &Path,
+    before: &[String],
+) -> (Duration, Vec<String>, Vec<String>) {
+    let started = std::time::Instant::now();
+    tokio::time::sleep(SETTLE_FLOOR).await;
+    loop {
+        let dirs = scratch_dirs(commondir);
+        let diff = manifest_diff(before, &git_dir_manifest(commondir));
+        if dirs.is_empty() && diff.is_empty() {
+            return (started.elapsed(), dirs, diff);
+        }
+        if started.elapsed() >= SETTLE_CEILING {
+            return (started.elapsed(), dirs, diff);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// **A2, linked worktree.** A preview driven from a linked worktree changes no
@@ -1736,6 +1853,20 @@ async fn a5_a_previewed_revert_writes_the_tree_a_real_revert_writes() {
 /// commit as its own merge base would produce a commit with the right parents
 /// in the right lane whose tree was simply HEAD's.
 ///
+/// # Why the catalogue's `cherry_pick_clean` and not this file's own shape
+///
+/// This test compares **trees**, never a layout, so the dating hazard that
+/// makes the suite build its own shapes for the parity tests (see the module
+/// doc) does not apply — and the catalogue shape is the better instrument
+/// here. It proves on a disposable clone that a real `git cherry-pick` applies,
+/// and it is built so its merged tree is provably *not* `main`'s own tree,
+/// which is exactly the non-triviality
+/// [`assert_tree_matches_the_real_run`] checks. It is also the half of a
+/// deliberate pair: [`git_vista_fixtures::cherry_pick_already_applied`], used
+/// by `a_cherry_pick_that_is_already_applied_must_not_be_drawn_as_a_clean_commit`
+/// below, is the other, and a tree comparison asserted against only one of the
+/// two would still pass an implementation that always answered "different".
+///
 /// # Two mutations
 ///
 /// 1. **Removes the mechanism** — use the picked commit itself as
@@ -1746,7 +1877,7 @@ async fn a5_a_previewed_revert_writes_the_tree_a_real_revert_writes() {
 ///    equality goes red on a different oid than mutation 1 produces.
 #[tokio::test]
 async fn a5_cherry_pick_actually_moves_the_content() {
-    let (_dir, repo) = cherry_pick_shape();
+    let (_dir, repo) = git_vista_fixtures::cherry_pick_clean();
     let topic = git::out(&repo, &["rev-parse", "topic"]);
     let op = GitOperation::CherryPick {
         commit: CommitOid::new(topic.clone()).expect("a full hex oid"),
@@ -1900,6 +2031,16 @@ async fn a5_the_previewed_merges_row_is_decided_by_its_timestamp() {
 /// fail and leave the path conflicted. Without that, a preview reporting a
 /// conflict on a shape that merges cleanly would look correct.
 ///
+/// # Why the catalogue's `merge_conflict` and not this file's own shape
+///
+/// A `Conflict` outcome carries no layout, so the dating hazard that makes this
+/// file build its own shapes for the parity tests (see the module doc) does not
+/// apply, and the catalogue shape is strictly the better one: it is two commits
+/// deep on each side rather than one, and it proves on a disposable clone that
+/// a real `git merge` conflicts and leaves all three index stages behind — a
+/// claim any caller gets for free, rather than one this file has to restate.
+/// ADR 0099 names it as the fixture built for exactly this test.
+///
 /// # Two mutations
 ///
 /// 1. **Removes the mechanism** — classify `Some(1)` as
@@ -1912,32 +2053,32 @@ async fn a5_the_previewed_merges_row_is_decided_by_its_timestamp() {
 ///    the whole feature exists to prevent.
 #[tokio::test]
 async fn a3_a_conflicting_merge_answers_conflict_naming_the_file() {
-    let (_dir, repo) = merge_conflict_shape();
+    let (_dir, repo) = git_vista_fixtures::merge_conflict();
 
     let (_scratch, copy) = copy_of(&repo);
     assert!(
-        !git::try_run(&copy, &["merge", "--no-edit", "feature"]),
+        !git::try_run(&copy, &["merge", "--no-edit", "incoming"]),
         "the fixture must really conflict under real git, or this test's \
          expectation is not git's"
     );
     assert!(
         git::out(&copy, &["diff", "--name-only", "--diff-filter=U"])
             .lines()
-            .any(|line| line == "target.txt"),
-        "real git must leave `target.txt` unmerged"
+            .any(|line| line == "shared.txt"),
+        "real git must leave `shared.txt` unmerged"
     );
 
     let plan = plan_for(
         &repo,
         GitOperation::MergeBranch {
-            branch: BranchName::new("feature").expect("a valid branch name"),
+            branch: BranchName::new("incoming").expect("a valid branch name"),
         },
     )
     .await;
     match preview(&repo, &plan).await {
         PreviewOutcome::Conflict { paths } => assert_eq!(
             paths,
-            vec!["target.txt".to_string()],
+            vec!["shared.txt".to_string()],
             "the conflicted path must be the file itself, not git's prose"
         ),
         other => panic!("expected Conflict for a conflicting merge, got {other:?}"),
@@ -2035,59 +2176,38 @@ async fn a_fast_forward_merge_moves_the_refs_and_adds_no_commit() {
     );
 }
 
-/// `topic`'s edit is **already present** on `main`, byte for byte, from a
-/// separate commit. Cherry-picking `topic`'s tip therefore produces nothing.
-///
-/// Measured on this host, 2026-08-30: `git cherry-pick <topic>` prints "The
-/// previous cherry-pick is now empty", exits **1**, leaves HEAD where it was
-/// and leaves `.git/CHERRY_PICK_HEAD` behind — the repository is mid-sequence
-/// and needs `--skip` or `--abort`.
-fn cherry_pick_already_applied_shape() -> (TempDir, PathBuf) {
-    let dir = TempDir::new().expect("tempdir");
-    let repo = dir.path().join("repo");
-    git::init(&repo);
-    let base: String = (1..=10).map(|n| format!("line {n}\n")).collect();
-    let edited = base.replace("line 5\n", "line 5 edited\n");
-    git::write(&repo, "target.txt", base.as_bytes());
-    commit_old(&repo, "base");
-
-    git::run(&repo, &["checkout", "-q", "-b", "topic"]);
-    git::write(&repo, "target.txt", edited.as_bytes());
-    commit_old(&repo, "topic: edit line five");
-
-    git::run(&repo, &["checkout", "-q", "main"]);
-    git::write(&repo, "target.txt", edited.as_bytes());
-    commit_old(&repo, "main: the same edit, independently");
-    (dir, repo)
-}
-
 /// **A cherry-pick whose change is already applied.** Real `git cherry-pick`
 /// refuses and strands the repository mid-sequence, so there is no clean added
 /// commit to draw.
 ///
-/// # Expected to be RED
+/// # The defect this was carried red for, and what closed it
 ///
-/// `resolve_plumbing`'s `CherryPick` arm never compares the merged tree against
-/// HEAD's, so `merge-tree` answers HEAD's own tree, `commit-tree` wraps it in
-/// an **empty** commit and the preview draws it as an ordinary addition. What
-/// the user is shown is a tidy new row; what they get on pressing the button is
-/// exit 1, a `CHERRY_PICK_HEAD` and a repository they have to `--abort` out of.
+/// The cherry-pick arm used to compare nothing: `merge-tree` answered HEAD's
+/// own tree, `commit-tree` wrapped it in an **empty** commit and the preview
+/// drew it as an ordinary addition. What the user was shown was a tidy new row;
+/// what they got on pressing the button was exit 1, a `CHERRY_PICK_HEAD` and a
+/// repository they had to `--abort` out of. `compute` now carries the recipe's
+/// `no_op` and refuses when the merged tree equals HEAD's.
 ///
-/// The signal needed to refuse is already in hand and is asserted below: the
-/// tree `merge_tree` returns **equals** HEAD's tree, which is precisely the
-/// "this pick contributes nothing" fact. That assertion is not decoration — it
-/// is the evidence that the fix costs one comparison rather than a new spawn.
+/// The signal needed to refuse was always in hand, and it is still asserted
+/// below: the tree `merge_tree` returns **equals** HEAD's tree, which is
+/// precisely the "this pick contributes nothing" fact. That assertion is not
+/// decoration — it is the evidence that the refusal costs one comparison rather
+/// than a new spawn, and it is what makes the outcome assertion below mean
+/// something rather than passing on a fixture that never reached the arm.
 ///
-/// # What this asserts, and the design decision left open
+/// # What this asserts, and what it deliberately does not
 ///
-/// Only that the outcome is **not a `Graph`**. Whether the right answer is
-/// `Unavailable { CheckFailed }`, `Unsupported`, or a fifth outcome that says
-/// "this operation would do nothing and then stop" is a contract decision for
-/// whoever fixes the arm. Asserting "no `Added` change" instead would be
+/// Only that the outcome is **not a `Graph`**. The shipped answer is
+/// `Unavailable { CheckFailed }`, and this test does not pin that: which
+/// refusal is right — that, `Unsupported`, or a fifth outcome meaning "this
+/// would do nothing and then stop" — is a contract question, and pinning it
+/// from here would make a deliberate contract change look like a regression.
+/// Asserting "no `Added` change" instead would be *weaker*, not narrower: it is
 /// satisfied by routing this to a `Graph` with `changes: []`, which still tells
 /// the user the pick is a harmless no-op when it is in fact an error.
 ///
-/// # Two mutations, once the arm is fixed
+/// # Two mutations
 ///
 /// 1. **Removes the mechanism** — drop the tree-versus-HEAD comparison: the
 ///    preview draws the empty commit again and this assertion names the
@@ -2099,7 +2219,7 @@ fn cherry_pick_already_applied_shape() -> (TempDir, PathBuf) {
 ///    the two comparisons are not interchangeable.
 #[tokio::test]
 async fn a_cherry_pick_that_is_already_applied_must_not_be_drawn_as_a_clean_commit() {
-    let (_dir, repo) = cherry_pick_already_applied_shape();
+    let (_dir, repo) = git_vista_fixtures::cherry_pick_already_applied();
     let topic = git::out(&repo, &["rev-parse", "topic"]);
     let head_tree = git::out(&repo, &["rev-parse", "HEAD^{tree}"]);
 
@@ -2144,28 +2264,290 @@ async fn a_cherry_pick_that_is_already_applied_must_not_be_drawn_as_a_clean_comm
 }
 
 // ---------------------------------------------------------------------------
-// `merge.ff` — what the executor will really do, which the preview does not ask
+// `merge.ff` — what the executor will really do, and what the preview asks
 // ---------------------------------------------------------------------------
+
+/// Compare a preview's `after` half against a real run's layout when the
+/// operation creates **no commit**, so every id on both sides is one that
+/// already existed and nothing has to be mapped.
+///
+/// [`assert_parity`] cannot be used for these: it *requires* exactly one novel
+/// commit on each side, because a hypothetical `commit-tree` oid can never
+/// equal a real one. A fast-forward has none, which is precisely the claim, and
+/// that makes the comparison strictly stronger here — the two graphs must be
+/// equal outright, oids included.
+///
+/// The three non-triviality guards are asserted about the **oracle**, never
+/// about the preview, for the reason [`assert_parity`] states: an equality
+/// between two empty or single-row layouts passes while the mechanism it claims
+/// to check is gone.
+fn assert_identical_layout(after: &Graph, real: &Graph, before: &Graph, what: &str) {
+    assert!(
+        real.rows.len() > 1,
+        "{what}: a one-row layout cannot show a placement mistake — the \
+         fixture is too small to prove anything"
+    );
+    assert!(
+        !real.edges.is_empty(),
+        "{what}: the real layout drew no edges at all, so comparing edge sets \
+         would compare two empty vectors and pass whatever the preview did"
+    );
+    assert_ne!(
+        real.rows, before.rows,
+        "{what}: the real run left the layout exactly as it found it, so \
+         `after == real` would also hold for a preview that reported nothing \
+         happening at all"
+    );
+
+    assert_eq!(
+        after.rows, real.rows,
+        "{what}: the rows differ — commit, row, lane, ref badges and colour are \
+         all compared here, because all of them are what the user reads"
+    );
+    assert_eq!(
+        after.edges, real.edges,
+        "{what}: the lines drawn between rows differ"
+    );
+    assert_eq!(
+        after.lane_count, real.lane_count,
+        "{what}: the gutter widths differ"
+    );
+    assert_eq!(after.stubs, real.stubs, "{what}: the branch stubs differ");
+}
+
+/// **`merge.ff` unset — the configuration nearly every repository is in.** Real
+/// `git merge --no-edit` fast-forwards; the preview must report that ref move
+/// and add no commit.
+///
+/// # Why this test exists at all, when two `merge.ff` tests already did
+///
+/// Because both of those pin a *set* value, and every other fast-forwardable
+/// shape in this file writes `merge.ff = true` into its own config. The
+/// **unset** arm of [`fast_forward_policy`] — git's documented default — was
+/// therefore pinned by nothing: measured on this host 2026-08-30, changing that
+/// arm from `Allow` to `Never` left the whole binary green, which reintroduces
+/// the exact "confidently wrong picture" defect the `merge.ff` round was about.
+///
+/// # Why the premise is checked twice, through two different launchers
+///
+/// The oracle below runs through `git_vista_fixtures::git`, which pins
+/// `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` to `/dev/null`. The preview does
+/// **not**: `sandbox::spawn` passes `$HOME` through and grants it read-only, so
+/// a developer's own `~/.gitconfig merge.ff` reaches every spawn the server
+/// makes (`fast_forward_policy`'s own doc says so). On such a host the two
+/// sides would be answering different questions, and this test would report the
+/// preview wrong when it was right. So the fixture asserts its own emptiness
+/// with its launcher, and this asserts it again with [`preview_git`] — the
+/// server's own path, the only config visibility that matters here. Removing
+/// either check makes the oracle unsound rather than merely less thorough.
+///
+/// # Two mutations
+///
+/// 1. **Removes the mechanism** — return `FastForward::Never` from
+///    [`fast_forward_policy`]'s `Some(1)` (key absent) arm. The preview
+///    synthesises a two-parent merge commit git would not write, so `changes`
+///    carries an `Added` and the first assertion goes red.
+/// 2. **Weakens it** — keep `Allow` but hand `lay_out` an empty `ref_moves`.
+///    Still no commit, so the `Added` assertion passes and so does the row
+///    comparison's commit list — the **`RefMoved`** assertions go red instead,
+///    naming a ref the user is told will move and is not, and
+///    [`assert_identical_layout`] goes red on the badges.
+#[tokio::test]
+async fn merge_ff_unset_previews_the_fast_forward_git_actually_performs() {
+    let (_dir, repo) = git_vista_fixtures::fast_forward_merge_ff_unset();
+
+    // The premise, read through the launcher the preview itself uses.
+    let probe = preview_git(&repo, &["config", "--get", "merge.ff"])
+        .await
+        .expect("run git config through the preview's own launcher");
+    assert_eq!(
+        probe.status.code(),
+        Some(1),
+        "`git config --get merge.ff` must exit 1 (key absent) for the spawn the \
+         SERVER makes, not merely for the fixture's own /dev/null-config \
+         launcher — this host appears to set merge.ff somewhere the preview can \
+         see it ({:?}), and with that set this test's oracle and its subject are \
+         answering different questions",
+        String::from_utf8_lossy(&probe.stdout)
+    );
+
+    let before_layout = layout_of(&repo);
+    let head_before = git::out(&repo, &["rev-parse", "HEAD"]);
+    let feature_tip = git::out(&repo, &["rev-parse", "feature"]);
+
+    // The oracle: the executor's own argv, on a copy.
+    let (_scratch, copy) = copy_of(&repo);
+    let commits_before = git::out(&copy, &["rev-list", "--count", "--all"]);
+    git::run(&copy, &["merge", "--no-edit", "feature"]);
+    assert_eq!(
+        git::out(&copy, &["rev-parse", "HEAD"]),
+        feature_tip,
+        "with merge.ff unset a real merge moves HEAD to feature's OWN oid — if \
+         this fails, git's default is not what this test was written against"
+    );
+    assert_eq!(
+        git::out(&copy, &["rev-list", "--count", "--all"]),
+        commits_before,
+        "a fast-forward writes no commit"
+    );
+    let real = layout_of(&copy);
+
+    let plan = plan_for(
+        &repo,
+        GitOperation::MergeBranch {
+            branch: BranchName::new("feature").expect("a valid branch name"),
+        },
+    )
+    .await;
+    let (graph, changes) = expect_graph(preview(&repo, &plan).await);
+
+    assert!(
+        !changes
+            .iter()
+            .any(|c| matches!(c, PreviewChange::Added { .. })),
+        "git fast-forwards here, creating no commit, so nothing may be reported \
+         as added: {changes:?}"
+    );
+    assert!(
+        changes.contains(&PreviewChange::RefMoved {
+            ref_name: "main".to_string(),
+            from: Oid(head_before.clone()),
+            to: Oid(feature_tip.clone()),
+        }),
+        "the checked-out branch must be reported as moving to feature's tip: {changes:?}"
+    );
+    assert!(
+        changes.contains(&PreviewChange::RefMoved {
+            ref_name: "HEAD".to_string(),
+            from: Oid(head_before),
+            to: Oid(feature_tip),
+        }),
+        "HEAD moves with the branch it is attached to: {changes:?}"
+    );
+    assert_identical_layout(&graph.after, &real, &before_layout, "merge.ff unset");
+}
+
+/// **`merge.ff = banana`.** git ignores a value it cannot parse and keeps its
+/// default; this preview **refuses** instead, and that divergence is deliberate.
+///
+/// # The measurement, and why the divergence is the right way round
+///
+/// Measured on this host, 2026-08-30, in a throwaway repository built like this
+/// one: `git config --get merge.ff` prints `banana` and exits 0;
+/// `git config --type=bool --get merge.ff` exits **128** with `fatal: bad
+/// boolean config value 'banana' for 'merge.ff'`; and `git merge --no-edit
+/// feature` **fast-forwards normally** — `builtin/merge.c` deliberately does
+/// not barf on values from future versions of git. The oracle below reproduces
+/// that, so this test states what git does rather than assuming it.
+///
+/// [`fast_forward_policy`] answers `Unavailable { CheckFailed }` here. That is
+/// stricter than git, in the only direction that is safe: the user sees no
+/// picture rather than a picture drawn from a value neither party understood,
+/// and it is the case a future git could give a *meaning* to, at which point
+/// silently defaulting would become silently wrong.
+///
+/// Nothing pinned that choice before this test, so "fixing" it to default
+/// quietly would have been a green change. It is a posture, not an accident,
+/// and it is recorded in ADR 0099 under "Where it still refuses rather than
+/// guesses".
+///
+/// # Two mutations
+///
+/// 1. **Removes the mechanism** — make the `--type=bool` failure arm return
+///    `Ok(FastForward::Allow)` instead of an error, i.e. default the way git
+///    does. The outcome becomes a `Graph` and the match arm goes red naming it.
+/// 2. **Weakens it** — keep the refusal but drop `{raw:?}` from the message.
+///    The outcome is still `CheckFailed`, so the match arm passes, and so does
+///    the "names the value" assertion — git's own stderr, which the message
+///    also carries, happens to contain `banana` too. The **quoted-literal**
+///    assertion is the one that goes red, which is exactly why it is written
+///    separately: this module's own rendering of the value is the part it
+///    controls, and it is what keeps `merge.ff = " only"` or an empty value
+///    from being invisible.
+#[tokio::test]
+async fn merge_ff_set_to_an_unparseable_value_refuses_instead_of_defaulting() {
+    let (_dir, repo) = git_vista_fixtures::fast_forward_merge_ff_unset();
+    git::run(&repo, &["config", "--local", "merge.ff", "banana"]);
+
+    // The oracle: real git ignores the value and keeps its default.
+    let feature_tip = git::out(&repo, &["rev-parse", "feature"]);
+    let (_scratch, copy) = copy_of(&repo);
+    assert_eq!(
+        git::out(&copy, &["config", "--get", "merge.ff"]),
+        "banana",
+        "the copy must carry the setting, or the oracle below is not the case \
+         this test is about"
+    );
+    git::run(&copy, &["merge", "--no-edit", "feature"]);
+    assert_eq!(
+        git::out(&copy, &["rev-parse", "HEAD"]),
+        feature_tip,
+        "git must IGNORE an unparseable merge.ff and fast-forward anyway — the \
+         whole point of this test is that the preview is deliberately stricter \
+         than that, so if git started refusing, the divergence would be gone \
+         and this test would be pinning nothing"
+    );
+
+    let plan = plan_for(
+        &repo,
+        GitOperation::MergeBranch {
+            branch: BranchName::new("feature").expect("a valid branch name"),
+        },
+    )
+    .await;
+    match preview(&repo, &plan).await {
+        PreviewOutcome::Unavailable {
+            reason: PreviewUnavailable::CheckFailed { detail },
+        } => {
+            assert!(
+                detail.contains("banana"),
+                "the refusal must name the value it choked on, or the user \
+                 cannot act on it: {detail}"
+            );
+            assert!(
+                detail.contains("\"banana\""),
+                "the refusal must name the value as a QUOTED literal, and this \
+                 one names it only in git's own stderr. The quoting is what \
+                 makes `merge.ff = \" only\"` — or an empty value — visible at \
+                 all, and git's stderr is a fallback this module does not \
+                 control: {detail}"
+            );
+            assert!(
+                detail.contains("merge.ff"),
+                "the refusal must name the setting: {detail}"
+            );
+        }
+        other => panic!(
+            "an unparseable merge.ff must refuse — a value neither git-vista \
+             nor the reader understands must not produce a picture; got {other:?}"
+        ),
+    }
+}
 
 /// **`merge.ff = false`, fast-forwardable.** Real `git merge --no-edit` writes
 /// a **two-parent commit**; the preview must draw that commit.
 ///
-/// # Expected to be RED until the merge arm reads the config
+/// # The defect this was carried red for, and what closed it
 ///
-/// `resolve_plumbing`'s `Previewable::Merge` arm decides between
-/// `AlreadyUpToDate`, `FastForward` and `Synthesize` from `merge-base` alone
-/// and reads no git config at any point. `planner::branch_exec::exec_merge`
-/// runs `["merge", "--no-edit"]`, which obeys `merge.ff`. Measured in a
-/// throwaway repository on this host, 2026-08-30: with `merge.ff=false` on a
-/// fast-forwardable branch git printed "Merge made by the 'ort' strategy" and
-/// `git cat-file -p HEAD` showed two `parent` lines. The preview takes the
-/// `FastForward` arm and draws a linear history with nothing added.
+/// `resolve_plumbing`'s `Previewable::Merge` arm used to decide between
+/// `AlreadyUpToDate`, `FastForward` and `Synthesize` from `merge-base` alone,
+/// reading no git config at any point, while
+/// `planner::branch_exec::exec_merge` runs `["merge", "--no-edit"]`, which
+/// obeys `merge.ff`. Measured in a throwaway repository on this host,
+/// 2026-08-30: with `merge.ff=false` on a fast-forwardable branch git printed
+/// "Merge made by the 'ort' strategy" and `git cat-file -p HEAD` showed two
+/// `parent` lines, while the preview took the `FastForward` arm and drew a
+/// linear history with nothing added. The arm now asks
+/// [`fast_forward_policy`], and this fixture — the catalogue's
+/// `fast_forward_merge_ff_false`, which writes the setting into its own local
+/// config and proves on a disposable clone that a real merge there is a
+/// two-parent commit — is what holds it to that.
 ///
 /// That is the confidently-wrong picture ADR 0099 exists to make impossible,
 /// and `merge.ff = false` is a common setting that `sandbox::spawn` carries
 /// into every repository through `$HOME`.
 ///
-/// # Two mutations, named against the arm once it is fixed
+/// # Two mutations
 ///
 /// 1. **Removes the mechanism** — drop the `merge.ff` read entirely and go back
 ///    to deciding on `merge-base` alone. The preview adds no commit and
@@ -2181,9 +2563,7 @@ async fn a_cherry_pick_that_is_already_applied_must_not_be_drawn_as_a_clean_comm
 ///    instead, naming one parent where git wrote two.
 #[tokio::test]
 async fn merge_ff_false_must_preview_the_two_parent_commit_git_actually_writes() {
-    let (_dir, repo) = fast_forward_shape();
-    git::run(&repo, &["checkout", "-q", "behind"]);
-    git::run(&repo, &["config", "merge.ff", "false"]);
+    let (_dir, repo) = git_vista_fixtures::fast_forward_merge_ff_false();
     let before_layout = layout_of(&repo);
 
     // The oracle: the executor's own argv, on a copy.
@@ -2194,7 +2574,7 @@ async fn merge_ff_false_must_preview_the_two_parent_commit_git_actually_writes()
         "the copy must carry the setting, or the oracle below is not the case \
          this test is about"
     );
-    git::run(&copy, &["merge", "--no-edit", "main"]);
+    git::run(&copy, &["merge", "--no-edit", "feature"]);
     assert_eq!(
         parent_count(&copy, "HEAD"),
         2,
@@ -2206,7 +2586,7 @@ async fn merge_ff_false_must_preview_the_two_parent_commit_git_actually_writes()
     let plan = plan_for(
         &repo,
         GitOperation::MergeBranch {
-            branch: BranchName::new("main").expect("a valid branch name"),
+            branch: BranchName::new("feature").expect("a valid branch name"),
         },
     )
     .await;
@@ -2227,28 +2607,32 @@ async fn merge_ff_false_must_preview_the_two_parent_commit_git_actually_writes()
 /// **`merge.ff = only`, divergent.** Real `git merge --no-edit` exits **128**
 /// and does nothing, so there is no graph to draw.
 ///
-/// # Expected to be RED until the merge arm reads the config
+/// # The defect this was carried red for, and what closed it
 ///
 /// Measured on this host, 2026-08-30: on two divergent branches with
 /// `merge.ff=only`, git printed "fatal: Not possible to fast-forward,
-/// aborting.", exited 128, and left HEAD exactly where it was. The preview
-/// takes the `Synthesize` arm and draws a clean merge commit — a picture of an
-/// operation that is going to fail.
+/// aborting.", exited 128, and left HEAD exactly where it was, while the
+/// preview took the `Synthesize` arm and drew a clean merge commit — a picture
+/// of an operation that was going to fail. The merge arm now asks
+/// [`fast_forward_policy`] and refuses on `Only` when HEAD has commits the
+/// branch does not. The fixture is the catalogue's `divergent_merge_ff_only`,
+/// which proves on a disposable clone that a real merge there is refused with
+/// no `MERGE_HEAD` to abort.
 ///
-/// # What this asserts, and the design decision it deliberately leaves open
+/// # What this asserts, and what it deliberately does not
 ///
-/// Only that the outcome is **not a `Graph`**. Which refusal is right —
-/// `Unavailable { CheckFailed { detail } }` ("the check could not establish a
-/// merge") or `Unsupported { operation }` ("this can never be previewed") — is
-/// a contract decision for whoever fixes the arm, and picking one here would
-/// pin a choice this test has no standing to make.
+/// Only that the outcome is **not a `Graph`**. The shipped answer is
+/// `Unavailable { CheckFailed { detail } }`, and this test does not pin that:
+/// which refusal is right — that, or `Unsupported { operation }` ("this can
+/// never be previewed") — is a contract question, and pinning it from here
+/// would make a deliberate contract change look like a regression.
 ///
 /// It is deliberately **not** written as "no `Added` change": `AlreadyUpToDate`
 /// already returns a `Graph` with empty `changes`, so routing this case there
 /// would satisfy that weaker form while still telling the user the merge is a
 /// no-op when it is in fact an error.
 ///
-/// # Two mutations, named against the arm once it is fixed
+/// # Two mutations
 ///
 /// 1. **Removes the mechanism** — drop the `merge.ff` read: the preview
 ///    synthesises a merge commit again and this assertion names the `Graph`.
@@ -2258,8 +2642,7 @@ async fn merge_ff_false_must_preview_the_two_parent_commit_git_actually_writes()
 ///    still a `Graph` and *this* assertion is the one that goes red.
 #[tokio::test]
 async fn merge_ff_only_must_not_draw_a_merge_git_refuses_to_make() {
-    let (_dir, repo) = merge_shape_with_a_competitor_tip();
-    git::run(&repo, &["config", "merge.ff", "only"]);
+    let (_dir, repo) = git_vista_fixtures::divergent_merge_ff_only();
 
     // The oracle first: prove real git refuses and moves nothing.
     let (_scratch, copy) = copy_of(&repo);
@@ -2271,7 +2654,7 @@ async fn merge_ff_only_must_not_draw_a_merge_git_refuses_to_make() {
          this test is about"
     );
     assert!(
-        !git::try_run(&copy, &["merge", "--no-edit", "feature"]),
+        !git::try_run(&copy, &["merge", "--no-edit", "rival"]),
         "with merge.ff=only a divergent merge must fail — if it succeeded, \
          git's behaviour is not what this test was written against"
     );
@@ -2284,7 +2667,7 @@ async fn merge_ff_only_must_not_draw_a_merge_git_refuses_to_make() {
     let plan = plan_for(
         &repo,
         GitOperation::MergeBranch {
-            branch: BranchName::new("feature").expect("a valid branch name"),
+            branch: BranchName::new("rival").expect("a valid branch name"),
         },
     )
     .await;
