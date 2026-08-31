@@ -1,0 +1,224 @@
+{
+  "conflict": {
+    "outcome": "conflict",
+    "paths": [
+      "src/main.rs",
+      "docs/na�me.md",
+      "with space/and'quote.txt"
+    ]
+  },
+  "graph": {
+    "outcome": "graph",
+    "before": {
+      "rows": [
+        {
+          "commit": {
+            "id": "2222222222222222222222222222222222222222",
+            "parents": [
+              "1111111111111111111111111111111111111111"
+            ],
+            "summary": "add thing",
+            "author": "Ada",
+            "time": 400
+          },
+          "row": 0,
+          "lane": 0,
+          "refs": [
+            {
+              "name": "HEAD",
+              "kind": "Head",
+              "target": "2222222222222222222222222222222222222222"
+            },
+            {
+              "name": "main",
+              "kind": "Branch",
+              "target": "2222222222222222222222222222222222222222"
+            },
+            {
+              "name": "v1.0.0",
+              "kind": "Tag",
+              "target": "2222222222222222222222222222222222222222"
+            }
+          ],
+          "color": 0,
+          "on_remote": true
+        },
+        {
+          "commit": {
+            "id": "1111111111111111111111111111111111111111",
+            "parents": [],
+            "summary": "root",
+            "author": "Ada",
+            "time": 300
+          },
+          "row": 1,
+          "lane": 0,
+          "refs": [],
+          "color": 0,
+          "on_remote": false
+        }
+      ],
+      "edges": [
+        {
+          "from_row": 0,
+          "from_lane": 0,
+          "to_row": 1,
+          "to_lane": 0
+        }
+      ],
+      "stubs": [
+        {
+          "name": "spike",
+          "anchor_row": 1,
+          "anchor_lane": 0,
+          "lane": 2,
+          "color": 5,
+          "depth": 0
+        }
+      ],
+      "lane_count": 3
+    },
+    "after": {
+      "rows": [
+        {
+          "commit": {
+            "id": "9999999999999999999999999999999999999999",
+            "parents": [
+              "2222222222222222222222222222222222222222"
+            ],
+            "summary": "Revert \"add thing\"",
+            "author": "git-vista",
+            "time": 500
+          },
+          "row": 0,
+          "lane": 0,
+          "refs": [
+            {
+              "name": "HEAD",
+              "kind": "Head",
+              "target": "9999999999999999999999999999999999999999"
+            },
+            {
+              "name": "main",
+              "kind": "Branch",
+              "target": "9999999999999999999999999999999999999999"
+            }
+          ],
+          "color": 0,
+          "on_remote": false
+        },
+        {
+          "commit": {
+            "id": "2222222222222222222222222222222222222222",
+            "parents": [
+              "1111111111111111111111111111111111111111"
+            ],
+            "summary": "add thing",
+            "author": "Ada",
+            "time": 400
+          },
+          "row": 1,
+          "lane": 0,
+          "refs": [
+            {
+              "name": "v1.0.0",
+              "kind": "Tag",
+              "target": "2222222222222222222222222222222222222222"
+            }
+          ],
+          "color": 0,
+          "on_remote": true
+        },
+        {
+          "commit": {
+            "id": "1111111111111111111111111111111111111111",
+            "parents": [],
+            "summary": "root",
+            "author": "Ada",
+            "time": 300
+          },
+          "row": 2,
+          "lane": 0,
+          "refs": [],
+          "color": 0,
+          "on_remote": false
+        }
+      ],
+      "edges": [
+        {
+          "from_row": 0,
+          "from_lane": 0,
+          "to_row": 1,
+          "to_lane": 0
+        },
+        {
+          "from_row": 1,
+          "from_lane": 0,
+          "to_row": 2,
+          "to_lane": 0
+        }
+      ],
+      "stubs": [
+        {
+          "name": "spike",
+          "anchor_row": 2,
+          "anchor_lane": 0,
+          "lane": 2,
+          "color": 5,
+          "depth": 0
+        }
+      ],
+      "lane_count": 3
+    },
+    "changes": [
+      {
+        "change": "added",
+        "commit": "9999999999999999999999999999999999999999"
+      },
+      {
+        "change": "ref_moved",
+        "ref_name": "main",
+        "from": "2222222222222222222222222222222222222222",
+        "to": "9999999999999999999999999999999999999999"
+      },
+      {
+        "change": "lane_shifted",
+        "commit": "2222222222222222222222222222222222222222",
+        "from_lane": 0,
+        "to_lane": 1
+      }
+    ]
+  },
+  "unavailable_check_failed": {
+    "outcome": "unavailable",
+    "reason": {
+      "unavailable": "check_failed",
+      "detail": "merge-tree exited with signal 9"
+    }
+  },
+  "unavailable_git_too_old": {
+    "outcome": "unavailable",
+    "reason": {
+      "unavailable": "git_too_old",
+      "found": "2.34.1",
+      "minimum": "2.38"
+    }
+  },
+  "unavailable_repository_read_only": {
+    "outcome": "unavailable",
+    "reason": {
+      "unavailable": "repository_read_only"
+    }
+  },
+  "unavailable_scratch_store": {
+    "outcome": "unavailable",
+    "reason": {
+      "unavailable": "scratch_store",
+      "detail": "mkdir: permission denied"
+    }
+  },
+  "unsupported": {
+    "outcome": "unsupported",
+    "operation": "RebaseBranch"
+  }
+}
