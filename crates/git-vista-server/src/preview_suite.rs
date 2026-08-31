@@ -3715,6 +3715,89 @@ fn a_named_pipe_wearing_the_markers_name_cannot_wedge_the_sweep() {
     );
 }
 
+/// A marker that **serves the magic** and is not a regular file must still be
+/// refused.
+///
+/// # Why this test exists: a `survived` verdict on the test above
+///
+/// `mutation_check` on 2026-08-31, run 303: deleting
+///
+/// ```text
+/// if !f.metadata().ok()?.is_file() { return None; }
+/// ```
+///
+/// left `a_named_pipe_wearing_the_markers_name_cannot_wedge_the_sweep` GREEN.
+/// The guard was doing nothing that test could detect, because with
+/// `O_NONBLOCK` a writerless FIFO fails at `read_exact` with `EAGAIN` and
+/// `.ok()?` refuses it one line later. So the wedge test pins "the sweep
+/// answers" and pins nothing at all about *type*.
+///
+/// That is the shape this repository keeps paying for — a guard that reads as
+/// load-bearing, with no test that can fail when it is removed. One `caught`
+/// on the flag would have let both claims ride on one experiment.
+///
+/// The case where `is_file()` is the only thing standing between a user and
+/// `remove_dir_all` is narrow: a non-regular file whose *contents* satisfy
+/// every later gate. A FIFO holding the magic does exactly that — the read
+/// succeeds, the magic matches, and `flock` on a pipe is free. Without the
+/// guard the directory is deleted.
+///
+/// The test holds the pipe open `O_RDWR` rather than spawning a writer:
+/// opening a FIFO read-write never blocks, and it leaves the magic sitting in
+/// the pipe buffer for the sweep's own reader to find. A writer thread would
+/// have raced the sweep and made a green run mean nothing.
+#[test]
+fn a_marker_that_serves_the_magic_but_is_not_a_regular_file_is_refused() {
+    let dir = TempDir::new().expect("tempdir");
+    let commondir = dir.path().to_path_buf();
+
+    let trap = commondir.join(format!("{SCRATCH_PREFIX}fedfifo"));
+    std::fs::create_dir_all(&trap).expect("create the trap directory");
+    let precious = trap.join("precious.txt");
+    std::fs::write(&precious, b"the user's own bytes\n").expect("write the decoy's content");
+
+    let fifo = trap.join(STORE_MARKER);
+    let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())
+        .expect("a temp path with no interior NUL");
+    // SAFETY: `c_path` is a valid NUL-terminated path that outlives the call.
+    let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+    assert_eq!(
+        rc,
+        0,
+        "mkfifo failed, so this test would prove nothing: {}",
+        std::io::Error::last_os_error()
+    );
+
+    // `O_RDWR` on a FIFO never blocks and makes this process both ends, so
+    // the magic can sit in the pipe buffer with no second thread to race.
+    let mut pipe = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&fifo)
+        .expect("open the planted FIFO read-write");
+    pipe.write_all(STORE_MARKER_MAGIC)
+        .expect("feed the magic into the pipe");
+
+    let long_ago = std::time::SystemTime::now() - STALE_SCRATCH_AGE - Duration::from_secs(60);
+    filetime_set(&trap, long_ago);
+
+    ScratchStore::sweep_stale(&commondir);
+
+    assert!(
+        trap.exists(),
+        "a directory whose marker SERVES the magic but is not a regular file \
+         was deleted. Every later gate passes on this input — the read \
+         succeeds, the magic matches exactly, and `flock` on a pipe is free — \
+         so `is_file()` on the open fd is the only thing refusing it"
+    );
+    assert_eq!(
+        std::fs::read(&precious).ok().as_deref(),
+        Some(b"the user's own bytes\n".as_slice()),
+        "`remove_dir_all` ran inside a directory this module never created, \
+         keyed on bytes anyone can feed through a pipe"
+    );
+}
+
 /// The **production** constructor validates containment itself, and carries
 /// the `commondir` rather than the `gitdir`.
 ///
