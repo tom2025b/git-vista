@@ -3070,6 +3070,7 @@ fn would_be_layout(repo: &Path, added: CommitSummary) -> PreviewLayout {
         head_branch: git_vista_git::read_head_branch(repo),
         added: Some(added),
         ref_moves: ref_moves_to(repo, &target),
+        history_limit: PREVIEW_HISTORY_LIMIT,
     })
 }
 
@@ -4610,4 +4611,130 @@ fn ref_moved_from_reports_the_branch_old_target_not_a_same_named_tags() {
         "the same repository read in a different ref order must give the same \
          previous targets"
     );
+}
+
+/// **A same-second tie refuses (#576 finding 6).**
+///
+/// `stable_topo_order` breaks a committer-second tie by comparing oid strings,
+/// and the previewed commit's oid is not the one a real run writes —
+/// [`commit_tree`] writes under a fixed `preview@git-vista.invalid` identity
+/// and `git_cmd` exposes no arity that could pin `GIT_COMMITTER_DATE`. So when
+/// the new commit ties with an independent tip already in view, which of the
+/// two is drawn on top is a coin flip, and the rows, lanes and edge
+/// coordinates below it all follow that flip.
+///
+/// # Why this is not driven through `preview()`
+///
+/// It cannot be, deterministically. Forcing a live tie means making a fixture
+/// commit land in the same wall-clock second as the scratch `commit-tree`
+/// write, and that second is exactly the value this module cannot pin. A test
+/// that raced for it would be flaky in the direction that matters — silently
+/// green. So the layout is built through the pure half from a *chosen* tie and
+/// handed to the guard selector, which is the wiring under test.
+///
+/// The three earlier reports are asserted clear on the same layout, so this is
+/// the tie firing and not one of them.
+///
+/// # Two mutations that make this red, failing differently
+///
+/// 1. **REMOVES the mechanism** — delete the fourth arm of [`refusal_for`].
+///    `expect` panics on `None`.
+/// 2. **WEAKENS the mechanism** — move the fourth arm above the third. The
+///    detached/no-branch layout in `the_refusal_says_detached_only_when_head_
+///    really_is_detached` keeps its own sentence (it has no tie), but a layout
+///    that meets both conditions would now report the tie instead of the
+///    narrower, actionable cause; the ordering assertion at the end of this
+///    test goes red.
+#[test]
+fn a_same_second_tie_refuses_rather_than_guessing_which_row_is_on_top() {
+    use git_vista_core::model::{CommitSummary, RefKind};
+
+    let oid_of = |d: char| Oid((0..40).map(|_| d).collect::<String>());
+    let commit = |d: char, time: i64, parents: &[char]| CommitSummary {
+        id: oid_of(d),
+        parents: parents.iter().copied().map(oid_of).collect(),
+        summary: format!("commit {d}"),
+        author: "Test".to_string(),
+        time,
+    };
+    let git_ref = |name: &str, kind: RefKind, d: char| GitRef {
+        name: name.to_string(),
+        kind,
+        target: oid_of(d),
+    };
+
+    // `4` is an independent tip stamped in the same second the new commit will
+    // carry; `3` is the checked-out tip it is committed onto.
+    let before = vec![
+        commit('4', 400, &['2']),
+        commit('3', 300, &['2']),
+        commit('2', 200, &[]),
+    ];
+    let refs = vec![
+        git_ref("HEAD", RefKind::Head, '3'),
+        git_ref("main", RefKind::Branch, '3'),
+        git_ref("side", RefKind::Branch, '4'),
+    ];
+    let input = |time: i64| PreviewInput {
+        before: before.clone(),
+        refs: refs.clone(),
+        head_branch: Some("main".to_string()),
+        added: Some(commit('9', time, &['3'])),
+        ref_moves: vec![
+            ("HEAD".to_string(), oid_of('9')),
+            ("main".to_string(), oid_of('9')),
+        ],
+        history_limit: usize::MAX,
+    };
+
+    let tied = lay_out_preview(input(400));
+    assert_eq!(tied.unmatched_ref_moves, Vec::<String>::new());
+    assert!(!tied.added_without_ref_moves);
+    assert!(
+        !tied.added_claimed_by_no_branch,
+        "`main` moved onto the new commit, so the three older reports are all \
+         clear — whatever refuses below is the tie and not one of them"
+    );
+
+    match refusal_for(&tied, false).expect("a coin-flip row order is not a picture") {
+        PreviewUnavailable::CheckFailed { detail } => {
+            assert!(
+                detail.contains("committer second"),
+                "the detail must name the state that was found: {detail}"
+            );
+            assert!(
+                detail.contains("re-run the preview once the seconds differ"),
+                "and this one resolves itself a moment later, unlike the \
+                 detached-HEAD refusal, so it must say so: {detail}"
+            );
+            assert!(
+                !detail.contains("colour"),
+                "that is the `added_claimed_by_no_branch` sentence, and this \
+                 layout's colours are fine: {detail}"
+            );
+        }
+        other => panic!("expected CheckFailed naming the tie, got {other:?}"),
+    }
+
+    // One second later, nothing shares the second and there is nothing to
+    // refuse — the guard must not swallow ordinary previews.
+    let clear = lay_out_preview(input(401));
+    assert!(
+        refusal_for(&clear, false).is_none(),
+        "at 401 the new commit is unambiguously newest, so all four reports \
+         are clear and the graph may be shown"
+    );
+
+    // The ordering the block has always had: a layout meeting the third
+    // condition AND the tie must report the third, which is the one with a
+    // cause the caller can act on.
+    let mut both = lay_out_preview(input(400));
+    both.added_claimed_by_no_branch = true;
+    match refusal_for(&both, true).expect("still refused") {
+        PreviewUnavailable::CheckFailed { detail } => assert!(
+            detail.contains("HEAD is detached"),
+            "the narrower, actionable cause must stay reachable: {detail}"
+        ),
+        other => panic!("expected CheckFailed, got {other:?}"),
+    }
 }

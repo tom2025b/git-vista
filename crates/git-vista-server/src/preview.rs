@@ -2033,6 +2033,67 @@ fn previous_targets(refs: &[GitRef], ref_moves: &[(String, Oid)]) -> Vec<(String
         .collect()
 }
 
+/// Which of [`PreviewLayout`]'s four reports refuses this preview, if any.
+///
+/// Its own pure function so each arm can be reached from a test by handing it a
+/// layout in a chosen state. That matters most for the fourth: a same-second
+/// tie needs the hypothetical commit's committer time to equal an existing
+/// commit's, and [`commit_tree`] cannot pin `GIT_COMMITTER_DATE`, so a live
+/// collision is not deterministically forceable through a real spawn.
+///
+/// The **order is load-bearing** and is the one this block has always had.
+fn refusal_for(layout: &PreviewLayout, detached: bool) -> Option<PreviewUnavailable> {
+    if !layout.unmatched_ref_moves.is_empty() {
+        return Some(check_failed(format!(
+            "the preview moved refs that this repository does not have as a \
+             branch or as HEAD: {:?} — a tag or remote-tracking ref of the same \
+             display name is a different ref and is not moved. The after \
+             graph's lanes and colours would not be the ones a real run \
+             produces, so there is no honest picture to return",
+            layout.unmatched_ref_moves
+        )));
+    }
+    if layout.added_without_ref_moves {
+        return Some(check_failed(
+            "the preview added a commit and moved no ref — the after graph's \
+             lanes and colours would not be the ones a real run produces",
+        ));
+    }
+    // Third, and before the fourth, because `added_without_ref_moves` implies
+    // this one: a guard placed above it would make the narrower, actionable
+    // sentence unreachable. Two sentences, because the condition has two causes
+    // and only one of them is a fact about HEAD.
+    if layout.added_claimed_by_no_branch {
+        return Some(check_failed(if detached {
+            "HEAD is detached, so this operation moves HEAD alone and no \
+             branch would point at the new commit. Its colour would be a hash \
+             of an object id that does not exist yet, while a real run's commit \
+             has a different id — the two would agree only by coincidence. \
+             There is no honest picture to return; re-run the preview on a \
+             branch."
+        } else {
+            "no branch would point at the previewed commit, so its colour would \
+             be a hash of an object id that does not exist yet — the after \
+             graph's colours would not be the ones a real run produces"
+        }));
+    }
+    // Fourth (#576 finding 6), and last because it is independent of the three
+    // above: they are all about which ref claims the new commit, this one is
+    // about where its row lands. Unlike the third, it resolves itself a second
+    // later, so the sentence says so.
+    if layout.added_time_tied {
+        return Some(check_failed(
+            "the previewed commit shares its committer second with another \
+             commit already in view, and a same-second tie is broken by \
+             comparing object ids. This preview's commit has an id a real run \
+             will not write, so which of the two rows would be drawn above the \
+             other is a coin flip rather than a fact. There is no honest \
+             picture to return; re-run the preview once the seconds differ.",
+        ));
+    }
+    None
+}
+
 fn lay_out(
     repo: &Path,
     added: Option<CommitSummary>,
@@ -2057,41 +2118,11 @@ fn lay_out(
         head_branch,
         added,
         ref_moves: ref_moves.clone(),
+        history_limit: PREVIEW_HISTORY_LIMIT,
     });
 
-    if !layout.unmatched_ref_moves.is_empty() {
-        return Err(check_failed(format!(
-            "the preview moved refs that this repository does not have as a \
-             branch or as HEAD: {:?} — a tag or remote-tracking ref of the same \
-             display name is a different ref and is not moved. The after \
-             graph's lanes and colours would not be the ones a real run \
-             produces, so there is no honest picture to return",
-            layout.unmatched_ref_moves
-        )));
-    }
-    if layout.added_without_ref_moves {
-        return Err(check_failed(
-            "the preview added a commit and moved no ref — the after graph's \
-             lanes and colours would not be the ones a real run produces",
-        ));
-    }
-    // Third, and last, because `added_without_ref_moves` implies this one: a
-    // guard placed above it would make the narrower, actionable sentence
-    // unreachable. Two sentences, because the condition has two causes and only
-    // one of them is a fact about HEAD.
-    if layout.added_claimed_by_no_branch {
-        return Err(check_failed(if detached {
-            "HEAD is detached, so this operation moves HEAD alone and no \
-             branch would point at the new commit. Its colour would be a hash \
-             of an object id that does not exist yet, while a real run's commit \
-             has a different id — the two would agree only by coincidence. \
-             There is no honest picture to return; re-run the preview on a \
-             branch."
-        } else {
-            "no branch would point at the previewed commit, so its colour would \
-             be a hash of an object id that does not exist yet — the after \
-             graph's colours would not be the ones a real run produces"
-        }));
+    if let Some(refusal) = refusal_for(&layout, detached) {
+        return Err(refusal);
     }
 
     let mut changes: Vec<PreviewChange> = Vec::new();

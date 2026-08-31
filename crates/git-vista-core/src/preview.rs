@@ -46,7 +46,7 @@
 //!    other branch tip in the window. See [`PreviewInput::added`]; this module
 //!    documents that dependency and deliberately does not paper over it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::layout::layout_with_refs;
 use crate::model::{CommitSummary, GitRef, Graph, Oid};
@@ -178,6 +178,32 @@ pub struct PreviewInput {
     /// it, and it is the general condition of which
     /// [`PreviewLayout::added_without_ref_moves`] is one special case.
     pub ref_moves: Vec<(String, Oid)>,
+    /// The most rows the **`after`** graph may hold.
+    ///
+    /// The caller has already chosen a window when it built
+    /// [`before`](Self::before) — the server reads exactly
+    /// `PREVIEW_HISTORY_LIMIT` commits — and prepending the hypothetical commit
+    /// without truncating pushes `after` one row past it. The real
+    /// post-operation view is walked through the same cap, so it holds that
+    /// many rows and no more; an untruncated `after` predicts a floor row the
+    /// user's own next page load will not draw, and boundary edges and stubs
+    /// are computed from the window, so the extra row can move those too.
+    ///
+    /// Bounds `after` **only**. `before` is the repository as it is right now
+    /// and must keep every commit the caller read, so that half still matches a
+    /// plain graph view taken at the same instant.
+    ///
+    /// The truncation drops from the **end** of `added` + `before`, and
+    /// `before` arrives newest-first, so the row that falls out is the oldest —
+    /// which is the row a real walk of the same width loses once a newer commit
+    /// exists. That equivalence assumes the caller honoured
+    /// [`added`](Self::added)'s stated `time` precondition; a hypothetical
+    /// commit stamped older than the window's floor is already predicting a
+    /// different picture for a different reason.
+    ///
+    /// `usize::MAX` means "do not bound it", which is what a caller laying out
+    /// a hand-built window smaller than any cap wants.
+    pub history_limit: usize,
 }
 
 /// The two layouts and what differs between them.
@@ -319,6 +345,44 @@ pub struct PreviewLayout {
     /// condition can also be met by a caller that moves a branch onto some
     /// *other* commit while adding one here, and lanes may then diverge too.
     pub added_claimed_by_no_branch: bool,
+    /// `true` when `added` is `Some` and some commit already in the window
+    /// shares its committer second **and could be ready beside it** — the one
+    /// state in which `stable_topo_order` decides row order by comparing oid
+    /// strings, and the preview's oid is not the oid a real run will write.
+    ///
+    /// # Why this cannot be computed correctly instead of reported
+    ///
+    /// `stable_topo_order`'s heap key is `(time, Reverse(id))`, so on an exact
+    /// time tie the row order is decided by the hypothetical commit's oid. That
+    /// oid differs from the real run's **by construction** — the server's
+    /// `commit_tree` writes under a fixed `preview@git-vista.invalid` identity
+    /// and cannot pin `GIT_COMMITTER_DATE` — and one hash's lexicographic
+    /// relation to a third string carries no information about a *different*
+    /// hash's relation to it. So there is no value this module could substitute
+    /// that would be the order git draws; a fixed rule ("the new commit always
+    /// sorts first") would be wrong exactly as often as a coin flip while
+    /// looking deterministic.
+    ///
+    /// The preview and a real run commonly share a one-second git timestamp,
+    /// so this is an ordinary path rather than an exotic one.
+    ///
+    /// # The check is conservative in one direction only
+    ///
+    /// In-window **ancestors** of `added` are excluded, and that exclusion is a
+    /// proof rather than a heuristic: a commit reachable from `added` through
+    /// in-window parents has `pending_children >= 1` until `added` is emitted,
+    /// so it is never in the heap at the same time as `added` and its oid is
+    /// never compared with `added`'s. Without the exclusion this field would be
+    /// true for the ordinary "commit, then immediately preview a revert" case,
+    /// where the only same-second commit is `added`'s own parent.
+    ///
+    /// Everything else that shares the second is flagged, including commits the
+    /// heap would never actually have compared because some other child still
+    /// blocked them. That direction is a needless refusal, never a wrong
+    /// picture, and computing the exact condition would mean either teaching
+    /// `stable_topo_order` to report its own comparisons or writing its tie
+    /// logic out a second time here, where the two copies could drift.
+    pub added_time_tied: bool,
 }
 
 /// Lay out `before`, then lay out the same history with `added` and
@@ -363,6 +427,7 @@ pub fn lay_out_preview(input: PreviewInput) -> PreviewLayout {
         head_branch,
         added,
         ref_moves,
+        history_limit,
     } = input;
 
     let before_graph = layout_with_refs(before.clone(), refs.clone(), head_branch.as_deref());
@@ -400,7 +465,34 @@ pub fn lay_out_preview(input: PreviewInput) -> PreviewLayout {
         None => false,
     };
 
-    let after_commits: Vec<CommitSummary> = added.into_iter().chain(before).collect();
+    // The fourth report, and the only one that is about row *order* rather
+    // than about which ref claims the new commit. See
+    // `PreviewLayout::added_time_tied` for why a tie cannot be resolved, only
+    // reported, and why in-window ancestors are excluded from the scan.
+    let added_time_tied = match added.as_ref() {
+        Some(c) => {
+            let by_id: HashMap<&Oid, &CommitSummary> = before.iter().map(|b| (&b.id, b)).collect();
+            let mut ancestors: HashSet<&Oid> = HashSet::new();
+            let mut stack: Vec<&Oid> = c.parents.iter().collect();
+            while let Some(p) = stack.pop() {
+                if let Some(parent) = by_id.get(p) {
+                    if ancestors.insert(&parent.id) {
+                        stack.extend(parent.parents.iter());
+                    }
+                }
+            }
+            before
+                .iter()
+                .any(|b| b.time == c.time && !ancestors.contains(&b.id))
+        }
+        None => false,
+    };
+
+    let after_commits: Vec<CommitSummary> =
+        // `.take` bounds `after` only — see `PreviewInput::history_limit`. A
+        // no-op whenever the caller's window is not full, and exactly the
+        // oldest row when it is.
+        added.into_iter().chain(before).take(history_limit).collect();
     let after_graph = layout_with_refs(after_commits, after_refs, head_branch.as_deref());
 
     let lane_shifts = {
@@ -433,6 +525,7 @@ pub fn lay_out_preview(input: PreviewInput) -> PreviewLayout {
         unmatched_ref_moves,
         added_without_ref_moves,
         added_claimed_by_no_branch,
+        added_time_tied,
     }
 }
 
@@ -535,6 +628,7 @@ mod tests {
     fn the_ref_rewrite_lands_the_hypothetical_commit_in_the_trunk_lane_and_colour() {
         let (before, refs) = linear_trunk();
         let out = lay_out_preview(PreviewInput {
+            history_limit: usize::MAX,
             before,
             refs,
             head_branch: Some("main".into()),
@@ -600,6 +694,7 @@ mod tests {
         let (before, refs) = linear_trunk();
 
         let mixed = lay_out_preview(PreviewInput {
+            history_limit: usize::MAX,
             before: before.clone(),
             refs: refs.clone(),
             head_branch: Some("main".into()),
@@ -618,6 +713,7 @@ mod tests {
         );
 
         let nothing_matched = lay_out_preview(PreviewInput {
+            history_limit: usize::MAX,
             before,
             refs,
             head_branch: Some("main".into()),
@@ -652,6 +748,7 @@ mod tests {
         let (before, refs) = linear_trunk();
 
         let caller_bug = lay_out_preview(PreviewInput {
+            history_limit: usize::MAX,
             before: before.clone(),
             refs: refs.clone(),
             head_branch: Some("main".into()),
@@ -674,6 +771,7 @@ mod tests {
         );
 
         let no_op = lay_out_preview(PreviewInput {
+            history_limit: usize::MAX,
             before,
             refs,
             head_branch: Some("main".into()),
@@ -737,6 +835,7 @@ mod tests {
         let detached = |digit: char| {
             let (before, refs) = detached_at_trunk_tip();
             lay_out_preview(PreviewInput {
+                history_limit: usize::MAX,
                 before,
                 refs,
                 head_branch: None,
@@ -748,6 +847,7 @@ mod tests {
         let attached = |digit: char| {
             let (before, refs) = detached_at_trunk_tip();
             lay_out_preview(PreviewInput {
+                history_limit: usize::MAX,
                 before,
                 refs,
                 head_branch: Some("main".into()),
@@ -820,6 +920,7 @@ mod tests {
         // --- the one-way implication the field docs claim ---
         let (before, refs) = detached_at_trunk_tip();
         let no_ref_moves = lay_out_preview(PreviewInput {
+            history_limit: usize::MAX,
             before,
             refs,
             head_branch: Some("main".into()),
@@ -866,6 +967,7 @@ mod tests {
         ];
 
         let out = lay_out_preview(PreviewInput {
+            history_limit: usize::MAX,
             before,
             refs,
             head_branch: Some("main".into()),
@@ -936,6 +1038,7 @@ mod tests {
         ];
 
         let newest = lay_out_preview(PreviewInput {
+            history_limit: usize::MAX,
             before: before.clone(),
             refs: refs.clone(),
             head_branch: Some("main".into()),
@@ -950,6 +1053,7 @@ mod tests {
         );
 
         let stale = lay_out_preview(PreviewInput {
+            history_limit: usize::MAX,
             before,
             refs,
             head_branch: Some("main".into()),
@@ -997,6 +1101,7 @@ mod tests {
         ];
 
         let out = lay_out_preview(PreviewInput {
+            history_limit: usize::MAX,
             before,
             refs,
             head_branch: Some("main".into()),
@@ -1053,6 +1158,7 @@ mod tests {
     fn no_row_of_either_half_claims_to_be_on_a_remote() {
         let (before, refs) = linear_trunk();
         let out = lay_out_preview(PreviewInput {
+            history_limit: usize::MAX,
             before,
             refs,
             head_branch: Some("main".into()),
@@ -1160,6 +1266,7 @@ mod tests {
         ];
 
         let out = lay_out_preview(PreviewInput {
+            history_limit: usize::MAX,
             before,
             refs,
             head_branch: Some("main".into()),
@@ -1202,6 +1309,250 @@ mod tests {
             Vec::<String>::new(),
             "both entries matched a ref of a movable kind"
         );
+    }
+
+    /// A trunk with an **independent competitor tip** stamped at the same
+    /// second the hypothetical commit will carry: `4` (tip of `side`, t=400)
+    /// and `3` (tip of `main`, t=300) -> `2`. `4` has no in-window child, so it
+    /// is ready from the start and competes with the hypothetical commit for
+    /// row 0 on `(time, Reverse(id))` alone.
+    fn trunk_with_a_competitor_tip_at_400() -> (Vec<CommitSummary>, Vec<GitRef>) {
+        let commits = vec![
+            commit('4', 400, &['2']),
+            commit('3', 300, &['2']),
+            commit('2', 200, &[]),
+        ];
+        let refs = vec![
+            git_ref("HEAD", RefKind::Head, '3'),
+            git_ref("main", RefKind::Branch, '3'),
+            git_ref("side", RefKind::Branch, '4'),
+        ];
+        (commits, refs)
+    }
+
+    /// **The defect, measured before the refusal that answers it.** Two
+    /// previews of the same operation on the same history, differing in
+    /// **nothing but the hypothetical commit's oid**, put a different commit in
+    /// row 0.
+    ///
+    /// `stable_topo_order`'s heap key is `(time, Reverse(id))`, so once the new
+    /// commit and an independent tip share a committer second the oid decides
+    /// the order — and the preview's oid is not the one a real run writes
+    /// (`commit_tree` uses a fixed `preview@git-vista.invalid` identity and
+    /// cannot pin `GIT_COMMITTER_DATE`). Rows, lanes and edge coordinates all
+    /// hang off that order.
+    ///
+    /// This test asserts the disagreement, not a preferred answer: there is no
+    /// correct row order to assert, which is the whole finding.
+    ///
+    /// # Two mutations that make this red, failing differently
+    ///
+    /// * **M12a — REMOVES the tie.** Stamp the competitor tip `4` at 401 or
+    ///   399 instead of 400. Both previews then agree and `assert_ne!` fires:
+    ///   the test proves it is the *tie* doing this, not the oid alone.
+    /// * **M12b — REMOVES the competitor.** Drop `4` from the fixture. Row 0 is
+    ///   forced by topology, both previews agree, and `assert_ne!` fires again
+    ///   — the other half of the same claim.
+    #[test]
+    fn a_same_second_tie_lets_the_hypothetical_oid_decide_row_zero() {
+        let (before, refs) = trunk_with_a_competitor_tip_at_400();
+        let preview_of = |digit: char| {
+            lay_out_preview(PreviewInput {
+                history_limit: usize::MAX,
+                before: before.clone(),
+                refs: refs.clone(),
+                head_branch: Some("main".into()),
+                added: Some(commit(digit, 400, &['3'])),
+                ref_moves: vec![("HEAD".into(), oid(digit)), ("main".into(), oid(digit))],
+            })
+        };
+
+        // "111…" sorts below "444…", "999…" above it. Nothing else differs.
+        let low = preview_of('1');
+        let high = preview_of('9');
+
+        assert_eq!(
+            low.after.rows[0].commit.id,
+            oid('1'),
+            "the smaller oid wins the tie, so the hypothetical commit takes row 0"
+        );
+        assert_eq!(
+            high.after.rows[0].commit.id,
+            oid('4'),
+            "the larger oid loses it, and the competitor tip takes row 0 instead"
+        );
+        assert_ne!(
+            low.after.rows[0].commit.id, high.after.rows[0].commit.id,
+            "row 0 changed hands on nothing but the hypothetical oid — the one \
+             value a preview may never be compared on"
+        );
+    }
+
+    /// **The report that answers it**, in all three directions.
+    ///
+    /// The tie flag must fire when an independent commit shares the second, and
+    /// must NOT fire when nothing shares it, and must NOT fire when the only
+    /// same-second commit is an in-window **ancestor** of the new one. That
+    /// third case is the ordinary path — commit, then immediately preview a
+    /// revert of it — and a flag that fired there would refuse nearly every
+    /// real preview.
+    ///
+    /// The exclusion is sound, not a guess: a commit reachable from `added`
+    /// through in-window parents has an unemitted child (`added` itself, or
+    /// something between) for as long as `added` is in the heap, so
+    /// `stable_topo_order` never compares their oids.
+    ///
+    /// # Two mutations that make this red, failing differently
+    ///
+    /// * **M13a — REMOVES the mechanism.** Return `false` unconditionally. Red
+    ///   on the first case alone.
+    /// * **M13b — WEAKENS the mechanism.** Drop the ancestor exclusion and scan
+    ///   the whole of `before`. Red on the third case alone — the one that
+    ///   decides whether this refusal is usable at all.
+    #[test]
+    fn the_tie_report_fires_on_an_independent_commit_and_not_on_an_ancestor() {
+        let (before, refs) = trunk_with_a_competitor_tip_at_400();
+
+        let tied = lay_out_preview(PreviewInput {
+            history_limit: usize::MAX,
+            before: before.clone(),
+            refs: refs.clone(),
+            head_branch: Some("main".into()),
+            added: Some(commit('9', 400, &['3'])),
+            ref_moves: vec![("HEAD".into(), oid('9')), ("main".into(), oid('9'))],
+        });
+        assert!(
+            tied.added_time_tied,
+            "`4` is an independent tip at the same second: the heap compares \
+             the two oids and the preview's is not the real one"
+        );
+
+        let clear = lay_out_preview(PreviewInput {
+            history_limit: usize::MAX,
+            before: before.clone(),
+            refs: refs.clone(),
+            head_branch: Some("main".into()),
+            added: Some(commit('9', 450, &['3'])),
+            ref_moves: vec![("HEAD".into(), oid('9')), ("main".into(), oid('9'))],
+        });
+        assert!(
+            !clear.added_time_tied,
+            "at 450 nothing shares the second, so no oid is ever compared and \
+             there is nothing to refuse"
+        );
+
+        // The ordinary path: the only commit at the same second is the new
+        // commit's own parent, which cannot be ready beside it.
+        let (linear, linear_refs) = linear_trunk();
+        let ancestor_only = lay_out_preview(PreviewInput {
+            history_limit: usize::MAX,
+            before: linear,
+            refs: linear_refs,
+            head_branch: Some("main".into()),
+            added: Some(commit('9', 300, &['3'])),
+            ref_moves: vec![("HEAD".into(), oid('9')), ("main".into(), oid('9'))],
+        });
+        assert!(
+            !ancestor_only.added_time_tied,
+            "commit 3 is the new commit's parent, stamped in the same second — \
+             it is blocked behind it in the heap and their oids are never \
+             compared. Refusing here would refuse nearly every real preview"
+        );
+    }
+
+    /// **The `after` graph may not be one row taller than the window (#576
+    /// finding 7).**
+    ///
+    /// The caller reads a fixed number of commits — the server reads exactly
+    /// `PREVIEW_HISTORY_LIMIT` — and the real post-operation view is walked
+    /// through that same cap, so it holds that many rows. Prepending the
+    /// hypothetical commit without truncating predicts one row more than the
+    /// user's own next page load will ever draw, and the extra floor row also
+    /// changes which parents fall outside the window, so boundary edges and
+    /// stubs move with it.
+    ///
+    /// Both directions are asserted. At the cap the oldest row must be *gone*
+    /// and the count must not grow; one row under it the count must grow by
+    /// one, because the truncation is a bound and not a fixed size.
+    ///
+    /// # Two mutations that make this red, failing differently
+    ///
+    /// * **M14a — REMOVES the mechanism.** Drop the `.take(history_limit)`.
+    ///   `after` holds six rows at a limit of five: red on the first count and
+    ///   on the "oldest is gone" assertion, green on the under-cap half.
+    /// * **M14b — WEAKENS the mechanism.** `.take(history_limit + 1)`, the
+    ///   off-by-one this finding *is*. Identical symptom at the cap, and it
+    ///   also leaves the under-cap half green — which is why the under-cap
+    ///   half alone could never pin this.
+    #[test]
+    fn the_after_graph_is_bounded_by_the_window_the_caller_read() {
+        let before = vec![
+            commit('5', 500, &['4']),
+            commit('4', 400, &['3']),
+            commit('3', 300, &['2']),
+            commit('2', 200, &['1']),
+            commit('1', 100, &[]),
+        ];
+        let refs = vec![
+            git_ref("HEAD", RefKind::Head, '5'),
+            git_ref("main", RefKind::Branch, '5'),
+        ];
+        let at = |history_limit: usize| {
+            lay_out_preview(PreviewInput {
+                before: before.clone(),
+                refs: refs.clone(),
+                head_branch: Some("main".into()),
+                added: Some(commit('9', 600, &['5'])),
+                ref_moves: vec![("HEAD".into(), oid('9')), ("main".into(), oid('9'))],
+                history_limit,
+            })
+        };
+
+        // At the cap: the window is full, so a new commit costs the oldest one.
+        let full = at(5);
+        assert_eq!(
+            full.after.rows.len(),
+            5,
+            "the caller read five commits and a real walk of the same width \
+             after the operation returns five rows, not six"
+        );
+        assert_eq!(full.after.rows[0].commit.id, oid('9'));
+        assert_eq!(
+            full.after.rows[4].commit.id,
+            oid('2'),
+            "the row that falls out is the OLDEST — `before` is newest-first, \
+             so truncating its tail is what a re-walk of the same width does"
+        );
+        assert!(
+            full.after.rows.iter().all(|r| r.commit.id != oid('1')),
+            "commit 1 is off the bottom of the window now: {:?}",
+            full.after
+                .rows
+                .iter()
+                .map(|r| &r.commit.id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            full.before.rows.len(),
+            5,
+            "the `before` half is the repository as it IS — the cap on `after` \
+             must not shrink it, or the current-state graph stops matching a \
+             plain graph view taken at the same instant"
+        );
+        assert_eq!(
+            full.before.rows[4].commit.id,
+            oid('1'),
+            "and commit 1 is still in it"
+        );
+
+        // One under the cap: nothing to drop, so the graph grows by one.
+        let roomy = at(6);
+        assert_eq!(
+            roomy.after.rows.len(),
+            6,
+            "with room left the bound does nothing and the new commit is added"
+        );
+        assert_eq!(roomy.after.rows[5].commit.id, oid('1'));
     }
 
     /// The three change variants are told apart on the wire by their own tag,
