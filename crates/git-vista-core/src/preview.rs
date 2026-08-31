@@ -1338,6 +1338,94 @@ mod tests {
         (commits, refs)
     }
 
+    /// A same-second competitor that is **blocked behind its own child**.
+    ///
+    /// `4` shares the hypothetical commit's second and is not one of its
+    /// ancestors — the two facts the old ancestor-based predicate looked at,
+    /// and on those alone it refused. But `5` is `4`'s child and has not been
+    /// emitted, so `4` is not in the heap when the hypothetical commit is
+    /// popped and the two oids are never compared. `blocker_time` is the whole
+    /// experiment: below the hypothetical's second the block holds, above it
+    /// the block clears and the tie is real.
+    fn competitor_blocked_behind_its_child(blocker_time: i64) -> (Vec<CommitSummary>, Vec<GitRef>) {
+        let commits = vec![
+            commit('5', blocker_time, &['4']),
+            commit('4', 400, &['2']),
+            commit('3', 300, &['2']),
+            commit('2', 200, &[]),
+        ];
+        let refs = vec![
+            git_ref("HEAD", RefKind::Head, '3'),
+            git_ref("main", RefKind::Branch, '3'),
+            git_ref("side", RefKind::Branch, '5'),
+        ];
+        (commits, refs)
+    }
+
+    /// **A commit that shares the second but can never be compared is not
+    /// refused.** #576 finding 6's first fix asked "is this same-second commit
+    /// an in-window ancestor of the new one?" That is sound and strictly too
+    /// narrow: a commit blocked behind any *other* unemitted child also never
+    /// reaches the heap beside the hypothetical commit, and was refused anyway.
+    /// An outside auditor found the needless refusal; this is the case it
+    /// named.
+    ///
+    /// # The two halves differ in ONE number, and it is the mechanism's number
+    ///
+    /// Both halves use the same four commits, the same refs and the same
+    /// hypothetical commit. The only difference is the blocking child's
+    /// committer time, and it decides whether the block is still standing when
+    /// the hypothetical commit is popped:
+    ///
+    /// * **350 — below.** The hypothetical commit is the newest ready entry and
+    ///   is emitted first; `4` only becomes ready afterwards. No comparison
+    ///   happens, so there is nothing to refuse.
+    /// * **450 — above.** `5` outranks the hypothetical commit and is emitted
+    ///   first, which frees `4` into the heap while the hypothetical commit is
+    ///   still in it. Now both carry second 400 and the oid decides the row.
+    ///
+    /// A predicate that cannot see the heap cannot tell those two apart — the
+    /// commits, the refs, the ancestry and the shared second are identical in
+    /// both. That is why the report is measured off the walk rather than
+    /// modelled from the input, and it is why this test needs both halves: the
+    /// first alone would pass for a report that never fires, the second alone
+    /// for one that always does.
+    #[test]
+    fn a_same_second_commit_the_heap_never_reaches_is_not_refused() {
+        let (blocked, refs) = competitor_blocked_behind_its_child(350);
+        let clear = lay_out_preview(PreviewInput {
+            history_limit: usize::MAX,
+            before: blocked,
+            refs: refs.clone(),
+            head_branch: Some("main".into()),
+            added: Some(commit('9', 400, &['3'])),
+            ref_moves: vec![("HEAD".into(), oid('9')), ("main".into(), oid('9'))],
+        });
+        assert!(
+            !clear.added_time_tied,
+            "`4` shares the second and is no ancestor, but its child `5` is \
+             still unemitted, so `4` is not in the heap beside the new commit \
+             and no oid is compared. Refusing here would turn the feature off \
+             on a preview that is perfectly determinate"
+        );
+
+        let (unblocked, refs) = competitor_blocked_behind_its_child(450);
+        let tied = lay_out_preview(PreviewInput {
+            history_limit: usize::MAX,
+            before: unblocked,
+            refs,
+            head_branch: Some("main".into()),
+            added: Some(commit('9', 400, &['3'])),
+            ref_moves: vec![("HEAD".into(), oid('9')), ("main".into(), oid('9'))],
+        });
+        assert!(
+            tied.added_time_tied,
+            "moving the blocking child ABOVE the new commit's second frees `4` \
+             into the heap while the new commit is still there — the same four \
+             commits, and now the oid really does decide row order"
+        );
+    }
+
     /// **The defect, measured before the refusal that answers it.** Two
     /// previews of the same operation on the same history, differing in
     /// **nothing but the hypothetical commit's oid**, put a different commit in
