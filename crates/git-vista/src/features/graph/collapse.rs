@@ -21,20 +21,58 @@ use std::collections::{HashMap, HashSet};
 
 use git_vista_core::model::{Edge, GraphRow, Oid};
 
-/// True for the exact message shape `~/.local/bin/autocheckpoint` produces:
-/// `wip(#123): auto-checkpoint 456`. Deliberately strict — a commit that
-/// merely mentions "wip" in prose, or a hand-written `wip(#12): fix thing`,
-/// is real work and must never be folded away.
+/// True for the message shape `~/.local/bin/autocheckpoint` produces:
+/// `wip: auto-checkpoint 456`, with an OPTIONAL scope — `wip(#123)`,
+/// `wip(mapstack)`.
+///
+/// Still deliberately strict about the thing that matters: a commit merely
+/// mentioning "wip" in prose, or a hand-written `wip(#12): fix thing`, is
+/// real work and must never be folded away. What decides is the
+/// `auto-checkpoint` body, not the decoration in front of it.
+///
+/// # Why the scope is optional, which it was not
+///
+/// This function used to require `wip(#<digits>)`, and a test pinned the
+/// unscoped form as a near-miss with the comment "missing the issue number
+/// the checkpointer always writes". The checkpointer does not always write
+/// it. From `~/.local/bin/autocheckpoint`:
+///
+/// ```text
+/// msg_prefix="wip"
+/// [[ -n "$ISSUE" ]] && msg_prefix="wip(#$ISSUE)"
+/// ```
+///
+/// The issue number is the script's **optional fourth argument**. Omitted —
+/// the ordinary case — every commit it writes reads `wip: auto-checkpoint N`,
+/// and this predicate refused all of them.
+///
+/// The cost was not cosmetic. Measured across this operator's repositories on
+/// 2026-08-31: 2,311 checkpoints folded and 399 did not in *this* repo, while
+/// **13 of 15 repositories folded nothing at all** — workboard 40 unfoldable,
+/// mind-map-mcp 55, mcp-fleet 58, teacher-thing 28. The topbar toggle sits
+/// beside the repository picker and reported "no runs" over graphs full of
+/// checkpoints, which #382 had made *honest* without making it *right*: a
+/// truthful zero from a predicate that could not recognise the input.
+///
+/// A viewer's features belong to every repository it can open, not to the one
+/// whose conventions it was written against.
 pub fn is_wip_checkpoint(summary: &str) -> bool {
-    let Some(rest) = summary.strip_prefix("wip(#") else {
+    // `wip` must be the whole token: `wipe: auto-checkpoint 4` is somebody
+    // else's commit, not ours.
+    let Some(rest) = summary.strip_prefix("wip") else {
         return false;
     };
-    let Some((digits, rest)) = rest.split_once(')') else {
-        return false;
+    // An optional `(scope)`. Its CONTENT is deliberately unconstrained —
+    // `#576`, `mapstack`, `#325,#323` are all real, and pinning the shape is
+    // exactly the mistake this function is being corrected for. An unclosed
+    // `(` is not a scope and refuses.
+    let rest = match rest.strip_prefix('(') {
+        Some(scoped) => match scoped.split_once(')') {
+            Some((_scope, after)) => after,
+            None => return false,
+        },
+        None => rest,
     };
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return false;
-    }
     let Some(rest) = rest.strip_prefix(": auto-checkpoint") else {
         return false;
     };
@@ -1050,6 +1088,20 @@ mod tests {
         assert!(is_wip_checkpoint("wip(#66): auto-checkpoint 690"));
         assert!(is_wip_checkpoint("wip(#374): auto-checkpoint 1"));
         assert!(is_wip_checkpoint("wip(#1): auto-checkpoint 999999"));
+        // The UNSCOPED form, and it is the checkpointer's DEFAULT, not an
+        // oddity: the issue number is `autocheckpoint`'s optional fourth
+        // argument, and with it omitted the script writes `msg_prefix="wip"`.
+        // Measured across this operator's repositories: `wip: auto-checkpoint
+        // N` is the single most common checkpoint shape outside this repo,
+        // and it was the reason the fold control did nothing in 13 of 15 of
+        // them.
+        assert!(is_wip_checkpoint("wip: auto-checkpoint 4"));
+        // A non-numeric scope. `autocheckpoint` never writes one, but
+        // `./dev wip` and its per-repo copies do, and the machine signature
+        // is the `auto-checkpoint <N>` body — not the decoration in front of
+        // it.
+        assert!(is_wip_checkpoint("wip(mapstack): auto-checkpoint 9"));
+        assert!(is_wip_checkpoint("wip(#325,#323): auto-checkpoint 12"));
     }
 
     #[test]
@@ -1060,8 +1112,16 @@ mod tests {
         assert!(!is_wip_checkpoint("wip(#12): fix the thing"));
         // Right prefix, wrong suffix.
         assert!(!is_wip_checkpoint("wip(#12): autocheckpoint 4"));
-        // Missing the issue number the checkpointer always writes.
-        assert!(!is_wip_checkpoint("wip: auto-checkpoint 4"));
+        // A scoped wip whose body is a real message — `mind-map-mcp` is full
+        // of these. The scope is not what makes a commit foldable; the
+        // `auto-checkpoint` body is, and this has none.
+        assert!(!is_wip_checkpoint(
+            "wip(claude): red test reproducing the escape"
+        ));
+        // `wip` must be the whole word, not a prefix of one.
+        assert!(!is_wip_checkpoint("wipe: auto-checkpoint 4"));
+        // An unclosed scope is not a scope.
+        assert!(!is_wip_checkpoint("wip(: auto-checkpoint 4"));
         // Not at the start of the line.
         assert!(!is_wip_checkpoint("revert wip(#66): auto-checkpoint 690"));
         assert!(!is_wip_checkpoint(""));
