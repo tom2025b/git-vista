@@ -3615,6 +3615,100 @@ fn the_sweep_removes_only_old_directories_it_named_itself() {
     );
 }
 
+/// A named pipe wearing the marker's name must not wedge the sweep.
+///
+/// [`ScratchStore::abandoned_store_lease`] opens the marker to read its
+/// magic, and `File::open` on a FIFO with no writer **blocks for ever**. So
+/// the four-gate refusal this module documents — "marker missing or
+/// unreadable or not a regular file … is a `continue`" — is never reached on
+/// this input: the decision hangs before it can be made, because the
+/// `is_file()` guard that would refuse a FIFO runs *after* the open that
+/// hangs.
+///
+/// The cost is not one leaked directory. `sweep_stale` runs from
+/// [`ScratchStore::new`], which `preview` reaches on a `tokio::spawn`ed
+/// task, so a single `mkfifo` inside `<commondir>` parks a runtime worker
+/// permanently and takes every later preview against that repository with
+/// it. The reach needed to plant one is write access to the scratch store's
+/// own directory — the same reach finding 2 was about. This time the
+/// mechanism that closed finding 2 is what opened it, which is why it is
+/// pinned here rather than left to the marker's own doc comment.
+///
+/// The sweep runs on its own thread and must answer inside a generous
+/// bound. A regression therefore costs one red test rather than a hung CI
+/// run — a test that reproduced this by hanging would be unrunnable.
+#[test]
+fn a_named_pipe_wearing_the_markers_name_cannot_wedge_the_sweep() {
+    let dir = TempDir::new().expect("tempdir");
+    let commondir = dir.path().to_path_buf();
+
+    // The attack: a `gv-preview-*` directory whose marker is a FIFO that
+    // nobody will ever open for writing.
+    let trap = commondir.join(format!("{SCRATCH_PREFIX}fifo"));
+    std::fs::create_dir_all(&trap).expect("create the trap directory");
+    let fifo = trap.join(STORE_MARKER);
+    let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())
+        .expect("a temp path with no interior NUL");
+    // SAFETY: `c_path` is a valid NUL-terminated path that outlives the call.
+    let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+    assert_eq!(
+        rc,
+        0,
+        "mkfifo failed, so this test would prove nothing: {}",
+        std::io::Error::last_os_error()
+    );
+    assert!(
+        !fifo
+            .symlink_metadata()
+            .expect("stat the planted marker")
+            .is_file(),
+        "the planted marker must really be a FIFO, or the hazard is absent \
+         and this test is inert"
+    );
+
+    // The control: a genuine abandoned store beside it. Without this, a
+    // sweep that had simply stopped working would pass.
+    let control = commondir.join(format!("{SCRATCH_PREFIX}control"));
+    std::fs::create_dir_all(&control).expect("create the control store");
+    drop(ScratchStore::claim(&control).expect("claim the control store"));
+
+    let long_ago = std::time::SystemTime::now() - STALE_SCRATCH_AGE - Duration::from_secs(60);
+    filetime_set(&trap, long_ago);
+    filetime_set(&control, long_ago);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let sweep_dir = commondir.clone();
+    std::thread::spawn(move || {
+        ScratchStore::sweep_stale(&sweep_dir);
+        let _ = tx.send(());
+    });
+
+    if rx
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .is_err()
+    {
+        panic!(
+            "`sweep_stale` never returned: the named pipe at `{}` wedged it. \
+             `File::open` on a FIFO with no writer blocks for ever, so the \
+             `is_file()` refusal one line later is unreachable — and because \
+             the sweep runs on a spawned task from `ScratchStore::new`, this \
+             parks a runtime worker and every later preview against this \
+             repository with it",
+            fifo.display()
+        );
+    }
+
+    assert!(
+        trap.exists(),
+        "a FIFO is not this module's marker: the trap directory must survive"
+    );
+    assert!(
+        !control.exists(),
+        "the sweep answered but reclaimed nothing — this test would pass \
+         against a sweep that had stopped working entirely"
+    );
+}
+
 /// The **production** constructor validates containment itself, and carries
 /// the `commondir` rather than the `gitdir`.
 ///

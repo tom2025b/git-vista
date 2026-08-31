@@ -1416,7 +1416,23 @@ impl ScratchStore {
     /// The returned lease is held by the caller across `remove_dir_all`, so
     /// two sweepers cannot race into the same tree.
     fn abandoned_store_lease(candidate: &Path) -> Option<std::fs::File> {
-        let f = std::fs::File::open(candidate.join(STORE_MARKER)).ok()?;
+        use std::os::unix::fs::OpenOptionsExt;
+        // `O_NONBLOCK` is what makes the `is_file()` refusal below reachable
+        // at all. A plain `File::open` on a FIFO with no writer blocks for
+        // ever, so a named pipe wearing the marker's name wedged this
+        // function — and, through `ScratchStore::new`'s spawned task, a
+        // runtime worker — before any gate could refuse it. The refusal ran
+        // *after* the open that hung. Opening a FIFO read-only with
+        // `O_NONBLOCK` is defined to return at once rather than wait for a
+        // writer, so the open now answers for every file type and the
+        // `fstat` one line down does the deciding, which is where the
+        // decision belongs. Pinned by
+        // `a_named_pipe_wearing_the_markers_name_cannot_wedge_the_sweep`.
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(candidate.join(STORE_MARKER))
+            .ok()?;
         if !f.metadata().ok()?.is_file() {
             return None;
         }
