@@ -4672,6 +4672,64 @@ async fn the_merge_message_is_the_one_git_itself_writes() {
     );
 }
 
+/// The **default-branch** case, proven against a real run rather than a
+/// literal: merging onto `main` — where git's built-in `merge.suppressDest`
+/// default decides whether an `into main` clause appears — produces exactly
+/// the bytes real `git merge --no-edit` stores.
+///
+/// # Why the oracle runs through [`preview_git`] and not `git::run`
+///
+/// Deliberately no literal here: the default suppression list is
+/// git-version territory (2.43 suppresses `master`/`main`; the rule is the
+/// list, not "the default branch"), so the only honest assertion is that
+/// both halves consult the *same* git and the *same* config stack. `git::run`
+/// nulls `GIT_CONFIG_GLOBAL` while the preview's spawns inherit `$HOME`
+/// read-only — an oracle run through it could disagree with the preview on a
+/// machine whose global config touches `merge.suppressDest`, and the fixture
+/// cannot pin the *built-in default* back into local config. Running the real
+/// merge through the same sealed launcher gives both sides one config
+/// environment, so the byte compare is config-proof and version-proof at
+/// once, and on an unconfigured host it exercises the built-in default list
+/// on `main` — the one case the `release` fixtures cannot reach.
+///
+/// # Mutation posture, stated honestly
+///
+/// A mechanism-removal that returns the old literal stays green here on a
+/// host where the default list suppresses `main` — the literal and the
+/// suppressed message are the same bytes. The wrong-branch and wrong-sha
+/// breaks redden it everywhere. The mutation weight lives in
+/// [`the_merge_message_is_the_one_git_itself_writes`] and the e2e test; this
+/// one's job is fidelity coverage of the default-branch case the handoff
+/// names.
+#[tokio::test]
+async fn the_merge_message_on_the_default_branch_is_proven_against_a_real_run() {
+    let (_dir, repo) = merge_shape_with_a_competitor_tip();
+    git::run(&repo, &["config", "merge.log", "false"]);
+    let tip = git::out(&repo, &["rev-parse", "feature"]);
+
+    let message = merge_message(&repo, "feature", &tip)
+        .await
+        .expect("format the default-branch merge message");
+
+    let (_scratch, copy) = copy_of(&repo);
+    let merged = preview_git(&copy, &["merge", "--no-edit", "feature"])
+        .await
+        .expect("run the real merge through the sealed launcher");
+    assert!(
+        merged.status.success(),
+        "the real merge must succeed, or there is no oracle: {}",
+        String::from_utf8_lossy(&merged.stderr)
+    );
+    let real = read_commit_record(&copy, None, "HEAD")
+        .await
+        .expect("read the real default-branch merge commit back");
+    assert_eq!(
+        message, real.body,
+        "on the default branch, the previewed message must be byte-identical \
+         to what the same git under the same config stack really stored"
+    );
+}
+
 /// `merge.suppressDest` — the config that makes every hand-written `into`
 /// rule wrong — is honoured, because git applies it, not this file.
 ///
