@@ -42,6 +42,7 @@ mod data;
 mod event;
 mod keys;
 mod layout;
+mod panes;
 mod ui;
 
 use git_vista_protocol::{RepositoryDescriptor, RepositoryKind};
@@ -312,6 +313,8 @@ mod tests {
             "keys.rs",
             "layout.rs",
             "main.rs",
+            "panes/detail.rs",
+            "panes/mod.rs",
             "ui.rs",
         ] {
             assert!(
