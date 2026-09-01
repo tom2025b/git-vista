@@ -91,6 +91,50 @@ fn picture(before: Half, after: Half, changes: Vec<PreviewChange>) -> Picture {
     }
 }
 
+/// The oid of the commit [`with_one_prepended`] adds — the stand-in for the
+/// one a real preview would create.
+const HYPOTHETICAL: usize = 0xbeef;
+
+/// The seven characters a reader sees on the picture, and what `alt` starts
+/// with.
+fn short(id: &Oid) -> String {
+    id.0.chars().take(7).collect()
+}
+
+/// `half` with one commit prepended at row 0 and every existing row renumbered
+/// beneath it — exactly what a preview does to the graph it draws.
+fn with_one_prepended(mut half: Half) -> Half {
+    for r in &mut half.rows {
+        r.row += 1;
+    }
+    for e in &mut half.edges {
+        e.from_row += 1;
+        e.to_row += 1;
+    }
+    for stub in &mut half.stubs {
+        stub.anchor_row += 1;
+    }
+    half.rows.insert(
+        0,
+        GraphRow {
+            commit: CommitSummary {
+                id: oid(HYPOTHETICAL),
+                parents: vec![oid(0)],
+                summary: "the hypothetical commit".into(),
+                author: "Test".into(),
+                time: 9_999,
+            },
+            row: 0,
+            lane: 0,
+            refs: Vec::new(),
+            color: 0,
+            on_remote: false,
+        },
+    );
+    half.edges.push(edge(0, 0));
+    half
+}
+
 /// Every commit id the scene actually drew, in order.
 fn drawn_ids(half: &HalfScene) -> Vec<String> {
     half.nodes
@@ -113,18 +157,23 @@ fn drawn_ids(half: &HalfScene) -> Vec<String> {
 ///    The window becomes rows 0..=9, the marked row 40 is not drawn, and the
 ///    first assertion is red on a window that holds nothing marked.
 /// 2. **WEAKENS the mechanism** — keep the mark search but take only the
-///    *first* marked row (`marked.first()` for both `lo` and `hi`). Row 40 is
-///    still drawn, so the first assertion passes; row 44 is not, and the
-///    "every marked row is drawn" assertion goes red — the near miss a
+///    *first* marked row (`marked.iter().min()` for both `lo` and `hi`). Row
+///    40 is still drawn, so the first assertion passes; row 48 is not, and the
+///    "the LAST marked row is drawn" assertion goes red — the near miss a
 ///    "does it contain a mark?" check would wave through.
 #[test]
 fn the_window_lands_on_what_changed_and_never_merely_on_the_top() {
+    // Rows 40 and 48: nine apart, so the pair plus one row of context exactly
+    // fills the ten-row budget. That spacing IS the fixture. A window anchored
+    // on the first mark alone still reaches row 45 with its own padding, so any
+    // pair closer together than the budget leaves that mutation invisible —
+    // measured, not guessed: it survived at 40 and 44.
     let changes = vec![
         PreviewChange::Added { commit: oid(40) },
         PreviewChange::RefMoved {
             ref_name: "main".into(),
             from: oid(50),
-            to: oid(44),
+            to: oid(48),
         },
     ];
     let p = picture(chain(60), chain(60), changes);
@@ -134,7 +183,11 @@ fn the_window_lands_on_what_changed_and_never_merely_on_the_top() {
         window.holds(40),
         "the added commit was cropped out of its own preview: {window:?}"
     );
-    assert!(window.holds(44), "a marked row was cropped out: {window:?}");
+    assert!(
+        window.holds(48),
+        "the LAST marked row was cropped out — a window anchored on the first \
+         mark alone is not a window around the change: {window:?}"
+    );
     assert!(
         window.len() <= MAX_ROWS,
         "the window overran the budget: {window:?}"
@@ -145,75 +198,101 @@ fn the_window_lands_on_what_changed_and_never_merely_on_the_top() {
     );
 }
 
-/// The two halves are matched by commit id, never by row number.
+/// The two halves are windowed onto the same **commits**, matched by id.
 ///
 /// This is the concrete form of the protocol's own argument for returning both
 /// halves: a preview that prepends one hypothetical commit renumbers every row
 /// beneath it, so `after` row 5 and `before` row 5 are different commits.
 ///
+/// # Why the fixture reports a lane shift and nothing else
+///
+/// Not decoration — a mutation run is what found it. Every operation the
+/// engine previews today adds its commit at row 0, so the after window
+/// normally starts at 0 and the two windows coincide *numerically*; under that
+/// shape a before half windowed by raw row number gives the identical answer
+/// and the id match is unfalsifiable. Measured: with a top-anchored added
+/// commit, **both** mutations below survived.
+///
+/// A deep, added-commit-free change list is what separates them, and it is
+/// well-formed: `changes` is whatever the server computed, and a preview whose
+/// only difference is a lane assignment carries exactly this shape.
+///
 /// # Two mutations, failing differently
 ///
-/// 1. **REMOVES the mechanism** — have `window_for_before` return
-///    `after_window` verbatim. The before half then starts one commit too
-///    early; its first drawn id is `oid(29)` rather than `oid(30)` and the
-///    id-equality assertion is red on the whole list.
-/// 2. **WEAKENS the mechanism** — match on `r.row` membership instead of on
-///    the id set (`after_window.holds(r.row)`). Identical wrong answer for
-///    this fixture but by a different route, and the *shared-commit* assertion
-///    below (which checks the overlap, not the offset) is what catches it.
+/// 1. **REMOVES the mechanism** — `return after_window` from
+///    `window_for_before`. The before half is drawn one commit too early:
+///    `oid(37)..oid(46)` against the after half's `oid(36)..oid(45)`. An
+///    off-by-one, so the halves still *look* like a matched pair — which is
+///    why the assertion is exact list equality rather than an overlap count.
+///    An overlap check would have called nine-of-ten a pass.
+/// 2. **WEAKENS the mechanism** — build `shown` from every row of `after`
+///    rather than from its window. The matched span becomes the whole history,
+///    overruns the budget, and the before half falls back to its own top:
+///    `oid(0)..oid(9)`, disjoint from the after half rather than adjacent to
+///    it. A different wrong answer, and a much louder one.
 #[test]
 fn the_before_half_is_windowed_onto_the_same_commits_by_id() {
-    // `after` is `before` with one hypothetical commit prepended, so every
-    // real commit's row number is one higher in `after` than in `before`.
-    let before = chain(60);
-    let mut after = chain(60);
-    for r in &mut after.rows {
-        r.row += 1;
-    }
-    for e in &mut after.edges {
-        e.from_row += 1;
-        e.to_row += 1;
-    }
-    let new = GraphRow {
-        commit: CommitSummary {
-            id: oid(999),
-            parents: vec![oid(30)],
-            summary: "the hypothetical commit".into(),
-            author: "Test".into(),
-            time: 2000,
-        },
-        row: 0,
-        lane: 0,
-        refs: Vec::new(),
-        color: 0,
-        on_remote: false,
-    };
-    after.rows.insert(0, new);
-    after.edges.push(Edge {
-        from_row: 0,
-        from_lane: 0,
-        to_row: 31,
-        to_lane: 0,
-    });
+    // The only change is deep in history and adds nothing. See the doc above
+    // for why an added commit at row 0 cannot discriminate here.
+    let scene = scene_of(&picture(
+        chain(60),
+        with_one_prepended(chain(60)),
+        vec![PreviewChange::LaneShifted {
+            commit: oid(40),
+            from_lane: 0,
+            to_lane: 1,
+        }],
+    ));
 
-    let changes = vec![PreviewChange::Added { commit: oid(999) }];
-    let scene = scene_of(&picture(before, after, changes));
-
-    let before_ids = drawn_ids(&scene.before);
-    let after_ids = drawn_ids(&scene.after);
-    // Every real commit in the after window is also in the before window: the
-    // reader is comparing the same commits, not two unrelated slices.
-    let shared: Vec<&String> = after_ids
-        .iter()
-        .filter(|id| before_ids.contains(id))
-        .collect();
-    assert!(
-        shared.len() >= after_ids.len() - 1,
-        "the halves show different commits — before {before_ids:?}, after {after_ids:?}"
+    assert_eq!(
+        drawn_ids(&scene.before),
+        drawn_ids(&scene.after),
+        "the halves drew different commits — a reader comparing them is \
+         comparing two unrelated slices of history"
     );
     assert!(
-        !before_ids.contains(&oid(999).0.chars().take(7).collect::<String>()),
-        "the hypothetical commit was drawn in the BEFORE half"
+        drawn_ids(&scene.after).contains(&short(&oid(40))),
+        "the shifted commit is missing from its own picture"
+    );
+}
+
+/// The hypothetical commit is drawn in the after half and **only** there.
+///
+/// The realistic shape, and the one the test above cannot cover: every
+/// operation the engine previews adds its commit at row 0, so both windows
+/// start at the top and the id match is invisible there. What stays visible —
+/// and is what a reader would notice instantly if it broke — is that the
+/// commit which does not exist yet is absent from the picture of the
+/// repository as it stands.
+///
+/// # Two mutations, failing differently
+///
+/// 1. **REMOVES the distinction** — lay both halves out from `picture.after`.
+///    The hypothetical commit appears on the left, and the "before" half is a
+///    picture of a repository that has never existed. Red on the absence
+///    assertion.
+/// 2. **WEAKENS it** — lay both halves out from `picture.before`. The
+///    hypothetical commit appears nowhere, so the absence assertion passes and
+///    the *presence* one is red: a preview that draws no new commit at all.
+#[test]
+fn the_hypothetical_commit_is_drawn_in_the_after_half_only() {
+    let scene = scene_of(&picture(
+        chain(6),
+        with_one_prepended(chain(6)),
+        vec![PreviewChange::Added {
+            commit: oid(HYPOTHETICAL),
+        }],
+    ));
+    let new = short(&oid(HYPOTHETICAL));
+
+    assert!(
+        drawn_ids(&scene.after).contains(&new),
+        "the commit the operation would create is missing from the after half"
+    );
+    assert!(
+        !drawn_ids(&scene.before).contains(&new),
+        "the commit that does not exist yet was drawn in the BEFORE half — a \
+         picture of a repository that has never existed"
     );
 }
 
@@ -489,20 +568,24 @@ fn a_lane_shift_names_both_lanes_in_the_right_order() {
 ///    before one still passes.
 #[test]
 fn a_branch_with_no_commits_of_its_own_survives_into_the_after_half() {
+    // Lane 7, with only five rows drawn: the stub's LANE sits deliberately
+    // outside the window's ROW range. Those are two different numbers about
+    // two different axes, and a filter that confuses them is invisible while
+    // they happen to overlap — measured, that mutation survived at lane 2.
     let stub = BranchStub {
         name: "spike".into(),
         anchor_row: 1,
         anchor_lane: 0,
-        lane: 2,
+        lane: 7,
         color: 4,
         depth: 0,
     };
     let mut before = chain(5);
     before.stubs = vec![stub.clone()];
-    before.lane_count = 3;
+    before.lane_count = 8;
     let mut after = chain(5);
     after.stubs = vec![stub];
-    after.lane_count = 3;
+    after.lane_count = 8;
 
     let scene = scene_of(&picture(before, after, Vec::new()));
 
