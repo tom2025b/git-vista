@@ -56,8 +56,9 @@ use git_vista_protocol::{
     TagAnnotation, TagMessage, TagName, WorktreePath,
 };
 
-use crate::auth::{self, Session};
-use crate::http;
+use git_vista_session::auth::{self, Session};
+use git_vista_session::http;
+
 use crate::tools::{PostFn, ToolError};
 
 /// The one endpoint every tool in this module talks to. A constant, not a
@@ -1140,10 +1141,10 @@ fn annotation_arg(args: &serde_json::Value, key: &str) -> Result<Option<TagAnnot
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::HttpResponse;
     use git_vista_protocol::{
         GenerationToken, OperationHash, RepositoryToken, UnixSeconds, WorktreeToken,
     };
+    use git_vista_session::http::HttpResponse;
 
     /// What the injected poster records: the path and body one tool sent.
     type CapturedPost = (String, Vec<u8>);

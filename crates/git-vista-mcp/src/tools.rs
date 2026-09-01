@@ -26,8 +26,8 @@
 //! dependency on either `git-vista-server` or `git-vista-git`) — it is the
 //! same crate the wasm frontend links for the identical reason.
 
-use crate::auth::{self, Session};
-use crate::http::{self, HttpResponse};
+use git_vista_session::auth::{self, Session};
+use git_vista_session::http::{self, HttpResponse};
 
 /// This crate's local instantiation of the paged-history Frame envelope —
 /// see the module doc for why this mirrors, rather than imports,
