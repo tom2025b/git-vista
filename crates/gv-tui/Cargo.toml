@@ -21,3 +21,19 @@ repository.workspace = true
 git-vista-protocol = { workspace = true }
 git-vista-session = { workspace = true }
 serde_json = { workspace = true }
+
+# The terminal toolkit (M10.02, #457 — phase 2a, the shell). Both pinned
+# EXACTLY (`=`), not caret: a terminal toolkit's minor releases change key
+# event shapes and backend traits, and this crate's key dispatch and draw
+# tests pin behaviour against one known version rather than whatever cargo
+# resolves next month.
+#
+# Pure Rust, no C build scripts, no kernel-ABI crate as a DIRECT dependency —
+# so gv-tui stays out of docs/NATIVE_DEPENDENCIES.md's register (scoped to
+# crates that speak the kernel ABI directly, and enforced over
+# git-vista-server's manifest; see `sandbox::deps`). crossterm reaches the
+# terminal through `rustix`/`mio` transitively, exactly as `gix` already does
+# for the server, and the register's own rule is that a crate which merely
+# depends on such a thing does not belong in it.
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm_0_29", "std", "layout-cache"] }
+crossterm = { version = "=0.29.0", default-features = false, features = ["events"] }
