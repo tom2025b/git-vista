@@ -87,12 +87,17 @@
 //!
 //! # No `Command` is constructed here
 //!
-//! Every spawn goes through [`crate::git_cmd::git_output`] — the sealed
-//! sandbox launcher, but deliberately **not** its kill-on-drop arity
-//! `git_output_bounded` — so `crate::argv_boundary`'s source scan needs no new
-//! entry and its allowlist is untouched. That is deliberate and load-bearing:
-//! reaching for `ALLOWED_SPAWN_SITES` is how a production spawn gets
-//! pre-authorised by a comment written about a test.
+//! Every spawn goes through [`crate::git_cmd::git_output`] — plus, for the one
+//! spawn that needs stdin (`fmt-merge-msg`, [`merge_message`]),
+//! [`crate::git_cmd::git_output_with_stdin`], the same sealed launcher the
+//! staging executor's `git apply --cached` already uses — but deliberately
+//! **not** the kill-on-drop arity `git_output_bounded` — so
+//! `crate::argv_boundary`'s source scan needs no new entry and its allowlist
+//! is untouched. That is deliberate and load-bearing: reaching for
+//! `ALLOWED_SPAWN_SITES` is how a production spawn gets pre-authorised by a
+//! comment written about a test. (`git_output_with_stdin` does carry
+//! kill-on-drop internally; [`preview_git_stdin`] says why that is harmless
+//! for a spawn that writes nothing.)
 //!
 //! `git_output_bounded` is the fix that suggests itself for the cancellation
 //! leak two paragraphs up, and it was tried: measured on this host
@@ -259,8 +264,9 @@ const STALE_SCRATCH_AGE: Duration = Duration::from_secs(60 * 60);
 /// a transient failure to run git does not permanently disable the feature.
 static GIT_VERSION: tokio::sync::OnceCell<(u32, u32, u32)> = tokio::sync::OnceCell::const_new();
 
-/// Every git spawn this module makes: the sealed launcher, `NetworkNeed::Local`,
-/// one place.
+/// Every git spawn this module makes goes through this or its stdin sibling
+/// [`preview_git_stdin`]: the sealed launcher, `NetworkNeed::Local`, one
+/// place each.
 ///
 /// # Why this is `git_output` and deliberately **not** `git_output_bounded`
 ///
@@ -293,6 +299,29 @@ static GIT_VERSION: tokio::sync::OnceCell<(u32, u32, u32)> = tokio::sync::OnceCe
 /// module does not own.
 async fn preview_git(repo: &Path, args: &[&str]) -> std::io::Result<Output> {
     git_cmd::git_output(repo, args).await
+}
+
+/// [`preview_git`] for the one spawn that needs stdin: `git fmt-merge-msg`
+/// reads its merge-names input from a pipe ([`merge_message`] carries the
+/// measured format). Same sealed launcher, same `NetworkNeed::Local`, via
+/// `git_cmd`'s existing stdin arity — the production path `git apply --cached`
+/// already takes through the same bwrap shim (`planner::staging_exec`), so
+/// stdin through the sandbox is a measured capability, not an assumption.
+///
+/// # Why `kill_on_drop` inside this arity is fine *here*, when [`preview_git`]
+/// # deliberately refuses it
+///
+/// `git_output_with_stdin` sets `.kill_on_drop(true)`. The whole case against
+/// kill-on-drop in this module ([`preview_git`]'s table, the module doc) is
+/// about **residue**: a SIGKILL landing part-way through `git init` turns "a
+/// store that will be complete in 15 ms and then removed" into "a store nobody
+/// will ever finish or remove". `fmt-merge-msg` writes nothing anywhere — it
+/// reads one line and prints a message — so the teardown SIGKILL that argument
+/// is about has nothing to half-finish. And mid-preview cancellation still
+/// never reaches it, for [`preview`]'s own reason: the work runs in a detached
+/// task, so no drop occurs while the child runs.
+async fn preview_git_stdin(repo: &Path, args: &[&str], input: &[u8]) -> std::io::Result<Output> {
+    git_cmd::git_output_with_stdin(repo, args, crate::sandbox::NetworkNeed::Local, input).await
 }
 
 // ---------------------------------------------------------------------------
@@ -450,8 +479,8 @@ impl PreviewTarget {
 /// |---|---|
 /// | revert | **7** — `rev-parse HEAD`, `show <target>`, `rev-parse --show-object-format`, `init`, `merge-tree`, `commit-tree`, `show <new>` |
 /// | cherry-pick | **8** — the same, plus [`tree_of`]'s `rev-parse HEAD^{tree}` |
-/// | merge, synthesised | **9** — `rev-parse HEAD`, `rev-parse <branch>`, `merge-base`, `config --get merge.ff`, then the five store steps |
-/// | merge, `merge.ff` set to a boolean | **10** — the second [`fast_forward_policy`] spawn, `config --type=bool` |
+/// | merge, synthesised | **10** — `rev-parse HEAD`, `rev-parse <branch>`, `merge-base`, `config --get merge.ff`, [`merge_message`]'s `fmt-merge-msg`, then the five store steps |
+/// | merge, `merge.ff` set to a boolean | **11** — the second [`fast_forward_policy`] spawn, `config --type=bool` |
 /// | merge, fast-forward | **4** — no store is created at all |
 /// | merge, already up to date | **3** — not even the config read |
 ///
@@ -991,6 +1020,9 @@ async fn resolve_plumbing(
                      to draw."
                 )));
             }
+            // Before the store exists: a message git will not format is a
+            // preview that fails before anything is created on disk.
+            let message = merge_message(repo, branch, &tip).await?;
             let store = ScratchStore::new(preview_target).await?;
             Ok(Plumbing::Synthesize(Recipe {
                 store,
@@ -1006,7 +1038,7 @@ async fn resolve_plumbing(
                 // the merged tip second, and a transposed parent list draws a
                 // graph a person can tell apart from the real one at a glance.
                 parents: vec![head.to_string(), tip],
-                message: merge_message(branch),
+                message,
                 // `None` on purpose: a merge commit whose tree equals HEAD's is
                 // ordinary and `git merge` writes it. See [`NoOp`].
                 no_op: None,
@@ -1172,15 +1204,70 @@ fn revert_message(target: &CommitRecord) -> String {
     )
 }
 
-/// git's own default merge message.
+/// git's own default merge message, from git itself: `git fmt-merge-msg`, fed
+/// the same merge-names line `git merge` builds for a local branch.
 ///
-/// Honest limit: `git merge` appends ` into <branch>` when the current branch
-/// is not the default one. That suffix is not reproduced here, so a merge
-/// preview's summary can differ from the eventual commit's by that clause. It
-/// is cosmetic — A5 compares parent topology, lane and row order, never
-/// message text — and naming it is cheaper than a wrong guess at git's rule.
-fn merge_message(branch: &str) -> String {
-    format!("Merge branch '{branch}'\n")
+/// # Why a spawn and not a `format!` (audit finding 10, #576)
+///
+/// This used to be `format!("Merge branch '{branch}'\n")`, with a doc comment
+/// calling the gap "cosmetic" because A5 compares topology, never message
+/// text. But the message **is** the row's summary in the UI, and the sibling
+/// [`revert_message`] above exists precisely because a preview that invented
+/// its own wording would show the user a commit whose message is not the one
+/// the real command will write. Real `git merge` appends ` into <dest>`
+/// under a rule that is not "is HEAD the default branch": measured on this
+/// host 2026-09-01 (git 2.43.0), the suffix is suppressed when the current
+/// branch matches the `merge.suppressDest` glob list (whose *default*
+/// suppresses `master`/`main` on this version — a repo whose default branch
+/// is `dev` still gets `into dev`), and `merge.log` grows the body a
+/// shortlog. Every hand-written rule here would be a model of git config —
+/// finding 9's mistake again — so the rule is asked, not modelled.
+///
+/// # The measured input format
+///
+/// One line, the shape `git merge` itself hands `fmt-merge-msg` for a local
+/// branch:
+///
+/// ```text
+/// <tip-sha>\t\tbranch '<name>' of .\n
+/// ```
+///
+/// Measured on this host 2026-09-01 against real `git merge --no-edit` runs
+/// (byte-compared through `commit-tree -m` round-trips, `cmp`-identical in
+/// all three probed shapes: plain non-default dest, `merge.log=true`, and a
+/// branch name carrying a quote merged into a `release/2.0` dest). The
+/// ` of .` clause is load-bearing even though the title drops it: with
+/// `merge.log=true` the shortlog header is `* <name>:` only when it is
+/// present; without it git prints `* branch '<name>':`, which is not what the
+/// real command writes.
+///
+/// # An honest limit, named like the old one was
+///
+/// The line always says `branch '<name>'` — [`GitOperation::MergeBranch`]'s
+/// own contract (`BranchName`, "a local branch's short name"). Its validator
+/// cannot *refuse* an off-contract revspec (`origin/x`, a tag, a raw oid),
+/// and for those git would title the merge `remote-tracking branch '…'` /
+/// `tag '…'` / `commit '…'` where this line still says `branch`. The
+/// `into <dest>` half and the body are git's either way. Reproducing the
+/// kind-prefix would mean re-implementing `merge_name()`'s dwim table here —
+/// a model, refused on the same grounds as everything else this file refuses
+/// to model.
+async fn merge_message(repo: &Path, branch: &str, tip: &str) -> Result<String, PreviewUnavailable> {
+    let line = format!("{tip}\t\tbranch '{branch}' of .\n");
+    let out = preview_git_stdin(repo, &["fmt-merge-msg"], line.as_bytes())
+        .await
+        .map_err(|e| check_failed(format!("could not run git fmt-merge-msg: {e}")))?;
+    if !out.status.success() {
+        return Err(check_failed(git_said(
+            &out.stderr,
+            "git fmt-merge-msg did not produce a message",
+        )));
+    }
+    let message = String::from_utf8_lossy(&out.stdout).into_owned();
+    if message.trim().is_empty() {
+        return Err(check_failed("git fmt-merge-msg printed no message"));
+    }
+    Ok(message)
 }
 
 // ---------------------------------------------------------------------------

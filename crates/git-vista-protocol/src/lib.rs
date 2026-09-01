@@ -84,6 +84,7 @@ pub mod operation;
 pub mod patch_build;
 pub mod patch_plan;
 pub mod plan;
+pub mod plan_export;
 pub mod preview;
 pub mod status;
 pub mod version;

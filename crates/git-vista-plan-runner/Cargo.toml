@@ -1,0 +1,21 @@
+[package]
+name = "git-vista-plan-runner"
+description = "YAML plan manifests and the fail-fast, resumable gv-run executor."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "gv-run"
+path = "src/main.rs"
+
+[dependencies]
+git-vista-protocol = { workspace = true }
+serde = { workspace = true }
+serde_yaml_ng = "0.10"
+sha2 = "0.10"
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -28,92 +28,26 @@ use std::process::Output;
 
 use axum::http::StatusCode;
 
-use git_vista_protocol::{CommitOid, SignTagError, SignTagFailureKind, TagAnnotation, TagName};
+use git_vista_protocol::{
+    plan_export, CommitOid, SignTagError, SignTagFailureKind, TagAnnotation, TagName,
+};
 
 use git_vista_core::activity::ActivityKind;
 
 use crate::sandbox::NetworkNeed;
 
 use super::{
-    couldnt_run, journal_app_event, rev_parse_ref_unpeeled, run_git, short, stderr_or, Obs,
-    Observed,
+    couldnt_run, journal_app_event, rev_parse_ref_unpeeled, run_git, run_git_argv, short,
+    stderr_or, Obs, Observed,
 };
 
-/// The argv for one [`GitOperation::CreateTag`](git_vista_protocol::GitOperation::CreateTag) — pulled out of
-/// [`exec_create_tag`] as a pure function so the **no-editor guarantee** can
-/// be asserted over the exact bytes that reach `execve`, without a repository,
-/// a spawn, or an environment.
-///
-/// Two properties this function exists to make checkable, both of which are
-/// the whole of ADR 0048's create half:
-///
-///  * **`-m <message>` is present whenever `-a` or `-s` is.** `git tag -a`
-///    (or `-s`, which implies `-a`) with no message writes `.git/TAG_EDITMSG`
-///    and launches `core.editor`; on a headless server there is no editor and
-///    nobody to type into one, so that process either dies on a
-///    `true`-shaped editor or waits forever. There is no `--no-edit` on
-///    `git tag` to close this after the fact — the only defence is never to
-///    build the argv that asks for it.
-///  * **`--edit` is never present.** It would re-open the editor even with
-///    `-m` given.
-///
-/// The type system already makes the bad case unrepresentable — an annotated
-/// tag *is* a [`TagAnnotation`], which cannot exist without a non-empty
-/// [`TagMessage`] — so this function has no failure mode to encode. That is
-/// the point: the guarantee is structural, and this is where it is visible.
-/// It holds for the signed arm too: [`TagAnnotation::sign`] lives *inside*
-/// the same struct, so a signed request is still, unconditionally, a request
-/// with a message.
-///
-/// `-a` is passed explicitly for the unsigned annotated case even though
-/// `-m` alone would imply it, so the argv says which kind of tag it is
-/// building rather than relying on a git implication a reader would have to
-/// know. The signed case asks for `-s` instead of `-a` — `-s` already
-/// implies `-a` (git accepts both together, but that would just repeat the
-/// same implication this function otherwise avoids relying on), so the two
-/// are mutually exclusive here, not additive.
-///
-/// # No gpg flags belong in this argv, ever
-///
-/// It is tempting to think a `-c gpg.program="gpg --batch --pinentry-mode
-/// cancel"`-shaped override could force gpg to fail fast instead of prompting.
-/// It cannot: git execs `gpg.program` directly (`use_shell` is never set in
-/// git's own `gpg-interface.c`), so a program string containing spaces execs
-/// a binary *literally named* `"gpg --batch --pinentry-mode cancel"`, which
-/// does not exist, and the tag creation fails for the wrong reason before
-/// gpg ever runs. The only way to inject gpg-side flags would be a wrapper
-/// executable, which needs its own exec grant from the sandbox — out of
-/// scope for #239, and exactly the kind of "fix the sandbox" move this
-/// slice's issue explicitly forbids. This is also why the bounded timeout in
-/// [`exec_create_tag`]'s signed arm is load-bearing rather than decorative:
-/// with no gpg-side flag reachable at all, non-interactivity rests entirely
-/// on the sandbox's own denials (see that function's doc comment) plus this
-/// bound as the backstop.
-pub(super) fn create_tag_argv<'a>(
-    name: &'a TagName,
-    target: &'a CommitOid,
-    annotation: Option<&'a TagAnnotation>,
-) -> Vec<&'a str> {
-    match annotation {
-        None => vec!["tag", name.as_str(), target.as_str()],
-        Some(a) if a.sign => vec![
-            "tag",
-            "-s",
-            "-m",
-            a.message.as_str(),
-            name.as_str(),
-            target.as_str(),
-        ],
-        Some(a) => vec![
-            "tag",
-            "-a",
-            "-m",
-            a.message.as_str(),
-            name.as_str(),
-            target.as_str(),
-        ],
-    }
-}
+// `create_tag_argv` moved to `git_vista_protocol::plan_export` with M10
+// (#590) — unchanged, including the property `tag_signing_suite` pins that it
+// never omits `-m` for an annotated or signed tag, so no editor can ever be
+// opened on a server with no terminal. Re-exported under the name this
+// module's suite already imports.
+#[cfg(test)]
+pub(super) use git_vista_protocol::plan_export::create_tag_argv;
 
 /// `git tag [-a|-s -m <message>] <name> <target>` (`/api/tag`).
 ///
@@ -146,7 +80,8 @@ pub(super) async fn exec_create_tag(
 ) -> (StatusCode, String) {
     let annotated = annotation.is_some();
     let signed = annotation.is_some_and(|a| a.sign);
-    let args = create_tag_argv(name, target, annotation);
+    let argv = plan_export::create_tag_argv(name, target, annotation);
+    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
 
     let output = if signed {
         match run_signed_tag(repo, need, &args, name).await {
@@ -498,7 +433,7 @@ pub(super) async fn exec_delete_local_tag(
     name: &TagName,
     observed: &Observed,
 ) -> (StatusCode, String) {
-    let output = match run_git(repo, need, &["tag", "-d", name.as_str()]).await {
+    let output = match run_git_argv(repo, need, &plan_export::delete_local_tag_argv(name)).await {
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/delete-tag", &e),
     };

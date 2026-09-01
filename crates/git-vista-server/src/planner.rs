@@ -2861,6 +2861,23 @@ async fn run_git(repo: &Path, need: NetworkNeed, args: &[&str]) -> std::io::Resu
     crate::git_cmd::git_output_for(repo, args, need).await
 }
 
+/// [`run_git`] for an argv that came from a
+/// [`git_vista_protocol::plan_export`] builder (M10, #590).
+///
+/// The builders hand back `Vec<String>` — they have to, because some argv
+/// entries are computed (`--force-with-lease=<ref>:<oid>`) — while the spawn
+/// takes `&[&str]`. Every executor that used to write an array literal at the
+/// spawn site now writes the builder call and this, so the borrow dance is in
+/// one place rather than at twenty call sites, and each site reads as one
+/// statement about which command it runs.
+///
+/// This is the shape the export depends on: the bytes printed on the checklist
+/// are the elements of the very slice handed to `git_output_for`.
+async fn run_git_argv(repo: &Path, need: NetworkNeed, argv: &[String]) -> std::io::Result<Output> {
+    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+    run_git(repo, need, &args).await
+}
+
 /// The wall-clock ceiling on a git spawn that may run repository hooks —
 /// `pre-commit`, `prepare-commit-msg`, `commit-msg`, `post-commit` — arbitrary
 /// user code whose own waiting is not under this server's control, the same
@@ -3047,6 +3064,13 @@ async fn git(repo: &Path, need: NetworkNeed, args: &[&str]) -> Result<(), String
         return Ok(());
     }
     Err(stderr_stdout_or(&output, "git failed."))
+}
+
+/// [`git`] for an argv from a [`git_vista_protocol::plan_export`] builder —
+/// the `Result<(), String>` half of [`run_git_argv`] (M10, #590).
+async fn git_argv(repo: &Path, need: NetworkNeed, argv: &[String]) -> Result<(), String> {
+    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+    git(repo, need, &args).await
 }
 
 /// Whether the working tree has any change at all (`git status --porcelain`
@@ -3594,3 +3618,9 @@ mod commit_classification_suite;
 // every remote-reaching operation.
 #[cfg(test)]
 mod remote_operation_shape_suite;
+
+// M10 (#590): the plan export's one seam into this crate — proof that every
+// printable operation's argv is built by the shared builder the export reads,
+// rather than a second time at the spawn site.
+#[cfg(test)]
+mod export_argv_suite;

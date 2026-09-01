@@ -97,8 +97,11 @@ its own `ALLOWED_GIT_CRATE_SPAWN_SITES` allowlist precisely to keep it that way.
 The sanctioned `git merge-tree --write-tree` path already exists one crate over,
 in `activity::revert_would_conflict` (#327), already allowlisted, already going
 through the sealed sandbox launcher. `crates/git-vista-server/src/preview.rs`
-constructs **no `Command`**: every spawn goes through `git_cmd::git_output`, so
-`argv_boundary`'s source scan needs no new entry and its allowlist is untouched.
+constructs **no `Command`**: every spawn goes through `git_cmd::git_output` —
+plus, since finding 10 (2026-09-01), `git_cmd::git_output_with_stdin` for the
+one spawn that needs stdin, `fmt-merge-msg`, the same sealed arity `git apply
+--cached` already uses — so `argv_boundary`'s source scan needs no new entry
+and its allowlist is untouched.
 
 ### 2. The scratch store lives under `<commondir>`, and nowhere else
 
@@ -704,21 +707,45 @@ commit by position instead.
   and the object-format inheritance is correct-but-not-yet-reachable. That is
   `git-vista-git`'s to fix, not this module's, and it is recorded here rather
   than papered over.
-- **Seven git spawns per preview** for a revert or cherry-pick, eight for a
-  merge, plus one more on the first call of the process — each through bwrap and
-  the shim. (`--version` once, `rev-parse --show-object-format`, `init`,
-  `rev-parse HEAD`, `show -s` on the named commit or `merge-base`, `merge-tree`,
-  `commit-tree`, `show -s` read-back.) Fine for a user-initiated preview; **not**
-  fine per keystroke or per row. A surface that wants it live needs its own
-  caching decision.
+- **Seven git spawns per revert preview**, eight for a cherry-pick, **ten for a
+  synthesised merge** (eleven when `merge.ff` is set to a boolean, which costs a
+  second `config` read; four for a fast-forward, three when already up to date),
+  plus one `--version` on the process's first call — each through bwrap and the
+  shim. The kept-current itemisation lives in `preview.rs`'s spawn-count table
+  (the doc comment on `preview`), which exists so nobody discovers these by
+  profiling; this bullet's earlier "eight for a merge" had already drifted from
+  it once, which is the fate of a second copy of a number. The merge total
+  includes finding 10's `fmt-merge-msg` (2026-09-01): one more spawn on a
+  deliberate, user-initiated action, which does not cross the standing line —
+  fine for a clicked preview; **not** fine per keystroke or per row. A surface
+  that wants it live needs its own caching decision.
 - **`POST /api/preview` sits at the full write posture** (`SessionAndCsrf`,
   loopback router only) despite mutating nothing: `security.rs` keys on the HTTP
   method, and a LAN visualize session must never see the plan-review surface
   (ADR 0005). `planner/contract_suite.rs` classifies it as a non-git-write and
   pins the inverse requirement — the handler must reach `preview(` and must
   reach no execution entry point at all.
-- **The merge message omits git's ` into <branch>` clause.** Cosmetic: the
-  parity test compares parent topology, lane and row order, never message text.
+- **The merge message is git's own, via `fmt-merge-msg` (finding 10, closed
+  2026-09-01).** This bullet used to say the missing ` into <branch>` clause was
+  cosmetic because the parity test never compares message text. That defence
+  contradicted `revert_message`'s own rationale in the same file — the message
+  *is* the row's summary in the UI — and the audit called the inconsistency the
+  finding. The rule for the clause is `merge.suppressDest`, a config glob list,
+  **not** "is HEAD the default branch" (measured: a repo whose default branch is
+  `dev` still gets `into dev`), so any hand-written rule would have been finding
+  9's mistake again. The merge arm now feeds `git fmt-merge-msg` the measured
+  merge-names line — `<tip-sha>\t\tbranch '<name>' of .\n`, whose ` of .`
+  clause is what keeps `merge.log`'s shortlog header `* <name>:` — and the
+  output byte-matches what real `git merge --no-edit` stores, proven through
+  `commit-tree` round-trips and pinned by a two-level test pair (an e2e subject
+  check through `preview()`, and byte compares against a real run on a copy
+  under `merge.log` and `merge.suppressDest`). One named residual: the line
+  always says `branch '<name>'`, `MergeBranch`'s own contract, so an
+  off-contract revspec (`origin/x`, a tag, a raw oid) would get git's `into`
+  clause and body but a `branch` kind-prefix where real git would write
+  `remote-tracking branch`/`tag`/`commit` — reproducing that vocabulary would
+  mean re-implementing `merge_name()`'s dwim table, refused on this document's
+  own grounds.
 
 ---
 
@@ -769,6 +796,32 @@ commit by position instead.
 - **2026-09-01, audit finding 12:** no tree oid was added to the protocol. The
   private scratch object is observed directly while `Recipe` owns the store,
   which supplies evidence without inventing a client contract.
+- **2026-09-01, finding 10.** The merge message stopped being modelled.
+  Decided: ask `git fmt-merge-msg` — it owns `merge.suppressDest` (whose
+  *default* list is git-version territory: 2.43 suppresses `master`/`main`,
+  and the rule was measured to be the glob list, not "the default branch"),
+  `merge.log`, and the ` into <dest>` clause itself. Measured, not recalled,
+  on throwaway repositories against git 2.43.0: the input is one line,
+  `<tip-sha>\t\tbranch '<name>' of .\n`, and dropping the ` of .` clause
+  changes `merge.log`'s shortlog header from the `* <name>:` real git writes
+  to `* branch '<name>':` — a wrong guess a title-only probe would never have
+  seen. Output byte-compared (`cmp`) to real `git merge --no-edit` through
+  `commit-tree -m` round-trips in three shapes: plain non-default dest,
+  `merge.log=true`, quoted branch name into a `release/2.0` dest. Stdin
+  reaches the child through the sealed launcher's existing
+  `git_output_with_stdin` — the `git apply --cached` production path — so no
+  new spawn seam and no `-F` temp file; its internal `kill_on_drop` is
+  harmless here because `fmt-merge-msg` writes nothing a SIGKILL could
+  half-finish. Cost, stated because Tom asked to see the trade: the
+  synthesised merge goes from nine spawns to **ten** (eleven with a boolean
+  `merge.ff`), one more bwrap+shim launch on a deliberate user action; revert
+  and cherry-pick are untouched. Proven by four hand-run mutations (the
+  failure-atlas runner still refuses this repo), each with a green
+  `forces_shim_build` baseline in the same invocation: mechanism removed,
+  input corrupted, call site reverted to the inline literal (reddens *only*
+  the e2e test — the demonstration that test carries weight), and ` of .`
+  dropped (reddens *only* the `merge.log` byte compare). Four mutations, four
+  distinct failure shapes.
 
 ---
 
@@ -929,6 +982,25 @@ wrong; the test could not express the failure it claimed to pin.
   the fixture, and none should, since fixtures are test-only. Stated this way so a
   later reader does not go looking for the wrong half.
 
+**Verification, finding-10 round (2026-09-01, fable, worktree `Git-Vista-576-f10`).**
+`cargo test -p git-vista-server --bin git-vista-server` → **1099 passed, 0 failed,
+6 ignored** on the committed tree (one earlier full-suite run had
+`a2_a_cancelled_preview_leaves_nothing_behind` red under 4-CPU suite load — the
+in-flight-`git init` shape already dissected above; 5 of 5 green in isolation and
+green in the final full run). `cargo fmt --check` and
+`cargo clippy --all-targets -- -D warnings` clean. Mutation matrix for the round
+(hand-run, `patch → run → git checkout --`, each invocation prefixed with a green
+`--test forces_shim_build` baseline leg):
+
+| Mutation | e2e subject | byte compare | suppressDest | Verdict |
+|---|---|---|---|---|
+| mechanism removed (old literal, no spawn) | **red** | **red** | green — the documented coincidence | caught |
+| input line names the wrong branch | **red** | **red** | **red** | caught |
+| call site reverted to inline `format!` | **red** | green | green | caught — only the e2e test sees it, by design |
+| ` of .` clause dropped | green | **red** (`* branch 'feature':` header) | green | caught |
+
+Four mutations, four distinct red patterns, no mutation survived.
+
 ---
 
 **Signed:** max · 2026-08-30
@@ -936,3 +1008,8 @@ wrong; the test could not express the failure it claimed to pin.
 the one red test (it was an in-flight `git init`, not a teardown); the fixture round
 that was deferred has now run; and the `cherry_pick_already_applied` consumer sentence
 split into its test half and its production half.
+**Amended:** fable · 2026-09-01T04:35:00-04:00 — finding 10 closed: the merge-message
+consequence bullet rewritten from "cosmetic" to the `fmt-merge-msg` decision, the
+spawn-count bullet corrected to the code table's real numbers, the decision log and
+this verification section extended with the measured input format and the four-way
+mutation matrix.
