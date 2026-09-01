@@ -231,7 +231,7 @@ mod tests {
     fn the_source_census_really_sees_every_file_in_the_crate() {
         let sources = crate_sources();
         let names: Vec<&str> = sources.iter().map(|(n, _)| n.as_str()).collect();
-        for expected in ["auth.rs", "http.rs", "lib.rs"] {
+        for expected in ["auth.rs", "http.rs", "lib.rs", "retry.rs"] {
             assert!(
                 names.contains(&expected),
                 "the source census missed {expected}: {names:?}"

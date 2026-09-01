@@ -34,11 +34,105 @@
 //! `tests::a_failed_request_never_leaks_the_session_cookie_or_csrf_into_its_error`
 //! pins that on both legs.
 
+use crate::auth::Session;
+use crate::http::HttpResponse;
+
+/// GET with the session cookie, authenticating on demand and retrying exactly
+/// once on 401 with a fresh session (covers a server restart mid-session).
+///
+/// Generic over the fetch and auth closures so the three legs — lazy first
+/// auth, 401 → re-auth → retry with the NEW cookie, 401 → 401 giving up — are
+/// unit-testable without a server. Production passes [`crate::http::get`] and
+/// [`crate::auth::authenticate`].
+pub fn authed_fetch(
+    path: &str,
+    session: &mut Option<Session>,
+    fetch: &mut dyn FnMut(&str, &str) -> Result<HttpResponse, String>,
+    auth: &mut dyn FnMut() -> Result<Session, String>,
+) -> Result<Vec<u8>, String> {
+    if session.is_none() {
+        *session = Some(auth()?);
+    }
+    let cookie = session.as_ref().expect("just set").cookie.clone();
+    let resp = fetch(path, &cookie)?;
+    if resp.status == 401 {
+        *session = Some(auth()?);
+        let cookie = session.as_ref().expect("just set").cookie.clone();
+        let retry = fetch(path, &cookie)?;
+        if retry.status != 200 {
+            return Err(format!(
+                "GET {path} answered {} even after re-authenticating: {}",
+                retry.status,
+                String::from_utf8_lossy(&retry.body)
+            ));
+        }
+        return Ok(retry.body);
+    }
+    if resp.status != 200 {
+        return Err(format!(
+            "GET {path} answered {}: {}",
+            resp.status,
+            String::from_utf8_lossy(&resp.body)
+        ));
+    }
+    Ok(resp.body)
+}
+
+/// [`authed_post`]'s injected POST closure: `(path, body, cookie, csrf) ->
+/// response`. Named so the signature below reads, rather than clippy's
+/// `type_complexity` firing on it inline.
+pub type PostFn<'a> = dyn FnMut(&str, &[u8], &str, &str) -> Result<HttpResponse, String> + 'a;
+
+/// POST with the session cookie AND CSRF token, authenticating on demand and
+/// retrying exactly once on 401 with a fresh session — the write-shaped
+/// sibling of [`authed_fetch`], needed because `/api/select` sits behind the
+/// full session+CSRF gate even though it doesn't mutate a repository (see
+/// `git-vista-mcp`'s `tools::select_repository` doc comment). Same three-leg
+/// shape, same unit-testability via injected closures.
+pub fn authed_post(
+    path: &str,
+    body: &[u8],
+    session: &mut Option<Session>,
+    post: &mut PostFn<'_>,
+    auth: &mut dyn FnMut() -> Result<Session, String>,
+) -> Result<Vec<u8>, String> {
+    if session.is_none() {
+        *session = Some(auth()?);
+    }
+    let (cookie, csrf) = {
+        let s = session.as_ref().expect("just set");
+        (s.cookie.clone(), s.csrf.clone())
+    };
+    let resp = post(path, body, &cookie, &csrf)?;
+    if resp.status == 401 {
+        *session = Some(auth()?);
+        let (cookie, csrf) = {
+            let s = session.as_ref().expect("just set");
+            (s.cookie.clone(), s.csrf.clone())
+        };
+        let retry = post(path, body, &cookie, &csrf)?;
+        if retry.status != 200 {
+            return Err(format!(
+                "POST {path} answered {} even after re-authenticating: {}",
+                retry.status,
+                String::from_utf8_lossy(&retry.body)
+            ));
+        }
+        return Ok(retry.body);
+    }
+    if resp.status != 200 {
+        return Err(format!(
+            "POST {path} answered {}: {}",
+            resp.status,
+            String::from_utf8_lossy(&resp.body)
+        ));
+    }
+    Ok(resp.body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::Session;
-    use crate::http::HttpResponse;
 
     fn session(cookie: &str) -> Session {
         Session {
