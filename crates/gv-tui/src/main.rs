@@ -37,6 +37,10 @@
 //! deliberately absent here; it lifts into `git-vista-session` when the
 //! first persistent-pane slice (#457) needs it.
 
+mod app;
+mod keys;
+mod layout;
+
 use git_vista_protocol::{RepositoryDescriptor, RepositoryKind};
 use git_vista_session::{auth, http};
 
@@ -231,11 +235,12 @@ mod tests {
     fn the_source_census_really_sees_every_file_in_the_crate() {
         let sources = crate_sources();
         let names: Vec<&str> = sources.iter().map(|(n, _)| n.as_str()).collect();
-        let expected = "main.rs";
-        assert!(
-            names.contains(&expected),
-            "the source census missed {expected}: {names:?}"
-        );
+        for expected in ["app.rs", "keys.rs", "layout.rs", "main.rs"] {
+            assert!(
+                names.contains(&expected),
+                "the source census missed {expected}: {names:?}"
+            );
+        }
         for (name, body) in &sources {
             assert!(
                 body.len() > 500,
