@@ -12,3 +12,4 @@
 //! per-row marks derived. Rendering and the request live beside it.
 
 pub mod core;
+pub mod scene;
