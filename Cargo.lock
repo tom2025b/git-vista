@@ -951,6 +951,7 @@ version = "0.2.0"
 dependencies = [
  "git-vista-core",
  "git-vista-protocol",
+ "git-vista-session",
  "serde",
  "serde_json",
 ]
@@ -991,6 +992,14 @@ dependencies = [
  "tokio",
  "tower",
  "tower-http 0.7.0",
+]
+
+[[package]]
+name = "git-vista-session"
+version = "0.2.0"
+dependencies = [
+ "git-vista-protocol",
+ "serde_json",
 ]
 
 [[package]]
@@ -1702,6 +1711,15 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "gv-tui"
+version = "0.2.0"
+dependencies = [
+ "git-vista-protocol",
+ "git-vista-session",
+ "serde_json",
 ]
 
 [[package]]
