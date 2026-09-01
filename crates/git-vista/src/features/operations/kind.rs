@@ -17,6 +17,8 @@ use git_vista_core::activity::Undoable;
 use git_vista_protocol::plan::Advisory;
 use git_vista_protocol::{CommitOid, Explanation, MergeStrategy, RiskLevel};
 
+use crate::features::graph::core::short_oid;
+
 /// A branch operation awaiting confirmation in the modal (Issue #33 follow-up).
 /// Merge and delete change history/refs and push reaches the network, so each is
 /// confirmed before it runs — reusing the same in-app modal the commit dialog uses
@@ -130,6 +132,22 @@ pub enum OperationKind {
     /// tap, and why nothing in its user-facing copy — or in `describe`
     /// below — says "undo", "restore" or "recover".
     DeleteUntrackedPaths { paths: Vec<String> },
+    /// Cherry-pick `commit` onto the checked-out branch (`git cherry-pick
+    /// <commit>`, M10.09/#596, `POST /api/cherry-pick`).
+    ///
+    /// `onto` is the live HEAD answer, fetched when the menu item is clicked,
+    /// exactly as [`Self::Merge`]'s `into` is — a pick lands on whatever branch
+    /// is checked out, never on the row that was tapped, so the confirmation
+    /// has to name the real destination rather than the graph's idea of it.
+    /// [`HeadBranch::Detached`] and [`HeadBranch::Unknown`] both disable the
+    /// confirm button with copy that says which one happened; a detached HEAD
+    /// would leave the picked commit unreferenced, and a failed read is not
+    /// evidence of anything.
+    ///
+    /// `commit` is the full hex id of the tapped row. Ordinary commits only —
+    /// `GitOperation::CherryPickMerge` is a separate operation needing a
+    /// mainline, and has no route yet.
+    CherryPick { commit: String, onto: HeadBranch },
     /// Delete the local tag `tag` (`git tag -d <tag>`, M2.21d/#238, `POST
     /// /api/delete-tag`). Local only — deleting a tag already pushed to a
     /// remote is a separate operation with its own route still to come
@@ -250,6 +268,12 @@ impl OperationKind {
                 format!(
                     "Pulling \u{2018}{branch}\u{2019} from \u{2018}{remote}\u{2019} ({verb} strategy)"
                 )
+            }
+            // Names the commit, not the destination: the destination is
+            // wherever HEAD is, which the confirmation already stated and the
+            // strip has no room to repeat. Short id — the strip is one line.
+            Self::CherryPick { commit, .. } => {
+                format!("Cherry-picking {}", short_oid(commit))
             }
             Self::Undo(u) => format!("Undoing: {}", u.label),
             Self::DiscardTrackedPaths { paths } => {

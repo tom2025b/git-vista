@@ -1009,7 +1009,7 @@ fn advisory_lines(advisories: &[Advisory]) -> String {
 /// `crates/git-vista-server/src/planner/push.rs:667`), so the truncation
 /// this client shows matches the one the server's own journal and undo
 /// labels already use.
-fn short_oid(oid: &str) -> &str {
+pub(crate) fn short_oid(oid: &str) -> &str {
     &oid[..oid.len().min(7)]
 }
 
