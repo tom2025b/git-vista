@@ -75,17 +75,17 @@ fn a_tag_argv_never_asks_for_an_editor() {
         // not, and `contract_suite::annotated_tag_creation_never_opens_
         // an_editor` drives that exact message through real git to prove
         // it lands as text.
-        let value_of_m = argv.iter().position(|x| *x == "-m").map(|i| i + 1);
+        let value_of_m = argv.iter().position(|x| x == "-m").map(|i| i + 1);
         for (i, arg) in argv.iter().enumerate() {
             if Some(i) == value_of_m {
                 continue;
             }
             assert!(
-                !matches!(*arg, "--edit" | "-e"),
+                !matches!(arg.as_str(), "--edit" | "-e"),
                 "{argv:?} asks git to open an editor"
             );
             assert!(
-                !matches!(*arg, "-f" | "--force"),
+                !matches!(arg.as_str(), "-f" | "--force"),
                 "{argv:?} would repoint an existing tag past the plan's \
                      RefAbsent precondition"
             );
@@ -93,7 +93,7 @@ fn a_tag_argv_never_asks_for_an_editor() {
             // *unsigned* argv must never carry a signing flag.
             if !signed {
                 assert!(
-                    !matches!(*arg, "-s" | "--sign" | "-u" | "--local-user"),
+                    !matches!(arg.as_str(), "-s" | "--sign" | "-u" | "--local-user"),
                     "{argv:?} asks for a signature this request never requested"
                 );
             }
@@ -102,34 +102,37 @@ fn a_tag_argv_never_asks_for_an_editor() {
             None => assert_eq!(argv, vec!["tag", "v1.0.0", &"a".repeat(40)]),
             Some(a) if a.sign => {
                 assert_eq!(
-                    argv.get(1),
-                    Some(&"-s"),
+                    argv.get(1).map(String::as_str),
+                    Some("-s"),
                     "a signed create must ask git to sign: {argv:?}"
                 );
                 assert!(
-                    !argv.contains(&"-a"),
+                    !argv.iter().any(|a| a == "-a"),
                     "-s already implies -a; this pins the argv this function \
                          actually emits, not merely a git behavior: {argv:?}"
                 );
                 let dash_m = argv
                         .iter()
-                        .position(|x| *x == "-m")
+                        .position(|x| x == "-m")
                         .expect("a signed tag is annotated by definition — -s with no -m is exactly the editor case");
-                assert_eq!(argv.get(dash_m + 1).copied(), Some(a.message.as_str()));
+                assert_eq!(
+                    argv.get(dash_m + 1).map(String::as_str),
+                    Some(a.message.as_str())
+                );
                 assert_eq!(argv[argv.len() - 2..], ["v1.0.0", &"a".repeat(40)]);
             }
             Some(a) => {
                 let dash_a = argv
                     .iter()
-                    .position(|x| *x == "-a")
+                    .position(|x| x == "-a")
                     .expect("an annotated create must say -a");
                 let dash_m = argv
                     .iter()
-                    .position(|x| *x == "-m")
+                    .position(|x| x == "-m")
                     .expect("…and -a with no -m is exactly the editor case");
                 assert!(dash_m > dash_a, "{argv:?}");
                 assert_eq!(
-                    argv.get(dash_m + 1).copied(),
+                    argv.get(dash_m + 1).map(String::as_str),
                     Some(a.message.as_str()),
                     "the message must be -m's own argv entry, so an \
                          option-shaped message can never be read as a flag"

@@ -19,6 +19,7 @@ use std::path::Path;
 
 use axum::http::StatusCode;
 
+use git_vista_protocol::plan_export::{self, SequenceKind};
 use git_vista_protocol::CommitOid;
 
 use git_vista_core::activity::ActivityKind;
@@ -27,27 +28,18 @@ use crate::git_cmd::rev_parse;
 use crate::sandbox::NetworkNeed;
 
 use super::{
-    couldnt_run, git, journal_app_event, read_head_branch_blocking, run_git, short, stderr_or, Obs,
-    Observed,
+    couldnt_run, git_argv, journal_app_event, read_head_branch_blocking, run_git_argv, short,
+    stderr_or, Obs, Observed,
 };
 
 /// Which way a sequence is being driven (M4.28, #81).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SequenceVerb {
-    Continue,
-    Skip,
-    Abort,
-}
-
-impl SequenceVerb {
-    fn flag(self) -> &'static str {
-        match self {
-            SequenceVerb::Continue => "--continue",
-            SequenceVerb::Skip => "--skip",
-            SequenceVerb::Abort => "--abort",
-        }
-    }
-}
+///
+/// The vocabulary and its flags moved to
+/// [`git_vista_protocol::plan_export`] with M10 (#590): the export has to name
+/// the same three verbs and spell the same three flags, and two copies of a
+/// three-way mapping is two places for it to drift. Re-exported under the name
+/// this module's callers already use.
+pub(super) use git_vista_protocol::plan_export::SequenceVerb;
 
 /// Which sequence, if any, the repository is in the middle of.
 ///
@@ -56,13 +48,13 @@ impl SequenceVerb {
 /// reason to invite that when the repository already knows.
 ///
 /// `None` means neither is in progress — a refusal, not a fallback.
-async fn sequence_in_progress(repo: &Path) -> Option<&'static str> {
+async fn sequence_in_progress(repo: &Path) -> Option<SequenceKind> {
     let git_dir = repo.join(".git");
     // Order matters only for the impossible case of both existing at once,
     // which git does not produce; cherry-pick first is arbitrary and harmless.
     for (marker, verb) in [
-        ("CHERRY_PICK_HEAD", "cherry-pick"),
-        ("REVERT_HEAD", "revert"),
+        ("CHERRY_PICK_HEAD", SequenceKind::CherryPick),
+        ("REVERT_HEAD", SequenceKind::Revert),
     ] {
         if tokio::fs::try_exists(git_dir.join(marker))
             .await
@@ -95,7 +87,7 @@ pub(super) async fn exec_sequence(
     need: NetworkNeed,
     verb: SequenceVerb,
 ) -> (StatusCode, String) {
-    let Some(kind) = sequence_in_progress(repo).await else {
+    let Some(sequence) = sequence_in_progress(repo).await else {
         return (
             StatusCode::CONFLICT,
             format!(
@@ -111,7 +103,12 @@ pub(super) async fn exec_sequence(
         );
     };
 
-    let output = match run_git(repo, need, &[kind, verb.flag()]).await {
+    // The subcommand is the sequence git is actually in, not one the caller
+    // named — which is exactly why `SequenceContinue` and its two siblings
+    // cannot be printed as a single command by the plan export, and are
+    // reported there as `Export::ChosenAtRunTime` over both candidates.
+    let kind = sequence.subcommand();
+    let output = match run_git_argv(repo, need, &plan_export::sequence_argv(sequence, verb)).await {
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/sequence", &e),
     };
@@ -194,10 +191,10 @@ pub(super) async fn exec_sequence(
 pub(super) async fn exec_cherry_pick(
     repo: &Path,
     need: NetworkNeed,
-    commit: &CommitOid,
+    commit_oid: &CommitOid,
     mainline: Option<std::num::NonZeroU8>,
 ) -> (StatusCode, String) {
-    let commit = commit.as_str();
+    let commit = commit_oid.as_str();
 
     if let Some(refusal) =
         refuse_mainline_mismatch(repo, need, commit, mainline, "cherry-picking").await
@@ -205,15 +202,9 @@ pub(super) async fn exec_cherry_pick(
         return refusal;
     }
 
-    let mainline_flag = mainline.map(|m| m.get().to_string());
-    let mut argv: Vec<&str> = vec!["cherry-pick"];
-    if let Some(m) = mainline_flag.as_deref() {
-        argv.push("-m");
-        argv.push(m);
-    }
-    argv.push(commit);
+    let argv = plan_export::cherry_pick_argv(commit_oid, mainline);
 
-    let output = match run_git(repo, need, &argv).await {
+    let output = match run_git_argv(repo, need, &argv).await {
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/cherry-pick", &e),
     };
@@ -338,7 +329,7 @@ async fn refuse_mainline_mismatch(
 ///
 /// Local (D3): reading a commit header walks the object database.
 async fn parent_count(repo: &Path, need: NetworkNeed, commit: &str) -> Option<usize> {
-    let out = run_git(repo, need, &["rev-list", "--parents", "-n", "1", commit])
+    let out = super::run_git(repo, need, &["rev-list", "--parents", "-n", "1", commit])
         .await
         .ok()?;
     if !out.status.success() {
@@ -399,38 +390,32 @@ async fn parent_count(repo: &Path, need: NetworkNeed, commit: &str) -> Option<us
 pub(super) async fn exec_revert(
     repo: &Path,
     need: NetworkNeed,
-    commit: &CommitOid,
+    commit_oid: &CommitOid,
     mainline: Option<std::num::NonZeroU8>,
     observed: &Observed,
 ) -> (StatusCode, String) {
-    let commit = commit.as_str();
+    let commit = commit_oid.as_str();
 
     if let Some(refusal) = refuse_mainline_mismatch(repo, need, commit, mainline, "undoing").await {
         return refusal;
     }
 
-    let mainline_flag = mainline.map(|m| m.get().to_string());
-    let mut argv: Vec<&str> = vec!["revert", "--no-commit"];
-    if let Some(m) = mainline_flag.as_deref() {
-        argv.push("-m");
-        argv.push(m);
-    }
-    argv.push(commit);
+    let argv = plan_export::revert_compute_argv(commit_oid, mainline);
 
     // Step 1: compute the revert into the index without committing.
-    if let Err(msg) = git(repo, need, &argv).await {
+    if let Err(msg) = git_argv(repo, need, &argv).await {
         // A conflicted (or otherwise failed) --no-commit leaves sequencer
         // state (REVERT_HEAD) and possibly conflict markers; --abort is
         // git's own cleanup for exactly that. Harmless when no revert is
         // in progress.
-        let _ = git(repo, need, &["revert", "--abort"]).await;
+        let _ = git_argv(repo, need, &plan_export::revert_abort_argv()).await;
         eprintln!("git-vista: /api/undo revert (compute) failed (aborted): {msg}");
         return revert_step1_failure_response(commit, &msg);
     }
 
     // Step 2: finish the revert as its own commit, explicitly allowing an
     // empty one — the step the single command cannot express on git < 2.45.
-    match git(repo, need, &["commit", "--allow-empty", "--no-edit"]).await {
+    match git_argv(repo, need, &plan_export::revert_commit_argv()).await {
         Ok(()) => {
             println!("[/api/undo] reverted {}", short(commit));
             let new = Obs::from_read(rev_parse(repo, "HEAD").await);
@@ -453,7 +438,7 @@ pub(super) async fn exec_revert(
             // is still set — git only clears it on a successful commit — so
             // --abort restores the pre-revert tree here exactly as it does
             // for a conflicted step 1.
-            let _ = git(repo, need, &["revert", "--abort"]).await;
+            let _ = git_argv(repo, need, &plan_export::revert_abort_argv()).await;
             eprintln!("git-vista: /api/undo revert (commit) failed (aborted): {msg}");
             (StatusCode::BAD_REQUEST, msg)
         }

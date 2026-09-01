@@ -49,12 +49,14 @@
 //! lines of dispatch. Hand-rolled wins at this size; revisit when the tool
 //! surface (#246–#249) makes the framing the bigger half of the crate.
 
-mod auth;
 mod execute_tool;
-mod http;
+mod export_tools;
+mod hygiene;
 mod lesson;
 mod plan_tools;
 mod tools;
+
+use git_vista_session::auth;
 
 use std::io::{BufRead, Write};
 

@@ -56,6 +56,7 @@
 
 use axum::http::StatusCode;
 
+use git_vista_protocol::plan_export;
 use git_vista_protocol::{ForcePublish, RemoteName, RemoteRefUpdate};
 
 use super::transfer::{diff_refs, parse_progress, remote_tracking_refs};
@@ -65,64 +66,20 @@ use super::*;
 const ENDPOINT: &str = "/api/push";
 
 // ---------------------------------------------------------------------------
-// The argv — the one place a push command line is built
+// The argv
 // ---------------------------------------------------------------------------
-
-/// The exact `git` arguments for one push.
-///
-/// Owned `String`s rather than `&str` because `--force-with-lease=<ref>:<oid>`
-/// is computed; the caller borrows them back for the spawn.
-///
-/// # Why this is a function, and why it has no wildcard
-///
-/// A push's argv is the whole security surface of this slice. Built inline in
-/// the executor it would be three `if`s next to a `match`, and the failure mode
-/// is quiet: an arm that fell through to "no flag" when a future `ForcePublish`
-/// variant appeared would silently downgrade a force the user approved into a
-/// fast-forward push — or, if someone wrote the fallback the other way, upgrade
-/// a fast-forward into an unguarded force. Pulling it out makes the property
-/// testable over the entire input space without spawning anything, and the
-/// exhaustive `match` below makes a third variant a compile error rather than a
-/// judgement call.
-///
-/// # Order
-///
-/// Flags first, then `<remote> <branch>`. git accepts options after the
-/// repository name too, but a fixed order means the assertions in this file's
-/// tests describe one shape rather than a family of them.
-///
-/// The lease's ref half is the **remote-side** name (`main`, not
-/// `refs/remotes/origin/main`): `--force-with-lease=<refname>:<expect>` names a
-/// ref on the remote, and git's `refname_match` expands the short form against
-/// the remote's advertised `refs/heads/main`. Verified against git 2.43.0.
-fn push_argv(
-    branch: &BranchName,
-    remote: &RemoteName,
-    set_upstream: bool,
-    force: &ForcePublish,
-) -> Vec<String> {
-    let mut argv = vec!["push".to_string(), "--progress".to_string()];
-    if set_upstream {
-        argv.push("--set-upstream".to_string());
-    }
-    // No wildcard arm, on purpose — see this function's doc. `None` adds
-    // nothing at all; `WithLease` adds exactly one flag and it is the leased
-    // one. There is no branch of this `match` from which an unguarded
-    // `--force` could be reached.
-    match force {
-        ForcePublish::None => {}
-        ForcePublish::WithLease {
-            expected_remote_tip,
-        } => argv.push(format!(
-            "--force-with-lease={}:{}",
-            branch.as_str(),
-            expected_remote_tip.as_str()
-        )),
-    }
-    argv.push(remote.as_str().to_string());
-    argv.push(branch.as_str().to_string());
-    argv
-}
+//
+// `push_argv` moved to `git_vista_protocol::plan_export` with M10 (#590), so
+// the plan export prints the command this module runs rather than a second
+// reconstruction of it. Everything that made it worth pulling out of the
+// executor in M2.20e is unchanged and travelled with it: the exhaustive,
+// wildcard-free `match` over `ForcePublish` from which no unguarded `--force`
+// is reachable, and the fixed flag order its tests describe.
+//
+// It now sits beside `ForcePublish` itself — the type whose design is what
+// makes an unguarded force unsayable in the first place — and the
+// force-construction tripwire moved with it (see
+// `contract_suite::only_one_place_builds_a_push_argv_and_it_can_only_build_a_leased_force`).
 
 // ---------------------------------------------------------------------------
 // The lease, checked before anything is spawned
@@ -446,7 +403,7 @@ pub(super) async fn exec_push(
     }
 
     // --- 4. the spawn -------------------------------------------------------
-    let argv = push_argv(branch, remote, set_upstream, force);
+    let argv = plan_export::push_argv(branch, remote, set_upstream, force);
     let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
     // `Box::pin` for the reason `planner::fetch` documents: `git_streamed_for`'s
     // future is large enough that inlining it into every caller's frame
@@ -826,7 +783,7 @@ mod tests {
         for force in every_force_mode() {
             for set_upstream in [true, false] {
                 for (b, r) in [("main", "origin"), ("release/2026-08", "upstream")] {
-                    let argv = push_argv(&branch(b), &remote(r), set_upstream, &force);
+                    let argv = plan_export::push_argv(&branch(b), &remote(r), set_upstream, &force);
                     for arg in &argv {
                         assert_ne!(arg, "--force", "bare force in {argv:?}");
                         assert_ne!(arg, "-f", "bare force in {argv:?}");
@@ -865,7 +822,8 @@ mod tests {
     #[test]
     fn only_a_lease_push_builds_a_force_flag_and_it_names_the_reviewed_tip() {
         let tip = "4".repeat(40);
-        let leased = push_argv(&branch("main"), &remote("origin"), false, &lease(&tip));
+        let leased =
+            plan_export::push_argv(&branch("main"), &remote("origin"), false, &lease(&tip));
         let leased_flags: Vec<&String> =
             leased.iter().filter(|a| a.starts_with("--force")).collect();
         assert_eq!(
@@ -874,7 +832,7 @@ mod tests {
             "the lease must name the remote-side ref and the reviewed tip: {leased:?}"
         );
 
-        let plain = push_argv(
+        let plain = plan_export::push_argv(
             &branch("main"),
             &remote("origin"),
             false,
@@ -891,14 +849,14 @@ mod tests {
     /// one thing to grep for).
     #[test]
     fn set_upstream_is_present_exactly_when_requested() {
-        let with = push_argv(
+        let with = plan_export::push_argv(
             &branch("main"),
             &remote("origin"),
             true,
             &ForcePublish::None,
         );
         assert!(with.iter().any(|a| a == "--set-upstream"), "{with:?}");
-        let without = push_argv(
+        let without = plan_export::push_argv(
             &branch("main"),
             &remote("origin"),
             false,
@@ -920,7 +878,12 @@ mod tests {
     fn every_push_argv_asks_git_for_progress() {
         for force in every_force_mode() {
             for set_upstream in [true, false] {
-                let argv = push_argv(&branch("main"), &remote("origin"), set_upstream, &force);
+                let argv = plan_export::push_argv(
+                    &branch("main"),
+                    &remote("origin"),
+                    set_upstream,
+                    &force,
+                );
                 assert!(
                     argv.iter().any(|a| a == "--progress"),
                     "no --progress in {argv:?}"
