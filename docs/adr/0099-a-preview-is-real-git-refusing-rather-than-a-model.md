@@ -398,7 +398,14 @@ helper was left intact could bypass it. There is no deterministic end-to-end
 observer after `preview()` returns — `Recipe` has dropped the store and the
 wire carries no tree — so closing that caller-link gap would require one of the
 rejected wire or test-hook designs. The current claim is the one mutation runs
-establish, not the stronger one.
+establish, not the stronger one. A second, narrower residual (named by the
+fresh-reader adjudication, 2026-09-01): the committed object is observed for
+the **cherry-pick arm only** — merge and revert content tests still pin the
+recipe through `predicted_tree`, so an *op-conditional* wrong tree at the
+`commit_tree` call (wrong only when `no_op` is `None`) would survive the
+suite. One call site serves all three operations, so an accidental regression
+still reddens the cherry-pick test; only a deliberately conditional break
+slips through, which is the same class as the re-inlining above.
 
 ---
 
