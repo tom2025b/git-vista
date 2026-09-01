@@ -13,3 +13,8 @@
 
 pub mod core;
 pub mod scene;
+// The reactive half. Gated because it imports Leptos and `crate::api`, which is
+// itself wasm-gated; `core` and `scene` above are not, so every rule and every
+// pixel of geometry is decided somewhere `cargo test` can reach.
+#[cfg(target_arch = "wasm32")]
+pub mod signals;

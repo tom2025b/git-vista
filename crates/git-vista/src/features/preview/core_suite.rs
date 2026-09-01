@@ -17,6 +17,8 @@
 
 use super::*;
 
+use git_vista_core::model::Oid;
+
 fn oid(d: char) -> Oid {
     Oid((0..40).map(|_| d).collect())
 }
@@ -313,4 +315,123 @@ fn no_outcome_ever_blocks_the_operation() {
         !views[1].has_picture(),
         "a Conflict is a successful preview with no picture — not a failed one"
     );
+}
+
+/// Which dialogs get a preview, and which get none.
+///
+/// The mapping matters twice over: asking for a preview the engine cannot give
+/// spends two round trips to be told `Unsupported`, and *not* asking where it
+/// can is exactly the omission that created #594 in the first place.
+///
+/// # Two mutations
+///
+/// 1. **REMOVES the mapping** — return `None` from the `Merge` arm. The merge
+///    assertion goes red; the revert one still passes, so the arm that broke
+///    is named rather than the whole function.
+/// 2. **WEAKENS the mapping** — have `NotPreviewable` fall through to
+///    `Merge { branch: "HEAD" }`. Both positive assertions still pass and the
+///    negative one goes red — a dialog with nothing to preview would otherwise
+///    silently ask the server about a branch nobody named.
+#[test]
+fn only_the_two_wired_dialogs_ask_for_a_preview() {
+    assert!(
+        matches!(
+            previewable(DialogSubject::Merge { branch: "feature" }),
+            Some(GitOperation::MergeBranch { ref branch }) if branch.as_str() == "feature"
+        ),
+        "a merge confirmation must ask for a preview"
+    );
+    let commit = "a".repeat(40);
+    assert!(
+        matches!(
+            previewable(DialogSubject::Revert { commit: &commit }),
+            Some(GitOperation::RevertCommit { ref commit }) if commit.as_str() == "a".repeat(40)
+        ),
+        "a revert confirmation must ask for a preview"
+    );
+    assert_eq!(
+        previewable(DialogSubject::NotPreviewable),
+        None,
+        "a dialog the engine cannot preview must not spend two round trips \
+         being told so"
+    );
+}
+
+/// A name the newtypes refuse yields no preview, never a panic.
+///
+/// A panic inside a Leptos view is a blank app, not a diagnostic — and the
+/// operation itself is still confirmable, because refusing a malformed name is
+/// the server's job, not a preview panel's.
+///
+/// # Two mutations
+///
+/// 1. **REMOVES the guard** — `BranchName::new(branch).unwrap()`. The empty
+///    branch name panics and the test is red on the panic itself.
+/// 2. **WEAKENS the guard** — fall back to a placeholder
+///    (`BranchName::new("HEAD").unwrap()`) when validation fails. Nothing
+///    panics, so a panic-only check would pass; the `None` assertions go red,
+///    which is the failure that matters — a preview of an operation the user
+///    never asked for.
+#[test]
+fn a_name_the_newtypes_refuse_yields_no_preview_rather_than_a_panic() {
+    assert_eq!(previewable(DialogSubject::Merge { branch: "" }), None);
+    assert_eq!(previewable(DialogSubject::Revert { commit: "nope" }), None);
+}
+
+/// Every arm without a picture says the operation is still available; the one
+/// with a picture says nothing.
+///
+/// This is the sentence that stops a conflict list or a "git is too old" note
+/// from reading as a refusal of the operation. It is wired to
+/// [`PreviewView::advisory_only`] deliberately: a future change that let a
+/// preview gate an operation would stop the promise being printed rather than
+/// leave it printed under a dead button.
+///
+/// # Two mutations
+///
+/// 1. **REMOVES the wiring** — delete the `advisory_only` guard. Every
+///    assertion still passes, which is why the *second* mutation is the
+///    load-bearing one; run it with `advisory_only` returning `false` and the
+///    three no-picture assertions go red exactly as designed.
+/// 2. **WEAKENS the coverage** — return `None` for `Unavailable` too. The
+///    `Conflict` and `Unsupported` assertions pass and the `Unavailable` one
+///    is red — the arm where the sentence matters most, because it is the one
+///    that names the host rather than the request.
+#[test]
+fn every_pictureless_arm_promises_the_operation_is_still_available() {
+    let conflict = PreviewView::Conflict {
+        paths: vec!["a.rs".into()],
+    };
+    let unsupported = PreviewView::Unsupported {
+        operation: "Rebase".into(),
+    };
+    let unavailable = view_of(PreviewOutcome::Unavailable {
+        reason: PreviewUnavailable::GitTooOld {
+            found: "2.34.1".into(),
+            minimum: "2.38".into(),
+        },
+    });
+
+    for (view, name) in [
+        (&conflict, "Conflict"),
+        (&unsupported, "Unsupported"),
+        (&unavailable, "Unavailable"),
+    ] {
+        let note = reassurance(view)
+            .unwrap_or_else(|| panic!("{name} left the user with no picture and no reassurance"));
+        assert!(
+            note.contains("still available"),
+            "{name}'s note does not say the operation is still available: {note}"
+        );
+    }
+
+    assert_eq!(
+        reassurance(&view_of(graph_of(Vec::new()))),
+        None,
+        "a picture needs no reassurance — the graph is the answer"
+    );
+    // The rule the note depends on, stated where a reader of this test finds it.
+    assert!(conflict.advisory_only());
+    assert!(!conflict.has_picture());
+    assert!(view_of(graph_of(Vec::new())).has_picture());
 }

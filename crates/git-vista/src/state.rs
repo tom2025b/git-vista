@@ -115,6 +115,7 @@ pub use crate::features::operations::kind::OperationKind as PendingOp;
 use crate::features::dialogs::signals::Dialogs;
 use crate::features::graph::core::GraphCore;
 use crate::features::operations::signals::Operations;
+use crate::features::preview::signals::Preview;
 use crate::features::shell::signals::Shell;
 use crate::features::stash::signals::StashDrawer;
 use crate::features::status::signals::StatusResource;
@@ -231,6 +232,14 @@ pub struct Features {
     /// the USER chose, and a background refresh re-reading the repo must not
     /// silently discard it.
     pub compare_anchor: RwSignal<Option<String>>,
+    /// The confirm dialog's before/after graph (M10.08 A6, #594).
+    ///
+    /// In this bundle for the reason every other handle here is: it is created
+    /// above the canvas, so an epoch bump cannot discard a preview that is
+    /// still in flight — and the generation tag that decides whether a late
+    /// reply may paint lives inside it, where a rebuild would reset it to zero
+    /// and re-admit exactly the stale answer it exists to drop.
+    pub preview: Preview,
 }
 
 /// The lazily-fetched commit detail (Phase 10): keyed on the open commit's hash,

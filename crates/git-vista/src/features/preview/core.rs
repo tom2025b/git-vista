@@ -30,9 +30,10 @@
 
 use std::collections::HashMap;
 
-use git_vista_core::model::{BranchStub, Edge, GraphRow, Oid};
+use git_vista_core::model::{BranchStub, Edge, GraphRow};
 use git_vista_core::preview::PreviewChange;
 use git_vista_protocol::preview::{PreviewGraph, PreviewOutcome, PreviewUnavailable};
+use git_vista_protocol::{BranchName, CommitOid, GitOperation};
 
 /// The concrete answer `/api/preview` returns, spelled with this crate's own
 /// model types.
@@ -280,6 +281,84 @@ fn sentence_list(parts: &[String]) -> String {
         [] => String::new(),
         [only] => only.clone(),
         [head @ .., last] => format!("{} and {last}", head.join(", ")),
+    }
+}
+
+/// What a confirm dialog is asking about, reduced to the part a preview needs.
+///
+/// Deliberately **not** `PendingOp`. That type lives in `crate::state`, which
+/// is `#[cfg(target_arch = "wasm32")]`, so a decision written against it could
+/// never be host-tested — and "which dialogs get a preview" is exactly the
+/// kind of decision that rots silently when nothing can check it. The wasm
+/// dialog does the one-line translation; the rule lives here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogSubject<'a> {
+    /// `git merge --no-edit <branch>`.
+    Merge { branch: &'a str },
+    /// `git revert --no-edit <commit>` — reached through `UndoAction::RevertCommit`.
+    Revert { commit: &'a str },
+    /// Every other confirmation this modal shows. Checkout, delete, fetch,
+    /// pull, push, reset, discard: the engine previews none of them
+    /// (`git-vista-server/src/preview.rs:752-760` maps exactly three
+    /// operations), so asking would spend two round trips to be told
+    /// `Unsupported`.
+    NotPreviewable,
+}
+
+/// The operation to preview for this dialog, or `None` if it has none.
+///
+/// # Cherry-pick is absent on purpose
+///
+/// The engine previews three operations and this maps two. Cherry-pick has no
+/// confirm dialog to hang a preview off (#596); it inherits this panel for
+/// free the day it gets one, by adding a `CherryPick` arm here and one line to
+/// the caller. Stated rather than silently narrowed.
+///
+/// # An invalid name yields `None`, never a panic
+///
+/// `BranchName`/`CommitOid` validate on construction. A name this app could
+/// not have produced is a bug somewhere upstream, and the right behaviour in a
+/// dialog is to show no picture — the operation itself is still confirmable,
+/// and it is the *server* that must refuse a bad name, not a preview panel.
+pub fn previewable(subject: DialogSubject<'_>) -> Option<GitOperation> {
+    match subject {
+        DialogSubject::Merge { branch } => Some(GitOperation::MergeBranch {
+            branch: BranchName::new(branch).ok()?,
+        }),
+        DialogSubject::Revert { commit } => Some(GitOperation::RevertCommit {
+            commit: CommitOid::new(commit).ok()?,
+        }),
+        DialogSubject::NotPreviewable => None,
+    }
+}
+
+/// The sentence shown under a preview that has no picture in it, or `None`
+/// when the picture speaks for itself.
+///
+/// Every arm but `Picture` shows a reader something that *looks* like a
+/// refusal — "these files conflict", "this host's git is too old" — and the
+/// one thing that must not follow from any of them is a belief that the
+/// operation is now unavailable. It is not, and it never was: all of these
+/// were executable before previews existed.
+///
+/// # Why this consults [`PreviewView::advisory_only`] instead of asserting it
+///
+/// The guard reads as redundant today, because `advisory_only` is
+/// unconditional. That is the point. If some future change makes a preview
+/// gate an operation, this sentence — which *promises* the operation is still
+/// available — stops being printed, rather than becoming a lie printed under
+/// a disabled button. A promise wired to the thing it promises is worth more
+/// than an assertion beside it.
+pub fn reassurance(view: &PreviewView) -> Option<&'static str> {
+    if !view.advisory_only() {
+        return None;
+    }
+    match view {
+        PreviewView::Picture(_) => None,
+        _ => Some(
+            "This is only a picture of what would happen. The operation itself is \
+             unchanged and still available — confirm below to run it.",
+        ),
     }
 }
 

@@ -124,6 +124,8 @@ const API_SRC: &str = concat!(
     "\n",
     include_str!("api/operations.rs"),
     "\n",
+    include_str!("api/preview.rs"),
+    "\n",
     include_str!("api/remotes.rs"),
     "\n",
     include_str!("api/repositories.rs"),
@@ -224,6 +226,19 @@ const OFFLINE_GUARDED: &[&str] = &[
     // failing early here is also what keeps that dialog from opening on
     // data it could never have obtained.
     "preview_push",
+    // M10.08 A6 (#594). The graph-preview round trip: `plan_request` POSTs
+    // /api/plan for a `Plan`, `preview_request` POSTs that plan to
+    // /api/preview for the before/after graphs. Neither executes anything and
+    // neither reaches `operations::admit`, so neither carries an idempotency
+    // key — classified guarded for exactly `preview_push`'s reason above, and
+    // with the same posture: they reach the write transport (`req_post`,
+    // because a `GitOperation` and a `Plan` are internally-tagged enums a
+    // query string cannot carry), and this audit classifies by transport
+    // rather than by intent, since intent is what a reader can be wrong about.
+    // Failing early here is also what keeps a confirm dialog from showing a
+    // preview slot that could never have been filled.
+    "plan_request",
+    "preview_request",
     // M2.20g (#233). The execution half of the force-with-lease ceremony —
     // POST /api/push, carrying the ForcePublish the confirmed plan named.
     // The most consequential write in this table: an irreversible remote

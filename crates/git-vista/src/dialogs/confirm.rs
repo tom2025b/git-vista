@@ -18,6 +18,11 @@ use crate::features::dialogs::core::{
     delete_confirm_prompt, merge_confirm_prompt, worktree_confirm, ConfirmPrompt, Dialog,
     PullTarget, WorktreeAction, TOUCH_TARGET_STYLE,
 };
+use crate::features::preview::core::{previewable, DialogSubject};
+
+use crate::features::preview::signals::PreviewSlot;
+
+use super::preview_panel_view;
 use crate::features::explain::core::{render, LinkTarget, RenderedSection, Span};
 use crate::features::graph::core::{disabled_menu_item_copy, push_confirm_copy};
 use crate::features::operations::kind::OperationKind;
@@ -41,6 +46,7 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
         dialogs,
         operations,
         shell,
+        preview,
         ..
     } = features;
 
@@ -72,6 +78,30 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
             dialogs.open(Dialog::Confirm);
             shell.open_confirm(next);
         }
+    });
+
+    // The graph preview (M10.08 A6, #594). Runs whenever the dialog's operation
+    // changes — which includes opening, closing, and the escalation above
+    // re-asking a different question in a modal that never visually closed.
+    //
+    // Three things this effect is careful about:
+    //
+    //  * It asks only for the two operations the engine previews and the app
+    //    has dialogs for; `previewable` is where that list lives, host-tested,
+    //    because "which dialogs get a preview" is exactly the decision whose
+    //    absence created #594.
+    //  * It **clears** on every other case, `None` included. A close is what
+    //    invalidates an in-flight request: `Preview::clear` bumps the
+    //    generation, so a reply already on the wire cannot paint the next
+    //    dialog with the last one's picture.
+    //  * It never touches `enabled`. The preview informs and does not gate —
+    //    every operation here was confirmable before previews existed.
+    create_effect(move |_| match shell.confirm_op() {
+        Some(op) => match previewable(preview_subject(&op)) {
+            Some(operation) => preview.start(operation),
+            None => preview.clear(),
+        },
+        None => preview.clear(),
     });
 
     move || {
@@ -389,10 +419,30 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                     }
                 >
                     <div
-                        style="min-width:300px; max-width:90vw; padding:16px; \
-                               background:#161b22; border:1px solid #30363d; \
-                               border-radius:10px; color:var(--fg); \
-                               box-shadow:0 12px 32px rgba(0,0,0,0.6);"
+                        // A confirmation that draws a before/after graph needs
+                        // room for two pictures side by side; every other one
+                        // is a paragraph and looks wrong stretched to fit a
+                        // canvas it does not have. `has_picture` is the right
+                        // question and not `matches!(slot, Ready(_))`: a
+                        // conflict list is a *successful* preview with no
+                        // picture in it, and wants the narrow modal.
+                        style=move || {
+                            let wide = matches!(
+                                preview.slot(),
+                                PreviewSlot::Ready(ref v) if v.has_picture()
+                            );
+                            let width = if wide {
+                                "min-width:320px; max-width:min(96vw, 780px);"
+                            } else {
+                                "min-width:300px; max-width:90vw;"
+                            };
+                            format!(
+                                "{width} padding:16px; background:#161b22; \
+                                 border:1px solid #30363d; border-radius:10px; \
+                                 color:var(--fg); \
+                                 box-shadow:0 12px 32px rgba(0,0,0,0.6);"
+                            )
+                        }
                         on:click=move |ev| ev.stop_propagation()
                     >
                         <div style="font-weight:600; margin-bottom:12px;">{title}</div>
@@ -402,6 +452,7 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                                     white-space:pre-wrap; max-height:50vh; \
                                     overflow-y:auto;">{body}</div>
                         {explanation.map(|e| explanation_panel_view(&e))}
+                        {preview_panel_view(preview)}
                         {arm_control}
                         {visible_reason.map(|reason| view! {
                             <div style="margin-bottom:10px; color:var(--muted); \
@@ -451,6 +502,33 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                 </div>
             }
         })
+    }
+}
+
+/// Which confirmation this is, in the vocabulary `previewable` decides on.
+///
+/// The one-line translation from the wasm-only `PendingOp` into
+/// `features::preview::core`'s framework-free [`DialogSubject`]. The *rule* —
+/// which subjects get a preview and which do not — lives there, where a host
+/// test can read it; this is only the part that has to name a type `cargo
+/// test` never compiles.
+///
+/// A revert reaches the modal as `Undo(UndoAction::RevertCommit)`, not as an
+/// operation of its own: it is the history-preserving undo for a commit that
+/// is already shared. The other two undo actions move or re-create a branch
+/// ref and the engine previews neither.
+///
+/// Cherry-pick has no dialog to appear in (#596) and so has no arm here; it
+/// inherits this panel the day it gets a menu entry, by adding one arm here
+/// and one in `previewable`.
+fn preview_subject(op: &PendingOp) -> DialogSubject<'_> {
+    match op {
+        PendingOp::Merge { branch, .. } => DialogSubject::Merge { branch },
+        PendingOp::Undo(u) => match &u.action {
+            UndoAction::RevertCommit { commit } => DialogSubject::Revert { commit },
+            _ => DialogSubject::NotPreviewable,
+        },
+        _ => DialogSubject::NotPreviewable,
     }
 }
 
