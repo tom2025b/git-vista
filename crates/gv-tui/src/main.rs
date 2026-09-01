@@ -1,6 +1,7 @@
-//! gv-tui — git-vista's terminal UI. This slice (M10.01, #456) is the crate
-//! skeleton: authenticate against the running `git-vista-server` and print
-//! one read from it. No rendering, no writes, no keybindings — deliberately.
+//! gv-tui — git-vista's terminal UI. With no arguments it launches the
+//! persistent four-pane shell built in M10.02 (#457); `gv-tui catalog` keeps
+//! M10.01's (#456) one-shot authenticated catalog report as a compatibility
+//! and diagnostic path. Neither path exposes repository writes.
 //!
 //! # What this slice exists to prove
 //!
@@ -31,29 +32,85 @@
 //! Every failure — token file missing, token already spent by a race, server
 //! down, non-200 answer, malformed body — is a clear one-line message on
 //! stderr and a non-zero exit. Never a panic, never a silent hang
-//! (`git-vista-session`'s socket timeouts bound a dead peer). A one-shot
-//! process re-authenticates on its next run, so the 401-retry loop
-//! `git-vista-mcp`'s `authed_fetch` carries for its long-lived bridge is
-//! deliberately absent here; it lifts into `git-vista-session` when the
-//! first persistent-pane slice (#457) needs it.
+//! (`git-vista-session`'s socket timeouts bound a dead peer). Under #457 the
+//! 401 retry lifted from `git-vista-mcp` into `git_vista_session::retry`: the
+//! persistent shell and MCP bridge now share the same one-reauthentication,
+//! one-fresh-cookie-retry rule.
 
 mod app;
+mod data;
+mod event;
 mod keys;
 mod layout;
+mod ui;
 
 use git_vista_protocol::{RepositoryDescriptor, RepositoryKind};
 use git_vista_session::{auth, http};
 
 const CATALOG_PATH: &str = "/api/catalog";
+const USAGE: &str = "usage: gv-tui [catalog]";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    Shell,
+    Catalog,
+}
+
+fn parse_args<I, S>(args: I) -> Result<Mode, &'static str>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut args = args.into_iter();
+    let first = args.next();
+    let second = args.next();
+    match (first, second) {
+        (None, None) => Ok(Mode::Shell),
+        (Some(arg), None) if arg.as_ref() == "catalog" => Ok(Mode::Catalog),
+        _ => Err(USAGE),
+    }
+}
 
 fn main() -> std::process::ExitCode {
-    match run(&mut auth::authenticate, &mut |path, cookie| {
-        http::get(path, Some(cookie))
-    }) {
-        Ok(report) => {
-            println!("{report}");
-            std::process::ExitCode::SUCCESS
+    match parse_args(std::env::args().skip(1)) {
+        Ok(Mode::Shell) => exit(shell()),
+        Ok(Mode::Catalog) => {
+            match run(&mut auth::authenticate, &mut |path, cookie| {
+                http::get(path, Some(cookie))
+            }) {
+                Ok(report) => {
+                    println!("{report}");
+                    std::process::ExitCode::SUCCESS
+                }
+                Err(message) => {
+                    eprintln!("gv-tui: {message}");
+                    std::process::ExitCode::FAILURE
+                }
+            }
         }
+        Err(usage) => {
+            eprintln!("{usage}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn shell() -> Result<(), String> {
+    let mut port = data::spawn(data::Client::live());
+    let mut app = app::App::new();
+    let mut terminal = ratatui::try_init()
+        .map_err(|error| format!("could not initialize the terminal: {error}"))?;
+    let mut inputs = event::CrosstermInputs;
+    let result = event::run(&mut terminal, &mut app, &mut inputs, &mut port);
+    ratatui::restore();
+    result
+}
+
+/// Turn a restored shell result into the process result. `shell()` restores
+/// before returning, so an error printed here is visible on the normal screen.
+fn exit(result: Result<(), String>) -> std::process::ExitCode {
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("gv-tui: {message}");
             std::process::ExitCode::FAILURE
@@ -126,6 +183,19 @@ mod tests {
       {"repository":"r1","worktree":"w1","name":"demo","kind":"main_worktree","read_only":false},
       {"repository":"r2","worktree":"w2","name":"mirror","kind":"bare","read_only":true}
     ]"#;
+
+    #[test]
+    fn command_line_without_arguments_selects_the_persistent_shell() {
+        assert_eq!(parse_args(std::iter::empty::<&str>()), Ok(Mode::Shell));
+    }
+
+    #[test]
+    fn command_line_catalog_keeps_the_one_shot_and_every_other_shape_is_usage() {
+        assert_eq!(parse_args(["catalog"]), Ok(Mode::Catalog));
+        for args in [vec!["wat"], vec!["catalog", "extra"]] {
+            assert_eq!(parse_args(args), Err(USAGE));
+        }
+    }
 
     #[test]
     fn an_auth_failure_surfaces_and_nothing_is_fetched() {
@@ -235,7 +305,15 @@ mod tests {
     fn the_source_census_really_sees_every_file_in_the_crate() {
         let sources = crate_sources();
         let names: Vec<&str> = sources.iter().map(|(n, _)| n.as_str()).collect();
-        for expected in ["app.rs", "keys.rs", "layout.rs", "main.rs"] {
+        for expected in [
+            "app.rs",
+            "data.rs",
+            "event.rs",
+            "keys.rs",
+            "layout.rs",
+            "main.rs",
+            "ui.rs",
+        ] {
             assert!(
                 names.contains(&expected),
                 "the source census missed {expected}: {names:?}"

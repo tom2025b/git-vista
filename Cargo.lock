@@ -1872,6 +1872,7 @@ dependencies = [
  "git-vista-protocol",
  "git-vista-session",
  "ratatui",
+ "serde",
  "serde_json",
 ]
 
