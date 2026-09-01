@@ -1,0 +1,72 @@
+# handoff — 2026-08-30, ~12:35, before Tom's reboot
+
+**Nothing is at risk.** Every commit on every branch is pushed to origin. The
+lane worktrees live under `/tmp/` and WILL vanish on reboot — that is fine,
+their commits are all on GitHub. After rebooting run `git worktree prune` in
+the repo to clear the stale registrations.
+
+## Landed today
+
+| PR | What |
+|---|---|
+| **#570** | MERGED — `KnownSizeBody` reports what remains, not what the body started with |
+| **#566** | MERGED — #540's readiness gate. Issue **#540 is genuinely closed** (verified `relabel_json_success` really calls `split_at_limit_when_ready` on main; #569 had claimed to close it and had not) |
+| #564 | Closed unmerged, branch kept, reasoning in the close comment |
+
+## Open, all pushed, all waiting only on CI
+
+| PR | Branch | State |
+|---|---|---|
+| **#579** | `fix/adr-index-cannot-rot` | **ALL 7 GREEN** — ready to merge the moment you're back |
+| **#577** | `fix/node-guard-test-premise` | 6/7; sandbox job was in progress |
+| **#567** | `claude/cloud-1-546-worktree-census` | pushed with main merged down; CI running |
+| **#563** | `claude/lesson-tool-issue-450-mrelst` | pushed with main merged down; CI running |
+| **#565** | `claude/external-changes-spec-rq2pz2` | pushed with main merged down; CI running |
+
+**Landing order** (each merge forces the rest to merge main down again — the
+ruleset is `strict: true`, so every merge costs the next PR a full CI cycle,
+and the sandbox job alone is ~14 minutes):
+
+`#579` → `#577` → `#563` → `#567` → `#565`
+
+Then close **#568, #561, #560** unmerged, branches kept — their salvage is
+already grafted into the winners.
+
+## The one decision still yours
+
+**#549 (AddWorktree) is blocked on you**: where does a new worktree get
+created — your `Git-Vista-336-wt` sibling convention, or a managed root like
+`clones_root`? The issue calls it a security-boundary decision, not taste.
+Closing it as "not planned for now" is explicitly a legitimate answer; #546–#548
+deliver most of the value without any path-picking UI.
+
+Also five spec questions inside #565's "Open questions — Tom's decisions"
+section, which decide M12.02–M12.06 at once.
+
+## Environment notes for the next session
+
+- `~/.local/bin` was EMPTY at session start. Rebuilt there: `buildlock`,
+  `autocheckpoint`, `render-md-pdf`, `milestone-bars`. These survive reboot.
+- **`buildlock` must use `flock -o`** — the `exec 9>` form leaks the lock fd to
+  every child, and a harness process held it for 15 minutes this morning while
+  every build queued silently behind it.
+- The sandbox battery needs host provisioning exactly as
+  `.github/actions/host-sandbox-setup/action.yml` does it (global git identity,
+  `~/.ssh/known_hosts`, `~/.ssh/id_ed25519`). Without it 36 tests fail for
+  environmental reasons. It is provisioned now.
+- **Do not give parallel lanes a shared `CARGO_TARGET_DIR`** — a stale
+  integration-test binary bakes in its manifest path and lanes fail with a
+  file-not-found pointing nowhere useful. Cost three builds today.
+- `failure-atlas` MCP is still NOT registered, so every mutation proof today was
+  hand-rolled. The other Claude session has the infra prompt at
+  `design-docs/handoffs/2026-08-30-other-claude-infra-lane.md`.
+- Another Claude session and codex share this box. The other session rewrote
+  `~/.ssh/` twice this morning and broke the gate both times.
+
+## Reading
+
+- Brief: `design-docs/briefs/2026-08-30-morning-brief.pdf` (24 pages, card p.1)
+- codex refutation prompt: `design-docs/handoffs/2026-08-30-codex-adjudication-refutation.md`
+- Other-Claude infra prompt: `design-docs/handoffs/2026-08-30-other-claude-infra-lane.md`
+
+**Signed:** max · 2026-08-30T12:35:00-04:00
