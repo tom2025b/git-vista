@@ -89,6 +89,12 @@ test.describe('the graph preview inside a confirmation', () => {
 
     // The legend, so the marks can be decoded rather than guessed at.
     await expect(page.getByText('a commit this operation would create')).toBeVisible()
+
+    // The panel's own heading. Asserted here, positively, because the third
+    // test below asserts its ABSENCE — and a negative on a locator that never
+    // matches anything is a test that cannot fail. This is the positive
+    // control for that one.
+    await expect(page.getByText(PREVIEW_HEADING)).toBeVisible()
   })
 
   test('4: the preview informs and never gates — Confirm stays live throughout', async ({
@@ -156,6 +162,128 @@ test.describe('the graph preview inside a confirmation', () => {
     await page.waitForTimeout(6000)
     await expect(page.getByText(PREVIEW_HEADING)).toHaveCount(0)
     await expect(page.getByRole('img', { name: /^After:/ })).toHaveCount(0)
+
+    await page.getByRole('button', { name: 'Cancel' }).click()
+  })
+})
+
+// The three arms with no picture in them. Every one is a real answer the
+// engine computes, and none can be produced against a healthy host: a
+// conflicted merge would need a fixture whose whole point is the opposite, and
+// "this host's git is too old" cannot be arranged at all. So the response is
+// fulfilled in the route layer.
+//
+// What that does and does not prove is worth being exact about. It does NOT
+// test the engine — #576's own suites do, against the real thing, and the wire
+// goldens pin the payloads these bodies are copied from. It tests the last
+// layer, which is the one this issue exists about: that an arm the server
+// takes trouble to distinguish is still distinguishable by the time a person
+// reads it, instead of being flattened into a spinner or a generic error.
+test.describe('the arms with no picture', () => {
+  /** Answer the next `/api/preview` with `body`, without touching the server. */
+  async function answerPreviewWith(page, body) {
+    await page.route('**/api/preview', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(body),
+      })
+    })
+  }
+
+  /** Open the merge confirmation and wait for the dialog's own text. */
+  async function openMergeConfirm(page) {
+    await openMergePreviewRepo(page)
+    const merge = await openBranchMenu(page, PREVIEW_BRANCH)
+    await merge.click()
+    await expect(dialog(page)).toBeVisible()
+  }
+
+  test('a conflict names its paths, and Confirm stays live', async ({ page }) => {
+    await answerPreviewWith(page, {
+      outcome: 'conflict',
+      paths: ['src/main.rs', 'docs/notes.md'],
+    })
+    await openMergeConfirm(page)
+
+    // A conflict is a live established fact — real git ran the real three-way
+    // merge and it does not apply. The paths are the content of that fact, and
+    // flattening them into "preview failed" would throw away the distinction
+    // the server spent #576 establishing, at the last possible moment.
+    await expect(page.getByText('This would conflict')).toBeVisible()
+    await expect(page.getByText('src/main.rs')).toBeVisible()
+    await expect(page.getByText('docs/notes.md')).toBeVisible()
+
+    // And it must not read as a refusal of the operation. Merging into a
+    // conflict is a thing a person may deliberately choose to do.
+    await expect(page.getByText(/still available/)).toBeVisible()
+    const confirm = page.getByRole('button', { name: 'Merge', exact: true })
+    await expect(confirm).toBeEnabled()
+    await expect(confirm).toHaveAttribute('aria-disabled', 'false')
+
+    await page.getByRole('button', { name: 'Cancel' }).click()
+  })
+
+  test('an unavailable host gives its named reason and its remedy', async ({ page }) => {
+    await answerPreviewWith(page, {
+      outcome: 'unavailable',
+      reason: { unavailable: 'git_too_old', found: '2.34.1', minimum: '2.38' },
+    })
+    await openMergeConfirm(page)
+
+    // The version the host actually has and the one the feature needs, both on
+    // screen. "Too old" without the two numbers sends a reader nowhere.
+    await expect(page.getByText(/2\.34\.1/)).toBeVisible()
+    await expect(page.getByText(/Upgrade git to 2\.38 or newer/)).toBeVisible()
+
+    // The load-bearing half of criterion 4: a host that cannot DRAW a merge
+    // can still PERFORM one, and every one of these operations worked before
+    // previews existed.
+    const confirm = page.getByRole('button', { name: 'Merge', exact: true })
+    await expect(confirm).toBeEnabled()
+    await expect(confirm).toHaveAttribute('aria-disabled', 'false')
+    await expect(page.getByText(/still available/)).toBeVisible()
+
+    await page.getByRole('button', { name: 'Cancel' }).click()
+  })
+
+  test('an unsupported operation says no host can draw it', async ({ page }) => {
+    await answerPreviewWith(page, {
+      outcome: 'unsupported',
+      operation: 'RebaseBranch',
+    })
+    await openMergeConfirm(page)
+
+    // Permanent, and about the OPERATION rather than this host — which is a
+    // different sentence from the one above, deliberately, because the two
+    // send a reader to different places. `Unsupported` sends them nowhere,
+    // and says so.
+    await expect(page.getByText('No picture for this one')).toBeVisible()
+    await expect(page.getByText(/RebaseBranch/)).toBeVisible()
+    await expect(page.getByText(/no preview on any host/)).toBeVisible()
+
+    const confirm = page.getByRole('button', { name: 'Merge', exact: true })
+    await expect(confirm).toBeEnabled()
+
+    await page.getByRole('button', { name: 'Cancel' }).click()
+  })
+
+  test('a round trip that fails is not reported as a fact about the repository', async ({
+    page,
+  }) => {
+    await page.route('**/api/preview', (route) => route.fulfill({ status: 500, body: 'boom' }))
+    await openMergeConfirm(page)
+
+    // Distinct from `Unavailable`, and that distinction is the whole reason
+    // `PreviewSlot::Failed` exists: the server saying "this host's git is too
+    // old" is a fact about the repository, and the fetch never arriving is a
+    // fact about the connection. Telling a user the second when the first is
+    // true sends them somewhere useless.
+    await expect(page.getByText('No preview')).toBeVisible()
+    await expect(page.getByText(/says nothing about the operation itself/)).toBeVisible()
+
+    const confirm = page.getByRole('button', { name: 'Merge', exact: true })
+    await expect(confirm).toBeEnabled()
 
     await page.getByRole('button', { name: 'Cancel' }).click()
   })
