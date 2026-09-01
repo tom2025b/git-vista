@@ -51,6 +51,28 @@ pub(crate) fn export_tool_catalog() -> Vec<serde_json::Value> {
                 "additionalProperties": false
             }
         }),
+        serde_json::json!({
+            "name": "export_plans_yaml_manifest",
+            "description": "Encode one or more exact plan_* results as an ordered YAML \
+                            manifest for gv-run. Each step stores program plus argv data, \
+                            never a shell command to reparse. gv-run stops at the first \
+                            non-zero exit and checkpoints every successful step for resume. \
+                            Plans without one fixed literal argv sequence are refused. This \
+                            export is local and read-only: it executes nothing.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "plans": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": { "type": "object" },
+                        "description": "Ordered exact `plan` objects returned by plan_* tools."
+                    }
+                },
+                "required": ["plans"],
+                "additionalProperties": false
+            }
+        }),
     ]
 }
 
@@ -58,6 +80,27 @@ pub(crate) fn call_export_tool(
     name: &str,
     args: &serde_json::Value,
 ) -> Option<Result<serde_json::Value, ToolError>> {
+    if name == "export_plans_yaml_manifest" {
+        let Some(value) = args.get("plans") else {
+            return Some(Err(ToolError::Execution(
+                "missing required argument `plans`".to_string(),
+            )));
+        };
+        let plans: Vec<Plan> = match serde_json::from_value(value.clone()) {
+            Ok(plans) => plans,
+            Err(error) => {
+                return Some(Err(ToolError::Execution(format!(
+                    "`plans` is not a valid list of Plans: {error}"
+                ))))
+            }
+        };
+        return Some(
+            git_vista_plan_runner::manifest_from_plans(&plans)
+                .and_then(|manifest| git_vista_plan_runner::manifest_to_yaml(&manifest))
+                .map(serde_json::Value::String)
+                .map_err(|error| ToolError::Execution(error.to_string())),
+        );
+    }
     if !matches!(name, "export_plan_checklist" | "export_plan_fish_script") {
         return None;
     }
@@ -147,6 +190,30 @@ mod tests {
             rendered,
             serde_json::Value::String(plan_export::fish_script(&a_plan()).unwrap())
         );
+    }
+
+    /// INVARIANT: the many-plan MCP export delegates the whole ordered plan
+    /// list to the native manifest encoder.
+    ///
+    /// MUTATION 1 (remove): return an empty string — exact equality is red.
+    /// MUTATION 2 (weaken): pass only the first plan — the second plan's argv
+    /// disappears and exact equality is red.
+    #[test]
+    fn yaml_manifest_tool_returns_the_shared_many_plan_encoder_verbatim() {
+        let first = a_plan();
+        let mut second = a_plan();
+        second.operation = GitOperation::UnstageAll;
+        second.operation_hash = OperationHash::new("b".repeat(64)).unwrap();
+        let plans = vec![first, second];
+        let args = serde_json::json!({ "plans": plans });
+        let rendered = call_export_tool("export_plans_yaml_manifest", &args)
+            .expect("the tool is known")
+            .expect("valid fixed-argv plans render");
+        let expected = git_vista_plan_runner::manifest_to_yaml(
+            &git_vista_plan_runner::manifest_from_plans(&plans).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rendered, serde_json::Value::String(expected));
     }
 
     #[test]

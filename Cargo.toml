@@ -15,6 +15,7 @@
 #                          non-browser client (#456; extracted from git-vista-mcp).
 #   - git-vista-mcp      : the MCP stdio bridge — agents drive git-vista through
 #                          the same HTTP API (and later the same planner) the browser uses.
+#   - git-vista-plan-runner: native YAML manifest encoder and resumable gv-run.
 #   - gv-tui             : the lazygit-style terminal UI (M10). Same client posture
 #                          as the MCP bridge: session auth, never links the server.
 #   - git-vista          : the Leptos frontend GUI, built to wasm by Trunk (the app
@@ -32,6 +33,7 @@ members = [
     "crates/git-vista-session",
     "crates/git-vista",
     "crates/git-vista-mcp",
+    "crates/git-vista-plan-runner",
     "crates/gv-tui",
     "crates/gv-scrollcast",
     "crates/git-vista-fixtures",
@@ -50,6 +52,7 @@ repository = "https://github.com/tom2025b/git-vista"
 git-vista-core = { path = "crates/git-vista-core" }
 git-vista-protocol = { path = "crates/git-vista-protocol" }
 git-vista-git = { path = "crates/git-vista-git" }
+git-vista-plan-runner = { path = "crates/git-vista-plan-runner" }
 # The #456 extraction: bootstrap-token session auth + the minimal loopback
 # HTTP/1.1 client, shared by git-vista-mcp and gv-tui.
 git-vista-session = { path = "crates/git-vista-session" }

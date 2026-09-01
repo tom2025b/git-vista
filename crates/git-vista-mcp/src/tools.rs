@@ -746,7 +746,7 @@ mod tests {
             "get_lesson",
         ];
         assert_eq!(names[..expected_reads.len()], expected_reads);
-        // #590 appends one local, read-only export tool after the plan builders,
+        // #590 appends local, read-only export tools after the plan builders,
         // followed by M2.23e's one write tool. Keeping execute_plan last still
         // makes a second write-shaped capability visible here.
         let after_reads = &names[expected_reads.len()..];
@@ -756,10 +756,14 @@ mod tests {
             "the catalog's last tool must be execute_plan — #249's one write tool"
         );
         assert!(before_execute.len() >= 2);
-        let (plan_names, exports) = before_execute.split_at(before_execute.len() - 2);
+        let (plan_names, exports) = before_execute.split_at(before_execute.len() - 3);
         assert_eq!(
             exports,
-            ["export_plan_checklist", "export_plan_fish_script"]
+            [
+                "export_plan_checklist",
+                "export_plan_fish_script",
+                "export_plans_yaml_manifest"
+            ]
         );
         assert!(
             plan_names.iter().all(|n| n.starts_with("plan_")),

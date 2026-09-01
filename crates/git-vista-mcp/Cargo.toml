@@ -31,6 +31,7 @@ repository.workspace = true
 [dependencies]
 git-vista-core = { workspace = true }
 git-vista-protocol = { workspace = true }
+git-vista-plan-runner = { workspace = true }
 git-vista-session = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
