@@ -331,6 +331,46 @@ fn merge_shape_with_a_competitor_tip() -> (TempDir, PathBuf) {
     (dir, repo)
 }
 
+/// `feature` diverged from a shared base, with **`release`** — not the default
+/// branch — checked out and carrying its own commit. The shape finding 10 is
+/// about: real `git merge --no-edit feature` here writes
+/// `Merge branch 'feature' into release`, and a message built anywhere but by
+/// git drops the `into` clause.
+///
+/// # Why two configs are pinned into the fixture
+///
+/// The reasoning is [`fast_forward_shape`]'s, verbatim: the preview's spawns
+/// inherit `$HOME` read-only, so a developer's own `~/.gitconfig` reaches
+/// them, while `git_vista_fixtures::git` runs the *oracle* with
+/// `GIT_CONFIG_GLOBAL` at `/dev/null` — and `merge.log` and
+/// `merge.suppressDest` both change this exact message. `merge.log = false`
+/// pins the body; the empty `merge.suppressDest` entry is git's own
+/// list-clearing syntax (measured on this host 2026-09-01: a local empty
+/// entry neutralises a global `merge.suppressDest release`, and later local
+/// entries then accumulate normally), so a machine whose global config
+/// suppresses `release` still shows the clause here.
+fn merge_shape_merging_onto_release() -> (TempDir, PathBuf) {
+    let dir = TempDir::new().expect("tempdir");
+    let repo = dir.path().join("repo");
+    git::init(&repo);
+    git::write(&repo, "shared.txt", b"base\n");
+    commit_old(&repo, "base");
+
+    git::run(&repo, &["checkout", "-q", "-b", "feature"]);
+    git::write(&repo, "feature-one.txt", b"one\n");
+    commit_old(&repo, "feature: one");
+    git::write(&repo, "feature-two.txt", b"two\n");
+    commit_old(&repo, "feature: two");
+
+    git::run(&repo, &["checkout", "-q", "-b", "release", "main"]);
+    git::write(&repo, "release.txt", b"release\n");
+    commit_old(&repo, "release: work");
+
+    git::run(&repo, &["config", "merge.log", "false"]);
+    git::run(&repo, &["config", "--add", "merge.suppressDest", ""]);
+    (dir, repo)
+}
+
 /// A **SHA-256** repository with two commits, dated in the past.
 ///
 /// The only fixture in this suite whose object format is not `sha1`, and the
@@ -2276,6 +2316,75 @@ async fn a5_the_previewed_merges_row_is_decided_by_its_timestamp() {
     );
     assert_row_zero_is_decided_by_time(&copy);
     assert_parity(&graph.after, &real, &before_layout, "merge with competitor");
+}
+
+/// **Finding 10, the wiring.** A merge previewed from a non-default branch
+/// carries the message the real command writes — `into <dest>` included — all
+/// the way through [`preview`] to the row a user reads.
+///
+/// The oracle runs first: real `git merge --no-edit` on a copy of the same
+/// fixture must itself write `Merge branch 'feature' into release`, so the
+/// literal below is git's sentence, not this suite's belief about it.
+///
+/// This test observes the message **through the preview seam**, on purpose:
+/// [`the_merge_message_is_the_one_git_itself_writes`] pins `merge_message`
+/// itself, and both its planned breaks live inside that helper — so a call
+/// site quietly reverted to an inline `format!` would survive every
+/// helper-level assertion while shipping the original defect. A subject can
+/// carry neither body nor trailing newline, which is why this test and the
+/// helper-level one pin different halves and neither is redundant.
+///
+/// # Two mutations
+///
+/// 1. **Removes the wiring** — set the merge recipe's `message` back to an
+///    inline `format!("Merge branch '{branch}'\n")` at the call site.
+///    `merge_message` is then dead code and every helper-level test stays
+///    green; the subject assertion here is the only thing that reddens.
+/// 2. **Weakens it** — build `merge_message`'s input line from the wrong
+///    branch name. The subject here names a branch nobody asked to merge and
+///    both the literal and the oracle equality go red — as does the
+///    helper-level byte compare, from a different angle.
+#[tokio::test]
+async fn a_merge_previewed_from_a_non_default_branch_carries_gits_own_message() {
+    let (dir, repo) = merge_shape_merging_onto_release();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
+
+    let (_scratch, copy) = copy_of(&repo);
+    git::run(&copy, &["merge", "-q", "--no-edit", "feature"]);
+    let real_subject = git::out(&copy, &["log", "-1", "--format=%s"]);
+    assert_eq!(
+        real_subject, "Merge branch 'feature' into release",
+        "the oracle must really append `into release`, or the assertion below \
+         tests this suite's belief rather than git's sentence"
+    );
+
+    let plan = plan_for(
+        &repo,
+        GitOperation::MergeBranch {
+            branch: BranchName::new("feature").expect("a valid branch name"),
+        },
+    )
+    .await;
+    let (graph, _) = expect_graph(preview(&target, &plan).await);
+    let merged: Vec<_> = graph
+        .after
+        .rows
+        .iter()
+        .filter(|r| r.commit.parents.len() == 2)
+        .collect();
+    assert_eq!(
+        merged.len(),
+        1,
+        "the fixture has no other merge commit, so the hypothetical one must \
+         be the only two-parent row"
+    );
+    assert_eq!(
+        merged[0].commit.summary, real_subject,
+        "the previewed row's summary must be the sentence the real command \
+         writes, `into release` included — an invented message here is a \
+         commit the user will never see git make"
+    );
 }
 
 /// **A3, merge.** A merge that would conflict answers `Conflict { paths }`,
@@ -4496,11 +4605,109 @@ fn the_revert_message_reproduces_gits_own_default_wording() {
     );
 }
 
-/// The merge message names the branch that was merged.
-#[test]
-fn the_merge_message_names_the_branch_it_merged() {
-    assert_eq!(merge_message("feature"), "Merge branch 'feature'\n");
-    assert_eq!(merge_message("release/2.0"), "Merge branch 'release/2.0'\n");
+/// The merge message is computed by git (`fmt-merge-msg`), not modelled here —
+/// proven against a real `git merge --no-edit` run on a copy, byte for byte,
+/// in two config shapes.
+///
+/// The comparison channel is [`read_commit_record`]'s `%B` body — trailing
+/// newline exact — rather than a trimmed helper, because the whole claim is
+/// "the bytes git will store". One literal stays alongside so the expected
+/// shape is said out loud, and the `merge.log` leg pins the measured
+/// `* feature:` shortlog header, which is the one place the input line's
+/// ` of .` clause is visible in the output.
+///
+/// # Two mutations
+///
+/// 1. **Removes the mechanism** — have `merge_message` return the old
+///    `format!("Merge branch '{branch}'\n")` without spawning. The literal
+///    here loses its `into release` clause and both byte compares go red.
+/// 2. **Weakens it** — drop the ` of .` clause from the input line. Every
+///    title survives (the clause never reaches a title), but with
+///    `merge.log = true` git's shortlog header becomes `* branch 'feature':`
+///    where the real command writes `* feature:` — measured on this host
+///    2026-09-01 — so the header literal and the second byte compare go red
+///    while everything else stays green.
+#[tokio::test]
+async fn the_merge_message_is_the_one_git_itself_writes() {
+    let (_dir, repo) = merge_shape_merging_onto_release();
+    let tip = git::out(&repo, &["rev-parse", "feature"]);
+
+    let message = merge_message(&repo, "feature", &tip)
+        .await
+        .expect("format the plain merge message");
+    assert_eq!(
+        message, "Merge branch 'feature' into release\n",
+        "the plain message must carry git's `into <dest>` clause — the exact \
+         text the old format! could not produce"
+    );
+    let (_scratch, copy) = copy_of(&repo);
+    git::run(&copy, &["merge", "-q", "--no-edit", "feature"]);
+    let real = read_commit_record(&copy, None, "HEAD")
+        .await
+        .expect("read the real merge commit back");
+    assert_eq!(
+        message, real.body,
+        "the previewed message must be byte-identical to the one the real \
+         command stored"
+    );
+
+    git::run(&repo, &["config", "merge.log", "true"]);
+    let with_log = merge_message(&repo, "feature", &tip)
+        .await
+        .expect("format the merge.log message");
+    assert!(
+        with_log.contains("* feature:\n"),
+        "`merge.log`'s shortlog header must be `* feature:` — `* branch \
+         'feature':` means the input line lost its ` of .` clause: {with_log:?}"
+    );
+    let (_scratch2, copy2) = copy_of(&repo);
+    git::run(&copy2, &["merge", "-q", "--no-edit", "feature"]);
+    let real_logged = read_commit_record(&copy2, None, "HEAD")
+        .await
+        .expect("read the real merge.log commit back");
+    assert_eq!(
+        with_log, real_logged.body,
+        "with `merge.log` set, the previewed message must still be \
+         byte-identical to the real one, shortlog included"
+    );
+}
+
+/// `merge.suppressDest` — the config that makes every hand-written `into`
+/// rule wrong — is honoured, because git applies it, not this file.
+///
+/// # Why this test alone would not be enough
+///
+/// Reverting `merge_message` to the old literal leaves this test **green by
+/// coincidence**: the suppressed message and the old hard-coded one are the
+/// same bytes. That is exactly why
+/// [`the_merge_message_is_the_one_git_itself_writes`] exists, and why this
+/// one's job is only the direction the other cannot see: a rule someone
+/// re-models in Rust ("append `into` when the branch is not the default")
+/// reddens here, because the fixture's dest is suppressed by *config*, not by
+/// being a default branch.
+#[tokio::test]
+async fn the_merge_message_honours_merge_suppress_dest() {
+    let (_dir, repo) = merge_shape_merging_onto_release();
+    git::run(&repo, &["config", "--add", "merge.suppressDest", "release"]);
+    let tip = git::out(&repo, &["rev-parse", "feature"]);
+
+    let message = merge_message(&repo, "feature", &tip)
+        .await
+        .expect("format the suppressed merge message");
+    assert_eq!(
+        message, "Merge branch 'feature'\n",
+        "with `merge.suppressDest` matching the current branch, git drops the \
+         `into` clause and so must the preview"
+    );
+    let (_scratch, copy) = copy_of(&repo);
+    git::run(&copy, &["merge", "-q", "--no-edit", "feature"]);
+    let real = read_commit_record(&copy, None, "HEAD")
+        .await
+        .expect("read the real suppressed merge commit back");
+    assert_eq!(
+        message, real.body,
+        "suppressed or not, the bytes must be the ones git stored"
+    );
 }
 
 /// `previewable` maps exactly three operations and nothing else, and
