@@ -1561,6 +1561,34 @@ impl ScratchStore {
             let Some(lease) = Self::abandoned_store_lease(&path) else {
                 continue;
             };
+            // Release the lease BEFORE removing, not after — the ordering is
+            // the fix for #598 and it is not cosmetic.
+            //
+            // `abandoned_store_lease` opens `<path>/<STORE_MARKER>`, a file
+            // *inside* the directory about to be deleted. Holding that
+            // descriptor across `remove_dir_all` is fine on ext4, where
+            // unlinking an open file is ordinary Unix behaviour — which is why
+            // this never reproduced on either development machine (5/5 alone,
+            // 2/2 full suite, and a mutation restoring this ordering SURVIVED).
+            // It is not reliably fine on **overlayfs**, which is what GitHub
+            // Actions runners use: an open descriptor keeps the lower-layer
+            // inode referenced, the whiteout cannot complete, and the removal
+            // fails with `EBUSY`/`ENOTEMPTY`. CI-only, never local,
+            // intermittent, and — before the logging below existed — silent,
+            // because the call used to be `let _ = remove_dir_all(..)`.
+            //
+            // Dropping first opens an ownership window measured in
+            // microseconds. Losing that race costs nothing: a second sweeper
+            // removing the same abandoned store gets `ENOENT` and moves on. The
+            // current cost is the opposite and worse — a removal that silently
+            // does not happen, leaving scratch stores inside a user's `.git`,
+            // which is the one thing this sweep exists to prevent.
+            //
+            // HONEST LIMIT: no local test pins this, because ext4 permits both
+            // orderings. The `#[cfg(test)]` logging below is what makes CI the
+            // experiment — if it prints EBUSY, the diagnosis is confirmed by an
+            // errno rather than by argument.
+            drop(lease);
             let removed = std::fs::remove_dir_all(&path);
             #[cfg(test)]
             if let Err(error) = &removed {
@@ -1569,7 +1597,6 @@ impl ScratchStore {
                     path.display()
                 );
             }
-            drop(lease);
         }
     }
 }
