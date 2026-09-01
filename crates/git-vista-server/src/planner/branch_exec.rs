@@ -31,8 +31,8 @@ use crate::sandbox::NetworkNeed;
 
 use super::{
     couldnt_run, git_argv, journal_app_event, read_head_branch_blocking,
-    remove_from_snapshot_blocking, run_git_argv, short, stderr_or, stderr_stdout_or,
-    strategy_word, worktree_dirty, Obs, Observed,
+    remove_from_snapshot_blocking, run_git_argv, short, stderr_or, stderr_stdout_or, strategy_word,
+    worktree_dirty, Obs, Observed,
 };
 
 /// `git branch <name> <at>` (`/api/branch`). B3 posture: git validates the

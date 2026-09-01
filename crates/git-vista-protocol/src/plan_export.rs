@@ -230,7 +230,10 @@ pub fn cherry_pick_argv(commit: &CommitOid, mainline: Option<std::num::NonZeroU8
 /// therefore two lines, and it has to be: a reader who runs only the first
 /// line is left mid-sequence with `REVERT_HEAD` set, which is a real state to
 /// be in and not a failure — but it is not a finished revert.
-pub fn revert_compute_argv(commit: &CommitOid, mainline: Option<std::num::NonZeroU8>) -> Vec<String> {
+pub fn revert_compute_argv(
+    commit: &CommitOid,
+    mainline: Option<std::num::NonZeroU8>,
+) -> Vec<String> {
     let mut argv = vec!["revert".to_string(), "--no-commit".to_string()];
     if let Some(m) = mainline {
         argv.push("-m".to_string());
@@ -349,7 +352,11 @@ pub fn create_tag_argv(
 
 /// `git tag -d <name>` — delete a local tag.
 pub fn delete_local_tag_argv(name: &TagName) -> Vec<String> {
-    vec!["tag".to_string(), "-d".to_string(), name.as_str().to_string()]
+    vec![
+        "tag".to_string(),
+        "-d".to_string(),
+        name.as_str().to_string(),
+    ]
 }
 
 /// `git push --progress <remote> refs/tags/<name>`.
@@ -556,11 +563,7 @@ pub fn stage_resolved_path_argv(path: &WorktreePath) -> Vec<String> {
 /// to the *index*: a path whose only difference is staged would be a silent
 /// no-op under the bare form.
 pub fn discard_tracked_argv(paths: &[WorktreePath]) -> Vec<String> {
-    let mut argv = vec![
-        "checkout".to_string(),
-        "HEAD".to_string(),
-        "--".to_string(),
-    ];
+    let mut argv = vec!["checkout".to_string(), "HEAD".to_string(), "--".to_string()];
     argv.extend(paths.iter().map(|p| p.as_str().to_string()));
     argv
 }
@@ -778,9 +781,7 @@ pub fn export_operation(operation: &GitOperation) -> Export {
             ),
         )]),
 
-        GitOperation::RevertCommit { commit } => {
-            Export::Commands(revert_steps(commit, None))
-        }
+        GitOperation::RevertCommit { commit } => Export::Commands(revert_steps(commit, None)),
 
         GitOperation::RevertMerge { commit, mainline } => {
             Export::Commands(revert_steps(commit, Some(*mainline)))
@@ -940,12 +941,12 @@ pub fn export_operation(operation: &GitOperation) -> Export {
             let mut steps = vec![Step::new(
                 resolve_conflict_argv(path, *resolution),
                 match resolution {
-                    Resolution::TakeOurs => format!(
-                        "Resolve {path} by keeping this branch's version whole."
-                    ),
-                    Resolution::TakeTheirs => format!(
-                        "Resolve {path} by keeping the incoming version whole."
-                    ),
+                    Resolution::TakeOurs => {
+                        format!("Resolve {path} by keeping this branch's version whole.")
+                    }
+                    Resolution::TakeTheirs => {
+                        format!("Resolve {path} by keeping the incoming version whole.")
+                    }
                     Resolution::TakeDeletion => format!(
                         "Resolve {path} by removing the file — this stages the removal too."
                     ),
@@ -985,14 +986,12 @@ pub fn export_operation(operation: &GitOperation) -> Export {
 
         // --- the three families with no honest single command line ----------
         GitOperation::ResetBranch { branch, to, .. } => Export::ChosenAtRunTime {
-            decided_by: format!(
-                "whether ‘{branch}’ is the branch you currently have checked out"
-            ),
+            decided_by: format!("whether ‘{branch}’ is the branch you currently have checked out"),
             candidates: vec![
                 Candidate {
                     when: format!("‘{branch}’ IS the checked-out branch"),
                     steps: vec![Step::new(
-                        reset_hard_argv(to),
+                        move_branch_argv(branch, to),
                         format!(
                             "Move ‘{}’ back to {} and rewrite the working tree to match. \
                              The app refuses this outright if the working tree is dirty, \
@@ -1005,7 +1004,7 @@ pub fn export_operation(operation: &GitOperation) -> Export {
                 Candidate {
                     when: format!("‘{branch}’ is NOT the checked-out branch"),
                     steps: vec![Step::new(
-                        move_branch_argv(branch, to),
+                        reset_hard_argv(to),
                         format!(
                             "Move the branch label ‘{}’ back to {}. No file is touched.",
                             branch,
@@ -1188,9 +1187,13 @@ impl Rendered {
 /// means something else, and this text is going into a terminal.
 fn is_shell_safe(arg: &str) -> bool {
     !arg.is_empty()
-        && arg
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '=' | ':' | '@' | '^' | '{' | '}' | ','))
+        && arg.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(
+                    c,
+                    '_' | '-' | '.' | '/' | '=' | ':' | '@' | '^' | '{' | '}' | ','
+                )
+        })
 }
 
 /// Render one step's argv as a `git …` command line.
@@ -1263,12 +1266,12 @@ pub fn checklist(plan: &Plan) -> String {
     let mut out = String::new();
     out.push_str("GIT-VISTA — PLAN CHECKLIST\n");
     out.push_str("==========================\n\n");
-    out.push_str(&format!("Operation:   {}\n", operation_name(&plan.operation)));
-    out.push_str(&format!("Risk:        {}\n", risk_word(plan.risk)));
     out.push_str(&format!(
-        "Generation:  {}\n",
-        plan.generation.as_str()
+        "Operation:   {}\n",
+        operation_name(&plan.operation)
     ));
+    out.push_str(&format!("Risk:        {}\n", risk_word(plan.risk)));
+    out.push_str(&format!("Generation:  {}\n", plan.generation.as_str()));
     out.push_str(&format!(
         "Issued:      {} (unix seconds)\n",
         plan.issued_at.0
@@ -1343,7 +1346,9 @@ fn format_step(n: usize, step: &Step) -> String {
             out.push_str(&format!("  {n}. {line}\n"));
         }
         Rendered::ShellSpecific { posix, fish } => {
-            out.push_str(&format!("  {n}. (this one is spelled differently per shell —\n"));
+            out.push_str(&format!(
+                "  {n}. (this one is spelled differently per shell —\n"
+            ));
             out.push_str("      an argument contains a single quote)\n");
             out.push_str(&format!("      fish:      {fish}\n"));
             out.push_str(&format!("      sh / bash: {posix}\n"));
@@ -1446,7 +1451,12 @@ fn describe_precondition(precondition: &crate::plan::Precondition) -> String {
     use crate::plan::Precondition;
     match precondition {
         Precondition::RefAt { ref_name, oid } => {
-            format!("‘{}’ is still at {} — check with `git rev-parse {}`", ref_name, short(oid), ref_name)
+            format!(
+                "‘{}’ is still at {} — check with `git rev-parse {}`",
+                ref_name,
+                short(oid),
+                ref_name
+            )
         }
         Precondition::RefExists { ref_name } => format!("‘{ref_name}’ exists"),
         Precondition::RefAbsent { ref_name } => format!("‘{ref_name}’ does NOT exist yet"),
@@ -1511,9 +1521,9 @@ fn describe_recovery(recovery: &crate::plan::RecoveryStrategy) -> String {
             name,
             short(at)
         ),
-        RecoveryStrategy::DeleteCreatedTag { name } => format!(
-            "This creates tag ‘{name}’. The way back is to delete it again."
-        ),
+        RecoveryStrategy::DeleteCreatedTag { name } => {
+            format!("This creates tag ‘{name}’. The way back is to delete it again.")
+        }
         RecoveryStrategy::RecreateStashEntry { at, message } => format!(
             "The way back is to re-create the stash entry from commit {}{}. A dropped \
              stash commit survives until git garbage-collects it, and not after.",
@@ -1523,9 +1533,9 @@ fn describe_recovery(recovery: &crate::plan::RecoveryStrategy) -> String {
                 None => String::new(),
             }
         ),
-        RecoveryStrategy::CheckoutPrevious { branch } => format!(
-            "The way back is to switch to ‘{branch}’ again — the branch you are on now."
-        ),
+        RecoveryStrategy::CheckoutPrevious { branch } => {
+            format!("The way back is to switch to ‘{branch}’ again — the branch you are on now.")
+        }
         RecoveryStrategy::RevertCommit { commit } => format!(
             "The way back is to revert {}, which adds a commit undoing it rather than \
              removing it from history.",

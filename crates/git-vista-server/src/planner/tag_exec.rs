@@ -49,7 +49,6 @@ use super::{
 #[cfg(test)]
 pub(super) use git_vista_protocol::plan_export::create_tag_argv;
 
-
 /// `git tag [-a|-s -m <message>] <name> <target>` (`/api/tag`).
 ///
 /// Lightweight, annotated and signed are one operation with one argv builder

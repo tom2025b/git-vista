@@ -35,8 +35,7 @@ use crate::sandbox::NetworkNeed;
 
 use super::{
     classify_path_states, couldnt_run, journal_app_event, journal_clear_blocking, read_seed,
-    run_git, run_git_argv, stderr_or, symlink_containment_guard, verify_path_states, Obs,
-    PathKind,
+    run_git, run_git_argv, stderr_or, symlink_containment_guard, verify_path_states, Obs, PathKind,
 };
 
 /// Reset a *test repo* to its recorded seed (`/api/reset-test-repo`): move

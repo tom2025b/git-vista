@@ -822,7 +822,8 @@ mod tests {
     #[test]
     fn only_a_lease_push_builds_a_force_flag_and_it_names_the_reviewed_tip() {
         let tip = "4".repeat(40);
-        let leased = plan_export::push_argv(&branch("main"), &remote("origin"), false, &lease(&tip));
+        let leased =
+            plan_export::push_argv(&branch("main"), &remote("origin"), false, &lease(&tip));
         let leased_flags: Vec<&String> =
             leased.iter().filter(|a| a.starts_with("--force")).collect();
         assert_eq!(
@@ -877,7 +878,12 @@ mod tests {
     fn every_push_argv_asks_git_for_progress() {
         for force in every_force_mode() {
             for set_upstream in [true, false] {
-                let argv = plan_export::push_argv(&branch("main"), &remote("origin"), set_upstream, &force);
+                let argv = plan_export::push_argv(
+                    &branch("main"),
+                    &remote("origin"),
+                    set_upstream,
+                    &force,
+                );
                 assert!(
                     argv.iter().any(|a| a == "--progress"),
                     "no --progress in {argv:?}"

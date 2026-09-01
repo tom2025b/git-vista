@@ -70,6 +70,9 @@ pub fn tool_catalog() -> serde_json::Value {
     // it is not a write either, so it belongs with the reads.
     array.extend(crate::lesson::lesson_tool_catalog());
     array.extend(crate::plan_tools::plan_tool_catalog());
+    // #590: local, read-only rendering of a plan_* result. It sits after the
+    // builders because it consumes their Plan, and before the one write tool.
+    array.extend(crate::export_tools::export_tool_catalog());
     // M2.23e (#249): the one write tool, appended last so it is always the
     // catalog's final entry — see `tools::tests::the_tool_catalog_lists_exactly_the_six_read_tools`.
     array.extend(crate::execute_tool::execute_tool_catalog());
@@ -363,7 +366,8 @@ pub fn call_tool(
         // unknown-tool refusal, so neither can shadow a read tool's name, and
         // an unrecognised name is still `Unknown` rather than silently
         // swallowed.
-        other => match crate::plan_tools::call_plan_tool_live(other, arguments, session)
+        other => match crate::export_tools::call_export_tool(other, arguments)
+            .or_else(|| crate::plan_tools::call_plan_tool_live(other, arguments, session))
             .or_else(|| crate::execute_tool::call_execute_tool_live(other, arguments, session))
         {
             Some(result) => result,
@@ -713,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn the_tool_catalog_lists_exactly_the_seven_read_tools() {
+    fn the_tool_catalog_orders_reads_plans_exports_and_the_one_write() {
         // #248 appended the `plan_*` surface after these, so the read tools
         // are now a *prefix* of the catalog rather than the whole of it —
         // still pinned in order, and still pinned to exactly these names, so
@@ -742,19 +746,19 @@ mod tests {
             "get_lesson",
         ];
         assert_eq!(names[..expected_reads.len()], expected_reads);
-        // M2.23e (#249) appended exactly one write tool, `execute_plan`, as
-        // the catalog's LAST entry — everything between the reads and it is
-        // still `plan_*`. Pinning it as the last name (not merely "somewhere
-        // after the reads") is what stops a second write tool from sneaking
-        // in unnoticed between two plan_* entries.
+        // #590 appends one local, read-only export tool after the plan builders,
+        // followed by M2.23e's one write tool. Keeping execute_plan last still
+        // makes a second write-shaped capability visible here.
         let after_reads = &names[expected_reads.len()..];
-        let (last, plan_names) = after_reads
-            .split_last()
-            .expect("the catalog has more than just the read tools");
+        let (last, before_execute) = after_reads.split_last().expect("more tools follow reads");
         assert_eq!(
             *last, "execute_plan",
             "the catalog's last tool must be execute_plan — #249's one write tool"
         );
+        let (export, plan_names) = before_execute
+            .split_last()
+            .expect("the plan builders and checklist exporter precede execution");
+        assert_eq!(*export, "export_plan_checklist");
         assert!(
             plan_names.iter().all(|n| n.starts_with("plan_")),
             "a non-read, non-plan, non-execute_plan tool appeared in the catalog: {names:?}"

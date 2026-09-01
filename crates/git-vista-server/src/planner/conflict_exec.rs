@@ -127,11 +127,11 @@ pub(super) async fn exec_resolve_conflict(
     // done both, so it needs no second step — and running `add` on a path it
     // just deleted would fail.
     if !matches!(resolution, Resolution::TakeDeletion) {
-        let add =
-            match run_git_argv(repo, need, &plan_export::stage_resolved_path_argv(path)).await {
-                Ok(o) => o,
-                Err(e) => return couldnt_run("/api/resolve-conflict", &e),
-            };
+        let add = match run_git_argv(repo, need, &plan_export::stage_resolved_path_argv(path)).await
+        {
+            Ok(o) => o,
+            Err(e) => return couldnt_run("/api/resolve-conflict", &e),
+        };
         if !add.status.success() {
             let msg = stderr_or(&add, "git could not stage the resolved file.");
             eprintln!("git-vista: /api/resolve-conflict failed to stage: {msg}");
