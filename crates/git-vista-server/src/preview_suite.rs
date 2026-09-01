@@ -2134,6 +2134,74 @@ async fn a5_cherry_pick_actually_moves_the_content() {
     assert_tree_matches_the_real_run(&target, &op, &["cherry-pick", &topic], "cherry-pick").await;
 }
 
+/// The object `commit-tree` actually writes contains the tree a real
+/// cherry-pick writes, not merely the tree the recipe predicted.
+///
+/// This is deliberately below [`synthesize`], the production seam that owns
+/// `merge_tree` through `read_back`. Calling [`commit_tree`] directly with the
+/// expected tree would bypass the choice this test exists to pin.
+///
+/// # Two mutations
+///
+/// 1. **Weakens the tree choice** — substitute `recipe.no_op.tree` for the
+///    clean tree at the `commit_tree` call. The committed tree becomes HEAD's
+///    tree and the first production-tree assertion goes red.
+/// 2. **Removes the content** — pass git's empty-tree oid to `commit_tree`.
+///    The HEAD-tree assertion no longer catches it; the real-tree comparison
+///    goes red instead.
+#[tokio::test]
+async fn the_synthesized_commit_contains_the_tree_the_real_cherry_pick_writes() {
+    let (dir, repo) = git_vista_fixtures::cherry_pick_clean();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
+    let head = git::out(&repo, &["rev-parse", "HEAD"]);
+    let head_tree_before = git::out(&repo, &["rev-parse", "HEAD^{tree}"]);
+    let topic = git::out(&repo, &["rev-parse", "topic"]);
+    let (_scratch, copy) = copy_of(&repo);
+    let op = previewable(&GitOperation::CherryPick {
+        commit: CommitOid::new(topic.clone()).expect("a full hex oid"),
+    })
+    .expect("a cherry-pick is previewable");
+    let plumbing = resolve_plumbing(&target, &op, &head)
+        .await
+        .expect("the plumbing resolves");
+    let Plumbing::Synthesize(recipe) = plumbing else {
+        panic!("a clean cherry-pick must synthesize a commit");
+    };
+
+    let caller = Arc::new(());
+    let alive = Arc::downgrade(&caller);
+    let synthesis = synthesize(&repo, &recipe, &alive)
+        .await
+        .expect("the clean cherry-pick synthesizes");
+    let Synthesis::Committed { oid, .. } = synthesis else {
+        panic!("a clean cherry-pick must write a commit");
+    };
+
+    let git_dir = recipe.store.git_dir_flag();
+    let committed_tree_spec = format!("{oid}^{{tree}}");
+    let committed_tree = git::out(&repo, &[&git_dir, "rev-parse", &committed_tree_spec]);
+
+    git::run(&copy, &["cherry-pick", &topic]);
+    let real_tree = git::out(&copy, &["rev-parse", "HEAD^{tree}"]);
+
+    assert_ne!(
+        real_tree, head_tree_before,
+        "the real cherry-pick must change the tree or this fixture proves nothing"
+    );
+    assert_ne!(
+        committed_tree, head_tree_before,
+        "the synthesized commit must not wrap HEAD's unchanged tree"
+    );
+    assert_eq!(
+        committed_tree, real_tree,
+        "the synthesized commit must wrap the tree the real cherry-pick writes"
+    );
+
+    drop(caller);
+    drop(recipe);
+}
+
 /// **A5, merge, content.** The previewed merge really unions the two branches'
 /// trees.
 ///
