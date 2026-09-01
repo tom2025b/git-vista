@@ -17,6 +17,7 @@ import {
   buildEditorFixture,
   buildFixture,
   buildInterleavedWipFixture,
+  buildMergePreviewFixture,
   buildNonTextConflictFixture,
   buildStashFixture,
 } from './fixture.mjs'
@@ -95,7 +96,12 @@ export default async function globalSetup() {
   // applied cleanly. Separate because it is the only repo here whose stash list
   // has an asserted count, and because applying that entry leaves collision.txt
   // conflicted — a state no other spec's repo may inherit.
-  const stashFixture = buildStashFixture(join(work, 'stash-repo'))
+  // #594: an eighth repo, two branches diverged from one base. Separate
+  // because every other fixture here is either already up to date with its
+  // other branch (so a merge preview would have nothing to draw) or
+  // deliberately dirty/conflicted (so it would answer a different question).
+  // Nothing ever merges it — the spec opens a confirmation and cancels.
+  const mergePreviewFixture = buildMergePreviewFixture(join(work, 'merge-preview-repo'))
   const { child, base, signInUrl } = await startServer({
     repoPath: fixture.root,
     extraRepos: [
@@ -105,6 +111,7 @@ export default async function globalSetup() {
       brokenHeadFixture.root,
       interleavedFixture.root,
       stashFixture.root,
+      mergePreviewFixture.root,
     ],
     stateHome: join(work, 'state'),
   })
@@ -128,6 +135,7 @@ export default async function globalSetup() {
         brokenHeadFixture,
         stashFixture,
         interleavedFixture,
+        mergePreviewFixture,
       },
       null,
       2,
