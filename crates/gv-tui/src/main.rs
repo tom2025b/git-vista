@@ -275,26 +275,47 @@ mod tests {
     // files.
     // -----------------------------------------------------------------------
 
-    /// Every `.rs` file in this crate's `src/`, read from disk at test time,
-    /// so a file added later cannot be forgotten the way a hand-written
-    /// `include_str!` list once forgot `plan_tools.rs` in git-vista-mcp.
+    /// Every `.rs` file in this crate's `src/` **tree**, read from disk at
+    /// test time, so a file added later cannot be forgotten the way a
+    /// hand-written `include_str!` list once forgot `plan_tools.rs` in
+    /// git-vista-mcp.
+    ///
+    /// The walk descends into sub-directories and names each file by its path
+    /// relative to `src/`, `/`-separated (`panes/detail.rs`). Both halves of
+    /// that sentence are load-bearing, and neither is hypothetical: this was
+    /// a flat `std::fs::read_dir`, and when `src/panes/` arrived in #458 the
+    /// #245 guard below stopped scanning 717 lines of new code *while still
+    /// reporting success*. That is the vacuous pass this census exists to
+    /// make impossible, so the floor list in
+    /// `the_source_census_really_sees_every_file_in_the_crate` names a file
+    /// inside that sub-directory — flatten this walk again, or name files by
+    /// `file_name()` alone, and that test goes red instead of the guard going
+    /// quietly blind.
     fn crate_sources() -> Vec<(String, String)> {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut sources: Vec<(String, String)> = std::fs::read_dir(&dir)
-            .unwrap_or_else(|e| panic!("reading {dir:?}: {e}"))
-            .map(|entry| entry.expect("a readable directory entry").path())
-            .filter(|p| p.extension().is_some_and(|e| e == "rs"))
-            .map(|p| {
-                let name = p
-                    .file_name()
-                    .expect("a file, so it has a name")
-                    .to_string_lossy()
-                    .into_owned();
-                let body =
-                    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("reading {p:?}: {e}"));
-                (name, body)
-            })
-            .collect();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources: Vec<(String, String)> = Vec::new();
+        let mut pending = vec![root.clone()];
+        while let Some(dir) = pending.pop() {
+            let entries =
+                std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("reading {dir:?}: {e}"));
+            for entry in entries {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let name = path
+                        .strip_prefix(&root)
+                        .expect("every walked path descends from src/")
+                        .components()
+                        .map(|part| part.as_os_str().to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    let body = std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| panic!("reading {path:?}: {e}"));
+                    sources.push((name, body));
+                }
+            }
+        }
         sources.sort();
         sources
     }
@@ -322,13 +343,35 @@ mod tests {
                 "the source census missed {expected}: {names:?}"
             );
         }
+        // Anti-vacuity, in the shapes that actually matter. A per-file
+        // `body.len() > 500` floor used to stand here. It was a proxy for
+        // "the read returned real content", and it held only while every
+        // file in this crate happened to be large: the moment a legitimate
+        // 402-byte `panes/mod.rs` appeared — six doc lines and one
+        // `pub mod detail;` — the proxy failed on code that was entirely
+        // fine. That is a test premise breaking, not a defect, and the fix
+        // is to assert the thing itself rather than a stand-in for it.
+        //
+        // What replaces it is strictly stronger, and split by what each
+        // part can actually catch:
+        //   - the floor list above catches a walk that stops descending or
+        //     names files by `file_name()` alone (both drop `panes/…`);
+        //   - the emptiness check catches any single file read as nothing,
+        //     at any size, which is what the byte floor was reaching for;
+        //   - the total catches a wholesale collapse of the scan.
         for (name, body) in &sources {
             assert!(
-                body.len() > 500,
-                "{name} was read as only {} bytes — the census is scanning nothing",
-                body.len()
+                !body.is_empty(),
+                "{name} was read as zero bytes — the census is scanning nothing"
             );
         }
+        let total: usize = sources.iter().map(|(_, body)| body.len()).sum();
+        assert!(
+            total > 80_000,
+            "the census read {total} bytes across {} files — far less than this \
+             crate's source, so it is scanning a fraction of it",
+            sources.len()
+        );
     }
 
     /// The #245 acceptance criterion — the token never lands in argv, env, or
