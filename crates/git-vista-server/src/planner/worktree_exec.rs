@@ -27,7 +27,7 @@ use axum::http::StatusCode;
 use git_vista_core::activity::ActivityKind;
 use git_vista_core::seed::reset_plan;
 
-use git_vista_protocol::WorktreePath;
+use git_vista_protocol::{plan_export, WorktreePath};
 
 use crate::git_cmd::{git_ok, rev_parse};
 use crate::journal;
@@ -35,7 +35,8 @@ use crate::sandbox::NetworkNeed;
 
 use super::{
     classify_path_states, couldnt_run, journal_app_event, journal_clear_blocking, read_seed,
-    run_git, stderr_or, symlink_containment_guard, verify_path_states, Obs, PathKind,
+    run_git, run_git_argv, stderr_or, symlink_containment_guard, verify_path_states, Obs,
+    PathKind,
 };
 
 /// Reset a *test repo* to its recorded seed (`/api/reset-test-repo`): move
@@ -341,9 +342,8 @@ pub(super) async fn exec_discard_tracked_paths(
     // staged blob (if any) still survives as a dangling object until the
     // next `git gc`, confirmed with `git fsck --unreachable`, so the
     // recovery-story text below stays true either way.
-    let mut args: Vec<&str> = vec!["checkout", "HEAD", "--"];
-    args.extend(paths.iter().map(WorktreePath::as_str));
-    let output = match run_git(repo, need, &args).await {
+    let args = plan_export::discard_tracked_argv(paths);
+    let output = match run_git_argv(repo, need, &args).await {
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/discard-tracked-paths", &e),
     };
@@ -660,15 +660,14 @@ pub(super) async fn exec_delete_untracked_paths(
     {
         return refused;
     }
-    let mut args: Vec<&str> = vec!["clean", "-f", "--"];
-    args.extend(paths.iter().map(WorktreePath::as_str));
+    let args = plan_export::delete_untracked_argv(paths);
     // Snapshot presence as late as possible — the very last thing before the
     // spawn — so what this operation is credited with destroying is what it
     // actually destroyed, not merely what is missing afterwards. See
     // [`DeleteOutcome`] for the window this does and does not close.
     let requested: Vec<&str> = paths.iter().map(WorktreePath::as_str).collect();
     let present_before = present_paths(repo, &requested);
-    let output = match run_git(repo, need, &args).await {
+    let output = match run_git_argv(repo, need, &args).await {
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/delete-untracked-paths", &e),
     };

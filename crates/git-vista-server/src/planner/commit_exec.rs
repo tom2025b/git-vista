@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use axum::http::StatusCode;
 
 use git_vista_protocol::{
-    AmendCommitError, AmendCommitSuccess, AmendFailureKind, BranchName, CommitError,
+    plan_export, AmendCommitError, AmendCommitSuccess, AmendFailureKind, BranchName, CommitError,
     CommitFailureKind, CommitMessage, CommitOid,
 };
 
@@ -158,12 +158,8 @@ pub(super) async fn exec_commit_on_head(
     // creation-like event with no old state, which is exactly what it is.
     let old = observed.head_tip.clone();
 
-    let mut args = vec!["commit"];
-    if allow_empty {
-        args.push("--allow-empty");
-    }
-    args.push("-m");
-    args.push(message.as_str());
+    let argv = plan_export::commit_on_head_argv(message, allow_empty);
+    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
 
     let output = match run_git_hooked(repo, need, &args).await {
         Ok(crate::git_cmd::BoundedOutput::Completed(o)) => o,
@@ -395,12 +391,8 @@ pub(super) async fn exec_amend_commit(
 
     let published = amended_commit_is_published(repo, expected_tip).await;
 
-    let mut args = vec!["commit", "--amend"];
-    if allow_empty {
-        args.push("--allow-empty");
-    }
-    args.push("-m");
-    args.push(message.as_str());
+    let argv = plan_export::amend_commit_argv(message, allow_empty);
+    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
     let output = match run_git_hooked(repo, need, &args).await {
         Ok(crate::git_cmd::BoundedOutput::Completed(o)) => o,
         Ok(crate::git_cmd::BoundedOutput::TimedOut) => {

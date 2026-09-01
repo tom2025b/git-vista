@@ -37,7 +37,9 @@
 
 use axum::http::StatusCode;
 
-use git_vista_protocol::{FetchError, FetchFailureKind, FetchSuccess, RemoteName, RemoteRefUpdate};
+use git_vista_protocol::{
+    plan_export, FetchError, FetchFailureKind, FetchSuccess, RemoteName, RemoteRefUpdate,
+};
 
 use super::transfer::{diff_refs, parse_progress, remote_tracking_refs};
 use super::*;
@@ -274,9 +276,11 @@ pub(super) async fn run_fetch(
     // build that overflows a 2 MiB test thread's stack. One allocation, on an
     // operation that is about to open a socket and receive a pack, is not a
     // cost worth measuring; the crash it prevents is.
+    let fetch_argv = plan_export::fetch_argv(remote);
+    let fetch_args: Vec<&str> = fetch_argv.iter().map(String::as_str).collect();
     let run = Box::pin(crate::git_cmd::git_streamed_for(
         repo,
-        &["fetch", "--progress", remote.as_str()],
+        &fetch_args,
         need,
         cancel,
         |record| {

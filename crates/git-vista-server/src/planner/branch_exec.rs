@@ -22,7 +22,7 @@ use std::path::Path;
 
 use axum::http::StatusCode;
 
-use git_vista_protocol::{BranchName, CommitOid, MergeStrategy, RefName};
+use git_vista_protocol::{plan_export, BranchName, CommitOid, MergeStrategy, RefName};
 
 use git_vista_core::activity::ActivityKind;
 
@@ -30,8 +30,9 @@ use crate::git_cmd::rev_parse;
 use crate::sandbox::NetworkNeed;
 
 use super::{
-    couldnt_run, git, journal_app_event, read_head_branch_blocking, remove_from_snapshot_blocking,
-    run_git, short, stderr_or, stderr_stdout_or, strategy_word, worktree_dirty, Obs, Observed,
+    couldnt_run, git_argv, journal_app_event, read_head_branch_blocking,
+    remove_from_snapshot_blocking, run_git_argv, short, stderr_or, stderr_stdout_or,
+    strategy_word, worktree_dirty, Obs, Observed,
 };
 
 /// `git branch <name> <at>` (`/api/branch`). B3 posture: git validates the
@@ -42,7 +43,7 @@ pub(super) async fn exec_create_branch(
     name: &BranchName,
     at: &CommitOid,
 ) -> (StatusCode, String) {
-    let output = match run_git(repo, need, &["branch", name.as_str(), at.as_str()]).await {
+    let output = match run_git_argv(repo, need, &plan_export::create_branch_argv(name, at)).await {
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/branch", &e),
     };
@@ -82,13 +83,10 @@ async fn run_branch_cmd(
     repo: &Path,
     need: NetworkNeed,
     endpoint: &str,
-    args: &[&str],
-    target: &RefName,
+    argv: &[String],
     ok_msg: String,
 ) -> (StatusCode, String) {
-    let mut argv: Vec<&str> = args.to_vec();
-    argv.push(target.as_str());
-    let output = match run_git(repo, need, &argv).await {
+    let output = match run_git_argv(repo, need, argv).await {
         Ok(o) => o,
         Err(e) => return couldnt_run(endpoint, &e),
     };
@@ -116,8 +114,7 @@ pub(super) async fn exec_checkout(
         repo,
         need,
         "/api/checkout",
-        &["checkout"],
-        &RefName::from(branch),
+        &plan_export::checkout_argv(branch),
         format!("checked out '{branch}'"),
     )
     .await;
@@ -202,8 +199,7 @@ pub(super) async fn exec_merge(
         repo,
         need,
         "/api/merge",
-        &["merge", "--no-edit"],
-        target,
+        &plan_export::merge_argv(target),
         format!("merged '{target}' into HEAD"),
     )
     .await;
@@ -260,17 +256,16 @@ pub(super) async fn exec_delete(
     observed: &Observed,
     force: bool,
 ) -> (StatusCode, String) {
-    let (endpoint, flag, verb) = if force {
-        ("/api/force-delete-branch", "-D", "force-deleted")
+    let (endpoint, verb) = if force {
+        ("/api/force-delete-branch", "force-deleted")
     } else {
-        ("/api/delete-branch", "-d", "deleted")
+        ("/api/delete-branch", "deleted")
     };
     let resp = run_branch_cmd(
         repo,
         need,
         endpoint,
-        &["branch", flag],
-        &RefName::from(branch),
+        &plan_export::delete_branch_argv(branch, force),
         format!("{verb} branch '{branch}'"),
     )
     .await;
@@ -305,7 +300,7 @@ pub(super) async fn exec_rebase(
     let target = base;
     let base = base.as_str();
 
-    let output = match run_git(repo, need, &["rebase", base]).await {
+    let output = match run_git_argv(repo, need, &plan_export::rebase_argv(target)).await {
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/rebase", &e),
     };
@@ -342,7 +337,7 @@ pub(super) async fn exec_rebase(
         // Best-effort: back out of the half-applied rebase so the working tree
         // isn't stuck mid-rebase. Harmless (exits non-zero, ignored) when none
         // is running.
-        let _ = run_git(repo, need, &["rebase", "--abort"]).await;
+        let _ = run_git_argv(repo, need, &plan_export::rebase_abort_argv()).await;
         eprintln!("git-vista: /api/rebase failed (aborted): {msg}");
         (StatusCode::BAD_REQUEST, msg)
     }
@@ -357,7 +352,7 @@ pub(super) async fn exec_restore_branch(
     name: &BranchName,
     tip: &CommitOid,
 ) -> (StatusCode, String) {
-    match git(repo, need, &["branch", name.as_str(), tip.as_str()]).await {
+    match git_argv(repo, need, &plan_export::create_branch_argv(name, tip)).await {
         Ok(()) => {
             println!(
                 "[/api/undo] restored branch '{name}' at {}",
@@ -418,11 +413,11 @@ pub(super) async fn exec_reset_branch(
                         .to_string(),
                 );
             }
-            Ok(false) => git(repo, need, &["reset", "--hard", to.as_str()]).await,
+            Ok(false) => git_argv(repo, need, &plan_export::reset_hard_argv(to)).await,
         }
     } else {
         // Not checked out: move the ref alone, no worktree involved.
-        git(repo, need, &["branch", "-f", branch.as_str(), to.as_str()]).await
+        git_argv(repo, need, &plan_export::move_branch_argv(branch, to)).await
     };
     match result {
         Ok(()) => {
