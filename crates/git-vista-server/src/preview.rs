@@ -647,8 +647,33 @@ async fn compute(
         return Err(reason);
     }
 
-    let tree = match merge_tree(repo, &recipe).await? {
-        MergeTreeAnswer::Conflict { paths } => return Ok(PreviewOutcome::Conflict { paths }),
+    match synthesize(repo, &recipe, alive).await? {
+        Synthesis::Conflict { paths } => Ok(PreviewOutcome::Conflict { paths }),
+        Synthesis::Committed { oid, added } => lay_out(repo, Some(added), ref_moves_to(repo, &oid)),
+    }
+}
+
+/// The production seam from git's merged tree to the commit read back from
+/// the scratch store.
+///
+/// Keeping `merge_tree` and the `commit_tree` argument in one function is
+/// load-bearing: a test that supplied `commit_tree`'s tree itself would prove
+/// only its own argument, while a caller-selected tree would move that same
+/// blind spot one frame upward. The finding-8 regression drives this function
+/// and independently reads the written commit's tree while `recipe` keeps the
+/// store alive.
+enum Synthesis {
+    Conflict { paths: Vec<String> },
+    Committed { oid: String, added: CommitSummary },
+}
+
+async fn synthesize(
+    repo: &Path,
+    recipe: &Recipe,
+    alive: &std::sync::Weak<()>,
+) -> Result<Synthesis, PreviewUnavailable> {
+    let tree = match merge_tree(repo, recipe).await? {
+        MergeTreeAnswer::Conflict { paths } => return Ok(Synthesis::Conflict { paths }),
         MergeTreeAnswer::Clean { tree } => tree,
     };
 
@@ -675,7 +700,7 @@ async fn compute(
     }
 
     let added = read_back(repo, &recipe.store, &oid).await?;
-    lay_out(repo, Some(added), ref_moves_to(repo, &oid))
+    Ok(Synthesis::Committed { oid, added })
 }
 
 /// Shorthand for the `CheckFailed` arm — "a git step ran and did not produce
