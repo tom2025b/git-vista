@@ -57,8 +57,9 @@
 
 use git_vista_protocol::Plan;
 
-use crate::auth::{self, Session};
-use crate::http::{self, HttpResponse};
+use git_vista_session::auth::{self, Session};
+use git_vista_session::http::{self, HttpResponse};
+
 use crate::tools::ToolError;
 
 /// The one endpoint this tool talks to.

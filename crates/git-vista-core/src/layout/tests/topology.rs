@@ -2,6 +2,7 @@
 //! determinism of the layout.
 
 use super::*;
+use crate::layout::topology::{stable_topo_order, topo_order_with_id_ties};
 use crate::layout::{layout, layout_with_refs};
 
 #[test]
@@ -376,4 +377,41 @@ fn a_time_skewed_child_is_still_laid_out_above_its_parent() {
         "the child draws above its parent"
     );
     assert_eq!(g.rows[1].commit.id.0, "P");
+}
+
+/// #576 finding 6: a cyclic parent graph — which real git can never hand this
+/// walk, and which #576's preview cannot either, since its one non-git-history
+/// commit (`added`) is always read back from a real `git commit-tree` write
+/// whose parent must already exist (see `read_back` in
+/// `git-vista-server/src/preview.rs`) — must not hang looking for a commit
+/// that will never become ready, and must not silently drop or reorder a
+/// commit. It falls back to the original arrival order, unchanged. See the
+/// comment on the fallback itself in `layout/topology.rs` for why this is a
+/// deliberate, tested choice rather than wired to a `CheckFailed` refusal.
+#[test]
+fn cyclic_input_falls_back_to_the_original_order_rather_than_hanging() {
+    // A and B each name the other as parent. Neither ever has zero pending
+    // children, so the heap the walk pops from starts empty and stays empty —
+    // `order` never grows past 0, which is exactly the condition the
+    // fallback guard checks for.
+    let cyclic = vec![commit("a", &["b"]), commit("b", &["a"])];
+    let ids = |cs: &[CommitSummary]| cs.iter().map(|c| c.id.0.clone()).collect::<Vec<_>>();
+
+    let out = stable_topo_order(cyclic.clone());
+    assert_eq!(
+        ids(&out),
+        vec!["a".to_string(), "b".to_string()],
+        "a cycle must fall back to the original arrival order, not drop a \
+         commit or reorder the list"
+    );
+
+    // The tie-tracking variant takes the same fallback. It must report no
+    // ties: the only place a tie is ever recorded is inside the walk's main
+    // loop, which never runs when nothing is ever ready to pop.
+    let (out2, ties) = topo_order_with_id_ties(cyclic);
+    assert_eq!(ids(&out2), vec!["a".to_string(), "b".to_string()]);
+    assert!(
+        ties.is_empty(),
+        "no id was ever compared, so none should be recorded as tied"
+    );
 }

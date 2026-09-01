@@ -2174,6 +2174,74 @@ async fn a5_cherry_pick_actually_moves_the_content() {
     assert_tree_matches_the_real_run(&target, &op, &["cherry-pick", &topic], "cherry-pick").await;
 }
 
+/// The object `commit-tree` actually writes contains the tree a real
+/// cherry-pick writes, not merely the tree the recipe predicted.
+///
+/// This is deliberately below [`synthesize`], the production seam that owns
+/// `merge_tree` through `read_back`. Calling [`commit_tree`] directly with the
+/// expected tree would bypass the choice this test exists to pin.
+///
+/// # Two mutations
+///
+/// 1. **Weakens the tree choice** — substitute `recipe.no_op.tree` for the
+///    clean tree at the `commit_tree` call. The committed tree becomes HEAD's
+///    tree and the first production-tree assertion goes red.
+/// 2. **Removes the content** — pass git's empty-tree oid to `commit_tree`.
+///    The HEAD-tree assertion no longer catches it; the real-tree comparison
+///    goes red instead.
+#[tokio::test]
+async fn the_synthesized_commit_contains_the_tree_the_real_cherry_pick_writes() {
+    let (dir, repo) = git_vista_fixtures::cherry_pick_clean();
+    let target =
+        PreviewTarget::resolved_in(&repo, dir.path()).expect("a target inside the fixture root");
+    let head = git::out(&repo, &["rev-parse", "HEAD"]);
+    let head_tree_before = git::out(&repo, &["rev-parse", "HEAD^{tree}"]);
+    let topic = git::out(&repo, &["rev-parse", "topic"]);
+    let (_scratch, copy) = copy_of(&repo);
+    let op = previewable(&GitOperation::CherryPick {
+        commit: CommitOid::new(topic.clone()).expect("a full hex oid"),
+    })
+    .expect("a cherry-pick is previewable");
+    let plumbing = resolve_plumbing(&target, &op, &head)
+        .await
+        .expect("the plumbing resolves");
+    let Plumbing::Synthesize(recipe) = plumbing else {
+        panic!("a clean cherry-pick must synthesize a commit");
+    };
+
+    let caller = Arc::new(());
+    let alive = Arc::downgrade(&caller);
+    let synthesis = synthesize(&repo, &recipe, &alive)
+        .await
+        .expect("the clean cherry-pick synthesizes");
+    let Synthesis::Committed { oid, .. } = synthesis else {
+        panic!("a clean cherry-pick must write a commit");
+    };
+
+    let git_dir = recipe.store.git_dir_flag();
+    let committed_tree_spec = format!("{oid}^{{tree}}");
+    let committed_tree = git::out(&repo, &[&git_dir, "rev-parse", &committed_tree_spec]);
+
+    git::run(&copy, &["cherry-pick", &topic]);
+    let real_tree = git::out(&copy, &["rev-parse", "HEAD^{tree}"]);
+
+    assert_ne!(
+        real_tree, head_tree_before,
+        "the real cherry-pick must change the tree or this fixture proves nothing"
+    );
+    assert_ne!(
+        committed_tree, head_tree_before,
+        "the synthesized commit must not wrap HEAD's unchanged tree"
+    );
+    assert_eq!(
+        committed_tree, real_tree,
+        "the synthesized commit must wrap the tree the real cherry-pick writes"
+    );
+
+    drop(caller);
+    drop(recipe);
+}
+
 /// **A5, merge, content.** The previewed merge really unions the two branches'
 /// trees.
 ///
@@ -4380,6 +4448,90 @@ fn preview_resolves_the_commondir_in_exactly_one_place() {
     }
 }
 
+/// The corrected module header — this file's own doc comment, directly above
+/// [`preview_git`] — states a fact about which primitive every spawn here
+/// runs through: `git_output`, never `git_output_bounded`. That correction
+/// (from a prior commit's false "every spawn is bounded" to today's true
+/// "every spawn is unbounded") pinned nothing when it landed — only the
+/// sentence changed, not the code. This is the house pattern named just above
+/// (`preview_resolves_the_commondir_in_exactly_one_place`'s own doc), applied
+/// to a second structural fact in the same module: assert it against the
+/// source text, comment-aware, so a doc-comment mention of the name cannot
+/// fire it and a doc-comment reword cannot silence it.
+///
+/// # Why this cannot be a behavioural test instead
+///
+/// `a2_a_cancelled_preview_leaves_nothing_behind`'s own doc comment records
+/// the measurement directly: swapping `preview_git` for `git_output_bounded`
+/// leaves that test green, 3 of 3 runs, because `preview`'s work runs in a
+/// **detached** task and a cancelled caller never drops a child for
+/// `kill_on_drop` to fire on. Nothing this module can observe at runtime
+/// distinguishes the two arities on the path production takes — the fact is
+/// real, it is simply invisible from behaviour, which is exactly what a
+/// source scan is for.
+///
+/// # Two mutations, both catching on the same assertion
+///
+/// Both mutations below redden the `bounded_calls.is_empty()` check, which
+/// runs FIRST in the test body on purpose — say so honestly rather than
+/// implying two distinct failure surfaces: what differs between the two is
+/// WHERE the change is made, not WHICH assertion notices it.
+///
+/// 1. **Removes the mechanism.** Rewrite [`preview_git`]'s body to call
+///    `git_cmd::git_output_bounded` and adapt its `BoundedOutput` back into
+///    `Output` inline (mapping `TimedOut` to an `io::Error`), keeping the
+///    function's own signature — and therefore every call site in this file —
+///    unchanged. This compiles; it is the realistic "fix" the module's own
+///    doc warns is worse here, and it is silent everywhere except this test.
+/// 2. **Weakens it.** Leave [`preview_git`] untouched and wire a second,
+///    independent call to `git_cmd::git_output_bounded` into one real call
+///    site elsewhere in this file (its signature is identical to
+///    `preview_git`'s, so it compiles and is actually reachable — not dead
+///    code, which would prove nothing). Which single wrapper every call
+///    funnels through is a different property (`argv_boundary`'s job); the
+///    primitive itself is checked file-wide on purpose, so a second,
+///    reachable call site proves that file-wide scope — not just
+///    `preview_git`'s own body — is what is load-bearing here.
+#[test]
+fn preview_spawns_the_unbounded_primitive_never_the_bounded_one() {
+    const SRC: &str = include_str!("preview.rs");
+
+    let bounded_calls: Vec<(usize, &str)> = SRC
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim_start().starts_with("//"))
+        .filter(|(_, l)| l.contains("git_output_bounded("))
+        .map(|(i, l)| (i + 1, l.trim()))
+        .collect();
+    assert!(
+        bounded_calls.is_empty(),
+        "preview.rs now calls git_cmd::git_output_bounded — the kill-on-drop \
+         arity — somewhere. This module's own doc comment (right above \
+         `preview_git`) measured that arity strictly worse here: `preview`'s \
+         work runs in a detached task, so a cancelled caller never drops a \
+         child for kill_on_drop to fire on, and what it fires on instead is \
+         runtime teardown mid-`git init`, turning a store that would finish \
+         and remove itself in 15ms into one nobody ever finishes or removes. \
+         If this is a deliberate change, update the module header's claim in \
+         the same commit — that is the gap this test exists to close. \
+         Found: {bounded_calls:?}"
+    );
+
+    // Vacuity guard, checked SECOND on purpose: the mechanism assertion above
+    // must be the first thing a broken run reports, or a real regression
+    // reads as "the read is wrong" instead of "the call is bounded". This
+    // guard only matters when the check above passes for the wrong reason —
+    // an include_str! that silently captured a stale or empty file would
+    // leave `bounded_calls` empty no matter what the real file says, and this
+    // is what catches that.
+    assert!(
+        SRC.contains("git_cmd::git_output(repo, args).await"),
+        "preview_git's call to the unbounded primitive is not where this test \
+         expects it — either the read is wrong or the call moved; find it \
+         before trusting the negative check above"
+    );
+}
+
 /// Set a directory's modification time.
 ///
 /// `std::fs` has no setter, and this crate has no `filetime` dependency, so
@@ -4875,6 +5027,80 @@ fn ref_moved_from_reports_the_branch_old_target_not_a_same_named_tags() {
         got,
         "the same repository read in a different ref order must give the same \
          previous targets"
+    );
+}
+
+/// **`RefMoved.from` must report the local branch's old target, not a
+/// remote-tracking ref's.**
+///
+/// The sibling of the tag-collision test above, for the OTHER kind
+/// [`GitRef::is_ref_moves_target`] must exclude: a local branch literally
+/// named `origin/main` (checked out) and the remote-tracking
+/// `refs/remotes/origin/main` both flatten to the display name
+/// `"origin/main"`. [`previous_targets`] uses `.find()` (first match wins),
+/// so — exactly as with the tag case — which entry is found first depends on
+/// enumeration order, and both orders are exercised deliberately so that
+/// order is proven not to be load-bearing for the CORRECT behaviour.
+///
+/// # Two mutations that make this red, failing differently
+///
+/// * **REMOVES the mechanism.** Delete `&& r.is_ref_moves_target()` from
+///   [`previous_targets`]'s `.find()` condition, so the lookup matches on
+///   name alone — proving the call site consults the predicate at all.
+///   `remote_first` now finds the remote-tracking ref first and reports its
+///   `2222…` target: red on the first assertion.
+/// * **WEAKENS the mechanism.** Add `RefKind::RemoteBranch` to the
+///   `matches!` arm (keeping `Head` and `Branch`) — the exact regression
+///   this test exists to catch. Same observable break: `remote_first`
+///   reports `2222…` instead of `3333…`, and the second assertion (which
+///   compares against that now-wrong value) also goes red because
+///   `branch_first` still correctly finds the branch's `3333…` — order was
+///   never supposed to matter, and under the weakening it suddenly does.
+#[test]
+fn ref_moved_from_reports_the_branch_old_target_not_a_same_named_remote_tracking_refs() {
+    use git_vista_core::model::RefKind;
+
+    let git_ref = |name: &str, kind: RefKind, digit: char| GitRef {
+        name: name.to_string(),
+        kind,
+        target: Oid((0..40).map(|_| digit).collect()),
+    };
+    let new_target = Oid("9".repeat(40));
+    let moves = vec![
+        ("origin/main".to_string(), new_target.clone()),
+        ("HEAD".to_string(), new_target.clone()),
+    ];
+
+    // Remote-tracking ref first — the discriminating order.
+    let remote_first = vec![
+        git_ref("origin/main", RefKind::RemoteBranch, '2'),
+        git_ref("HEAD", RefKind::Head, '3'),
+        git_ref("origin/main", RefKind::Branch, '3'),
+    ];
+    let got = previous_targets(&remote_first, &moves);
+    assert_eq!(
+        got,
+        vec![
+            ("origin/main".to_string(), Oid("3".repeat(40))),
+            ("HEAD".to_string(), Oid("3".repeat(40))),
+        ],
+        "`origin/main` moved as the checked-out local branch, so its \
+         previous position is the BRANCH's old target — the remote-tracking \
+         ref on 2222… is a different ref that a preview never moves"
+    );
+
+    // Branch first — the order this host's reader happens to produce. Same
+    // answer, which is the point: order must not be load-bearing.
+    let branch_first = vec![
+        git_ref("HEAD", RefKind::Head, '3'),
+        git_ref("origin/main", RefKind::Branch, '3'),
+        git_ref("origin/main", RefKind::RemoteBranch, '2'),
+    ];
+    assert_eq!(
+        previous_targets(&branch_first, &moves),
+        got,
+        "the same repository read in a different ref order must give the \
+         same previous targets"
     );
 }
 

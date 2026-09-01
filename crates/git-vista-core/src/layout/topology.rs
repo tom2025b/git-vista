@@ -114,8 +114,28 @@ fn walk(commits: Vec<CommitSummary>, want_ties: bool) -> (Vec<CommitSummary>, Ha
             }
         }
     }
-    // Git DAGs are acyclic, so every commit is emitted; keep the original list
-    // as a safety net if something upstream ever handed us a cycle.
+    // Git DAGs are acyclic, so a real walk always emits every commit. This
+    // guard is unreachable by any caller that exists in this codebase today:
+    // `layout_with_refs()`'s commits come from `walk_history` (real git),
+    // and #576's preview hands this walk one commit that isn't real git
+    // history — `added` — but `added` is read back from an actual
+    // `git commit-tree` write in a scratch clone (see `read_back` in
+    // `git-vista-server/src/preview.rs`), never hand-built, so its one parent
+    // is by construction a commit that already exists. A cycle can only be
+    // built by hand, which is exactly what
+    // `cyclic_input_falls_back_to_the_original_order_rather_than_hanging`
+    // (in `layout/tests/topology.rs`) does — it pins this fallback (preserve
+    // arrival order, never hang looking for a commit that will never become
+    // ready) as a deliberate, tested choice rather than a silent guess at a
+    // graph shape.
+    //
+    // Deliberately NOT wired to a `PreviewUnavailable::CheckFailed` the way
+    // `added_time_tied` is: that field fires routinely, on real same-second
+    // commits; this one cannot fire through any caller that exists, so there
+    // is nothing today for a refusal to protect against. If a future preview
+    // operation ever builds `added`'s parent chain from something other than
+    // a real, already-existing commit, revisit this and route it through
+    // `PreviewLayout`'s report fields instead of leaving it here.
     if order.len() != commits.len() {
         return (commits, id_ties);
     }

@@ -88,7 +88,7 @@ real repository:  show-ref                -> byte-identical before and after
 throwaway store it can read through and cannot write back to, and it refuses
 rather than models.**
 
-Six parts, each load-bearing.
+Seven parts, each load-bearing.
 
 ### 1. The computation lives in `git-vista-server`, not `git-vista-git`
 
@@ -350,6 +350,65 @@ level. Same fail-closed rule `activity::undoables` already applies.
 The revert row is byte-identical to the merge `activity::revert_would_conflict`
 already runs, which is what makes this preview and the app's own revert offer
 consistent by construction rather than by review.
+
+### 7. The object `commit-tree` wrote is observed in the store, not put on the wire
+
+Audit finding 8 exposed a gap between computing the right tree and committing
+that tree. The A5 content tests recomputed `merge-tree`'s answer and compared it
+with a real command. They did not inspect the object production actually wrote,
+so substituting the cherry-pick recipe's `no_op.tree` — HEAD's unchanged tree —
+at the `commit-tree` call left the server suite green.
+
+Option B as first stated, a test that calls `commit_tree` with its own correct
+tree, is rejected. It bypasses the production choice and proves only the
+argument the test supplied. The production tail is instead extracted into
+`synthesize`, whose inputs are the repository, the `Recipe`, and caller
+liveness — **not a tree**. Inside that function, and in this order:
+
+1. `merge_tree` supplies `MergeTreeAnswer::Clean { tree }` (or the function
+   returns the conflict);
+2. the `no_op` refusal compares that same local `tree` with the refusal tree;
+3. `commit_tree` receives that same local `tree`; and
+4. `read_back` reads the commit oid that call returned.
+
+That answers the boundary question explicitly: after the extraction, the tree
+argument gets its value from `merge_tree`'s `Clean { tree }` **inside
+`synthesize`**. `compute` chooses no tree and passes none. Pulling the conflict
+and no-op branches into the same function is intentional; leaving either tree
+interpretation above the boundary would relocate the seam rather than cover it.
+Layout remains in `compute` because it consumes the completed hypothetical
+commit, not the tree choice.
+
+The regression drives this production function while its `Recipe` keeps the
+scratch store alive. It then asks an independent git process, using
+`--git-dir=<scratch> rev-parse <oid>^{tree}`, what tree the written object
+contains, and compares that with `HEAD^{tree}` after the real cherry-pick on a
+filesystem copy. A non-triviality guard first requires the real cherry-pick's
+tree to differ from the original HEAD tree.
+
+This is the protocol decision for audit finding 12 too: **no tree oid is added
+to `PreviewOutcome` or any other wire type.** The tree is evidence used by a
+server-side regression test while the private store exists; a client neither
+needs nor consumes it. A wire field whose only reader is a test would make
+test instrumentation part of the product contract without strengthening the
+production seam.
+
+The extraction is a production refactor, which is a deliberate deviation from
+the original "test-only Option B" description. Its honest limit is narrower
+than "unrepresentable": the test pins the exact current tree-selection seam.
+A future duplicate implementation re-inlined into `compute` while the tested
+helper was left intact could bypass it. There is no deterministic end-to-end
+observer after `preview()` returns — `Recipe` has dropped the store and the
+wire carries no tree — so closing that caller-link gap would require one of the
+rejected wire or test-hook designs. The current claim is the one mutation runs
+establish, not the stronger one. A second, narrower residual (named by the
+fresh-reader adjudication, 2026-09-01): the committed object is observed for
+the **cherry-pick arm only** — merge and revert content tests still pin the
+recipe through `predicted_tree`, so an *op-conditional* wrong tree at the
+`commit_tree` call (wrong only when `no_op` is `None`) would survive the
+suite. One call site serves all three operations, so an accidental regression
+still reddens the cherry-pick test; only a deliberately conditional break
+slips through, which is the same class as the re-inlining above.
 
 ---
 
@@ -728,6 +787,15 @@ commit by position instead.
   commit had fixed. Corrected here rather than left standing. The lesson is an
   ordering one and it belongs in the record: **a document lane must run after the code
   lane it describes, never beside it.**
+- **2026-09-01, audit finding 8:** Option B was changed from a direct
+  `commit_tree` test into a production extraction after adjudication established
+  that the direct test never executes the defective choice. The tree argument
+  now originates at `MergeTreeAnswer::Clean { tree }` inside `synthesize`; the
+  no-op refusal, `commit_tree`, and `read_back` share that boundary, while
+  `compute` supplies no tree.
+- **2026-09-01, audit finding 12:** no tree oid was added to the protocol. The
+  private scratch object is observed directly while `Recipe` owns the store,
+  which supplies evidence without inventing a client contract.
 - **2026-09-01, finding 10.** The merge message stopped being modelled.
   Decided: ask `git fmt-merge-msg` — it owns `merge.suppressDest` (whose
   *default* list is git-version territory: 2.43 suppresses `master`/`main`,
@@ -759,6 +827,30 @@ commit by position instead.
 
 ## Verification
 
+**2026-09-01, audit finding 8, dedicated target directory.** The restored
+implementation ran
+
+```text
+CARGO_TARGET_DIR=/home/tom/.cargo-target/git-vista-576b \
+  cargo test -p git-vista-server --test forces_shim_build
+CARGO_TARGET_DIR=/home/tom/.cargo-target/git-vista-576b \
+  cargo test -p git-vista-server --bin git-vista-server
+```
+
+in one foreground invocation: **1 passed, 0 failed** for the shim build, then
+**1098 passed, 0 failed, 6 ignored** for the server binary. The targeted
+restored-baseline run of
+`the_synthesized_commit_contains_the_tree_the_real_cherry_pick_writes` passed.
+
+Each finding-8 mutation used that same invocation shape, with the shim test
+first and green before the targeted server test ran. Substituting
+`recipe.no_op.tree` made the committed tree equal HEAD's tree and failed the
+dedicated `assert_ne!`. Passing literal empty tree
+`4b825dc642cb6eb9a060e54bf8d69288fbee4904` passed that guard and failed the
+following equality against the real cherry-pick's tree. The two mutations
+therefore remove different properties and fail on different assertions.
+
+**Initial implementation record, 2026-08-30:**
 `buildlock cargo test -p git-vista-server --bin git-vista-server` →
 **1080 passed, 0 failed, 4 ignored**;
 `buildlock cargo clippy -p git-vista-server --all-targets -- -D warnings` → clean.
@@ -804,6 +896,7 @@ committed yet. Every pair below was executed and the stated verdict observed:
 | **A4** — `Unsupported` is the default | `_ => Some(Merge)` | `operation_name` → constant | caught; 1 draws a graph for a rebase, 2 keeps the arm and fails the literal name |
 | **A5** — the merge's *parent identity and order* match reality, on `merge_clean_two_branch` only | drop the second parent | transpose the parents | caught; 1 fails on row 0's commit, 2 on row 0's parent order — see the correction below the table for what this row does **not** cover |
 | **Object format** | drop `--object-format` | hardcode `sha256` | caught; 1 fails the SHA-256 test, 2 passes it and takes **seven SHA-1 tests** down instead |
+| **Committed tree wiring (audit finding 8)** | substitute `recipe.no_op.tree` at the `commit_tree` call | pass literal empty tree `4b825dc642cb6eb9a060e54bf8d69288fbee4904` | caught; 1 fails the assertion that the written tree is not HEAD's unchanged tree, 2 passes that guard and fails the comparison with the real cherry-pick's tree |
 | **The route runs nothing** | `preview_plan` calls `plan_and_execute` | the needle stops matching a real call | caught; different assertion lines in `contract_suite` |
 
 **Correction to the A5 row, from a later review round (2026-08-30): the

@@ -1333,6 +1333,98 @@ mod tests {
         );
     }
 
+    /// **A remote-tracking ref that shares a branch's display name must not
+    /// be moved either.**
+    ///
+    /// The sibling of the tag case above, for the OTHER kind
+    /// [`GitRef::is_ref_moves_target`] must exclude. `read_refs` shortens
+    /// remote branches into the same flat display namespace as local
+    /// branches and tags, and a legal (if unusual) repository can hold a
+    /// local branch literally named `refs/heads/origin/main`, checked out,
+    /// alongside the remote-tracking `refs/remotes/origin/main` — both
+    /// arrive here as `name: "origin/main"`, told apart only by `kind`.
+    ///
+    /// Unlike the tag case, this loop does not need a discriminating ref
+    /// order to expose a weakened predicate: the rewrite loop has no
+    /// `break` and mutates every matching ref, so admitting
+    /// `RefKind::RemoteBranch` here rewrites BOTH same-named refs
+    /// regardless of which one the fixture lists first.
+    ///
+    /// # Two mutations that make this red, failing differently
+    ///
+    /// * **REMOVES the mechanism.** Delete `&& r.is_ref_moves_target()`
+    ///   from this loop's condition, so it matches on name alone. The
+    ///   remote-tracking ref moves onto `9` same as the branch, so row 0
+    ///   gains a third badge and row 2 loses its badge: red on both
+    ///   halves.
+    /// * **WEAKENS the mechanism.** Add `RefKind::RemoteBranch` to the
+    ///   `matches!` arm (keeping `Head` and `Branch`) — the exact
+    ///   regression this test exists to catch. Same observable break: row 0
+    ///   reads three badges instead of two, row 2 reads zero instead of one.
+    #[test]
+    fn the_ref_rewrite_leaves_a_remote_tracking_ref_that_shares_a_branchs_display_name_alone() {
+        let before = vec![
+            commit('3', 300, &['2']),
+            commit('2', 200, &['1']),
+            commit('1', 100, &[]),
+        ];
+        // The legal collision: a local branch literally named `origin/main`
+        // on the tip, a remote-tracking ref also called `origin/main` two
+        // commits back. One display namespace, two different refs.
+        let refs = vec![
+            git_ref("HEAD", RefKind::Head, '3'),
+            git_ref("origin/main", RefKind::Branch, '3'),
+            git_ref("origin/main", RefKind::RemoteBranch, '2'),
+        ];
+
+        let out = lay_out_preview(PreviewInput {
+            history_limit: usize::MAX,
+            before,
+            refs,
+            head_branch: Some("origin/main".into()),
+            added: Some(commit('9', 400, &['3'])),
+            ref_moves: vec![("HEAD".into(), oid('9')), ("origin/main".into(), oid('9'))],
+        });
+
+        assert_eq!(out.after.rows[0].commit.id, oid('9'));
+        assert_eq!(
+            badge_names(&out.after.rows, 0),
+            vec!["HEAD", "origin/main"],
+            "HEAD and the local BRANCH origin/main moved onto the \
+             hypothetical commit — the remote-tracking ref did not, so \
+             exactly two badges belong here"
+        );
+        assert_eq!(
+            out.after.rows[0]
+                .refs
+                .iter()
+                .map(|r| r.kind.clone())
+                .collect::<Vec<_>>(),
+            vec![RefKind::Head, RefKind::Branch],
+            "and neither of them is the remote-tracking ref"
+        );
+
+        assert_eq!(out.after.rows[2].commit.id, oid('2'));
+        assert_eq!(
+            badge_names(&out.after.rows, 2),
+            vec!["origin/main"],
+            "a preview never moves a remote-tracking ref, so it must still \
+             be drawn on commit 2"
+        );
+        assert_eq!(
+            out.after.rows[2].refs[0].kind,
+            RefKind::RemoteBranch,
+            "and the badge left on commit 2 is the remote-tracking ref, not \
+             the branch"
+        );
+
+        assert_eq!(
+            out.unmatched_ref_moves,
+            Vec::<String>::new(),
+            "both entries matched a ref of a movable kind"
+        );
+    }
+
     /// A trunk with an **independent competitor tip** stamped at the same
     /// second the hypothetical commit will carry: `4` (tip of `side`, t=400)
     /// and `3` (tip of `main`, t=300) -> `2`. `4` has no in-window child, so it
