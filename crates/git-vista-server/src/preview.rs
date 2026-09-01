@@ -1589,6 +1589,7 @@ impl ScratchStore {
             // experiment — if it prints EBUSY, the diagnosis is confirmed by an
             // errno rather than by argument.
             drop(lease);
+            #[cfg_attr(not(test), allow(unused_variables))]
             let removed = std::fs::remove_dir_all(&path);
             #[cfg(test)]
             if let Err(error) = &removed {
