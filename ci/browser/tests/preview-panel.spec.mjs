@@ -68,16 +68,24 @@ test.describe('the graph preview inside a confirmation', () => {
     await expect(after.getByText('new', { exact: true })).toBeVisible()
     await expect(before.getByText('new', { exact: true })).toHaveCount(0)
 
-    // The ref that lands. The arrow is what separates "main is here" from
+    // The refs that land. The arrow is what separates "main is here" from
     // "main would move here"; a badge without it is the unmarked form.
+    //
+    // BOTH of them, and that is not padding. A merge moves the branch AND
+    // HEAD, and `preview::ref_moves` has to be fed both or the after layout
+    // reserves lane 0 for the wrong commit and colours the new commit off its
+    // own hash — the two failures `git_vista_core::preview`'s module doc
+    // spends its longest section on. A picture showing only `→main` would be
+    // the visible symptom of exactly that.
     await expect(after.getByText(`→${PREVIEW_INTO}`)).toBeVisible()
+    await expect(after.getByText('→HEAD')).toBeVisible()
 
     // The sentence beside the picture, for a reader who will not read a graph
-    // and for a screen reader, which cannot. A merge adds one commit and moves
-    // the branch, so both clauses must be there.
-    const summary = page.getByText(/one new commit/)
-    await expect(summary).toBeVisible()
-    await expect(page.getByText(new RegExp(`${PREVIEW_INTO} moves`))).toBeVisible()
+    // and for a screen reader, which cannot. Asserted as the whole sentence,
+    // not as a fragment: "one new commit" alone would still pass if the ref
+    // moves had been dropped from the change list entirely, which is the half
+    // of this summary a caller cannot re-derive for itself.
+    await expect(page.getByText('one new commit and 2 refs move.')).toBeVisible()
 
     // The legend, so the marks can be decoded rather than guessed at.
     await expect(page.getByText('a commit this operation would create')).toBeVisible()

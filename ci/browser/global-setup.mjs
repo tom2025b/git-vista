@@ -96,6 +96,7 @@ export default async function globalSetup() {
   // applied cleanly. Separate because it is the only repo here whose stash list
   // has an asserted count, and because applying that entry leaves collision.txt
   // conflicted — a state no other spec's repo may inherit.
+  const stashFixture = buildStashFixture(join(work, 'stash-repo'))
   // #594: an eighth repo, two branches diverged from one base. Separate
   // because every other fixture here is either already up to date with its
   // other branch (so a merge preview would have nothing to draw) or
