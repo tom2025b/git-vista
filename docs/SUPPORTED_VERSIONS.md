@@ -85,6 +85,34 @@ A binary that is not the documented floor is refused before it is compared
 against anything, so pointing `GV_GIT_FLOOR` at a second copy of your ordinary
 git fails rather than comparing a version with itself.
 
+### Feature floors above the product floor
+
+The heading above is the **product** floor: everything git-vista does works at
+2.32, and #365 builds and exercises a real 2.32 binary to prove it. One feature
+needs more than that, and it degrades rather than raising the floor for
+everyone.
+
+| Feature | Needs | Why | Below it |
+|---|---|---|---|
+| Graph preview (M10.08, #576) | **git 2.38** | `git merge-tree --write-tree` — the plumbing that computes the real three-way merge without a worktree or an index — arrived in 2.38.0 | The server starts, everything else works, and the preview alone answers `Unavailable { GitTooOld { found, minimum } }` |
+
+**Why this is a table and not a second floor.** A host on 2.32–2.37 is a fully
+supported host. Raising the product floor to 2.38 for one feature would refuse
+service to a machine on which every other feature is correct, and the boot gate
+that would have to enforce it (`sandbox::probe`) is deliberately the one gate in
+this codebase with no degraded outcome at all — "a verdict other than
+`Contained` means no server, full stop" (ADR 0029). A capability question does
+not belong in a gate whose whole argument is that it has none.
+
+The check therefore lives in the feature: a lazily-initialised, once-per-process
+probe in `crates/git-vista-server/src/preview.rs`, whose floor constant
+`MIN_GIT_FOR_PREVIEW` is deliberately separate from the number in the heading
+above. Reasoning in full: **ADR 0099**.
+
+Do not fold this number into the `## Git:` heading. That heading is parsed by
+the `core` job's floor check (#67) and names the tag #365's floor test builds;
+changing it moves both.
+
 ## Safari: 16.4 or later (iOS/iPadOS 16.4, and the matching macOS Safari 16.4)
 
 **Why 16.4:** the frontend's app shell and full-screen overlays size

@@ -456,6 +456,94 @@ cmd_report() {
   printf '  %-22s %6d\n' "total" "$grand"
   echo
 
+  # What actually compiles, split product vs test. The by-crate figures above
+  # are raw `wc -l` — they include blanks and the ~58k lines of doc comments
+  # this repo writes on purpose, so they answer "how much file is there", not
+  # "how much code ships". This block answers the second question, and it
+  # RECOMPUTES rather than quoting a number somebody measured once: a
+  # denominator that is remembered instead of derived goes stale silently,
+  # which is the same failure as a stale ADR.
+  #
+  # Method, stated so the number can be argued with: a line counts when it is
+  # neither blank nor a `//` comment. Test code is everything in a test-only
+  # file (tests/, *_suite.rs, *_golden.rs, the fixtures crate — a
+  # dev-dependency, absent from any release build) plus every `#[cfg(test)]`
+  # span in an ordinary source file, found by brace-matching while skipping
+  # string and char literals and comments. `#[cfg(not(test))]` is production
+  # and stays that way. There is no generated Rust in this tree and no
+  # build.rs, so there is no third bucket.
+  echo "── what compiles, and what ships ────────────────────"
+  python3 - <<'PYSPLIT'
+import subprocess
+
+def cfg_test_lines(src):
+    out, i = set(), 0
+    while True:
+        i = src.find('#[cfg(test)]', i)
+        if i < 0:
+            return out
+        k, depth, opened = i + 12, 0, False
+        in_s = in_c = in_lc = in_bc = esc = False
+        while k < len(src):
+            ch, nxt = src[k], src[k + 1] if k + 1 < len(src) else ''
+            if in_lc:
+                if ch == '\n': in_lc = False
+            elif in_bc:
+                if ch == '*' and nxt == '/': in_bc = False; k += 1
+            elif in_s:
+                if esc: esc = False
+                elif ch == '\\': esc = True
+                elif ch == '"': in_s = False
+            elif in_c:
+                if esc: esc = False
+                elif ch == '\\': esc = True
+                elif ch == "'": in_c = False
+            elif ch == '/' and nxt == '/': in_lc = True; k += 1
+            elif ch == '/' and nxt == '*': in_bc = True; k += 1
+            elif ch == '"': in_s = True
+            elif ch == "'" and src[k-1:k] not in ('&', '<'): in_c = True
+            elif ch == '{': depth += 1; opened = True
+            elif ch == '}':
+                depth -= 1
+                if opened and depth == 0: k += 1; break
+            elif ch == ';' and not opened: k += 1; break
+            k += 1
+        for n in range(src.count('\n', 0, i), src.count('\n', 0, k) + 1):
+            out.add(n)
+        i = k
+
+files = subprocess.run(['git', 'ls-files', '*.rs'],
+                       capture_output=True, text=True).stdout.split()
+prod = test = pf = tf = 0
+for f in files:
+    testfile = (f.endswith(('_suite.rs', '_golden.rs')) or '/tests/' in f
+                or f.startswith('crates/git-vista-fixtures/'))
+    try:
+        src = open(f, encoding='utf-8', errors='replace').read()
+    except OSError:
+        continue
+    lines = src.splitlines()
+    if testfile:
+        tf += 1
+        test += sum(1 for l in lines
+                    if l.strip() and not l.strip().startswith('//'))
+        continue
+    pf += 1
+    excl = cfg_test_lines(src)
+    for n, l in enumerate(lines):
+        s = l.strip()
+        if not s or s.startswith('//'):
+            continue
+        if n in excl: test += 1
+        else: prod += 1
+tot = prod + test or 1
+print(f'  {"product code (src, cfg(test) excluded)":<40} {prod:6d}  {100*prod/tot:4.1f}%  [{pf} files]')
+print(f'  {"test code (suites, tests/, fixtures)":<40} {test:6d}  {100*test/tot:4.1f}%  [{tf} files]')
+print(f'  {"total compiled Rust":<40} {tot:6d}')
+print('  blanks and // comments excluded from all three.')
+PYSPLIT
+  echo
+
   echo "── main, by ISO week, from day 1 ────────────────────"
   # Single `git log --numstat` pass, not one invocation per week: a commit
   # line ('@@'-prefixed) sets the current week, and every numstat line that

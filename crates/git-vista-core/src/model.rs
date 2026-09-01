@@ -100,6 +100,23 @@ impl GitRef {
     pub fn is_branch(&self) -> bool {
         matches!(self.kind, RefKind::Branch | RefKind::RemoteBranch)
     }
+
+    /// Whether this ref is of a kind a preview's `ref_moves` list can name.
+    ///
+    /// `read_refs` shortens local branches, remote branches and tags into ONE
+    /// display namespace, so `refs/heads/main` and `refs/tags/main` both arrive
+    /// as `name: "main"` and only `kind` tells them apart. A preview moves the
+    /// checked-out local branch and `HEAD` — never a tag, never a
+    /// remote-tracking ref — so a rewrite or lookup keyed on the display name
+    /// alone must consult this before it acts, or a same-named tag is moved
+    /// onto a commit real git would never move it to.
+    ///
+    /// Deliberately **not** [`is_branch`](Self::is_branch), which admits
+    /// `RefKind::RemoteBranch` (never a `ref_moves` target) and excludes
+    /// `RefKind::Head` (always one when HEAD resolves).
+    pub fn is_ref_moves_target(&self) -> bool {
+        matches!(self.kind, RefKind::Head | RefKind::Branch)
+    }
 }
 
 /// A commit placed in the vertical graph. `row` is the vertical position

@@ -89,6 +89,8 @@ use color::assign_branch_colors;
 use stream::{canonicalize_edges, strip_resolved_edges, StreamLayout};
 use topology::stable_topo_order;
 
+pub(crate) use topology::topo_order_with_id_ties;
+
 /// The lane-0 reservation rule, re-exported for paged history (M1.10, #63).
 ///
 /// A page builder outside this crate has to reserve lane 0 for the trunk's own

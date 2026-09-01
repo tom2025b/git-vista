@@ -245,6 +245,17 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     // the route that merely mints the approval token does. Loopback router
     // only (ADR 0005).
     ("/api/execute-plan", Method::POST, Authz::SessionAndCsrf),
+    // M10.08 (#576, ADR 0099): the graph a Plan would produce. Classified
+    // `SessionAndCsrf` — the full write posture — even though it is the one
+    // route in this block that mutates nothing at all and never will: it is a
+    // POST, and `security.rs`'s gate keys on the method, so CSRF applies
+    // whatever the handler does. It also sits on the loopback router only,
+    // beside the two plan routes it completes, because a LAN visualize session
+    // must never see the plan-review surface (ADR 0005). Note what it does
+    // *not* do, deliberately: it never answers 403 for a read-only
+    // repository — that case is a named `Unavailable { RepositoryReadOnly }`
+    // in the body. See `handlers::preview`'s module doc for why.
+    ("/api/preview", Method::POST, Authz::SessionAndCsrf),
     // M2.20f (#232): the id admitted for an idempotency key, readable while
     // the operation it names may still be running. A GET (no CSRF surface)
     // and same posture as `GET /api/operations/{id}` below — it describes an
@@ -292,7 +303,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// dropped by a `main.rs` refactor that this scanner's pattern-matching
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
-const EXPECTED_ROUTE_COUNT: usize = 67;
+const EXPECTED_ROUTE_COUNT: usize = 68;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in

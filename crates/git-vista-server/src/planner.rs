@@ -1090,8 +1090,12 @@ async fn proof_holds(repo: &Path, proof: &DropProof) -> Result<(), (StatusCode, 
 }
 
 /// The live repository generation as the plan's opaque token (ADR 0001).
-/// Computed from HEAD, every ref, and the worktree/index status (#145) — any
-/// of them moving means the repository the plan described no longer exists.
+/// Computed from HEAD, every ref, `refs/stash`, the worktree/index status
+/// (#145) and `merge.ff` (#576 finding 9) — any of them moving means the
+/// repository the plan described no longer exists. `merge.ff` is the one input
+/// that is not repository *state*: it is here because it decides what a
+/// `MergeBranch` plan's own executor writes, and nothing else in this digest
+/// can see it change.
 /// The token is opaque and compared only for equality, so deepening its
 /// inputs further later is not a wire change.
 /// Async since #60: the ref read below is synchronous filesystem work and now
@@ -1127,6 +1131,23 @@ async fn generation_token(repo: &Path, observed: &Observed) -> GenerationToken {
     // the list. Caught by a test written for #77's "generation updates are
     // correct" criterion, not by inspection.
     inputs.field("stash", stash_digest_input(repo).await);
+    // `merge.ff`, explicitly (#576 finding 9).
+    //
+    // Every other input here is something a ref, the stash or the worktree can
+    // show. `merge.ff` is none of those, and it decides whether this plan's own
+    // `git merge --no-edit` fast-forwards a ref or writes a two-parent commit —
+    // the difference between the graph the user approved and a commit that
+    // appears nowhere in it. `preview::fast_forward_policy` reads it live when
+    // the picture is drawn and the executor obeys it live when the operation
+    // runs; without this field nothing at all guards the window between them.
+    //
+    // Unconditional rather than scoped to merge plans: this function is also
+    // called for the post-execution reconnect token and for the stash-pop
+    // freshness re-check, neither of which has a `GitOperation` in scope, and
+    // the token is only ever compared for equality across those call sites. A
+    // token that meant different things depending on which caller built it
+    // would not be comparable at all.
+    inputs.field("merge_ff", merge_ff_digest_input(repo).await);
     inputs.field("status", observed.status.digest_field());
     GenerationToken::new(inputs.generation().to_string())
         .expect("a RepositoryGeneration displays as non-empty decimal")
@@ -1162,14 +1183,77 @@ async fn read_head_branch_blocking(repo: &Path) -> Option<String> {
 ///
 /// The three outcomes stay apart, same discipline as `Obs` everywhere else:
 /// a resolved oid, "there is no stash", and "the read failed". The last is
-/// deliberately UNIQUE per call, so a repository whose stash cannot be read
-/// invalidates every plan rather than silently digesting as "no stash" — the
-/// failure mode being a stale plan surviving a change nobody could see.
+/// deliberately tagged with the wall-clock **second**, so a repository whose
+/// stash cannot be read invalidates every plan rather than silently digesting
+/// as "no stash" — the failure mode being a stale plan surviving a change
+/// nobody could see. A second, not a call: [`crate::activity::now_secs`] is
+/// whole seconds, so two reads inside one second while the stash stays
+/// unreadable do digest identically. See [`merge_ff_digest_input`], which
+/// carries the same construction and spells out why that is benign here.
 async fn stash_digest_input(repo: &Path) -> String {
     match rev_parse_ref_unpeeled(repo, "refs/stash").await {
         Ok(Some(oid)) => format!("at\u{0}{oid}"),
         Ok(None) => "absent".to_string(),
         Err(_) => format!("unreadable\u{0}{}", crate::activity::now_secs()),
+    }
+}
+
+/// `merge.ff`'s configured value, or a tagged absence, for the generation
+/// digest.
+///
+/// # Why the raw string and not the resolved policy
+///
+/// `preview::fast_forward_policy` turns this key into a three-way decision and
+/// refuses on values it cannot read. Calling it from here would couple the
+/// planner to a preview decision type and to its `PreviewUnavailable` error
+/// shape, for no gain: the question this digest asks is only "is it the same
+/// value it was when the plan was built", and the raw string answers that
+/// strictly more conservatively than the resolved policy does (`true` and an
+/// unset key resolve alike but are different strings, so a change between them
+/// invalidates rather than silently passing).
+///
+/// The exit-code classification is `fast_forward_policy`'s own, deliberately:
+/// **1** is "git looked and the key is not set", **0** is "git looked and here
+/// is the value", and anything else — an unreadable config file, a git that
+/// could not be spawned — is neither. The last is tagged with the wall-clock
+/// **second**, the same discipline [`stash_digest_input`] uses: a repository
+/// whose config cannot be read invalidates every plan rather than digesting as
+/// "unset", because the failure mode being guarded is a stale plan surviving a
+/// change nobody could see.
+///
+/// A second is not "per call", and the difference is worth stating rather than
+/// rounding off: [`crate::activity::now_secs`] is whole seconds, so a plan
+/// built and re-checked inside one second while the config stays unreadable
+/// digests identically both times and the plan is admitted. The direction is
+/// benign — the state genuinely did not change, and `fast_forward_policy`
+/// refuses to draw the preview at all while the config is unreadable — but a
+/// reader who took "unique per call" literally for some other input would be
+/// wrong, so it does not say that.
+///
+/// One consequence, stated rather than left to be discovered: a config git
+/// cannot read makes every plan refuse with `enforce_fresh`'s "the repository
+/// changed" sentence, which is not quite what happened. That is the same
+/// wording `stash_digest_input` already produces for the same reason, and it
+/// fails closed; a message bound to the cause would need a channel this
+/// function does not have.
+async fn merge_ff_digest_input(repo: &Path) -> String {
+    // Local (D3): reading config touches no socket.
+    let out = match run_git(repo, NetworkNeed::Local, &["config", "--get", "merge.ff"]).await {
+        Ok(out) => out,
+        Err(_) => return format!("unreadable\u{0}{}", crate::activity::now_secs()),
+    };
+    match out.status.code() {
+        Some(1) => "absent".to_string(),
+        Some(0) => {
+            // `--get` prints the value and one newline; the value may legally
+            // contain trailing whitespace of its own, so exactly one trailing
+            // newline is removed rather than the whole thing trimmed — the same
+            // reading `fast_forward_policy` performs.
+            let printed = String::from_utf8_lossy(&out.stdout).into_owned();
+            let raw = printed.strip_suffix('\n').unwrap_or(&printed);
+            format!("known\u{0}{raw}")
+        }
+        _ => format!("unreadable\u{0}{}", crate::activity::now_secs()),
     }
 }
 

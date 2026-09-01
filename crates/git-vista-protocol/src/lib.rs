@@ -15,6 +15,14 @@
 //! - [`plan`]    — the closed, typed [`GitOperation`] vocabulary (every mutation
 //!   the server can perform) and the reviewable [`Plan`] previewing one before
 //!   execution (M1.06a, #142; enforcement lands with #145).
+//! - [`preview`] — the graph-preview envelope (M10.08, #576):
+//!   [`PreviewOutcome`](preview::PreviewOutcome), the four-arm answer to "what
+//!   would the graph look like if I ran this?" — a `before`/`after`
+//!   [`PreviewGraph`](preview::PreviewGraph) pair, a live `Conflict` git itself
+//!   established, a permanently `Unsupported` operation, or an
+//!   [`Unavailable`](preview::PreviewUnavailable) reason naming why *this* host
+//!   or repository could not compute it. Generic over the row/edge/stub/change
+//!   types for the same reason [`history`] is.
 //! - [`operation`] — operation identity and lifecycle (M1.08, #61): the client's
 //!   [`IdempotencyKey`], the server's [`OperationId`], the [`OperationState`]
 //!   machine, the replayable [`OperationStatus`] record, and [`ProgressEvent`].
@@ -76,6 +84,7 @@ pub mod operation;
 pub mod patch_build;
 pub mod patch_plan;
 pub mod plan;
+pub mod preview;
 pub mod status;
 pub mod version;
 pub mod worktree;

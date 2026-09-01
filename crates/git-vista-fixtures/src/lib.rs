@@ -62,11 +62,13 @@
 
 pub mod browser;
 pub mod git;
+pub mod reexec;
 pub mod status;
 
 mod broken;
 mod conflict;
 mod content;
+mod divergent;
 mod seeded;
 
 pub use broken::{broken_head, unrunnable};
@@ -77,5 +79,10 @@ pub use conflict::{
 pub use content::{
     binary_blob, four_mode, on_disk_len, path_battery, pathological_content, write_rows,
     BIG_TEXT_APPEND, BIG_TEXT_BYTES, BINARY_SENTINEL,
+};
+pub use divergent::{
+    cherry_pick_already_applied, cherry_pick_clean, cherry_pick_conflict, divergent_merge_ff_only,
+    fast_forward_merge_ff_false, fast_forward_merge_ff_unset, merge_clean_two_branch,
+    merge_conflict,
 };
 pub use seeded::{empty, seeded, seeded_dated, seeded_files, Fixture, PINNED_DATE};
