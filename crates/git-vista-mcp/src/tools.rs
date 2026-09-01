@@ -755,10 +755,12 @@ mod tests {
             *last, "execute_plan",
             "the catalog's last tool must be execute_plan — #249's one write tool"
         );
-        let (export, plan_names) = before_execute
-            .split_last()
-            .expect("the plan builders and checklist exporter precede execution");
-        assert_eq!(*export, "export_plan_checklist");
+        assert!(before_execute.len() >= 2);
+        let (plan_names, exports) = before_execute.split_at(before_execute.len() - 2);
+        assert_eq!(
+            exports,
+            ["export_plan_checklist", "export_plan_fish_script"]
+        );
         assert!(
             plan_names.iter().all(|n| n.starts_with("plan_")),
             "a non-read, non-plan, non-execute_plan tool appeared in the catalog: {names:?}"

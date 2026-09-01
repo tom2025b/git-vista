@@ -5,7 +5,7 @@
 //! pins instead of maintaining a second catalogue of hand-built operations.
 
 use git_vista_protocol::plan_export::{
-    checklist, export_operation, render, Export, Rendered, Step,
+    checklist, export_operation, fish_script, render, Export, Rendered, ScriptUnavailable, Step,
 };
 use git_vista_protocol::Plan;
 
@@ -141,5 +141,82 @@ fn every_golden_operation_has_an_explicit_export_answer() {
     for plan in plans {
         let _ = export_operation(&plan.operation);
         assert!(!checklist(&plan).is_empty());
+    }
+}
+
+/// INVARIANT: a generated script names fish in its shebang and fails fast
+/// after every exact shared-argv command.
+///
+/// MUTATION 1 (remove): omit `or exit $status` — the fail-fast assertion is
+/// red while the command baseline stays green.
+/// MUTATION 2 (weaken): emit the guard only after the final step — the
+/// command/guard cardinality check is red for multi-step plans.
+#[test]
+fn fish_script_is_explicit_and_stops_after_each_failed_step() {
+    let plan = plan("pull_branch");
+    let Export::Commands(steps) = export_operation(&plan.operation) else {
+        panic!("pull has literal fetch and integration commands")
+    };
+    assert!(steps.len() > 1, "the multi-step baseline must be real");
+
+    let script = fish_script(&plan).expect("pull is scriptable");
+    assert!(script.starts_with("#!/usr/bin/env fish\n"), "{script}");
+    assert!(script.contains("# Shell: fish"), "{script}");
+    assert_eq!(script.matches("\nor exit $status\n").count(), steps.len());
+    for (index, step) in steps.iter().enumerate() {
+        let rendered = match render(step) {
+            Rendered::Portable(line) => line,
+            Rendered::ShellSpecific { fish, .. } => fish,
+        };
+        assert!(
+            script.contains(&format!(
+                "# Step {}: {}\n{}\n",
+                index + 1,
+                step.why,
+                rendered
+            )),
+            "{script}"
+        );
+    }
+}
+
+/// INVARIANT: the fish script selects the fish spelling when quoting differs;
+/// no POSIX escape is smuggled under a fish shebang.
+///
+/// MUTATION 1 (remove): choose `posix` from `Rendered::ShellSpecific` — the
+/// exact fish line is absent.
+/// MUTATION 2 (weaken): drop the shebang while retaining fish quoting — the
+/// script no longer declares its dialect and this test is red.
+#[test]
+fn fish_script_uses_fish_quoting_and_says_that_it_does() {
+    let mut plan = plan("commit_on_head");
+    let git_vista_protocol::GitOperation::CommitOnHead { message, .. } = &mut plan.operation else {
+        unreachable!()
+    };
+    *message = git_vista_protocol::CommitMessage::new("Tom's plan").unwrap();
+
+    let script = fish_script(&plan).expect("a commit is scriptable");
+    assert!(script.starts_with("#!/usr/bin/env fish\n"), "{script}");
+    assert!(
+        script.contains("git commit -m 'Tom\\'s plan'\n"),
+        "{script}"
+    );
+    assert!(!script.contains("'Tom'\\''s plan'"), "{script}");
+}
+
+/// INVARIANT: runtime-selected, prior-output-dependent and non-argv plans do
+/// not acquire guessed scripts just because slice 2 exists.
+///
+/// MUTATION 1 (remove): turn the runtime-choice refusal into an empty script —
+/// the ResetBranch leg is red.
+/// MUTATION 2 (weaken): permit only `Export::Chained` as an empty script — the
+/// EmptyCommitOnBranch leg is red while the other refusals stay green.
+#[test]
+fn fish_script_refuses_operations_without_an_exact_literal_step_list() {
+    for op in ["reset_branch", "empty_commit_on_branch", "stage_selection"] {
+        assert!(
+            matches!(fish_script(&plan(op)), Err(ScriptUnavailable { .. })),
+            "{op} must explain that no exact literal script is available"
+        );
     }
 }

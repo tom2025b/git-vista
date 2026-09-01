@@ -1293,7 +1293,7 @@ pub fn checklist(plan: &Plan) -> String {
         for precondition in &plan.preconditions {
             out.push_str(&format!("  [ ] {}\n", describe_precondition(precondition)));
         }
-        out.push('\n');
+        out.push_str("or exit $status\n\n");
     }
 
     match export_operation(&plan.operation) {
@@ -1336,6 +1336,73 @@ pub fn checklist(plan: &Plan) -> String {
     out.push_str("\nRECOVERY\n\n");
     out.push_str(&wrapped(&describe_recovery(&plan.recovery)));
     out
+}
+
+// ---------------------------------------------------------------------------
+// The fish script (#590 slice 2)
+// ---------------------------------------------------------------------------
+
+/// Why a plan cannot be emitted as a literal fish script.
+///
+/// A refusal is data rather than an empty/partial script: a caller must show
+/// the reason, and can never accidentally save a file that looks runnable but
+/// silently omitted the operation's hard half.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptUnavailable {
+    pub why: String,
+}
+
+/// Render a plan as an explicitly fish-targeted, fail-fast script.
+///
+/// Every `git` line comes from [`render`] over the same [`Step::argv`] the
+/// executor's shared builder produced. The script adds only control surface:
+/// a fish shebang, one explanatory comment per step, and fish's fail-fast
+/// idiom (`or exit $status`) immediately after every command. It never parses
+/// or reconstructs a command string.
+///
+/// Plans without a literal [`Export::Commands`] list are refused. In
+/// particular, this function does not guess a runtime-selected argv, invent
+/// command substitution for a prior-output chain, or flatten stdin/file bytes
+/// into shell syntax.
+pub fn fish_script(plan: &Plan) -> Result<String, ScriptUnavailable> {
+    let steps = match export_operation(&plan.operation) {
+        Export::Commands(steps) => steps,
+        Export::ChosenAtRunTime { decided_by, .. } => {
+            return Err(ScriptUnavailable {
+                why: format!(
+                    "the executor chooses this operation's argv at run time from {decided_by}"
+                ),
+            })
+        }
+        Export::Chained { why } | Export::NotACommandLine { why } => {
+            return Err(ScriptUnavailable { why })
+        }
+    };
+
+    let mut out = String::new();
+    out.push_str("#!/usr/bin/env fish\n");
+    out.push_str("# git-vista plan export\n");
+    out.push_str("# Shell: fish (this file is not POSIX sh or bash)\n");
+    out.push_str("# Fail-fast: each command exits immediately with its own non-zero status.\n");
+    out.push_str(&format!("# Generation: {}\n", plan.generation.as_str()));
+    out.push_str(&format!(
+        "# App expiry: {} (unix seconds)\n",
+        plan.expires_at.0
+    ));
+    out.push_str("# Re-generate if the repository has moved since this plan was built.\n\n");
+
+    for (index, step) in steps.iter().enumerate() {
+        let why = step.why.split_whitespace().collect::<Vec<_>>().join(" ");
+        let command = match render(step) {
+            Rendered::Portable(line) => line,
+            Rendered::ShellSpecific { fish, .. } => fish,
+        };
+        out.push_str(&format!("# Step {}: {why}\n", index + 1));
+        out.push_str(&command);
+        out.push('\n');
+        out.push_str("or exit $status\n\n");
+    }
+    Ok(out)
 }
 
 /// One numbered entry: the command, then the reason, then a checkbox.

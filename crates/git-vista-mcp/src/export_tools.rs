@@ -11,32 +11,54 @@ use git_vista_protocol::{plan_export, Plan};
 use crate::tools::ToolError;
 
 pub(crate) fn export_tool_catalog() -> Vec<serde_json::Value> {
-    vec![serde_json::json!({
-        "name": "export_plan_checklist",
-        "description": "Render the exact Plan returned by a plan_* tool as a numbered, \
-                        printable checklist. Each literal git command is followed by one \
-                        line explaining why it is present; generation, expiry, \
-                        preconditions, and recovery stay visible. This is local and \
-                        read-only: it executes nothing and makes no network request.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "plan": {
-                    "type": "object",
-                    "description": "The exact `plan` object returned by a plan_* tool."
-                }
-            },
-            "required": ["plan"],
-            "additionalProperties": false
-        }
-    })]
+    vec![
+        serde_json::json!({
+            "name": "export_plan_checklist",
+            "description": "Render the exact Plan returned by a plan_* tool as a numbered, \
+                            printable checklist. Each literal git command is followed by one \
+                            line explaining why it is present; generation, expiry, \
+                            preconditions, and recovery stay visible. This is local and \
+                            read-only: it executes nothing and makes no network request.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "plan": {
+                        "type": "object",
+                        "description": "The exact `plan` object returned by a plan_* tool."
+                    }
+                },
+                "required": ["plan"],
+                "additionalProperties": false
+            }
+        }),
+        serde_json::json!({
+            "name": "export_plan_fish_script",
+            "description": "Render the exact literal argv steps in a plan_* result as an \
+                            explicitly fish-targeted script. Every step has one explanatory \
+                            comment and exits immediately on a non-zero status. Plans whose \
+                            argv is selected at run time, depends on prior command output, or \
+                            requires stdin/file bytes are refused instead of guessed. This is \
+                            local and read-only: it executes nothing.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "plan": {
+                        "type": "object",
+                        "description": "The exact `plan` object returned by a plan_* tool."
+                    }
+                },
+                "required": ["plan"],
+                "additionalProperties": false
+            }
+        }),
+    ]
 }
 
 pub(crate) fn call_export_tool(
     name: &str,
     args: &serde_json::Value,
 ) -> Option<Result<serde_json::Value, ToolError>> {
-    if name != "export_plan_checklist" {
+    if !matches!(name, "export_plan_checklist" | "export_plan_fish_script") {
         return None;
     }
     let Some(value) = args.get("plan") else {
@@ -52,7 +74,18 @@ pub(crate) fn call_export_tool(
             ))))
         }
     };
-    Some(Ok(serde_json::Value::String(plan_export::checklist(&plan))))
+    Some(match name {
+        "export_plan_checklist" => Ok(serde_json::Value::String(plan_export::checklist(&plan))),
+        "export_plan_fish_script" => plan_export::fish_script(&plan)
+            .map(serde_json::Value::String)
+            .map_err(|unavailable| {
+                ToolError::Execution(format!(
+                    "this plan cannot be exported as a literal fish script: {}",
+                    unavailable.why
+                ))
+            }),
+        _ => unreachable!("the name gate above is exhaustive"),
+    })
 }
 
 #[cfg(test)]
@@ -95,6 +128,24 @@ mod tests {
         assert_eq!(
             rendered,
             serde_json::Value::String(plan_export::checklist(&a_plan()))
+        );
+    }
+
+    /// INVARIANT: MCP returns the protocol crate's fish script verbatim.
+    ///
+    /// MUTATION 1 (remove): return an empty string — exact equality is red.
+    /// MUTATION 2 (weaken): return the checklist under the script tool's name
+    /// — equality is red even though both renderers contain the same argv.
+    #[test]
+    fn fish_script_tool_returns_the_shared_renderer_verbatim() {
+        let plan = a_plan();
+        let args = serde_json::json!({ "plan": plan });
+        let rendered = call_export_tool("export_plan_fish_script", &args)
+            .expect("the tool is known")
+            .expect("a valid scriptable plan renders");
+        assert_eq!(
+            rendered,
+            serde_json::Value::String(plan_export::fish_script(&a_plan()).unwrap())
         );
     }
 

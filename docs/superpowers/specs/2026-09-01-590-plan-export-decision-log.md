@@ -5,3 +5,5 @@
 - 2026-09-01 — Ship each requested slice as a separate commit so checklist behavior is reviewable and revertible before script and runner scope is added.
 - 2026-09-01 — Put renderer behavior in the pure, wasm-safe protocol crate so browser, MCP, and native runner can consume the same export without another command reconstruction.
 - 2026-09-01 — Expose slice 1 as a local MCP tool consuming the exact `plan_*` result because that is the existing user-reachable review workflow and needs no second server plan endpoint.
+- 2026-09-01 — Target generated scripts explicitly at fish and use `or exit $status` after every command because silently placing POSIX `set -e` under Tom's login shell would be a false dialect promise.
+- 2026-09-01 — Refuse scripts for runtime-selected, prior-output-dependent, stdin-fed, and file-write operations until their exact execution data has one shared representation.
