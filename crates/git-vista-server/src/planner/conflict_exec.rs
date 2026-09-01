@@ -18,11 +18,13 @@ use std::path::Path;
 
 use axum::http::StatusCode;
 
-use git_vista_protocol::{CommitOid, ContentResolutionRefused, GenerationToken, WorktreePath};
+use git_vista_protocol::{
+    plan_export, CommitOid, ContentResolutionRefused, GenerationToken, WorktreePath,
+};
 
 use crate::sandbox::NetworkNeed;
 
-use super::{couldnt_run, run_git, stderr_or, symlink_containment_guard};
+use super::{couldnt_run, run_git, run_git_argv, stderr_or, symlink_containment_guard};
 
 /// Resolve one conflicted path by taking a whole side, or by deleting it
 /// (M4.31, #84).
@@ -108,16 +110,9 @@ pub(super) async fn exec_resolve_conflict(
     // `--` before the path, always: it stops a path that begins with a dash
     // being read as an option. The newtype already rejects the worst shapes,
     // but the separator is what makes that irrelevant rather than load-bearing.
-    let argv: Vec<&str> = match resolution {
-        Resolution::TakeOurs => vec!["checkout", "--ours", "--", path.as_str()],
-        Resolution::TakeTheirs => vec!["checkout", "--theirs", "--", path.as_str()],
-        // `rm` clears the index entries and removes the file in one step;
-        // `-f` because a conflicted path is by definition not "clean" and git
-        // refuses without it.
-        Resolution::TakeDeletion => vec!["rm", "-f", "--", path.as_str()],
-    };
+    let argv = plan_export::resolve_conflict_argv(path, resolution);
 
-    let output = match run_git(repo, need, &argv).await {
+    let output = match run_git_argv(repo, need, &argv).await {
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/resolve-conflict", &e),
     };
@@ -132,7 +127,8 @@ pub(super) async fn exec_resolve_conflict(
     // done both, so it needs no second step — and running `add` on a path it
     // just deleted would fail.
     if !matches!(resolution, Resolution::TakeDeletion) {
-        let add = match run_git(repo, need, &["add", "--", path.as_str()]).await {
+        let add = match run_git_argv(repo, need, &plan_export::stage_resolved_path_argv(path)).await
+        {
             Ok(o) => o,
             Err(e) => return couldnt_run("/api/resolve-conflict", &e),
         };

@@ -4033,61 +4033,144 @@ fn only_operations_with_a_real_cancellation_point_claim_to_be_cancellable() {
     );
 }
 
-/// **The force-construction tripwire.** `planner::push::push_argv` is the only
-/// place in this server that builds a push command line, and nothing in its
-/// production half can produce an unguarded force.
+/// **The force-construction tripwire.** Exactly one function in this workspace
+/// builds a push command line, and nothing in its production half can produce
+/// an unguarded force.
 ///
-/// Two halves, and neither is redundant:
+/// # It moved crates in M10 (#590), and so did this test
+///
+/// `push_argv` used to live in `planner/push.rs`. The plan export has to print
+/// the push command a user would run, and printing it means *reading the same
+/// builder* — a second reconstruction in the export would be the drift #590
+/// exists to remove, and it would be a reconstruction of the single most
+/// dangerous argv this server builds. So the builder moved to
+/// `git_vista_protocol::plan_export`, beside [`ForcePublish`] itself: the type
+/// whose closed two-variant design is what makes an unguarded force unsayable
+/// in the first place.
+///
+/// **The guard moved with it rather than being dropped**, and it now covers
+/// more source than before, because "the one place" is now a claim about two
+/// crates rather than one. Three halves, none redundant:
 ///
 ///  * `push::tests::no_push_argv_can_carry_a_bare_force` proves the *builder*
 ///    cannot emit one, over the whole `ForcePublish` × `set_upstream` × name
 ///    space. What it cannot prove is that some other module builds a push argv
 ///    of its own — a function's own tests never see its siblings.
-///  * This test closes that: `src/planner.rs`, which built `&["push", …]`
-///    inline until M2.20e moved it, must no longer name `push` as a git
-///    subcommand at all, and `planner/push.rs`'s production half must contain
-///    the leased flag and none of the unguarded spellings.
+///  * `src/planner.rs` and `src/planner/push.rs` must no longer name `push` as
+///    a git subcommand or spell any force flag: whatever they do now, they do
+///    not build this argv.
+///  * `plan_export.rs`'s production half must contain the leased flag and none
+///    of the unguarded spellings — the assertion that used to point at
+///    `push.rs`, following the code.
 ///
-/// The source scan stops at `#[cfg(test)]`, on purpose: `push.rs`'s own tests
+/// Each source scan stops at `#[cfg(test)]`, on purpose: the test modules
 /// contain the literal `"--force"` precisely because they assert it never
 /// appears in an argv, and a scan that could not tell the two apart would have
 /// to be weakened until it proved nothing.
 #[test]
-fn only_planner_push_builds_a_push_argv_and_it_can_only_build_a_leased_force() {
-    let planner = source("src/planner.rs");
-    assert!(
-        !planner.contains("\"push\""),
-        "src/planner.rs names `push` as a git subcommand again — every push \
-         argv must be built by planner::push::push_argv, which is the one \
-         function whose `match` over ForcePublish cannot reach an unguarded \
-         force (#231, ADR 0045 D1)"
-    );
-
-    let src = source("src/planner/push.rs");
-    let split = src
-        .find("#[cfg(test)]")
-        .expect("planner/push.rs has a test module");
-    let production = &src[..split];
-    assert!(
-        production.contains("--force-with-lease="),
-        "the leased flag must be built here, or nothing offers the capability \
-         at all"
-    );
-    for forbidden in [
+fn only_one_place_builds_a_push_argv_and_it_can_only_build_a_leased_force() {
+    /// Every spelling of an unguarded force. `--force-with-lease=` is the one
+    /// form this workspace may build, and it is not on this list.
+    const UNGUARDED: &[&str] = &[
         "\"--force\"",
         "\"-f\"",
         "\"--force-if-includes\"",
         "--force=",
         "'--force'",
-    ] {
+    ];
+
+    /// The half of a source file that ships. Anything from the first
+    /// `#[cfg(test)]` onward is assertions *about* these strings.
+    fn production(src: &str) -> &str {
+        match src.find("#[cfg(test)]") {
+            Some(split) => &src[..split],
+            None => src,
+        }
+    }
+
+    let planner = source("src/planner.rs");
+    assert!(
+        !production(&planner).contains("\"push\""),
+        "src/planner.rs names `push` as a git subcommand again — every push \
+         argv must be built by plan_export::push_argv, which is the one \
+         function whose `match` over ForcePublish cannot reach an unguarded \
+         force (#231, ADR 0045 D1; moved crates by #590)"
+    );
+
+    // The executor no longer builds the argv at all; it calls the builder. So
+    // it must not have grown a second one — and, unlike before, it must not
+    // contain the leased flag either, because containing it would mean it is
+    // spelling a push argv again.
+    let push_src = source("src/planner/push.rs");
+    let executor = production(&push_src);
+    for forbidden in UNGUARDED {
         assert!(
-            !production.contains(forbidden),
-            "planner::push's production half contains {forbidden} — the only \
-             force this server may ever build is `--force-with-lease=`, and it \
-             is the one thing standing between a user and another party's \
-             commits"
+            !executor.contains(forbidden),
+            "planner::push's production half contains {forbidden} — it calls \
+             plan_export::push_argv and builds no argv of its own"
         );
     }
+
+    // The builder itself, in the protocol crate.
+    //
+    // **Scoped to `push_argv`'s own body, and it has to be.** The old version
+    // of this test scanned the whole of `push.rs`, where every argv in the file
+    // was a push's, so `"-f"` appearing anywhere could only mean one thing.
+    // `plan_export.rs` holds every operation's argv, and three of them spell a
+    // perfectly ordinary `-f` at a different subcommand — `git branch -f`,
+    // `git clean -f`, `git rm -f`. A file-wide scan here fails on all three,
+    // and the tempting repair is to drop `"-f"` from the forbidden list, which
+    // would delete the assertion that matters most. Narrowing the *scope*
+    // keeps every spelling forbidden where a push is being built and nowhere
+    // else — the guard got sharper in the move, not looser.
+    let plan_export = source("../git-vista-protocol/src/plan_export.rs");
+    let builder = fn_body_braced(production(&plan_export), "pub fn push_argv(");
+    assert!(
+        builder.contains("--force-with-lease="),
+        "the leased flag must be built in plan_export::push_argv, or nothing \
+         offers the capability at all — if push_argv moved again, move this \
+         assertion with it rather than deleting it"
+    );
+    for forbidden in UNGUARDED {
+        assert!(
+            !builder.contains(forbidden),
+            "plan_export::push_argv contains {forbidden} — the only force this \
+             workspace may ever build is `--force-with-lease=`, and it is the \
+             one thing standing between a user and another party's commits"
+        );
+    }
+}
+
+/// The body of the function whose signature begins with `head`, from its
+/// opening brace to the matching close.
+///
+/// Brace-counting rather than "up to the next `fn`", because the assertion
+/// above is a security scan: a body cut short would silently stop covering the
+/// lines past the cut, and a scan that reads less than it claims is worse than
+/// none. Panics rather than returning an empty slice if the function is not
+/// found, for the same reason.
+fn fn_body_braced<'a>(src: &'a str, head: &str) -> &'a str {
+    let start = src
+        .find(head)
+        .unwrap_or_else(|| panic!("no ‘{head}’ found — did it move or get renamed?"));
+    let open = start
+        + src[start..]
+            .find('{')
+            .unwrap_or_else(|| panic!("‘{head}’ has no body"));
+    let mut depth = 0usize;
+    for (i, ch) in src[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &src[open..open + i + 1];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("‘{head}’ has an unbalanced body")
 }
 
 /// [`GitOperation::PullBranch`] executes end-to-end through the pipeline
