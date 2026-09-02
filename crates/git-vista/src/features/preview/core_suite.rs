@@ -340,6 +340,10 @@ fn no_outcome_ever_blocks_the_operation() {
 /// compiles, round-trips, and previews the exact inverse of what the dialog
 /// is about to do. A test that only checked the commit id would pass through
 /// that. This one matches on the variant, which is the part that can be wrong.
+///
+/// Proved: returning `None` from the `CherryPick` arm, and mapping it to
+/// `RevertCommit`, were both run through `failure-atlas`'s `mutation_check`
+/// and both came back `caught`.
 #[test]
 fn only_the_three_wired_dialogs_ask_for_a_preview() {
     assert!(
