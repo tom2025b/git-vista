@@ -177,11 +177,20 @@ write is legal in; and it is this terminal session's own selection, so the
 browser's is untouched.
 
 **The deeper fix is a protocol change and is deliberately not made here.** The
-endpoint arguably ought to carry the repository, the way every read does. That
-is a wire-contract decision with its own blast radius, it belongs in its own
-issue, and #462 is not the place to make it. Recorded so the next reader knows
-the pairing is a mitigation with a known better answer, not the end of the
-thought.
+endpoint ought to carry the repository, the way every read does. That is a
+wire-contract decision with its own blast radius, it belongs in its own issue,
+and #462 is not the place to make it. Filed as
+[#621](https://github.com/tom2025b/git-vista/issues/621), so the pairing is a
+mitigation with its better answer written down and tracked rather than an
+observation buried in a decision record.
+
+*Amended after the merge with #461.* That milestone's shell selects a
+repository when one is activated, so in the ordinary flow the pairing is a
+**second** select. It stays anyway, and the merge sharpened the reason rather
+than weakening it: with only the activation-time select, "the resolution lands
+where the user was looking" depends on that earlier call having run and nothing
+having changed the selection since — two conditions a write cannot check. The
+cost is one loopback round trip; the failure it prevents is silent.
 
 ### 6. The overlay owns the keyboard, because its editor takes every printable key
 

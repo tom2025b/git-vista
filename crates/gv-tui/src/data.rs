@@ -326,7 +326,8 @@ impl Client {
     /// remembered, and the failure it prevents is silent — a conflict at the
     /// same path in another repository resolves successfully, in the wrong
     /// one. ADR 0105 decision 5 records that the real fix is for the endpoint
-    /// to carry the repository, and why that is a separate issue.
+    /// to carry the repository, the way every conflict READ already does;
+    /// that is issue #621, and this pairing goes away when it lands.
     fn resolve_whole_file(
         &self,
         repo: &str,
