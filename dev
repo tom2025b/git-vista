@@ -420,17 +420,60 @@ cmd_report() {
   echo
 
   echo "── branches (origin) ──────────────────────────────"
-  local total merged open
-  total="$(git for-each-ref --format='%(refname:short)' refs/remotes/origin/ | grep -vc '/HEAD$' || true)"
-  merged="$(git branch -r --merged origin/main | grep -v '\->' | wc -l)"
-  open=$((total - merged))
+  # Every figure here counts the SAME population — origin only — and the
+  # census checks itself rather than being true by construction.
+  #
+  # History, so nobody re-introduces either defect:
+  #   - `total` counted refs/remotes/origin/ while a bare `git branch -r
+  #     --merged` counted every remote namespace, and this repository fetches
+  #     PR heads into refs/remotes/pr/. 167 `pr/*` refs were in `merged` and
+  #     not in `total`, so the report printed `open: -73`.
+  #   - The first fix derived `merged = total - open`, which made the equation
+  #     hold for ANY values including wrong ones, and guarded the counts with
+  #     `|| true`, which swallows a real git failure into a plausible-looking
+  #     `0`. Both were found by an independent review before landing.
+  #
+  # `origin_count` and `origin_list` succeed on "no matches" (grep exits 1)
+  # and FAIL on a real error (grep/git exit 2+), so a broken git aborts the
+  # report instead of printing zeros. `merged` is measured independently and
+  # the three are cross-checked; a disagreement prints a warning rather than
+  # a number that happens to add up.
+  origin_count() { grep -c '^origin/' || [ "$?" -eq 1 ]; }
+  origin_list()  { grep    '^origin/' || [ "$?" -eq 1 ]; }
+  # Same "no matches is success, real error is not" rule as origin_count/
+  # origin_list above — an unguarded `grep -v` here died under `set -o
+  # pipefail` whenever `--no-merged` had zero branches (grep -v on empty
+  # input still exits 1), aborting the report before it printed anything.
+  # Anchored on the literal alias line, not a bare `->` substring match, so a
+  # branch name that happens to contain "->" is not silently dropped from
+  # merged/open the way `total` never drops it either.
+  drop_head_alias() { grep -vE '^[[:space:]]*origin/HEAD -> ' || [ "$?" -eq 1 ]; }
+  local total merged open listed
+  # Full refname, not `:short`: the short form of refs/remotes/origin/HEAD is
+  # the bare word `origin`, which `/HEAD$` never matched — so `total` counted
+  # the symbolic HEAD and ran one high. The self-check below caught it on its
+  # first run.
+  total="$(git for-each-ref --format='%(refname)' refs/remotes/origin/ | grep -vc '^refs/remotes/origin/HEAD$' || [ "$?" -eq 1 ])"
+  merged="$(git branch -r --merged    origin/main | drop_head_alias | sed 's/^ *//' | origin_count)"
+  open="$(  git branch -r --no-merged origin/main | drop_head_alias | sed 's/^ *//' | origin_count)"
   echo "  total:  $total"
   echo "  merged: $merged"
   echo "  open:   $open"
+  if [ "$((merged + open))" -ne "$total" ]; then
+    echo "  WARNING: merged + open = $((merged + open)) but total = $total —"
+    echo "           the three counts disagree; a ref is neither merged nor"
+    echo "           unmerged relative to origin/main (or origin/main is not"
+    echo "           itself counted the same way). Do not trust this block."
+  fi
   echo
 
   echo "── open branches (not yet merged into main) ────────"
-  git branch -r --no-merged origin/main | grep -v '\->' | sed 's/^ */  /'
+  listed="$(git branch -r --no-merged origin/main | drop_head_alias | sed 's/^ *//' | origin_list)"
+  printf '%s\n' "$listed" | sed '/^$/d; s/^/  /'
+  if [ "$(printf '%s\n' "$listed" | sed '/^$/d' | wc -l)" -ne "$open" ]; then
+    echo "  WARNING: the list above has a different length than 'open' — the"
+    echo "           count and the list were derived from different commands."
+  fi
   echo
 
   echo "── WIP / auto-checkpoint commits, all branches ─────"
@@ -438,10 +481,18 @@ cmd_report() {
   wips="$(git log --all --oneline --grep='^wip(' -i | wc -l)"
   echo "  $wips total"
   echo "  by branch:"
-  git for-each-ref --format='%(refname:short)' refs/remotes/origin/ | grep -v '/HEAD$' | while read -r b; do
+  # Same bare-`origin` leak the `total` line above had to guard against:
+  # origin/HEAD's SHORT name is the literal word "origin", which a
+  # `/HEAD$` match never catches — `-vx origin` matches that exact line
+  # instead of a suffix. And process substitution, not a pipe, so the
+  # loop's own conditional last statement (`&& printf`, false on any
+  # branch with zero WIP commits — the common case) can't make `set -o
+  # pipefail` kill the report; the "unfinished work" loop above already
+  # uses this same fix for the same reason.
+  while read -r b; do
     c="$(git log "$b" --oneline --grep='^wip(' -i 2>/dev/null | wc -l)"
     [[ "$c" -gt 0 ]] && printf '    %-55s %s\n' "$b" "$c"
-  done
+  done < <(git for-each-ref --format='%(refname:short)' refs/remotes/origin/ | grep -vx origin)
   echo
 
   echo "── lines of Rust, by crate ──────────────────────────"
