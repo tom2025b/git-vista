@@ -1989,6 +1989,13 @@ mod branch_prompt_tests {
     ///    through it — while the dialog asked the server to picture the exact
     ///    inverse of what it is about to do. Matching on the variant is what
     ///    goes red.
+    ///
+    /// Both were run through `failure-atlas`'s `mutation_check` against
+    /// 7b1e66a0 and both came back `caught`. Mutation 2's failure is the one
+    /// worth reading: `left: Revert { commit: "bbb…" }` against
+    /// `right: CherryPick { commit: "bbb…" }` — identical ids, and only the
+    /// variant separates a preview of the operation from a preview of its
+    /// inverse.
     #[test]
     fn the_three_previewable_confirmations_each_name_their_own_subject() {
         assert_eq!(
@@ -2040,6 +2047,10 @@ mod branch_prompt_tests {
     ///    `Merge { branch: "HEAD" }`. The `Push` assertion goes red; a
     ///    confirmation nobody wired would otherwise spend two round trips
     ///    asking the server about a branch no user named.
+    ///
+    /// Both were run and both came back `caught`. Mutation 1 also reddened the
+    /// positive revert case in the test above, which is the asymmetry that
+    /// names the defect rather than merely reporting one.
     #[test]
     fn an_unpreviewable_confirmation_asks_for_nothing() {
         for action in [
