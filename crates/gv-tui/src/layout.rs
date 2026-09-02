@@ -3,12 +3,13 @@
 //!
 //! # The shape
 //!
-//! lazygit's: a left column one third wide carrying three stacked panes
-//! (Repositories, Branches, Commits) and a main pane taking the right two
-//! thirds, with a one-row status strip along the bottom. The three left
-//! panes share their column equally; #457 will want the Commits pane to
-//! take more once the graph draws there, and that is a constraint change in
-//! [`split`] with a test to match, not a redesign.
+//! lazygit's: a left column carrying three stacked panes (Repositories,
+//! Branches, Commits) and a main pane, with a one-row status strip along the
+//! bottom. The three left panes share their column equally. #457's graph
+//! rows carry a short id and summary beside their lane glyphs, which a
+//! one-third column truncated — the left/main split is half and half so
+//! Commits has room, the constraint change this module anticipated rather
+//! than a redesign of the shape.
 //!
 //! # Too small is said, not squeezed
 //!
@@ -57,8 +58,13 @@ pub fn split(area: Rect) -> Option<Panes> {
         return None;
     }
     let [body, status] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
+    // #457's graph rows carry a short id and a summary beside their lane
+    // glyphs (`render_commit_line`); a one-third column truncates that
+    // before the summary is legible. Widening the left column to half is
+    // the "constraint change... not a redesign" this module anticipated —
+    // same two-column shape, wider split.
     let [left, main] =
-        Layout::horizontal([Constraint::Ratio(1, 3), Constraint::Ratio(2, 3)]).areas(body);
+        Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).areas(body);
     let [repositories, branches, commits] = Layout::vertical([
         Constraint::Ratio(1, 3),
         Constraint::Ratio(1, 3),
@@ -139,12 +145,12 @@ mod tests {
     }
 
     #[test]
-    fn the_main_pane_takes_the_right_two_thirds_and_the_left_column_stacks_three() {
+    fn the_main_pane_takes_the_right_half_and_the_left_column_stacks_three() {
         let panes = split(area(90, 31)).unwrap();
-        assert_eq!(panes.main, Rect::new(30, 0, 60, 30));
+        assert_eq!(panes.main, Rect::new(45, 0, 45, 30));
         for left in [panes.repositories, panes.branches, panes.commits] {
             assert_eq!(left.x, 0);
-            assert_eq!(left.width, 30);
+            assert_eq!(left.width, 45);
             assert_eq!(left.height, 10);
         }
         assert_eq!(panes.repositories.y, 0);

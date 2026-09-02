@@ -25,6 +25,7 @@ use serde::de::DeserializeOwned;
 use crate::app::{Data, Fetch};
 
 pub const CATALOG_PATH: &str = "/api/catalog";
+pub const HISTORY_LIMIT: usize = 250;
 
 pub type FetchFn = Box<dyn FnMut(&str, &str) -> Result<HttpResponse, String> + Send>;
 pub type AuthFn = Box<dyn FnMut() -> Result<Session, String> + Send>;
@@ -60,6 +61,23 @@ impl Client {
     pub fn serve(&mut self, fetch: Fetch) -> Data {
         match fetch {
             Fetch::Catalog => Data::Catalog(self.get_json(CATALOG_PATH)),
+            Fetch::History { repo } => {
+                let path = format!("/api/commits?repo={repo}&limit={HISTORY_LIMIT}");
+                let result = self.get_json(&path);
+                Data::History { repo, result }
+            }
+            Fetch::Commit { repo, id } => {
+                let path = format!("/api/commit/{id}?repo={repo}");
+                let result = self.get_json(&path);
+                Data::Commit { repo, id, result }
+            }
+            Fetch::Diff { repo, id } => {
+                // Deliberately no `full=1`: the terminal consumes the server's
+                // bounded panel representation and windows it again on draw.
+                let path = format!("/api/diff/{id}?repo={repo}");
+                let result = self.get_json(&path);
+                Data::Diff { repo, id, result }
+            }
         }
     }
 }
@@ -97,10 +115,8 @@ pub fn spawn(mut client: Client) -> Worker {
 
 impl DataPort for Worker {
     fn request(&mut self, fetch: Fetch) {
-        if self.requests.send(fetch).is_err() {
-            self.pending.push_back(Data::Catalog(Err(String::from(
-                "the data thread has stopped; restart gv-tui",
-            ))));
+        if let Err(stopped) = self.requests.send(fetch) {
+            self.pending.push_back(stopped_answer(stopped.0));
         }
     }
 
@@ -108,6 +124,27 @@ impl DataPort for Worker {
         self.pending
             .pop_front()
             .or_else(|| self.answers.try_recv().ok())
+    }
+}
+
+fn stopped_answer(fetch: Fetch) -> Data {
+    let message = || String::from("the data thread has stopped; restart gv-tui");
+    match fetch {
+        Fetch::Catalog => Data::Catalog(Err(message())),
+        Fetch::History { repo } => Data::History {
+            repo,
+            result: Err(message()),
+        },
+        Fetch::Commit { repo, id } => Data::Commit {
+            repo,
+            id,
+            result: Err(message()),
+        },
+        Fetch::Diff { repo, id } => Data::Diff {
+            repo,
+            id,
+            result: Err(message()),
+        },
     }
 }
 
@@ -220,6 +257,7 @@ mod tests {
                 assert!(message.contains("503"), "{message}");
             }
             Data::Catalog(Ok(_)) => panic!("a 503 became catalog rows"),
+            _ => panic!("a catalog request became a different answer kind"),
         }
     }
 
@@ -321,6 +359,7 @@ mod tests {
             }
             Some(Data::Catalog(Ok(_))) => panic!("a stopped worker returned rows"),
             None => panic!("a stopped worker silently lost the request"),
+            Some(_) => panic!("a catalog request became a different answer kind"),
         }
     }
 }

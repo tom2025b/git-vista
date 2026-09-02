@@ -31,7 +31,16 @@
 //! - Refresh coalesces: while a catalog fetch is in flight, another `r` asks
 //!   nothing. A held-down key must not queue fifty reads behind a slow server.
 
-use git_vista_protocol::{RepositoryDescriptor, RepositoryKind};
+use git_vista_core::diff::CommitDiff;
+use git_vista_core::model::{CommitDetail, Edge, FrameStub, GraphRow};
+use git_vista_protocol::{HistoryPage, RepositoryDescriptor, RepositoryKind};
+
+use crate::panes::detail::DetailPane;
+
+/// The existing paged-history wire shape, instantiated with the lane core's
+/// types. #458 uses its summaries as a small selector; #457 remains the owner
+/// of rendering the lanes and edges themselves.
+pub type CommitPage = HistoryPage<GraphRow, Edge, FrameStub>;
 
 /// One of the four regions of the frame, in focus-ring order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,18 +106,40 @@ pub enum Action {
     CursorDown,
     CursorUp,
     Refresh,
+    Activate,
+    ParentPrev,
+    ParentNext,
+    HorizontalLeft,
+    HorizontalRight,
 }
 
 /// A read the loop must hand to the data layer. Phase 2a has one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Fetch {
     Catalog,
+    History { repo: String },
+    Commit { repo: String, id: String },
+    Diff { repo: String, id: String },
 }
 
 /// A read's answer, back from the data layer.
 #[derive(Debug)]
 pub enum Data {
     Catalog(Result<Vec<RepositoryDescriptor>, String>),
+    History {
+        repo: String,
+        result: Result<CommitPage, String>,
+    },
+    Commit {
+        repo: String,
+        id: String,
+        result: Result<CommitDetail, String>,
+    },
+    Diff {
+        repo: String,
+        id: String,
+        result: Result<CommitDiff, String>,
+    },
 }
 
 /// How the status line should be drawn.
@@ -130,10 +161,20 @@ pub struct Status {
 pub struct App {
     pub focus: Pane,
     pub catalog: Vec<RepositoryDescriptor>,
+    pub active_repo: Option<String>,
+    pub commits: Vec<GraphRow>,
+    /// The rest of the fetched [`CommitPage`], kept beside `commits` so
+    /// `ui.rs` can hand the graph renderer the same lanes core computed —
+    /// no relayout, no separate fetch.
+    pub edges: Vec<Edge>,
+    pub stubs: Vec<FrameStub>,
+    pub lane_count: usize,
+    pub detail: DetailPane,
     cursors: [usize; 4],
     pub status: Status,
     /// Catalog reads dispatched and not yet answered.
     pub in_flight: u32,
+    history_in_flight: Option<String>,
     pub quit: bool,
 }
 
@@ -148,12 +189,19 @@ impl App {
         App {
             focus: Pane::Repositories,
             catalog: Vec::new(),
+            active_repo: None,
+            commits: Vec::new(),
+            edges: Vec::new(),
+            stubs: Vec::new(),
+            lane_count: 0,
+            detail: DetailPane::default(),
             cursors: [0; 4],
             status: Status {
                 text: String::from("connecting to git-vista-server…"),
                 tone: Tone::Info,
             },
             in_flight: 0,
+            history_in_flight: None,
             quit: false,
         }
     }
@@ -199,6 +247,31 @@ impl App {
                 Vec::new()
             }
             Action::Refresh => self.request_catalog(),
+            Action::Activate => self.activate(),
+            Action::ParentPrev => {
+                if self.focus == Pane::Main {
+                    self.detail.select_parent(-1);
+                }
+                Vec::new()
+            }
+            Action::ParentNext => {
+                if self.focus == Pane::Main {
+                    self.detail.select_parent(1);
+                }
+                Vec::new()
+            }
+            Action::HorizontalLeft => {
+                if self.focus == Pane::Main {
+                    self.detail.scroll_horizontal(-4);
+                }
+                Vec::new()
+            }
+            Action::HorizontalRight => {
+                if self.focus == Pane::Main {
+                    self.detail.scroll_horizontal(4);
+                }
+                Vec::new()
+            }
         }
     }
 
@@ -210,6 +283,16 @@ impl App {
                 match result {
                     Ok(catalog) => {
                         self.catalog = catalog;
+                        if self.active_repo.as_ref().is_some_and(|active| {
+                            !self.catalog.iter().any(|repo| repo.worktree == *active)
+                        }) {
+                            self.active_repo = None;
+                            self.commits.clear();
+                            self.edges.clear();
+                            self.stubs.clear();
+                            self.lane_count = 0;
+                            self.detail = DetailPane::default();
+                        }
                         self.clamp_cursors();
                         let n = self.catalog.len();
                         self.status = Status {
@@ -230,7 +313,147 @@ impl App {
                     }
                 }
             }
+            Data::History { repo, result } => {
+                if self.active_repo.as_deref() != Some(repo.as_str()) {
+                    return;
+                }
+                self.history_in_flight = None;
+                match result {
+                    Ok(page) => {
+                        self.commits = page.rows;
+                        self.edges = page.edges;
+                        self.stubs = page.stubs;
+                        self.lane_count = page.lane_count;
+                        self.clamp_cursors();
+                        self.status = Status {
+                            text: format!(
+                                "{} commits · Enter opens detail · q quit · Tab focus",
+                                self.commits.len()
+                            ),
+                            tone: Tone::Info,
+                        };
+                    }
+                    Err(message) => {
+                        self.status = Status {
+                            text: message,
+                            tone: Tone::Error,
+                        };
+                    }
+                }
+            }
+            Data::Commit { repo, id, result } => {
+                let error = result.as_ref().err().cloned();
+                if self.detail.receive_detail(&repo, &id, result) {
+                    self.clamp_cursors();
+                    self.status = error.map_or_else(
+                        || Status {
+                            text: String::from(
+                                "commit loaded · [/] parent · arrows scroll · q quit",
+                            ),
+                            tone: Tone::Info,
+                        },
+                        |text| Status {
+                            text,
+                            tone: Tone::Error,
+                        },
+                    );
+                }
+            }
+            Data::Diff { repo, id, result } => {
+                let error = result.as_ref().err().cloned();
+                if self.detail.receive_diff(&repo, &id, result) {
+                    self.clamp_cursors();
+                    self.status = error.map_or_else(
+                        || Status {
+                            text: String::from(
+                                "detail ready · j/k vertical · ←/→ horizontal · [/] parent",
+                            ),
+                            tone: Tone::Info,
+                        },
+                        |text| Status {
+                            text,
+                            tone: Tone::Error,
+                        },
+                    );
+                }
+            }
         }
+    }
+
+    fn activate(&mut self) -> Vec<Fetch> {
+        match self.focus {
+            Pane::Repositories => self.activate_repository(),
+            Pane::Branches => Vec::new(),
+            Pane::Commits => {
+                let Some(repo) = self.active_repo.clone() else {
+                    return Vec::new();
+                };
+                let Some(id) = self
+                    .commits
+                    .get(self.cursor(Pane::Commits))
+                    .map(|row| row.commit.id.0.clone())
+                else {
+                    return Vec::new();
+                };
+                self.open_detail(repo, id)
+            }
+            Pane::Main => {
+                let Some(repo) = self.active_repo.clone() else {
+                    return Vec::new();
+                };
+                let Some(id) = self.detail.selected_parent().map(str::to_string) else {
+                    return Vec::new();
+                };
+                self.open_detail(repo, id)
+            }
+        }
+    }
+
+    fn activate_repository(&mut self) -> Vec<Fetch> {
+        let Some(repo) = self
+            .catalog
+            .get(self.cursor(Pane::Repositories))
+            .map(|repo| repo.worktree.clone())
+        else {
+            return Vec::new();
+        };
+        if self.history_in_flight.as_deref() == Some(repo.as_str()) {
+            return Vec::new();
+        }
+        if self.active_repo.as_deref() != Some(repo.as_str()) {
+            self.commits.clear();
+            self.edges.clear();
+            self.stubs.clear();
+            self.lane_count = 0;
+            self.cursors[Pane::Commits.index()] = 0;
+            self.cursors[Pane::Main.index()] = 0;
+            self.detail = DetailPane::default();
+        }
+        self.active_repo = Some(repo.clone());
+        self.history_in_flight = Some(repo.clone());
+        self.focus = Pane::Commits;
+        self.status = Status {
+            text: String::from("loading commits…"),
+            tone: Tone::Info,
+        };
+        vec![Fetch::History { repo }]
+    }
+
+    fn open_detail(&mut self, repo: String, id: String) -> Vec<Fetch> {
+        self.detail.open(repo.clone(), id.clone());
+        self.cursors[Pane::Main.index()] = 0;
+        self.focus = Pane::Main;
+        self.status = Status {
+            text: format!("loading {}…", short_id(&id)),
+            tone: Tone::Info,
+        };
+        vec![
+            Fetch::Commit {
+                repo: repo.clone(),
+                id: id.clone(),
+            },
+            Fetch::Diff { repo, id },
+        ]
     }
 
     /// Ask for the catalog unless a catalog read is already out — a held
@@ -264,7 +487,9 @@ impl App {
     pub fn rows(&self, pane: Pane) -> usize {
         match pane {
             Pane::Repositories => self.catalog.len(),
-            Pane::Branches | Pane::Commits | Pane::Main => 0,
+            Pane::Branches => 0,
+            Pane::Commits => self.commits.len(),
+            Pane::Main => self.detail.row_count(),
         }
     }
 
@@ -280,8 +505,15 @@ impl App {
     }
 }
 
+fn short_id(id: &str) -> &str {
+    &id[..id.len().min(7)]
+}
+
 #[cfg(test)]
 mod tests {
+    use git_vista_core::model::{CommitSummary, Oid};
+    use git_vista_protocol::plan::GenerationToken;
+
     use super::*;
 
     /// The catalog exactly as the server serializes it — a wire literal, not
@@ -305,6 +537,54 @@ mod tests {
         app.receive(Data::Catalog(Ok(catalog(wire))));
         app
     }
+
+    fn page(rows: &[(&str, &str)]) -> CommitPage {
+        CommitPage {
+            rows: rows
+                .iter()
+                .enumerate()
+                .map(|(row, (id, summary))| GraphRow {
+                    commit: CommitSummary {
+                        id: Oid((*id).to_string()),
+                        parents: Vec::new(),
+                        summary: (*summary).to_string(),
+                        author: "Ada".to_string(),
+                        time: 1_700_000_000,
+                    },
+                    row,
+                    lane: 0,
+                    refs: Vec::new(),
+                    color: 0,
+                    on_remote: false,
+                })
+                .collect(),
+            edges: Vec::new(),
+            stubs: Vec::new(),
+            lane_count: 1,
+            cursor: None,
+            generation: GenerationToken::new("generation-1").unwrap(),
+        }
+    }
+
+    fn detail(id: &str, parents: &[&str]) -> CommitDetail {
+        CommitDetail {
+            id: Oid(id.to_string()),
+            parents: parents.iter().map(|id| Oid((*id).to_string())).collect(),
+            author_name: "Ada".to_string(),
+            author_email: "ada@example.com".to_string(),
+            author_time: 1,
+            committer_name: "Casey".to_string(),
+            committer_email: "casey@example.com".to_string(),
+            commit_time: 2,
+            message: "message".to_string(),
+            on_remote: false,
+        }
+    }
+
+    const COMMIT_1: &str = "1111111111111111111111111111111111111111";
+    const COMMIT_2: &str = "2222222222222222222222222222222222222222";
+    const PARENT_1: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const PARENT_2: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     #[test]
     fn a_new_app_focuses_the_repositories_pane_and_asks_for_the_catalog_once_on_start() {
@@ -479,5 +759,124 @@ mod tests {
                 "gamma (linked worktree)"
             ]
         );
+    }
+
+    #[test]
+    fn activating_the_selected_repository_requests_its_bounded_history_page() {
+        let mut app = loaded(THREE);
+        app.apply(Action::CursorDown);
+
+        assert_eq!(
+            app.apply(Action::Activate),
+            [Fetch::History {
+                repo: "w2".to_string()
+            }]
+        );
+        assert_eq!(app.active_repo.as_deref(), Some("w2"));
+        assert_eq!(app.focus, Pane::Commits);
+    }
+
+    #[test]
+    fn a_history_answer_populates_commits_and_enter_requests_detail_and_diff() {
+        let mut app = loaded(THREE);
+        assert_eq!(app.apply(Action::Activate).len(), 1);
+        app.receive(Data::History {
+            repo: "w1".to_string(),
+            result: Ok(page(&[(COMMIT_1, "first"), (COMMIT_2, "second")])),
+        });
+        assert_eq!(app.rows(Pane::Commits), 2);
+        app.apply(Action::CursorDown);
+
+        assert_eq!(
+            app.apply(Action::Activate),
+            [
+                Fetch::Commit {
+                    repo: "w1".to_string(),
+                    id: COMMIT_2.to_string(),
+                },
+                Fetch::Diff {
+                    repo: "w1".to_string(),
+                    id: COMMIT_2.to_string(),
+                },
+            ]
+        );
+        assert_eq!(app.focus, Pane::Main);
+        assert_eq!(app.detail.current(), Some(("w1", COMMIT_2)));
+    }
+
+    #[test]
+    fn a_late_history_answer_for_the_previous_repository_is_ignored() {
+        let mut app = loaded(THREE);
+        app.apply(Action::Activate);
+        app.apply(Action::Focus(Pane::Repositories));
+        app.apply(Action::CursorDown);
+        app.apply(Action::Activate);
+
+        app.receive(Data::History {
+            repo: "w1".to_string(),
+            result: Ok(page(&[(COMMIT_1, "stale")])),
+        });
+        assert!(app.commits.is_empty());
+        app.receive(Data::History {
+            repo: "w2".to_string(),
+            result: Ok(page(&[(COMMIT_2, "current")])),
+        });
+        assert_eq!(app.commits[0].commit.summary, "current");
+    }
+
+    #[test]
+    fn a_selected_parent_can_be_opened_from_the_main_pane() {
+        let mut app = loaded(THREE);
+        app.apply(Action::Activate);
+        app.receive(Data::History {
+            repo: "w1".to_string(),
+            result: Ok(page(&[(COMMIT_1, "merge")])),
+        });
+        app.apply(Action::Activate);
+        app.receive(Data::Commit {
+            repo: "w1".to_string(),
+            id: COMMIT_1.to_string(),
+            result: Ok(detail(COMMIT_1, &[PARENT_1, PARENT_2])),
+        });
+        app.apply(Action::ParentNext);
+
+        assert_eq!(
+            app.apply(Action::Activate),
+            [
+                Fetch::Commit {
+                    repo: "w1".to_string(),
+                    id: PARENT_2.to_string(),
+                },
+                Fetch::Diff {
+                    repo: "w1".to_string(),
+                    id: PARENT_2.to_string(),
+                },
+            ]
+        );
+        assert_eq!(app.detail.current(), Some(("w1", PARENT_2)));
+    }
+
+    #[test]
+    fn main_vertical_and_horizontal_scroll_positions_are_independent() {
+        let mut app = loaded(THREE);
+        app.apply(Action::Activate);
+        app.receive(Data::History {
+            repo: "w1".to_string(),
+            result: Ok(page(&[(COMMIT_1, "long")])),
+        });
+        app.apply(Action::Activate);
+        app.receive(Data::Commit {
+            repo: "w1".to_string(),
+            id: COMMIT_1.to_string(),
+            result: Ok(detail(COMMIT_1, &[])),
+        });
+
+        app.apply(Action::CursorDown);
+        app.apply(Action::HorizontalRight);
+        assert_eq!(app.cursor(Pane::Main), 1);
+        assert_eq!(app.detail.horizontal(), 4);
+        app.apply(Action::HorizontalLeft);
+        assert_eq!(app.cursor(Pane::Main), 1);
+        assert_eq!(app.detail.horizontal(), 0);
     }
 }
