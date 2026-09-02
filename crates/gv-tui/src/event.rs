@@ -61,7 +61,7 @@ pub fn run<B: Backend>(
         }
         match inputs.next(TICK)? {
             Input::Key(key) => {
-                if let Some(action) = keys::dispatch(key) {
+                if let Some(action) = keys::dispatch(key, app.focus) {
                     for fetch in app.apply(action) {
                         port.request(fetch);
                     }

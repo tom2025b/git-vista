@@ -18,6 +18,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+git-vista-core = { workspace = true }
 git-vista-protocol = { workspace = true }
 git-vista-session = { workspace = true }
 serde = { workspace = true }
