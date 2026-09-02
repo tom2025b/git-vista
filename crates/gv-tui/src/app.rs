@@ -36,6 +36,7 @@ use git_vista_core::model::{CommitDetail, Edge, FrameStub, GraphRow};
 use git_vista_protocol::{HistoryPage, RepositoryDescriptor, RepositoryKind};
 
 use crate::panes::detail::DetailPane;
+use crate::panes::plan_review::{PlanApproval, PlanReviewPane, SubmissionOutcome};
 
 /// The existing paged-history wire shape, instantiated with the lane core's
 /// types. #458 uses its summaries as a small selector; #457 remains the owner
@@ -111,6 +112,8 @@ pub enum Action {
     ParentNext,
     HorizontalLeft,
     HorizontalRight,
+    ApprovePlan,
+    RefusePlan,
 }
 
 /// A read the loop must hand to the data layer. Phase 2a has one.
@@ -120,11 +123,16 @@ pub enum Fetch {
     History { repo: String },
     Commit { repo: String, id: String },
     Diff { repo: String, id: String },
+    ExecutePlan(PlanApproval),
 }
 
 /// A read's answer, back from the data layer.
 #[derive(Debug)]
 pub enum Data {
+    /// Exact response bytes from `/api/plan`. #461 will produce this answer;
+    /// keeping the bytes here avoids a serialize-after-review seam.
+    #[allow(dead_code)] // The producer is deliberately #461, which this pane gates.
+    PlanReady(Result<Vec<u8>, String>),
     Catalog(Result<Vec<RepositoryDescriptor>, String>),
     History {
         repo: String,
@@ -140,6 +148,7 @@ pub enum Data {
         id: String,
         result: Result<CommitDiff, String>,
     },
+    PlanSubmitted(SubmissionOutcome),
 }
 
 /// How the status line should be drawn.
@@ -170,6 +179,10 @@ pub struct App {
     pub stubs: Vec<FrameStub>,
     pub lane_count: usize,
     pub detail: DetailPane,
+    /// A modal review blocks every ordinary navigation action until the user
+    /// approves or refuses it. #461 hands received `/api/plan` bytes to
+    /// [`App::present_plan`]; this slice owns everything after that seam.
+    pub plan_review: Option<PlanReviewPane>,
     cursors: [usize; 4],
     pub status: Status,
     /// Catalog reads dispatched and not yet answered.
@@ -195,6 +208,7 @@ impl App {
             stubs: Vec::new(),
             lane_count: 0,
             detail: DetailPane::default(),
+            plan_review: None,
             cursors: [0; 4],
             status: Status {
                 text: String::from("connecting to git-vista-server…"),
@@ -213,6 +227,9 @@ impl App {
 
     /// Fold one action in; the reads it asks for come back to the loop.
     pub fn apply(&mut self, action: Action) -> Vec<Fetch> {
+        if self.plan_review.is_some() {
+            return self.apply_plan_review(action);
+        }
         match action {
             Action::Quit => {
                 self.quit = true;
@@ -272,12 +289,29 @@ impl App {
                 }
                 Vec::new()
             }
+            Action::ApprovePlan | Action::RefusePlan => Vec::new(),
         }
     }
 
     /// Fold one answer in.
     pub fn receive(&mut self, data: Data) {
         match data {
+            Data::PlanReady(result) => match result {
+                Ok(wire) => {
+                    if let Err(message) = self.present_plan(wire) {
+                        self.status = Status {
+                            text: message,
+                            tone: Tone::Error,
+                        };
+                    }
+                }
+                Err(message) => {
+                    self.status = Status {
+                        text: message,
+                        tone: Tone::Error,
+                    };
+                }
+            },
             Data::Catalog(result) => {
                 self.in_flight = self.in_flight.saturating_sub(1);
                 match result {
@@ -377,6 +411,99 @@ impl App {
                     );
                 }
             }
+            Data::PlanSubmitted(outcome) => {
+                let success = matches!(outcome, SubmissionOutcome::Executed(_));
+                let message = outcome.message();
+                if success {
+                    self.plan_review = None;
+                    self.status = Status {
+                        text: message,
+                        tone: Tone::Info,
+                    };
+                } else if let Some(review) = self.plan_review.as_mut() {
+                    review.receive(outcome);
+                    self.status = Status {
+                        text: message,
+                        tone: Tone::Error,
+                    };
+                }
+            }
+        }
+    }
+
+    /// Open the immutable review modal from the exact bytes `/api/plan`
+    /// returned. This is the integration seam for #461's operation builders.
+    fn present_plan(&mut self, wire: Vec<u8>) -> Result<(), String> {
+        let review = PlanReviewPane::from_wire(wire)?;
+        self.plan_review = Some(review);
+        self.status = Status {
+            text: String::from("review the plan · a approve · Esc refuse · j/k scroll"),
+            tone: Tone::Info,
+        };
+        Ok(())
+    }
+
+    fn apply_plan_review(&mut self, action: Action) -> Vec<Fetch> {
+        match action {
+            Action::Quit => {
+                self.quit = true;
+                Vec::new()
+            }
+            Action::ApprovePlan => {
+                let Some(approval) = self.plan_review.as_mut().and_then(PlanReviewPane::approve)
+                else {
+                    return Vec::new();
+                };
+                self.status = Status {
+                    text: String::from("submitting reviewed plan for server re-validation…"),
+                    tone: Tone::Info,
+                };
+                vec![Fetch::ExecutePlan(approval)]
+            }
+            Action::RefusePlan => {
+                let submitting = self
+                    .plan_review
+                    .as_ref()
+                    .is_some_and(PlanReviewPane::is_submitting);
+                if submitting {
+                    self.status = Status {
+                        text: String::from(
+                            "approval is already submitted; wait for the server's answer",
+                        ),
+                        tone: Tone::Error,
+                    };
+                } else {
+                    self.plan_review = None;
+                    self.status = Status {
+                        text: String::from("plan refused locally · nothing was executed"),
+                        tone: Tone::Info,
+                    };
+                }
+                Vec::new()
+            }
+            Action::CursorDown => {
+                if let Some(review) = self.plan_review.as_mut() {
+                    review.scroll(1);
+                }
+                Vec::new()
+            }
+            Action::CursorUp => {
+                if let Some(review) = self.plan_review.as_mut() {
+                    review.scroll(-1);
+                }
+                Vec::new()
+            }
+            // The modal owns the keyboard until a decision is made. In
+            // particular, refresh cannot silently replace a stale plan.
+            Action::FocusNext
+            | Action::FocusPrev
+            | Action::Focus(_)
+            | Action::Refresh
+            | Action::Activate
+            | Action::ParentPrev
+            | Action::ParentNext
+            | Action::HorizontalLeft
+            | Action::HorizontalRight => Vec::new(),
         }
     }
 
@@ -512,7 +639,10 @@ fn short_id(id: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use git_vista_core::model::{CommitSummary, Oid};
-    use git_vista_protocol::plan::GenerationToken;
+    use git_vista_protocol::{
+        GenerationToken, GitOperation, OperationHash, Plan, RecoveryStrategy, RepositoryToken,
+        RiskLevel, UnixSeconds, WorktreeToken,
+    };
 
     use super::*;
 
@@ -536,6 +666,24 @@ mod tests {
         assert_eq!(app.start(), [Fetch::Catalog]);
         app.receive(Data::Catalog(Ok(catalog(wire))));
         app
+    }
+
+    fn plan_wire() -> Vec<u8> {
+        serde_json::to_vec(&Plan {
+            repository: RepositoryToken::new("repo-1").unwrap(),
+            worktree: WorktreeToken::new("worktree-1").unwrap(),
+            generation: GenerationToken::new("generation-reviewed").unwrap(),
+            operation: GitOperation::StageAll,
+            operation_hash: OperationHash::new("a".repeat(64)).unwrap(),
+            issued_at: UnixSeconds(1_788_365_000),
+            expires_at: UnixSeconds(1_788_365_300),
+            risk: RiskLevel::Safe,
+            preconditions: Vec::new(),
+            expected_ref_changes: Vec::new(),
+            advisories: Vec::new(),
+            recovery: RecoveryStrategy::NotNeeded,
+        })
+        .unwrap()
     }
 
     fn page(rows: &[(&str, &str)]) -> CommitPage {
@@ -878,5 +1026,65 @@ mod tests {
         app.apply(Action::HorizontalLeft);
         assert_eq!(app.cursor(Pane::Main), 1);
         assert_eq!(app.detail.horizontal(), 0);
+    }
+
+    #[test]
+    fn a_received_plan_blocks_navigation_until_it_is_refused_locally() {
+        let mut app = loaded(THREE);
+        app.receive(Data::PlanReady(Ok(plan_wire())));
+        assert!(app.plan_review.is_some());
+
+        let focus = app.focus;
+        assert!(app.apply(Action::FocusNext).is_empty());
+        assert_eq!(app.focus, focus, "the shell moved underneath its modal");
+        assert!(app.apply(Action::Refresh).is_empty());
+
+        assert!(app.apply(Action::RefusePlan).is_empty());
+        assert!(app.plan_review.is_none());
+        assert_eq!(
+            app.status.text,
+            "plan refused locally · nothing was executed"
+        );
+    }
+
+    #[test]
+    fn approval_mints_one_submission_and_a_stale_answer_is_not_retried() {
+        let wire = plan_wire();
+        let mut app = loaded(THREE);
+        app.receive(Data::PlanReady(Ok(wire.clone())));
+
+        let requests = app.apply(Action::ApprovePlan);
+        let [Fetch::ExecutePlan(approval)] = requests.as_slice() else {
+            panic!("approval did not produce exactly one execute request: {requests:?}");
+        };
+        assert_eq!(approval.body(), wire);
+        assert!(
+            app.apply(Action::ApprovePlan).is_empty(),
+            "a repeated key press minted another request"
+        );
+
+        app.receive(Data::PlanSubmitted(SubmissionOutcome::Stale));
+        assert!(app.plan_review.is_some(), "the refusal details vanished");
+        assert_eq!(
+            app.status.text,
+            "Plan is stale. It was not executed. Build and review a new plan."
+        );
+        assert!(
+            app.apply(Action::Refresh).is_empty(),
+            "a stale refusal silently rebuilt the plan"
+        );
+    }
+
+    #[test]
+    fn a_successful_approval_closes_the_modal_and_surfaces_the_receipt() {
+        let mut app = loaded(THREE);
+        app.receive(Data::PlanReady(Ok(plan_wire())));
+        assert_eq!(app.apply(Action::ApprovePlan).len(), 1);
+        app.receive(Data::PlanSubmitted(SubmissionOutcome::Executed(
+            "Staged all changes.".to_string(),
+        )));
+        assert!(app.plan_review.is_none());
+        assert_eq!(app.status.text, "Staged all changes.");
+        assert_eq!(app.status.tone, Tone::Info);
     }
 }

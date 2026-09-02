@@ -23,31 +23,51 @@ use git_vista_session::retry;
 use serde::de::DeserializeOwned;
 
 use crate::app::{Data, Fetch};
+use crate::panes::plan_review::{PlanApproval, SubmissionOutcome};
 
 pub const CATALOG_PATH: &str = "/api/catalog";
 pub const HISTORY_LIMIT: usize = 250;
+pub const EXECUTE_PLAN_PATH: &str = "/api/execute-plan";
 
 pub type FetchFn = Box<dyn FnMut(&str, &str) -> Result<HttpResponse, String> + Send>;
+pub type PostFn =
+    Box<dyn FnMut(&str, &[u8], &str, &str, &str) -> Result<HttpResponse, String> + Send>;
 pub type AuthFn = Box<dyn FnMut() -> Result<Session, String> + Send>;
 
 pub struct Client {
     session: Option<Session>,
     fetch: FetchFn,
+    post: PostFn,
     auth: AuthFn,
 }
 
 impl Client {
     pub fn live() -> Client {
-        Client::with(
+        Client::with_transport(
             Box::new(|path, cookie| http::get(path, Some(cookie))),
+            Box::new(|path, body, cookie, csrf, key| {
+                http::post_json_idempotent(path, body, Some(cookie), Some(csrf), key)
+            }),
             Box::new(auth::authenticate),
         )
     }
 
+    #[cfg(test)]
     pub fn with(fetch: FetchFn, auth: AuthFn) -> Client {
+        Client::with_transport(
+            fetch,
+            Box::new(|path, body, cookie, csrf, key| {
+                http::post_json_idempotent(path, body, Some(cookie), Some(csrf), key)
+            }),
+            auth,
+        )
+    }
+
+    pub fn with_transport(fetch: FetchFn, post: PostFn, auth: AuthFn) -> Client {
         Client {
             session: None,
             fetch,
+            post,
             auth,
         }
     }
@@ -78,7 +98,48 @@ impl Client {
                 let result = self.get_json(&path);
                 Data::Diff { repo, id, result }
             }
+            Fetch::ExecutePlan(approval) => Data::PlanSubmitted(self.submit_plan(&approval)),
         }
+    }
+
+    /// Submit exactly one reviewed plan. Only a 401 earns a retry, and that
+    /// retry reuses the same body and idempotency key. A 409 is an operation
+    /// refusal, never a prompt to rebuild or resubmit behind the user's back.
+    fn submit_plan(&mut self, approval: &PlanApproval) -> SubmissionOutcome {
+        if self.session.is_none() {
+            match (self.auth)() {
+                Ok(session) => self.session = Some(session),
+                Err(message) => return SubmissionOutcome::TransportFailed(message),
+            }
+        }
+
+        let response = self.post_approval(approval);
+        let response = match response {
+            Ok(response) if response.status == 401 => {
+                match (self.auth)() {
+                    Ok(session) => self.session = Some(session),
+                    Err(message) => return SubmissionOutcome::TransportFailed(message),
+                }
+                self.post_approval(approval)
+            }
+            other => other,
+        };
+
+        match response {
+            Ok(response) => SubmissionOutcome::from_response(response.status, &response.body),
+            Err(message) => SubmissionOutcome::TransportFailed(message),
+        }
+    }
+
+    fn post_approval(&mut self, approval: &PlanApproval) -> Result<HttpResponse, String> {
+        let session = self.session.as_ref().expect("authenticated above");
+        (self.post)(
+            EXECUTE_PLAN_PATH,
+            approval.body(),
+            &session.cookie,
+            &session.csrf,
+            approval.key(),
+        )
     }
 }
 
@@ -145,6 +206,7 @@ fn stopped_answer(fetch: Fetch) -> Data {
             id,
             result: Err(message()),
         },
+        Fetch::ExecutePlan(_) => Data::PlanSubmitted(SubmissionOutcome::TransportFailed(message())),
     }
 }
 
@@ -155,9 +217,13 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use git_vista_protocol::RepositoryDescriptor;
+    use git_vista_protocol::{
+        GenerationToken, GitOperation, OperationHash, Plan, RecoveryStrategy, RepositoryDescriptor,
+        RepositoryToken, RiskLevel, UnixSeconds, WorktreeToken,
+    };
 
     use super::*;
+    use crate::panes::plan_review::PlanReviewPane;
 
     const ALPHA: &str = r#"[
       {"repository":"r1","worktree":"w1","name":"alpha","kind":"main_worktree","read_only":false}
@@ -179,6 +245,31 @@ mod tests {
             headers: Vec::new(),
             body: body.as_ref().to_vec(),
         }
+    }
+
+    fn approval() -> (Vec<u8>, PlanApproval) {
+        let wire = format!(
+            " {}\n",
+            serde_json::to_string(&Plan {
+                repository: RepositoryToken::new("repo-1").unwrap(),
+                worktree: WorktreeToken::new("worktree-1").unwrap(),
+                generation: GenerationToken::new("generation-reviewed").unwrap(),
+                operation: GitOperation::StageAll,
+                operation_hash: OperationHash::new("a".repeat(64)).unwrap(),
+                issued_at: UnixSeconds(1_788_365_000),
+                expires_at: UnixSeconds(1_788_365_300),
+                risk: RiskLevel::Safe,
+                preconditions: Vec::new(),
+                expected_ref_changes: Vec::new(),
+                advisories: Vec::new(),
+                recovery: RecoveryStrategy::NotNeeded,
+            })
+            .unwrap()
+        )
+        .into_bytes();
+        let mut pane = PlanReviewPane::from_wire(wire.clone()).unwrap();
+        let approval = pane.approve().unwrap();
+        (wire, approval)
     }
 
     #[test]
@@ -361,5 +452,78 @@ mod tests {
             None => panic!("a stopped worker silently lost the request"),
             Some(_) => panic!("a catalog request became a different answer kind"),
         }
+    }
+
+    #[test]
+    fn a_409_is_returned_as_stale_after_one_post_with_the_exact_reviewed_bytes() {
+        let (wire, approval) = approval();
+        let posts = Arc::new(AtomicUsize::new(0));
+        let post_count = Arc::clone(&posts);
+        let mut client = Client::with_transport(
+            Box::new(|_, _| panic!("approval is not a GET")),
+            Box::new(move |path, body, cookie, csrf, key| {
+                post_count.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(path, EXECUTE_PLAN_PATH);
+                assert_eq!(body, wire);
+                assert_eq!(cookie, "gv_session=gen1");
+                assert_eq!(csrf, "csrf-gen1");
+                assert!(key.starts_with("tui-"));
+                Ok(response(
+                    409,
+                    "The repository changed while this plan was pending — refresh and try again.",
+                ))
+            }),
+            Box::new(|| Ok(session(1))),
+        );
+
+        assert!(matches!(
+            client.serve(Fetch::ExecutePlan(approval)),
+            Data::PlanSubmitted(SubmissionOutcome::Stale)
+        ));
+        assert_eq!(
+            posts.load(Ordering::SeqCst),
+            1,
+            "a staleness refusal was silently retried"
+        );
+    }
+
+    #[test]
+    fn only_a_401_reauthenticates_and_it_reuses_the_body_and_idempotency_key() {
+        let (wire, approval) = approval();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&seen);
+        let auths = Arc::new(AtomicUsize::new(0));
+        let auth_count = Arc::clone(&auths);
+        let mut client = Client::with_transport(
+            Box::new(|_, _| panic!("approval is not a GET")),
+            Box::new(move |_, body, cookie, _csrf, key| {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push((body.to_vec(), cookie.to_string(), key.to_string()));
+                if cookie == "gv_session=gen1" {
+                    Ok(response(401, "session ended"))
+                } else {
+                    Ok(response(200, "Staged all changes."))
+                }
+            }),
+            Box::new(move || {
+                let generation = auth_count.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(session(generation))
+            }),
+        );
+
+        assert!(matches!(
+            client.serve(Fetch::ExecutePlan(approval)),
+            Data::PlanSubmitted(SubmissionOutcome::Executed(_))
+        ));
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, wire);
+        assert_eq!(calls[1].0, calls[0].0);
+        assert_eq!(calls[0].1, "gv_session=gen1");
+        assert_eq!(calls[1].1, "gv_session=gen2");
+        assert_eq!(calls[1].2, calls[0].2, "retry changed its intent key");
+        assert_eq!(auths.load(Ordering::SeqCst), 2);
     }
 }
