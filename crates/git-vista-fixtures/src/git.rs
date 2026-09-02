@@ -319,15 +319,25 @@ mod tests {
     /// `GIT_TRACE=1` settles it directly: git prints the spawn, or it does not.
     /// No race, no snapshot, no reliance on a lock file still being on disk.
     ///
-    /// # Two mutations, both real
+    /// # Two mutations, both real — but not both against THIS test
     ///
     /// 1. **Removes the mechanism** — delete the `-c maintenance.auto=false`
-    ///    pair from [`ident_args`]. The trace then carries
-    ///    `run_command: git maintenance run --auto --quiet --detach` and this
-    ///    test fails on the negative assertion.
-    /// 2. **Weakens it** — set `maintenance.auto=true` instead of `false`. Same
-    ///    spawn, same failure, reached through a config value that *looks*
-    ///    deliberate rather than through a missing argument.
+    ///    pair from [`ident_args`]. **This test does not catch it**: `init`
+    ///    already routed through [`init_as`], which wrote the same setting
+    ///    into the repository's own local config, so the commit below is
+    ///    still protected by that second layer. An earlier version of this
+    ///    comment claimed otherwise — a fresh reader's mutation run
+    ///    disproved it; the two suppressors are confounded here on purpose,
+    ///    because that is what a real fixture commit looks like. What
+    ///    *does* redden on this mutation is the structural companion test
+    ///    below (it reads [`ident_args`] directly), and, more importantly,
+    ///    [`a_bare_local_config_free_commit_needs_the_dash_c_override`] —
+    ///    which exists specifically because nothing here isolated `-c` from
+    ///    local config until that gap was found.
+    /// 2. **Weakens it** — set `maintenance.auto=true` instead of `false`.
+    ///    This one DOES redden this test: it changes what [`init_as`] itself
+    ///    writes, so both layers see the weaker value at once and the spawn
+    ///    happens.
     ///
     /// Note what is deliberately **not** offered as a mutation: dropping
     /// `-c gc.auto=0` while keeping `maintenance.auto=false`. Measured on git
@@ -372,6 +382,79 @@ mod tests {
              asynchronously, so a test photographing .git before and after an \
              operation catches it in one snapshot and not the other and fails on \
              a file it never touched. That is #598. Trace was: {trace}"
+        );
+    }
+
+    /// A commit routed through this module, in a repository [`init_as`] never
+    /// built — so `-c maintenance.auto=false` is the ONLY suppressor in play,
+    /// not confounded with the local config `init_as` also writes.
+    ///
+    /// The test above shares a fixture built by [`init`], so it cannot tell
+    /// `-c` and local config apart: dropping `-c` from [`ident_args`] leaves
+    /// local config still holding `false`, and that test stays green (a fresh
+    /// reader's mutation run proved this — see the corrected comment above).
+    /// A real repository with no local override exists in this codebase
+    /// today: `divergent.rs::clone_onto` builds one with a bare `git clone`,
+    /// which does not copy the source repository's custom config keys, and
+    /// every subsequent commit against it goes through this module's `run`/
+    /// `command`, never through [`init_as`] again. This test stands in for
+    /// that shape directly, rather than depending on another module's fixture
+    /// staying built the way it happens to be built today.
+    #[test]
+    fn a_commit_with_no_local_maintenance_config_is_protected_by_dash_c_alone() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("create fixture repo directory");
+
+        // Deliberately NOT `init_as`: identity only, no maintenance override
+        // written to local config. This is the one difference from the test
+        // above, and it is the whole point of this test.
+        let identity_only = Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "init", "-q", "-b", "main"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("run git init");
+        assert!(identity_only.success(), "git init failed");
+        for (key, value) in [
+            ("user.name", CATALOGUE.name),
+            ("user.email", CATALOGUE.email),
+        ] {
+            let status = Command::new("git")
+                .args(["-C", repo.to_str().unwrap(), "config", key, value])
+                .status()
+                .expect("run git config");
+            assert!(status.success(), "git config {key} failed");
+        }
+
+        // Routed through THIS module, so `ident_args`'s `-c` applies — the
+        // thing this test exists to isolate.
+        let output = command(
+            &repo,
+            &["commit", "-q", "--allow-empty", "-m", "trace maintenance"],
+        )
+        .env("GIT_TRACE", "1")
+        .output()
+        .expect("run a traced commit with no local maintenance config");
+        assert!(
+            output.status.success(),
+            "the traced commit failed, so the assertions below say nothing \
+             about maintenance: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let trace = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            trace.contains("built-in: git commit"),
+            "GIT_TRACE produced no commit event, so the check below is vacuous: \
+             {trace}"
+        );
+        assert!(
+            !trace.contains("maintenance run"),
+            "a commit with no local maintenance config spawned auto-maintenance \
+             even with `-c maintenance.auto=false` on the command line — the \
+             override this test exists to prove is load-bearing on its own \
+             failed to suppress the spawn. Trace was: {trace}"
         );
     }
 
