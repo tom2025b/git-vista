@@ -7,3 +7,5 @@
 
 pub mod detail;
 pub mod graph;
+pub mod staging;
+pub mod worktree;
