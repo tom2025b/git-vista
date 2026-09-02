@@ -16,6 +16,8 @@
 //! | `Enter` | load a repository, open a commit, or follow a parent |
 //! | `[` / `]` | select the previous/next parent in Main |
 //! | `r`, `F5` | refresh |
+//! | `a` | approve the open plan review |
+//! | `Esc` | refuse/close the open plan review |
 //!
 //! The vi-shaped `hjkl` set is lazygit's, and lazygit is the interface this
 //! milestone is modelled on; the arrow and Tab set is for everyone else.
@@ -60,6 +62,8 @@ pub fn dispatch(key: KeyEvent, pane: Pane) -> Option<Action> {
         KeyCode::Char('[') if pane == Pane::Main => Some(Action::ParentPrev),
         KeyCode::Char(']') if pane == Pane::Main => Some(Action::ParentNext),
         KeyCode::F(5) | KeyCode::Char('r') => Some(Action::Refresh),
+        KeyCode::Char('a') => Some(Action::ApprovePlan),
+        KeyCode::Esc => Some(Action::RefusePlan),
         KeyCode::Char(d @ '1'..='9') => Pane::from_number(d.to_digit(10)? as u8).map(Action::Focus),
         _ => None,
     }
@@ -187,12 +191,17 @@ mod tests {
     fn an_unbound_key_is_none() {
         for key in [
             press(KeyCode::Char('x')),
-            press(KeyCode::Esc),
             press(KeyCode::Char(' ')),
             press(KeyCode::F(1)),
         ] {
             assert_eq!(global(key), None, "{key:?}");
         }
+    }
+
+    #[test]
+    fn a_approves_and_escape_refuses_a_plan_review() {
+        assert_eq!(global(press(KeyCode::Char('a'))), Some(Action::ApprovePlan));
+        assert_eq!(global(press(KeyCode::Esc)), Some(Action::RefusePlan));
     }
 
     #[test]

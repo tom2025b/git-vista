@@ -9,13 +9,14 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::{App, Pane, Tone};
 use crate::layout;
 use crate::panes::detail::RowTone;
 use crate::panes::graph::{self, ColorDepth, Emphasis, Foreground, GraphLine, LayoutData};
+use crate::panes::plan_review::{PlanReviewPane, RowTone as PlanRowTone};
 
 /// Draw one complete frame from the current application state.
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -61,6 +62,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     );
     draw_commits(frame, panes.of(Pane::Commits), app, detect_color_depth());
     draw_main(frame, panes.of(Pane::Main), app);
+    if let Some(review) = &app.plan_review {
+        draw_plan_review(frame, area, review);
+    }
 
     let status_style = match app.status.tone {
         Tone::Info => Style::default(),
@@ -70,6 +74,54 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Paragraph::new(app.status.text.as_str()).style(status_style),
         panes.status,
     );
+}
+
+/// Draw plan review as a modal over the shell: no pane underneath can look
+/// actionable while the reducer is deliberately ignoring its navigation.
+fn draw_plan_review(frame: &mut Frame, area: Rect, review: &PlanReviewPane) {
+    let margin_x = if area.width >= 70 { 4 } else { 1 };
+    let margin_y = if area.height >= 18 { 2 } else { 1 };
+    let modal = Rect {
+        x: area.x + margin_x,
+        y: area.y + margin_y,
+        width: area.width.saturating_sub(margin_x * 2),
+        // Leave the shell's final status row visible.
+        height: area.height.saturating_sub(margin_y * 2 + 1),
+    };
+    let block = Block::bordered()
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Line::styled(
+            " Plan review — nothing runs until approval ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Line::from(format!(" {} ", review.help())));
+    let rows = review.rows();
+    let lines: Vec<Line<'static>> = rows
+        .into_iter()
+        .skip(review.offset())
+        .map(|row| Line::styled(row.text, plan_tone_style(row.tone)))
+        .collect();
+
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(block),
+        modal,
+    );
+}
+
+fn plan_tone_style(tone: PlanRowTone) -> Style {
+    match tone {
+        PlanRowTone::Plain => Style::default(),
+        PlanRowTone::Heading => Style::default().add_modifier(Modifier::BOLD),
+        PlanRowTone::Muted => Style::default().fg(Color::DarkGray),
+        PlanRowTone::Risk => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        PlanRowTone::Advisory => Style::default().fg(Color::Yellow),
+        PlanRowTone::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    }
 }
 
 fn pane_block(pane: Pane, focus: Pane) -> Block<'static> {
@@ -235,8 +287,10 @@ mod tests {
     use git_vista_core::diff::{CommitDiff, DiffFile};
     use git_vista_core::model::{CommitDetail, CommitSummary, GraphRow, Oid};
     use git_vista_core::status::ChangeKind;
-    use git_vista_protocol::plan::GenerationToken;
-    use git_vista_protocol::RepositoryDescriptor;
+    use git_vista_protocol::{
+        GenerationToken, GitOperation, OperationHash, Plan, RecoveryStrategy, RepositoryDescriptor,
+        RepositoryToken, RiskLevel, UnixSeconds, WorktreeToken,
+    };
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
@@ -259,6 +313,26 @@ mod tests {
         let catalog: Vec<RepositoryDescriptor> =
             serde_json::from_str(THREE).expect("the wire literal is valid");
         app.receive(Data::Catalog(Ok(catalog)));
+        app
+    }
+
+    fn reviewing() -> App {
+        let mut app = loaded();
+        let plan = Plan {
+            repository: RepositoryToken::new("repo-1").unwrap(),
+            worktree: WorktreeToken::new("worktree-1").unwrap(),
+            generation: GenerationToken::new("generation-reviewed").unwrap(),
+            operation: GitOperation::StageAll,
+            operation_hash: OperationHash::new("a".repeat(64)).unwrap(),
+            issued_at: UnixSeconds(1_788_365_000),
+            expires_at: UnixSeconds(1_788_365_300),
+            risk: RiskLevel::Remote,
+            preconditions: Vec::new(),
+            expected_ref_changes: Vec::new(),
+            advisories: Vec::new(),
+            recovery: RecoveryStrategy::NotNeeded,
+        };
+        app.receive(Data::PlanReady(Ok(serde_json::to_vec(&plan).unwrap())));
         app
     }
 
@@ -739,5 +813,45 @@ mod tests {
             ColorDepth::Basic,
             "an unrecognised COLORTERM value must not be treated as rich"
         );
+    }
+
+    #[test]
+    fn plan_review_is_a_visible_modal_with_decision_keys_and_expiry() {
+        let app = reviewing();
+        let terminal = rendered(100, 30, &app);
+        let buffer = terminal.backend().buffer();
+        let screen = text(buffer);
+        for expected in [
+            "Plan review",
+            "nothing runs until approval",
+            "a approve",
+            "Esc refuse",
+            "expires: 1788365300",
+            "Preconditions",
+            "Expected ref changes",
+            "REMOTE",
+        ] {
+            assert!(screen.contains(expected), "missing {expected:?}:\n{screen}");
+        }
+        assert!(
+            buffer.content().iter().any(|cell| cell.fg == Color::Yellow),
+            "the modal had no review/risk emphasis"
+        );
+    }
+
+    #[test]
+    fn stale_refusal_replaces_server_cause_with_the_honest_message() {
+        let mut app = reviewing();
+        assert_eq!(app.apply(Action::ApprovePlan).len(), 1);
+        app.receive(Data::PlanSubmitted(
+            crate::panes::plan_review::SubmissionOutcome::from_response(
+                409,
+                b"The repository changed while this plan was pending",
+            ),
+        ));
+        let terminal = rendered(100, 30, &app);
+        let screen = text(terminal.backend().buffer());
+        assert!(screen.contains("Plan is stale."), "{screen}");
+        assert!(!screen.contains("repository changed"), "{screen}");
     }
 }
