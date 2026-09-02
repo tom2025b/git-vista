@@ -1561,6 +1561,7 @@ impl ScratchStore {
             let Some(lease) = Self::abandoned_store_lease(&path) else {
                 continue;
             };
+            #[cfg_attr(not(test), allow(unused_variables))]
             let removed = std::fs::remove_dir_all(&path);
             #[cfg(test)]
             if let Err(error) = &removed {
