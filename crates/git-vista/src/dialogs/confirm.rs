@@ -14,11 +14,12 @@ use leptos::*;
 use git_vista_core::activity::UndoAction;
 use git_vista_protocol::MergeStrategy;
 
+use crate::features::dialogs::core::preview_subject;
 use crate::features::dialogs::core::{
     cherry_pick_confirm_prompt, delete_confirm_prompt, merge_confirm_prompt, worktree_confirm,
     ConfirmPrompt, Dialog, PullTarget, WorktreeAction, TOUCH_TARGET_STYLE,
 };
-use crate::features::preview::core::{previewable, DialogSubject};
+use crate::features::preview::core::previewable;
 
 use crate::features::preview::signals::PreviewSlot;
 
@@ -505,36 +506,6 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                 </div>
             }
         })
-    }
-}
-
-/// Which confirmation this is, in the vocabulary `previewable` decides on.
-///
-/// The one-line translation from the wasm-only `PendingOp` into
-/// `features::preview::core`'s framework-free [`DialogSubject`]. The *rule* —
-/// which subjects get a preview and which do not — lives there, where a host
-/// test can read it; this is only the part that has to name a type `cargo
-/// test` never compiles.
-///
-/// A revert reaches the modal as `Undo(UndoAction::RevertCommit)`, not as an
-/// operation of its own: it is the history-preserving undo for a commit that
-/// is already shared. The other two undo actions move or re-create a branch
-/// ref and the engine previews neither.
-///
-/// Cherry-pick now has a dialog to appear in: #599 gave it the
-/// `POST /api/cherry-pick` door and the confirmation that fronts it, which is
-/// the menu entry this note used to be waiting for. Its `onto` is dropped on
-/// purpose — see [`DialogSubject::CherryPick`]; the destination is HEAD as the
-/// server reads it, not as the menu resolved it.
-fn preview_subject(op: &PendingOp) -> DialogSubject<'_> {
-    match op {
-        PendingOp::Merge { branch, .. } => DialogSubject::Merge { branch },
-        PendingOp::CherryPick { commit, .. } => DialogSubject::CherryPick { commit },
-        PendingOp::Undo(u) => match &u.action {
-            UndoAction::RevertCommit { commit } => DialogSubject::Revert { commit },
-            _ => DialogSubject::NotPreviewable,
-        },
-        _ => DialogSubject::NotPreviewable,
     }
 }
 

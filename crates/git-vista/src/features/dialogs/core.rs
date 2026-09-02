@@ -17,7 +17,10 @@
 //! ever the guarded one. The three separate clocks were never deliberate isolation — they
 //! were three copies of the same idea that happened never to overlap.
 
-use crate::features::operations::kind::HeadBranch;
+use git_vista_core::activity::UndoAction;
+
+use crate::features::operations::kind::{HeadBranch, OperationKind};
+use crate::features::preview::core::DialogSubject;
 
 /// A modal that dismisses by backdrop tap, and therefore needs the guard.
 ///
@@ -899,6 +902,54 @@ pub fn cherry_pick_confirm_prompt(commit: &str, onto: &HeadBranch) -> ConfirmPro
     }
 }
 
+/// Which confirmation this is, in the vocabulary [`previewable`] decides on.
+///
+/// # Why this lives here and not in `dialogs/confirm.rs`
+///
+/// It used to live there, beside the modal it feeds. That put a *decision* —
+/// which operation gets a preview and which does not — in a wasm-gated file,
+/// and this repo has no wasm test runner: CI compiles that file
+/// (`clippy --target wasm32`, `trunk build`) and lints it, but nothing ever
+/// executes it. A rule written there is unprovable by construction.
+///
+/// `confirm.rs`'s own module doc already states the rule this move obeys:
+/// which ceremony an operation gets, and every word either one shows, is
+/// decided in this module, and `confirm.rs` is the part that needs a DOM.
+/// Mapping an operation to a preview subject is the former, so it belongs
+/// here, where `cargo test` can reach it.
+///
+/// The `PendingOp` alias in `crate::state` is wasm-gated, but
+/// [`OperationKind`] itself — the type behind it — is not, which is what makes
+/// this movable at all.
+///
+/// # The arms
+///
+/// A revert reaches the modal as `Undo(UndoAction::RevertCommit)`, not as an
+/// operation of its own: it is the history-preserving undo for a commit that
+/// is already shared. The other two undo actions move or re-create a branch
+/// ref and the engine previews neither.
+///
+/// Cherry-pick's `onto` is dropped on purpose — see
+/// [`DialogSubject::CherryPick`]. The pick lands on whatever HEAD is checked
+/// out when the server runs it, and the engine reads that itself.
+///
+/// Everything else is [`DialogSubject::NotPreviewable`], which is the seam
+/// that matters: the caller turns it into `preview.clear()`, so a wrong answer
+/// here does not draw a wrong picture — it draws no panel at all.
+///
+/// [`previewable`]: crate::features::preview::core::previewable
+pub fn preview_subject(op: &OperationKind) -> DialogSubject<'_> {
+    match op {
+        OperationKind::Merge { branch, .. } => DialogSubject::Merge { branch },
+        OperationKind::CherryPick { commit, .. } => DialogSubject::CherryPick { commit },
+        OperationKind::Undo(u) => match &u.action {
+            UndoAction::RevertCommit { commit } => DialogSubject::Revert { commit },
+            _ => DialogSubject::NotPreviewable,
+        },
+        _ => DialogSubject::NotPreviewable,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1682,6 +1733,8 @@ mod tests {
 mod branch_prompt_tests {
     use super::*;
 
+    use git_vista_core::activity::Undoable;
+
     fn known(b: &str) -> HeadBranch {
         HeadBranch::Known(b.into())
     }
@@ -1904,5 +1957,113 @@ mod branch_prompt_tests {
             assert!(p.arm.is_none(), "a pick is a single-tap ceremony");
             assert_eq!(p.confirm_label, "Cherry-pick");
         }
+    }
+
+    fn undoable(action: UndoAction) -> Undoable {
+        Undoable {
+            action,
+            label: "undo".into(),
+            warn_pushed: false,
+        }
+    }
+
+    /// Each of the three previewable confirmations names its own subject, and
+    /// names it as the right VARIANT.
+    ///
+    /// This is #594's criterion 1 — "call `/api/preview` from the revert,
+    /// cherry-pick and merge confirm dialogs" — at the only layer that can be
+    /// tested. It lived in `dialogs/confirm.rs` until this commit, which CI
+    /// compiles for wasm and lints but never executes; there is no wasm test
+    /// runner in this repo, so every assertion below was previously
+    /// unwritable.
+    ///
+    /// # Two mutations
+    ///
+    /// 1. **REMOVES the mapping** — drop the `CherryPick` arm so it falls to
+    ///    the `_` catch-all and returns `NotPreviewable`. The cherry-pick
+    ///    assertion goes red; merge and revert still pass, so the arm that
+    ///    broke is named rather than the whole function.
+    /// 2. **WEAKENS the mapping** — return `DialogSubject::Revert` from the
+    ///    `CherryPick` arm. Both carry one commit id, so the id-level facts are
+    ///    identical and a test comparing only the commit would pass straight
+    ///    through it — while the dialog asked the server to picture the exact
+    ///    inverse of what it is about to do. Matching on the variant is what
+    ///    goes red.
+    #[test]
+    fn the_three_previewable_confirmations_each_name_their_own_subject() {
+        assert_eq!(
+            preview_subject(&OperationKind::Merge {
+                branch: "feature".into(),
+                into: HeadBranch::Known("main".into()),
+            }),
+            DialogSubject::Merge { branch: "feature" },
+            "a merge confirmation must ask for a merge preview"
+        );
+
+        let commit = "a".repeat(40);
+        assert_eq!(
+            preview_subject(&OperationKind::Undo(undoable(UndoAction::RevertCommit {
+                commit: commit.clone(),
+            }))),
+            DialogSubject::Revert { commit: &commit },
+            "a revert reaches this modal as an Undo, and must still be previewed"
+        );
+
+        let picked = "b".repeat(40);
+        assert_eq!(
+            preview_subject(&OperationKind::CherryPick {
+                commit: picked.clone(),
+                onto: HeadBranch::Known("main".into()),
+            }),
+            DialogSubject::CherryPick { commit: &picked },
+            "a cherry-pick confirmation must ask for a CherryPick preview — \
+             Revert carries the same single commit id and is the exact inverse"
+        );
+    }
+
+    /// Everything else draws no panel at all, rather than a wrong one.
+    ///
+    /// `NotPreviewable` is the seam: the caller in `confirm.rs` turns it into
+    /// `preview.clear()`, so a confirmation the engine cannot picture shows
+    /// nothing instead of a plausible picture of the wrong operation. The two
+    /// undo actions that are NOT a revert matter most here — they reach the
+    /// same `Undo` arm as the one that IS previewable, so a careless `_` inside
+    /// that inner match would preview a branch reset as a commit revert.
+    ///
+    /// # Two mutations
+    ///
+    /// 1. **REMOVES the discrimination** — map the whole `Undo` arm to
+    ///    `Revert { commit: "" }`. The two undo assertions go red; the positive
+    ///    revert case in the test above still passes, which is exactly the
+    ///    asymmetry that names the defect.
+    /// 2. **WEAKENS the default** — have the `_` catch-all return
+    ///    `Merge { branch: "HEAD" }`. The `Push` assertion goes red; a
+    ///    confirmation nobody wired would otherwise spend two round trips
+    ///    asking the server about a branch no user named.
+    #[test]
+    fn an_unpreviewable_confirmation_asks_for_nothing() {
+        for action in [
+            UndoAction::RestoreBranch {
+                name: "gone".into(),
+                tip: "c".repeat(40),
+            },
+            UndoAction::ResetBranch {
+                branch: "main".into(),
+                to: "d".repeat(40),
+                expected_tip: "e".repeat(40),
+            },
+        ] {
+            assert_eq!(
+                preview_subject(&OperationKind::Undo(undoable(action))),
+                DialogSubject::NotPreviewable,
+                "an undo that moves a ref is not a preview the engine draws"
+            );
+        }
+
+        assert_eq!(
+            preview_subject(&OperationKind::DeleteLocalTag { tag: "v1".into() }),
+            DialogSubject::NotPreviewable,
+            "an operation the engine cannot picture must draw no panel at all"
+        );
     }
 }

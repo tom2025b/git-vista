@@ -286,11 +286,18 @@ fn sentence_list(parts: &[String]) -> String {
 
 /// What a confirm dialog is asking about, reduced to the part a preview needs.
 ///
-/// Deliberately **not** `PendingOp`. That type lives in `crate::state`, which
-/// is `#[cfg(target_arch = "wasm32")]`, so a decision written against it could
-/// never be host-tested — and "which dialogs get a preview" is exactly the
-/// kind of decision that rots silently when nothing can check it. The wasm
-/// dialog does the one-line translation; the rule lives here.
+/// Deliberately **not** `OperationKind`. Not because that type is unreachable
+/// — this doc used to say it "lives in `crate::state`, which is
+/// `#[cfg(target_arch = "wasm32")]`", and that was wrong: `crate::state`
+/// re-exports it under its old name `PendingOp`, but the definition is in
+/// `features::operations::kind`, which is framework-free and host-tested. The
+/// re-export path is wasm-only; the type is not.
+///
+/// The real reason is narrowness. This vocabulary carries only what a preview
+/// needs — a branch name, a commit id — so the preview core never has to know
+/// the operations vocabulary, and a new `OperationKind` variant cannot change
+/// what this file decides. `features::dialogs::core::preview_subject` does the
+/// translation, and is host-tested for it; the rule lives here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DialogSubject<'a> {
     /// `git merge --no-edit <branch>`.
