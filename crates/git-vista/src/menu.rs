@@ -209,7 +209,7 @@ pub fn menu_view(
                 view_items::build_view_items(shell, ic, &m);
             let (create_branch_item, create_tag_item) =
                 create_items::build_create_items(features, ic, &m);
-            let (commit_changes, commit_empty, amend_item) =
+            let (commit_changes, commit_empty, amend_item, cherry_pick_item) =
                 commit_items::build_commit_items(features, ic, &m);
             let (compare_anchor_item, compare_direct, compare_since) =
                 compare_items::build_compare_items(features, ic, &m);
@@ -262,6 +262,10 @@ pub fn menu_view(
                     {commit_changes}
                     {commit_empty}
                     {amend_item}
+                    // #596: with the commit writes, immediately before the
+                    // branch operations. A pick's subject is this commit; the
+                    // items below are about refs that live at it.
+                    {cherry_pick_item}
                     {branch_items}
                     {tag_items}
                     {rebase_item}

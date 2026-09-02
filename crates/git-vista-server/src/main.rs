@@ -153,7 +153,7 @@ use handlers::branch::{
     checkout_branch, create_branch, delete_branch, force_delete_branch, merge_branch, push_branch,
 };
 use handlers::clone::{clone_repo, clone_status, delete_clone_repo};
-use handlers::commit::{amend_commit, create_commit, stage_all, unstage_all};
+use handlers::commit::{amend_commit, cherry_pick, create_commit, stage_all, unstage_all};
 use handlers::conflicts::{
     blob_content, conflict_source, list_conflicts, resolve_conflict, resolve_conflict_content,
     worktree_file,
@@ -537,6 +537,12 @@ fn api_router(
             // `handlers::commit::amend_commit` for why this must never be a
             // widened `/api/commit` body.
             .route("/api/amend-commit", post(amend_commit))
+            // M10.09 (#596): cherry-pick one commit onto the checked-out
+            // branch. A dedicated write route, not the generic `/api/plan` +
+            // `/api/execute-plan` pair, so the frontend's write carries an
+            // idempotency key and lands in the operations registry like every
+            // other mutation — see `handlers::commit::cherry_pick`.
+            .route("/api/cherry-pick", post(cherry_pick))
             // Stage the working tree (`git add -A`) so the UI can stage, then commit.
             .route("/api/stage", post(stage_all))
             // The staging-selection surface (M2.17b, #213). All three under

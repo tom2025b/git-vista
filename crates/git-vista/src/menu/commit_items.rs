@@ -1,16 +1,25 @@
-//! The three "Commit …" items (Issue #33, M2.19c/#224): "Commit Changes",
-//! "Create empty commit", and "Amend last commit".
+//! The three "Commit …" items (Issue #33, M2.19c/#224) — "Commit Changes",
+//! "Create empty commit", "Amend last commit" — and, since M10.09 (#596),
+//! "Cherry-pick this commit".
+//!
+//! The first three write a commit from the working tree or rewrite the tip. The
+//! fourth copies an *existing* commit onto the current branch, which is why it
+//! sits here rather than with the branch operations: its subject is the commit
+//! dot the user tapped, not a ref living at it.
 
 use leptos::*;
 
-use crate::api::fetch_commit_detail;
+use crate::api::{fetch_commit_detail, fetch_head_branch};
+use crate::features::core_traits::RequestTarget;
 use crate::features::dialogs::commit::{amend_offer, AmendOffer};
-use crate::features::dialogs::core::Dialog;
+use crate::features::dialogs::core::{cherry_pick_offer, CherryPickOffer, Dialog};
 use crate::features::graph::core::disabled_menu_item_copy;
+use crate::features::operations::core::PendingIntent;
+use crate::features::operations::kind::HeadBranch;
 use crate::icons::GitIcons;
-use crate::state::{CommitIntent, Features, MenuData};
+use crate::state::{CommitIntent, Features, MenuData, PendingOp};
 
-/// Builds `(commit_changes, commit_empty, amend_item)`.
+/// Builds `(commit_changes, commit_empty, amend_item, cherry_pick_item)`.
 ///
 /// The two "Commit …" items (Issue #33). Clicking one closes the menu
 /// and opens the commit-message modal (below); the actual POST + refresh
@@ -28,9 +37,10 @@ pub(super) fn build_commit_items(
     features: Features,
     ic: &'static GitIcons,
     m: &MenuData,
-) -> (View, View, View) {
+) -> (View, View, View, View) {
     let Features {
         dialogs,
+        operations,
         status,
         shell,
         ..
@@ -208,5 +218,80 @@ pub(super) fn build_commit_items(
             .into_view()
         }
     };
-    (commit_changes, commit_empty, amend_item)
+    // "Cherry-pick this commit" (M10.09, #596) — the door the server has been
+    // waiting for since #576. `GitOperation::CherryPick`, its executor and its
+    // graph preview all existed; nothing in the app could ask for them.
+    //
+    // Shaped like `branch_items`' merge item rather than like the three above,
+    // because it asks the same question merge does: a pick lands on whatever
+    // branch is checked out *now*, not on the row that was tapped. So HEAD is
+    // resolved live on click and carried into the confirmation, which names the
+    // real destination — and distinguishes a detached HEAD from a read that
+    // failed, since `HeadBranch::Unknown` is not evidence of anything.
+    //
+    // The gate is `cherry_pick_offer`, in the host-tested core, for the reason
+    // `amend_offer` is: this file is wasm-only, so an inverted condition here
+    // would ship a cherry-pick item on every branch stub with nothing in the
+    // suite going red.
+    //
+    // No preview panel is built here. Routing through `shell.open_confirm` is
+    // what puts this operation in front of the confirm dialog's `/api/preview`
+    // panel (#594), which is also what answers the two cases this gate
+    // deliberately does not: a pick that is already an ancestor of HEAD, and a
+    // merge commit (`Previewable::CherryPick` returns `Unsupported` when the
+    // target has no sole parent).
+    let pick_commit = m.commit.clone();
+    let cherry_pick_item = match cherry_pick_offer(is_head, is_stub) {
+        CherryPickOffer::Offered => {
+            let on_pick = move |_| {
+                let commit = pick_commit.clone();
+                shell.close_menu();
+                // Minted synchronously, before the await: identity records when
+                // the user tapped, not when the HEAD read answered (M1.11, #64)
+                // — the same ordering every other live-resolved item keeps.
+                let seq = operations.next_seq();
+                let key = operations.request_key(RequestTarget::Commit(commit.clone()));
+                spawn_local(async move {
+                    let onto = HeadBranch::classify(fetch_head_branch().await);
+                    let intent = PendingIntent {
+                        seq,
+                        key,
+                        kind: PendingOp::CherryPick { commit, onto },
+                    };
+                    if !operations.admit_intent(&intent) {
+                        return;
+                    }
+                    // Start the ghost-click guard when the modal opens.
+                    dialogs.open(Dialog::Confirm);
+                    shell.open_confirm(intent.kind);
+                });
+            };
+            view! {
+                <button class="ctx-item" on:click=on_pick>
+                    // The commit glyph: what a pick produces is a new commit.
+                    <span class="nf ctx-icon">{ic.commit}</span>
+                    "Cherry-pick this commit"
+                </button>
+            }
+            .into_view()
+        }
+        CherryPickOffer::Blocked(reason) => {
+            let (aria_label, visible_reason) =
+                disabled_menu_item_copy("Cherry-pick this commit", reason);
+            view! {
+                <button
+                    class="ctx-item disabled"
+                    title=reason
+                    aria-disabled="true"
+                    aria-label=aria_label
+                >
+                    <span class="nf ctx-icon">{ic.commit}</span>
+                    "Cherry-pick this commit"
+                    <span class="ctx-item-reason">{visible_reason}</span>
+                </button>
+            }
+            .into_view()
+        }
+    };
+    (commit_changes, commit_empty, amend_item, cherry_pick_item)
 }

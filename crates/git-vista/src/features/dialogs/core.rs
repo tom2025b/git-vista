@@ -779,6 +779,126 @@ pub fn merge_confirm_prompt(branch: &str, into: &HeadBranch) -> ConfirmPrompt {
     }
 }
 
+/// Whether the "Cherry-pick this commit" menu item is offered (M10.09, #596).
+///
+/// Same shape as [`AmendOffer`](crate::features::dialogs::commit::AmendOffer)
+/// and for the same reason: #65's rule is that a disabled control states why,
+/// on screen. An item that is simply absent teaches the reader nothing, and
+/// "cherry-pick is missing" is the exact confusion that opened this issue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CherryPickOffer {
+    /// Enabled: this row is a commit a pick could copy onto the current branch.
+    Offered,
+    /// Disabled, carrying the reason the item must show.
+    Blocked(&'static str),
+}
+
+/// The gate for the "Cherry-pick this commit" menu item.
+///
+/// `is_head` — the tapped row is the commit HEAD resolves to. `is_stub` — the
+/// row is a branch stub rather than a commit dot.
+///
+/// # Why each condition blocks
+///
+/// **A stub** represents a branch, not a commit. `GitOperation::CherryPick`
+/// takes one `CommitOid`, so a pick from a stub would silently mean "its tip",
+/// which is a different thing from what the header names — the same
+/// header-names-the-branch reasoning that keeps tag deletion off stubs.
+///
+/// **HEAD itself** is the empty pick, and an empty pick is not a no-op: it is
+/// a *failure* that leaves state behind. `preview::NoOp`'s doc comment records
+/// the measurement — `git cherry-pick` passes no `--allow-empty`, so it exits 1
+/// with "The previous cherry-pick is now empty…", leaves HEAD where it was and
+/// leaves `CHERRY_PICK_HEAD` set, stranding the repository mid-sequence. Every
+/// other ancestor of HEAD fails the same way, but only this one is knowable
+/// without asking the server; the `/api/preview` panel in the confirm dialog is
+/// what answers for the rest, which is why they are not blocked here and are
+/// not claimed to be.
+///
+/// The stub case is checked first so a row which is somehow both gets the
+/// accurate reason, exactly as `amend_offer` orders its two.
+///
+/// Lives here rather than inline in `menu/commit_items.rs` because that file is
+/// wasm-only: an inverted condition there would put the item on every stub — or
+/// take it away everywhere — with nothing in the suite going red.
+pub fn cherry_pick_offer(is_head: bool, is_stub: bool) -> CherryPickOffer {
+    if is_stub {
+        return CherryPickOffer::Blocked(
+            "Cherry-pick copies one commit — open this menu on a commit dot, not a branch",
+        );
+    }
+    if is_head {
+        return CherryPickOffer::Blocked(
+            "This commit is already the tip of the current branch — there is nothing to copy",
+        );
+    }
+    CherryPickOffer::Offered
+}
+
+/// The confirmation for a cherry-pick (M10.09, #596).
+///
+/// Mirrors [`merge_confirm_prompt`] one operation over: `onto` is the live HEAD
+/// read taken when the item was clicked, and the three non-`Known` answers are
+/// kept apart rather than collapsed — a failed read is not a detached HEAD.
+///
+/// # The body says what failure leaves behind, because this operation leaves
+/// something behind
+///
+/// Merge and revert either happen or do not. A cherry-pick has a third outcome:
+/// it stops part-way and leaves the repository *mid-sequence*, with
+/// `.git/CHERRY_PICK_HEAD` written, needing `--skip` or `--abort` before
+/// anything else can proceed. That is measured behaviour recorded in
+/// `preview::NoOp`, not a guess, and it is reached two ways — a real conflict,
+/// and a pick whose change is already present (git passes no `--allow-empty`
+/// here, so "empty" is an exit-1 failure, not a quiet success).
+///
+/// The copy names both routes and says plainly that this app cannot finish or
+/// abandon the sequence for you. Promising a recovery the UI does not have
+/// would be the same defect `revert_message` exists to prevent one layer down:
+/// telling the user something the tool will not actually do.
+pub fn cherry_pick_confirm_prompt(commit: &str, onto: &HeadBranch) -> ConfirmPrompt {
+    let short = crate::features::graph::core::short_oid(commit);
+    match onto {
+        HeadBranch::Known(onto) => ConfirmPrompt::plain(
+            "Cherry-pick commit",
+            format!(
+                "Cherry-pick {short} onto ‘{onto}’? This copies that commit's changes into \
+                 a new commit on ‘{onto}’; the original commit stays exactly where it is.\n\n\
+                 If the changes conflict — or are already present, which git also treats as \
+                 a failure here — the pick stops part-way and leaves the repository \
+                 mid-cherry-pick with CHERRY_PICK_HEAD set. Finishing or abandoning it then \
+                 needs ‘git cherry-pick --skip’ or ‘--abort’ at a terminal; this app cannot \
+                 do that for you yet."
+            ),
+            "Cherry-pick",
+            false,
+            true,
+        ),
+        HeadBranch::Detached => ConfirmPrompt::plain(
+            "Cherry-pick commit",
+            format!(
+                "HEAD is detached, so there's no branch for the copy of {short} to land on — \
+                 it would be left unreferenced the moment you check anything else out. Check \
+                 out a branch first."
+            ),
+            "Cherry-pick",
+            false,
+            false,
+        ),
+        HeadBranch::Unknown(err) => ConfirmPrompt::plain(
+            "Cherry-pick commit",
+            format!(
+                "Couldn't read which branch is checked out — {err}\n\n\
+                 There's no way to name where {short} would be copied to, so cherry-picking \
+                 isn't offered. Close this and try again."
+            ),
+            "Cherry-pick",
+            false,
+            false,
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1681,6 +1801,108 @@ mod branch_prompt_tests {
         ] {
             assert_eq!(p.blocked_reason, None, "{}", p.body);
             assert!(p.arm.is_none(), "branch ops are single-tap ceremonies");
+        }
+    }
+
+    // ---- cherry-pick (M10.09, #596) ----
+
+    /// The commit id used throughout the cherry-pick tests: a full 40-char hex
+    /// id, because that is the only thing the route accepts.
+    const PICKED: &str = "2d8b8190c4e5f6a7b8c9d0e1f2a3b4c5d6e7f809";
+
+    /// The ordinary case — a commit dot that is not HEAD — is the one the
+    /// issue reported missing entirely.
+    #[test]
+    fn an_ordinary_commit_dot_offers_the_cherry_pick() {
+        assert_eq!(cherry_pick_offer(false, false), CherryPickOffer::Offered);
+    }
+
+    /// HEAD is the one empty pick knowable without asking the server, and an
+    /// empty pick is a *failure* that strands the repository mid-sequence —
+    /// not a no-op. The reason has to say something true about this commit.
+    #[test]
+    fn cherry_picking_head_itself_is_blocked_with_a_stated_reason() {
+        let CherryPickOffer::Blocked(reason) = cherry_pick_offer(true, false) else {
+            panic!("HEAD must not offer a pick of itself");
+        };
+        assert!(reason.contains("tip of the current branch"), "{reason}");
+    }
+
+    /// A stub names a branch; a pick takes a commit. Blocked, and — the part
+    /// that matters — blocked with the *stub* reason rather than the HEAD one
+    /// even when both conditions hold, so the sentence describes the row the
+    /// user actually tapped.
+    #[test]
+    fn a_branch_stub_is_blocked_and_keeps_its_own_reason_over_the_head_one() {
+        let CherryPickOffer::Blocked(stub) = cherry_pick_offer(false, true) else {
+            panic!("a stub must not offer a pick");
+        };
+        assert!(stub.contains("commit dot"), "{stub}");
+        assert_eq!(
+            cherry_pick_offer(true, true),
+            CherryPickOffer::Blocked(stub),
+            "a row that is somehow both keeps the stub reason"
+        );
+    }
+
+    /// The enabled confirmation names the real destination — the live HEAD
+    /// branch, not the tapped row — and says what a failed pick leaves behind.
+    /// That last part is the whole reason this prompt is not a one-liner:
+    /// `git cherry-pick` passes no `--allow-empty`, so both a conflict and an
+    /// already-applied change exit 1 and strand the repository mid-sequence
+    /// with CHERRY_PICK_HEAD set (measured, `preview::NoOp`).
+    #[test]
+    fn the_cherry_pick_confirmation_names_head_and_the_mid_sequence_failure() {
+        let p = cherry_pick_confirm_prompt(PICKED, &known("main"));
+        assert!(p.enabled);
+        assert!(!p.danger, "a pick adds a commit; it destroys nothing");
+        assert!(p.body.contains("‘main’"), "{}", p.body);
+        assert!(p.body.contains(&PICKED[..7]), "{}", p.body);
+        assert!(
+            !p.body.contains(PICKED),
+            "the short id is the house convention: {}",
+            p.body
+        );
+        assert!(p.body.contains("CHERRY_PICK_HEAD"), "{}", p.body);
+        assert!(p.body.contains("--abort"), "{}", p.body);
+        // The honest limit: the app cannot finish or abandon the sequence.
+        assert!(p.body.contains("cannot do that for you"), "{}", p.body);
+    }
+
+    /// A detached HEAD and a failed read are different facts and must not
+    /// share copy — the same rule `merge_confirm_prompt` keeps. Both refuse.
+    #[test]
+    fn a_detached_head_and_an_unreadable_one_refuse_with_different_copy() {
+        let detached = cherry_pick_confirm_prompt(PICKED, &HeadBranch::Detached);
+        let unreadable = cherry_pick_confirm_prompt(PICKED, &unknown());
+        assert!(!detached.enabled);
+        assert!(!unreadable.enabled);
+        assert!(detached.body.contains("detached"), "{}", detached.body);
+        assert!(
+            unreadable.body.contains("connection refused"),
+            "{}",
+            unreadable.body
+        );
+        assert!(
+            !unreadable.body.contains("detached"),
+            "a failed read is not evidence of a detached HEAD: {}",
+            unreadable.body
+        );
+        assert_ne!(detached.body, unreadable.body);
+    }
+
+    /// Same convention the branch prompts keep: refusals carry their reason in
+    /// the body, and a pick is a single-tap ceremony with no arming step.
+    #[test]
+    fn cherry_pick_prompts_keep_reasons_in_the_body_not_blocked_reason() {
+        for p in [
+            cherry_pick_confirm_prompt(PICKED, &known("main")),
+            cherry_pick_confirm_prompt(PICKED, &HeadBranch::Detached),
+            cherry_pick_confirm_prompt(PICKED, &unknown()),
+        ] {
+            assert_eq!(p.blocked_reason, None, "{}", p.body);
+            assert!(p.arm.is_none(), "a pick is a single-tap ceremony");
+            assert_eq!(p.confirm_label, "Cherry-pick");
         }
     }
 }

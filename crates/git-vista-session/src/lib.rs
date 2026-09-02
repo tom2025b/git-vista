@@ -28,11 +28,13 @@
 //! part — the SPA's `gv` flow, the MCP bridge and the TUI authenticate
 //! identically — so the session boundary is what moves, and nothing else.
 //!
-//! What deliberately did **not** move (yet): `git-vista-mcp`'s `authed_fetch`
-//! / `authed_post` helpers (lazy first auth + one 401 retry). They serve a
-//! long-lived bridge that must survive a server restart mid-session; the
-//! first long-lived TUI slice that needs the same loop (#457) is the right
-//! moment to lift them, with a consumer on each side to keep the seam honest.
+//! What deliberately did **not** move with them: `git-vista-mcp`'s
+//! `authed_fetch` / `authed_post` helpers (lazy first auth + one 401 retry).
+//! They serve a long-lived bridge that must survive a server restart
+//! mid-session, and #456 ruled they would lift only when a second long-lived
+//! consumer existed, with a caller on each side to keep the seam honest.
+//! #457's `gv-tui` event loop is that consumer, and they now live in
+//! [`retry`] (ADR 0102 records the move; ADR 0101 records why it waited).
 //!
 //! # What this crate must never do
 //!
@@ -49,3 +51,4 @@
 
 pub mod auth;
 pub mod http;
+pub mod retry;
