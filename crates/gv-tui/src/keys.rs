@@ -14,6 +14,11 @@
 //! | `j`, `↓` | cursor down |
 //! | `k`, `↑` | cursor up |
 //! | `Enter` | load a repository, open a commit, or follow a parent |
+//! | `Space` | preview selected working-tree file / diff file / hunk / line |
+//! | `a` | preview stage-all or unstage-all from the selected status section |
+//! | `d` | guard discard of the selected unstaged tracked path |
+//! | `y` | approve the visible discard confirmation or plan review |
+//! | `n`, `Esc` | refuse the visible confirmation or plan review |
 //! | `[` / `]` | select the previous/next parent in Main |
 //! | `r`, `F5` | refresh |
 //!
@@ -27,12 +32,8 @@
 //! ignores `Release` and `Repeat` is treated as a press — so `q` quits once,
 //! not twice, and a held `j` still scrolls.
 //!
-//! # Where per-pane keys will go
-//!
-//! Phase 2a's bindings are the same in every pane. The first pane-specific
-//! key (#459's `s` to stage, say) adds a layer here that consults the
-//! focused pane; the signature grows a `Pane` when that key exists, not
-//! before.
+//! The staging bindings are pane-specific. Dispatch only identifies intent;
+//! `App` decides whether the selected row can honestly perform it.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
@@ -48,6 +49,8 @@ pub fn dispatch(key: KeyEvent, pane: Pane) -> Option<Action> {
         KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => Some(Action::Quit),
         _ if !plain => None,
         KeyCode::Char('q') => Some(Action::Quit),
+        KeyCode::Char('y') => Some(Action::Approve),
+        KeyCode::Char('n') | KeyCode::Esc => Some(Action::Cancel),
         KeyCode::Tab | KeyCode::Char('l') => Some(Action::FocusNext),
         KeyCode::BackTab | KeyCode::Char('h') => Some(Action::FocusPrev),
         KeyCode::Right if pane == Pane::Main => Some(Action::HorizontalRight),
@@ -56,7 +59,12 @@ pub fn dispatch(key: KeyEvent, pane: Pane) -> Option<Action> {
         KeyCode::Left => Some(Action::FocusPrev),
         KeyCode::Down | KeyCode::Char('j') => Some(Action::CursorDown),
         KeyCode::Up | KeyCode::Char('k') => Some(Action::CursorUp),
-        KeyCode::Enter if pane != Pane::Branches => Some(Action::Activate),
+        KeyCode::Enter => Some(Action::Activate),
+        KeyCode::Char(' ') if matches!(pane, Pane::WorkingTree | Pane::Main) => {
+            Some(Action::PreviewSelection)
+        }
+        KeyCode::Char('a') if pane == Pane::WorkingTree => Some(Action::PreviewWholeTree),
+        KeyCode::Char('d') if pane == Pane::WorkingTree => Some(Action::Discard),
         KeyCode::Char('[') if pane == Pane::Main => Some(Action::ParentPrev),
         KeyCode::Char(']') if pane == Pane::Main => Some(Action::ParentNext),
         KeyCode::F(5) | KeyCode::Char('r') => Some(Action::Refresh),
@@ -115,7 +123,7 @@ mod tests {
         );
         assert_eq!(
             global(press(KeyCode::Char('2'))),
-            Some(Action::Focus(Pane::Branches))
+            Some(Action::Focus(Pane::WorkingTree))
         );
         assert_eq!(
             global(press(KeyCode::Char('3'))),
@@ -185,23 +193,43 @@ mod tests {
 
     #[test]
     fn an_unbound_key_is_none() {
-        for key in [
-            press(KeyCode::Char('x')),
-            press(KeyCode::Esc),
-            press(KeyCode::Char(' ')),
-            press(KeyCode::F(1)),
-        ] {
+        for key in [press(KeyCode::Char('x')), press(KeyCode::F(1))] {
             assert_eq!(global(key), None, "{key:?}");
+        }
+        assert_eq!(global(press(KeyCode::Char(' '))), None);
+    }
+
+    #[test]
+    fn enter_activates_rows_in_all_four_built_panes() {
+        let enter = press(KeyCode::Enter);
+        for pane in Pane::ALL {
+            assert_eq!(dispatch(enter, pane), Some(Action::Activate), "{pane:?}");
         }
     }
 
     #[test]
-    fn enter_activates_rows_that_open_something_but_not_the_branches_placeholder() {
-        let enter = press(KeyCode::Enter);
-        for pane in [Pane::Repositories, Pane::Commits, Pane::Main] {
-            assert_eq!(dispatch(enter, pane), Some(Action::Activate), "{pane:?}");
-        }
-        assert_eq!(dispatch(enter, Pane::Branches), None);
+    fn staging_and_review_keys_are_scoped_without_hiding_cancel() {
+        assert_eq!(
+            dispatch(press(KeyCode::Char(' ')), Pane::WorkingTree),
+            Some(Action::PreviewSelection)
+        );
+        assert_eq!(
+            dispatch(press(KeyCode::Char(' ')), Pane::Main),
+            Some(Action::PreviewSelection)
+        );
+        assert_eq!(
+            dispatch(press(KeyCode::Char('a')), Pane::WorkingTree),
+            Some(Action::PreviewWholeTree)
+        );
+        assert_eq!(
+            dispatch(press(KeyCode::Char('d')), Pane::WorkingTree),
+            Some(Action::Discard)
+        );
+        assert_eq!(global(press(KeyCode::Char('y'))), Some(Action::Approve));
+        assert_eq!(global(press(KeyCode::Char('n'))), Some(Action::Cancel));
+        assert_eq!(global(press(KeyCode::Esc)), Some(Action::Cancel));
+        assert_eq!(global(press(KeyCode::Char('a'))), None);
+        assert_eq!(global(press(KeyCode::Char('d'))), None);
     }
 
     #[test]

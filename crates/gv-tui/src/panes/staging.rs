@@ -44,6 +44,7 @@ pub struct Row {
 }
 
 impl Row {
+    #[cfg(test)]
     pub fn granularity(&self) -> Option<&'static str> {
         match self.target {
             Some(Target::File { .. }) => Some("file"),
@@ -56,17 +57,15 @@ impl Row {
 
 #[derive(Clone, Debug)]
 pub struct StagingPane {
-    pub repo: String,
     pub direction: StageDirection,
     pub diff: StagingDiff,
     rows: Vec<Row>,
 }
 
 impl StagingPane {
-    pub fn new(repo: String, direction: StageDirection, diff: StagingDiff) -> Self {
+    pub fn new(direction: StageDirection, diff: StagingDiff) -> Self {
         let rows = flatten(&diff.patch);
         Self {
-            repo,
             direction,
             diff,
             rows,
@@ -236,7 +235,7 @@ mod tests {
     }
 
     fn pane() -> StagingPane {
-        StagingPane::new("wt-1".into(), StageDirection::Stage, diff())
+        StagingPane::new(StageDirection::Stage, diff())
     }
 
     #[test]

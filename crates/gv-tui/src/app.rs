@@ -1,7 +1,7 @@
-//! The shell's state and its reducer (M10.02, #457 — phase 2a).
+//! The terminal shell's state and reducer (M10.02/#457, extended by #459).
 //!
 //! Pure: [`App`] holds what the screen shows, [`App::apply`] folds one
-//! [`Action`] into it and returns the [`Fetch`]es the loop must dispatch,
+//! [`Action`] into it and returns the [`Request`]es the loop must dispatch,
 //! [`App::receive`] folds one [`Data`] answer back in. No terminal, no
 //! socket, no thread in this file — `ui.rs` draws it, `event.rs` drives it,
 //! `data.rs` answers it — so every rule below is host-tested with nothing
@@ -10,12 +10,11 @@
 //! # The four panes
 //!
 //! A lazygit-shaped frame: a left column of three stacked panes and one main
-//! pane on the right. Phase 2a fills exactly one of them — Repositories,
-//! from `GET /api/catalog`, the read #456 already proved — and leaves the
-//! other three as honest placeholders naming the slice that draws them
-//! (#457 the graph, #458 the detail and diff, #459 the working tree). The
-//! focus ring, the cursor rules and the status line are the shell's, and
-//! every pane inherits them.
+//! pane on the right. Repositories selects the server session, Working Tree
+//! projects the shared status and staging vocabulary, Commits renders the
+//! shared graph, and Main switches among commit detail, staging diff,
+//! destructive confirmation, and exact plan review. The focus ring, cursor
+//! rules, and status line belong to the shell and every pane inherits them.
 //!
 //! # Rules the tests pin
 //!
@@ -24,18 +23,23 @@
 //! - A cursor never leaves its pane's rows: it stops at the last row rather
 //!   than wrapping, stays at zero on an empty pane, and is clamped when the
 //!   rows it indexed are replaced by fewer.
-//! - A failed fetch lands on the status line as an error and **keeps the
+//! - A failed request lands on the status line as an error and **keeps the
 //!   old rows** — a transient refusal must not blank a screen the user was
 //!   reading — and it never ends the loop (that is `event.rs`'s side of the
 //!   same rule).
-//! - Refresh coalesces: while a catalog fetch is in flight, another `r` asks
+//! - Refresh coalesces: while a catalog request is in flight, another `r` asks
 //!   nothing. A held-down key must not queue fifty reads behind a slow server.
 
 use git_vista_core::diff::CommitDiff;
 use git_vista_core::model::{CommitDetail, Edge, FrameStub, GraphRow};
-use git_vista_protocol::{HistoryPage, RepositoryDescriptor, RepositoryKind};
+use git_vista_protocol::{
+    GitOperation, HistoryPage, PatchPlan, PatchPreview, Plan, RepositoryDescriptor, RepositoryKind,
+    StageDirection, StagingDiff, WorktreePath, WorktreeStatus,
+};
 
 use crate::panes::detail::DetailPane;
+use crate::panes::staging::StagingPane;
+use crate::panes::worktree::WorktreePane;
 
 /// The existing paged-history wire shape, instantiated with the lane core's
 /// types. #458 uses its summaries as a small selector; #457 remains the owner
@@ -46,7 +50,7 @@ pub type CommitPage = HistoryPage<GraphRow, Edge, FrameStub>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pane {
     Repositories,
-    Branches,
+    WorkingTree,
     Commits,
     Main,
 }
@@ -55,7 +59,7 @@ impl Pane {
     /// Focus-ring order, which is also the drawing order and the digit order.
     pub const ALL: [Pane; 4] = [
         Pane::Repositories,
-        Pane::Branches,
+        Pane::WorkingTree,
         Pane::Commits,
         Pane::Main,
     ];
@@ -81,7 +85,7 @@ impl Pane {
     pub fn title(self) -> &'static str {
         match self {
             Pane::Repositories => "Repositories",
-            Pane::Branches => "Branches",
+            Pane::WorkingTree => "Working Tree",
             Pane::Commits => "Commits",
             Pane::Main => "Main",
         }
@@ -111,21 +115,65 @@ pub enum Action {
     ParentNext,
     HorizontalLeft,
     HorizontalRight,
+    PreviewSelection,
+    PreviewWholeTree,
+    Discard,
+    Approve,
+    Cancel,
 }
 
-/// A read the loop must hand to the data layer. Phase 2a has one.
+/// One authenticated request the event loop hands to the data worker. Writes
+/// are represented only by typed shared plans — never argv.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Fetch {
+pub enum Request {
     Catalog,
-    History { repo: String },
-    Commit { repo: String, id: String },
-    Diff { repo: String, id: String },
+    Select {
+        repo: String,
+    },
+    History {
+        repo: String,
+    },
+    Status {
+        repo: String,
+    },
+    Commit {
+        repo: String,
+        id: String,
+    },
+    Diff {
+        repo: String,
+        id: String,
+    },
+    StagingDiff {
+        repo: String,
+        direction: StageDirection,
+    },
+    BuildPlan {
+        repo: String,
+        operation: GitOperation,
+    },
+    PreviewPatch {
+        repo: String,
+        plan: PatchPlan,
+    },
+    ExecutePlan {
+        repo: String,
+        plan: Box<Plan>,
+    },
+    ApplyPatch {
+        repo: String,
+        plan: PatchPlan,
+    },
 }
 
 /// A read's answer, back from the data layer.
 #[derive(Debug)]
 pub enum Data {
     Catalog(Result<Vec<RepositoryDescriptor>, String>),
+    Selected {
+        repo: String,
+        result: Result<(), String>,
+    },
     History {
         repo: String,
         result: Result<CommitPage, String>,
@@ -140,6 +188,50 @@ pub enum Data {
         id: String,
         result: Result<CommitDiff, String>,
     },
+    Status {
+        repo: String,
+        result: Result<WorktreeStatus, String>,
+    },
+    StagingDiff {
+        repo: String,
+        direction: StageDirection,
+        result: Result<StagingDiff, String>,
+    },
+    Plan {
+        repo: String,
+        result: Result<Plan, String>,
+    },
+    PatchPreview {
+        repo: String,
+        plan: PatchPlan,
+        result: Result<PatchPreview, String>,
+    },
+    Written {
+        repo: String,
+        result: Result<String, String>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Confirmation {
+    pub prompt: String,
+    operation: GitOperation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Review {
+    Operation(Box<Plan>),
+    Patch {
+        plan: PatchPlan,
+        preview: PatchPreview,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingFile {
+    repo: String,
+    path: String,
+    direction: StageDirection,
 }
 
 /// How the status line should be drawn.
@@ -163,18 +255,27 @@ pub struct App {
     pub catalog: Vec<RepositoryDescriptor>,
     pub active_repo: Option<String>,
     pub commits: Vec<GraphRow>,
-    /// The rest of the fetched [`CommitPage`], kept beside `commits` so
+    /// The rest of the requested [`CommitPage`], kept beside `commits` so
     /// `ui.rs` can hand the graph renderer the same lanes core computed —
-    /// no relayout, no separate fetch.
+    /// no relayout, no separate request.
     pub edges: Vec<Edge>,
     pub stubs: Vec<FrameStub>,
     pub lane_count: usize,
     pub detail: DetailPane,
+    pub worktree: WorktreePane,
+    pub staging: Option<StagingPane>,
+    pub confirmation: Option<Confirmation>,
+    pub review: Option<Review>,
+    pending_file: Option<PendingFile>,
     cursors: [usize; 4],
     pub status: Status,
     /// Catalog reads dispatched and not yet answered.
     pub in_flight: u32,
     history_in_flight: Option<String>,
+    selection_in_flight: Option<String>,
+    status_in_flight: Option<String>,
+    write_in_flight: bool,
+    execution_in_flight: bool,
     pub quit: bool,
 }
 
@@ -195,6 +296,11 @@ impl App {
             stubs: Vec::new(),
             lane_count: 0,
             detail: DetailPane::default(),
+            worktree: WorktreePane::default(),
+            staging: None,
+            confirmation: None,
+            review: None,
+            pending_file: None,
             cursors: [0; 4],
             status: Status {
                 text: String::from("connecting to git-vista-server…"),
@@ -202,17 +308,21 @@ impl App {
             },
             in_flight: 0,
             history_in_flight: None,
+            selection_in_flight: None,
+            status_in_flight: None,
+            write_in_flight: false,
+            execution_in_flight: false,
             quit: false,
         }
     }
 
     /// The reads to dispatch before the first key arrives.
-    pub fn start(&mut self) -> Vec<Fetch> {
+    pub fn start(&mut self) -> Vec<Request> {
         self.request_catalog()
     }
 
     /// Fold one action in; the reads it asks for come back to the loop.
-    pub fn apply(&mut self, action: Action) -> Vec<Fetch> {
+    pub fn apply(&mut self, action: Action) -> Vec<Request> {
         match action {
             Action::Quit => {
                 self.quit = true;
@@ -246,7 +356,11 @@ impl App {
                 }
                 Vec::new()
             }
-            Action::Refresh => self.request_catalog(),
+            Action::Refresh => {
+                let mut requests = self.request_catalog();
+                requests.extend(self.request_status());
+                requests
+            }
             Action::Activate => self.activate(),
             Action::ParentPrev => {
                 if self.focus == Pane::Main {
@@ -261,22 +375,46 @@ impl App {
                 Vec::new()
             }
             Action::HorizontalLeft => {
-                if self.focus == Pane::Main {
+                if self.focus == Pane::Main && self.staging.is_none() && self.review.is_none() {
                     self.detail.scroll_horizontal(-4);
                 }
                 Vec::new()
             }
             Action::HorizontalRight => {
-                if self.focus == Pane::Main {
+                if self.focus == Pane::Main && self.staging.is_none() && self.review.is_none() {
                     self.detail.scroll_horizontal(4);
                 }
+                Vec::new()
+            }
+            Action::PreviewSelection => self.preview_selection(),
+            Action::PreviewWholeTree => self.preview_whole_tree(),
+            Action::Discard => self.confirm_discard(),
+            Action::Approve => self.approve(),
+            Action::Cancel => {
+                if self.execution_in_flight {
+                    self.status = Status {
+                        text: String::from(
+                            "the reviewed plan was already submitted; wait for its outcome",
+                        ),
+                        tone: Tone::Error,
+                    };
+                    return Vec::new();
+                }
+                self.confirmation = None;
+                self.review = None;
+                self.write_in_flight = false;
+                self.status = Status {
+                    text: String::from("cancelled · no changes were made"),
+                    tone: Tone::Info,
+                };
+                self.clamp_cursors();
                 Vec::new()
             }
         }
     }
 
     /// Fold one answer in.
-    pub fn receive(&mut self, data: Data) {
+    pub fn receive(&mut self, data: Data) -> Vec<Request> {
         match data {
             Data::Catalog(result) => {
                 self.in_flight = self.in_flight.saturating_sub(1);
@@ -312,10 +450,39 @@ impl App {
                         };
                     }
                 }
+                Vec::new()
+            }
+            Data::Selected { repo, result } => {
+                if self.active_repo.as_deref() != Some(repo.as_str()) {
+                    return Vec::new();
+                }
+                self.selection_in_flight = None;
+                match result {
+                    Ok(()) => {
+                        self.history_in_flight = Some(repo.clone());
+                        self.status_in_flight = Some(repo.clone());
+                        self.worktree.begin_load();
+                        self.status = Status {
+                            text: String::from("loading history and working tree…"),
+                            tone: Tone::Info,
+                        };
+                        vec![
+                            Request::History { repo: repo.clone() },
+                            Request::Status { repo },
+                        ]
+                    }
+                    Err(message) => {
+                        self.status = Status {
+                            text: message,
+                            tone: Tone::Error,
+                        };
+                        Vec::new()
+                    }
+                }
             }
             Data::History { repo, result } => {
                 if self.active_repo.as_deref() != Some(repo.as_str()) {
-                    return;
+                    return Vec::new();
                 }
                 self.history_in_flight = None;
                 match result {
@@ -340,6 +507,7 @@ impl App {
                         };
                     }
                 }
+                Vec::new()
             }
             Data::Commit { repo, id, result } => {
                 let error = result.as_ref().err().cloned();
@@ -358,6 +526,7 @@ impl App {
                         },
                     );
                 }
+                Vec::new()
             }
             Data::Diff { repo, id, result } => {
                 let error = result.as_ref().err().cloned();
@@ -376,14 +545,170 @@ impl App {
                         },
                     );
                 }
+                Vec::new()
+            }
+            Data::Status { repo, result } => {
+                if self.active_repo.as_deref() != Some(repo.as_str()) {
+                    return Vec::new();
+                }
+                self.status_in_flight = None;
+                let error = result.as_ref().err().cloned();
+                self.worktree.receive(result);
+                self.clamp_cursors();
+                self.status = error.map_or_else(
+                    || Status {
+                        text: String::from(
+                            "working tree ready · Space preview · a all · d discard",
+                        ),
+                        tone: Tone::Info,
+                    },
+                    |text| Status {
+                        text,
+                        tone: Tone::Error,
+                    },
+                );
+                Vec::new()
+            }
+            Data::StagingDiff {
+                repo,
+                direction,
+                result,
+            } => {
+                if self.active_repo.as_deref() != Some(repo.as_str()) {
+                    return Vec::new();
+                }
+                match result {
+                    Ok(diff) => {
+                        self.staging = Some(StagingPane::new(direction, diff));
+                        self.confirmation = None;
+                        self.review = None;
+                        self.cursors[Pane::Main.index()] = 0;
+                        self.focus = Pane::Main;
+                        if let Some(pending) = self.pending_file.take().filter(|pending| {
+                            pending.repo == repo && pending.direction == direction
+                        }) {
+                            return self.preview_file_from_loaded_diff(pending.path);
+                        }
+                        self.status = Status {
+                            text: format!(
+                                "{} diff · Space previews file/hunk/line",
+                                direction_words(direction)
+                            ),
+                            tone: Tone::Info,
+                        };
+                    }
+                    Err(message) => {
+                        self.pending_file = None;
+                        self.status = Status {
+                            text: message,
+                            tone: Tone::Error,
+                        };
+                    }
+                }
+                Vec::new()
+            }
+            Data::Plan { repo, result } => {
+                if self.active_repo.as_deref() != Some(repo.as_str()) {
+                    return Vec::new();
+                }
+                if !self.write_in_flight {
+                    return Vec::new();
+                }
+                self.write_in_flight = false;
+                match result {
+                    Ok(plan) => {
+                        self.confirmation = None;
+                        self.review = Some(Review::Operation(Box::new(plan)));
+                        self.cursors[Pane::Main.index()] = 0;
+                        self.focus = Pane::Main;
+                        self.status = Status {
+                            text: String::from("review the plan · y approve · n/Esc refuse"),
+                            tone: Tone::Info,
+                        };
+                    }
+                    Err(message) => {
+                        self.status = Status {
+                            text: message,
+                            tone: Tone::Error,
+                        };
+                    }
+                }
+                Vec::new()
+            }
+            Data::PatchPreview { repo, plan, result } => {
+                if self.active_repo.as_deref() != Some(repo.as_str()) {
+                    return Vec::new();
+                }
+                if !self.write_in_flight {
+                    return Vec::new();
+                }
+                self.write_in_flight = false;
+                match result {
+                    Ok(preview) => {
+                        if preview.generation != plan.generation {
+                            self.status = Status {
+                                text: String::from(
+                                    "preview generation did not match the submitted patch plan",
+                                ),
+                                tone: Tone::Error,
+                            };
+                            return Vec::new();
+                        }
+                        self.review = Some(Review::Patch { plan, preview });
+                        self.cursors[Pane::Main.index()] = 0;
+                        self.focus = Pane::Main;
+                        self.status = Status {
+                            text: String::from("review the patch plan · y approve · n/Esc refuse"),
+                            tone: Tone::Info,
+                        };
+                    }
+                    Err(message) => {
+                        self.status = Status {
+                            text: message,
+                            tone: Tone::Error,
+                        };
+                    }
+                }
+                Vec::new()
+            }
+            Data::Written { repo, result } => {
+                if self.active_repo.as_deref() != Some(repo.as_str()) {
+                    return Vec::new();
+                }
+                self.write_in_flight = false;
+                self.execution_in_flight = false;
+                match result {
+                    Ok(message) => {
+                        self.review = None;
+                        self.confirmation = None;
+                        self.staging = None;
+                        self.cursors[Pane::Main.index()] = 0;
+                        self.status = Status {
+                            text: if message.trim().is_empty() {
+                                String::from("write completed · refreshing working tree…")
+                            } else {
+                                message
+                            },
+                            tone: Tone::Info,
+                        };
+                        self.request_status()
+                    }
+                    Err(message) => {
+                        self.status = Status {
+                            text: message,
+                            tone: Tone::Error,
+                        };
+                        Vec::new()
+                    }
+                }
             }
         }
     }
 
-    fn activate(&mut self) -> Vec<Fetch> {
+    fn activate(&mut self) -> Vec<Request> {
         match self.focus {
             Pane::Repositories => self.activate_repository(),
-            Pane::Branches => Vec::new(),
+            Pane::WorkingTree => self.open_selected_staging_diff(),
             Pane::Commits => {
                 let Some(repo) = self.active_repo.clone() else {
                     return Vec::new();
@@ -398,6 +723,9 @@ impl App {
                 self.open_detail(repo, id)
             }
             Pane::Main => {
+                if self.staging.is_some() || self.review.is_some() || self.confirmation.is_some() {
+                    return Vec::new();
+                }
                 let Some(repo) = self.active_repo.clone() else {
                     return Vec::new();
                 };
@@ -409,7 +737,7 @@ impl App {
         }
     }
 
-    fn activate_repository(&mut self) -> Vec<Fetch> {
+    fn activate_repository(&mut self) -> Vec<Request> {
         let Some(repo) = self
             .catalog
             .get(self.cursor(Pane::Repositories))
@@ -417,7 +745,7 @@ impl App {
         else {
             return Vec::new();
         };
-        if self.history_in_flight.as_deref() == Some(repo.as_str()) {
+        if self.selection_in_flight.as_deref() == Some(repo.as_str()) {
             return Vec::new();
         }
         if self.active_repo.as_deref() != Some(repo.as_str()) {
@@ -425,21 +753,29 @@ impl App {
             self.edges.clear();
             self.stubs.clear();
             self.lane_count = 0;
+            self.worktree.clear();
+            self.staging = None;
+            self.confirmation = None;
+            self.review = None;
             self.cursors[Pane::Commits.index()] = 0;
+            self.cursors[Pane::WorkingTree.index()] = 0;
             self.cursors[Pane::Main.index()] = 0;
             self.detail = DetailPane::default();
         }
         self.active_repo = Some(repo.clone());
-        self.history_in_flight = Some(repo.clone());
-        self.focus = Pane::Commits;
+        self.selection_in_flight = Some(repo.clone());
+        self.focus = Pane::WorkingTree;
         self.status = Status {
-            text: String::from("loading commits…"),
+            text: String::from("selecting repository…"),
             tone: Tone::Info,
         };
-        vec![Fetch::History { repo }]
+        vec![Request::Select { repo }]
     }
 
-    fn open_detail(&mut self, repo: String, id: String) -> Vec<Fetch> {
+    fn open_detail(&mut self, repo: String, id: String) -> Vec<Request> {
+        self.staging = None;
+        self.confirmation = None;
+        self.review = None;
         self.detail.open(repo.clone(), id.clone());
         self.cursors[Pane::Main.index()] = 0;
         self.focus = Pane::Main;
@@ -448,22 +784,278 @@ impl App {
             tone: Tone::Info,
         };
         vec![
-            Fetch::Commit {
+            Request::Commit {
                 repo: repo.clone(),
                 id: id.clone(),
             },
-            Fetch::Diff { repo, id },
+            Request::Diff { repo, id },
         ]
+    }
+
+    fn open_selected_staging_diff(&mut self) -> Vec<Request> {
+        let Some(repo) = self.active_repo.clone() else {
+            return Vec::new();
+        };
+        let Some(row) = self.worktree.row(self.cursor(Pane::WorkingTree)) else {
+            return Vec::new();
+        };
+        let Some(direction) = row.file_direction else {
+            self.status = Status {
+                text: match row.section {
+                    crate::panes::worktree::Section::Untracked => String::from(
+                        "untracked files are not in the shared partial diff; press a to stage all",
+                    ),
+                    _ => String::from("that status row has no staging diff"),
+                },
+                tone: Tone::Error,
+            };
+            return Vec::new();
+        };
+        self.pending_file = None;
+        self.status = Status {
+            text: format!("loading {} diff…", direction_words(direction)),
+            tone: Tone::Info,
+        };
+        vec![Request::StagingDiff { repo, direction }]
+    }
+
+    fn preview_selection(&mut self) -> Vec<Request> {
+        if self.write_in_flight || self.review.is_some() || self.confirmation.is_some() {
+            return Vec::new();
+        }
+        match self.focus {
+            Pane::WorkingTree => {
+                let Some(repo) = self.active_repo.clone() else {
+                    return Vec::new();
+                };
+                let Some(row) = self.worktree.row(self.cursor(Pane::WorkingTree)) else {
+                    return Vec::new();
+                };
+                let Some(direction) = row.file_direction else {
+                    self.status = Status {
+                        text: if row.section == crate::panes::worktree::Section::Untracked {
+                            String::from(
+                                "a single untracked file has no shared diff preview; press a to stage all",
+                            )
+                        } else {
+                            String::from("that row cannot be staged or unstaged")
+                        },
+                        tone: Tone::Error,
+                    };
+                    return Vec::new();
+                };
+                self.pending_file = Some(PendingFile {
+                    repo: repo.clone(),
+                    path: row.path.clone(),
+                    direction,
+                });
+                self.status = Status {
+                    text: format!("building {} file preview…", direction_words(direction)),
+                    tone: Tone::Info,
+                };
+                vec![Request::StagingDiff { repo, direction }]
+            }
+            Pane::Main => {
+                let Some(staging) = self.staging.as_ref() else {
+                    return Vec::new();
+                };
+                let Some(descriptor) = self.active_descriptor() else {
+                    return Vec::new();
+                };
+                match staging.plan_for_row(
+                    self.cursor(Pane::Main),
+                    &descriptor.repository,
+                    &descriptor.worktree,
+                ) {
+                    Ok(plan) => self.request_patch_preview(plan),
+                    Err(message) => {
+                        self.status = Status {
+                            text: message,
+                            tone: Tone::Error,
+                        };
+                        Vec::new()
+                    }
+                }
+            }
+            Pane::Repositories | Pane::Commits => Vec::new(),
+        }
+    }
+
+    fn preview_file_from_loaded_diff(&mut self, path: String) -> Vec<Request> {
+        let Some(staging) = self.staging.as_ref() else {
+            return Vec::new();
+        };
+        let Some(descriptor) = self.active_descriptor() else {
+            return Vec::new();
+        };
+        match staging.plan_for_file(&path, &descriptor.repository, &descriptor.worktree) {
+            Ok(plan) => self.request_patch_preview(plan),
+            Err(message) => {
+                self.status = Status {
+                    text: message,
+                    tone: Tone::Error,
+                };
+                Vec::new()
+            }
+        }
+    }
+
+    fn request_patch_preview(&mut self, plan: PatchPlan) -> Vec<Request> {
+        let Some(repo) = self.active_repo.clone() else {
+            return Vec::new();
+        };
+        self.write_in_flight = true;
+        self.execution_in_flight = false;
+        self.status = Status {
+            text: String::from("asking the server to preview the exact patch plan…"),
+            tone: Tone::Info,
+        };
+        vec![Request::PreviewPatch { repo, plan }]
+    }
+
+    fn preview_whole_tree(&mut self) -> Vec<Request> {
+        if self.focus != Pane::WorkingTree || self.write_in_flight || self.review.is_some() {
+            return Vec::new();
+        }
+        let Some(row) = self.worktree.row(self.cursor(Pane::WorkingTree)) else {
+            return Vec::new();
+        };
+        let Some(direction) = row.section.whole_direction() else {
+            self.status = Status {
+                text: String::from("that section has no whole-tree staging action"),
+                tone: Tone::Error,
+            };
+            return Vec::new();
+        };
+        let operation = match direction {
+            StageDirection::Stage => GitOperation::StageAll,
+            StageDirection::Unstage => GitOperation::UnstageAll,
+        };
+        self.request_operation_plan(operation)
+    }
+
+    fn confirm_discard(&mut self) -> Vec<Request> {
+        if self.focus != Pane::WorkingTree || self.write_in_flight || self.review.is_some() {
+            return Vec::new();
+        }
+        let Some(row) = self.worktree.row(self.cursor(Pane::WorkingTree)) else {
+            return Vec::new();
+        };
+        if !row.discardable {
+            self.status = Status {
+                text: String::from("discard is available only for unstaged tracked changes"),
+                tone: Tone::Error,
+            };
+            return Vec::new();
+        }
+        let path = match WorktreePath::new(row.path.clone()) {
+            Ok(path) => path,
+            Err(error) => {
+                self.status = Status {
+                    text: error.to_string(),
+                    tone: Tone::Error,
+                };
+                return Vec::new();
+            }
+        };
+        self.confirmation = Some(Confirmation {
+            prompt: format!(
+                "Discard unstaged changes to {}? This permanently loses its uncommitted work. y confirm · n/Esc keep it",
+                row.path
+            ),
+            operation: GitOperation::DiscardTrackedPaths { paths: vec![path] },
+        });
+        self.review = None;
+        self.cursors[Pane::Main.index()] = 0;
+        self.focus = Pane::Main;
+        self.status = Status {
+            text: String::from("destructive discard is guarded · y confirm · n/Esc keep it"),
+            tone: Tone::Error,
+        };
+        Vec::new()
+    }
+
+    fn approve(&mut self) -> Vec<Request> {
+        if self.write_in_flight {
+            return Vec::new();
+        }
+        if let Some(confirmation) = self.confirmation.take() {
+            return self.request_operation_plan(confirmation.operation);
+        }
+        let Some(review) = self.review.as_ref() else {
+            return Vec::new();
+        };
+        let Some(repo) = self.active_repo.clone() else {
+            return Vec::new();
+        };
+        self.write_in_flight = true;
+        self.execution_in_flight = true;
+        self.status = Status {
+            text: String::from("submitting the reviewed plan unchanged…"),
+            tone: Tone::Info,
+        };
+        match review {
+            Review::Operation(plan) => vec![Request::ExecutePlan {
+                repo,
+                plan: plan.clone(),
+            }],
+            Review::Patch { plan, .. } => vec![Request::ApplyPatch {
+                repo,
+                plan: plan.clone(),
+            }],
+        }
+    }
+
+    fn request_operation_plan(&mut self, operation: GitOperation) -> Vec<Request> {
+        let Some(repo) = self.active_repo.clone() else {
+            return Vec::new();
+        };
+        self.write_in_flight = true;
+        self.execution_in_flight = false;
+        self.status = Status {
+            text: String::from("asking the server to build a reviewable plan…"),
+            tone: Tone::Info,
+        };
+        vec![Request::BuildPlan { repo, operation }]
+    }
+
+    fn request_status(&mut self) -> Vec<Request> {
+        let Some(repo) = self.active_repo.clone() else {
+            return Vec::new();
+        };
+        if self.status_in_flight.as_deref() == Some(repo.as_str()) {
+            return Vec::new();
+        }
+        self.status_in_flight = Some(repo.clone());
+        self.worktree.begin_load();
+        vec![Request::Status { repo }]
+    }
+
+    fn active_descriptor(&self) -> Option<&RepositoryDescriptor> {
+        let active = self.active_repo.as_deref()?;
+        self.catalog.iter().find(|repo| repo.worktree == active)
+    }
+
+    fn main_rows(&self) -> usize {
+        if let Some(review) = &self.review {
+            review_lines(review).len()
+        } else if let Some(confirmation) = &self.confirmation {
+            confirmation.prompt.lines().count().max(1)
+        } else if let Some(staging) = &self.staging {
+            staging.rows().len()
+        } else {
+            self.detail.row_count()
+        }
     }
 
     /// Ask for the catalog unless a catalog read is already out — a held
     /// `r` must not queue fifty reads behind a slow server.
-    fn request_catalog(&mut self) -> Vec<Fetch> {
+    fn request_catalog(&mut self) -> Vec<Request> {
         if self.in_flight > 0 {
             return Vec::new();
         }
         self.in_flight += 1;
-        vec![Fetch::Catalog]
+        vec![Request::Catalog]
     }
 
     /// After rows change, no cursor may point past the new end.
@@ -482,14 +1074,13 @@ impl App {
         self.cursors[pane.index()]
     }
 
-    /// How many rows a pane has to select among. Only Repositories has any
-    /// in phase 2a; the others answer zero until their slices land.
+    /// How many rows a pane has to select among.
     pub fn rows(&self, pane: Pane) -> usize {
         match pane {
             Pane::Repositories => self.catalog.len(),
-            Pane::Branches => 0,
+            Pane::WorkingTree => self.worktree.rows().len(),
             Pane::Commits => self.commits.len(),
-            Pane::Main => self.detail.row_count(),
+            Pane::Main => self.main_rows(),
         }
     }
 
@@ -505,6 +1096,43 @@ impl App {
     }
 }
 
+pub fn review_lines(review: &Review) -> Vec<String> {
+    match review {
+        Review::Operation(plan) => {
+            let mut lines = vec![String::from("SERVER PLAN — review before execution")];
+            let json = serde_json::to_string_pretty(plan)
+                .unwrap_or_else(|error| format!("could not render plan: {error}"));
+            lines.extend(json.lines().map(str::to_string));
+            lines.push(String::from("y approve unchanged · n/Esc refuse"));
+            lines
+        }
+        Review::Patch { plan, preview } => {
+            let mut lines = vec![String::from("PATCH PLAN — review before execution")];
+            let json = serde_json::to_string_pretty(plan)
+                .unwrap_or_else(|error| format!("could not render patch plan: {error}"));
+            lines.extend(json.lines().map(str::to_string));
+            if !preview.whole_files.is_empty() {
+                lines.push(format!("whole files: {}", preview.whole_files.join(", ")));
+            }
+            lines.push(String::from("exact patch:"));
+            if preview.patch.is_empty() {
+                lines.push(String::from("(no hunk bytes; whole-file pathspecs above)"));
+            } else {
+                lines.extend(preview.patch.lines().map(str::to_string));
+            }
+            lines.push(String::from("y approve unchanged · n/Esc refuse"));
+            lines
+        }
+    }
+}
+
+fn direction_words(direction: StageDirection) -> &'static str {
+    match direction {
+        StageDirection::Stage => "stage (worktree → index)",
+        StageDirection::Unstage => "unstage (index → HEAD)",
+    }
+}
+
 fn short_id(id: &str) -> &str {
     &id[..id.len().min(7)]
 }
@@ -512,7 +1140,10 @@ fn short_id(id: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use git_vista_core::model::{CommitSummary, Oid};
-    use git_vista_protocol::plan::GenerationToken;
+    use git_vista_protocol::{
+        ChangeKind, ChangeSides, GenerationToken, OperationHash, Precondition, RecoveryStrategy,
+        RepositoryToken, RiskLevel, SelectionShape, StatusEntry, UnixSeconds, WorktreeToken,
+    };
 
     use super::*;
 
@@ -533,9 +1164,32 @@ mod tests {
 
     fn loaded(wire: &str) -> App {
         let mut app = App::new();
-        assert_eq!(app.start(), [Fetch::Catalog]);
+        assert_eq!(app.start(), [Request::Catalog]);
         app.receive(Data::Catalog(Ok(catalog(wire))));
         app
+    }
+
+    fn select_first(app: &mut App) {
+        assert_eq!(
+            app.apply(Action::Activate),
+            [Request::Select {
+                repo: "w1".to_string()
+            }]
+        );
+        assert_eq!(
+            app.receive(Data::Selected {
+                repo: "w1".to_string(),
+                result: Ok(()),
+            }),
+            [
+                Request::History {
+                    repo: "w1".to_string()
+                },
+                Request::Status {
+                    repo: "w1".to_string()
+                }
+            ]
+        );
     }
 
     fn page(rows: &[(&str, &str)]) -> CommitPage {
@@ -581,6 +1235,62 @@ mod tests {
         }
     }
 
+    fn status(entries: Vec<StatusEntry>) -> WorktreeStatus {
+        WorktreeStatus {
+            generation: GenerationToken::new("status-v1:test").unwrap(),
+            branch: Some("main".to_string()),
+            upstream: Some("origin/main".to_string()),
+            ahead: 0,
+            behind: 0,
+            entries,
+        }
+    }
+
+    fn ready_status(app: &mut App, entries: Vec<StatusEntry>) {
+        app.receive(Data::Status {
+            repo: "w1".to_string(),
+            result: Ok(status(entries)),
+        });
+    }
+
+    fn changed(path: &str, sides: ChangeSides) -> StatusEntry {
+        StatusEntry::Changed {
+            path: path.to_string(),
+            sides,
+            submodule: None,
+            binary: false,
+        }
+    }
+
+    fn plan(operation: GitOperation) -> Plan {
+        Plan {
+            repository: RepositoryToken::new("r1").unwrap(),
+            worktree: WorktreeToken::new("w1").unwrap(),
+            generation: GenerationToken::new("status-v1:test").unwrap(),
+            operation,
+            operation_hash: OperationHash::new("a".repeat(64)).unwrap(),
+            issued_at: UnixSeconds(100),
+            expires_at: UnixSeconds(200),
+            risk: RiskLevel::Safe,
+            preconditions: vec![Precondition::CleanWorktree],
+            expected_ref_changes: Vec::new(),
+            advisories: Vec::new(),
+            recovery: RecoveryStrategy::NotNeeded,
+        }
+    }
+
+    fn staging_diff(direction: StageDirection) -> (StageDirection, StagingDiff) {
+        (
+            direction,
+            StagingDiff {
+                generation: GenerationToken::new("diff-v1:test").unwrap(),
+                patch: "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n"
+                    .to_string(),
+                truncated: false,
+            },
+        )
+    }
+
     const COMMIT_1: &str = "1111111111111111111111111111111111111111";
     const COMMIT_2: &str = "2222222222222222222222222222222222222222";
     const PARENT_1: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -592,7 +1302,7 @@ mod tests {
         assert_eq!(app.focus, Pane::Repositories);
         assert!(!app.quit);
         assert_eq!(app.status.tone, Tone::Info);
-        assert_eq!(app.start(), [Fetch::Catalog]);
+        assert_eq!(app.start(), [Request::Catalog]);
         assert_eq!(app.in_flight, 1, "start counts its own read as in flight");
     }
 
@@ -611,7 +1321,7 @@ mod tests {
             seen,
             [
                 Pane::Repositories,
-                Pane::Branches,
+                Pane::WorkingTree,
                 Pane::Commits,
                 Pane::Main,
                 Pane::Repositories
@@ -659,12 +1369,12 @@ mod tests {
         assert_eq!(app.cursor(Pane::Repositories), 1);
 
         // An empty pane's cursor is pinned at zero in both directions.
-        app.apply(Action::Focus(Pane::Branches));
+        app.apply(Action::Focus(Pane::WorkingTree));
         app.apply(Action::CursorDown);
         app.apply(Action::CursorDown);
-        assert_eq!(app.cursor(Pane::Branches), 0);
+        assert_eq!(app.cursor(Pane::WorkingTree), 0);
         app.apply(Action::CursorUp);
-        assert_eq!(app.cursor(Pane::Branches), 0);
+        assert_eq!(app.cursor(Pane::WorkingTree), 0);
         // …and moving it left the Repositories cursor alone.
         assert_eq!(app.cursor(Pane::Repositories), 1);
     }
@@ -677,7 +1387,7 @@ mod tests {
         assert_eq!(app.cursor(Pane::Repositories), 2);
         assert_eq!(app.in_flight, 0, "the answer cleared the in-flight count");
 
-        assert_eq!(app.apply(Action::Refresh), [Fetch::Catalog]);
+        assert_eq!(app.apply(Action::Refresh), [Request::Catalog]);
         app.receive(Data::Catalog(Ok(catalog(ONE))));
         assert_eq!(app.catalog.len(), 1);
         assert_eq!(app.catalog[0].name, "solo");
@@ -725,7 +1435,7 @@ mod tests {
     #[test]
     fn refresh_asks_again_but_not_while_a_fetch_is_already_in_flight() {
         let mut app = App::new();
-        assert_eq!(app.start(), [Fetch::Catalog]);
+        assert_eq!(app.start(), [Request::Catalog]);
         assert!(
             app.apply(Action::Refresh).is_empty(),
             "coalesced: one read is already out"
@@ -735,7 +1445,7 @@ mod tests {
         app.receive(Data::Catalog(Ok(Vec::new())));
         assert_eq!(
             app.apply(Action::Refresh),
-            [Fetch::Catalog],
+            [Request::Catalog],
             "answered, so the next r asks again"
         );
         assert_eq!(app.in_flight, 1);
@@ -762,39 +1472,55 @@ mod tests {
     }
 
     #[test]
-    fn activating_the_selected_repository_requests_its_bounded_history_page() {
+    fn activating_the_selected_repository_selects_it_before_scoped_reads() {
         let mut app = loaded(THREE);
         app.apply(Action::CursorDown);
 
         assert_eq!(
             app.apply(Action::Activate),
-            [Fetch::History {
+            [Request::Select {
                 repo: "w2".to_string()
             }]
         );
         assert_eq!(app.active_repo.as_deref(), Some("w2"));
-        assert_eq!(app.focus, Pane::Commits);
+        assert_eq!(app.focus, Pane::WorkingTree);
+        assert_eq!(
+            app.receive(Data::Selected {
+                repo: "w2".to_string(),
+                result: Ok(()),
+            }),
+            [
+                Request::History {
+                    repo: "w2".to_string()
+                },
+                Request::Status {
+                    repo: "w2".to_string()
+                }
+            ],
+            "session selection must complete before any selection-scoped read"
+        );
     }
 
     #[test]
     fn a_history_answer_populates_commits_and_enter_requests_detail_and_diff() {
         let mut app = loaded(THREE);
-        assert_eq!(app.apply(Action::Activate).len(), 1);
+        select_first(&mut app);
         app.receive(Data::History {
             repo: "w1".to_string(),
             result: Ok(page(&[(COMMIT_1, "first"), (COMMIT_2, "second")])),
         });
         assert_eq!(app.rows(Pane::Commits), 2);
+        app.apply(Action::Focus(Pane::Commits));
         app.apply(Action::CursorDown);
 
         assert_eq!(
             app.apply(Action::Activate),
             [
-                Fetch::Commit {
+                Request::Commit {
                     repo: "w1".to_string(),
                     id: COMMIT_2.to_string(),
                 },
-                Fetch::Diff {
+                Request::Diff {
                     repo: "w1".to_string(),
                     id: COMMIT_2.to_string(),
                 },
@@ -807,7 +1533,7 @@ mod tests {
     #[test]
     fn a_late_history_answer_for_the_previous_repository_is_ignored() {
         let mut app = loaded(THREE);
-        app.apply(Action::Activate);
+        select_first(&mut app);
         app.apply(Action::Focus(Pane::Repositories));
         app.apply(Action::CursorDown);
         app.apply(Action::Activate);
@@ -827,11 +1553,12 @@ mod tests {
     #[test]
     fn a_selected_parent_can_be_opened_from_the_main_pane() {
         let mut app = loaded(THREE);
-        app.apply(Action::Activate);
+        select_first(&mut app);
         app.receive(Data::History {
             repo: "w1".to_string(),
             result: Ok(page(&[(COMMIT_1, "merge")])),
         });
+        app.apply(Action::Focus(Pane::Commits));
         app.apply(Action::Activate);
         app.receive(Data::Commit {
             repo: "w1".to_string(),
@@ -843,11 +1570,11 @@ mod tests {
         assert_eq!(
             app.apply(Action::Activate),
             [
-                Fetch::Commit {
+                Request::Commit {
                     repo: "w1".to_string(),
                     id: PARENT_2.to_string(),
                 },
-                Fetch::Diff {
+                Request::Diff {
                     repo: "w1".to_string(),
                     id: PARENT_2.to_string(),
                 },
@@ -859,11 +1586,12 @@ mod tests {
     #[test]
     fn main_vertical_and_horizontal_scroll_positions_are_independent() {
         let mut app = loaded(THREE);
-        app.apply(Action::Activate);
+        select_first(&mut app);
         app.receive(Data::History {
             repo: "w1".to_string(),
             result: Ok(page(&[(COMMIT_1, "long")])),
         });
+        app.apply(Action::Focus(Pane::Commits));
         app.apply(Action::Activate);
         app.receive(Data::Commit {
             repo: "w1".to_string(),
@@ -878,5 +1606,315 @@ mod tests {
         app.apply(Action::HorizontalLeft);
         assert_eq!(app.cursor(Pane::Main), 1);
         assert_eq!(app.detail.horizontal(), 0);
+    }
+
+    /// INVARIANT: whole-tree staging and unstaging submit only a server-built
+    /// Plan, unchanged, after it has been visible and explicitly approved.
+    ///
+    /// MUTATION 1 (remove): return ExecutePlan directly from `preview_whole_tree`.
+    /// MUTATION 2 (weaken): let `approve` execute while BuildPlan is pending.
+    #[test]
+    fn whole_tree_stage_and_unstage_wait_for_and_submit_the_exact_reviewed_plan() {
+        for (sides, expected) in [
+            (
+                ChangeSides::UnstagedOnly {
+                    unstaged: ChangeKind::Modified,
+                },
+                GitOperation::StageAll,
+            ),
+            (
+                ChangeSides::StagedOnly {
+                    staged: ChangeKind::Modified,
+                },
+                GitOperation::UnstageAll,
+            ),
+        ] {
+            let mut app = loaded(THREE);
+            select_first(&mut app);
+            ready_status(&mut app, vec![changed("a.txt", sides)]);
+
+            assert_eq!(
+                app.apply(Action::PreviewWholeTree),
+                [Request::BuildPlan {
+                    repo: "w1".to_string(),
+                    operation: expected.clone(),
+                }]
+            );
+            assert!(
+                app.apply(Action::Approve).is_empty(),
+                "approval before the server plan arrives cannot write"
+            );
+
+            let reviewed = plan(expected);
+            assert!(app
+                .receive(Data::Plan {
+                    repo: "w1".to_string(),
+                    result: Ok(reviewed.clone()),
+                })
+                .is_empty());
+            assert_eq!(
+                app.review,
+                Some(Review::Operation(Box::new(reviewed.clone())))
+            );
+            assert_eq!(
+                app.apply(Action::Approve),
+                [Request::ExecutePlan {
+                    repo: "w1".to_string(),
+                    plan: Box::new(reviewed.clone()),
+                }],
+                "the visible Plan is the exact value submitted"
+            );
+            assert!(app.apply(Action::Cancel).is_empty());
+            assert_eq!(app.review, Some(Review::Operation(Box::new(reviewed))));
+            assert!(app.status.text.contains("already submitted"));
+        }
+    }
+
+    /// INVARIANT: destructive discard has both a path-specific loss warning
+    /// and the ordinary full-Plan review; neither confirmation itself writes.
+    ///
+    /// MUTATION 1 (remove): have `confirm_discard` call BuildPlan immediately.
+    /// MUTATION 2 (weaken): omit the permanent/uncommitted-loss wording.
+    #[test]
+    fn discard_requires_loss_confirmation_then_exact_plan_review() {
+        let mut app = loaded(THREE);
+        select_first(&mut app);
+        ready_status(
+            &mut app,
+            vec![changed(
+                "precious.txt",
+                ChangeSides::UnstagedOnly {
+                    unstaged: ChangeKind::Modified,
+                },
+            )],
+        );
+
+        assert!(app.apply(Action::Discard).is_empty());
+        let warning = &app.confirmation.as_ref().unwrap().prompt;
+        assert!(warning.contains("precious.txt"), "{warning}");
+        assert!(warning.contains("permanently"), "{warning}");
+        assert!(warning.contains("uncommitted"), "{warning}");
+
+        let expected = GitOperation::DiscardTrackedPaths {
+            paths: vec![WorktreePath::new("precious.txt").unwrap()],
+        };
+        assert_eq!(
+            app.apply(Action::Approve),
+            [Request::BuildPlan {
+                repo: "w1".to_string(),
+                operation: expected.clone(),
+            }]
+        );
+        assert!(app.apply(Action::Approve).is_empty());
+
+        let reviewed = plan(expected);
+        app.receive(Data::Plan {
+            repo: "w1".to_string(),
+            result: Ok(reviewed.clone()),
+        });
+        assert_eq!(
+            app.apply(Action::Approve),
+            [Request::ExecutePlan {
+                repo: "w1".to_string(),
+                plan: Box::new(reviewed),
+            }]
+        );
+    }
+
+    /// INVARIANT: a file shortcut is resolved against the pinned shared diff,
+    /// previewed by the server, then applies the exact reviewed PatchPlan.
+    ///
+    /// MUTATION 1 (remove): build ApplyPatch directly from the status row.
+    /// MUTATION 2 (weaken): replace the reviewed plan with a newly-built plan.
+    #[test]
+    fn file_staging_uses_pinned_diff_preview_and_applies_the_exact_reviewed_patch_plan() {
+        let mut app = loaded(THREE);
+        select_first(&mut app);
+        ready_status(
+            &mut app,
+            vec![changed(
+                "a.txt",
+                ChangeSides::UnstagedOnly {
+                    unstaged: ChangeKind::Modified,
+                },
+            )],
+        );
+
+        assert_eq!(
+            app.apply(Action::PreviewSelection),
+            [Request::StagingDiff {
+                repo: "w1".to_string(),
+                direction: StageDirection::Stage,
+            }]
+        );
+        let (direction, diff) = staging_diff(StageDirection::Stage);
+        let requests = app.receive(Data::StagingDiff {
+            repo: "w1".to_string(),
+            direction,
+            result: Ok(diff),
+        });
+        let [Request::PreviewPatch {
+            repo,
+            plan: submitted,
+        }] = requests.as_slice()
+        else {
+            panic!("file shortcut did not request one patch preview: {requests:?}");
+        };
+        assert_eq!(repo, "w1");
+        assert_eq!(submitted.generation.as_str(), "diff-v1:test");
+        assert!(matches!(
+            submitted.files[0].selection,
+            SelectionShape::EntireFile
+        ));
+        assert!(app.apply(Action::Approve).is_empty());
+
+        let reviewed = submitted.clone();
+        app.receive(Data::PatchPreview {
+            repo: "w1".to_string(),
+            plan: reviewed.clone(),
+            result: Ok(PatchPreview {
+                generation: reviewed.generation.clone(),
+                patch: String::new(),
+                whole_files: vec!["a.txt".to_string()],
+            }),
+        });
+        assert_eq!(
+            app.apply(Action::Approve),
+            [Request::ApplyPatch {
+                repo: "w1".to_string(),
+                plan: reviewed,
+            }]
+        );
+    }
+
+    /// INVARIANT: refusal invalidates an outstanding preview and late network
+    /// answers cannot reopen an approval surface or become executable.
+    ///
+    /// MUTATION 1 (remove): do not clear `write_in_flight` on Cancel.
+    /// MUTATION 2 (weaken): accept Plan/PatchPreview without the pending gate.
+    #[test]
+    fn cancellation_makes_late_plan_and_patch_preview_answers_inert() {
+        let mut app = loaded(THREE);
+        select_first(&mut app);
+        ready_status(
+            &mut app,
+            vec![changed(
+                "a.txt",
+                ChangeSides::UnstagedOnly {
+                    unstaged: ChangeKind::Modified,
+                },
+            )],
+        );
+
+        assert!(matches!(
+            app.apply(Action::PreviewWholeTree).as_slice(),
+            [Request::BuildPlan { .. }]
+        ));
+        app.apply(Action::Cancel);
+        app.receive(Data::Plan {
+            repo: "w1".to_string(),
+            result: Ok(plan(GitOperation::StageAll)),
+        });
+        assert!(app.review.is_none());
+        assert!(app.apply(Action::Approve).is_empty());
+
+        let direction = StageDirection::Stage;
+        let (_, diff) = staging_diff(direction);
+        app.receive(Data::StagingDiff {
+            repo: "w1".to_string(),
+            direction,
+            result: Ok(diff),
+        });
+        let preview_requests = app.apply(Action::PreviewSelection);
+        let [Request::PreviewPatch { plan, .. }] = preview_requests.as_slice() else {
+            panic!("selected staging row did not request a preview");
+        };
+        let submitted = plan.clone();
+        app.apply(Action::Cancel);
+        app.receive(Data::PatchPreview {
+            repo: "w1".to_string(),
+            plan: submitted.clone(),
+            result: Ok(PatchPreview {
+                generation: submitted.generation.clone(),
+                patch: "exact".to_string(),
+                whole_files: Vec::new(),
+            }),
+        });
+        assert!(app.review.is_none());
+        assert!(app.apply(Action::Approve).is_empty());
+    }
+
+    /// INVARIANT: the visible review includes every server Plan field and the
+    /// exact patch preview, not a lossy client-side summary.
+    ///
+    /// MUTATION 1 (remove): omit the serialized Plan/PatchPlan body.
+    /// MUTATION 2 (weaken): display only patch length or whole-file count.
+    #[test]
+    fn review_lines_show_the_complete_plan_and_exact_patch_bytes() {
+        let operation = plan(GitOperation::StageAll);
+        let operation_lines = review_lines(&Review::Operation(Box::new(operation))).join("\n");
+        for field in [
+            "generation",
+            "operation_hash",
+            "issued_at",
+            "expires_at",
+            "risk",
+            "preconditions",
+            "expected_ref_changes",
+            "advisories",
+            "recovery",
+        ] {
+            assert!(
+                operation_lines.contains(field),
+                "missing {field}: {operation_lines}"
+            );
+        }
+
+        let pane = StagingPane::new(StageDirection::Stage, staging_diff(StageDirection::Stage).1);
+        let patch_plan = pane.plan_for_row(2, "r1", "w1").unwrap();
+        let exact = "diff --git a/a.txt b/a.txt\n-old\n+new\n";
+        let patch_lines = review_lines(&Review::Patch {
+            plan: patch_plan.clone(),
+            preview: PatchPreview {
+                generation: patch_plan.generation,
+                patch: exact.to_string(),
+                whole_files: vec!["whole.bin".to_string()],
+            },
+        })
+        .join("\n");
+        assert!(patch_lines.contains("whole.bin"), "{patch_lines}");
+        assert!(patch_lines.contains(exact.trim()), "{patch_lines}");
+        assert!(
+            patch_lines.contains("\"select\": \"lines\""),
+            "{patch_lines}"
+        );
+    }
+
+    /// INVARIANT: a preview cannot be approved under a generation other than
+    /// the exact PatchPlan generation the terminal submitted.
+    ///
+    /// MUTATION 1 (remove): delete the generation comparison.
+    /// MUTATION 2 (weaken): compare only the `diff-v1:` prefix.
+    #[test]
+    fn mismatched_patch_preview_generation_is_never_reviewable() {
+        let mut app = loaded(THREE);
+        select_first(&mut app);
+        let pane = StagingPane::new(StageDirection::Stage, staging_diff(StageDirection::Stage).1);
+        let submitted = pane.plan_for_row(0, "r1", "w1").unwrap();
+        app.request_patch_preview(submitted.clone());
+
+        app.receive(Data::PatchPreview {
+            repo: "w1".to_string(),
+            plan: submitted,
+            result: Ok(PatchPreview {
+                generation: GenerationToken::new("diff-v1:different").unwrap(),
+                patch: String::new(),
+                whole_files: vec!["a.txt".to_string()],
+            }),
+        });
+        assert!(app.review.is_none());
+        assert_eq!(app.status.tone, Tone::Error);
+        assert!(app.status.text.contains("generation did not match"));
+        assert!(app.apply(Action::Approve).is_empty());
     }
 }

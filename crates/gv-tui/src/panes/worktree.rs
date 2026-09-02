@@ -26,14 +26,6 @@ pub enum Section {
 }
 
 impl Section {
-    pub const ALL: [Section; 5] = [
-        Section::Conflicted,
-        Section::Staged,
-        Section::Unstaged,
-        Section::Untracked,
-        Section::Ignored,
-    ];
-
     pub fn heading(self) -> &'static str {
         match self {
             Section::Conflicted => "Conflicted",
@@ -79,8 +71,18 @@ pub struct Row {
 impl Row {
     pub fn render(&self) -> String {
         match &self.detail {
-            Some(detail) => format!("{} {} — {detail}", self.section.marker(), self.path),
-            None => format!("{} {}", self.section.marker(), self.path),
+            Some(detail) => format!(
+                "{} [{}] {} — {detail}",
+                self.section.marker(),
+                self.section.heading(),
+                self.path
+            ),
+            None => format!(
+                "{} [{}] {}",
+                self.section.marker(),
+                self.section.heading(),
+                self.path
+            ),
         }
     }
 }

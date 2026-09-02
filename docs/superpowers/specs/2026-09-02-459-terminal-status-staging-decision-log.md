@@ -51,11 +51,32 @@
 
 ## Acceptance ledger (running)
 
-- Status list with browser-equivalent states: **IN PROGRESS**
+- Status list with browser-equivalent states: implementation and rendered
+  terminal assertions are green; final line-number audit pending.
 - Stage/unstage at whole-tree, file, hunk, and line granularities through the
-  shared planner: **IN PROGRESS**
-- Guarded discard confirmation says what is lost: **IN PROGRESS**
-- Every write plan is visible before execution: **IN PROGRESS**
+  shared planner: reducer and transport assertions are green; final
+  line-number audit pending.
+- Guarded discard confirmation says what is lost: two-step guard assertion is
+  green; final line-number audit pending.
+- Every write plan is visible before execution: full Plan/PatchPlan plus exact
+  preview assertions are green; final line-number audit pending.
+
+## 2026-09-02 — first wired checkpoint
+
+- Repository activation is deliberately sequenced: `POST /api/select` must
+  answer before History and Status requests are dispatched. The reducer test
+  pins the order and the transport test pins Active mode, cookie, and CSRF.
+- Preview and execution are separate reducer states. Refusing while a preview
+  request is outstanding invalidates its late answer; refusing after an
+  approved execution has already been submitted does not lie that it was
+  cancelled and instead tells the user to wait for the outcome.
+- Generic writes use an idempotency key derived from the server Plan's
+  operation hash and issue time. Patch writes use UUIDv5 of the serialized
+  shared PatchPlan, so retrying the same approved selection is stable while a
+  different selection cannot collide by reusing a constant key.
+- `cargo test -p gv-tui --bins`: **90 passed, 0 failed, 0 ignored**. This is
+  the binary target containing the implementation, not the empty-library
+  false green.
 
 Final entries will replace each status with exact `file:line` evidence or an
 honest **NOT MET**.

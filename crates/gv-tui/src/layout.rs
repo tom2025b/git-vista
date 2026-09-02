@@ -4,7 +4,7 @@
 //! # The shape
 //!
 //! lazygit's: a left column carrying three stacked panes (Repositories,
-//! Branches, Commits) and a main pane, with a one-row status strip along the
+//! Working Tree, Commits) and a main pane, with a one-row status strip along the
 //! bottom. The three left panes share their column equally. #457's graph
 //! rows carry a short id and summary beside their lane glyphs, which a
 //! one-third column truncated — the left/main split is half and half so
@@ -34,7 +34,7 @@ pub const MIN_HEIGHT: u16 = 10;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Panes {
     pub repositories: Rect,
-    pub branches: Rect,
+    pub working_tree: Rect,
     pub commits: Rect,
     pub main: Rect,
     pub status: Rect,
@@ -44,7 +44,7 @@ impl Panes {
     pub fn of(&self, pane: Pane) -> Rect {
         match pane {
             Pane::Repositories => self.repositories,
-            Pane::Branches => self.branches,
+            Pane::WorkingTree => self.working_tree,
             Pane::Commits => self.commits,
             Pane::Main => self.main,
         }
@@ -65,7 +65,7 @@ pub fn split(area: Rect) -> Option<Panes> {
     // same two-column shape, wider split.
     let [left, main] =
         Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).areas(body);
-    let [repositories, branches, commits] = Layout::vertical([
+    let [repositories, working_tree, commits] = Layout::vertical([
         Constraint::Ratio(1, 3),
         Constraint::Ratio(1, 3),
         Constraint::Ratio(1, 3),
@@ -73,7 +73,7 @@ pub fn split(area: Rect) -> Option<Panes> {
     .areas(left);
     Some(Panes {
         repositories,
-        branches,
+        working_tree,
         commits,
         main,
         status,
@@ -110,7 +110,7 @@ mod tests {
             let panes = split(whole).expect("above the minimum");
             let all = [
                 panes.repositories,
-                panes.branches,
+                panes.working_tree,
                 panes.commits,
                 panes.main,
                 panes.status,
@@ -148,13 +148,13 @@ mod tests {
     fn the_main_pane_takes_the_right_half_and_the_left_column_stacks_three() {
         let panes = split(area(90, 31)).unwrap();
         assert_eq!(panes.main, Rect::new(45, 0, 45, 30));
-        for left in [panes.repositories, panes.branches, panes.commits] {
+        for left in [panes.repositories, panes.working_tree, panes.commits] {
             assert_eq!(left.x, 0);
             assert_eq!(left.width, 45);
             assert_eq!(left.height, 10);
         }
         assert_eq!(panes.repositories.y, 0);
-        assert_eq!(panes.branches.y, 10);
+        assert_eq!(panes.working_tree.y, 10);
         assert_eq!(panes.commits.y, 20);
     }
 
