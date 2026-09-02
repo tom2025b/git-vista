@@ -130,6 +130,14 @@ struct Bootstrap {
 struct Session {
     csrf: String,
     expires_at: Instant,
+    /// This session's selected repository (#588).
+    ///
+    /// Owned here, so its lifetime is the session's: [`SessionManager::revoke`]
+    /// removes the record and the selection goes with it, which is why signing
+    /// out cannot leave a repository behind for the next person. Nothing else
+    /// holds a strong reference except the task currently serving a request for
+    /// this session.
+    selection: crate::state::SelectionCell,
 }
 
 /// What a successful bootstrap exchange hands back: the new session id (destined
@@ -198,6 +206,9 @@ impl SessionManager {
             Session {
                 csrf: csrf.clone(),
                 expires_at: Instant::now() + SESSION_IDLE_TTL,
+                // Empty: a new session has chosen nothing, so it resolves to the
+                // launch repository rather than to the previous session's pick.
+                selection: crate::state::new_selection_cell(),
             },
         );
         Some(NewSession { id, csrf })
@@ -246,6 +257,18 @@ impl SessionManager {
             }
             None => None,
         }
+    }
+
+    /// This session's selection cell, when the session is live.
+    ///
+    /// Deliberately separate from [`validate`]: `validate` answers "may this
+    /// request proceed", and the answer must not change shape because a caller
+    /// also wants the selection. Does not refresh the idle deadline — the
+    /// `validate` call in the same request already did.
+    pub(crate) fn selection_cell(&self, id: &str) -> Option<crate::state::SelectionCell> {
+        let sessions = self.sessions.lock().expect("sessions lock");
+        let session = sessions.get(id)?;
+        (Instant::now() < session.expires_at).then(|| std::sync::Arc::clone(&session.selection))
     }
 
     /// Revoke a session by id (logout). Returns whether a session was actually
