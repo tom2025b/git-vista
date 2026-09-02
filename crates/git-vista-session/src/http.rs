@@ -37,8 +37,9 @@ const SERVER: &str = "127.0.0.1:8080";
 /// A per-read-syscall bound (`SO_RCVTIMEO`), honestly named: `read_to_end`
 /// restarts this clock on every chunk, so it bounds a *dead* peer, not a
 /// slow-dripping one. Acceptable here because the peer is this box's own
-/// loopback server (a slow-drip adversary is not in the threat model) and the
-/// MCP client above the bridge carries its own tool-call timeout.
+/// loopback server (a slow-drip adversary is not in the threat model) and
+/// every caller above carries its own outer bound (an MCP host's tool-call
+/// timeout; a human at `gv-tui`'s terminal).
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A parsed response: status, lower-cased header pairs, raw body bytes.
@@ -80,7 +81,6 @@ impl std::fmt::Debug for HttpResponse {
 
 impl HttpResponse {
     /// First header with this (already lower-case) name, if any.
-    #[allow(dead_code)] // exercised by tests today; the write slices (#248/#249) read it next
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()

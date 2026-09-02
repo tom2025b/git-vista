@@ -19,11 +19,13 @@ use axum::http::StatusCode;
 
 use crate::sandbox::NetworkNeed;
 
-use super::{couldnt_run, run_git, stderr_or};
+use git_vista_protocol::plan_export;
+
+use super::{couldnt_run, run_git, run_git_argv, stderr_or};
 
 /// `git add -A` (`/api/stage`).
 pub(super) async fn exec_stage_all(repo: &Path, need: NetworkNeed) -> (StatusCode, String) {
-    let output = match run_git(repo, need, &["add", "-A"]).await {
+    let output = match run_git_argv(repo, need, &plan_export::stage_all_argv()).await {
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/stage", &e),
     };
@@ -180,7 +182,7 @@ pub(super) async fn exec_stage_selection(
 /// `git reset -q HEAD` (`/api/unstage`) — the exact inverse of stage-all; the
 /// working tree keeps every edit, so nothing is lost.
 pub(super) async fn exec_unstage_all(repo: &Path, need: NetworkNeed) -> (StatusCode, String) {
-    let output = match run_git(repo, need, &["reset", "-q", "HEAD"]).await {
+    let output = match run_git_argv(repo, need, &plan_export::unstage_all_argv()).await {
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/unstage", &e),
     };

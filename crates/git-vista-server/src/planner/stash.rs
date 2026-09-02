@@ -23,13 +23,13 @@ use std::path::Path;
 
 use axum::http::StatusCode;
 
-use git_vista_protocol::{CommitOid, StashMessage, StashSelector};
+use git_vista_protocol::{plan_export, CommitOid, StashMessage, StashSelector};
 
 use git_vista_core::activity::ActivityKind;
 
 use crate::sandbox::NetworkNeed;
 
-use super::{couldnt_run, journal_app_event, run_git, stderr_or, Obs};
+use super::{couldnt_run, journal_app_event, run_git, run_git_argv, stderr_or, Obs};
 
 /// Resolve a stash selector to the oid it names **right now**, and refuse
 /// unless that matches what the plan was built against (M3.24, #77).
@@ -118,18 +118,8 @@ pub(super) async fn exec_push_stash(
     keep_index: bool,
     include_untracked: bool,
 ) -> (StatusCode, String) {
-    let mut args: Vec<&str> = vec!["stash", "push"];
-    if keep_index {
-        args.push("--keep-index");
-    }
-    if include_untracked {
-        args.push("--include-untracked");
-    }
-    if let Some(m) = message {
-        args.push("-m");
-        args.push(m.as_str());
-    }
-    let output = match run_git(repo, need, &args).await {
+    let args = plan_export::push_stash_argv(message, keep_index, include_untracked);
+    let output = match run_git_argv(repo, need, &args).await {
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/stash/push", &e),
     };
@@ -409,7 +399,7 @@ pub(super) async fn exec_apply_stash(
     {
         return refusal;
     }
-    let output = match run_git(repo, need, &["stash", "apply", entry.as_str()]).await {
+    let output = match run_git_argv(repo, need, &plan_export::apply_stash_argv(entry)).await {
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/stash/apply", &e),
     };
@@ -486,10 +476,10 @@ pub(super) async fn exec_branch_from_stash(
         return refusal;
     }
 
-    let output = match run_git(
+    let output = match run_git_argv(
         repo,
         need,
-        &["stash", "branch", name.as_str(), entry.as_str()],
+        &plan_export::branch_from_stash_argv(name, entry),
     )
     .await
     {
@@ -602,7 +592,7 @@ pub(super) async fn exec_drop_stash(
     {
         return refusal;
     }
-    let output = match run_git(repo, need, &["stash", "drop", entry.as_str()]).await {
+    let output = match run_git_argv(repo, need, &plan_export::drop_stash_argv(entry)).await {
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/stash/drop", &e),
     };

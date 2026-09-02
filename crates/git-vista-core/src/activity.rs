@@ -546,7 +546,22 @@ pub fn parse_reflog_message(message: &str) -> (ActivityKind, String) {
         return (ActivityKind::Commit, rest.trim().to_string());
     }
     if let Some(rest) = msg.strip_prefix("commit:") {
-        return (ActivityKind::Commit, rest.trim().to_string());
+        let summary = rest.trim();
+        // The app reverts in two commands so it can support empty reverts on
+        // older Git: `revert --no-commit`, then plain `commit --no-edit`.
+        // That second command records `commit: Revert "..."`, not `revert:`.
+        // Recognize Git's exact conventional subject so the resulting row has
+        // the same kind as the app journal and the normal attribution match
+        // can absorb the reflog echo.
+        let kind = if summary
+            .strip_prefix("Revert \"")
+            .is_some_and(|subject| subject.ends_with('"'))
+        {
+            ActivityKind::Revert
+        } else {
+            ActivityKind::Commit
+        };
+        return (kind, summary.to_string());
     }
     if let Some(rest) = msg.strip_prefix("checkout: moving from ") {
         // "checkout: moving from <a> to <b>" — ref names can't contain spaces,
@@ -1358,6 +1373,100 @@ mod tests {
         assert_eq!(feed.len(), 1, "one event for one merge: {feed:#?}");
         assert_eq!(feed[0].source, ActivitySource::App);
         assert_eq!(feed[0].summary, "merged ‘feature’ into ‘main’");
+    }
+
+    #[test]
+    fn a_revert_journal_absorbs_both_reflog_spellings() {
+        let journal = ActivityEvent {
+            time: 101, // journal stamps right after git returns — 1s off
+            kind: ActivityKind::Revert,
+            ref_name: Some("main".into()),
+            summary: "reverted 2d8b819".into(),
+            old_oid: Some("a".into()),
+            new_oid: Some("r".into()),
+            source: ActivitySource::App,
+            undo: None,
+            refs: None,
+        };
+
+        for message in [
+            "revert: Revert \"bad change\"",
+            // The app runs `revert --no-commit` and then plain `commit`, so
+            // this is the spelling its second command actually writes.
+            "commit: Revert \"bad change\"",
+        ] {
+            let reflog = vec![entry("main", 100, "a", "r", message)];
+            let feed = assemble_feed(
+                vec![journal.clone()],
+                reflog,
+                &HashMap::new(),
+                &HashSet::new(),
+                10,
+            );
+            assert_eq!(
+                feed.len(),
+                1,
+                "one App event for reflog spelling {message:?}: {feed:#?}"
+            );
+            assert_eq!(feed[0].source, ActivitySource::App);
+            assert_eq!(feed[0].summary, "reverted 2d8b819");
+        }
+    }
+
+    #[test]
+    fn a_nearby_different_revert_is_not_absorbed() {
+        let journal = vec![ActivityEvent {
+            time: 101,
+            kind: ActivityKind::Revert,
+            ref_name: Some("main".into()),
+            summary: "reverted 2d8b819".into(),
+            old_oid: Some("a".into()),
+            new_oid: Some("app-revert".into()),
+            source: ActivitySource::App,
+            undo: None,
+            refs: None,
+        }];
+        let reflog = vec![
+            entry(
+                "main",
+                100,
+                "a",
+                "app-revert",
+                "commit: Revert \"app change\"",
+            ),
+            entry(
+                "main",
+                98,
+                "older",
+                "external-revert",
+                "revert: Revert \"other change\"",
+            ),
+        ];
+
+        let feed = assemble_feed(journal, reflog, &HashMap::new(), &HashSet::new(), 10);
+
+        assert_eq!(feed.len(), 2, "both genuine reverts must remain: {feed:#?}");
+        assert_eq!(
+            feed.iter()
+                .filter(|event| event.kind == ActivityKind::Revert)
+                .count(),
+            2,
+            "both rows are reverts: {feed:#?}"
+        );
+        assert!(
+            feed.iter().any(|event| {
+                event.new_oid.as_deref() == Some("app-revert")
+                    && event.source == ActivitySource::App
+            }),
+            "the app revert keeps App attribution: {feed:#?}"
+        );
+        assert!(
+            feed.iter().any(|event| {
+                event.new_oid.as_deref() == Some("external-revert")
+                    && event.source == ActivitySource::External
+            }),
+            "the unrelated revert stays visible as External: {feed:#?}"
+        );
     }
 
     /// A pushed remote-tracking ref and an independently pushed local branch
