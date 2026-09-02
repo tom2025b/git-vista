@@ -284,11 +284,17 @@ have dialogs.
 |---|---|---|
 | `MergeBranch` | `PendingOp::Merge`, from the branch menu | yes |
 | `RevertCommit` | `PendingOp::Undo(UndoAction::RevertCommit)` | yes |
-| `CherryPick` | none — [#596](https://github.com/tom2025b/git-vista/issues/596) | no |
+| `CherryPick` | `PendingOp::CherryPick`, from the branch menu ([#596](https://github.com/tom2025b/git-vista/issues/596)) | yes |
 
-Cherry-pick has nothing to hang a preview off. It inherits the panel the day it
-gets a menu entry: one arm in `previewable`, one in `preview_subject`. Stated
-here rather than silently narrowed.
+All three dialogs the engine can preview are wired. Cherry-pick was the last:
+it had no dialog to hang a preview off until [#596](https://github.com/tom2025b/git-vista/issues/596)
+gave it a door, and this record's own prediction — that it would inherit the
+panel via one arm in `previewable` and one in `preview_subject` — is what
+#594 then did. Both arms live in `features::dialogs::core`, host-tested,
+because the mapping is the decision: `CherryPick` and `RevertCommit` each
+carry exactly one `CommitOid`, so swapping one for the other compiles and
+renders the exact inverse operation, and an assertion checking only the oid
+passes straight through it.
 
 The mapping lives in `features::preview::core::previewable`, over a
 framework-free `DialogSubject`, because `PendingOp` lives in `crate::state`

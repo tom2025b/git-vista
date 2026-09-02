@@ -87,8 +87,10 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
     //
     // Three things this effect is careful about:
     //
-    //  * It asks only for the two operations the engine previews and the app
-    //    has dialogs for; `previewable` is where that list lives, host-tested,
+    //  * It asks only for the operations the engine previews and the app has
+    //    dialogs for — merge, revert and cherry-pick as of #594.
+    //    `previewable` is where that list lives, host-tested, and is the
+    //    authority: do not re-derive the count from this comment,
     //    because "which dialogs get a preview" is exactly the decision whose
     //    absence created #594.
     //  * It **clears** on every other case, `None` included. A close is what
