@@ -238,6 +238,12 @@ mod tests {
         StagingPane::new(StageDirection::Stage, diff())
     }
 
+    /// INVARIANT: the three partial granularities preserve their shared wire
+    /// shape, pinned generation, both directions, hunk anchors, and line indices.
+    ///
+    /// MUTATION 1 (remove): make added/removed rows non-selectable.
+    /// MUTATION 2 (weaken): shift every hunk ordinal by one. Direction
+    /// propagation is separately killed both always-Stage and file-only-Stage.
     #[test]
     fn file_hunk_and_changed_lines_build_the_three_shared_plan_shapes() {
         let pane = pane();
@@ -272,8 +278,24 @@ mod tests {
             panic!("changed line built a different granularity");
         };
         assert_eq!(hunks[0].lines, [1]);
+
+        let unstage = StagingPane::new(StageDirection::Unstage, diff());
+        for index in [0, 1, 2, 3] {
+            assert_eq!(
+                unstage
+                    .plan_for_row(index, "repo-1", "wt-1")
+                    .unwrap()
+                    .direction,
+                StageDirection::Unstage,
+                "file, hunk, and both changed-line shapes must preserve unstage"
+            );
+        }
     }
 
+    /// INVARIANT: context is visible but never selectable as a changed line.
+    ///
+    /// MUTATION 1 (remove): make every context row selectable.
+    /// MUTATION 2 (weaken): make context selectable for one text prefix.
     #[test]
     fn context_and_note_rows_can_never_become_line_plans() {
         let pane = pane();
@@ -286,6 +308,11 @@ mod tests {
         assert!(refused.contains("changed line"), "{refused}");
     }
 
+    /// INVARIANT: a file shortcut resolves by exact canonical path inside the
+    /// pinned diff; an arbitrary same-extension path cannot alias it.
+    ///
+    /// MUTATION 1 (remove): accept the first file without comparing its path.
+    /// MUTATION 2 (weaken): compare only the `.txt` extension.
     #[test]
     fn a_file_shortcut_must_resolve_inside_the_pinned_diff() {
         let pane = pane();

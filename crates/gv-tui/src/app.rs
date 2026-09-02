@@ -1471,6 +1471,11 @@ mod tests {
         );
     }
 
+    /// INVARIANT: selecting a repository activates the server session before
+    /// any selection-scoped read is dispatched.
+    ///
+    /// MUTATION 1 (remove): replace the Select request with an immediate Status read.
+    /// MUTATION 2 (weaken): dispatch History but omit Status after selection.
     #[test]
     fn activating_the_selected_repository_selects_it_before_scoped_reads() {
         let mut app = loaded(THREE);
@@ -1611,8 +1616,8 @@ mod tests {
     /// INVARIANT: whole-tree staging and unstaging submit only a server-built
     /// Plan, unchanged, after it has been visible and explicitly approved.
     ///
-    /// MUTATION 1 (remove): return ExecutePlan directly from `preview_whole_tree`.
-    /// MUTATION 2 (weaken): let `approve` execute while BuildPlan is pending.
+    /// MUTATION 1 (remove): discard the server Plan instead of storing Review.
+    /// MUTATION 2 (weaken): map the unstage direction to StageAll too.
     #[test]
     fn whole_tree_stage_and_unstage_wait_for_and_submit_the_exact_reviewed_plan() {
         for (sides, expected) in [
@@ -1673,7 +1678,7 @@ mod tests {
     /// INVARIANT: destructive discard has both a path-specific loss warning
     /// and the ordinary full-Plan review; neither confirmation itself writes.
     ///
-    /// MUTATION 1 (remove): have `confirm_discard` call BuildPlan immediately.
+    /// MUTATION 1 (remove): invert the discardable-path eligibility guard.
     /// MUTATION 2 (weaken): omit the permanent/uncommitted-loss wording.
     #[test]
     fn discard_requires_loss_confirmation_then_exact_plan_review() {
@@ -1724,8 +1729,8 @@ mod tests {
     /// INVARIANT: a file shortcut is resolved against the pinned shared diff,
     /// previewed by the server, then applies the exact reviewed PatchPlan.
     ///
-    /// MUTATION 1 (remove): build ApplyPatch directly from the status row.
-    /// MUTATION 2 (weaken): replace the reviewed plan with a newly-built plan.
+    /// MUTATION 1 (remove): drop the pending file instead of requesting preview.
+    /// MUTATION 2 (weaken): coerce the file shortcut into the first hunk.
     #[test]
     fn file_staging_uses_pinned_diff_preview_and_applies_the_exact_reviewed_patch_plan() {
         let mut app = loaded(THREE);

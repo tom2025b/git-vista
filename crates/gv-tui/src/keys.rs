@@ -207,6 +207,11 @@ mod tests {
         }
     }
 
+    /// INVARIANT: every #459 action is keyboard-reachable only in the panes
+    /// where its selection has meaning, while approval/refusal remain global.
+    ///
+    /// MUTATION 1 (remove): make Space inert in Working Tree and Main.
+    /// MUTATION 2 (weaken): make the all-tree shortcut active in every pane.
     #[test]
     fn staging_and_review_keys_are_scoped_without_hiding_cancel() {
         assert_eq!(

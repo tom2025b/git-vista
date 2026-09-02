@@ -340,6 +340,11 @@ mod tests {
         }
     }
 
+    /// INVARIANT: every browser status state survives projection, including
+    /// both-sides and renamed-then-edited paths appearing twice.
+    ///
+    /// MUTATION 1 (remove): drop conflicted entries.
+    /// MUTATION 2 (weaken): suppress the unstaged half of `Both`.
     #[test]
     fn every_browser_status_state_is_visible_and_actionable_only_when_supported() {
         let submodule = Some(SubmoduleState {
@@ -433,6 +438,10 @@ mod tests {
         );
     }
 
+    /// INVARIANT: failure is a third state and retains the last good snapshot.
+    ///
+    /// MUTATION 1 (remove): clear rows on failure.
+    /// MUTATION 2 (weaken): label failure Ready.
     #[test]
     fn a_failed_refresh_is_not_clean_and_does_not_erase_the_last_good_rows() {
         let mut pane = WorktreePane::default();
@@ -455,6 +464,10 @@ mod tests {
         assert_eq!(pane.state(), &LoadState::Failed("refresh refused".into()));
     }
 
+    /// INVARIANT: server/porcelain order cannot destabilize terminal order.
+    ///
+    /// MUTATION 1 (remove): omit sorting.
+    /// MUTATION 2 (weaken): sort by path without section priority.
     #[test]
     fn rows_are_section_then_path_sorted_independent_of_porcelain_order() {
         let entries = vec![
