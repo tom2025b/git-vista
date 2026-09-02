@@ -95,9 +95,38 @@ mutation and was discarded when cross-file residue was noticed.
 | exact typed write transport | operation sent instead of Plan | constant idempotency key reused |
 | terminal rendering | Working Tree draw removed | Main rendered only a Plan summary |
 
-Result: **36/36 mutants RED across 18 invariants, exactly two independent
-breaks each**. Direction propagation became its own invariant after the audit
-caught that the first version of the plan-shape test exercised only Stage.
+The original result claimed **36/36**, but grok's independent rerun on
+`1acdffb9` correctly found it was **35/36**: the reducer-level
+Space-on-untracked mutation survived. The row mapping was pinned, but the
+actionable refusal was not. Direction propagation did become its own invariant
+after the audit caught that the first version of the plan-shape test exercised
+only Stage; that does not excuse the separate surviving mutation.
+
+## 2026-09-02 — cross-family review repairs
+
+- Cancel now clears the `pending_file` intent as well as visible review and
+  busy state. A late staging diff can still be displayed, but cannot resurrect
+  the cancelled file shortcut as a PatchPreview request.
+- `Data::Written` clears the two global busy flags before the active-repository
+  relevance guard. The data worker is ordered, so this old-repository
+  completion is precisely what releases the later queued selection; ignoring
+  its visible result must not ignore its reducer cleanup.
+- Space on an untracked row now has explicit reducer coverage: it emits no
+  request, retains no pending intent, stays non-reviewable, and gives the
+  actionable StageAll refusal.
+
+The three repaired invariants were mutation-proved twice, with distinct
+failures, after each change was restored before the next run:
+
+| Invariant | Mutation A and observed failure | Mutation B and observed failure |
+|---|---|---|
+| cancel pending file | remove `pending_file` clear → leaked-intent assertion | invert cancel's busy clear → reducer-busy assertion |
+| untracked Space | give row `Stage` direction → emitted-request assertion | downgrade refusal tone → Error/Info assertion |
+| repo switch during execution | move cleanup below repo guard → execution-pinned assertion | clear execution only → write-gate-pinned assertion |
+
+Review-repair result: **6/6 mutants RED**. The original survivor is one of
+those six and is now caught at the reducer seam grok identified. No claim is
+made that the original run was 36/36.
 
 ## Final acceptance ledger
 

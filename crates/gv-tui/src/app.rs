@@ -412,6 +412,10 @@ impl App {
                 }
                 self.confirmation = None;
                 self.review = None;
+                // A file shortcut begins before its staging diff exists.
+                // Refusal must invalidate that earlier intent too, otherwise
+                // the late diff can still turn it into a PatchPreview.
+                self.pending_file = None;
                 self.write_in_flight = false;
                 self.status = Status {
                     text: String::from("cancelled · no changes were made"),
@@ -701,11 +705,16 @@ impl App {
                 Vec::new()
             }
             Data::Written { repo, result } => {
+                // The data worker is ordered: this completion releases every
+                // later request, including a repository selection queued
+                // while the write ran. Clear the global busy state before
+                // deciding whether the old repository's result is still
+                // relevant to the visible pane.
+                self.write_in_flight = false;
+                self.execution_in_flight = false;
                 if self.active_repo.as_deref() != Some(repo.as_str()) {
                     return Vec::new();
                 }
-                self.write_in_flight = false;
-                self.execution_in_flight = false;
                 match result {
                     Ok(message) => {
                         self.review = None;
@@ -1968,6 +1977,150 @@ mod tests {
         });
         assert!(app.review.is_none());
         assert!(app.apply(Action::Approve).is_empty());
+    }
+
+    /// INVARIANT: cancelling a Working Tree file shortcut invalidates the
+    /// pending file before its staging diff can answer.
+    ///
+    /// MUTATION 1 (remove): retain `pending_file` in the Cancel arm.
+    /// MUTATION 2 (invert): leave the reducer busy after cancellation.
+    #[test]
+    fn cancelling_a_pending_file_makes_its_late_staging_diff_non_executable() {
+        let mut app = loaded(THREE);
+        select_first(&mut app);
+        ready_status(
+            &mut app,
+            vec![changed(
+                "a.txt",
+                ChangeSides::UnstagedOnly {
+                    unstaged: ChangeKind::Modified,
+                },
+            )],
+        );
+
+        assert!(matches!(
+            app.apply(Action::PreviewSelection).as_slice(),
+            [Request::StagingDiff { .. }]
+        ));
+        app.apply(Action::Cancel);
+        assert!(
+            app.pending_file.is_none(),
+            "cancel retained the file intent"
+        );
+        assert!(!app.write_in_flight, "cancel left the reducer busy");
+        let (direction, diff) = staging_diff(StageDirection::Stage);
+        assert!(
+            app.receive(Data::StagingDiff {
+                repo: "w1".to_string(),
+                direction,
+                result: Ok(diff),
+            })
+            .is_empty(),
+            "a cancelled file intent escaped as a late PatchPreview request"
+        );
+        assert!(app.review.is_none());
+        assert!(!app.write_in_flight);
+        assert!(app.apply(Action::Approve).is_empty());
+    }
+
+    /// INVARIANT: Space on an untracked row never invents a partial plan;
+    /// only the separately reviewed StageAll path can include that file.
+    ///
+    /// MUTATION 1 (remove): give the untracked row a file direction.
+    /// MUTATION 2 (weaken): downgrade the actionable refusal to Info.
+    #[test]
+    fn space_on_untracked_refuses_partial_staging_and_points_to_stage_all() {
+        let mut app = loaded(THREE);
+        select_first(&mut app);
+        ready_status(
+            &mut app,
+            vec![StatusEntry::Untracked {
+                path: "new.txt".to_string(),
+                binary: false,
+            }],
+        );
+
+        assert!(app.apply(Action::PreviewSelection).is_empty());
+        assert_eq!(app.status.tone, Tone::Error);
+        assert!(app.status.text.contains("untracked"), "{}", app.status.text);
+        assert!(app.status.text.contains("stage all"), "{}", app.status.text);
+        assert!(app.pending_file.is_none());
+        assert!(!app.write_in_flight);
+        assert!(app.review.is_none());
+    }
+
+    /// INVARIANT: completion of an already-submitted write releases the
+    /// reducer even if the user selected another repository while it ran.
+    ///
+    /// MUTATION 1 (remove): move busy-state cleanup below the active-repo
+    /// stale-answer guard.
+    /// MUTATION 2 (weaken): clear `execution_in_flight` but leave the shared
+    /// `write_in_flight` gate set.
+    #[test]
+    fn old_repo_write_completion_cannot_freeze_writes_after_a_repo_switch() {
+        let mut app = loaded(THREE);
+        select_first(&mut app);
+        ready_status(
+            &mut app,
+            vec![changed(
+                "a.txt",
+                ChangeSides::UnstagedOnly {
+                    unstaged: ChangeKind::Modified,
+                },
+            )],
+        );
+        app.apply(Action::PreviewWholeTree);
+        app.receive(Data::Plan {
+            repo: "w1".to_string(),
+            result: Ok(plan(GitOperation::StageAll)),
+        });
+        assert!(matches!(
+            app.apply(Action::Approve).as_slice(),
+            [Request::ExecutePlan { .. }]
+        ));
+
+        app.apply(Action::Focus(Pane::Repositories));
+        app.apply(Action::CursorDown);
+        assert_eq!(
+            app.apply(Action::Activate),
+            [Request::Select {
+                repo: "w2".to_string()
+            }]
+        );
+        assert_eq!(app.active_repo.as_deref(), Some("w2"));
+
+        assert!(app
+            .receive(Data::Written {
+                repo: "w1".to_string(),
+                result: Ok(String::from("staged")),
+            })
+            .is_empty());
+        assert!(
+            !app.execution_in_flight,
+            "old completion left execution pinned"
+        );
+        assert!(
+            !app.write_in_flight,
+            "old completion left preview/write gate pinned"
+        );
+
+        app.receive(Data::Selected {
+            repo: "w2".to_string(),
+            result: Ok(()),
+        });
+        app.receive(Data::Status {
+            repo: "w2".to_string(),
+            result: Ok(status(vec![changed(
+                "b.txt",
+                ChangeSides::UnstagedOnly {
+                    unstaged: ChangeKind::Modified,
+                },
+            )])),
+        });
+        assert!(matches!(
+            app.apply(Action::PreviewWholeTree).as_slice(),
+            [Request::BuildPlan { repo, .. }] if repo == "w2"
+        ));
     }
 
     /// INVARIANT: the visible review includes every server Plan field and the
