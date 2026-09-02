@@ -481,10 +481,18 @@ cmd_report() {
   wips="$(git log --all --oneline --grep='^wip(' -i | wc -l)"
   echo "  $wips total"
   echo "  by branch:"
-  git for-each-ref --format='%(refname:short)' refs/remotes/origin/ | grep -v '/HEAD$' | while read -r b; do
+  # Same bare-`origin` leak the `total` line above had to guard against:
+  # origin/HEAD's SHORT name is the literal word "origin", which a
+  # `/HEAD$` match never catches — `-vx origin` matches that exact line
+  # instead of a suffix. And process substitution, not a pipe, so the
+  # loop's own conditional last statement (`&& printf`, false on any
+  # branch with zero WIP commits — the common case) can't make `set -o
+  # pipefail` kill the report; the "unfinished work" loop above already
+  # uses this same fix for the same reason.
+  while read -r b; do
     c="$(git log "$b" --oneline --grep='^wip(' -i 2>/dev/null | wc -l)"
     [[ "$c" -gt 0 ]] && printf '    %-55s %s\n' "$b" "$c"
-  done
+  done < <(git for-each-ref --format='%(refname:short)' refs/remotes/origin/ | grep -vx origin)
   echo
 
   echo "── lines of Rust, by crate ──────────────────────────"
