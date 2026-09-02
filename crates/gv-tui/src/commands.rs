@@ -3,6 +3,17 @@
 //! This is an operation builder, not an argv parser: every accepted command
 //! constructs one existing protocol value (or the read-only tag listing), and
 //! every other token is rejected before the data layer can make a request.
+//!
+//! ```text
+//! branch create NAME OID        branch checkout|merge|delete|force-delete NAME
+//! commit [--allow-empty] MESSAGE
+//! amend EXPECTED_HEAD [--allow-empty] MESSAGE
+//! tag list|delete NAME          tag create NAME OID
+//! tag annotate|sign NAME OID MESSAGE
+//! tag push|delete-remote NAME REMOTE
+//! fetch REMOTE                 pull REMOTE BRANCH merge|rebase
+//! push BRANCH REMOTE [--set-upstream] [--force-with-lease=OID]
+//! ```
 
 use git_vista_protocol::{
     BranchName, CommitMessage, CommitOid, ForcePublish, GitOperation, MergeStrategy, RemoteName,

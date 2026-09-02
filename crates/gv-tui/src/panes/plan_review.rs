@@ -338,18 +338,22 @@ pub struct PlanReviewPane {
     scroll: usize,
 }
 
+pub(crate) fn cancellable_operation(operation: &GitOperation) -> bool {
+    matches!(
+        operation,
+        GitOperation::FetchRemote { .. }
+            | GitOperation::PullBranch { .. }
+            | GitOperation::PushBranch { .. }
+    )
+}
+
 impl PlanReviewPane {
     /// Parse the exact bytes returned by `/api/plan` and retain them for approval.
     pub fn from_wire(wire: Vec<u8>) -> Result<PlanReviewPane, String> {
         let plan: Plan = serde_json::from_slice(&wire)
             .map_err(|error| format!("/api/plan did not return a valid Plan: {error}"))?;
         let projection = project(&plan);
-        let cancellable = matches!(
-            plan.operation,
-            GitOperation::FetchRemote { .. }
-                | GitOperation::PullBranch { .. }
-                | GitOperation::PushBranch { .. }
-        );
+        let cancellable = cancellable_operation(&plan.operation);
         let key = format!("tui-{}-{}", plan.operation_hash.as_str(), plan.issued_at.0);
         Ok(PlanReviewPane {
             wire: Arc::from(wire),

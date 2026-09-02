@@ -40,7 +40,9 @@ use git_vista_protocol::{
 
 use crate::commands::{self, Command};
 use crate::panes::detail::DetailPane;
-use crate::panes::plan_review::{PlanApproval, PlanReviewPane, SubmissionOutcome};
+use crate::panes::plan_review::{
+    cancellable_operation, PlanApproval, PlanReviewPane, SubmissionOutcome,
+};
 
 /// The existing paged-history wire shape, instantiated with the lane core's
 /// types. #458 uses its summaries as a small selector; #457 remains the owner
@@ -235,6 +237,7 @@ pub struct App {
     pub tags: Vec<TagDetail>,
     pub tags_loaded: bool,
     pub execution: Option<TrackedExecution>,
+    refresh_after_write: bool,
     cursors: [usize; 4],
     pub status: Status,
     /// Catalog reads dispatched and not yet answered.
@@ -266,6 +269,7 @@ impl App {
             tags: Vec::new(),
             tags_loaded: false,
             execution: None,
+            refresh_after_write: false,
             cursors: [0; 4],
             status: Status {
                 text: String::from("connecting to git-vista-server…"),
@@ -615,6 +619,7 @@ impl App {
                 let message = outcome.message();
                 if success {
                     self.plan_review = None;
+                    self.refresh_after_write = true;
                     self.status = Status {
                         text: message,
                         tone: Tone::Info,
@@ -635,6 +640,16 @@ impl App {
     /// second, and each in-flight flag prevents a slow server from queuing
     /// duplicates behind itself.
     pub fn tick(&mut self) -> Vec<Fetch> {
+        if self.refresh_after_write {
+            self.refresh_after_write = false;
+            if let Some(repo) = self.active_repo.clone() {
+                let mut requests = vec![Fetch::History { repo: repo.clone() }];
+                if self.tags_loaded {
+                    requests.push(Fetch::Tags { repo });
+                }
+                return requests;
+            }
+        }
         let Some(execution) = self.execution.as_mut() else {
             return Vec::new();
         };
@@ -1030,9 +1045,14 @@ fn operation_progress_line(operation: &OperationStatus) -> String {
             git_vista_protocol::TransferPhase::Writing => "writing",
             git_vista_protocol::TransferPhase::Resolving => "resolving",
         };
+        let cancel = if cancellable_operation(&operation.operation) {
+            " · c cancel"
+        } else {
+            ""
+        };
         return progress.percent.map_or_else(
-            || format!("transfer {phase} · c cancel"),
-            |percent| format!("transfer {phase} {percent}% · c cancel"),
+            || format!("transfer {phase}{cancel}"),
+            |percent| format!("transfer {phase} {percent}%{cancel}"),
         );
     }
     let stage = match operation.stage {
@@ -1594,6 +1614,9 @@ mod tests {
         assert!(app.plan_review.is_none());
         assert_eq!(app.status.text, "Staged all changes.");
         assert_eq!(app.status.tone, Tone::Info);
+        // This test has no active repository, so the refresh marker drains
+        // without fabricating a target.
+        assert!(app.tick().is_empty());
     }
 
     #[test]

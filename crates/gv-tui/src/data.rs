@@ -415,8 +415,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use git_vista_protocol::{
-        GenerationToken, GitOperation, OperationHash, OperationId, Plan, RecoveryStrategy,
-        RepositoryDescriptor, RepositoryToken, RiskLevel, UnixSeconds, WorktreeToken,
+        BranchName, GenerationToken, GitOperation, OperationHash, OperationId, Plan,
+        RecoveryStrategy, RepositoryDescriptor, RepositoryToken, RiskLevel, UnixSeconds,
+        WorktreeToken,
     };
 
     use super::*;
@@ -709,8 +710,8 @@ mod tests {
                 assert_eq!(cookie, "gv_session=gen1");
                 assert_eq!(csrf, "csrf-gen1");
                 match path {
-                    SELECT_PATH => Ok(response(200, "selected")),
-                    PLAN_PATH => Ok(response(200, &answer)),
+                    "/api/select" => Ok(response(200, "selected")),
+                    "/api/plan" => Ok(response(200, &answer)),
                     _ => panic!("unexpected POST {path}"),
                 }
             }),
@@ -723,13 +724,15 @@ mod tests {
             Data::Selected { result: Ok(()), .. }
         ));
         assert!(matches!(
-            client.serve(Fetch::BuildPlan(GitOperation::StageAll)),
+            client.serve(Fetch::BuildPlan(GitOperation::DeleteBranch {
+                branch: BranchName::new("topic").unwrap(),
+            })),
             Data::PlanReady(Ok(body)) if body == plan_wire
         ));
 
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].0, SELECT_PATH);
+        assert_eq!(calls[0].0, "/api/select");
         assert_eq!(
             serde_json::from_slice::<SelectRequest>(&calls[0].1).unwrap(),
             SelectRequest {
@@ -737,10 +740,12 @@ mod tests {
                 mode: RepoMode::Active,
             }
         );
-        assert_eq!(calls[1].0, PLAN_PATH);
+        assert_eq!(calls[1].0, "/api/plan");
         assert_eq!(
             serde_json::from_slice::<GitOperation>(&calls[1].1).unwrap(),
-            GitOperation::StageAll
+            GitOperation::DeleteBranch {
+                branch: BranchName::new("topic").unwrap(),
+            }
         );
     }
 
