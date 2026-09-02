@@ -132,9 +132,19 @@ impl DetailPane {
     }
 
     pub fn window(&self, offset: usize, limit: usize) -> Vec<DetailRow> {
+        self.project_window(offset, limit).rows
+    }
+
+    fn project_window(&self, offset: usize, limit: usize) -> RowWindow {
         let mut window = RowWindow::new(offset, limit);
         self.visit_rows(|row| window.push(row));
-        window.rows
+        window
+    }
+
+    #[cfg(test)]
+    fn window_with_visit_count(&self, offset: usize, limit: usize) -> (Vec<DetailRow>, usize) {
+        let window = self.project_window(offset, limit);
+        (window.rows, window.seen)
     }
 
     pub fn select_parent(&mut self, delta: isize) {
@@ -649,11 +659,15 @@ mod tests {
         pane.receive_diff("worktree-1", ID, Ok(diff(ID, &patch)));
 
         assert!(pane.row_count() > 200);
-        let window = pane.window(80, 7);
+        let (window, visited) = pane.window_with_visit_count(80, 7);
         assert_eq!(
             window.len(),
             7,
             "the view must not materialize off-screen rows"
+        );
+        assert_eq!(
+            visited, 87,
+            "projection must stop after skipping 80 rows and building the seven-row viewport"
         );
         assert_eq!(window, pane.window(0, pane.row_count())[80..87]);
     }
