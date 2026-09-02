@@ -626,6 +626,12 @@ pub fn App() -> impl IntoView {
     // bump, and every drawer write ends with a bump. Owned below it, the
     // outcome notice was destroyed one frame after being written.
     let stash = crate::features::stash::signals::StashDrawer::new();
+    // M10.08 A6 (#594): the confirm dialog's before/after picture. Created here,
+    // above the canvas, for the reason the two handles above it are — and for
+    // one more of its own: the generation tag that decides whether a late
+    // preview reply may paint lives inside it, and a rebuild would reset it to
+    // zero and re-admit the stale answer it exists to drop.
+    let preview = crate::features::preview::signals::Preview::new();
     let features = Features {
         graph,
         dialogs: dialogs_guard,
@@ -634,6 +640,7 @@ pub fn App() -> impl IntoView {
         shell,
         stash,
         compare_anchor,
+        preview,
     };
     let settings = Settings {
         nerd_icons,
