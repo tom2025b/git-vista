@@ -201,3 +201,88 @@ async fn two_sessions_hold_different_selected_repositories() {
     })
     .await;
 }
+
+/// **Acceptance criterion 2.** A session that has chosen nothing resolves to
+/// the *launch* repository — a defined place — not to whatever the previous
+/// session left behind.
+///
+/// The setup is the leftover itself: `beta` is registered second, so the
+/// process-wide default at sign-in time is beta. The alpha session then picks
+/// alpha. A *third*, brand-new session must still land on the launch default
+/// and must not inherit alpha's pick.
+#[tokio::test]
+async fn a_fresh_session_starts_at_the_launch_repository_not_the_previous_pick() {
+    state::with_isolated_test_current(async {
+        let (_dir_a, repo_a) = seeded_files(&[("a.txt", "a\n")], "alpha seed");
+        let (_dir_l, repo_launch) = seeded_files(&[("l.txt", "l\n")], "launch seed");
+
+        let handle_a = state::set_current(&repo_a, RepoMode::Active).expect("alpha registers");
+        // Registered last, so this is the standing default every fresh session
+        // seeds from — the stand-in for `main`'s startup selection.
+        state::set_current(&repo_launch, RepoMode::Active).expect("launch registers");
+
+        let (router, sessions) = router_and_manager();
+        let first = sign_in(&router, &sessions).await;
+        assert_eq!(
+            select(&router, &first, &handle_a.worktree.to_string()).await,
+            StatusCode::OK
+        );
+        assert!(commits_body(&router, &first).await.contains("alpha seed"));
+
+        let newcomer = sign_in(&router, &sessions).await;
+        let sees = commits_body(&router, &newcomer).await;
+        assert!(
+            sees.contains("launch seed"),
+            "a fresh session must start at the launch repository:\n{sees}"
+        );
+        assert!(
+            !sees.contains("alpha seed"),
+            "a fresh session inherited the previous session's selection:\n{sees}"
+        );
+    })
+    .await;
+}
+
+/// **Acceptance criterion 3.** Signing out leaves no selection behind.
+///
+/// The selection cell hangs off the session record, so `revoke` drops it. This
+/// pins that: after a sign-out, a new session on the same server is back at the
+/// launch repository rather than at the departed session's choice.
+#[tokio::test]
+async fn signing_out_leaves_no_selection_for_the_next_session() {
+    state::with_isolated_test_current(async {
+        let (_dir_a, repo_a) = seeded_files(&[("a.txt", "a\n")], "alpha seed");
+        let (_dir_l, repo_launch) = seeded_files(&[("l.txt", "l\n")], "launch seed");
+
+        let handle_a = state::set_current(&repo_a, RepoMode::Active).expect("alpha registers");
+        state::set_current(&repo_launch, RepoMode::Active).expect("launch registers");
+
+        let (router, sessions) = router_and_manager();
+        let leaver = sign_in(&router, &sessions).await;
+        assert_eq!(
+            select(&router, &leaver, &handle_a.worktree.to_string()).await,
+            StatusCode::OK
+        );
+        assert!(commits_body(&router, &leaver).await.contains("alpha seed"));
+
+        let id = leaver
+            .cookie
+            .split_once('=')
+            .expect("a cookie name=value")
+            .1
+            .to_string();
+        assert!(sessions.revoke(&id), "the session was live before sign-out");
+
+        let next = sign_in(&router, &sessions).await;
+        let sees = commits_body(&router, &next).await;
+        assert!(
+            sees.contains("launch seed"),
+            "after a sign-out the next session must start at the launch repository:\n{sees}"
+        );
+        assert!(
+            !sees.contains("alpha seed"),
+            "the departed session's selection outlived its session:\n{sees}"
+        );
+    })
+    .await;
+}

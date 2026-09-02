@@ -333,7 +333,7 @@ async fn plan_and_execute_tracked(
     // therefore happens *inside* the detached task, not before it's spawned,
     // even though that means the `Accepted` row lands a beat later than the
     // in-memory state does.
-    tokio::spawn(crate::state::inherit_test_current(
+    tokio::spawn(crate::state::inherit_selection(
         crate::operations::with_progress(record.clone(), async move {
             crate::durable::persist(durable_key.clone(), durable_record.status()).await;
 

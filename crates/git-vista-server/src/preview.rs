@@ -537,8 +537,8 @@ pub(crate) async fn preview(target: &PreviewTarget, plan: &Plan) -> PreviewRespo
     let alive = std::sync::Arc::downgrade(&caller);
     let target = target.clone();
     let plan = plan.clone();
-    // `inherit_test_current` is the house pattern for a detached task and is
-    // `planner.rs`'s too (`tokio::spawn(crate::state::inherit_test_current(…))`).
+    // `inherit_selection` is the house pattern for a detached task and is
+    // `planner.rs`'s too (`tokio::spawn(crate::state::inherit_selection(…))`).
     // It is the identity function in production (`#[cfg(not(test))]`) and, under
     // `cfg(test)`, captures the caller's `TEST_CURRENT` scope *synchronously* —
     // its own doc: "`tokio::spawn` first polls the returned future in the child
@@ -550,7 +550,7 @@ pub(crate) async fn preview(target: &PreviewTarget, plan: &Plan) -> PreviewRespo
     // its mode inside `with_isolated_test_current` — would still pass, but only
     // through `set_current`'s side effect on the process-global catalog, i.e.
     // for a different reason than it was written to check.
-    let task = tokio::spawn(crate::state::inherit_test_current(async move {
+    let task = tokio::spawn(crate::state::inherit_selection(async move {
         match compute(&target, &plan, &alive).await {
             Ok(outcome) => outcome,
             Err(reason) => PreviewOutcome::Unavailable { reason },

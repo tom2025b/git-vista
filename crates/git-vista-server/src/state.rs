@@ -8,7 +8,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use axum::http::StatusCode;
 
@@ -275,8 +275,10 @@ pub(crate) fn descriptor_for(worktree: WorktreeId) -> Option<RepositoryDescripto
 /// the CLI-arg repo (Active — the user's own working repo), `POST /api/clone`
 /// swaps it for a clone (Visualize), and `POST /api/select` moves it to any
 /// catalog entry in the mode the operator chose (ADR 0007).
+/// `pub(crate)` only so [`SelectionCell`] can name it — a session record holds
+/// one of these but never looks inside. Its fields stay private to this module.
 #[derive(Clone)]
-struct Current {
+pub(crate) struct Current {
     path: PathBuf,
     /// Visualize = look-only: every write handler refuses (ADR 0007). This
     /// supersedes the old per-selection `read_only: bool` (Phase-12 clones).
@@ -287,65 +289,110 @@ struct Current {
     handle: Option<RepositoryHandle>,
 }
 
+/// The **launch** selection: the repository the operator started the server on.
+///
+/// Written once, by `main`, before any listener binds — and, since #588, never
+/// again by a request. Every request-scoped write lands in that request's
+/// session cell instead (see [`SELECTION`]), so this stays the fixed, defined
+/// place a *fresh* session begins at rather than drifting to whatever the last
+/// person happened to pick.
 static CURRENT: OnceLock<RwLock<Current>> = OnceLock::new();
 
-#[cfg(test)]
-tokio::task_local! {
-    /// Per-test repository selection. Production keeps the process-global
-    /// `CURRENT`; async tests opt into a scope so parallel tasks cannot replace
-    /// one another's fixture repository.
-    static TEST_CURRENT: RwLock<Option<Current>>;
+/// One session's selection, shared between the session record that owns it and
+/// whatever task is currently serving a request for that session.
+pub(crate) type SelectionCell = Arc<RwLock<Option<Current>>>;
+
+/// A selection cell for a session that has not chosen anything yet. Empty
+/// means "no choice made", which resolves to the launch selection — never to
+/// another session's leftovers.
+pub(crate) fn new_selection_cell() -> SelectionCell {
+    Arc::new(RwLock::new(None))
 }
 
+tokio::task_local! {
+    /// The selection belonging to whoever this task is serving (#588).
+    ///
+    /// Established by `security::guard` once per authenticated request, from
+    /// the cell hanging off that session's record, and inherited by detached
+    /// tasks through [`inherit_selection`]. A task with no scope — startup, and
+    /// only startup — reads and writes the process-global [`CURRENT`].
+    ///
+    /// This began as a `#[cfg(test)]` task-local that existed so parallel tests
+    /// could not replace one another's fixture repository. The hazard was real
+    /// and the shape was right; it was only ever scoped too narrowly. It is now
+    /// the production mechanism, and the test harness below is a thin wrapper
+    /// over it rather than a shadow of it — which is what #588's last
+    /// acceptance criterion asks for.
+    static SELECTION: SelectionCell;
+}
+
+/// Serve `future` as the owner of `cell`.
+///
+/// A cell nothing has been chosen from yet is seeded with the **ambient**
+/// selection first, so a brand-new session starts at a defined place rather
+/// than at nothing.
+///
+/// "Ambient" is [`current_snapshot`] evaluated *before* entering the new scope,
+/// which is the launch selection in production (no enclosing scope, so
+/// [`CURRENT`]) and the harness's own scope under test. One expression covers
+/// both, and the seed is therefore never another session's cell: a session
+/// scope is only ever entered from the guard, which is not itself inside one.
+///
+/// Seeding happens here rather than at session creation because the launch
+/// selection is not yet set when a `SessionManager` is built.
+pub(crate) async fn with_selection<F: std::future::Future>(
+    cell: SelectionCell,
+    future: F,
+) -> F::Output {
+    if cell.read().expect("selection lock not poisoned").is_none() {
+        if let Some(ambient) = current_snapshot() {
+            *cell.write().expect("selection lock not poisoned") = Some(ambient);
+        }
+    }
+    SELECTION.scope(cell, future).await
+}
+
+/// Run `future` in a fresh, isolated selection scope.
+///
+/// The test harness. Async tests that select a repository must use it, so a
+/// parallel test cannot replace another's fixture — and so nothing in the test
+/// binary writes the process-global launch selection.
 #[cfg(test)]
 pub(crate) async fn with_isolated_test_current<F: std::future::Future>(future: F) -> F::Output {
-    TEST_CURRENT.scope(RwLock::new(None), future).await
+    SELECTION.scope(new_selection_cell(), future).await
 }
 
-/// Carry a test's repository selection into a detached task.
-#[cfg(test)]
-pub(crate) fn inherit_test_current<F: std::future::Future>(
+/// Carry the caller's selection into a detached task.
+///
+/// The child shares the *same* cell, not a copy: a task spawned to serve a
+/// request must see that session's repository, and a selection it makes must be
+/// visible to the session that spawned it. Outside any scope (startup) the
+/// future is returned unchanged and resolves against [`CURRENT`].
+pub(crate) fn inherit_selection<F: std::future::Future>(
     future: F,
 ) -> impl std::future::Future<Output = F::Output> {
     // Capture synchronously: `tokio::spawn` first polls the returned future in
     // the child task, where the parent's task-local scope is no longer visible.
-    // Preserve the difference between no test scope and a scoped-yet-unset
-    // selection so a detached child cannot silently fall back to `CURRENT`.
-    let inherited = TEST_CURRENT
-        .try_with(|current| {
-            current
-                .read()
-                .expect("test CURRENT lock not poisoned")
-                .clone()
-        })
-        .ok();
-
+    let inherited = SELECTION.try_with(Arc::clone).ok();
     async move {
         match inherited {
-            Some(current) => TEST_CURRENT.scope(RwLock::new(current), future).await,
+            Some(cell) => SELECTION.scope(cell, future).await,
             None => future.await,
         }
     }
 }
 
-#[cfg(not(test))]
-pub(crate) fn inherit_test_current<F: std::future::Future>(future: F) -> F {
-    future
-}
-
-#[cfg(test)]
 fn set_current_resolved(path: PathBuf, mode: RepoMode, handle: Option<RepositoryHandle>) {
     let value = Current { path, mode, handle };
-    TEST_CURRENT
-        .try_with(|current| {
-            *current.write().expect("test CURRENT lock not poisoned") = Some(value);
-        })
-        .expect("tests that select a repository must use with_isolated_test_current");
-}
-
-#[cfg(not(test))]
-fn set_current_resolved(path: PathBuf, mode: RepoMode, handle: Option<RepositoryHandle>) {
-    let value = Current { path, mode, handle };
+    if let Ok(()) = SELECTION.try_with(|cell| {
+        *cell.write().expect("selection lock not poisoned") = Some(value.clone());
+    }) {
+        return;
+    }
+    // No scope: this is startup writing the launch selection.
+    #[cfg(test)]
+    panic!("tests that select a repository must use with_isolated_test_current");
+    #[cfg(not(test))]
     if let Some(lock) = CURRENT.get() {
         *lock.write().expect("CURRENT lock not poisoned") = value;
     } else {
@@ -357,18 +404,13 @@ fn set_current_resolved(path: PathBuf, mode: RepoMode, handle: Option<Repository
 
 /// Clone the current selection while holding its lock only briefly.
 ///
-/// Test tasks consult their explicit task-local scope first. Outside such a
-/// scope (and in every production build), the process-global startup selection
-/// remains the source of truth.
+/// The session serving this task answers first (#588). Outside any session
+/// scope — startup, and only startup — the launch selection answers.
 fn current_snapshot() -> Option<Current> {
-    #[cfg(test)]
-    if let Ok(current) = TEST_CURRENT.try_with(|current| {
-        current
-            .read()
-            .expect("test CURRENT lock not poisoned")
-            .clone()
-    }) {
-        return current;
+    if let Ok(Some(current)) =
+        SELECTION.try_with(|cell| cell.read().expect("selection lock not poisoned").clone())
+    {
+        return Some(current);
     }
 
     CURRENT
@@ -797,12 +839,12 @@ mod tests {
     /// Detached operation tasks must see the selection of the request that
     /// spawned them, not a process-global or catalog fallback.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn detached_tasks_inherit_their_test_selection() {
+    async fn detached_tasks_inherit_their_session_selection() {
         with_isolated_test_current(async {
             let expected = PathBuf::from("/tmp/git-vista-current-detached");
             set_current_resolved(expected.clone(), RepoMode::Active, None);
 
-            let observed = tokio::spawn(inherit_test_current(async { current() }))
+            let observed = tokio::spawn(inherit_selection(async { current() }))
                 .await
                 .expect("detached selection task completes");
 
