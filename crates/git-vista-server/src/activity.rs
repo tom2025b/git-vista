@@ -428,6 +428,29 @@ pub(crate) async fn revert_would_conflict(
     let found = crate::git_version::current(repo)
         .await
         .map_err(RevertCheckError::CheckFailed)?;
+    revert_would_conflict_at_version(repo, commit, parent, head, found).await
+}
+
+/// [`revert_would_conflict`] with the host's git version supplied rather than
+/// probed.
+///
+/// Split out for one reason, and it is a testing reason worth stating plainly:
+/// [`crate::git_version::current`] caches per process, so no test can make the
+/// running host's git look old. Without this arity the gate's *wiring* — as
+/// opposed to [`merge_tree_version_gate`]'s pure decision — could only be
+/// pinned by a source scan, and deleting the gate call would leave every test
+/// in this file green. With it, a test drives the real function with a literal
+/// 2.34.1 against a real repository and sees the real refusal.
+///
+/// The version is the only injected value. The repository, the spawn and the
+/// exit-code reading are all the production path.
+async fn revert_would_conflict_at_version(
+    repo: &Path,
+    commit: &str,
+    parent: &str,
+    head: &str,
+    found: (u32, u32, u32),
+) -> Result<bool, RevertCheckError> {
     if let Some(too_old) = merge_tree_version_gate(found) {
         return Err(too_old);
     }
@@ -764,10 +787,6 @@ mod tests {
     /// host's new-enough git the gate does **not** fire, and the function still
     /// answers the real question rather than refusing.
     ///
-    /// Stated as a limit rather than hidden: the `GitTooOld` arm is reached
-    /// end-to-end only against a genuinely old git binary. That was run by hand
-    /// against git 2.34.1 for this issue; see the module docs on
-    /// [`crate::git_version`] for the measurement.
     #[tokio::test]
     async fn a_new_enough_git_passes_the_gate_and_answers_the_real_question() {
         let (_dir, repo) = seeded_repo();
@@ -788,6 +807,46 @@ mod tests {
                 panic!("the check itself failed: {detail}")
             }
         }
+    }
+
+    /// #581: the gate is actually *wired in*, proven against a real repository
+    /// on the production path with only the version supplied.
+    ///
+    /// This is the test that makes deleting the gate a red build. The pure test
+    /// above proves the decision is right; this proves the decision is
+    /// consulted. Without it, removing the `if let Some(too_old)` block would
+    /// leave every other test in this file green — the host's git is 2.5x, so
+    /// nothing else can reach the refusal.
+    ///
+    /// The repository, the argv and the exit-code reading are all production;
+    /// only the version is injected, because
+    /// [`crate::git_version::current`] caches per process and cannot be made
+    /// to lie.
+    #[tokio::test]
+    async fn an_old_git_is_refused_by_name_before_merge_tree_is_ever_run() {
+        let (_dir, repo) = seeded_repo();
+        std::fs::write(repo.join("f.txt"), "line1\nline2\n").unwrap();
+        run(&repo, &["add", "f.txt"]);
+        run(&repo, &["commit", "-q", "-m", "add line2"]);
+        let tip = rev_parse_plain(&repo, "HEAD");
+        let parent = rev_parse_plain(&repo, "HEAD^");
+
+        // 2.34.1 is Ubuntu 22.04's git, measured 2026-09-02. On this exact
+        // repository shape the same call with the host's real git answers
+        // `Ok(false)` — the test above pins that — so an `Err` here can only
+        // come from the gate.
+        let refused =
+            revert_would_conflict_at_version(&repo, &tip, &parent, &tip, (2, 34, 1)).await;
+
+        assert_eq!(
+            refused,
+            Err(RevertCheckError::GitTooOld {
+                found: String::from("2.34.1"),
+                minimum: String::from("2.38"),
+            }),
+            "an old git must be refused by name, not fall through to merge-tree \
+             and surface as an unexplained CheckFailed"
+        );
     }
 
     /// The wiring itself, not just `revert_would_conflict`'s raw answer:
