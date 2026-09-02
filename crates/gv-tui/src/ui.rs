@@ -62,10 +62,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Tone::Info => Style::default(),
         Tone::Error => Style::default().fg(Color::Red),
     };
-    frame.render_widget(
-        Paragraph::new(app.status.text.as_str()).style(status_style),
-        panes.status,
-    );
+    let status = app
+        .command_input
+        .as_ref()
+        .map_or_else(|| app.status.text.clone(), |input| format!(":{input}█"));
+    frame.render_widget(Paragraph::new(status).style(status_style), panes.status);
 }
 
 fn draw_plan_review(frame: &mut Frame, area: Rect, review: &PlanReviewPane) {
@@ -415,6 +416,26 @@ mod tests {
         let catalog: Vec<RepositoryDescriptor> =
             serde_json::from_str(THREE).expect("the wire literal is valid");
         app.receive(Data::Catalog(Ok(catalog)));
+        app
+    }
+
+    fn reviewing() -> App {
+        let mut app = loaded();
+        let plan = Plan {
+            repository: RepositoryToken::new("repo-1").unwrap(),
+            worktree: WorktreeToken::new("worktree-1").unwrap(),
+            generation: GenerationToken::new("generation-reviewed").unwrap(),
+            operation: GitOperation::StageAll,
+            operation_hash: OperationHash::new("a".repeat(64)).unwrap(),
+            issued_at: UnixSeconds(1_788_365_000),
+            expires_at: UnixSeconds(1_788_365_300),
+            risk: RiskLevel::Remote,
+            preconditions: Vec::new(),
+            expected_ref_changes: Vec::new(),
+            advisories: Vec::new(),
+            recovery: RecoveryStrategy::NotNeeded,
+        };
+        app.receive(Data::PlanReady(Ok(serde_json::to_vec(&plan).unwrap())));
         app
     }
 
@@ -1027,5 +1048,20 @@ mod tests {
             buffer.content().iter().any(|cell| cell.fg == Color::Yellow),
             "the modal had no review/risk emphasis"
         );
+    }
+    #[test]
+    fn stale_refusal_replaces_server_cause_with_the_honest_message() {
+        let mut app = reviewing();
+        assert_eq!(app.apply(Action::ApprovePlan).len(), 2);
+        app.receive(Data::PlanSubmitted(
+            crate::panes::plan_review::SubmissionOutcome::from_response(
+                409,
+                b"The repository changed while this plan was pending",
+            ),
+        ));
+        let terminal = rendered(100, 30, &app);
+        let screen = text(terminal.backend().buffer());
+        assert!(screen.contains("Plan is stale."), "{screen}");
+        assert!(!screen.contains("repository changed"), "{screen}");
     }
 }

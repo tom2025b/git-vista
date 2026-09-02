@@ -1,11 +1,15 @@
 # ADR 0103 — The selection belongs to the session, not the process
 
 **Status:** Accepted — implemented, driven through the real router by two
-concurrent sessions, mutation-proved three ways on the one mechanism (3/3)
-**Date:** 2026-09-01
+concurrent sessions; original per-request scoping 3/3 still hold; the #614
+snapshot mutation those three did not catch is now closed (2/2 on child writes)
+**Date:** 2026-09-01 · follow-up 2026-09-02
 **Issues:** [#588](https://github.com/tom2025b/git-vista/issues/588) — the
 selected repository is process-global: a second session inherits, and
-overwrites, the first one's pick
+overwrites, the first one's pick. [#614](https://github.com/tom2025b/git-vista/issues/614)
+records two leftovers from the #609 audit; this ADR now covers only the
+surviving-mutation half. The unenforced `set_current_resolved` guarantee stays
+open on that issue.
 **Follows:** ADR 0006 / 0007 (the `RepoMode` model `state.rs` cites for what
 a selection *is*); the D2 decision of 2026-07-30 recorded on
 `state::read_only_for_path` (mode is the single source of truth for the
@@ -282,6 +286,7 @@ calling the function that defines it.
 | `two_sessions_hold_different_selected_repositories` | A selects alpha, B selects beta; A's read contains `alpha seed` and not `beta seed`, and B's the reverse |
 | `a_fresh_session_starts_at_the_launch_repository_not_the_previous_pick` | with launch registered last, a first session picks alpha; a brand-new third session reads `launch seed`, not `alpha seed` |
 | `signing_out_leaves_no_selection_for_the_next_session` | a session picks alpha and is revoked; the next session reads `launch seed`, not `alpha seed` |
+| `a_selection_written_inside_a_spawned_task_is_visible_to_the_parent` | parent selects beta, a spawned child `select_registered`s alpha through `inherit_selection`; the parent then reads alpha. Added 2026-09-02 to close the #614 snapshot gap |
 
 The red commit came first (`920f6b4a`): all three failed against the
 process-global `CURRENT` with the messages above, before any production code
@@ -328,9 +333,63 @@ Three shapes, one mechanism: all three break per-request scoping. What was
 **not** mutation-proved in this change, said plainly so it is not mistaken for
 proved: `inherit_selection` (the detached-task inheritance) and
 `SessionManager::revoke` dropping the cell. The revoke path is pinned by the
-third test above; inheritance is exercised by the planner and preview suites
-only through their existing behaviour, with no mutation run against it.
+third test above. Inheritance *reads* were exercised by
+`detached_tasks_inherit_their_session_selection`; inheritance *writes* were
+not. That gap is the next section, not a silent 3/3.
+
+### Follow-up 2026-09-02 — the snapshot mutation that 3/3 did not catch (#614)
+
+A commissioned re-run of the table above plus three more breaks against
+`inherit_selection` found that **snapshotting the cell's value into a fresh
+`Arc` survived**. Child reads still saw the parent's repository, so every
+existing test stayed green. Child writes would have been invisible. Planner
+and preview only ever read, so this was a suite gap, not a live leak.
+
+```mermaid
+---
+config:
+  flowchart:
+    wrappingWidth: 320
+---
+flowchart TD
+    subgraph SHARE["<b>Production — share the Arc</b>"]
+        P1["<b>parent on beta</b>"] -->|"same Arc"| C1["<b>child writes alpha</b>"]
+        C1 -->|"parent now reads alpha"| P1
+    end
+    subgraph SNAP["<b>The mutation that survived 3/3</b>"]
+        P2["<b>parent still on beta</b>"] -->|"copy of the value"| C2["<b>child writes alpha</b>"]
+        C2 -.->|"write never reaches the parent"| P2
+    end
+
+    KEY["<b>LEGEND</b><br/>green - shared cell, writes propagate<br/>red - snapshot copy, writes vanish<br/>dashed - the invisible write"]
+
+    classDef ok fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px,color:#1b5e20
+    classDef bad fill:#fdecea,stroke:#8b1a10,stroke-width:3px,color:#5c110a
+    classDef key fill:#f5f5f5,stroke:#616161,stroke-width:2px,color:#212121
+    class P1,C1 ok
+    class P2,C2 bad
+    class KEY key
+```
+
+Closed by `a_selection_written_inside_a_spawned_task_is_visible_to_the_parent`
+in `session_selection_suite.rs`. `inherit_selection`'s behaviour is unchanged.
+failure-atlas on HEAD `5584f1b5`, unmutated suite green first, assertion-level
+red only:
+
+| # | Shape | Where | What it did | Result |
+|---|---|---|---|---|
+| M04 | weakened it | `state.rs` `inherit_selection` | cloned the *value* into a fresh `Arc` instead of sharing | caught — parent still on beta (id 91) |
+| M05 | removed the mechanism | `state.rs` `inherit_selection` | returned the future unchanged (identity) | caught — child `set_current` panics with no scope (id 92) |
+
+Two independent breaks: vanished write versus missing scope. One `caught` would
+only have proved the test noticed *that* break.
+
+What #614 still leaves open, said plainly so this table is not mistaken for
+closing the issue: the `set_current_resolved` no-scope branch still writes the
+process-global in production (`cfg(test)` panics; release does not). That is a
+design decision, not this test.
 
 ---
 
 **Signed:** max · 2026-09-01T23:50:05-04:00
+**Signed:** grok · 2026-09-02T16:38:00-04:00

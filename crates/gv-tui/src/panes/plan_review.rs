@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use git_vista_protocol::{
-    explain, Advisory, ExplanationFact, IndexEffect, NetworkNeed, Plan, Precondition,
+    explain, Advisory, ExplanationFact, GitOperation, IndexEffect, NetworkNeed, Plan, Precondition,
     RecoveryStrategy, RefState, RiskLevel, Topic, WorktreeEffect,
 };
 
@@ -278,10 +278,10 @@ impl PlanApproval {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SubmissionOutcome {
     Executed(String),
-    /// A 409 for which the server did not explicitly establish expiry.
+    /// The server proved only that the reviewed plan can no longer execute.
+    /// `/api/execute-plan` carries no typed reason that can distinguish an
+    /// expired plan from a generation or precondition conflict.
     Stale,
-    /// The server explicitly said the plan expired.
-    Expired,
     Refused {
         status: u16,
         message: String,
@@ -295,14 +295,10 @@ impl SubmissionOutcome {
         let message = String::from_utf8_lossy(body).trim().to_string();
         match status {
             200..=299 => SubmissionOutcome::Executed(message),
-            409 if message
-                .eq_ignore_ascii_case("This plan has expired — refresh and try again.") =>
-            {
-                SubmissionOutcome::Expired
-            }
-            // A generation mismatch, a failed live precondition, or any other
-            // conflict means the reviewed plan is no longer executable. The
-            // status proves staleness; it does not prove what caused it.
+            // A generation mismatch, expiry, a failed live precondition, or
+            // any other conflict means the reviewed plan is no longer
+            // executable. The status proves that fact; the untyped body does
+            // not prove which cause produced it.
             409 => SubmissionOutcome::Stale,
             _ => SubmissionOutcome::Refused { status, message },
         }
@@ -313,9 +309,6 @@ impl SubmissionOutcome {
             SubmissionOutcome::Executed(message) => message.clone(),
             SubmissionOutcome::Stale => {
                 "Plan is stale. It was not executed. Build and review a new plan.".to_string()
-            }
-            SubmissionOutcome::Expired => {
-                "Plan expired. It was not executed. Build and review a new plan.".to_string()
             }
             SubmissionOutcome::Refused { status, message } => {
                 format!("Plan was not executed (HTTP {status}): {message}")
@@ -340,8 +333,18 @@ pub struct PlanReviewPane {
     wire: Arc<[u8]>,
     key: String,
     projection: PlanProjection,
+    cancellable: bool,
     state: ReviewState,
     scroll: usize,
+}
+
+pub(crate) fn cancellable_operation(operation: &GitOperation) -> bool {
+    matches!(
+        operation,
+        GitOperation::FetchRemote { .. }
+            | GitOperation::PullBranch { .. }
+            | GitOperation::PushBranch { .. }
+    )
 }
 
 impl PlanReviewPane {
@@ -350,11 +353,13 @@ impl PlanReviewPane {
         let plan: Plan = serde_json::from_slice(&wire)
             .map_err(|error| format!("/api/plan did not return a valid Plan: {error}"))?;
         let projection = project(&plan);
+        let cancellable = cancellable_operation(&plan.operation);
         let key = format!("tui-{}-{}", plan.operation_hash.as_str(), plan.issued_at.0);
         Ok(PlanReviewPane {
             wire: Arc::from(wire),
             key,
             projection,
+            cancellable,
             state: ReviewState::AwaitingDecision,
             scroll: 0,
         })
@@ -380,6 +385,10 @@ impl PlanReviewPane {
 
     pub fn is_submitting(&self) -> bool {
         self.state == ReviewState::Submitting
+    }
+
+    pub fn cancellable(&self) -> bool {
+        self.cancellable
     }
 
     pub fn scroll(&mut self, delta: isize) {
@@ -410,6 +419,9 @@ impl PlanReviewPane {
     pub fn help(&self) -> &'static str {
         match self.state {
             ReviewState::AwaitingDecision => "a approve · Esc refuse · j/k scroll",
+            ReviewState::Submitting if self.cancellable => {
+                "c cancel transfer · waiting for server re-validation"
+            }
             ReviewState::Submitting => "waiting for server re-validation",
             ReviewState::Refused(_) => "Esc close · j/k scroll",
         }
@@ -683,15 +695,9 @@ mod tests {
     }
 
     #[test]
-    fn explicit_expiry_is_distinct_but_other_409_prose_cannot_become_a_cause() {
-        let expired = SubmissionOutcome::from_response(
-            409,
-            b"This plan has expired \xe2\x80\x94 refresh and try again.",
-        );
-        assert_eq!(expired, SubmissionOutcome::Expired);
-        assert!(expired.message().starts_with("Plan expired."));
-
+    fn every_409_is_stale_regardless_of_english_prose() {
         for body in [
+            b"This plan has expired \xe2\x80\x94 refresh and try again.".as_slice(),
             b"refs/heads/main moved".as_slice(),
             b"This plan was built for a different worktree".as_slice(),
             b"some future conflict wording".as_slice(),
@@ -716,6 +722,45 @@ mod tests {
                 SubmissionOutcome::from_response(status, b"not done"),
                 SubmissionOutcome::Executed(_)
             ));
+        }
+    }
+
+    #[test]
+    fn only_server_supported_transfer_operations_offer_cancellation() {
+        let mut local = plan();
+        local.operation = GitOperation::CreateBranch {
+            name: BranchName::new("topic").unwrap(),
+            at: oid('a'),
+        };
+        assert!(
+            !PlanReviewPane::from_wire(serde_json::to_vec(&local).unwrap())
+                .unwrap()
+                .cancellable()
+        );
+
+        for operation in [
+            GitOperation::FetchRemote {
+                remote: RemoteName::new("origin").unwrap(),
+            },
+            GitOperation::PullBranch {
+                remote: RemoteName::new("origin").unwrap(),
+                branch: BranchName::new("main").unwrap(),
+                strategy: git_vista_protocol::MergeStrategy::Merge,
+            },
+            GitOperation::PushBranch {
+                branch: BranchName::new("main").unwrap(),
+                remote: RemoteName::new("origin").unwrap(),
+                set_upstream: false,
+                force: git_vista_protocol::ForcePublish::None,
+            },
+        ] {
+            let mut remote = plan();
+            remote.operation = operation;
+            assert!(
+                PlanReviewPane::from_wire(serde_json::to_vec(&remote).unwrap())
+                    .unwrap()
+                    .cancellable()
+            );
         }
     }
 }

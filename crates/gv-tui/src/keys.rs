@@ -50,7 +50,8 @@ pub fn dispatch(key: KeyEvent, pane: Pane) -> Option<Action> {
         _ if !plain => None,
         KeyCode::Char('q') => Some(Action::Quit),
         KeyCode::Char('y') => Some(Action::Approve),
-        KeyCode::Char('n') | KeyCode::Esc => Some(Action::Cancel),
+        KeyCode::Char('n') => Some(Action::Cancel),
+        KeyCode::Esc => Some(Action::RefusePlan),
         KeyCode::Tab | KeyCode::Char('l') => Some(Action::FocusNext),
         KeyCode::BackTab | KeyCode::Char('h') => Some(Action::FocusPrev),
         KeyCode::Right if pane == Pane::Main => Some(Action::HorizontalRight),
@@ -64,12 +65,33 @@ pub fn dispatch(key: KeyEvent, pane: Pane) -> Option<Action> {
             Some(Action::PreviewSelection)
         }
         KeyCode::Char('a') if pane == Pane::WorkingTree => Some(Action::PreviewWholeTree),
-        KeyCode::Char('a') => Some(Action::Approve),
+        KeyCode::Char('a') => Some(Action::ApprovePlan),
         KeyCode::Char('d') if pane == Pane::WorkingTree => Some(Action::Discard),
         KeyCode::Char('[') if pane == Pane::Main => Some(Action::ParentPrev),
         KeyCode::Char(']') if pane == Pane::Main => Some(Action::ParentNext),
         KeyCode::F(5) | KeyCode::Char('r') => Some(Action::Refresh),
+        KeyCode::Char('c') => Some(Action::CancelOperation),
+        KeyCode::Char(':') => Some(Action::OpenCommand),
         KeyCode::Char(d @ '1'..='9') => Pane::from_number(d.to_digit(10)? as u8).map(Action::Focus),
+        _ => None,
+    }
+}
+
+/// Translate input while the `:` command palette owns the keyboard.
+pub fn dispatch_command(key: KeyEvent) -> Option<Action> {
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => Some(Action::Quit),
+        KeyCode::Esc => Some(Action::RefusePlan),
+        KeyCode::Enter => Some(Action::SubmitCommand),
+        KeyCode::Backspace => Some(Action::CommandBackspace),
+        KeyCode::Char(character)
+            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+        {
+            Some(Action::CommandChar(character))
+        }
         _ => None,
     }
 }
@@ -208,6 +230,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_approves_and_escape_refuses_a_plan_review() {
+        assert_eq!(global(press(KeyCode::Char('a'))), Some(Action::ApprovePlan));
+        assert_eq!(global(press(KeyCode::Esc)), Some(Action::RefusePlan));
+        assert_eq!(
+            global(press(KeyCode::Char('c'))),
+            Some(Action::CancelOperation)
+        );
+    }
+
+    #[test]
+    fn colon_opens_the_palette_and_palette_keys_do_not_leak_navigation() {
+        assert_eq!(global(press(KeyCode::Char(':'))), Some(Action::OpenCommand));
+        assert_eq!(
+            dispatch_command(press(KeyCode::Char('j'))),
+            Some(Action::CommandChar('j'))
+        );
+        assert_eq!(
+            dispatch_command(press(KeyCode::Backspace)),
+            Some(Action::CommandBackspace)
+        );
+        assert_eq!(
+            dispatch_command(press(KeyCode::Enter)),
+            Some(Action::SubmitCommand)
+        );
+        assert_eq!(
+            dispatch_command(press(KeyCode::Esc)),
+            Some(Action::RefusePlan)
+        );
+        assert_eq!(dispatch_command(ctrl('c')), Some(Action::Quit));
+    }
+
     /// INVARIANT: every #459 action is keyboard-reachable only in the panes
     /// where its selection has meaning, while approval/refusal remain global.
     ///
@@ -233,8 +287,8 @@ mod tests {
         );
         assert_eq!(global(press(KeyCode::Char('y'))), Some(Action::Approve));
         assert_eq!(global(press(KeyCode::Char('n'))), Some(Action::Cancel));
-        assert_eq!(global(press(KeyCode::Esc)), Some(Action::Cancel));
-        assert_eq!(global(press(KeyCode::Char('a'))), Some(Action::Approve));
+        assert_eq!(global(press(KeyCode::Esc)), Some(Action::RefusePlan));
+        assert_eq!(global(press(KeyCode::Char('a'))), Some(Action::ApprovePlan));
         assert_eq!(global(press(KeyCode::Char('d'))), None);
     }
 

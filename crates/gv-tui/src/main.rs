@@ -38,6 +38,7 @@
 //! one-fresh-cookie-retry rule.
 
 mod app;
+mod commands;
 mod data;
 mod event;
 mod keys;
