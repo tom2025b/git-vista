@@ -49,17 +49,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let mut state = ListState::default().with_selected(selected);
     frame.render_stateful_widget(repositories, panes.of(Pane::Repositories), &mut state);
 
-    // #457's graph: refs are badged inline on their commit row (see
-    // graph.rs's ref-badge handling), not listed separately here. No issue
-    // yet owns a standalone branches list, so this stays an honest
-    // placeholder rather than a claim #457 will fill it.
-    draw_placeholder(
-        frame,
-        panes.of(Pane::Branches),
-        Pane::Branches,
-        app.focus,
-        "a branches list is not yet built",
-    );
+    draw_refs(frame, panes.of(Pane::Branches), app);
     draw_commits(frame, panes.of(Pane::Commits), app, detect_color_depth());
     draw_main(frame, panes.of(Pane::Main), app);
     if let Some(review) = &app.plan_review {
@@ -70,9 +60,45 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Tone::Info => Style::default(),
         Tone::Error => Style::default().fg(Color::Red),
     };
+    let status = app
+        .command_input
+        .as_ref()
+        .map_or_else(|| app.status.text.clone(), |input| format!(":{input}█"));
+    frame.render_widget(Paragraph::new(status).style(status_style), panes.status);
+}
+
+fn draw_refs(frame: &mut Frame, area: Rect, app: &App) {
+    if !app.tags_loaded {
+        draw_placeholder(
+            frame,
+            area,
+            Pane::Branches,
+            app.focus,
+            "tags: run :tag list",
+        );
+        return;
+    }
+    let lines: Vec<Line<'static>> = if app.tags.is_empty() {
+        vec![Line::from("No tags.")]
+    } else {
+        app.tags
+            .iter()
+            .map(|tag| {
+                let kind = match tag.kind {
+                    git_vista_protocol::TagKind::Lightweight => "light",
+                    git_vista_protocol::TagKind::Annotated => "annotated",
+                };
+                Line::from(format!(
+                    "{} [{kind}] {}",
+                    tag.name.as_str(),
+                    &tag.target.as_str()[..7]
+                ))
+            })
+            .collect()
+    };
     frame.render_widget(
-        Paragraph::new(app.status.text.as_str()).style(status_style),
-        panes.status,
+        Paragraph::new(lines).block(pane_block(Pane::Branches, app.focus)),
+        area,
     );
 }
 
@@ -516,20 +542,17 @@ mod tests {
         assert!(line(second_buffer, second_y).contains("beta"));
     }
 
-    // #457 (graph) and #458 (detail/diff) are wired now — the dedicated tests
-    // below exercise their real content. Branches has no owning issue yet and
-    // stays an honest placeholder; Commits and Main say why they are empty
-    // rather than sitting blank, which is the property this test used to pin
-    // for all three panes via their old `#457`/`#458`/`#459` placeholder text.
     #[test]
-    fn the_still_unbuilt_branches_pane_says_so_rather_than_sitting_empty() {
-        let app = loaded();
+    fn refs_pane_names_the_tag_command_then_renders_an_empty_tag_result() {
+        let mut app = loaded();
         let terminal = rendered(80, 24, &app);
         let screen = text(terminal.backend().buffer());
-        assert!(
-            screen.contains("branches list is not yet built"),
-            "{screen}"
-        );
+        assert!(screen.contains("tags: run :tag list"), "{screen}");
+
+        app.tags_loaded = true;
+        let terminal = rendered(80, 24, &app);
+        let screen = text(terminal.backend().buffer());
+        assert!(screen.contains("No tags."), "{screen}");
     }
 
     #[test]
@@ -842,7 +865,7 @@ mod tests {
     #[test]
     fn stale_refusal_replaces_server_cause_with_the_honest_message() {
         let mut app = reviewing();
-        assert_eq!(app.apply(Action::ApprovePlan).len(), 1);
+        assert_eq!(app.apply(Action::ApprovePlan).len(), 2);
         app.receive(Data::PlanSubmitted(
             crate::panes::plan_review::SubmissionOutcome::from_response(
                 409,

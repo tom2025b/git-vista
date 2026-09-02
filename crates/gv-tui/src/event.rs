@@ -61,13 +61,23 @@ pub fn run<B: Backend>(
         }
         match inputs.next(TICK)? {
             Input::Key(key) => {
-                if let Some(action) = keys::dispatch(key, app.focus) {
+                let action = if app.command_input.is_some() {
+                    keys::dispatch_command(key)
+                } else {
+                    keys::dispatch(key, app.focus)
+                };
+                if let Some(action) = action {
                     for fetch in app.apply(action) {
                         port.request(fetch);
                     }
                 }
             }
-            Input::Resize | Input::Tick => {}
+            Input::Tick => {
+                for fetch in app.tick() {
+                    port.request(fetch);
+                }
+            }
+            Input::Resize => {}
         }
         while let Some(data) = port.poll() {
             app.receive(data);

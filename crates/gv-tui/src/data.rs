@@ -15,11 +15,12 @@
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
+use git_vista_protocol::{OperationByKeyResponse, RepoMode, SelectRequest};
 use git_vista_session::auth::{self, Session};
 use git_vista_session::http::{self, HttpResponse};
-use git_vista_session::retry;
 use serde::de::DeserializeOwned;
 
 use crate::app::{Data, Fetch};
@@ -28,23 +29,38 @@ use crate::panes::plan_review::{PlanApproval, SubmissionOutcome};
 pub const CATALOG_PATH: &str = "/api/catalog";
 pub const HISTORY_LIMIT: usize = 250;
 pub const EXECUTE_PLAN_PATH: &str = "/api/execute-plan";
+pub const PLAN_PATH: &str = "/api/plan";
+pub const SELECT_PATH: &str = "/api/select";
 
-pub type FetchFn = Box<dyn FnMut(&str, &str) -> Result<HttpResponse, String> + Send>;
+pub type FetchFn = Box<dyn Fn(&str, &str) -> Result<HttpResponse, String> + Send + Sync>;
 pub type PostFn =
-    Box<dyn FnMut(&str, &[u8], &str, &str, &str) -> Result<HttpResponse, String> + Send>;
-pub type AuthFn = Box<dyn FnMut() -> Result<Session, String> + Send>;
+    Box<dyn Fn(&str, &[u8], &str, &str) -> Result<HttpResponse, String> + Send + Sync>;
+pub type IdempotentPostFn =
+    Box<dyn Fn(&str, &[u8], &str, &str, &str) -> Result<HttpResponse, String> + Send + Sync>;
+pub type AuthFn = Box<dyn Fn() -> Result<Session, String> + Send + Sync>;
+type SharedFetchFn = Arc<dyn Fn(&str, &str) -> Result<HttpResponse, String> + Send + Sync>;
+type SharedPostFn =
+    Arc<dyn Fn(&str, &[u8], &str, &str) -> Result<HttpResponse, String> + Send + Sync>;
+type SharedIdempotentPostFn =
+    Arc<dyn Fn(&str, &[u8], &str, &str, &str) -> Result<HttpResponse, String> + Send + Sync>;
+type SharedAuthFn = Arc<dyn Fn() -> Result<Session, String> + Send + Sync>;
 
+#[derive(Clone)]
 pub struct Client {
-    session: Option<Session>,
-    fetch: FetchFn,
-    post: PostFn,
-    auth: AuthFn,
+    session: Arc<Mutex<Option<Session>>>,
+    fetch: SharedFetchFn,
+    post: SharedPostFn,
+    idempotent_post: SharedIdempotentPostFn,
+    auth: SharedAuthFn,
 }
 
 impl Client {
     pub fn live() -> Client {
         Client::with_transport(
             Box::new(|path, cookie| http::get(path, Some(cookie))),
+            Box::new(|path, body, cookie, csrf| {
+                http::post_json(path, body, Some(cookie), Some(csrf))
+            }),
             Box::new(|path, body, cookie, csrf, key| {
                 http::post_json_idempotent(path, body, Some(cookie), Some(csrf), key)
             }),
@@ -56,6 +72,9 @@ impl Client {
     pub fn with(fetch: FetchFn, auth: AuthFn) -> Client {
         Client::with_transport(
             fetch,
+            Box::new(|path, body, cookie, csrf| {
+                http::post_json(path, body, Some(cookie), Some(csrf))
+            }),
             Box::new(|path, body, cookie, csrf, key| {
                 http::post_json_idempotent(path, body, Some(cookie), Some(csrf), key)
             }),
@@ -63,22 +82,43 @@ impl Client {
         )
     }
 
-    pub fn with_transport(fetch: FetchFn, post: PostFn, auth: AuthFn) -> Client {
+    pub fn with_transport(
+        fetch: FetchFn,
+        post: PostFn,
+        idempotent_post: IdempotentPostFn,
+        auth: AuthFn,
+    ) -> Client {
         Client {
-            session: None,
-            fetch,
-            post,
-            auth,
+            session: Arc::new(Mutex::new(None)),
+            fetch: Arc::from(fetch),
+            post: Arc::from(post),
+            idempotent_post: Arc::from(idempotent_post),
+            auth: Arc::from(auth),
         }
     }
 
-    pub fn get_json<T: DeserializeOwned>(&mut self, path: &str) -> Result<T, String> {
-        let body = retry::authed_fetch(path, &mut self.session, &mut *self.fetch, &mut *self.auth)?;
+    pub fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, String> {
+        let session = self.authenticated()?;
+        let response = (self.fetch)(path, &session.cookie)?;
+        let response = if response.status == 401 {
+            let fresh = self.reauthenticate_after(&session)?;
+            (self.fetch)(path, &fresh.cookie)?
+        } else {
+            response
+        };
+        if !(200..=299).contains(&response.status) {
+            return Err(format!(
+                "GET {path} answered {}: {}",
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            ));
+        }
+        let body = response.body;
         serde_json::from_slice(&body)
             .map_err(|error| format!("{path} did not return valid JSON: {error}"))
     }
 
-    pub fn serve(&mut self, fetch: Fetch) -> Data {
+    pub fn serve(&self, fetch: Fetch) -> Data {
         match fetch {
             Fetch::Catalog => Data::Catalog(self.get_json(CATALOG_PATH)),
             Fetch::History { repo } => {
@@ -98,30 +138,114 @@ impl Client {
                 let result = self.get_json(&path);
                 Data::Diff { repo, id, result }
             }
+            Fetch::Select { repo } => {
+                let body = serde_json::to_vec(&SelectRequest {
+                    worktree: repo.clone(),
+                    mode: RepoMode::Active,
+                })
+                .map_err(|error| error.to_string());
+                let result = body.and_then(|body| self.post_json(SELECT_PATH, &body).map(|_| ()));
+                Data::Selected { repo, result }
+            }
+            Fetch::BuildPlan(operation) => {
+                let body = serde_json::to_vec(&operation).map_err(|error| error.to_string());
+                Data::PlanReady(body.and_then(|body| self.post_json(PLAN_PATH, &body)))
+            }
+            Fetch::Tags { repo } => {
+                let path = format!("/api/tags?repo={repo}");
+                let result = self.get_json(&path);
+                Data::Tags { repo, result }
+            }
+            Fetch::OperationByKey { key } => {
+                let path = format!("/api/operations/by-key/{key}");
+                let result = self.get_optional_json::<OperationByKeyResponse>(&path);
+                Data::OperationByKey {
+                    key,
+                    result: result.map(|found| found.map(|response| response.id)),
+                }
+            }
+            Fetch::OperationStatus { id } => {
+                let path = format!("/api/operations/{}", id.as_str());
+                Data::OperationStatus(self.get_json(&path))
+            }
+            Fetch::CancelOperation { id } => {
+                let path = format!("/api/operations/{}/cancel", id.as_str());
+                let result = self
+                    .post_json(&path, b"{}")
+                    .map(|body| String::from_utf8_lossy(&body).trim().to_string());
+                Data::OperationCancelled { id, result }
+            }
             Fetch::ExecutePlan(approval) => Data::PlanSubmitted(self.submit_plan(&approval)),
         }
+    }
+
+    fn get_optional_json<T: DeserializeOwned>(&self, path: &str) -> Result<Option<T>, String> {
+        let session = self.authenticated()?;
+        let response = (self.fetch)(path, &session.cookie)?;
+        let response = if response.status == 401 {
+            let fresh = self.reauthenticate_after(&session)?;
+            (self.fetch)(path, &fresh.cookie)?
+        } else {
+            response
+        };
+        if response.status == 404 {
+            return Ok(None);
+        }
+        if !(200..=299).contains(&response.status) {
+            return Err(format!(
+                "GET {path} answered {}: {}",
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            ));
+        }
+        serde_json::from_slice(&response.body)
+            .map(Some)
+            .map_err(|error| format!("{path} did not return valid JSON: {error}"))
+    }
+
+    fn post_json(&self, path: &str, body: &[u8]) -> Result<Vec<u8>, String> {
+        let session = self.authenticated()?;
+        let response = self.post_once(path, body, &session)?;
+        let response = if response.status == 401 {
+            let fresh = self.reauthenticate_after(&session)?;
+            self.post_once(path, body, &fresh)?
+        } else {
+            response
+        };
+        if (200..=299).contains(&response.status) {
+            Ok(response.body)
+        } else {
+            Err(format!(
+                "POST {path} answered {}: {}",
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            ))
+        }
+    }
+
+    fn post_once(
+        &self,
+        path: &str,
+        body: &[u8],
+        session: &Session,
+    ) -> Result<HttpResponse, String> {
+        (self.post)(path, body, &session.cookie, &session.csrf)
     }
 
     /// Submit exactly one reviewed plan. Only a 401 earns a retry, and that
     /// retry reuses the same body and idempotency key. A 409 is an operation
     /// refusal, never a prompt to rebuild or resubmit behind the user's back.
-    fn submit_plan(&mut self, approval: &PlanApproval) -> SubmissionOutcome {
-        if self.session.is_none() {
-            match (self.auth)() {
-                Ok(session) => self.session = Some(session),
-                Err(message) => return SubmissionOutcome::TransportFailed(message),
-            }
-        }
-
-        let response = self.post_approval(approval);
+    fn submit_plan(&self, approval: &PlanApproval) -> SubmissionOutcome {
+        let session = match self.authenticated() {
+            Ok(session) => session,
+            Err(message) => return SubmissionOutcome::TransportFailed(message),
+        };
+        let response = self.post_approval(approval, &session);
         let response = match response {
-            Ok(response) if response.status == 401 => {
-                match (self.auth)() {
-                    Ok(session) => self.session = Some(session),
-                    Err(message) => return SubmissionOutcome::TransportFailed(message),
-                }
-                self.post_approval(approval)
-            }
+            Ok(response) if response.status == 401 => match self.reauthenticate_after(&session) {
+                Ok(fresh) => self.post_approval(approval, &fresh),
+                Err(message) => return SubmissionOutcome::TransportFailed(message),
+            },
             other => other,
         };
 
@@ -131,15 +255,50 @@ impl Client {
         }
     }
 
-    fn post_approval(&mut self, approval: &PlanApproval) -> Result<HttpResponse, String> {
-        let session = self.session.as_ref().expect("authenticated above");
-        (self.post)(
+    fn post_approval(
+        &self,
+        approval: &PlanApproval,
+        session: &Session,
+    ) -> Result<HttpResponse, String> {
+        (self.idempotent_post)(
             EXECUTE_PLAN_PATH,
             approval.body(),
             &session.cookie,
             &session.csrf,
             approval.key(),
         )
+    }
+
+    fn authenticated(&self) -> Result<Session, String> {
+        let mut slot = self
+            .session
+            .lock()
+            .map_err(|_| String::from("the in-memory session lock was poisoned"))?;
+        if let Some(session) = slot.as_ref() {
+            return Ok(session.clone());
+        }
+        let session = (self.auth)()?;
+        *slot = Some(session.clone());
+        Ok(session)
+    }
+
+    /// Refresh only if this request still owns the stale generation. A
+    /// concurrent request may already have replaced it; in that case reuse
+    /// the fresh in-memory session instead of racing for another token.
+    fn reauthenticate_after(&self, attempted: &Session) -> Result<Session, String> {
+        let mut slot = self
+            .session
+            .lock()
+            .map_err(|_| String::from("the in-memory session lock was poisoned"))?;
+        if let Some(current) = slot
+            .as_ref()
+            .filter(|current| current.cookie != attempted.cookie)
+        {
+            return Ok(current.clone());
+        }
+        let session = (self.auth)()?;
+        *slot = Some(session.clone());
+        Ok(session)
     }
 }
 
@@ -154,13 +313,33 @@ pub struct Worker {
     pending: VecDeque<Data>,
 }
 
-pub fn spawn(mut client: Client) -> Worker {
+pub fn spawn(client: Client) -> Worker {
     let (request_tx, request_rx) = mpsc::channel();
     let (answer_tx, answer_rx) = mpsc::channel();
     thread::Builder::new()
         .name(String::from("gv-tui-data"))
         .spawn(move || {
             for fetch in request_rx {
+                if let Fetch::ExecutePlan(approval) = fetch {
+                    let execute_client = client.clone();
+                    let execute_answers = answer_tx.clone();
+                    let started = thread::Builder::new()
+                        .name(String::from("gv-tui-execute"))
+                        .spawn(move || {
+                            let answer = execute_client.serve(Fetch::ExecutePlan(approval));
+                            let _ = execute_answers.send(answer);
+                        });
+                    if started.is_err()
+                        && answer_tx
+                            .send(Data::PlanSubmitted(SubmissionOutcome::TransportFailed(
+                                String::from("gv-tui could not start its execution thread"),
+                            )))
+                            .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
                 if answer_tx.send(client.serve(fetch)).is_err() {
                     break;
                 }
@@ -206,6 +385,24 @@ fn stopped_answer(fetch: Fetch) -> Data {
             id,
             result: Err(message()),
         },
+        Fetch::Select { repo } => Data::Selected {
+            repo,
+            result: Err(message()),
+        },
+        Fetch::BuildPlan(_) => Data::PlanReady(Err(message())),
+        Fetch::Tags { repo } => Data::Tags {
+            repo,
+            result: Err(message()),
+        },
+        Fetch::OperationByKey { key } => Data::OperationByKey {
+            key,
+            result: Err(message()),
+        },
+        Fetch::OperationStatus { .. } => Data::OperationStatus(Err(message())),
+        Fetch::CancelOperation { id } => Data::OperationCancelled {
+            id,
+            result: Err(message()),
+        },
         Fetch::ExecutePlan(_) => Data::PlanSubmitted(SubmissionOutcome::TransportFailed(message())),
     }
 }
@@ -213,13 +410,14 @@ fn stopped_answer(fetch: Fetch) -> Data {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{mpsc, Arc};
+    use std::sync::{mpsc, Arc, Barrier};
     use std::thread;
     use std::time::{Duration, Instant};
 
     use git_vista_protocol::{
-        GenerationToken, GitOperation, OperationHash, Plan, RecoveryStrategy, RepositoryDescriptor,
-        RepositoryToken, RiskLevel, UnixSeconds, WorktreeToken,
+        BranchName, GenerationToken, GitOperation, OperationHash, OperationId, Plan,
+        RecoveryStrategy, RepositoryDescriptor, RepositoryToken, RiskLevel, UnixSeconds,
+        WorktreeToken,
     };
 
     use super::*;
@@ -278,7 +476,7 @@ mod tests {
         let fetches = Arc::new(AtomicUsize::new(0));
         let auth_count = Arc::clone(&auths);
         let fetch_count = Arc::clone(&fetches);
-        let mut client = Client::with(
+        let client = Client::with(
             Box::new(move |path, cookie| {
                 assert_eq!(path, CATALOG_PATH);
                 let call = fetch_count.fetch_add(1, Ordering::SeqCst) + 1;
@@ -313,7 +511,7 @@ mod tests {
 
     #[test]
     fn a_non_200_answer_and_a_malformed_body_are_errors_that_name_the_path() {
-        let mut client = Client::with(
+        let client = Client::with(
             Box::new(|path, _| match path {
                 "/api/down" => Ok(response(503, "catalog rebuilding")),
                 "/api/broken" => Ok(response(200, "<html>not json</html>")),
@@ -338,7 +536,7 @@ mod tests {
 
     #[test]
     fn serve_maps_a_catalog_fetch_to_a_catalog_answer_carrying_the_error() {
-        let mut client = Client::with(
+        let client = Client::with(
             Box::new(|_, _| Ok(response(503, "catalog rebuilding"))),
             Box::new(|| Ok(session(1))),
         );
@@ -400,6 +598,48 @@ mod tests {
         assert_eq!(auths.load(Ordering::SeqCst), 2);
     }
 
+    #[test]
+    fn operation_lookup_is_served_while_the_approved_execution_is_still_running() {
+        let (_, approval) = approval();
+        let gate = Arc::new(Barrier::new(2));
+        let execute_gate = Arc::clone(&gate);
+        let client = Client::with_transport(
+            Box::new(|path, _| {
+                assert!(path.starts_with("/api/operations/by-key/"), "{path}");
+                Ok(response(200, r#"{"id":"op_0123456789abcdef"}"#))
+            }),
+            Box::new(|_, _, _, _| panic!("lookup is not a POST")),
+            Box::new(move |path, _, _, _, _| {
+                assert_eq!(path, EXECUTE_PLAN_PATH);
+                execute_gate.wait();
+                Ok(response(200, "done"))
+            }),
+            Box::new(|| Ok(session(1))),
+        );
+        let mut worker = spawn(client);
+        let key = approval.key().to_string();
+        worker.request(Fetch::ExecutePlan(approval));
+        worker.request(Fetch::OperationByKey { key: key.clone() });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut found = false;
+        while !found && Instant::now() < deadline {
+            if let Some(Data::OperationByKey {
+                key: answer,
+                result,
+            }) = worker.poll()
+            {
+                assert_eq!(answer, key);
+                assert_eq!(result.unwrap().unwrap().as_str(), "op_0123456789abcdef");
+                found = true;
+            } else {
+                thread::yield_now();
+            }
+        }
+        assert!(found, "lookup was blocked behind the running execution");
+        gate.wait();
+    }
+
     struct DropFlag(Arc<AtomicBool>);
 
     impl Drop for DropFlag {
@@ -455,12 +695,119 @@ mod tests {
     }
 
     #[test]
+    fn selection_and_planning_use_plain_posts_with_typed_exact_bodies() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&calls);
+        let (plan_wire, _) = approval();
+        let answer = plan_wire.clone();
+        let client = Client::with_transport(
+            Box::new(|_, _| panic!("selection and planning are not GETs")),
+            Box::new(move |path, body, cookie, csrf| {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push((path.to_string(), body.to_vec()));
+                assert_eq!(cookie, "gv_session=gen1");
+                assert_eq!(csrf, "csrf-gen1");
+                match path {
+                    "/api/select" => Ok(response(200, "selected")),
+                    "/api/plan" => Ok(response(200, &answer)),
+                    _ => panic!("unexpected POST {path}"),
+                }
+            }),
+            Box::new(|_, _, _, _, _| panic!("build-only requests are not idempotent writes")),
+            Box::new(|| Ok(session(1))),
+        );
+
+        assert!(matches!(
+            client.serve(Fetch::Select { repo: "w1".into() }),
+            Data::Selected { result: Ok(()), .. }
+        ));
+        assert!(matches!(
+            client.serve(Fetch::BuildPlan(GitOperation::DeleteBranch {
+                branch: BranchName::new("topic").unwrap(),
+            })),
+            Data::PlanReady(Ok(body)) if body == plan_wire
+        ));
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "/api/select");
+        assert_eq!(
+            serde_json::from_slice::<SelectRequest>(&calls[0].1).unwrap(),
+            SelectRequest {
+                worktree: "w1".into(),
+                mode: RepoMode::Active,
+            }
+        );
+        assert_eq!(calls[1].0, "/api/plan");
+        assert_eq!(
+            serde_json::from_slice::<GitOperation>(&calls[1].1).unwrap(),
+            GitOperation::DeleteBranch {
+                branch: BranchName::new("topic").unwrap(),
+            }
+        );
+    }
+
+    #[test]
+    fn tag_listing_is_a_scoped_read_not_a_write_disguised_as_a_plan() {
+        let client = Client::with(
+            Box::new(|path, cookie| {
+                assert_eq!(path, "/api/tags?repo=w1");
+                assert_eq!(cookie, "gv_session=gen1");
+                Ok(response(200, "[]"))
+            }),
+            Box::new(|| Ok(session(1))),
+        );
+        assert!(matches!(
+            client.serve(Fetch::Tags { repo: "w1".into() }),
+            Data::Tags { result: Ok(tags), .. } if tags.is_empty()
+        ));
+    }
+
+    #[test]
+    fn missing_operation_identity_is_pending_and_cancel_uses_the_typed_id_path() {
+        let client = Client::with_transport(
+            Box::new(|path, _| {
+                assert!(path.starts_with("/api/operations/by-key/"));
+                Ok(response(404, "not admitted yet"))
+            }),
+            Box::new(|path, body, cookie, csrf| {
+                assert_eq!(path, "/api/operations/op_0123456789abcdef/cancel");
+                assert_eq!(body, b"{}");
+                assert_eq!(cookie, "gv_session=gen1");
+                assert_eq!(csrf, "csrf-gen1");
+                Ok(response(202, "Cancellation requested."))
+            }),
+            Box::new(|_, _, _, _, _| panic!("cancel is not execute-plan")),
+            Box::new(|| Ok(session(1))),
+        );
+
+        assert!(matches!(
+            client.serve(Fetch::OperationByKey {
+                key: "intent_1".into()
+            }),
+            Data::OperationByKey {
+                result: Ok(None),
+                ..
+            }
+        ));
+        let id = OperationId::new("op_0123456789abcdef").unwrap();
+        assert!(matches!(
+            client.serve(Fetch::CancelOperation { id }),
+            Data::OperationCancelled { result: Ok(message), .. }
+                if message == "Cancellation requested."
+        ));
+    }
+
+    #[test]
     fn a_409_is_returned_as_stale_after_one_post_with_the_exact_reviewed_bytes() {
         let (wire, approval) = approval();
         let posts = Arc::new(AtomicUsize::new(0));
         let post_count = Arc::clone(&posts);
-        let mut client = Client::with_transport(
+        let client = Client::with_transport(
             Box::new(|_, _| panic!("approval is not a GET")),
+            Box::new(|_, _, _, _| panic!("approval is not a plain POST")),
             Box::new(move |path, body, cookie, csrf, key| {
                 post_count.fetch_add(1, Ordering::SeqCst);
                 assert_eq!(path, EXECUTE_PLAN_PATH);
@@ -494,8 +841,9 @@ mod tests {
         let captured = Arc::clone(&seen);
         let auths = Arc::new(AtomicUsize::new(0));
         let auth_count = Arc::clone(&auths);
-        let mut client = Client::with_transport(
+        let client = Client::with_transport(
             Box::new(|_, _| panic!("approval is not a GET")),
+            Box::new(|_, _, _, _| panic!("approval is not a plain POST")),
             Box::new(move |_, body, cookie, _csrf, key| {
                 captured
                     .lock()
