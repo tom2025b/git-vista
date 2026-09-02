@@ -3,6 +3,10 @@
 # One job per crate:
 #   - git-vista-core     : pure logic (graph layout + data models). No platform or UI
 #                          deps, so it compiles for wasm and is shared by the frontend.
+#   - git-vista-conflicts: the conflict view model (four-pane inspection, the
+#                          resolution surface, marker-file blocks). Downstream of
+#                          core and protocol, upstream of every client that
+#                          resolves a conflict — the browser viewer and gv-tui.
 #   - git-vista-protocol : the versioned HTTP transport contract — protocol version
 #                          negotiation, the API error envelope, request-id, and the
 #                          shared request/response DTOs. Pure/wasm-safe; depended on
@@ -28,6 +32,7 @@ resolver = "2"
 members = [
     "crates/git-vista-core",
     "crates/git-vista-protocol",
+    "crates/git-vista-conflicts",
     "crates/git-vista-git",
     "crates/git-vista-server",
     "crates/git-vista-session",
@@ -51,6 +56,10 @@ repository = "https://github.com/tom2025b/git-vista"
 [workspace.dependencies]
 git-vista-core = { path = "crates/git-vista-core" }
 git-vista-protocol = { path = "crates/git-vista-protocol" }
+# M10.07 (#462), ADR 0104: the conflict view model, downstream of core and
+# protocol so both the browser viewer and the terminal resolve conflicts
+# through one implementation.
+git-vista-conflicts = { path = "crates/git-vista-conflicts" }
 git-vista-git = { path = "crates/git-vista-git" }
 git-vista-plan-runner = { path = "crates/git-vista-plan-runner" }
 # The #456 extraction: bootstrap-token session auth + the minimal loopback

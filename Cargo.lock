@@ -1058,6 +1058,7 @@ version = "0.2.0"
 dependencies = [
  "console_error_panic_hook",
  "futures",
+ "git-vista-conflicts",
  "git-vista-core",
  "git-vista-protocol",
  "gloo-net 0.7.0",
@@ -1067,6 +1068,14 @@ dependencies = [
  "serde_json",
  "wasm-bindgen",
  "web-sys",
+]
+
+[[package]]
+name = "git-vista-conflicts"
+version = "0.2.0"
+dependencies = [
+ "git-vista-core",
+ "git-vista-protocol",
 ]
 
 [[package]]
