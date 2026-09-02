@@ -36,11 +36,16 @@ use git_vista_core::diff::{BlobContent, CommitDiff};
 use git_vista_core::model::{CommitDetail, Edge, FrameStub, GraphRow};
 use git_vista_protocol::conflict::{ConflictedFile, Resolution};
 use git_vista_protocol::{
-    CommitOid, ConflictSource, GenerationToken, HistoryPage, RepositoryDescriptor, RepositoryKind,
+    CommitOid, ConflictSource, GenerationToken, GitOperation, HistoryPage, OperationId,
+    OperationStatus, RepositoryDescriptor, RepositoryKind, TagDetail,
 };
 
+use crate::commands::{self, Command};
 use crate::panes::conflicts::{self, ConflictsPane};
 use crate::panes::detail::DetailPane;
+use crate::panes::plan_review::{
+    cancellable_operation, PlanApproval, PlanReviewPane, SubmissionOutcome,
+};
 
 /// The existing paged-history wire shape, instantiated with the lane core's
 /// types. #458 uses its summaries as a small selector; #457 remains the owner
@@ -122,6 +127,13 @@ pub enum Action {
     /// keymap: while its text buffer has focus, `q` is a letter somebody
     /// typed, not a request to quit the program.
     Conflict(conflicts::Act),
+    ApprovePlan,
+    RefusePlan,
+    OpenCommand,
+    CommandChar(char),
+    CommandBackspace,
+    SubmitCommand,
+    CancelOperation,
 }
 
 /// A read the loop must hand to the data layer. Phase 2a has one.
@@ -176,11 +188,48 @@ pub enum Fetch {
         expected_source: GenerationToken,
         content: String,
     },
+    Select {
+        repo: String,
+    },
+    BuildPlan(GitOperation),
+    Tags {
+        repo: String,
+    },
+    OperationByKey {
+        key: String,
+    },
+    OperationStatus {
+        id: OperationId,
+    },
+    CancelOperation {
+        id: OperationId,
+    },
+    ExecutePlan(PlanApproval),
 }
 
 /// A read's answer, back from the data layer.
 #[derive(Debug)]
 pub enum Data {
+    /// Exact response bytes from `/api/plan`. #461 will produce this answer;
+    /// keeping the bytes here avoids a serialize-after-review seam.
+    PlanReady(Result<Vec<u8>, String>),
+    Selected {
+        repo: String,
+        result: Result<(), String>,
+    },
+    Tags {
+        repo: String,
+        result: Result<Vec<TagDetail>, String>,
+    },
+    OperationByKey {
+        key: String,
+        result: Result<Option<OperationId>, String>,
+    },
+    OperationStatus(Result<OperationStatus, String>),
+    OperationCancelled {
+        id: OperationId,
+        result: Result<String, String>,
+    },
     Catalog(Result<Vec<RepositoryDescriptor>, String>),
     History {
         repo: String,
@@ -224,6 +273,7 @@ pub enum Data {
         path: String,
         result: Result<(), String>,
     },
+    PlanSubmitted(SubmissionOutcome),
 }
 
 /// How the status line should be drawn.
@@ -240,12 +290,27 @@ pub struct Status {
     pub tone: Tone,
 }
 
+#[derive(Debug)]
+pub struct TrackedExecution {
+    key: String,
+    id: Option<OperationId>,
+    status: Option<OperationStatus>,
+    cancellable: bool,
+    cancel_requested: bool,
+    lookup_in_flight: bool,
+    status_in_flight: bool,
+    cancel_in_flight: bool,
+    ticks: u8,
+}
+
 /// The shell's whole state.
 #[derive(Debug)]
 pub struct App {
     pub focus: Pane,
     pub catalog: Vec<RepositoryDescriptor>,
     pub active_repo: Option<String>,
+    /// Repository last acknowledged by `/api/select` in Active mode.
+    pub writable_repo: Option<String>,
     pub commits: Vec<GraphRow>,
     /// The rest of the fetched [`CommitPage`], kept beside `commits` so
     /// `ui.rs` can hand the graph renderer the same lanes core computed —
@@ -257,6 +322,17 @@ pub struct App {
     /// The conflict overlay (M10.07, #462). It takes the whole frame when
     /// open, so it is not a fifth member of the focus ring.
     pub conflicts: ConflictsPane,
+    /// A modal review blocks every ordinary navigation action until the user
+    /// approves or refuses it. #461 hands received `/api/plan` bytes to
+    /// [`App::present_plan`]; this slice owns everything after that seam.
+    pub plan_review: Option<PlanReviewPane>,
+    /// Text after `:` while the command palette owns the keyboard.
+    pub command_input: Option<String>,
+    /// Last explicit tag listing for the active repository.
+    pub tags: Vec<TagDetail>,
+    pub tags_loaded: bool,
+    pub execution: Option<TrackedExecution>,
+    refresh_after_write: bool,
     cursors: [usize; 4],
     pub status: Status,
     /// Catalog reads dispatched and not yet answered.
@@ -277,12 +353,19 @@ impl App {
             focus: Pane::Repositories,
             catalog: Vec::new(),
             active_repo: None,
+            writable_repo: None,
             commits: Vec::new(),
             edges: Vec::new(),
             stubs: Vec::new(),
             lane_count: 0,
             detail: DetailPane::default(),
             conflicts: ConflictsPane::default(),
+            plan_review: None,
+            command_input: None,
+            tags: Vec::new(),
+            tags_loaded: false,
+            execution: None,
+            refresh_after_write: false,
             cursors: [0; 4],
             status: Status {
                 text: String::from("connecting to git-vista-server…"),
@@ -301,6 +384,12 @@ impl App {
 
     /// Fold one action in; the reads it asks for come back to the loop.
     pub fn apply(&mut self, action: Action) -> Vec<Fetch> {
+        if self.plan_review.is_some() {
+            return self.apply_plan_review(action);
+        }
+        if self.command_input.is_some() {
+            return self.apply_command(action);
+        }
         match action {
             Action::Quit => {
                 self.quit = true;
@@ -369,6 +458,13 @@ impl App {
                 };
                 self.dispatch_conflict(requests)
             }
+            Action::OpenCommand => self.open_command(),
+            Action::ApprovePlan
+            | Action::RefusePlan
+            | Action::CommandChar(_)
+            | Action::CommandBackspace
+            | Action::SubmitCommand
+            | Action::CancelOperation => Vec::new(),
         }
     }
 
@@ -387,6 +483,71 @@ impl App {
 
     fn receive_into(&mut self, data: Data, follow_up: &mut Vec<Fetch>) {
         match data {
+            Data::Selected { repo, result } => match result {
+                Ok(()) if self.active_repo.as_deref() == Some(repo.as_str()) => {
+                    self.writable_repo = Some(repo);
+                    self.status = Status {
+                        text: String::from("repository opened for writes · : commands"),
+                        tone: Tone::Info,
+                    };
+                }
+                Ok(()) => {}
+                Err(message) if self.active_repo.as_deref() == Some(repo.as_str()) => {
+                    self.writable_repo = None;
+                    self.status = Status {
+                        text: format!("repository is not writable: {message}"),
+                        tone: Tone::Error,
+                    };
+                }
+                Err(_) => {}
+            },
+            Data::Tags { repo, result } => {
+                if self.active_repo.as_deref() != Some(repo.as_str()) {
+                    return;
+                }
+                match result {
+                    Ok(tags) => {
+                        self.tags = tags;
+                        self.tags_loaded = true;
+                        let names = self
+                            .tags
+                            .iter()
+                            .map(|tag| tag.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        self.status = Status {
+                            text: if names.is_empty() {
+                                String::from("no tags")
+                            } else {
+                                format!("{} tag(s): {names}", self.tags.len())
+                            },
+                            tone: Tone::Info,
+                        };
+                    }
+                    Err(message) => {
+                        self.status = Status {
+                            text: message,
+                            tone: Tone::Error,
+                        };
+                    }
+                }
+            }
+            Data::PlanReady(result) => match result {
+                Ok(wire) => {
+                    if let Err(message) = self.present_plan(wire) {
+                        self.status = Status {
+                            text: message,
+                            tone: Tone::Error,
+                        };
+                    }
+                }
+                Err(message) => {
+                    self.status = Status {
+                        text: message,
+                        tone: Tone::Error,
+                    };
+                }
+            },
             Data::Catalog(result) => {
                 self.in_flight = self.in_flight.saturating_sub(1);
                 match result {
@@ -396,6 +557,9 @@ impl App {
                             !self.catalog.iter().any(|repo| repo.worktree == *active)
                         }) {
                             self.active_repo = None;
+                            self.writable_repo = None;
+                            self.tags.clear();
+                            self.tags_loaded = false;
                             self.commits.clear();
                             self.edges.clear();
                             self.stubs.clear();
@@ -519,6 +683,379 @@ impl App {
                     );
                 }
             }
+            Data::OperationByKey { key, result } => {
+                let Some(execution) = self.execution.as_mut().filter(|item| item.key == key) else {
+                    return;
+                };
+                execution.lookup_in_flight = false;
+                match result {
+                    Ok(Some(id)) => {
+                        execution.id = Some(id);
+                        execution.ticks = 9;
+                        self.status = Status {
+                            text: String::from("operation admitted · waiting for progress…"),
+                            tone: Tone::Info,
+                        };
+                    }
+                    Ok(None) => {
+                        execution.ticks = 9;
+                    }
+                    Err(message) => {
+                        self.status = Status {
+                            text: format!("could not locate operation progress: {message}"),
+                            tone: Tone::Error,
+                        };
+                    }
+                }
+            }
+            Data::OperationStatus(result) => match result {
+                Ok(operation) => {
+                    let Some(execution) = self
+                        .execution
+                        .as_mut()
+                        .filter(|item| item.id.as_ref().is_some_and(|id| *id == operation.id))
+                    else {
+                        return;
+                    };
+                    execution.status_in_flight = false;
+                    execution.ticks = 0;
+                    self.status = Status {
+                        text: operation_progress_line(&operation),
+                        tone: if operation.state == git_vista_protocol::OperationState::Failed {
+                            Tone::Error
+                        } else {
+                            Tone::Info
+                        },
+                    };
+                    execution.status = Some(operation);
+                }
+                Err(message) => {
+                    if let Some(execution) = self.execution.as_mut() {
+                        execution.status_in_flight = false;
+                    }
+                    self.status = Status {
+                        text: format!("could not read operation progress: {message}"),
+                        tone: Tone::Error,
+                    };
+                }
+            },
+            Data::OperationCancelled { id, result } => {
+                let Some(execution) = self
+                    .execution
+                    .as_mut()
+                    .filter(|item| item.id.as_ref() == Some(&id))
+                else {
+                    return;
+                };
+                execution.cancel_in_flight = false;
+                self.status = match result {
+                    Ok(message) => Status {
+                        text: if message.trim().is_empty() {
+                            String::from("cancellation requested; waiting for the terminal outcome")
+                        } else {
+                            message
+                        },
+                        tone: Tone::Info,
+                    },
+                    Err(message) => Status {
+                        text: format!("cancellation was refused: {message}"),
+                        tone: Tone::Error,
+                    },
+                };
+            }
+            Data::PlanSubmitted(outcome) => {
+                self.execution = None;
+                let success = matches!(outcome, SubmissionOutcome::Executed(_));
+                let message = outcome.message();
+                if success {
+                    self.plan_review = None;
+                    self.refresh_after_write = true;
+                    self.status = Status {
+                        text: message,
+                        tone: Tone::Info,
+                    };
+                } else if let Some(review) = self.plan_review.as_mut() {
+                    review.receive(outcome);
+                    self.status = Status {
+                        text: message,
+                        tone: Tone::Error,
+                    };
+                }
+            }
+        }
+    }
+
+    /// Poll the tracked operation at a bounded cadence. The event loop calls
+    /// this only on its 50 ms tick; ten ticks means at most two requests per
+    /// second, and each in-flight flag prevents a slow server from queuing
+    /// duplicates behind itself.
+    pub fn tick(&mut self) -> Vec<Fetch> {
+        if self.refresh_after_write {
+            self.refresh_after_write = false;
+            if let Some(repo) = self.active_repo.clone() {
+                let mut requests = vec![Fetch::History { repo: repo.clone() }];
+                if self.tags_loaded {
+                    requests.push(Fetch::Tags { repo });
+                }
+                return requests;
+            }
+        }
+        let Some(execution) = self.execution.as_mut() else {
+            return Vec::new();
+        };
+        if execution
+            .status
+            .as_ref()
+            .is_some_and(OperationStatus::is_terminal)
+        {
+            return Vec::new();
+        }
+        if execution.cancel_requested && execution.cancellable && !execution.cancel_in_flight {
+            if let Some(id) = execution.id.clone() {
+                execution.cancel_in_flight = true;
+                return vec![Fetch::CancelOperation { id }];
+            }
+        }
+        execution.ticks = execution.ticks.saturating_add(1);
+        if execution.ticks < 10 {
+            return Vec::new();
+        }
+        execution.ticks = 0;
+        if let Some(id) = execution.id.clone() {
+            if execution.status_in_flight {
+                Vec::new()
+            } else {
+                execution.status_in_flight = true;
+                vec![Fetch::OperationStatus { id }]
+            }
+        } else if execution.lookup_in_flight {
+            Vec::new()
+        } else {
+            execution.lookup_in_flight = true;
+            vec![Fetch::OperationByKey {
+                key: execution.key.clone(),
+            }]
+        }
+    }
+
+    /// Open the immutable review modal from the exact bytes `/api/plan`
+    /// returned. This is the integration seam for #461's operation builders.
+    fn present_plan(&mut self, wire: Vec<u8>) -> Result<(), String> {
+        let review = PlanReviewPane::from_wire(wire)?;
+        self.plan_review = Some(review);
+        self.status = Status {
+            text: String::from("review the plan · a approve · Esc refuse · j/k scroll"),
+            tone: Tone::Info,
+        };
+        Ok(())
+    }
+
+    fn apply_plan_review(&mut self, action: Action) -> Vec<Fetch> {
+        match action {
+            Action::Quit => {
+                self.quit = true;
+                Vec::new()
+            }
+            Action::ApprovePlan => {
+                let Some(review) = self.plan_review.as_mut() else {
+                    return Vec::new();
+                };
+                let cancellable = review.cancellable();
+                let Some(approval) = review.approve() else {
+                    return Vec::new();
+                };
+                let key = approval.key().to_string();
+                self.execution = Some(TrackedExecution {
+                    key: key.clone(),
+                    id: None,
+                    status: None,
+                    cancellable,
+                    cancel_requested: false,
+                    lookup_in_flight: true,
+                    status_in_flight: false,
+                    cancel_in_flight: false,
+                    ticks: 0,
+                });
+                self.status = Status {
+                    text: String::from("submitting reviewed plan for server re-validation…"),
+                    tone: Tone::Info,
+                };
+                vec![Fetch::ExecutePlan(approval), Fetch::OperationByKey { key }]
+            }
+            Action::CancelOperation => self.request_cancel(),
+            Action::RefusePlan => {
+                let submitting = self
+                    .plan_review
+                    .as_ref()
+                    .is_some_and(PlanReviewPane::is_submitting);
+                if submitting {
+                    self.status = Status {
+                        text: String::from(
+                            "approval is already submitted; wait for the server's answer",
+                        ),
+                        tone: Tone::Error,
+                    };
+                } else {
+                    self.plan_review = None;
+                    self.status = Status {
+                        text: String::from("plan refused locally · nothing was executed"),
+                        tone: Tone::Info,
+                    };
+                }
+                Vec::new()
+            }
+            Action::CursorDown => {
+                if let Some(review) = self.plan_review.as_mut() {
+                    review.scroll(1);
+                }
+                Vec::new()
+            }
+            Action::CursorUp => {
+                if let Some(review) = self.plan_review.as_mut() {
+                    review.scroll(-1);
+                }
+                Vec::new()
+            }
+            // The modal owns the keyboard until a decision is made. In
+            // particular, refresh cannot silently replace a stale plan.
+            Action::FocusNext
+            | Action::FocusPrev
+            | Action::Focus(_)
+            | Action::Refresh
+            | Action::Activate
+            | Action::ParentPrev
+            | Action::ParentNext
+            | Action::HorizontalLeft
+            | Action::HorizontalRight
+            | Action::OpenCommand
+            | Action::CommandChar(_)
+            | Action::CommandBackspace
+            | Action::SubmitCommand
+            // #462's two, ignored here for #461's own reason: a plan review is
+            // waiting on a decision, and opening the conflict overlay would
+            // put a full-screen takeover in front of an approval the user has
+            // neither given nor refused. The modal is dismissed by deciding,
+            // never by navigating away from it.
+            | Action::OpenConflicts
+            | Action::Conflict(_) => Vec::new(),
+        }
+    }
+
+    fn request_cancel(&mut self) -> Vec<Fetch> {
+        let Some(execution) = self.execution.as_mut() else {
+            return Vec::new();
+        };
+        if !execution.cancellable {
+            self.status = Status {
+                text: String::from("this operation is short-lived and cannot be cancelled"),
+                tone: Tone::Error,
+            };
+            return Vec::new();
+        }
+        execution.cancel_requested = true;
+        if let Some(id) = execution.id.clone().filter(|_| !execution.cancel_in_flight) {
+            execution.cancel_in_flight = true;
+            self.status = Status {
+                text: String::from(
+                    "requesting transfer cancellation · a push may already have published",
+                ),
+                tone: Tone::Info,
+            };
+            vec![Fetch::CancelOperation { id }]
+        } else {
+            self.status = Status {
+                text: String::from("cancellation queued while the operation id is located…"),
+                tone: Tone::Info,
+            };
+            Vec::new()
+        }
+    }
+
+    fn open_command(&mut self) -> Vec<Fetch> {
+        if self.active_repo.is_none() {
+            self.status = Status {
+                text: String::from("select a repository before planning a write"),
+                tone: Tone::Error,
+            };
+        } else if self.writable_repo != self.active_repo {
+            self.status = Status {
+                text: String::from("this repository is not open for writes"),
+                tone: Tone::Error,
+            };
+        } else {
+            self.command_input = Some(String::new());
+            self.status = Status {
+                text: commands::HELP.to_string(),
+                tone: Tone::Info,
+            };
+        }
+        Vec::new()
+    }
+
+    fn apply_command(&mut self, action: Action) -> Vec<Fetch> {
+        match action {
+            Action::Quit => {
+                self.quit = true;
+                Vec::new()
+            }
+            Action::RefusePlan => {
+                self.command_input = None;
+                self.status = Status {
+                    text: String::from("command cancelled · nothing was sent"),
+                    tone: Tone::Info,
+                };
+                Vec::new()
+            }
+            Action::CommandChar(character) => {
+                if let Some(input) = self.command_input.as_mut() {
+                    input.push(character);
+                }
+                Vec::new()
+            }
+            Action::CommandBackspace => {
+                if let Some(input) = self.command_input.as_mut() {
+                    input.pop();
+                }
+                Vec::new()
+            }
+            Action::SubmitCommand => {
+                let input = self.command_input.take().unwrap_or_default();
+                match commands::parse(&input) {
+                    Ok(Command::Plan(operation)) => {
+                        self.status = Status {
+                            text: String::from("building a reviewable plan…"),
+                            tone: Tone::Info,
+                        };
+                        vec![Fetch::BuildPlan(operation)]
+                    }
+                    Ok(Command::ListTags) => {
+                        let repo = self
+                            .active_repo
+                            .clone()
+                            .expect("the palette opens only with an active repository");
+                        self.status = Status {
+                            text: String::from("loading tags…"),
+                            tone: Tone::Info,
+                        };
+                        vec![Fetch::Tags { repo }]
+                    }
+                    Ok(Command::Help) => {
+                        self.status = Status {
+                            text: commands::HELP.to_string(),
+                            tone: Tone::Info,
+                        };
+                        Vec::new()
+                    }
+                    Err(message) => {
+                        self.status = Status {
+                            text: message,
+                            tone: Tone::Error,
+                        };
+                        Vec::new()
+                    }
+                }
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -642,17 +1179,17 @@ impl App {
     }
 
     fn activate_repository(&mut self) -> Vec<Fetch> {
-        let Some(repo) = self
-            .catalog
-            .get(self.cursor(Pane::Repositories))
-            .map(|repo| repo.worktree.clone())
-        else {
+        let Some(descriptor) = self.catalog.get(self.cursor(Pane::Repositories)).cloned() else {
             return Vec::new();
         };
+        let repo = descriptor.worktree;
         if self.history_in_flight.as_deref() == Some(repo.as_str()) {
             return Vec::new();
         }
         if self.active_repo.as_deref() != Some(repo.as_str()) {
+            self.writable_repo = None;
+            self.tags.clear();
+            self.tags_loaded = false;
             self.commits.clear();
             self.edges.clear();
             self.stubs.clear();
@@ -668,7 +1205,11 @@ impl App {
             text: String::from("loading commits…"),
             tone: Tone::Info,
         };
-        vec![Fetch::History { repo }]
+        let mut requests = vec![Fetch::History { repo: repo.clone() }];
+        if !descriptor.read_only {
+            requests.push(Fetch::Select { repo });
+        }
+        requests
     }
 
     fn open_detail(&mut self, repo: String, id: String) -> Vec<Fetch> {
@@ -741,10 +1282,45 @@ fn short_id(id: &str) -> &str {
     &id[..id.len().min(7)]
 }
 
+fn operation_progress_line(operation: &OperationStatus) -> String {
+    if let Some(progress) = operation.progress {
+        let phase = match progress.phase {
+            git_vista_protocol::TransferPhase::Enumerating => "enumerating",
+            git_vista_protocol::TransferPhase::Counting => "counting",
+            git_vista_protocol::TransferPhase::Compressing => "compressing",
+            git_vista_protocol::TransferPhase::Receiving => "receiving",
+            git_vista_protocol::TransferPhase::Writing => "writing",
+            git_vista_protocol::TransferPhase::Resolving => "resolving",
+        };
+        let cancel = if cancellable_operation(&operation.operation) {
+            " · c cancel"
+        } else {
+            ""
+        };
+        return progress.percent.map_or_else(
+            || format!("transfer {phase}{cancel}"),
+            |percent| format!("transfer {phase} {percent}%{cancel}"),
+        );
+    }
+    let stage = match operation.stage {
+        git_vista_protocol::OperationStage::Queued => "queued",
+        git_vista_protocol::OperationStage::Planning => "planning",
+        git_vista_protocol::OperationStage::Waiting => "waiting for repository",
+        git_vista_protocol::OperationStage::Checking => "checking reviewed plan",
+        git_vista_protocol::OperationStage::Executing => "executing",
+        git_vista_protocol::OperationStage::Finished => "finished",
+    };
+    format!("operation {stage}")
+}
+
 #[cfg(test)]
 mod tests {
     use git_vista_core::model::{CommitSummary, Oid};
-    use git_vista_protocol::plan::GenerationToken;
+    use git_vista_protocol::{
+        GenerationToken, GitOperation, OperationHash, OperationId, OperationStage, OperationState,
+        OperationStatus, Plan, RecoveryStrategy, RemoteName, RepositoryToken, RiskLevel,
+        TransferPhase, TransferProgress, UnixSeconds, WorktreeToken,
+    };
 
     use super::*;
 
@@ -768,6 +1344,53 @@ mod tests {
         assert_eq!(app.start(), [Fetch::Catalog]);
         app.receive(Data::Catalog(Ok(catalog(wire))));
         app
+    }
+
+    fn plan_wire() -> Vec<u8> {
+        plan_wire_for(GitOperation::StageAll)
+    }
+
+    fn plan_wire_for(operation: GitOperation) -> Vec<u8> {
+        serde_json::to_vec(&Plan {
+            repository: RepositoryToken::new("repo-1").unwrap(),
+            worktree: WorktreeToken::new("worktree-1").unwrap(),
+            generation: GenerationToken::new("generation-reviewed").unwrap(),
+            operation,
+            operation_hash: OperationHash::new("a".repeat(64)).unwrap(),
+            issued_at: UnixSeconds(1_788_365_000),
+            expires_at: UnixSeconds(1_788_365_300),
+            risk: RiskLevel::Safe,
+            preconditions: Vec::new(),
+            expected_ref_changes: Vec::new(),
+            advisories: Vec::new(),
+            recovery: RecoveryStrategy::NotNeeded,
+        })
+        .unwrap()
+    }
+
+    fn running_transfer(id: &OperationId, operation: GitOperation) -> OperationStatus {
+        OperationStatus {
+            id: id.clone(),
+            state: OperationState::Running,
+            stage: OperationStage::Executing,
+            operation,
+            operation_hash: OperationHash::new("a".repeat(64)).unwrap(),
+            repository: RepositoryToken::new("repo-1").unwrap(),
+            worktree: WorktreeToken::new("worktree-1").unwrap(),
+            accepted_at: UnixSeconds(1_788_365_000),
+            ended_at: None,
+            status: None,
+            message: None,
+            generation: None,
+            recovery: None,
+            recovers: None,
+            progress: Some(TransferProgress {
+                phase: TransferPhase::Receiving,
+                percent: Some(42),
+                objects: Some(42),
+                total_objects: Some(100),
+            }),
+        }
     }
 
     fn page(rows: &[(&str, &str)]) -> CommitPage {
@@ -1009,9 +1632,75 @@ mod tests {
     }
 
     #[test]
+    fn writable_selection_precedes_a_closed_command_and_shared_plan_review() {
+        let mut app = loaded(THREE);
+        let requests = app.apply(Action::Activate);
+        assert!(matches!(
+            requests.as_slice(),
+            [Fetch::History { repo: history }, Fetch::Select { repo: selected }]
+                if history == "w1" && selected == "w1"
+        ));
+
+        assert!(app.apply(Action::OpenCommand).is_empty());
+        assert!(
+            app.command_input.is_none(),
+            "selection was not acknowledged"
+        );
+        app.receive(Data::Selected {
+            repo: "w1".to_string(),
+            result: Ok(()),
+        });
+        app.apply(Action::OpenCommand);
+        assert_eq!(app.command_input.as_deref(), Some(""));
+        for character in "branch delete topic".chars() {
+            app.apply(Action::CommandChar(character));
+        }
+        assert_eq!(
+            app.apply(Action::SubmitCommand),
+            [Fetch::BuildPlan(GitOperation::DeleteBranch {
+                branch: git_vista_protocol::BranchName::new("topic").unwrap(),
+            })]
+        );
+        assert!(app.command_input.is_none());
+
+        app.receive(Data::PlanReady(Ok(plan_wire())));
+        assert!(app.plan_review.is_some());
+        assert!(app.apply(Action::FocusNext).is_empty());
+        assert!(matches!(
+            app.apply(Action::ApprovePlan).as_slice(),
+            [Fetch::ExecutePlan(_), Fetch::OperationByKey { .. }]
+        ));
+    }
+
+    #[test]
+    fn malformed_commands_and_palette_cancellation_send_nothing() {
+        let mut app = loaded(THREE);
+        app.apply(Action::Activate);
+        app.receive(Data::Selected {
+            repo: "w1".to_string(),
+            result: Ok(()),
+        });
+
+        app.apply(Action::OpenCommand);
+        for character in "push main origin --force".chars() {
+            app.apply(Action::CommandChar(character));
+        }
+        assert!(app.apply(Action::SubmitCommand).is_empty());
+        assert!(app.status.text.contains("unknown push flag"));
+
+        app.apply(Action::OpenCommand);
+        app.apply(Action::CommandChar('x'));
+        app.apply(Action::CommandBackspace);
+        assert_eq!(app.command_input.as_deref(), Some(""));
+        assert!(app.apply(Action::RefusePlan).is_empty());
+        assert!(app.command_input.is_none());
+        assert!(app.status.text.contains("nothing was sent"));
+    }
+
+    #[test]
     fn a_history_answer_populates_commits_and_enter_requests_detail_and_diff() {
         let mut app = loaded(THREE);
-        assert_eq!(app.apply(Action::Activate).len(), 1);
+        assert_eq!(app.apply(Action::Activate).len(), 2);
         app.receive(Data::History {
             repo: "w1".to_string(),
             result: Ok(page(&[(COMMIT_1, "first"), (COMMIT_2, "second")])),
@@ -1110,5 +1799,136 @@ mod tests {
         app.apply(Action::HorizontalLeft);
         assert_eq!(app.cursor(Pane::Main), 1);
         assert_eq!(app.detail.horizontal(), 0);
+    }
+
+    #[test]
+    fn a_received_plan_blocks_navigation_until_it_is_refused_locally() {
+        let mut app = loaded(THREE);
+        app.receive(Data::PlanReady(Ok(plan_wire())));
+        assert!(app.plan_review.is_some());
+
+        let focus = app.focus;
+        assert!(app.apply(Action::FocusNext).is_empty());
+        assert_eq!(app.focus, focus, "the shell moved underneath its modal");
+        assert!(app.apply(Action::Refresh).is_empty());
+
+        assert!(app.apply(Action::RefusePlan).is_empty());
+        assert!(app.plan_review.is_none());
+        assert_eq!(
+            app.status.text,
+            "plan refused locally · nothing was executed"
+        );
+    }
+
+    #[test]
+    fn approval_mints_one_submission_and_a_stale_answer_is_not_retried() {
+        let wire = plan_wire();
+        let mut app = loaded(THREE);
+        app.receive(Data::PlanReady(Ok(wire.clone())));
+
+        let requests = app.apply(Action::ApprovePlan);
+        let [Fetch::ExecutePlan(approval), Fetch::OperationByKey { key }] = requests.as_slice()
+        else {
+            panic!("approval did not produce one execution and one lookup: {requests:?}");
+        };
+        assert_eq!(approval.body(), wire);
+        assert_eq!(key, approval.key());
+        assert!(
+            app.apply(Action::ApprovePlan).is_empty(),
+            "a repeated key press minted another request"
+        );
+
+        app.receive(Data::PlanSubmitted(SubmissionOutcome::Stale));
+        assert!(app.plan_review.is_some(), "the refusal details vanished");
+        assert_eq!(
+            app.status.text,
+            "Plan is stale. It was not executed. Build and review a new plan."
+        );
+        assert!(
+            app.apply(Action::Refresh).is_empty(),
+            "a stale refusal silently rebuilt the plan"
+        );
+    }
+
+    #[test]
+    fn a_successful_approval_closes_the_modal_and_surfaces_the_receipt() {
+        let mut app = loaded(THREE);
+        app.receive(Data::PlanReady(Ok(plan_wire())));
+        assert_eq!(app.apply(Action::ApprovePlan).len(), 2);
+        app.receive(Data::PlanSubmitted(SubmissionOutcome::Executed(
+            "Staged all changes.".to_string(),
+        )));
+        assert!(app.plan_review.is_none());
+        assert_eq!(app.status.text, "Staged all changes.");
+        assert_eq!(app.status.tone, Tone::Info);
+        // This test has no active repository, so the refresh marker drains
+        // without fabricating a target.
+        assert!(app.tick().is_empty());
+    }
+
+    #[test]
+    fn remote_execution_lookup_drives_typed_progress_and_cancellation() {
+        let operation = GitOperation::FetchRemote {
+            remote: RemoteName::new("origin").unwrap(),
+        };
+        let mut app = loaded(THREE);
+        app.receive(Data::PlanReady(Ok(plan_wire_for(operation.clone()))));
+        let requests = app.apply(Action::ApprovePlan);
+        let [Fetch::ExecutePlan(_), Fetch::OperationByKey { key }] = requests.as_slice() else {
+            panic!("approval did not start execution plus lookup: {requests:?}");
+        };
+        let key = key.clone();
+        let id = OperationId::new("op_0123456789abcdef").unwrap();
+        app.receive(Data::OperationByKey {
+            key,
+            result: Ok(Some(id.clone())),
+        });
+        assert_eq!(app.tick(), [Fetch::OperationStatus { id: id.clone() }]);
+        app.receive(Data::OperationStatus(Ok(running_transfer(&id, operation))));
+        assert!(
+            app.status.text.contains("receiving 42%"),
+            "{}",
+            app.status.text
+        );
+
+        assert_eq!(
+            app.apply(Action::CancelOperation),
+            [Fetch::CancelOperation { id: id.clone() }]
+        );
+        app.receive(Data::OperationCancelled {
+            id,
+            result: Ok(String::from("Cancellation requested.")),
+        });
+        assert!(app.status.text.contains("Cancellation requested"));
+    }
+
+    #[test]
+    fn cancel_before_operation_identity_is_queued_but_local_writes_refuse_it() {
+        let remote = GitOperation::PushBranch {
+            branch: git_vista_protocol::BranchName::new("main").unwrap(),
+            remote: RemoteName::new("origin").unwrap(),
+            set_upstream: false,
+            force: git_vista_protocol::ForcePublish::None,
+        };
+        let mut app = loaded(THREE);
+        app.receive(Data::PlanReady(Ok(plan_wire_for(remote))));
+        let requests = app.apply(Action::ApprovePlan);
+        let [_, Fetch::OperationByKey { key }] = requests.as_slice() else {
+            panic!("missing operation lookup: {requests:?}");
+        };
+        assert!(app.apply(Action::CancelOperation).is_empty());
+        assert!(app.status.text.contains("queued"));
+        let id = OperationId::new("op_cancel_later").unwrap();
+        app.receive(Data::OperationByKey {
+            key: key.clone(),
+            result: Ok(Some(id.clone())),
+        });
+        assert_eq!(app.tick(), [Fetch::CancelOperation { id }]);
+
+        let mut local = loaded(THREE);
+        local.receive(Data::PlanReady(Ok(plan_wire())));
+        local.apply(Action::ApprovePlan);
+        assert!(local.apply(Action::CancelOperation).is_empty());
+        assert!(local.status.text.contains("cannot be cancelled"));
     }
 }

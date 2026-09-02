@@ -61,12 +61,19 @@ pub fn run<B: Backend>(
         }
         match inputs.next(TICK)? {
             Input::Key(key) => {
-                // The conflict overlay owns the keyboard while it is up. It
-                // has to: its text buffer accepts every printable key, so a
-                // shared keymap would quit the program the first time somebody
-                // typed a `q` into a file they were resolving.
+                // Three keymaps, and the ORDER of these two arms is a
+                // decision rather than a merge artefact. Both #461's command
+                // prompt and #462's conflict overlay capture the keyboard so
+                // that a printable key is text and not a command; the overlay
+                // is checked first because it is a full-screen takeover whose
+                // own keymap has no binding that opens a command prompt, so
+                // "both at once" is a state the two keymaps cannot produce.
+                // If a later slice makes it reachable, the overlay is still
+                // the right winner: it is the one holding an unsaved edit.
                 let action = if app.conflicts.is_open() {
                     keys::dispatch_conflict(key, app.conflicts.key_mode())
+                } else if app.command_input.is_some() {
+                    keys::dispatch_command(key)
                 } else {
                     keys::dispatch(key, app.focus)
                 };
@@ -76,7 +83,12 @@ pub fn run<B: Backend>(
                     }
                 }
             }
-            Input::Resize | Input::Tick => {}
+            Input::Tick => {
+                for fetch in app.tick() {
+                    port.request(fetch);
+                }
+            }
+            Input::Resize => {}
         }
         while let Some(data) = port.poll() {
             for fetch in app.receive(data) {

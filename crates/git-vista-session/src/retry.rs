@@ -50,69 +50,32 @@ pub fn authed_fetch(
     fetch: &mut dyn FnMut(&str, &str) -> Result<HttpResponse, String>,
     auth: &mut dyn FnMut() -> Result<Session, String>,
 ) -> Result<Vec<u8>, String> {
-    let (resp, reauthenticated) = authed_fetch_response(path, session, fetch, auth)?;
-    if resp.status != 200 {
-        // The "even after re-authenticating" half is kept because it answers
-        // the first question a failed read raises. Without it a 503 on a fresh
-        // cookie reads exactly like a 503 on an expired one.
-        let after = if reauthenticated {
-            " even after re-authenticating"
-        } else {
-            ""
-        };
-        return Err(format!(
-            "GET {path} answered {}{after}: {}",
-            resp.status,
-            String::from_utf8_lossy(&resp.body)
-        ));
-    }
-    Ok(resp.body)
-}
-
-/// [`authed_fetch`] without the 200-or-error verdict: the same lazy auth and
-/// the same one-shot 401 retry, handing back whatever the server answered.
-///
-/// For the caller that must tell one non-200 apart from another, because the
-/// status is **information** rather than a failure. `GET
-/// /api/worktree-file/{path}` is the case that asked for it: a 404 there means
-/// there is no file at that path, which in a delete/modify conflict is exactly
-/// what git left behind and exactly what the resolver must show. Folded into a
-/// message string it becomes "content could not be loaded", which reports a
-/// fault where nothing went wrong — the same collapse `Stage::Absent` versus
-/// `Stage::Unreadable` exists to prevent, arriving one layer down in the
-/// transport.
-///
-/// A 401 that survives one re-authentication is still an `Err`: that is not a
-/// status a caller can interpret, it is the session boundary refusing twice.
-///
-/// The `bool` is "this answer arrived on a freshly minted session", so a
-/// caller can keep saying so in its own wording rather than losing the
-/// difference between a server that refused a stale cookie and one that
-/// refused a new one.
-pub fn authed_fetch_response(
-    path: &str,
-    session: &mut Option<Session>,
-    fetch: &mut dyn FnMut(&str, &str) -> Result<HttpResponse, String>,
-    auth: &mut dyn FnMut() -> Result<Session, String>,
-) -> Result<(HttpResponse, bool), String> {
     if session.is_none() {
         *session = Some(auth()?);
     }
     let cookie = session.as_ref().expect("just set").cookie.clone();
     let resp = fetch(path, &cookie)?;
-    if resp.status != 401 {
-        return Ok((resp, false));
+    if resp.status == 401 {
+        *session = Some(auth()?);
+        let cookie = session.as_ref().expect("just set").cookie.clone();
+        let retry = fetch(path, &cookie)?;
+        if retry.status != 200 {
+            return Err(format!(
+                "GET {path} answered {} even after re-authenticating: {}",
+                retry.status,
+                String::from_utf8_lossy(&retry.body)
+            ));
+        }
+        return Ok(retry.body);
     }
-    *session = Some(auth()?);
-    let cookie = session.as_ref().expect("just set").cookie.clone();
-    let retry = fetch(path, &cookie)?;
-    if retry.status == 401 {
+    if resp.status != 200 {
         return Err(format!(
-            "GET {path} answered 401 even after re-authenticating: {}",
-            String::from_utf8_lossy(&retry.body)
+            "GET {path} answered {}: {}",
+            resp.status,
+            String::from_utf8_lossy(&resp.body)
         ));
     }
-    Ok((retry, true))
+    Ok(resp.body)
 }
 
 /// [`authed_post`]'s injected POST closure: `(path, body, cookie, csrf) ->

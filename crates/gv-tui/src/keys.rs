@@ -17,6 +17,8 @@
 //! | `[` / `]` | select the previous/next parent in Main |
 //! | `r`, `F5` | refresh |
 //! | `x` | open the conflict overlay (M10.07, #462) |
+//! | `a` | approve the open plan review |
+//! | `Esc` | refuse/close the open plan review |
 //!
 //! The vi-shaped `hjkl` set is lazygit's, and lazygit is the interface this
 //! milestone is modelled on; the arrow and Tab set is for everyone else.
@@ -34,7 +36,7 @@
 //! key (#459's `s` to stage, say) adds a layer here that consults the
 //! focused pane; the signature grows a `Pane` when that key exists, not
 //! before.
-//!
+
 //! # The conflict overlay has its own keymap, and that is not a style choice
 //!
 //! [`dispatch_conflict`] is a second table rather than more arms in
@@ -81,6 +83,10 @@ pub fn dispatch(key: KeyEvent, pane: Pane) -> Option<Action> {
         KeyCode::Char(']') if pane == Pane::Main => Some(Action::ParentNext),
         KeyCode::F(5) | KeyCode::Char('r') => Some(Action::Refresh),
         KeyCode::Char('x') => Some(Action::OpenConflicts),
+        KeyCode::Char('c') => Some(Action::CancelOperation),
+        KeyCode::Char('a') => Some(Action::ApprovePlan),
+        KeyCode::Esc => Some(Action::RefusePlan),
+        KeyCode::Char(':') => Some(Action::OpenCommand),
         KeyCode::Char(d @ '1'..='9') => Pane::from_number(d.to_digit(10)? as u8).map(Action::Focus),
         _ => None,
     }
@@ -147,6 +153,25 @@ pub fn dispatch_conflict(key: KeyEvent, mode: KeyMode) -> Option<Action> {
         _ => return None,
     };
     Some(Action::Conflict(act))
+}
+
+/// Translate input while the `:` command palette owns the keyboard.
+pub fn dispatch_command(key: KeyEvent) -> Option<Action> {
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => Some(Action::Quit),
+        KeyCode::Esc => Some(Action::RefusePlan),
+        KeyCode::Enter => Some(Action::SubmitCommand),
+        KeyCode::Backspace => Some(Action::CommandBackspace),
+        KeyCode::Char(character)
+            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+        {
+            Some(Action::CommandChar(character))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -269,18 +294,100 @@ mod tests {
 
     #[test]
     fn an_unbound_key_is_none() {
-        // `x` used to be in this list and is now the conflict overlay
-        // (M10.07, #462) — this test is what noticed, which is the whole point
-        // of keeping an explicit unbound set rather than trusting the match's
+        // This list has now lost TWO members to real bindings: `x` to the
+        // conflict overlay (#462) and `Esc` to plan refusal (#461). Both were
+        // caught by this test failing rather than by anyone remembering, which
+        // is why an explicit unbound set beats trusting the match's
         // fall-through.
         for key in [
             press(KeyCode::Char('z')),
-            press(KeyCode::Esc),
             press(KeyCode::Char(' ')),
             press(KeyCode::F(1)),
         ] {
             assert_eq!(global(key), None, "{key:?}");
         }
+    }
+
+    #[test]
+    fn a_approves_and_escape_refuses_a_plan_review() {
+        assert_eq!(global(press(KeyCode::Char('a'))), Some(Action::ApprovePlan));
+        assert_eq!(global(press(KeyCode::Esc)), Some(Action::RefusePlan));
+        assert_eq!(
+            global(press(KeyCode::Char('c'))),
+            Some(Action::CancelOperation)
+        );
+    }
+
+    #[test]
+    fn colon_opens_the_palette_and_palette_keys_do_not_leak_navigation() {
+        assert_eq!(global(press(KeyCode::Char(':'))), Some(Action::OpenCommand));
+        assert_eq!(
+            dispatch_command(press(KeyCode::Char('j'))),
+            Some(Action::CommandChar('j'))
+        );
+        assert_eq!(
+            dispatch_command(press(KeyCode::Backspace)),
+            Some(Action::CommandBackspace)
+        );
+        assert_eq!(
+            dispatch_command(press(KeyCode::Enter)),
+            Some(Action::SubmitCommand)
+        );
+        assert_eq!(
+            dispatch_command(press(KeyCode::Esc)),
+            Some(Action::RefusePlan)
+        );
+        assert_eq!(dispatch_command(ctrl('c')), Some(Action::Quit));
+    }
+
+    #[test]
+    fn enter_activates_rows_that_open_something_but_not_the_branches_placeholder() {
+        let enter = press(KeyCode::Enter);
+        for pane in [Pane::Repositories, Pane::Commits, Pane::Main] {
+            assert_eq!(dispatch(enter, pane), Some(Action::Activate), "{pane:?}");
+        }
+        assert_eq!(dispatch(enter, Pane::Branches), None);
+    }
+
+    #[test]
+    fn main_arrows_scroll_horizontally_while_tab_and_h_l_still_move_focus() {
+        assert_eq!(
+            dispatch(press(KeyCode::Left), Pane::Main),
+            Some(Action::HorizontalLeft)
+        );
+        assert_eq!(
+            dispatch(press(KeyCode::Right), Pane::Main),
+            Some(Action::HorizontalRight)
+        );
+        assert_eq!(
+            dispatch(press(KeyCode::Left), Pane::Commits),
+            Some(Action::FocusPrev)
+        );
+        assert_eq!(
+            dispatch(press(KeyCode::Char('h')), Pane::Main),
+            Some(Action::FocusPrev)
+        );
+        assert_eq!(
+            dispatch(press(KeyCode::Char('l')), Pane::Main),
+            Some(Action::FocusNext)
+        );
+    }
+
+    #[test]
+    fn brackets_select_parents_only_in_the_main_pane() {
+        assert_eq!(
+            dispatch(press(KeyCode::Char('[')), Pane::Main),
+            Some(Action::ParentPrev)
+        );
+        assert_eq!(
+            dispatch(press(KeyCode::Char(']')), Pane::Main),
+            Some(Action::ParentNext)
+        );
+        assert_eq!(dispatch(press(KeyCode::Char('[')), Pane::Commits), None);
+        assert_eq!(
+            dispatch(press(KeyCode::Char(']')), Pane::Repositories),
+            None
+        );
     }
 
     #[test]
@@ -390,55 +497,5 @@ mod tests {
         );
         assert_eq!(dispatch_conflict(release, KeyMode::Insert), None);
         assert_eq!(dispatch_conflict(release, KeyMode::List), None);
-    }
-
-    #[test]
-    fn enter_activates_rows_that_open_something_but_not_the_branches_placeholder() {
-        let enter = press(KeyCode::Enter);
-        for pane in [Pane::Repositories, Pane::Commits, Pane::Main] {
-            assert_eq!(dispatch(enter, pane), Some(Action::Activate), "{pane:?}");
-        }
-        assert_eq!(dispatch(enter, Pane::Branches), None);
-    }
-
-    #[test]
-    fn main_arrows_scroll_horizontally_while_tab_and_h_l_still_move_focus() {
-        assert_eq!(
-            dispatch(press(KeyCode::Left), Pane::Main),
-            Some(Action::HorizontalLeft)
-        );
-        assert_eq!(
-            dispatch(press(KeyCode::Right), Pane::Main),
-            Some(Action::HorizontalRight)
-        );
-        assert_eq!(
-            dispatch(press(KeyCode::Left), Pane::Commits),
-            Some(Action::FocusPrev)
-        );
-        assert_eq!(
-            dispatch(press(KeyCode::Char('h')), Pane::Main),
-            Some(Action::FocusPrev)
-        );
-        assert_eq!(
-            dispatch(press(KeyCode::Char('l')), Pane::Main),
-            Some(Action::FocusNext)
-        );
-    }
-
-    #[test]
-    fn brackets_select_parents_only_in_the_main_pane() {
-        assert_eq!(
-            dispatch(press(KeyCode::Char('[')), Pane::Main),
-            Some(Action::ParentPrev)
-        );
-        assert_eq!(
-            dispatch(press(KeyCode::Char(']')), Pane::Main),
-            Some(Action::ParentNext)
-        );
-        assert_eq!(dispatch(press(KeyCode::Char('[')), Pane::Commits), None);
-        assert_eq!(
-            dispatch(press(KeyCode::Char(']')), Pane::Repositories),
-            None
-        );
     }
 }
