@@ -244,3 +244,73 @@ export async function openDrawer(page) {
   return drawer
 }
 
+// --- #594: the graph preview inside a confirmation ------------------------
+//
+// Shared between `preview-panel.spec.mjs` and `harness-selfcheck.spec.mjs`,
+// for the reason the stash helpers above are: importing a spec file
+// re-registers its tests under the importing file, so the self-check would
+// run the real spec a second time.
+
+/** The branch the merge-preview fixture offers to merge. */
+export const PREVIEW_BRANCH = 'feature'
+/** The branch it would be merged into — the one that fixture checks out. */
+export const PREVIEW_INTO = 'main'
+
+/**
+ * Open the merge-preview repo in FULL mode.
+ *
+ * Not Visualize like `openApp`: a merge is a write, so in Visualize the menu
+ * offers no merge item at all and there would be no confirmation to hang a
+ * preview off. `api::preview_request` refuses in that mode too, deliberately —
+ * see its module doc.
+ */
+export async function openMergePreviewRepo(page) {
+  await forceOnline(page)
+  const { base } = runtime()
+  await page.goto(base)
+  await expect(page.getByRole('heading', { name: 'git-vista' })).toBeVisible()
+
+  const entry = page.getByRole('button', { name: /merge-preview-repo/i }).first()
+  await expect(entry).toBeVisible()
+  await entry.click()
+
+  const full = page.getByRole('button', { name: /full git operations/ })
+  if (await full.isVisible().catch(() => false)) {
+    await full.click()
+  }
+  await expect(page.getByRole('region', { name: 'Commit history graph' })).toBeVisible()
+  await expect(page.locator('circle.node-hit').first()).toBeAttached()
+}
+
+/**
+ * Open the context menu on whichever commit carries `branch`, and return it.
+ *
+ * Found by walking the nodes rather than by reading a badge. The badge is an
+ * SVG `<text>` beside the dot, not a child of it, so mapping badge -> node
+ * would mean matching on coordinates; and the branch items are built from what
+ * the MENU knows (`MenuData::branches`), which is the thing under test here
+ * anyway. Walking asks the app the question directly.
+ *
+ * Throws with the branch named rather than timing out anonymously: a fixture
+ * whose branch is missing is a fixture problem, and "no such menu item" is a
+ * far more useful message than a 30-second wait on a locator.
+ */
+export async function openBranchMenu(page, branch) {
+  const nodes = page.locator('circle.node-hit')
+  const count = await nodes.count()
+  for (let i = 0; i < count; i++) {
+    await nodes.nth(i).click()
+    const item = page.getByRole('button', { name: new RegExp(`Merge \u2018${branch}\u2019`) })
+    if (await item.isVisible().catch(() => false)) {
+      return item
+    }
+    await page.keyboard.press('Escape')
+  }
+  throw new Error(
+    `no commit in this graph carries the branch ${branch} — ` +
+      `walked ${count} nodes and none offered a merge item for it`,
+  )
+}
+
+/** The preview panel's heading, when a picture (or a pending one) is showing. */
+export const PREVIEW_HEADING = 'What this would do'
