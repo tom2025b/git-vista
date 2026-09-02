@@ -174,6 +174,11 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
         Method::POST,
         Authz::SessionAndCsrf,
     ),
+    // M10.09 (#596): cherry-pick one commit onto the checked-out branch.
+    // Classified exactly as every other local git write — a session plus the
+    // CSRF gate — because it writes a commit and moves a ref. Nothing about it
+    // reaches the network, so it needs no more than `/api/merge` does.
+    ("/api/cherry-pick", Method::POST, Authz::SessionAndCsrf),
     ("/api/unstage", Method::POST, Authz::SessionAndCsrf),
     ("/api/undo", Method::POST, Authz::SessionAndCsrf),
     ("/api/merge", Method::POST, Authz::SessionAndCsrf),
@@ -303,7 +308,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// dropped by a `main.rs` refactor that this scanner's pattern-matching
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
-const EXPECTED_ROUTE_COUNT: usize = 68;
+const EXPECTED_ROUTE_COUNT: usize = 69;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in

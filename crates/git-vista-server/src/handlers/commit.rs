@@ -1,7 +1,8 @@
 //! `POST /api/commit` (Issue #33): create a commit — either a plain commit on
 //! HEAD, or (the branch-stub path) an empty commit written directly onto a
 //! branch that isn't checked out — plus `POST /api/amend-commit` (M2.19b,
-//! #223) and `POST /api/stage` / `POST /api/unstage`.
+//! #223), `POST /api/cherry-pick` (M10.09, #596) and `POST /api/stage` /
+//! `POST /api/unstage`.
 //!
 //! Since M1.06b (#143) these handlers validate the request (unchanged
 //! wording), build the matching [`GitOperation`], and hand it to
@@ -12,7 +13,7 @@ use axum::http::StatusCode;
 use axum::Json;
 
 use git_vista_protocol::{
-    AmendCommitRequest, AmendFailureKind, BranchName, CommitMessage, CommitOid,
+    AmendCommitRequest, AmendFailureKind, BranchName, CherryPickRequest, CommitMessage, CommitOid,
     CreateCommitRequest, GitOperation,
 };
 
@@ -240,4 +241,63 @@ async fn commit_empty_on_branch(
         expected_tip,
     })
     .await
+}
+
+/// Cherry-pick one commit onto the checked-out branch (`POST /api/cherry-pick`,
+/// M10.09, #596): [`GitOperation::CherryPick`], a `git cherry-pick <commit>`.
+///
+/// # Why this route exists at all
+///
+/// The operation, its executor (`planner::sequence_exec::exec_cherry_pick`) and
+/// its graph preview have all been in the server since #576 — with no door.
+/// `/api/plan` could already build a plan for it and `/api/execute-plan` could
+/// already run one, but the frontend deliberately reaches neither for a write:
+/// every mutation it performs goes through a dedicated route so it carries an
+/// idempotency key, passes `api.rs`'s offline/visualize guards, and lands in the
+/// operations registry as a tracked, cancellable, reportable operation. Driving
+/// a write through the generic plan endpoints would have bypassed all four. So
+/// this is a route rather than a shortcut, and it is the *only* thing #596 adds
+/// to the server.
+///
+/// # What it refuses, and what it deliberately does not
+///
+/// A non-hex or symbolic `commit` is a 400 here — see [`CherryPickRequest`] for
+/// why the reviewed id is never re-resolved through `rev-parse`.
+///
+/// Everything else is git's answer, forwarded verbatim, because the honest
+/// failures of this operation are not knowable from the request alone:
+///
+/// * **A merge commit.** `git cherry-pick` refuses one without `-m`, since
+///   "apply this merge's changes" has no meaning until a mainline is named.
+///   That is [`GitOperation::CherryPickMerge`], which has no route yet; asking
+///   for it through this one gets git's own "is a merge but no -m option was
+///   given" text rather than a guess.
+/// * **An empty pick** — a commit whose change is already present. Measured on
+///   this host and written down in `preview::NoOp`: git exits **1** with "The
+///   previous cherry-pick is now empty…", leaves HEAD where it was, and leaves
+///   `.git/CHERRY_PICK_HEAD` behind. The repository is then mid-sequence and
+///   needs `--skip` or `--abort`.
+/// * **A conflict** — the same mid-sequence state, reached the other way.
+///
+/// The frontend does not pretend to pre-empt any of these. It shows the
+/// `/api/preview` panel, which answers the empty-pick and merge-commit cases
+/// exactly (`Previewable::CherryPick` returns `Unsupported` when the target has
+/// no sole parent), and its confirm copy says what a conflict leaves behind.
+///
+/// [`CherryPickRequest`]: git_vista_protocol::dto::CherryPickRequest
+/// [`GitOperation::CherryPickMerge`]: git_vista_protocol::plan::GitOperation::CherryPickMerge
+pub(crate) async fn cherry_pick(Json(req): Json<CherryPickRequest>) -> (StatusCode, String) {
+    if let Some(rejected) = reject_if_read_only() {
+        return rejected;
+    }
+    let commit = match CommitOid::new(req.commit.trim()) {
+        Ok(commit) => commit,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("commit must be the full commit id the pick was reviewed against: {e}"),
+            )
+        }
+    };
+    planner::plan_and_execute(GitOperation::CherryPick { commit }).await
 }

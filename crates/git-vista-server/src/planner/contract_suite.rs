@@ -2438,6 +2438,10 @@ fn every_git_write_route_reaches_the_planner() {
         ("/api/commit", "create_commit"),
         // M2.19b (#223): amend — a git write, funnel row below.
         ("/api/amend-commit", "amend_commit"),
+        // M10.09 (#596): cherry-pick — a git write, funnel row below. The
+        // operation and its executor predate this route by a whole milestone
+        // (#576); what #596 added is the only way for a client to ask for it.
+        ("/api/cherry-pick", "cherry_pick"),
         ("/api/stage", "stage_all"),
         // Staging selections (M2.17b, #213): apply is a git write and MUST
         // reach the planner (funnel row below). Preview is deliberately not
@@ -2619,6 +2623,9 @@ fn every_git_write_route_reaches_the_planner() {
         // M2.19b (#223): the amend handler builds `AmendCommit` and calls
         // the planner directly.
         ("src/handlers/commit.rs", "amend_commit", None),
+        // M10.09 (#596): the cherry-pick handler builds `CherryPick` and calls
+        // the planner directly, same shape as the amend row above.
+        ("src/handlers/commit.rs", "cherry_pick", None),
         ("src/handlers/commit.rs", "stage_all", None),
         ("src/handlers/commit.rs", "unstage_all", None),
         // M2.20c (#229) and M2.20d (#230): the two remote-reaching writes.

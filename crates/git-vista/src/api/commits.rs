@@ -1,17 +1,21 @@
 //! Commit-object endpoints — `GET /api/commit/<id>`, `POST /api/commit`,
-//! `POST /api/amend-commit`.
+//! `POST /api/amend-commit`, `POST /api/cherry-pick`.
 //!
 //! Split out of the former monolithic `api.rs`.
 
 use git_vista_core::model::CommitDetail;
-use git_vista_protocol::CreateCommitRequest;
+use git_vista_protocol::operation::IdempotencyKey;
+use git_vista_protocol::{CherryPickRequest, CreateCommitRequest};
 
 use crate::features::dialogs::commit::{
     amend_body, classify_amend_response, classify_create_commit_response, AmendOutcome,
     CreateCommitOutcome,
 };
 
-use super::{network_error, refuse_if_offline, refuse_if_visualize, req_get, write_json};
+use super::{
+    network_error, receipt, refuse_if_offline, refuse_if_visualize, req_get, send_write_with_key,
+    write_json, WriteReceipt, REQUEST_TIMEOUT_MS,
+};
 
 /// Fetch one commit's full detail for the side panel (Phase 10,
 /// `GET /api/commit/<id>`). Same-origin relative URL, cache-busted like the graph
@@ -110,4 +114,33 @@ pub async fn amend_commit_request(message: &str, expected_tip: &str) -> AmendOut
         .await
         .unwrap_or_else(|_| format!("HTTP {status}"));
     classify_amend_response(status, &text)
+}
+
+/// Cherry-pick `commit` onto the checked-out branch (`POST /api/cherry-pick`,
+/// M10.09/#596).
+///
+/// Shaped like [`branch_op_request`](super::branches::branch_op_request) rather
+/// than like [`amend_commit_request`] above: a cherry-pick is a *tracked*
+/// operation — it goes through the operations registry, carries `key` for
+/// idempotent retry, and reports through the progress strip — so it returns a
+/// [`WriteReceipt`] and lets `dialogs/confirm.rs` classify the outcome, instead
+/// of parsing a bespoke response shape here. That is also why it is reached
+/// through this route at all rather than through `/api/plan` +
+/// `/api/execute-plan`, which would have skipped every one of those.
+///
+/// `commit` is the full hex id the confirm dialog reviewed. The server refuses
+/// anything else with a 400 rather than resolving it — see `CherryPickRequest`.
+pub async fn cherry_pick_request(
+    commit: &str,
+    key: IdempotencyKey,
+) -> Result<WriteReceipt, String> {
+    refuse_if_offline()?;
+    refuse_if_visualize()?;
+    let body = CherryPickRequest {
+        commit: commit.to_string(),
+    };
+    let json = serde_json::to_string(&body).map_err(|e| e.to_string())?;
+    let (resp, _key) =
+        send_write_with_key("/api/cherry-pick", Some(json), key, REQUEST_TIMEOUT_MS).await?;
+    Ok(receipt(resp).await)
 }
