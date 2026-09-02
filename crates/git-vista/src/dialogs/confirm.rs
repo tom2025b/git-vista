@@ -521,12 +521,15 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
 /// is already shared. The other two undo actions move or re-create a branch
 /// ref and the engine previews neither.
 ///
-/// Cherry-pick has no dialog to appear in (#596) and so has no arm here; it
-/// inherits this panel the day it gets a menu entry, by adding one arm here
-/// and one in `previewable`.
+/// Cherry-pick now has a dialog to appear in: #599 gave it the
+/// `POST /api/cherry-pick` door and the confirmation that fronts it, which is
+/// the menu entry this note used to be waiting for. Its `onto` is dropped on
+/// purpose — see [`DialogSubject::CherryPick`]; the destination is HEAD as the
+/// server reads it, not as the menu resolved it.
 fn preview_subject(op: &PendingOp) -> DialogSubject<'_> {
     match op {
         PendingOp::Merge { branch, .. } => DialogSubject::Merge { branch },
+        PendingOp::CherryPick { commit, .. } => DialogSubject::CherryPick { commit },
         PendingOp::Undo(u) => match &u.action {
             UndoAction::RevertCommit { commit } => DialogSubject::Revert { commit },
             _ => DialogSubject::NotPreviewable,

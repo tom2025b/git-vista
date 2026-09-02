@@ -297,9 +297,25 @@ pub enum DialogSubject<'a> {
     Merge { branch: &'a str },
     /// `git revert --no-edit <commit>` — reached through `UndoAction::RevertCommit`.
     Revert { commit: &'a str },
+    /// `git cherry-pick <commit>` — reached through `PendingOp::CherryPick`,
+    /// the confirm dialog #599 built for the door it opened.
+    ///
+    /// Ordinary commits only, like [`Revert`]. A merge commit has no sole
+    /// parent, so the engine answers `Unsupported` rather than guessing which
+    /// side the change is measured against, and this panel renders that
+    /// honestly — which is exactly what `menu::commit_items` defers to it for.
+    ///
+    /// The destination branch is deliberately **not** carried here.
+    /// `PendingOp::CherryPick` knows its `onto`, but a pick lands on whatever
+    /// HEAD is checked out when the server runs it, and the engine reads that
+    /// itself. A second copy of the destination could only ever disagree with
+    /// the operation it claims to picture.
+    ///
+    /// [`Revert`]: DialogSubject::Revert
+    CherryPick { commit: &'a str },
     /// Every other confirmation this modal shows. Checkout, delete, fetch,
     /// pull, push, reset, discard: the engine previews none of them
-    /// (`git-vista-server/src/preview.rs:752-760` maps exactly three
+    /// (`git-vista-server/src/preview.rs:753-766` maps exactly three
     /// operations), so asking would spend two round trips to be told
     /// `Unsupported`.
     NotPreviewable,
@@ -307,12 +323,15 @@ pub enum DialogSubject<'a> {
 
 /// The operation to preview for this dialog, or `None` if it has none.
 ///
-/// # Cherry-pick is absent on purpose
+/// # All three of the engine's operations are mapped
 ///
-/// The engine previews three operations and this maps two. Cherry-pick has no
-/// confirm dialog to hang a preview off (#596); it inherits this panel for
-/// free the day it gets one, by adding a `CherryPick` arm here and one line to
-/// the caller. Stated rather than silently narrowed.
+/// This mapped two until #599 gave cherry-pick the confirm dialog it had no
+/// route to (#596). The note that used to stand here said cherry-pick would
+/// "inherit this panel for free the day it gets one, by adding a `CherryPick`
+/// arm here and one line to the caller" — that day is this commit, and that
+/// is exactly what it cost. The engine previews three operations
+/// (`git-vista-server/src/preview.rs:753-766`) and this now maps all three,
+/// so the two sides are no longer silently narrower than each other.
 ///
 /// # An invalid name yields `None`, never a panic
 ///
@@ -326,6 +345,9 @@ pub fn previewable(subject: DialogSubject<'_>) -> Option<GitOperation> {
             branch: BranchName::new(branch).ok()?,
         }),
         DialogSubject::Revert { commit } => Some(GitOperation::RevertCommit {
+            commit: CommitOid::new(commit).ok()?,
+        }),
+        DialogSubject::CherryPick { commit } => Some(GitOperation::CherryPick {
             commit: CommitOid::new(commit).ok()?,
         }),
         DialogSubject::NotPreviewable => None,

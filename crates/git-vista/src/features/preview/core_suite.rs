@@ -332,8 +332,16 @@ fn no_outcome_ever_blocks_the_operation() {
 ///    `Merge { branch: "HEAD" }`. Both positive assertions still pass and the
 ///    negative one goes red — a dialog with nothing to preview would otherwise
 ///    silently ask the server about a branch nobody named.
+///
+/// # Why the cherry-pick assertion names the variant, not just the id
+///
+/// `GitOperation::CherryPick` and `GitOperation::RevertCommit` are the same
+/// shape — one `CommitOid` each — so mapping cherry-pick to `RevertCommit`
+/// compiles, round-trips, and previews the exact inverse of what the dialog
+/// is about to do. A test that only checked the commit id would pass through
+/// that. This one matches on the variant, which is the part that can be wrong.
 #[test]
-fn only_the_two_wired_dialogs_ask_for_a_preview() {
+fn only_the_three_wired_dialogs_ask_for_a_preview() {
     assert!(
         matches!(
             previewable(DialogSubject::Merge { branch: "feature" }),
@@ -348,6 +356,15 @@ fn only_the_two_wired_dialogs_ask_for_a_preview() {
             Some(GitOperation::RevertCommit { ref commit }) if commit.as_str() == "a".repeat(40)
         ),
         "a revert confirmation must ask for a preview"
+    );
+    let picked = "b".repeat(40);
+    assert!(
+        matches!(
+            previewable(DialogSubject::CherryPick { commit: &picked }),
+            Some(GitOperation::CherryPick { ref commit }) if commit.as_str() == "b".repeat(40)
+        ),
+        "a cherry-pick confirmation must ask for a preview, and must ask for a \
+         CherryPick — RevertCommit is the same shape and the exact inverse"
     );
     assert_eq!(
         previewable(DialogSubject::NotPreviewable),
@@ -376,6 +393,10 @@ fn only_the_two_wired_dialogs_ask_for_a_preview() {
 fn a_name_the_newtypes_refuse_yields_no_preview_rather_than_a_panic() {
     assert_eq!(previewable(DialogSubject::Merge { branch: "" }), None);
     assert_eq!(previewable(DialogSubject::Revert { commit: "nope" }), None);
+    assert_eq!(
+        previewable(DialogSubject::CherryPick { commit: "nope" }),
+        None
+    );
 }
 
 /// Every arm without a picture says the operation is still available; the one
