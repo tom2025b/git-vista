@@ -420,31 +420,52 @@ cmd_report() {
   echo
 
   echo "── branches (origin) ──────────────────────────────"
-  local total merged open
-  total="$(git for-each-ref --format='%(refname:short)' refs/remotes/origin/ | grep -vc '/HEAD$' || true)"
-  # Every figure here counts the SAME population: origin only.
+  # Every figure here counts the SAME population — origin only — and the
+  # census checks itself rather than being true by construction.
   #
-  # It did not used to. `total` counts refs/remotes/origin/, but a bare
-  # `git branch -r --merged` counts every remote-tracking namespace, and this
-  # repository fetches PR heads into refs/remotes/pr/. Those 167 `pr/*` refs
-  # were in `merged` and not in `total`, so merged (440) exceeded total (367)
-  # and the report printed `open: -73`.
+  # History, so nobody re-introduces either defect:
+  #   - `total` counted refs/remotes/origin/ while a bare `git branch -r
+  #     --merged` counted every remote namespace, and this repository fetches
+  #     PR heads into refs/remotes/pr/. 167 `pr/*` refs were in `merged` and
+  #     not in `total`, so the report printed `open: -73`.
+  #   - The first fix derived `merged = total - open`, which made the equation
+  #     hold for ANY values including wrong ones, and guarded the counts with
+  #     `|| true`, which swallows a real git failure into a plausible-looking
+  #     `0`. Both were found by an independent review before landing.
   #
-  # `open` is now derived from the very command that prints the list below, so
-  # the number and the list it heads cannot disagree — the earlier arithmetic
-  # was off by one against its own list even after the namespace was filtered.
-  # `merged` is then the remainder, which keeps total = merged + open true by
-  # construction rather than by coincidence.
-  open="$(git branch -r --no-merged origin/main | grep -v '\->' | sed 's/^ *//' | grep -c '^origin/' || true)"
-  merged=$((total - open))
+  # `origin_count` and `origin_list` succeed on "no matches" (grep exits 1)
+  # and FAIL on a real error (grep/git exit 2+), so a broken git aborts the
+  # report instead of printing zeros. `merged` is measured independently and
+  # the three are cross-checked; a disagreement prints a warning rather than
+  # a number that happens to add up.
+  origin_count() { grep -c '^origin/' || [ "$?" -eq 1 ]; }
+  origin_list()  { grep    '^origin/' || [ "$?" -eq 1 ]; }
+  local total merged open listed
+  # Full refname, not `:short`: the short form of refs/remotes/origin/HEAD is
+  # the bare word `origin`, which `/HEAD$` never matched — so `total` counted
+  # the symbolic HEAD and ran one high. The self-check below caught it on its
+  # first run.
+  total="$(git for-each-ref --format='%(refname)' refs/remotes/origin/ | grep -vc '^refs/remotes/origin/HEAD$' || [ "$?" -eq 1 ])"
+  merged="$(git branch -r --merged    origin/main | grep -v '\->' | sed 's/^ *//' | origin_count)"
+  open="$(  git branch -r --no-merged origin/main | grep -v '\->' | sed 's/^ *//' | origin_count)"
   echo "  total:  $total"
   echo "  merged: $merged"
   echo "  open:   $open"
+  if [ "$((merged + open))" -ne "$total" ]; then
+    echo "  WARNING: merged + open = $((merged + open)) but total = $total —"
+    echo "           the three counts disagree; a ref is neither merged nor"
+    echo "           unmerged relative to origin/main (or origin/main is not"
+    echo "           itself counted the same way). Do not trust this block."
+  fi
   echo
 
   echo "── open branches (not yet merged into main) ────────"
-  git branch -r --no-merged origin/main | grep -v '\->' | sed 's/^ *//' \
-    | grep '^origin/' | sed 's/^/  /'
+  listed="$(git branch -r --no-merged origin/main | grep -v '\->' | sed 's/^ *//' | origin_list)"
+  printf '%s\n' "$listed" | sed '/^$/d; s/^/  /'
+  if [ "$(printf '%s\n' "$listed" | sed '/^$/d' | wc -l)" -ne "$open" ]; then
+    echo "  WARNING: the list above has a different length than 'open' — the"
+    echo "           count and the list were derived from different commands."
+  fi
   echo
 
   echo "── WIP / auto-checkpoint commits, all branches ─────"
