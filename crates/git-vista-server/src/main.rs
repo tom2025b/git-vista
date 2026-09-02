@@ -128,6 +128,11 @@ mod worktree_census;
 // them concurrently in one process.
 #[cfg(test)]
 mod test_ports;
+// #588: the selected repository belongs to the session, not the process. Its
+// own suite because it drives two concurrent sessions through the real router
+// rather than calling any one module's functions.
+#[cfg(test)]
+mod session_selection_suite;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

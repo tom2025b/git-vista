@@ -276,8 +276,14 @@ pub(crate) async fn require_auth(
     // 5. Session + CSRF, unless this is a pre-session endpoint.
     let session_exempt = path == NEGOTIATION_PATH
         || (path == SESSION_PATH && matches!(method, Method::GET | Method::POST));
+    // #588: the selection this request acts on belongs to the session making
+    // it. Captured here, at the one place that already decides who is calling,
+    // so there is never a second opinion about that. `None` for a pre-session
+    // endpoint — those resolve against the launch selection.
+    let mut selection = None;
     if !session_exempt {
         let cookie = cookie_value(headers, SESSION_COOKIE);
+        selection = cookie.and_then(|id| state.manager.selection_cell(id));
         if is_state_changing(&method) {
             // Writes need a live session *and* the matching CSRF header.
             let expected = match cookie.and_then(|id| state.manager.validate(id)) {
@@ -314,7 +320,12 @@ pub(crate) async fn require_auth(
         }
     }
 
-    let mut response = next.run(request).await;
+    // Serve the request as the owner of this session's selection, so
+    // `state::current()` and its siblings answer for *this* session (#588).
+    let mut response = match selection {
+        Some(cell) => crate::state::with_selection(cell, next.run(request)).await,
+        None => next.run(request).await,
+    };
     // Authenticated API data is never cacheable — the security model's
     // `Cache-Control: no-store` for API responses.
     response
