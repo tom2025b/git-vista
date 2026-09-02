@@ -58,8 +58,8 @@ pub struct Session {
     /// requests). #245 carried it unused, ahead of need; #246's
     /// `select_repository` tool is the first consumer (`/api/select` sits
     /// behind the full write auth gate even though it's non-mutating — see
-    /// `tools::select_repository`'s doc comment), and the write slices
-    /// (#248/#249) reuse it after.
+    /// `git-vista-mcp`'s `tools::select_repository` doc comment), and the
+    /// write slices (#248/#249) reuse it after.
     pub csrf: String,
 }
 
@@ -83,8 +83,9 @@ impl std::fmt::Debug for Session {
 
 /// Read the current bootstrap token and exchange it for a session.
 ///
-/// Errors are strings meant for the MCP client's eyes (they become tool-call
-/// errors); none of them ever embeds the token itself.
+/// Errors are strings meant for the calling client's user — the MCP bridge
+/// folds them into tool-call errors, `gv-tui` prints them to stderr — and
+/// none of them ever embeds the token itself.
 pub fn authenticate() -> Result<Session, String> {
     let path = bootstrap_token_path();
     let token = std::fs::read_to_string(&path).map_err(|e| {
@@ -191,12 +192,15 @@ mod tests {
 
     /// Every `.rs` file in this crate's `src/`, read from disk at test time.
     ///
-    /// This used to be a hand-written `include_str!` list — and #248 added
-    /// `plan_tools.rs` (1887 lines, a third of the crate) without updating it,
-    /// so the guard below kept passing green while silently covering none of
-    /// the file most likely to grow next. Enumerating the directory means the
-    /// next file cannot be forgotten the same way; nothing here needs editing
-    /// when one is added.
+    /// This used to be a hand-written `include_str!` list — and, back when
+    /// these modules lived inside `git-vista-mcp`, #248 added `plan_tools.rs`
+    /// (1887 lines, a third of that crate) without updating it, so the guard
+    /// below kept passing green while silently covering none of the file most
+    /// likely to grow next. Enumerating the directory means the next file
+    /// cannot be forgotten the same way; nothing here needs editing when one
+    /// is added. (`git-vista-mcp` keeps its own census over its remaining
+    /// files — this guard belongs to every crate that handles a live
+    /// [`Session`], not to one file location.)
     fn crate_sources() -> Vec<(String, String)> {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut sources: Vec<(String, String)> = std::fs::read_dir(&dir)
@@ -227,7 +231,7 @@ mod tests {
     fn the_source_census_really_sees_every_file_in_the_crate() {
         let sources = crate_sources();
         let names: Vec<&str> = sources.iter().map(|(n, _)| n.as_str()).collect();
-        for expected in ["auth.rs", "http.rs", "main.rs", "plan_tools.rs", "tools.rs"] {
+        for expected in ["auth.rs", "http.rs", "lib.rs", "retry.rs"] {
             assert!(
                 names.contains(&expected),
                 "the source census missed {expected}: {names:?}"
@@ -271,8 +275,9 @@ mod tests {
 
     /// The hand-written [`Session`] `Debug` impl is the only thing standing
     /// between the live session cookie and a `format!("{session:?}")` in some
-    /// future error string — `tools.rs` already folds server error bodies into
-    /// `ToolError::Execution(String)`, which the MCP host may log or show.
+    /// future error string — `git-vista-mcp`'s `tools.rs` already folds server
+    /// error bodies into `ToolError::Execution(String)`, which the MCP host
+    /// may log or show.
     /// The impl carried a doc comment saying exactly that, and nothing pinned
     /// it: replacing the two redactions with `&self.cookie` / `&self.csrf`
     /// left all 47 tests green.

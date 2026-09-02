@@ -1,4 +1,4 @@
-# ADR 0100 — A preview draws its own picture, windowed on what changed
+# ADR 0104 — A preview draws its own picture, windowed on what changed
 
 **Status:** Accepted — implemented, mutation-proved two ways per invariant,
 browser-verified against the real app

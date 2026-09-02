@@ -184,6 +184,12 @@ const OFFLINE_GUARDED: &[&str] = &[
     "create_branch_request",
     "create_commit_request",
     "amend_commit_request",
+    // M10.09 (#596). `POST /api/cherry-pick` — a ref-and-object write like
+    // any other, and the first thing in the app that could ask for an
+    // operation the server had supported since #576. Guarded, not exempt:
+    // an offline attempt would otherwise reach the transport and come back
+    // as a bare network error instead of the guard's own refusal text.
+    "cherry_pick_request",
     "stage_request",
     "unstage_request",
     "undo_request",

@@ -48,7 +48,9 @@ pub use branches::{
     rebase_request,
 };
 pub use clone::clone_request;
-pub use commits::{amend_commit_request, create_commit_request, fetch_commit_detail};
+pub use commits::{
+    amend_commit_request, cherry_pick_request, create_commit_request, fetch_commit_detail,
+};
 pub use conflicts::{
     fetch_conflict_panes, fetch_conflict_source, fetch_conflicts, resolve_conflict_content_request,
     resolve_conflict_request,

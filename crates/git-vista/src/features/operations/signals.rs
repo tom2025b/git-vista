@@ -597,6 +597,11 @@ async fn send(kind: &OperationKind, key: IdempotencyKey) -> Result<WriteReceipt,
             branch,
             strategy,
         } => api::pull_request(remote, branch, *strategy, key).await,
+        // Its own route and its own function, for the reason `cherry_pick`'s
+        // server-side doc comment gives: `/api/plan` + `/api/execute-plan`
+        // could already run this operation, but nothing reached through them
+        // carries an idempotency key or lands in this registry.
+        OperationKind::CherryPick { commit, .. } => api::cherry_pick_request(commit, key).await,
         OperationKind::Undo(u) => api::undo_request(&u.action, key).await,
         // Two arms, not one parameterised by a bool — mirroring the two
         // separate `GitOperation` variants and the two separate endpoints

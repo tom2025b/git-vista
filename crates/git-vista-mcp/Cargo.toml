@@ -2,16 +2,19 @@
 #
 # Deliberately tiny dependency surface: the MCP framing is hand-rolled
 # newline-delimited JSON-RPC 2.0 (see main.rs for why), and the HTTP client is
-# a minimal hand-rolled HTTP/1.1-over-TcpStream implementation (see http.rs) —
-# the server is loopback-only on one fixed port, both endpoints this crate
-# calls return small Content-Length JSON bodies, and pulling reqwest/hyper as
-# a *client* would add a dependency tree the reviewed-dependency discipline
-# (docs/NATIVE_DEPENDENCIES.md) would then have to carry forever.
+# a minimal hand-rolled HTTP/1.1-over-TcpStream implementation — built here
+# under #245, moved to git-vista-session under #456 when gv-tui became the
+# second binary to need it. The reasoning (loopback-only server, one fixed
+# port, small Content-Length JSON bodies, reqwest/hyper as a *client* would
+# add a dependency tree the reviewed-dependency discipline in
+# docs/NATIVE_DEPENDENCIES.md would then carry forever) lives with the code,
+# in git-vista-session's module docs.
 #
-# This crate links git-vista-protocol (the shared wire contract — headers,
-# DTOs) and git-vista-core (the *pure*, wasm-safe domain-model crate the
-# generic HistoryFrame/HistoryPage envelopes are instantiated over — GitRef,
-# GraphRow, Edge, FrameStub, CommitDetail, CommitDiff, ActivityEvent) — but
+# This crate links git-vista-session (the bootstrap-token session boundary),
+# git-vista-protocol (the shared wire contract — headers, DTOs) and
+# git-vista-core (the *pure*, wasm-safe domain-model crate the generic
+# HistoryFrame/HistoryPage envelopes are instantiated over — GitRef, GraphRow,
+# Edge, FrameStub, CommitDetail, CommitDiff, ActivityEvent) — but
 # deliberately, structurally NOT git-vista-server: the token-path resolution
 # is a small mirrored function (#245's scope), and #246's dependency-graph
 # test (tests/no_write_dependency.rs) proves this crate's whole transitive
@@ -28,5 +31,7 @@ repository.workspace = true
 [dependencies]
 git-vista-core = { workspace = true }
 git-vista-protocol = { workspace = true }
+git-vista-plan-runner = { workspace = true }
+git-vista-session = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

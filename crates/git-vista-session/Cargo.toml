@@ -1,0 +1,23 @@
+# git-vista-session — the client half of git-vista's session boundary
+# (M10.01, #456): auth.rs + http.rs, moved verbatim from git-vista-mcp when
+# gv-tui became the second standalone binary to need them. src/lib.rs and
+# ADR 0101 record why this is a shared crate rather than gv-tui depending on
+# the MCP crate.
+#
+# The dependency surface is inherited from the MCP crate's own discipline and
+# deliberately tiny: git-vista-protocol (the wire contract — headers, session
+# DTOs) plus serde_json. Structurally NOT git-vista-server:
+# tests/no_write_dependency.rs proves this crate's whole transitive dependency
+# graph never reaches it, the same #246 mechanism git-vista-mcp carries.
+[package]
+name = "git-vista-session"
+description = "Bootstrap-token session client for git-vista-server: one-time token exchange, in-memory cookie + CSRF, minimal loopback HTTP/1.1."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+git-vista-protocol = { workspace = true }
+serde_json = { workspace = true }

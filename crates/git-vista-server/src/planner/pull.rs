@@ -56,7 +56,8 @@
 use axum::http::StatusCode;
 
 use git_vista_protocol::{
-    FetchFailureKind, MergeStrategy, PullError, PullFailureKind, PullSuccess, RemoteRefUpdate,
+    plan_export, FetchFailureKind, MergeStrategy, PullError, PullFailureKind, PullSuccess,
+    RemoteRefUpdate,
 };
 
 use super::branch_exec::{exec_merge, exec_rebase, IntegrationCaller};
@@ -110,23 +111,11 @@ const INTEGRATION_NEED: NetworkNeed = NetworkNeed::Local;
 // Naming the ref a pull integrates
 // ---------------------------------------------------------------------------
 
-/// `<remote>/<branch>` — the remote-tracking name the integration half runs
-/// against, e.g. `origin/main`.
-///
-/// A [`RefName`] and not a [`BranchName`], because it is not a local branch:
-/// [`RefName`]'s own contract names `origin/main` as one of the three shapes
-/// it exists for. The conversion cannot fail and the `expect` explains why
-/// rather than hoping — both halves already passed
-/// [`RefName`]'s identical `require_git_safe` gate (non-empty, not
-/// option-shaped), so the join is non-empty and begins with `remote`'s first
-/// byte, which is not `-`. Should that gate ever widen asymmetrically this
-/// fails loudly at the one place instead of silently at every argv.
-fn tracking_ref(remote: &RemoteName, branch: &BranchName) -> RefName {
-    RefName::new(format!("{}/{}", remote.as_str(), branch.as_str())).expect(
-        "RemoteName and BranchName already satisfy RefName's require_git_safe \
-         gate, so their `/`-join does too",
-    )
-}
+// `tracking_ref` — `<remote>/<branch>`, e.g. `origin/main` — moved to
+// `git_vista_protocol::plan_export` with M10 (#590). The plan export has to
+// reproduce this exact string to print a pull's second line, and reproducing
+// it locally is the drift that issue exists to prevent, so there is now one
+// definition and both callers read it.
 
 // ---------------------------------------------------------------------------
 // Classification
@@ -330,7 +319,7 @@ pub(super) async fn exec_pull(
     }
 
     // --- what there is to integrate ----------------------------------------
-    let target = tracking_ref(remote, branch);
+    let target = plan_export::tracking_ref(remote, branch);
     let tracking = format!("refs/remotes/{target}");
     match Obs::from_read(rev_parse(repo, &tracking).await) {
         Obs::Known(_) => {}
@@ -717,7 +706,7 @@ mod tests {
             ("upstream", "release/2026-08", "upstream/release/2026-08"),
             ("fork2", "feature/x", "fork2/feature/x"),
         ] {
-            let target = tracking_ref(
+            let target = plan_export::tracking_ref(
                 &RemoteName::new(remote).unwrap(),
                 &BranchName::new(branch).unwrap(),
             );

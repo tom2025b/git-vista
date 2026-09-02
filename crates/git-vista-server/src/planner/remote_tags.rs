@@ -28,7 +28,7 @@
 
 use axum::http::StatusCode;
 
-use git_vista_protocol::{RemoteName, TagName};
+use git_vista_protocol::{plan_export, RemoteName, TagName};
 
 use super::transfer::parse_progress;
 use super::*;
@@ -40,32 +40,18 @@ const PUSH_ENDPOINT: &str = "/api/push-tag";
 const DELETE_ENDPOINT: &str = "/api/delete-remote-tag";
 
 // ---------------------------------------------------------------------------
-// The argv — one place each, matching plan.rs's documented command table
+// The argv
 // ---------------------------------------------------------------------------
-
-/// `git push --progress <remote> refs/tags/<name>`. The full `refs/tags/`
-/// path (not the bare short name) disambiguates from a same-named branch on
-/// the remote — a bare `<name>` would let git's own refspec-matching rules
-/// decide which ref that meant.
-fn push_tag_argv(name: &TagName, remote: &RemoteName) -> Vec<String> {
-    vec![
-        "push".to_string(),
-        "--progress".to_string(),
-        remote.as_str().to_string(),
-        format!("refs/tags/{}", name.as_str()),
-    ]
-}
-
-/// `git push --progress <remote> --delete refs/tags/<name>`.
-fn delete_remote_tag_argv(name: &TagName, remote: &RemoteName) -> Vec<String> {
-    vec![
-        "push".to_string(),
-        "--progress".to_string(),
-        remote.as_str().to_string(),
-        "--delete".to_string(),
-        format!("refs/tags/{}", name.as_str()),
-    ]
-}
+//
+// `push_tag_argv` and `delete_remote_tag_argv` moved to
+// `git_vista_protocol::plan_export` with M10 (#590), unchanged — including the
+// full `refs/tags/<name>` path that stops git's refspec matching from choosing
+// a same-named branch on the remote. Re-exported under the names this module's
+// own tests already use.
+// The suite below still names them bare; production calls them qualified, so
+// the export's source scan can see which shared builder this module uses.
+#[cfg(test)]
+use git_vista_protocol::plan_export::{delete_remote_tag_argv, push_tag_argv};
 
 // ---------------------------------------------------------------------------
 // Failure classification — shared by both executors
@@ -222,7 +208,7 @@ pub(super) async fn exec_push_tag(
         );
     }
 
-    let argv = push_tag_argv(name, remote);
+    let argv = plan_export::push_tag_argv(name, remote);
     let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
     let run = Box::pin(crate::git_cmd::git_streamed_for(
         repo,
@@ -329,7 +315,7 @@ pub(super) async fn exec_delete_remote_tag(
         );
     }
 
-    let argv = delete_remote_tag_argv(name, remote);
+    let argv = plan_export::delete_remote_tag_argv(name, remote);
     let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
     let run = Box::pin(crate::git_cmd::git_streamed_for(
         repo,

@@ -15,8 +15,8 @@ use git_vista_core::activity::UndoAction;
 use git_vista_protocol::MergeStrategy;
 
 use crate::features::dialogs::core::{
-    delete_confirm_prompt, merge_confirm_prompt, worktree_confirm, ConfirmPrompt, Dialog,
-    PullTarget, WorktreeAction, TOUCH_TARGET_STYLE,
+    cherry_pick_confirm_prompt, delete_confirm_prompt, merge_confirm_prompt, worktree_confirm,
+    ConfirmPrompt, Dialog, PullTarget, WorktreeAction, TOUCH_TARGET_STYLE,
 };
 use crate::features::preview::core::{previewable, DialogSubject};
 
@@ -144,6 +144,9 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                 // host-tested); this arm only plugs its answer in, the same
                 // shape the Push arm below took for `push_confirm_copy`.
                 PendingOp::Merge { branch, into } => merge_confirm_prompt(branch, into),
+                PendingOp::CherryPick { commit, onto } => {
+                    cherry_pick_confirm_prompt(commit, onto)
+                }
                 // #233: a plain push keeps the single-tap ceremony this
                 // operation has always had; a force-with-lease push (reached
                 // only through the menu's separate force-push entry point,

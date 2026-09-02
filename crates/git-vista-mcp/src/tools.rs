@@ -26,8 +26,8 @@
 //! dependency on either `git-vista-server` or `git-vista-git`) — it is the
 //! same crate the wasm frontend links for the identical reason.
 
-use crate::auth::{self, Session};
-use crate::http::{self, HttpResponse};
+use git_vista_session::auth::{self, Session};
+use git_vista_session::http;
 
 /// This crate's local instantiation of the paged-history Frame envelope —
 /// see the module doc for why this mirrors, rather than imports,
@@ -70,6 +70,9 @@ pub fn tool_catalog() -> serde_json::Value {
     // it is not a write either, so it belongs with the reads.
     array.extend(crate::lesson::lesson_tool_catalog());
     array.extend(crate::plan_tools::plan_tool_catalog());
+    // #590: local, read-only rendering of a plan_* result. It sits after the
+    // builders because it consumes their Plan, and before the one write tool.
+    array.extend(crate::export_tools::export_tool_catalog());
     // M2.23e (#249): the one write tool, appended last so it is always the
     // catalog's final entry — see `tools::tests::the_tool_catalog_lists_exactly_the_six_read_tools`.
     array.extend(crate::execute_tool::execute_tool_catalog());
@@ -363,7 +366,8 @@ pub fn call_tool(
         // unknown-tool refusal, so neither can shadow a read tool's name, and
         // an unrecognised name is still `Unknown` rather than silently
         // swallowed.
-        other => match crate::plan_tools::call_plan_tool_live(other, arguments, session)
+        other => match crate::export_tools::call_export_tool(other, arguments)
+            .or_else(|| crate::plan_tools::call_plan_tool_live(other, arguments, session))
             .or_else(|| crate::execute_tool::call_execute_tool_live(other, arguments, session))
         {
             Some(result) => result,
@@ -595,125 +599,30 @@ fn get_json<T: serde::de::DeserializeOwned + serde::Serialize>(
         .map_err(|e| ToolError::Execution(format!("could not re-encode {path}'s response: {e}")))
 }
 
-/// GET with the session cookie, authenticating on demand and retrying exactly
-/// once on 401 with a fresh session (covers a server restart mid-bridge).
+/// The lazy-auth + one-401-retry helpers every tool call goes through.
 ///
-/// Generic over the fetch and auth closures so the three legs — lazy first
-/// auth, 401 → re-auth → retry with the NEW cookie, 401 → 401 giving up — are
-/// unit-testable without a server. Production passes `http::get` and
-/// `auth::authenticate`.
-fn authed_fetch(
-    path: &str,
-    session: &mut Option<Session>,
-    fetch: &mut dyn FnMut(&str, &str) -> Result<HttpResponse, String>,
-    auth: &mut dyn FnMut() -> Result<Session, String>,
-) -> Result<Vec<u8>, String> {
-    if session.is_none() {
-        *session = Some(auth()?);
-    }
-    let cookie = session.as_ref().expect("just set").cookie.clone();
-    let resp = fetch(path, &cookie)?;
-    if resp.status == 401 {
-        *session = Some(auth()?);
-        let cookie = session.as_ref().expect("just set").cookie.clone();
-        let retry = fetch(path, &cookie)?;
-        if retry.status != 200 {
-            return Err(format!(
-                "GET {path} answered {} even after re-authenticating: {}",
-                retry.status,
-                String::from_utf8_lossy(&retry.body)
-            ));
-        }
-        return Ok(retry.body);
-    }
-    if resp.status != 200 {
-        return Err(format!(
-            "GET {path} answered {}: {}",
-            resp.status,
-            String::from_utf8_lossy(&resp.body)
-        ));
-    }
-    Ok(resp.body)
-}
-
-/// POST with the session cookie AND CSRF token, authenticating on demand and
-/// retrying exactly once on 401 with a fresh session — the write-shaped
-/// sibling of [`authed_fetch`], needed because `/api/select` sits behind the
-/// full session+CSRF gate even though it doesn't mutate a repository (see
-/// [`select_repository`]'s doc comment). Same three-leg shape, same
-/// unit-testability via injected closures.
-/// `authed_post`'s injected POST closure: `(path, body, cookie, csrf) ->
-/// response`. Named so the signature below reads, rather than clippy's
-/// `type_complexity` firing on it inline.
-pub(crate) type PostFn<'a> =
-    dyn FnMut(&str, &[u8], &str, &str) -> Result<HttpResponse, String> + 'a;
-
-pub(crate) fn authed_post(
-    path: &str,
-    body: &[u8],
-    session: &mut Option<Session>,
-    post: &mut PostFn<'_>,
-    auth: &mut dyn FnMut() -> Result<Session, String>,
-) -> Result<Vec<u8>, String> {
-    if session.is_none() {
-        *session = Some(auth()?);
-    }
-    let (cookie, csrf) = {
-        let s = session.as_ref().expect("just set");
-        (s.cookie.clone(), s.csrf.clone())
-    };
-    let resp = post(path, body, &cookie, &csrf)?;
-    if resp.status == 401 {
-        *session = Some(auth()?);
-        let (cookie, csrf) = {
-            let s = session.as_ref().expect("just set");
-            (s.cookie.clone(), s.csrf.clone())
-        };
-        let retry = post(path, body, &cookie, &csrf)?;
-        if retry.status != 200 {
-            return Err(format!(
-                "POST {path} answered {} even after re-authenticating: {}",
-                retry.status,
-                String::from_utf8_lossy(&retry.body)
-            ));
-        }
-        return Ok(retry.body);
-    }
-    if resp.status != 200 {
-        return Err(format!(
-            "POST {path} answered {}: {}",
-            resp.status,
-            String::from_utf8_lossy(&resp.body)
-        ));
-    }
-    Ok(resp.body)
-}
+/// Built here under #246 for the long-lived bridge (a server restart
+/// mid-session answers `401`; re-authenticate once with the self-replacing
+/// bootstrap token, retry once with the NEW cookie, give up honestly on a
+/// second `401`). #456 left them behind on purpose when `auth`/`http` moved
+/// to `git-vista-session`, until a second long-lived consumer earned the
+/// lift; #457's `gv-tui` event loop is that consumer, and the helpers now
+/// live in `git_vista_session::retry` with their tests. Re-exported under
+/// the old paths so `execute_tool.rs` and `plan_tools.rs` — and the
+/// `crate::tools::authed_post` seam `execute_tool.rs`'s doc reasons about —
+/// read exactly as before. ADR 0102.
+pub(crate) use git_vista_session::retry::{authed_fetch, authed_post, PostFn};
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn session(cookie: &str) -> Session {
-        Session {
-            cookie: cookie.to_string(),
-            csrf: "csrf".to_string(),
-        }
-    }
-
-    fn resp(status: u16, body: &[u8]) -> HttpResponse {
-        HttpResponse {
-            status,
-            headers: Vec::new(),
-            body: body.to_vec(),
-        }
-    }
 
     fn no_args() -> serde_json::Value {
         serde_json::json!({})
     }
 
     #[test]
-    fn the_tool_catalog_lists_exactly_the_seven_read_tools() {
+    fn the_tool_catalog_orders_reads_plans_exports_and_the_one_write() {
         // #248 appended the `plan_*` surface after these, so the read tools
         // are now a *prefix* of the catalog rather than the whole of it —
         // still pinned in order, and still pinned to exactly these names, so
@@ -742,18 +651,24 @@ mod tests {
             "get_lesson",
         ];
         assert_eq!(names[..expected_reads.len()], expected_reads);
-        // M2.23e (#249) appended exactly one write tool, `execute_plan`, as
-        // the catalog's LAST entry — everything between the reads and it is
-        // still `plan_*`. Pinning it as the last name (not merely "somewhere
-        // after the reads") is what stops a second write tool from sneaking
-        // in unnoticed between two plan_* entries.
+        // #590 appends local, read-only export tools after the plan builders,
+        // followed by M2.23e's one write tool. Keeping execute_plan last still
+        // makes a second write-shaped capability visible here.
         let after_reads = &names[expected_reads.len()..];
-        let (last, plan_names) = after_reads
-            .split_last()
-            .expect("the catalog has more than just the read tools");
+        let (last, before_execute) = after_reads.split_last().expect("more tools follow reads");
         assert_eq!(
             *last, "execute_plan",
             "the catalog's last tool must be execute_plan — #249's one write tool"
+        );
+        assert!(before_execute.len() >= 2);
+        let (plan_names, exports) = before_execute.split_at(before_execute.len() - 3);
+        assert_eq!(
+            exports,
+            [
+                "export_plan_checklist",
+                "export_plan_fish_script",
+                "export_plans_yaml_manifest"
+            ]
         );
         assert!(
             plan_names.iter().all(|n| n.starts_with("plan_")),
@@ -1103,158 +1018,5 @@ mod tests {
         for value in ["", "a\rb", "a\nb", "a b", "a/b", "a;b"] {
             assert!(!is_url_segment_safe(value), "{value} should be refused");
         }
-    }
-
-    #[test]
-    fn the_first_call_authenticates_lazily_and_sends_that_cookie() {
-        let mut sess = None;
-        let mut seen = Vec::new();
-        let body = authed_fetch(
-            "/x",
-            &mut sess,
-            &mut |_, cookie| {
-                seen.push(cookie.to_string());
-                Ok(resp(200, b"ok"))
-            },
-            &mut || Ok(session("gv_session=first")),
-        )
-        .unwrap();
-        assert_eq!(body, b"ok");
-        assert_eq!(seen, ["gv_session=first"]);
-        assert_eq!(sess.unwrap().cookie, "gv_session=first");
-    }
-
-    #[test]
-    fn a_401_reauthenticates_once_and_retries_with_the_new_cookie() {
-        // The trap this test exists for: a retry that resends the STALE
-        // cookie would loop 401 forever in production while looking
-        // superficially like a retry.
-        let mut sess = Some(session("gv_session=stale"));
-        let mut seen = Vec::new();
-        let body = authed_fetch(
-            "/x",
-            &mut sess,
-            &mut |_, cookie| {
-                seen.push(cookie.to_string());
-                if cookie == "gv_session=stale" {
-                    Ok(resp(401, b""))
-                } else {
-                    Ok(resp(200, b"fresh"))
-                }
-            },
-            &mut || Ok(session("gv_session=fresh")),
-        )
-        .unwrap();
-        assert_eq!(body, b"fresh");
-        assert_eq!(seen, ["gv_session=stale", "gv_session=fresh"]);
-    }
-
-    #[test]
-    fn a_second_401_gives_up_rather_than_retrying_forever() {
-        let mut sess = Some(session("gv_session=stale"));
-        let mut fetches = 0;
-        let err = authed_fetch(
-            "/x",
-            &mut sess,
-            &mut |_, _| {
-                fetches += 1;
-                Ok(resp(401, b"no"))
-            },
-            &mut || Ok(session("gv_session=fresh")),
-        )
-        .unwrap_err();
-        assert_eq!(fetches, 2, "exactly one retry, never a loop");
-        assert!(err.contains("even after re-authenticating"));
-    }
-
-    #[test]
-    fn authed_post_sends_the_sessions_csrf_token_alongside_its_cookie() {
-        let mut sess = Some(session("gv_session=live"));
-        let mut seen: Vec<(String, String)> = Vec::new();
-        let body = authed_post(
-            "/api/select",
-            b"{}",
-            &mut sess,
-            &mut |_, _, cookie, csrf| {
-                seen.push((cookie.to_string(), csrf.to_string()));
-                Ok(resp(200, b"Selected."))
-            },
-            &mut || Ok(session("gv_session=fresh")),
-        )
-        .unwrap();
-        assert_eq!(body, b"Selected.");
-        assert_eq!(seen, [("gv_session=live".to_string(), "csrf".to_string())]);
-    }
-
-    /// Every failure string these two helpers build becomes a
-    /// `ToolError::Execution` the MCP host may render or log, so neither may
-    /// carry the live cookie or CSRF token. The error is assembled from the
-    /// path, the status and the *server's* body — never from the session —
-    /// and this pins that, in both the first-response and the
-    /// retried-after-401 legs.
-    #[test]
-    fn a_failed_request_never_leaks_the_session_cookie_or_csrf_into_its_error() {
-        const COOKIE: &str = "gv_session=CookieSecretABCDEF";
-        const CSRF: &str = "CsrfSecret123456";
-        let secret_session = || Session {
-            cookie: COOKIE.to_string(),
-            csrf: CSRF.to_string(),
-        };
-
-        let mut sess = Some(secret_session());
-        let get_err = authed_fetch(
-            "/api/status/v2",
-            &mut sess,
-            &mut |_, _| Ok(resp(500, b"the server said no")),
-            &mut || panic!("500 is not 401 — no re-authentication"),
-        )
-        .unwrap_err();
-
-        let mut sess = Some(secret_session());
-        let post_err = authed_post(
-            "/api/plan",
-            b"{}",
-            &mut sess,
-            &mut |_, _, _, _| Ok(resp(401, b"stale")),
-            &mut || Ok(secret_session()),
-        )
-        .unwrap_err();
-
-        for err in [&get_err, &post_err] {
-            // Anti-vacuity first: these really are the messages a client sees,
-            // carrying the server's own words — not empty strings that would
-            // pass the leak check for the wrong reason.
-            assert!(err.contains("/api/"), "{err}");
-            assert!(!err.contains("CookieSecretABCDEF"), "cookie leaked: {err}");
-            assert!(!err.contains("CsrfSecret123456"), "csrf leaked: {err}");
-        }
-        assert!(get_err.contains("the server said no"), "{get_err}");
-        assert!(
-            post_err.contains("even after re-authenticating"),
-            "{post_err}"
-        );
-    }
-
-    #[test]
-    fn authed_post_reauthenticates_once_on_401_like_authed_fetch() {
-        let mut sess = Some(session("gv_session=stale"));
-        let mut seen = Vec::new();
-        let body = authed_post(
-            "/api/select",
-            b"{}",
-            &mut sess,
-            &mut |_, _, cookie, _csrf| {
-                seen.push(cookie.to_string());
-                if cookie == "gv_session=stale" {
-                    Ok(resp(401, b""))
-                } else {
-                    Ok(resp(200, b"Selected."))
-                }
-            },
-            &mut || Ok(session("gv_session=fresh")),
-        )
-        .unwrap();
-        assert_eq!(body, b"Selected.");
-        assert_eq!(seen, ["gv_session=stale", "gv_session=fresh"]);
     }
 }
