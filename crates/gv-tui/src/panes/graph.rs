@@ -1,7 +1,7 @@
 //! Terminal projection of git-vista-core's already-computed commit lanes.
 
 use git_vista_core::color::{branch_color, HEAD_BADGE, TAG_BADGE};
-use git_vista_core::model::{Edge, Graph, RefKind};
+use git_vista_core::model::{BranchStub, Edge, FrameStub, Graph, GraphRow, RefKind};
 
 /// The colour vocabulary a caller has established for its terminal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,18 +44,103 @@ impl GraphLine {
     }
 }
 
+/// The common renderer-facing shape shared by whole-graph and paged layout.
+/// All fields are borrowed directly from core's output; no lane is assigned or
+/// inferred here.
+#[derive(Clone, Copy, Debug)]
+pub struct LayoutData<'a, S> {
+    pub rows: &'a [GraphRow],
+    pub edges: &'a [Edge],
+    pub stubs: &'a [S],
+    pub lane_count: usize,
+}
+
+impl<'a> From<&'a Graph> for LayoutData<'a, BranchStub> {
+    fn from(graph: &'a Graph) -> Self {
+        Self {
+            rows: &graph.rows,
+            edges: &graph.edges,
+            stubs: &graph.stubs,
+            lane_count: graph.lane_count,
+        }
+    }
+}
+
+/// A core-computed local-branch stub, expressed only as the badge facts the
+/// terminal projection needs. The two implementations preserve each layout
+/// format's own anchor identity rather than translating it into new lanes.
+pub trait BranchAnchor {
+    fn name(&self) -> &str;
+    fn color(&self) -> usize;
+    fn points_to(&self, row: &GraphRow) -> bool;
+}
+
+impl BranchAnchor for BranchStub {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn color(&self) -> usize {
+        self.color
+    }
+
+    fn points_to(&self, row: &GraphRow) -> bool {
+        self.anchor_row == row.row
+    }
+}
+
+impl BranchAnchor for FrameStub {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn color(&self) -> usize {
+        self.color
+    }
+
+    fn points_to(&self, row: &GraphRow) -> bool {
+        self.anchor_commit == row.commit.id
+    }
+}
+
+/// Pure graph-pane state: borrowed core layout plus an established terminal
+/// capability. A draw asks this state for only its physical-row window.
+#[derive(Clone, Copy, Debug)]
+pub struct GraphPane<'a, S> {
+    layout: LayoutData<'a, S>,
+    colors: ColorDepth,
+}
+
+impl<'a, S: BranchAnchor> GraphPane<'a, S> {
+    pub fn new(layout: LayoutData<'a, S>, colors: ColorDepth) -> Self {
+        Self { layout, colors }
+    }
+
+    pub fn row_count(&self) -> usize {
+        if self.layout.rows.is_empty() {
+            0
+        } else {
+            self.layout.rows.len().saturating_mul(2).saturating_sub(1)
+        }
+    }
+
+    pub fn window(&self, line_offset: usize, height: usize) -> Vec<GraphLine> {
+        render_window(&self.layout, line_offset, height, self.colors)
+    }
+}
+
 /// Project only `[line_offset, line_offset + height)` from the laid-out graph.
-pub fn render_window(
-    graph: &Graph,
+pub fn render_window<S: BranchAnchor>(
+    layout: &LayoutData<'_, S>,
     line_offset: usize,
     height: usize,
     colors: ColorDepth,
 ) -> Vec<GraphLine> {
-    if height == 0 || graph.rows.is_empty() {
+    if height == 0 || layout.rows.is_empty() {
         return Vec::new();
     }
 
-    let total_lines = graph.rows.len().saturating_mul(2).saturating_sub(1);
+    let total_lines = layout.rows.len().saturating_mul(2).saturating_sub(1);
     let end = line_offset.saturating_add(height).min(total_lines);
     if line_offset >= end {
         return Vec::new();
@@ -66,7 +151,7 @@ pub fn render_window(
     // edge that merely passes through the viewport.
     let first_layout_row = line_offset / 2;
     let last_layout_row = (end - 1) / 2;
-    let visible_edges: Vec<&Edge> = graph
+    let visible_edges: Vec<&Edge> = layout
         .edges
         .iter()
         .filter(|edge| edge.from_row <= last_layout_row && edge.to_row >= first_layout_row)
@@ -76,10 +161,10 @@ pub fn render_window(
         .filter_map(|physical_row| {
             let layout_row = physical_row / 2;
             if physical_row % 2 == 0 {
-                render_commit_line(graph, &visible_edges, layout_row, colors)
+                render_commit_line(layout, &visible_edges, layout_row, colors)
             } else {
                 Some(render_connector_line(
-                    graph,
+                    layout,
                     &visible_edges,
                     layout_row,
                     colors,
@@ -115,14 +200,14 @@ impl Default for Cell {
     }
 }
 
-fn render_commit_line(
-    graph: &Graph,
+fn render_commit_line<S: BranchAnchor>(
+    layout: &LayoutData<'_, S>,
     edges: &[&Edge],
     layout_row: usize,
     colors: ColorDepth,
 ) -> Option<GraphLine> {
-    let row = graph.rows.get(layout_row)?;
-    let mut cells = gutter(graph);
+    let row = layout.rows.get(layout_row)?;
+    let mut cells = gutter(layout.lane_count);
 
     // Once an edge has left its child connector it occupies its parent's
     // lane until it reaches the parent node. This is what keeps long-running
@@ -133,7 +218,7 @@ fn render_commit_line(
                 &mut cells,
                 lane_x(edge.to_lane),
                 NORTH | SOUTH,
-                edge_foreground(graph, edge, colors),
+                edge_foreground(layout.rows, edge, colors),
             );
         }
     }
@@ -163,6 +248,14 @@ fn render_commit_line(
         spans.push(span(" ", Foreground::Default, Emphasis::Normal));
         spans.push(span(label, foreground, Emphasis::Bold));
     }
+    for stub in layout.stubs.iter().filter(|stub| stub.points_to(row)) {
+        spans.push(span(" ", Foreground::Default, Emphasis::Normal));
+        spans.push(span(
+            format!("[branch {}]", stub.name()),
+            slot_foreground(stub.color(), colors),
+            Emphasis::Bold,
+        ));
+    }
     spans.push(span(" ", Foreground::Default, Emphasis::Normal));
     spans.push(span(
         row.commit.summary.clone(),
@@ -173,18 +266,18 @@ fn render_commit_line(
     Some(GraphLine { spans })
 }
 
-fn render_connector_line(
-    graph: &Graph,
+fn render_connector_line<S>(
+    layout: &LayoutData<'_, S>,
     edges: &[&Edge],
     layout_row: usize,
     colors: ColorDepth,
 ) -> GraphLine {
-    let mut cells = gutter(graph);
+    let mut cells = gutter(layout.lane_count);
     for edge in edges {
         if !(edge.from_row <= layout_row && layout_row < edge.to_row) {
             continue;
         }
-        let foreground = edge_foreground(graph, edge, colors);
+        let foreground = edge_foreground(layout.rows, edge, colors);
         if edge.from_row < layout_row || edge.from_lane == edge.to_lane {
             let lane = if edge.from_row == layout_row {
                 edge.from_lane
@@ -216,19 +309,8 @@ fn render_connector_line(
     }
 }
 
-fn gutter(graph: &Graph) -> Vec<Cell> {
-    let lanes_from_rows = graph.rows.iter().map(|row| row.lane + 1).max().unwrap_or(0);
-    let lanes_from_edges = graph
-        .edges
-        .iter()
-        .flat_map(|edge| [edge.from_lane + 1, edge.to_lane + 1])
-        .max()
-        .unwrap_or(0);
-    let lanes = graph
-        .lane_count
-        .max(lanes_from_rows)
-        .max(lanes_from_edges)
-        .max(1);
+fn gutter(lane_count: usize) -> Vec<Cell> {
+    let lanes = lane_count.max(1);
     vec![Cell::default(); lanes.saturating_mul(2).saturating_sub(1)]
 }
 
@@ -289,11 +371,11 @@ fn box_glyph(directions: u8) -> char {
     }
 }
 
-fn edge_foreground(graph: &Graph, edge: &Edge, colors: ColorDepth) -> Foreground {
-    let Some(from) = graph.rows.get(edge.from_row) else {
+fn edge_foreground(rows: &[GraphRow], edge: &Edge, colors: ColorDepth) -> Foreground {
+    let Some(from) = rows.get(edge.from_row) else {
         return Foreground::Default;
     };
-    let Some(to) = graph.rows.get(edge.to_row) else {
+    let Some(to) = rows.get(edge.to_row) else {
         return Foreground::Default;
     };
     let slot = if from.commit.parents.first() == Some(&to.commit.id) {
@@ -361,7 +443,8 @@ mod tests {
     }
 
     fn whole_graph(graph: &Graph, colors: ColorDepth) -> Vec<GraphLine> {
-        render_window(graph, 0, graph.rows.len().saturating_mul(2), colors)
+        let pane = GraphPane::new(LayoutData::from(graph), colors);
+        pane.window(0, pane.row_count())
     }
 
     #[test]
@@ -417,6 +500,7 @@ mod tests {
             vec![
                 git_ref("HEAD", RefKind::Head, "tip"),
                 git_ref("main", RefKind::Branch, "tip"),
+                git_ref("fork", RefKind::Branch, "tip"),
                 git_ref("v1.0", RefKind::Tag, "base"),
                 git_ref("origin/main", RefKind::RemoteBranch, "tip"),
             ],
@@ -428,6 +512,10 @@ mod tests {
 
         assert!(tip.contains("[HEAD]"), "{tip}");
         assert!(tip.contains("[branch main]"), "{tip}");
+        assert!(
+            tip.contains("[branch fork]"),
+            "a core stub is still a local branch on this commit: {tip}"
+        );
         assert!(!tip.contains("v1.0"), "{tip}");
         assert!(base.contains("[tag v1.0]"), "{base}");
         assert!(
@@ -438,6 +526,26 @@ mod tests {
             !tip.contains("origin/main"),
             "remote refs are not local-branch badges: {tip}"
         );
+
+        let page_stub = [FrameStub {
+            name: "page-fork".to_string(),
+            anchor_commit: Oid("base".to_string()),
+            lane_offset: 0,
+            color: 2,
+            depth: 0,
+        }];
+        let page = GraphPane::new(
+            LayoutData {
+                rows: &graph.rows,
+                edges: &graph.edges,
+                stubs: &page_stub,
+                lane_count: graph.lane_count,
+            },
+            ColorDepth::Ansi256,
+        );
+        let page_lines = page.window(0, page.row_count());
+        assert!(!page_lines[0].plain_text().contains("page-fork"));
+        assert!(page_lines[2].plain_text().contains("[branch page-fork]"));
     }
 
     #[test]
@@ -458,7 +566,8 @@ mod tests {
             .collect();
         let graph = layout(commits);
 
-        let lines = render_window(&graph, 8_000, 7, ColorDepth::Ansi256);
+        let pane = GraphPane::new(LayoutData::from(&graph), ColorDepth::Ansi256);
+        let lines = pane.window(8_000, 7);
         assert_eq!(lines.len(), 7, "only viewport-height rows are materialized");
         let text = lines
             .iter()
@@ -475,8 +584,8 @@ mod tests {
             !text.contains("commit 0"),
             "off-screen root leaked in: {text}"
         );
-        assert!(render_window(&graph, 0, 0, ColorDepth::Ansi256).is_empty());
-        assert!(render_window(&graph, 10_000, 7, ColorDepth::Ansi256).is_empty());
+        assert!(pane.window(0, 0).is_empty());
+        assert!(pane.window(10_000, 7).is_empty());
     }
 
     #[test]
