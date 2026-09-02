@@ -537,20 +537,23 @@ pub(crate) async fn preview(target: &PreviewTarget, plan: &Plan) -> PreviewRespo
     let alive = std::sync::Arc::downgrade(&caller);
     let target = target.clone();
     let plan = plan.clone();
-    // `inherit_test_current` is the house pattern for a detached task and is
-    // `planner.rs`'s too (`tokio::spawn(crate::state::inherit_test_current(…))`).
-    // It is the identity function in production (`#[cfg(not(test))]`) and, under
-    // `cfg(test)`, captures the caller's `TEST_CURRENT` scope *synchronously* —
-    // its own doc: "`tokio::spawn` first polls the returned future in the child
-    // task, where the parent's task-local scope is no longer visible".
+    // `inherit_selection` is the house pattern for a detached task and is
+    // `planner.rs`'s too (`tokio::spawn(crate::state::inherit_selection(…))`).
+    // Since #588, the caller's selection is a per-session `SELECTION`
+    // task-local cell, not a process-global — `inherit_selection` captures
+    // that cell synchronously (its own doc: "`tokio::spawn` first polls the
+    // returned future in the child task, where the parent's task-local scope
+    // is no longer visible") and hands the *same* cell to the spawned task,
+    // so this session's selection, not some other session's, is what the
+    // task sees.
     //
     // Load-bearing here, not decoration: `compute`'s second check is
-    // `state::read_only_for_path`, which consults that task-local first. Without
-    // this, `a_read_only_repository_answers_repository_read_only` — which sets
-    // its mode inside `with_isolated_test_current` — would still pass, but only
-    // through `set_current`'s side effect on the process-global catalog, i.e.
-    // for a different reason than it was written to check.
-    let task = tokio::spawn(crate::state::inherit_test_current(async move {
+    // `state::read_only_for_path`, which consults that task-local first.
+    // Without this, `a_read_only_repository_answers_repository_read_only` —
+    // which sets its mode inside `with_isolated_test_current` — would still
+    // pass, but only by accident of running alone, not because the selection
+    // actually reached the task.
+    let task = tokio::spawn(crate::state::inherit_selection(async move {
         match compute(&target, &plan, &alive).await {
             Ok(outcome) => outcome,
             Err(reason) => PreviewOutcome::Unavailable { reason },
