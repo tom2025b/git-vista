@@ -1,3 +1,86 @@
+# PR for #462 — conflict resolution in the terminal (M10.07)
+
+Running log, in the order the decisions were taken. Three of these were made
+in commits the WIP checkpointer swept before my own commit ran, so their
+reasoning lives here rather than in a commit message.
+
+- 2026-09-02 max — Move `features/conflicts/{core,markers}.rs` into a new
+  `git-vista-conflicts` crate rather than reimplementing them in `gv-tui`.
+  They lived in a wasm **binary** crate, so the terminal had nothing to depend
+  on; the choice was never "reuse or rewrite" but "move the model or write it
+  twice". A `git mv` plus a manifest, all 37 M4.31 tests carried across.
+- 2026-09-02 max — A NEW crate, not a module of `git-vista-core` or
+  `git-vista-protocol`. `core.rs` reads both, and each of those crates writes
+  down a dependency invariant that folding it in would reverse. ADR 0101 is
+  the precedent: when a second client needed a first client's logic, the answer
+  was to extract a crate.
+- 2026-09-02 max — Delete `features/conflicts/` rather than keep it as a
+  re-export shim. With no code of its own left, a forwarding module only hides
+  where the model now lives.
+- 2026-09-02 max — Widen the shared surface exactly twice, each with a reason.
+  `markers::Choice::describe()` so the browser and the terminal cannot drift on
+  the four words that tell somebody which version they are keeping.
+  `core::ConflictPanes::pane_mut()` so the terminal does not write a second
+  copy of the which-field-is-which-side mapping — #612's
+  `CherryPick`/`RevertCommit` shape.
+- 2026-09-02 max — The overlay takes the whole frame, and the four panes are a
+  permanent summary strip plus one full-width body. Quartering a 40-column
+  floor gives 20 columns of source per pane: the shape of inspection without
+  the substance, which is the same lie as an empty box.
+- 2026-09-02 max — Pair every conflict write with its own `POST /api/select`,
+  rather than selecting once when the overlay opens. `/api/resolve-conflict`
+  carries no repository and acts on the session's selection; a stale selection
+  writes to the wrong repository and SUCCEEDS if that one has a conflict at the
+  same path. A remembered fact can be wrong; a paired one cannot.
+- 2026-09-02 max — Do NOT change the endpoint to carry the repository, even
+  though that is the better fix. It is a wire-contract change with its own
+  blast radius and belongs in its own issue. Recorded in ADR 0105 so the next
+  reader knows the pairing is a mitigation, not the end of the thought.
+- 2026-09-02 max — A second keymap for the overlay, not more arms in the first.
+  The editor takes every printable key as text, so a shared table would quit
+  the program the first time somebody typed `q` into a file they were
+  resolving. `Ctrl-C` is the one binding that survives insert mode.
+- 2026-09-02 max — `x` opens the overlay, not `c`: #459 is the natural owner of
+  a commit key, and renaming a learned binding later is worse than picking a
+  duller letter now.
+- 2026-09-02 max — `hand_edited` is "a keystroke changed it", not "the buffer
+  exists". Opening the composed text must not freeze the block choices; typing
+  must. Before the first edit the buffer re-seeds from the current composition;
+  after it, never.
+- 2026-09-02 max — Seed the editor from the marker file when no composition
+  exists, never from empty. An empty buffer offers "delete everything in this
+  file" as the starting point of a resolution.
+- 2026-09-02 max — Add `retry::authed_fetch_response` so a 404 from
+  `/api/worktree-file` stays information. Through the ordinary JSON path it
+  arrives as "content could not be loaded" — a fault reported where nothing
+  went wrong. It returns whether the answer came on a fresh session, so
+  `authed_fetch` keeps its exact "even after re-authenticating" wording.
+- 2026-09-02 max — Mint the idempotency key per press, not from the request's
+  content. A key names one user action and the server replays keys it has seen;
+  a derived key makes a second deliberate attempt replay the first's answer.
+  Wall-clock nanoseconds are in it because the registry is durable across
+  restarts (#62) and a bare counter would restart at 1 and collide.
+- 2026-09-02 max — `Tone::State` split from `Tone::Muted`. The sentences saying
+  a side is absent or a control is withheld ARE the content on those screens;
+  dimming them would make the most important line on the pane the faintest.
+- 2026-09-02 max — `row_count` stays arithmetic beside the visitor's walk (a
+  2 MB file must not allocate 30k rows per redraw), and the two are pinned
+  against each other by a test that fails the moment they diverge.
+- 2026-09-02 max — Add the binary-side-with-no-typed-reason fixture. Without
+  it, the plausible local re-derivation of `text_resolvable` passes every
+  conflict test in the module; mutation 95 proved that, and only this fixture
+  caught it.
+- 2026-09-02 max — Stop the WIP checkpointer partway through. It raced my hand
+  commits twice and swept their messages; with commits landing at every step
+  the safety net was costing more record than it protected. Reported rather
+  than changed silently.
+- 2026-09-02 max — (Outside this repo, Tom's call.) `gv-thermal`'s throttle
+  rule became a RATE rather than a lifetime latch. It was refusing every build
+  on a 32°C machine with the fan at full because a counter had been non-zero
+  since boot. Proved it can still fire five ways before trusting it.
+
+---
+
 # PR 570 round-two decisions
 
 - 2026-08-27 codex — Attack and test only `87a63385432a1a7f1bb707ae9ceb3d41f232ea6e` in `/tmp/git-vista-codex-570-round-two`; keep every Cargo artifact on `/dev/sde1`.

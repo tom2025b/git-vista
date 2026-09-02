@@ -1,5 +1,5 @@
 # git-vista-conflicts — the conflict view model, shared by every client that
-# resolves a conflict (M10.07, #462; ADR 0104).
+# resolves a conflict (M10.07, #462; ADR 0105).
 #
 # It exists because M4.31's conflict model was correct and in the wrong place.
 # `features/conflicts/{core,markers}.rs` were already framework-free and

@@ -56,7 +56,7 @@ repository = "https://github.com/tom2025b/git-vista"
 [workspace.dependencies]
 git-vista-core = { path = "crates/git-vista-core" }
 git-vista-protocol = { path = "crates/git-vista-protocol" }
-# M10.07 (#462), ADR 0104: the conflict view model, downstream of core and
+# M10.07 (#462), ADR 0105: the conflict view model, downstream of core and
 # protocol so both the browser viewer and the terminal resolve conflicts
 # through one implementation.
 git-vista-conflicts = { path = "crates/git-vista-conflicts" }

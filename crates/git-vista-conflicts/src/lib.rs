@@ -1,5 +1,5 @@
 //! `git-vista-conflicts` — the conflict view model, shared by every client
-//! that inspects or resolves a conflict (M10.07, #462; ADR 0104).
+//! that inspects or resolves a conflict (M10.07, #462; ADR 0105).
 //!
 //! Two modules, and between them they are the whole of the client-side
 //! conflict slice M4.31 shipped:

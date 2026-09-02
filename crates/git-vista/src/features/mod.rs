@@ -10,7 +10,7 @@ pub mod a11y;
 pub mod activity;
 // No `conflicts` module here any more. M4.31's four-pane view model and its
 // marker-file block editor moved to the `git-vista-conflicts` crate for
-// M10.07 (#462; ADR 0104), so the terminal client resolves conflicts through
+// M10.07 (#462; ADR 0105), so the terminal client resolves conflicts through
 // the same implementation this one does rather than a second copy of it. They
 // were always framework-free and host-tested, which is what made the move a
 // `git mv`; `api::conflicts` and `viewer.rs` now name that crate directly.
