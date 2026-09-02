@@ -331,7 +331,7 @@ mod tests {
     ///    because that is what a real fixture commit looks like. What
     ///    *does* redden on this mutation is the structural companion test
     ///    below (it reads [`ident_args`] directly), and, more importantly,
-    ///    [`a_bare_local_config_free_commit_needs_the_dash_c_override`] —
+    ///    [`a_commit_with_no_local_maintenance_config_is_protected_by_dash_c_alone`] —
     ///    which exists specifically because nothing here isolated `-c` from
     ///    local config until that gap was found.
     /// 2. **Weakens it** — set `maintenance.auto=true` instead of `false`.
