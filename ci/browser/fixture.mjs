@@ -210,3 +210,31 @@ export function buildStashFixture(root) {
     untracked: STASH_UNTRACKED_FILE,
   }
 }
+
+/** The branch the merge-preview repo offers to merge, and the branch it goes
+ *  into. Mirror `browser::MERGE_PREVIEW_BRANCH` / `MERGE_PREVIEW_INTO`. */
+export const MERGE_PREVIEW_BRANCH = 'feature'
+export const MERGE_PREVIEW_INTO = 'main'
+
+/** How many commits each side carries past the shared base. Two, so the graph
+ *  has real width and a lane mistake is visible. Mirrors
+ *  `browser::MERGE_PREVIEW_DEPTH`. */
+export const MERGE_PREVIEW_DEPTH = 2
+
+/**
+ * An EIGHTH repository: two branches diverged from one base, each two commits
+ * deep on disjoint files, so merging `feature` into `main` is clean and
+ * produces a real two-parent commit (M10.08 A6, #594).
+ *
+ * Its own repository, and never merged by anything. `buildFixture`'s repo has
+ * only `base`, a plain ancestor of `main`, so merging it is "already up to
+ * date" — a preview with an empty change list, which is the one picture that
+ * proves nothing. It is also left deliberately dirty for #348, and a merge
+ * previewed against a dirty tree answers a different question.
+ *
+ * Shape and rationale: `git_vista_fixtures::browser::merge_preview_fixture`.
+ */
+export function buildMergePreviewFixture(root) {
+  build('merge-preview', root)
+  return { root, branch: MERGE_PREVIEW_BRANCH, into: MERGE_PREVIEW_INTO, depth: MERGE_PREVIEW_DEPTH }
+}

@@ -778,6 +778,82 @@ pub fn stash_fixture(root: &Path) {
     git::write(root, STASH_UNTRACKED_FILE, b"not in the index\n");
 }
 
+/// The branch `merge_preview_fixture` offers to merge, and the branch it is
+/// merged into. Named constants because the browser spec matches on the menu
+/// item's text, which interpolates both.
+pub const MERGE_PREVIEW_BRANCH: &str = "feature";
+pub const MERGE_PREVIEW_INTO: &str = "main";
+
+/// How many commits each side carries past the shared base.
+///
+/// Two, not one. A branch a single commit from its base gives the preview a
+/// graph with no width: every lane assignment is trivially right, and a
+/// renderer that put both chains in one lane would look correct. Mirrors the
+/// same reasoning `divergent::merge_clean_two_branch` states at length.
+pub const MERGE_PREVIEW_DEPTH: usize = 2;
+
+/// Two branches diverged from one base, each two commits deep, touching
+/// disjoint files — so merging `feature` into `main` produces a real
+/// two-parent commit and no conflict (M10.08 A6, #594).
+///
+/// ## Why a browser fixture and not `divergent::merge_clean_two_branch`
+///
+/// Same topology, deliberately, and the reasoning there applies here
+/// unchanged. What differs is the delivery: that one hands back a
+/// `tempfile::TempDir` for a Rust test to open, and this suite needs a
+/// repository at a path the *server* is told to serve, built by the
+/// `gv-fixture` binary. Sharing would mean widening that function's return
+/// shape for one caller; the topology is eight git commands and stating them
+/// twice is cheaper than a seam.
+///
+/// ## Why it is its own repository
+///
+/// `main_fixture` has a `base` branch, but `base` is a plain ancestor of
+/// `main`, so merging it is "already up to date" — a preview with an empty
+/// change list, which is exactly the picture that proves nothing. And
+/// `main_fixture` is left deliberately dirty (one staged, one unstaged, two
+/// untracked, asserted by #348's spec); a merge previewed against a dirty tree
+/// is a different question than the one A6 asks.
+///
+/// ## Why nothing here is ever merged
+///
+/// The fixture is handed to the app *pre*-merge, and the spec only ever opens
+/// a confirmation and cancels it. That is the point: a preview must draw the
+/// merge without performing it, so a fixture that arrived already merged could
+/// not tell a working preview from a picture of the past.
+pub fn merge_preview_fixture(root: &Path) {
+    fresh(root);
+
+    git::write(root, "shared.txt", b"shared\n");
+    run(root, &["add", "-A"]);
+    run(root, &["commit", "-q", "-m", "seed: the shared base"]);
+
+    run(root, &["checkout", "-q", "-b", MERGE_PREVIEW_BRANCH]);
+    for n in 1..=MERGE_PREVIEW_DEPTH {
+        git::write(
+            root,
+            &format!("feature-{n}.txt"),
+            format!("feature work {n}\n").as_bytes(),
+        );
+        run(root, &["add", "-A"]);
+        run(
+            root,
+            &["commit", "-q", "-m", &format!("feature: add {n}.txt")],
+        );
+    }
+
+    run(root, &["checkout", "-q", MERGE_PREVIEW_INTO]);
+    for n in 1..=MERGE_PREVIEW_DEPTH {
+        git::write(
+            root,
+            &format!("main-{n}.txt"),
+            format!("main work {n}\n").as_bytes(),
+        );
+        run(root, &["add", "-A"]);
+        run(root, &["commit", "-q", "-m", &format!("main: add {n}.txt")]);
+    }
+}
+
 /// Every browser shape, by the name the `gv-fixture` binary accepts.
 pub const SHAPES: &[(&str, Builder)] = &[
     ("main", main_fixture),
@@ -787,6 +863,7 @@ pub const SHAPES: &[(&str, Builder)] = &[
     ("broken-head", broken_head_fixture),
     ("interleaved-wip", interleaved_wip_fixture),
     ("stash", stash_fixture),
+    ("merge-preview", merge_preview_fixture),
 ];
 
 #[cfg(test)]
@@ -1127,6 +1204,102 @@ mod tests {
             auto.ends_with(&oldest),
             "the automatic entry should repeat the OLDEST commit's subject \
              ({oldest:?}), so `stash@{{1}}` hangs off the seed commit: {auto}"
+        );
+    }
+
+    /// The merge-preview fixture must be genuinely divergent, genuinely
+    /// clean, and genuinely **un**merged.
+    ///
+    /// All three matter and each fails differently. Not divergent and the
+    /// merge is a fast-forward, so the preview has no merge commit to draw.
+    /// Not clean and the preview answers `Conflict` — a correct answer to a
+    /// different question. Already merged and the spec cannot tell a working
+    /// preview from a picture of what already happened.
+    ///
+    /// MUTATION 1: drop the `main:` commits, leaving `main` an ancestor of
+    ///   `feature` — RED on the merge-base assertion, because the base is then
+    ///   `main`'s own tip.
+    /// MUTATION 2: have both branches write the same path — RED on the
+    ///   clean-merge assertion, and green on every other one, which is what
+    ///   tells the two apart.
+    #[test]
+    fn the_merge_preview_fixture_is_divergent_clean_and_not_yet_merged() {
+        let (_d, root) = build("merge-preview");
+
+        assert_eq!(
+            git::out_as(BROWSER, &root, &["rev-list", "--count", MERGE_PREVIEW_INTO]),
+            (MERGE_PREVIEW_DEPTH + 1).to_string(),
+            "main must be the base plus its own commits"
+        );
+        assert_eq!(
+            git::out_as(
+                BROWSER,
+                &root,
+                &["rev-list", "--count", MERGE_PREVIEW_BRANCH]
+            ),
+            (MERGE_PREVIEW_DEPTH + 1).to_string(),
+            "feature must be the base plus its own commits, so the graph has width"
+        );
+
+        // Neither branch is an ancestor of the other: the shared base is
+        // strictly behind both tips.
+        let base = git::out_as(
+            BROWSER,
+            &root,
+            &["merge-base", MERGE_PREVIEW_INTO, MERGE_PREVIEW_BRANCH],
+        );
+        for branch in [MERGE_PREVIEW_INTO, MERGE_PREVIEW_BRANCH] {
+            assert_ne!(
+                base,
+                git::out_as(BROWSER, &root, &["rev-parse", branch]),
+                "{branch} must not be the merge base, or this is a fast-forward"
+            );
+        }
+
+        // Merging is clean — proven on a THROWAWAY CLONE, never here: a
+        // fixture that verified itself by merging would hand the suite an
+        // already-merged repository, which is the one state this shape must
+        // not be in.
+        let clone_dir = tempfile::tempdir().unwrap();
+        let clone = clone_dir.path().join("clone");
+        git::run_as(
+            BROWSER,
+            std::path::Path::new("."),
+            &[
+                "clone",
+                "-q",
+                root.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        git::run_as(BROWSER, &clone, &["checkout", "-q", MERGE_PREVIEW_INTO]);
+        git::run_as(
+            BROWSER,
+            &clone,
+            &[
+                "merge",
+                "-q",
+                "--no-edit",
+                &format!("origin/{MERGE_PREVIEW_BRANCH}"),
+            ],
+        );
+        assert!(
+            !clone.join(".git/MERGE_HEAD").exists(),
+            "the two branches touch disjoint files and must merge without a conflict"
+        );
+
+        assert!(
+            !root.join(".git/MERGE_HEAD").exists(),
+            "the fixture handed to the suite must stay PRE-merge"
+        );
+        let tip_parents = git::out_as(BROWSER, &root, &["cat-file", "-p", MERGE_PREVIEW_INTO])
+            .lines()
+            .filter(|line| line.starts_with("parent "))
+            .count();
+        assert_eq!(
+            tip_parents, 1,
+            "main's tip must be an ordinary commit — a merge already performed \
+             would let the spec pass against a picture of the past"
         );
     }
 }
