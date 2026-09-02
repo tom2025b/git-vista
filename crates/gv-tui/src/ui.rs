@@ -110,6 +110,10 @@ fn draw_placeholder(
 mod tests {
     use std::collections::BTreeSet;
 
+    use git_vista_core::diff::{CommitDiff, DiffFile};
+    use git_vista_core::model::{CommitDetail, CommitSummary, GraphRow, Oid};
+    use git_vista_core::status::ChangeKind;
+    use git_vista_protocol::plan::GenerationToken;
     use git_vista_protocol::RepositoryDescriptor;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -118,7 +122,7 @@ mod tests {
     use ratatui::Terminal;
 
     use super::*;
-    use crate::app::{Action, App, Data, Pane};
+    use crate::app::{Action, App, CommitPage, Data, Pane};
     use crate::layout;
 
     const THREE: &str = r#"[
@@ -166,6 +170,80 @@ mod tests {
 
     fn inside(rect: Rect, x: u16, y: u16) -> bool {
         x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom()
+    }
+
+    const COMMIT: &str = "1111111111111111111111111111111111111111";
+
+    fn page() -> CommitPage {
+        CommitPage {
+            rows: vec![GraphRow {
+                commit: CommitSummary {
+                    id: Oid(COMMIT.to_string()),
+                    parents: Vec::new(),
+                    summary: "render the detail pane".to_string(),
+                    author: "Ada".to_string(),
+                    time: 1_700_000_000,
+                },
+                row: 0,
+                lane: 0,
+                refs: Vec::new(),
+                color: 0,
+                on_remote: false,
+            }],
+            edges: Vec::new(),
+            stubs: Vec::new(),
+            lane_count: 1,
+            cursor: None,
+            generation: GenerationToken::new("generation-1").unwrap(),
+        }
+    }
+
+    fn detail() -> CommitDetail {
+        CommitDetail {
+            id: Oid(COMMIT.to_string()),
+            parents: Vec::new(),
+            author_name: "Ada Author".to_string(),
+            author_email: "ada@example.com".to_string(),
+            author_time: 1_700_000_001,
+            committer_name: "Casey Committer".to_string(),
+            committer_email: "casey@example.com".to_string(),
+            commit_time: 1_700_000_099,
+            message: "subject\n\nbody".to_string(),
+            on_remote: false,
+        }
+    }
+
+    fn detailed(patch: &str, files: Vec<DiffFile>) -> App {
+        let mut app = loaded();
+        app.apply(Action::Activate);
+        app.receive(Data::History {
+            repo: "w1".to_string(),
+            result: Ok(page()),
+        });
+        app.apply(Action::Activate);
+        app.receive(Data::Commit {
+            repo: "w1".to_string(),
+            id: COMMIT.to_string(),
+            result: Ok(detail()),
+        });
+        app.receive(Data::Diff {
+            repo: "w1".to_string(),
+            id: COMMIT.to_string(),
+            result: Ok(CommitDiff {
+                id: COMMIT.to_string(),
+                files,
+                patch: patch.to_string(),
+                truncated: false,
+                against_first_parent: false,
+            }),
+        });
+        app
+    }
+
+    fn row_containing(buffer: &Buffer, needle: &str) -> u16 {
+        (buffer.area.y..buffer.area.bottom())
+            .find(|y| line(buffer, *y).contains(needle))
+            .unwrap_or_else(|| panic!("missing {needle:?}:\n{}", text(buffer)))
     }
 
     #[test]
@@ -329,5 +407,98 @@ mod tests {
                 assert!(is_ansi_or_reset(cell.bg), "non-ANSI bg: {:?}", cell.bg);
             }
         }
+    }
+
+    #[test]
+    fn the_commit_selector_renders_the_existing_summary_and_selection() {
+        let mut app = loaded();
+        app.apply(Action::Activate);
+        app.receive(Data::History {
+            repo: "w1".to_string(),
+            result: Ok(page()),
+        });
+        let terminal = rendered(80, 24, &app);
+        let buffer = terminal.backend().buffer();
+        let y = row_containing(buffer, "1111111 render the detail pane");
+        assert!(inside(layout::split(buffer.area).unwrap().commits, 1, y));
+        assert!(line(buffer, y).contains("1111111 render the detail pane"));
+        assert!(
+            (0..buffer.area.width).any(|x| buffer
+                .cell((x, y))
+                .unwrap()
+                .modifier
+                .contains(Modifier::REVERSED)),
+            "the selected commit row is not visibly selected"
+        );
+    }
+
+    #[test]
+    fn the_main_pane_draws_metadata_binary_labels_and_diff_line_colours() {
+        let patch = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n-old\n+new\n same\ndiff --git a/logo.png b/logo.png\nBinary files a/logo.png and b/logo.png differ\n";
+        let files = vec![DiffFile {
+            path: "logo.png".to_string(),
+            old_path: None,
+            kind: ChangeKind::Modified,
+            additions: None,
+            deletions: None,
+        }];
+        let app = detailed(patch, files);
+        let terminal = rendered(100, 30, &app);
+        let buffer = terminal.backend().buffer();
+        let screen = text(buffer);
+        for expected in [
+            "Ada Author <ada@example.com>",
+            "Casey Committer <casey@example.com>",
+            "binary — content not shown",
+            "binary file — contents not shown",
+        ] {
+            assert!(screen.contains(expected), "missing {expected:?}:\n{screen}");
+        }
+        assert!(!screen.contains("Binary files a/logo.png"));
+
+        for (needle, colour) in [("-old", Color::Red), ("+new", Color::Green)] {
+            let y = row_containing(buffer, needle);
+            let rendered = line(buffer, y);
+            let start = rendered.find(needle).unwrap() as u16;
+            for x in start..start + needle.len() as u16 {
+                assert_eq!(buffer.cell((x, y)).unwrap().fg, colour, "{needle} at x={x}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_diff_line_is_clipped_inside_the_frame_and_can_scroll_horizontally() {
+        let long = "+0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-END";
+        let patch = format!(
+            "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -0,0 +1 @@\n{long}\n"
+        );
+        let mut app = detailed(&patch, Vec::new());
+        let first = rendered(80, 24, &app);
+        let first_buffer = first.backend().buffer();
+        let panes = layout::split(first_buffer.area).unwrap();
+        let first_y = row_containing(first_buffer, "+012345");
+        assert!(!line(first_buffer, first_y).contains("-END"));
+        for y in panes.main.y + 1..panes.main.bottom() - 1 {
+            assert_eq!(
+                first_buffer
+                    .cell((panes.main.right() - 1, y))
+                    .unwrap()
+                    .symbol(),
+                "│",
+                "long content overwrote the Main border at row {y}"
+            );
+        }
+
+        app.apply(Action::HorizontalRight);
+        let second = rendered(80, 24, &app);
+        let shifted = text(second.backend().buffer());
+        assert!(
+            !shifted.contains("+012345"),
+            "horizontal offset was ignored:\n{shifted}"
+        );
+        assert!(
+            shifted.contains("456789"),
+            "the shifted line vanished:\n{shifted}"
+        );
     }
 }

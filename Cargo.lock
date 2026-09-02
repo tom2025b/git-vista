@@ -1881,6 +1881,7 @@ name = "gv-tui"
 version = "0.2.0"
 dependencies = [
  "crossterm",
+ "git-vista-core",
  "git-vista-protocol",
  "git-vista-session",
  "ratatui",
