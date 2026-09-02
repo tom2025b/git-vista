@@ -19,17 +19,16 @@
 - `cargo test --workspace`: compiled, then host sandbox battery unavailable
   because this managed host denies user-namespace creation (server result: 765
   passed, 340 failed, 6 ignored). No `gv-tui` failure.
+- Branch pushed to
+  `origin/feature/m10.05-460-plan-review-pane`; post-reboot focused gate
+  reverified 90/90 green.
 
 ## In flight
 
-- Implementation committed at `ccd04cfd3ab191056f566d128ace6c5d68aefd62`.
-- Push was blocked by the managed approval layer because it could not establish
-  `https://github.com/tom2025b/git-vista.git` as an explicitly trusted export
-  destination. Awaiting explicit user authorization for this exact branch and
-  remote, then open the PR and record CI.
+- Open the PR and record CI.
 
 ## Single next command
 
 ```bash
-git push -u origin feature/m10.05-460-plan-review-pane
+gh pr create --base main --head feature/m10.05-460-plan-review-pane
 ```
