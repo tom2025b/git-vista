@@ -6,3 +6,4 @@
 //! windowing rules from turning `app.rs` or `ui.rs` into a second monolith.
 
 pub mod detail;
+pub mod graph;
