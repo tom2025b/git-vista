@@ -434,6 +434,8 @@ fn span(text: impl Into<String>, foreground: Foreground, emphasis: Emphasis) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use git_vista_core::layout::{layout, layout_with_refs};
     use git_vista_core::model::{CommitSummary, GitRef, Oid, RefKind};
 
@@ -454,6 +456,25 @@ mod tests {
             name: name.to_string(),
             kind,
             target: Oid(target.to_string()),
+        }
+    }
+
+    struct CountingAnchor<'a> {
+        visited_rows: &'a Cell<usize>,
+    }
+
+    impl BranchAnchor for CountingAnchor<'_> {
+        fn name(&self) -> &str {
+            "viewport-probe"
+        }
+
+        fn color(&self) -> usize {
+            0
+        }
+
+        fn points_to(&self, _row: &GraphRow) -> bool {
+            self.visited_rows.set(self.visited_rows.get() + 1);
+            false
         }
     }
 
@@ -534,7 +555,9 @@ mod tests {
         assert!(!tip.contains("v1.0"), "{tip}");
         assert!(base.contains("[tag v1.0]"), "{base}");
         assert!(
-            !base.contains("HEAD") && !base.contains("branch main"),
+            !base.contains("HEAD")
+                && !base.contains("branch main")
+                && !base.contains("branch fork"),
             "{base}"
         );
         assert!(
@@ -581,9 +604,26 @@ mod tests {
             .collect();
         let graph = layout(commits);
 
-        let pane = GraphPane::new(LayoutData::from(&graph), ColorDepth::Ansi256);
+        let visited_rows = Cell::new(0);
+        let viewport_probe = [CountingAnchor {
+            visited_rows: &visited_rows,
+        }];
+        let pane = GraphPane::new(
+            LayoutData {
+                rows: &graph.rows,
+                edges: &graph.edges,
+                stubs: &viewport_probe,
+                lane_count: graph.lane_count,
+            },
+            ColorDepth::Ansi256,
+        );
         let lines = pane.window(8_000, 7);
         assert_eq!(lines.len(), 7, "only viewport-height rows are materialized");
+        assert_eq!(
+            visited_rows.get(),
+            4,
+            "only the four commit rows intersecting the seven-line viewport are built"
+        );
         let text = lines
             .iter()
             .map(GraphLine::plain_text)
