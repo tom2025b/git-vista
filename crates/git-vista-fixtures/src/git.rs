@@ -88,6 +88,20 @@ pub const BROWSER: Ident = Ident {
 /// natural runs, and only reproducible under an `LD_PRELOAD` that widened it.
 ///
 /// A fixture must not race a background process it never asked for.
+///
+/// # `-c` here is only half of it
+///
+/// This vector reaches the commits **this module** makes. It does not reach a
+/// caller's own bare `git commit`, which the module doc above says the suites
+/// deliberately perform — and such a commit spawns the janitor exactly as any
+/// other does (measured with `GIT_TRACE`). So [`init_as`] additionally writes
+/// `maintenance.auto` and `gc.auto` into the repository's own config, which
+/// every later commit reads whoever makes it.
+///
+/// The first version of this fix set only the `-c` pair and described this
+/// function as "the one place every fixture git invocation passes through". A
+/// fresh reader found the counter-example in `seeded.rs`. Both halves are
+/// needed; neither is decoration.
 fn ident_args(ident: Ident) -> Vec<String> {
     let Ident { name, email } = ident;
     vec![
@@ -217,6 +231,15 @@ pub fn init_as(ident: Ident, repo: &Path) {
     run_as(ident, repo, &["init", "-q", "-b", "main"]);
     run_as(ident, repo, &["config", "user.email", ident.email]);
     run_as(ident, repo, &["config", "user.name", ident.name]);
+    // #598, and the reason this is LOCAL config rather than only `-c`: the
+    // module doc above says callers "go on to run their own `git commit`
+    // against the repository afterwards, through their own helpers, which pass
+    // no identity". Such a commit gets none of `ident_args`, so a `-c` override
+    // does not reach it and it spawns the janitor — measured with GIT_TRACE on
+    // `seeded::tests::a_caller_can_commit_again_without_supplying_an_identity`.
+    // Written into the repository, it covers every later commit by anyone.
+    run_as(ident, repo, &["config", "maintenance.auto", "false"]);
+    run_as(ident, repo, &["config", "gc.auto", "0"]);
 }
 
 /// [`run`] under an explicit identity.
@@ -282,61 +305,153 @@ pub fn write(repo: &Path, name: &str, content: &[u8]) {
 mod tests {
     use super::*;
 
-    /// #598 — every fixture git invocation must disable auto-maintenance.
+    /// #598 — a fixture commit must not spawn git's background janitor.
     ///
-    /// # Why this is a unit test on the argument vector, and not a behavioural one
+    /// This is the **behavioural** test, and it exists because the first attempt
+    /// at pinning #598 was a test that could not fail. Two attempts, in fact:
     ///
-    /// The obvious test — build a fixture repo, assert no `objects/maintenance.lock`
-    /// is left behind — was written first and **proved inert**. Both mutations
-    /// survived it:
+    /// 1. "assert no `objects/maintenance.lock` is left behind" — inert, because
+    ///    the lock's lifetime measured **~0.7 ms** on this box, so the check
+    ///    almost never catches it even with maintenance fully enabled.
+    /// 2. "assert `git config --get maintenance.auto` is false" — inert, because
+    ///    that reads *repository* config, which never holds a `-c` value.
     ///
-    /// - the lock's lifetime on a fast box measured **~0.7 ms**, so the check
-    ///   almost never catches it even with maintenance fully enabled; and
-    /// - `git config --get maintenance.auto` reads the *repository* config, which
-    ///   never contains a value passed as `-c` on the command line, so that
-    ///   assertion passed no matter what.
+    /// `GIT_TRACE=1` settles it directly: git prints the spawn, or it does not.
+    /// No race, no snapshot, no reliance on a lock file still being on disk.
     ///
-    /// A test that cannot fail on the break it names is worse than no test. The
-    /// argument vector is where the setting actually lives, so that is what this
-    /// asserts. It fails immediately if either override is dropped, renamed, or
-    /// flipped.
+    /// # Two mutations, both real
     ///
-    /// # Two mutations
+    /// 1. **Removes the mechanism** — delete the `-c maintenance.auto=false`
+    ///    pair from [`ident_args`]. The trace then carries
+    ///    `run_command: git maintenance run --auto --quiet --detach` and this
+    ///    test fails on the negative assertion.
+    /// 2. **Weakens it** — set `maintenance.auto=true` instead of `false`. Same
+    ///    spawn, same failure, reached through a config value that *looks*
+    ///    deliberate rather than through a missing argument.
     ///
-    /// 1. **Removes the mechanism** — delete both `-c` pairs. Both `assert!`s below
-    ///    fire.
-    /// 2. **Weakens it** — keep the flag but set `maintenance.auto=true`. The
-    ///    value assertion fires on a *different* line than mutation 1.
+    /// Note what is deliberately **not** offered as a mutation: dropping
+    /// `-c gc.auto=0` while keeping `maintenance.auto=false`. Measured on git
+    /// 2.53, that changes nothing — `maintenance.auto=false` alone already
+    /// suppresses the spawn. A mutation that cannot change behaviour is not a
+    /// weakening, and an earlier version of this test claimed it as one.
     #[test]
-    fn every_fixture_git_call_disables_auto_maintenance() {
+    fn a_real_fixture_commit_does_not_spawn_auto_maintenance() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let repo = dir.path().join("repo");
+        init(&repo);
+
+        let output = command(
+            &repo,
+            &["commit", "-q", "--allow-empty", "-m", "trace maintenance"],
+        )
+        .env("GIT_TRACE", "1")
+        .output()
+        .expect("run a traced fixture commit");
+        assert!(
+            output.status.success(),
+            "the traced fixture commit failed, so the assertions below say \
+             nothing about maintenance: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let trace = String::from_utf8_lossy(&output.stderr);
+
+        // Vacuity guard FIRST here, unlike the structural test below: a run that
+        // produced no trace at all would satisfy the negative assertion for
+        // entirely the wrong reason, and that is the exact failure mode this
+        // test was written to escape.
+        assert!(
+            trace.contains("built-in: git commit"),
+            "GIT_TRACE produced no commit event, so the negative assertion below \
+             would pass by scanning nothing. Trace was: {trace}"
+        );
+        assert!(
+            !trace.contains("maintenance run"),
+            "a fixture commit spawned git's auto-maintenance. That janitor \
+             creates an empty `objects/maintenance.lock` and unlinks it \
+             asynchronously, so a test photographing .git before and after an \
+             operation catches it in one snapshot and not the other and fails on \
+             a file it never touched. That is #598. Trace was: {trace}"
+        );
+    }
+
+    /// A caller's own bare `git commit` — no `ident_args` — must not spawn it
+    /// either.
+    ///
+    /// This is the gap a fresh reader found in the first version of this fix.
+    /// The module doc says callers "go on to run their own `git commit` against
+    /// the repository afterwards, through their own helpers, which pass no
+    /// identity", and `seeded.rs` has a test doing exactly that. A `-c` override
+    /// reaches none of those commits, so the first fix left the race open on
+    /// every one of them while claiming `ident_args` was the single choke point.
+    ///
+    /// [`init_as`] therefore writes the setting into the repository's own config
+    /// as well. This test drives the bare path — a raw `Command`, deliberately
+    /// bypassing this module — so it fails if that local config is dropped.
+    #[test]
+    fn a_bare_caller_commit_does_not_spawn_auto_maintenance_either() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let repo = dir.path().join("repo");
+        init(&repo);
+        write(&repo, "a.txt", b"one\n");
+        // A seed commit through this module, so the follow-up below has a
+        // tracked file to modify. `commit -am` stages tracked paths only, and a
+        // repository with no commit has none.
+        run(&repo, &["add", "-A"]);
+        run(&repo, &["commit", "-q", "-m", "seed"]);
+        write(&repo, "a.txt", b"two\n");
+
+        // Deliberately NOT through this module: this is the caller's own shape.
+        let output = Command::new("git")
+            .args(["commit", "-q", "-am", "a caller's own follow-up"])
+            .current_dir(&repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_TRACE", "1")
+            .output()
+            .expect("run a bare follow-up commit");
+        assert!(
+            output.status.success(),
+            "the bare follow-up commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let trace = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            trace.contains("built-in: git commit"),
+            "GIT_TRACE produced no commit event, so the check below is vacuous: \
+             {trace}"
+        );
+        assert!(
+            !trace.contains("maintenance run"),
+            "a caller's bare commit spawned auto-maintenance. `ident_args` \
+             cannot reach this path — the setting has to be in the repository's \
+             own config, written by `init_as`. See #598. Trace was: {trace}"
+        );
+    }
+
+    /// The overrides are on the argument vector — a fast structural companion to
+    /// the behavioural tests above.
+    ///
+    /// It earns its place by being instant and by naming the mechanism in its
+    /// failure message; it is **not** the proof. The traced tests above are.
+    #[test]
+    fn every_fixture_git_call_carries_the_maintenance_overrides() {
         let args = ident_args(CATALOGUE);
 
         assert!(
             args.iter().any(|a| a == "maintenance.auto=false"),
             "fixture git invocations no longer pass `-c maintenance.auto=false`. \
-             Every `git commit` then spawns `git maintenance run --auto --detach`, \
-             which creates and asynchronously unlinks `objects/maintenance.lock`. \
-             Tests that photograph .git before and after an operation catch that \
-             file in one snapshot and not the other and fail on something they \
-             never touched. That is #598. Note that GIT_CONFIG_GLOBAL=/dev/null \
-             does NOT cover this: the default is compiled in, not in a file. \
+             See #598, and see the traced test above for what actually breaks. \
              Args were: {args:?}"
         );
 
-        assert!(
-            args.iter().any(|a| a == "gc.auto=0"),
-            "fixture git invocations no longer pass `-c gc.auto=0`, so the legacy \
-             auto-gc path can still spawn background work. See #598. Args were: \
-             {args:?}"
-        );
-
-        // Vacuity guard, checked last on purpose: if `ident_args` ever returned
-        // an empty vector, the two `any()` checks above would fail with a
-        // confusing message about maintenance rather than the real fault.
+        // Vacuity guard, checked last: an empty vector would otherwise fail the
+        // check above with a confusing message about maintenance.
         assert!(
             args.iter().any(|a| a.starts_with("user.email=")),
             "ident_args returned something that is not a git argument vector at \
-             all — fix that before trusting the checks above. Got: {args:?}"
+             all — fix that before trusting the check above. Got: {args:?}"
         );
     }
 }
