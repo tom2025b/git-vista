@@ -49,8 +49,8 @@ pub fn run<B: Backend>(
     inputs: &mut dyn Inputs,
     port: &mut dyn DataPort,
 ) -> Result<(), String> {
-    for fetch in app.start() {
-        port.request(fetch);
+    for request in app.start() {
+        port.request(request);
     }
     loop {
         terminal
@@ -67,8 +67,8 @@ pub fn run<B: Backend>(
                     keys::dispatch(key, app.focus)
                 };
                 if let Some(action) = action {
-                    for fetch in app.apply(action) {
-                        port.request(fetch);
+                    for request in app.apply(action) {
+                        port.request(request);
                     }
                 }
             }
@@ -80,7 +80,9 @@ pub fn run<B: Backend>(
             Input::Resize => {}
         }
         while let Some(data) = port.poll() {
-            app.receive(data);
+            for request in app.receive(data) {
+                port.request(request);
+            }
         }
     }
     Ok(())
@@ -100,7 +102,7 @@ mod tests {
     use ratatui::layout::{Position, Size};
 
     use super::*;
-    use crate::app::{Data, Fetch, Pane};
+    use crate::app::{Data, Pane, Request};
 
     const THREE: &str = r#"[
       {"repository":"r1","worktree":"w1","name":"alpha","kind":"main_worktree","read_only":false},
@@ -160,13 +162,13 @@ mod tests {
 
     #[derive(Default)]
     struct FakePort {
-        seen: Vec<Fetch>,
+        seen: Vec<Request>,
         answers: VecDeque<Data>,
     }
 
     impl DataPort for FakePort {
-        fn request(&mut self, fetch: Fetch) {
-            self.seen.push(fetch);
+        fn request(&mut self, request: Request) {
+            self.seen.push(request);
         }
 
         fn poll(&mut self) -> Option<Data> {
@@ -198,7 +200,7 @@ mod tests {
 
         run(&mut terminal, &mut app, &mut script, &mut port).unwrap();
 
-        assert_eq!(port.seen, [Fetch::Catalog]);
+        assert_eq!(port.seen, [Request::Catalog]);
         assert!(app.quit);
     }
 
@@ -248,7 +250,7 @@ mod tests {
 
         run(&mut terminal, &mut app, &mut script, &mut port).unwrap();
 
-        assert_eq!(port.seen, [Fetch::Catalog, Fetch::Catalog]);
+        assert_eq!(port.seen, [Request::Catalog, Request::Catalog]);
     }
 
     #[test]
@@ -261,7 +263,7 @@ mod tests {
         let error = run(&mut terminal, &mut app, &mut script, &mut port).unwrap_err();
 
         assert_eq!(error, "the input stream vanished");
-        assert_eq!(port.seen, [Fetch::Catalog]);
+        assert_eq!(port.seen, [Request::Catalog]);
     }
 
     struct ResizeBackend {
