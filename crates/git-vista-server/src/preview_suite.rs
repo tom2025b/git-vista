@@ -4149,30 +4149,40 @@ async fn a_live_store_is_never_swept_however_old_it_looks() {
         let marker_bytes = std::fs::read(&marker);
         let marker_meta = std::fs::metadata(&marker);
         let lease_is_free = ScratchStore::abandoned_store_lease(&path).is_some();
-        let open_here: Vec<String> = std::fs::read_dir("/proc/self/fd")
-            .map(|entries| {
-                entries
+        // An unreadable /proc must not render as an empty list — "probed and
+        // found nothing" and "could not probe" are different answers, and
+        // collapsing them is the same class of defect this whole change
+        // exists to remove.
+        let open_here = match std::fs::read_dir("/proc/self/fd") {
+            Ok(entries) => {
+                let found: Vec<String> = entries
                     .flatten()
                     .filter_map(|entry| {
                         let target = std::fs::read_link(entry.path()).ok()?;
                         (target == marker).then(|| entry.file_name().to_string_lossy().into_owned())
                     })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let lock_rows: Vec<String> = match (std::fs::read_to_string("/proc/locks"), &marker_meta) {
-            (Ok(locks), Ok(marker_meta)) => locks
-                .lines()
-                .filter(|line| line.ends_with(&format!(":{} 0 EOF", marker_meta.ino())))
-                .map(str::to_owned)
-                .collect(),
-            _ => Vec::new(),
+                    .collect();
+                format!("{found:?}")
+            }
+            Err(err) => format!("UNPROBED: {err}"),
+        };
+        let lock_rows = match (std::fs::read_to_string("/proc/locks"), &marker_meta) {
+            (Ok(locks), Ok(marker_meta)) => {
+                let rows: Vec<String> = locks
+                    .lines()
+                    .filter(|line| line.ends_with(&format!(":{} 0 EOF", marker_meta.ino())))
+                    .map(str::to_owned)
+                    .collect();
+                format!("{rows:?}")
+            }
+            (Err(err), _) => format!("UNPROBED: {err}"),
+            (Ok(_), Err(err)) => format!("UNPROBED: no marker inode to match ({err})"),
         };
         eprintln!(
             "surviving abandoned-store diagnosis: age={observed_age:?}, stat={:?}, \
              is_dir={:?}, marker_read={}, marker_matches={:?}, \
              lease_is_free={lease_is_free}, marker_dev={:?}, marker_ino={:?}, \
-             open_here={open_here:?}, lock_rows={lock_rows:?}",
+             open_here={open_here}, lock_rows={lock_rows}",
             meta.as_ref().err(),
             meta.as_ref().map(std::fs::Metadata::is_dir).ok(),
             match &marker_bytes {
