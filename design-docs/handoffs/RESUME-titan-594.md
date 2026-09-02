@@ -1,41 +1,43 @@
 # RESUME — titan / #594
 
 **Branch:** `feature/m10.08-a6-wire-the-graph-preview-into-the-app-t`
-**Pushed head:** `ebad7676` — everything below is on the remote.
+**PR:** #613 — https://github.com/tom2025b/git-vista/pull/613
 
-## Done
+## Done — the handoff's five acceptance criteria
 
-1. **Merge-down** (`36c516fc`). 41 commits of main. One conflict
-   (`docs/adr/README.md`); main's rows kept verbatim in main's order, this
-   branch's appended last.
-2. **ADR renumbered 0100 → 0104** (same commit). Main's 0100 is #599's.
-3. **Criterion 1 — cherry-pick preview** (`c68fe5de`). The arm the branch's own
-   comments promised once #596 closed.
-4. **`preview_subject` moved to `features::dialogs::core`** (`7b1e66a0`) — it
-   was in wasm-gated `confirm.rs`, which CI compiles and lints but never
-   executes. There is no wasm test runner here, so it was unprovable by
-   construction. Now host-tested.
-5. **Six mutations, six caught** (`92ab2dc9`, `ebad7676`). atlas 57–62, all
-   conclusive against a clean tree.
+| id | Criterion | State |
+|---|---|---|
+| a1 | main merged down, conflicts resolved with reasoning recorded | done (`36c516fc`) |
+| a2 | `./dev gate` green, all legs incl. browser | done on `a7dc96b4`, 82 browser tests |
+| a3 | every #594 criterion MET with file:line, or named NOT MET | done — all five MET |
+| a4 | PR opened, body says `Closes #594` and nothing else | done — #613, exactly one closer |
+| a5 | decision log written as you go, committed to the branch | done (`a7dc96b4`) |
 
-804 tests pass.
+Criterion 1 was the genuinely partial one and is now closed for real: cherry-pick
+asks for a preview, and `preview_subject` moved from wasm-gated `confirm.rs`
+into host-tested `features::dialogs::core` so it could be proved at all.
+Six mutations, six caught (atlas 57-62).
 
 ## In flight right now
 
-`./dev gate` (fmt → clippy → wasm-clippy → test → trunk build → browser),
-running in the background. Nothing uncommitted.
+Nothing. Working tree clean, everything pushed.
 
 ## Single next command
 
 ```
 # ON TITAN
-./dev gate
+gh pr checks 613
 ```
 
-## Not started
+## Not done, deliberately
 
-PR with `Closes #594`. Criteria 2–5 audit is written up in the decision log
-beside this file but not yet posted.
+* **Not landed.** The handoff asked for the PR, not the merge.
+* **No browser assertion for the cherry-pick panel.** `preview-panel.spec.mjs`
+  drives merge only; the panel heading is outcome-dependent, so an assertion
+  there would couple to whatever the fixture's engine answers. Named in the
+  decision log rather than hidden.
+* **No second closing keyword for #576**, though #594 is its last acceptance
+  criterion. Stated in the PR body as prose for a human to decide.
 
 ---
-**Signed:** max · 2026-09-02T12:30:00-04:00
+**Signed:** max · 2026-09-02T12:40:00-04:00
