@@ -304,7 +304,14 @@ mod tests {
         //
         // MUTATION: move the insert-mode block below the shared `q`/`j`/`k`
         // arms. Every other key test still passes and this one fails.
-        for (ch, _) in [('q', ()), ('j', ()), ('k', ()), ('o', ()), ('e', ()), ('i', ())] {
+        for (ch, _) in [
+            ('q', ()),
+            ('j', ()),
+            ('k', ()),
+            ('o', ()),
+            ('e', ()),
+            ('i', ()),
+        ] {
             assert_eq!(
                 dispatch_conflict(press(KeyCode::Char(ch)), KeyMode::Insert),
                 Some(Action::Conflict(Act::Type(ch))),

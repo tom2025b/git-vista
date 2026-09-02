@@ -101,7 +101,10 @@ pub enum Request {
     /// `GET /api/conflict-source/{*path}` — the marker file and its token.
     Source { path: String },
     /// `POST /api/resolve-conflict` — a whole side, or the deletion.
-    ResolveWholeFile { path: String, resolution: Resolution },
+    ResolveWholeFile {
+        path: String,
+        resolution: Resolution,
+    },
     /// `POST /api/resolve-conflict-content` (ADR 0069).
     ResolveContent {
         path: String,
@@ -653,7 +656,7 @@ impl ConflictsPane {
             path: file.path.clone(),
             panes,
             focus: View::Ours,
-            });
+        });
         self.editor = None;
         self.screen = Screen::Inspect;
         self.scroll = 0;
@@ -701,12 +704,13 @@ impl ConflictsPane {
         // server asks before executing a content resolution — so the editor
         // cannot open on a file the executor would refuse.
         if !inspect.panes.surface.text_resolution_allowed {
-            self.message = Some((
-                inspect.panes.surface.note.clone().unwrap_or_else(|| {
-                    String::from("This file cannot be resolved line by line.")
-                }),
-                true,
-            ));
+            self.message =
+                Some((
+                    inspect.panes.surface.note.clone().unwrap_or_else(|| {
+                        String::from("This file cannot be resolved line by line.")
+                    }),
+                    true,
+                ));
             return Vec::new();
         }
         let path = inspect.path.clone();
@@ -802,7 +806,10 @@ impl ConflictsPane {
             return Vec::new();
         };
         let composed = if editor.hand_edited {
-            editor.buffer.as_ref().map(|buffer| buffer.text().to_string())
+            editor
+                .buffer
+                .as_ref()
+                .map(|buffer| buffer.text().to_string())
         } else {
             markers::compose(&editor.blocks, &editor.choices)
         };
@@ -1146,9 +1153,7 @@ fn block_row_count(block: &Block) -> usize {
         Block::Conflict { ours, theirs, base } => {
             // heading + the ancestor (its lines, or the one sentence saying
             // there is none) + both sides.
-            1 + base
-                .as_ref()
-                .map_or(1, |text| text.lines().count().max(1))
+            1 + base.as_ref().map_or(1, |text| text.lines().count().max(1))
                 + ours.lines().count().max(1)
                 + theirs.lines().count().max(1)
         }
@@ -1196,12 +1201,12 @@ fn visit_editor(editor: &Editor, emit: &mut impl FnMut(Row) -> bool) {
             Block::Conflict { ours, theirs, base } => {
                 let index = nth;
                 nth += 1;
-                let choice = editor.choices.get(index).copied().unwrap_or(Choice::Unchosen);
-                let heading = format!(
-                    "Conflict {} of {total} — {}",
-                    index + 1,
-                    choice.describe()
-                );
+                let choice = editor
+                    .choices
+                    .get(index)
+                    .copied()
+                    .unwrap_or(Choice::Unchosen);
+                let heading = format!("Conflict {} of {total} — {}", index + 1, choice.describe());
                 let line = if index == editor.block {
                     selected_row(heading, Tone::Heading)
                 } else {
@@ -1332,7 +1337,7 @@ mod tests {
         "before\n<<<<<<< HEAD\nours line\n=======\ntheirs line\n>>>>>>> theirs\nafter\n";
 
     fn oid(seed: char) -> CommitOid {
-        CommitOid::new(std::iter::repeat(seed).take(40).collect::<String>()).unwrap()
+        CommitOid::new(std::iter::repeat_n(seed, 40).collect::<String>()).unwrap()
     }
 
     fn present(seed: char) -> Stage {
@@ -1533,7 +1538,8 @@ mod tests {
             .position(|row| row.text == "Base" && row.tone == Tone::Heading)
             .expect("the focused pane's heading is missing");
         assert_eq!(
-            drawn[heading + 1].text, "Not present on this side",
+            drawn[heading + 1].text,
+            "Not present on this side",
             "the focused ancestor pane drew something other than its own sentence"
         );
         assert_ne!(
@@ -1737,6 +1743,57 @@ mod tests {
     }
 
     #[test]
+    fn a_binary_side_bars_the_editor_even_when_the_server_sent_no_typed_reason() {
+        // The case that separates READING the predicate from recomputing it,
+        // and the reason the previous test alone is not enough.
+        //
+        // `ConflictedFile::text_resolvable` is three clauses: no typed reason,
+        // AND both live sides actually text. The obvious local re-derivation
+        // keeps only the first — and on every ordinary fixture the two agree,
+        // which is exactly how a wrong copy of a rule survives its own tests.
+        //
+        // This fixture is the documented disagreement: the wire carries no
+        // `not_text_resolvable`, but a stage says it is binary, and the
+        // protocol's own doc says the per-side flag wins because "rendering
+        // real binary bytes as lossy text is worse than withholding a pane".
+        //
+        // MUTATION: `let allowed = inspect.panes.surface.note.is_none();` or
+        // `file.not_text_resolvable.is_none()` in place of the flag. Both pass
+        // every other test in this module and fail here.
+        let disagreeing = ConflictedFile {
+            path: PATH.to_string(),
+            kind: ConflictKind::BothModified,
+            base: present('c'),
+            ours: Stage::Present {
+                oid: oid('a'),
+                binary: true,
+                size_bytes: 4096,
+            },
+            theirs: present('b'),
+            not_text_resolvable: None,
+        };
+        assert!(
+            !disagreeing.text_resolvable(),
+            "fixture is wrong: the protocol must already refuse this file"
+        );
+        assert!(
+            disagreeing.not_text_resolvable.is_none(),
+            "fixture is wrong: the naive re-derivation must say yes here"
+        );
+
+        let mut pane = inspecting(disagreeing);
+        assert!(
+            pane.apply(Act::OpenEditor).is_empty(),
+            "the editor opened on a file the server would refuse to resolve as text"
+        );
+        assert!(
+            body(&pane).contains("not available for this file"),
+            "the pane offered a line editor it cannot deliver:\n{}",
+            body(&pane)
+        );
+    }
+
+    #[test]
     fn a_conflicts_shape_is_named_in_the_list_and_on_the_pane() {
         // The note is the model's sentence, and #430's second criterion is
         // that a delete/modify conflict names which side did what. Asserted as
@@ -1774,14 +1831,28 @@ mod tests {
             pane.apply(Act::Type(ch));
         }
         pane.apply(Act::EndEdit);
-        let typed = pane.editor.as_ref().unwrap().buffer.as_ref().unwrap().text().to_string();
+        let typed = pane
+            .editor
+            .as_ref()
+            .unwrap()
+            .buffer
+            .as_ref()
+            .unwrap()
+            .text()
+            .to_string();
         assert!(typed.contains("ZZZ"), "the typing never landed: {typed:?}");
 
         // Now press the block buttons. Nothing about the text may move.
         pane.apply(Act::Choose(Choice::Theirs));
         pane.apply(Act::Choose(Choice::Both));
         assert_eq!(
-            pane.editor.as_ref().unwrap().buffer.as_ref().unwrap().text(),
+            pane.editor
+                .as_ref()
+                .unwrap()
+                .buffer
+                .as_ref()
+                .unwrap()
+                .text(),
             typed,
             "a block choice rewrote text the user had typed"
         );
@@ -1816,14 +1887,26 @@ mod tests {
         pane.apply(Act::Choose(Choice::Ours));
         pane.apply(Act::BeginEdit);
         assert_eq!(
-            pane.editor.as_ref().unwrap().buffer.as_ref().unwrap().text(),
+            pane.editor
+                .as_ref()
+                .unwrap()
+                .buffer
+                .as_ref()
+                .unwrap()
+                .text(),
             "before\nours line\nafter\n"
         );
         pane.apply(Act::EndEdit);
         pane.apply(Act::Choose(Choice::Theirs));
         pane.apply(Act::BeginEdit);
         assert_eq!(
-            pane.editor.as_ref().unwrap().buffer.as_ref().unwrap().text(),
+            pane.editor
+                .as_ref()
+                .unwrap()
+                .buffer
+                .as_ref()
+                .unwrap()
+                .text(),
             "before\ntheirs line\nafter\n",
             "the buffer kept a stale composition after the choice changed"
         );
@@ -2023,10 +2106,7 @@ mod tests {
         let refetch = pane.receive_resolved(REPO, PATH, Ok(()));
         assert!(refetch, "a successful resolution did not ask for a refetch");
         assert_eq!(pane.screen(), Screen::List);
-        assert!(
-            pane.files.is_none(),
-            "the stale list survived a resolution"
-        );
+        assert!(pane.files.is_none(), "the stale list survived a resolution");
         assert!(body(&pane).contains("loading"), "{}", body(&pane));
     }
 
@@ -2041,9 +2121,11 @@ mod tests {
         let refetch = pane.receive_resolved(
             REPO,
             PATH,
-            Err("a.txt changed since you opened it — the version you resolved \
+            Err(
+                "a.txt changed since you opened it — the version you resolved \
                  against is no longer current. Reopen it and try again."
-                .to_string()),
+                    .to_string(),
+            ),
         );
         assert!(!refetch, "a refusal asked for a refetch");
         assert_eq!(pane.screen(), Screen::Editor, "a refusal closed the editor");
@@ -2051,7 +2133,10 @@ mod tests {
             .message()
             .is_some_and(|(text, error)| error && text.contains("no longer current")));
         // …and the controls are live again, so a refusal is recoverable.
-        assert!(!pane.apply(Act::Apply).is_empty(), "the pane stayed busy after a refusal");
+        assert!(
+            !pane.apply(Act::Apply).is_empty(),
+            "the pane stayed busy after a refusal"
+        );
     }
 
     #[test]

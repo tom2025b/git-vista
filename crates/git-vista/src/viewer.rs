@@ -29,7 +29,6 @@ use crate::api::{
 // different numbers is how a window and its scrollbar drift apart.
 use crate::detail::{accessible_rows_window, file_change_marker, DIFF_LINE_PX, DIFF_OVERSCAN};
 use crate::features::a11y::focus::GraphFocus;
-use git_vista_conflicts::core::{ConflictPanes, Pane, PaneState};
 use crate::features::diff::core::{render_window, LineWrap};
 use crate::features::diff::rows::{flatten, row_heights};
 use crate::features::diff::selection::DiffSelection;
@@ -40,6 +39,7 @@ use crate::features::shell::signals::Shell;
 use crate::features::status::signals::StatusResource;
 use crate::icons::icon_set;
 use crate::state::{Features, Settings, ViewerDoc};
+use git_vista_conflicts::core::{ConflictPanes, Pane, PaneState};
 use git_vista_protocol::conflict::Resolution;
 use git_vista_protocol::diff::parse_unified_diff;
 

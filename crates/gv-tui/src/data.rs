@@ -61,9 +61,7 @@ impl Client {
         Client::with(
             Box::new(|path, cookie| http::get(path, Some(cookie))),
             Box::new(|path, body, cookie, csrf, key| match key {
-                Some(key) => {
-                    http::post_json_idempotent(path, body, Some(cookie), Some(csrf), key)
-                }
+                Some(key) => http::post_json_idempotent(path, body, Some(cookie), Some(csrf), key),
                 None => http::post_json(path, body, Some(cookie), Some(csrf)),
             }),
             Box::new(auth::authenticate),
@@ -134,9 +132,7 @@ impl Client {
             .map_err(|error| format!("could not encode the request for {path}: {error}"))?;
         // Destructured so the session and the POST closure are two disjoint
         // borrows rather than one of `self`.
-        let Client {
-            session, post, ..
-        } = self;
+        let Client { session, post, .. } = self;
         let auth = &mut *self.auth;
         retry::authed_post(
             path,
@@ -666,6 +662,303 @@ mod tests {
             dropped.load(Ordering::SeqCst),
             "the detached thread kept the client and its session alive"
         );
+    }
+
+    // ---- conflict reads and writes (M10.07, #462) ----------------------
+
+    type Posted = Arc<std::sync::Mutex<Vec<(String, Vec<u8>, Option<String>)>>>;
+
+    /// A client whose POSTs are recorded and answered by `reply`.
+    fn recording_client(
+        reply: impl Fn(&str) -> HttpResponse + Send + 'static,
+        get: impl Fn(&str) -> HttpResponse + Send + 'static,
+    ) -> (Client, Posted) {
+        let posted: Posted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&posted);
+        let client = Client::with(
+            Box::new(move |path, _| Ok(get(path))),
+            Box::new(move |path, body, _, _, key| {
+                seen.lock().unwrap().push((
+                    path.to_string(),
+                    body.to_vec(),
+                    key.map(str::to_string),
+                ));
+                Ok(reply(path))
+            }),
+            Box::new(|| Ok(session(1))),
+        );
+        (client, posted)
+    }
+
+    fn oid_hex(seed: char) -> CommitOid {
+        CommitOid::new(std::iter::repeat_n(seed, 40).collect::<String>()).unwrap()
+    }
+
+    #[test]
+    fn a_write_selects_the_repository_it_is_about_to_write_to_first() {
+        // `/api/resolve-conflict` carries no repository — it goes through the
+        // planner, which acts on this session's selection (ADR 0103). Without
+        // the select, a resolution lands in whichever repository the server
+        // launched with, and if that one happens to have a conflict at the
+        // same path it SUCCEEDS, in the wrong repository, silently.
+        //
+        // MUTATION A: delete the `select_for_write` call. MUTATION B: move it
+        // after the resolution post. Both leave the write working against
+        // whatever was already selected, so only the order assertion catches
+        // them.
+        let (mut client, posted) = recording_client(
+            |_| HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: b"Resolved.".to_vec(),
+            },
+            |path| panic!("a whole-side resolution should not GET {path}"),
+        );
+
+        let answer = client.serve(Fetch::ResolveWholeFile {
+            repo: "worktree-77".to_string(),
+            path: "src/a.txt".to_string(),
+            resolution: Resolution::TakeTheirs,
+        });
+        match answer {
+            Data::Resolved {
+                result: Ok(()),
+                path,
+                repo,
+            } => {
+                assert_eq!(path, "src/a.txt");
+                assert_eq!(repo, "worktree-77");
+            }
+            other => panic!("expected a resolved answer, got {other:?}"),
+        }
+
+        let posted = posted.lock().unwrap();
+        let paths: Vec<&str> = posted.iter().map(|(path, _, _)| path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["/api/select", "/api/resolve-conflict"],
+            "the write did not select the repository it wrote to, first"
+        );
+
+        let select: serde_json::Value = serde_json::from_slice(&posted[0].1).unwrap();
+        assert_eq!(select["worktree"], "worktree-77");
+        assert_eq!(
+            select["mode"], "active",
+            "a write selected a mode that refuses writes"
+        );
+        assert!(
+            posted[0].2.is_none(),
+            "the select carried an idempotency key it does not need"
+        );
+
+        let write: serde_json::Value = serde_json::from_slice(&posted[1].1).unwrap();
+        assert_eq!(write["path"], "src/a.txt");
+        assert_eq!(
+            write["resolution"]["choice"], "take_theirs",
+            "the resolution reached the wire as {write}"
+        );
+        assert!(
+            posted[1]
+                .2
+                .as_deref()
+                .is_some_and(|key| key.starts_with("gvtui-")),
+            "the planner write carried no idempotency key: {:?}",
+            posted[1].2
+        );
+    }
+
+    #[test]
+    fn a_failed_select_fails_the_write_and_never_posts_the_resolution() {
+        // The failure that matters: if selecting is refused and the write goes
+        // out anyway, it goes out against the previous selection.
+        let (mut client, posted) = recording_client(
+            |path| HttpResponse {
+                status: if path == "/api/select" { 404 } else { 200 },
+                headers: Vec::new(),
+                body: b"No such repository.".to_vec(),
+            },
+            |path| panic!("unexpected GET {path}"),
+        );
+
+        match client.serve(Fetch::ResolveWholeFile {
+            repo: "gone".to_string(),
+            path: "a.txt".to_string(),
+            resolution: Resolution::TakeOurs,
+        }) {
+            Data::Resolved {
+                result: Err(message),
+                ..
+            } => {
+                assert!(
+                    message.contains("select the repository"),
+                    "the failure did not say what went wrong: {message}"
+                );
+                assert!(message.contains("No such repository"), "{message}");
+            }
+            other => panic!("a refused select still produced {other:?}"),
+        }
+        let posted = posted.lock().unwrap();
+        assert_eq!(
+            posted.len(),
+            1,
+            "the resolution was posted after the select was refused"
+        );
+        assert_eq!(posted[0].0, "/api/select");
+    }
+
+    #[test]
+    fn a_content_resolution_posts_the_stages_and_token_it_was_handed() {
+        // ADR 0069 gates 3 and 4 compare these against a fresh scan and a
+        // re-minted token. Anything this client computed itself would agree
+        // with itself by construction.
+        let (mut client, posted) = recording_client(
+            |_| HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: b"Resolved.".to_vec(),
+            },
+            |path| panic!("unexpected GET {path}"),
+        );
+        client.serve(Fetch::ResolveContent {
+            repo: "w1".to_string(),
+            path: "dir/a b.txt".to_string(),
+            expected_stages: [None, Some(oid_hex('a')), Some(oid_hex('b'))],
+            expected_source: GenerationToken::new("conflict-v1:deadbeef").unwrap(),
+            content: "resolved
+"
+            .to_string(),
+        });
+        let posted = posted.lock().unwrap();
+        assert_eq!(posted[1].0, "/api/resolve-conflict-content");
+        let body: serde_json::Value = serde_json::from_slice(&posted[1].1).unwrap();
+        assert_eq!(body["path"], "dir/a b.txt");
+        assert_eq!(body["content"], "resolved\n");
+        assert_eq!(body["expected_source"], "conflict-v1:deadbeef");
+        assert_eq!(body["expected_stages"][0], serde_json::Value::Null);
+        assert_eq!(body["expected_stages"][1], oid_hex('a').as_str());
+        assert_eq!(body["expected_stages"][2], oid_hex('b').as_str());
+    }
+
+    #[test]
+    fn the_result_read_turns_a_404_into_no_file_and_anything_else_into_a_failure() {
+        // "There is no file at this path" is what git leaves behind in a
+        // delete/modify conflict — information, not a fault. Read through the
+        // ordinary JSON path it would arrive as "content could not be loaded",
+        // reporting a failure where nothing went wrong.
+        //
+        // MUTATION: drop the 404 arm from `get_json_or_missing`. The result
+        // pane then says a read failed for every conflict resolved toward
+        // deletion.
+        let (mut client, _) = recording_client(
+            |_| panic!("no POST here"),
+            |path| {
+                let status = if path.contains("missing") { 404 } else { 500 };
+                HttpResponse {
+                    status,
+                    headers: Vec::new(),
+                    body: b"nope".to_vec(),
+                }
+            },
+        );
+        match client.serve(Fetch::ConflictResult {
+            repo: "w1".to_string(),
+            path: "missing.txt".to_string(),
+        }) {
+            Data::ConflictResult {
+                read: ResultRead::NoFile,
+                ..
+            } => {}
+            other => panic!("a 404 was not read as an absent file: {other:?}"),
+        }
+        match client.serve(Fetch::ConflictResult {
+            repo: "w1".to_string(),
+            path: "broken.txt".to_string(),
+        }) {
+            Data::ConflictResult {
+                read: ResultRead::Failed(message),
+                ..
+            } => {
+                assert!(message.contains("500"), "{message}");
+            }
+            other => panic!("a 500 was not read as a failure: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_path_is_encoded_so_it_cannot_cut_the_request_short() {
+        // Every one of these is a real filename and every one of them ends the
+        // request line or starts a query string if it goes through raw.
+        assert_eq!(
+            encode_path("src/a.txt"),
+            "src/a.txt",
+            "slashes are the route's"
+        );
+        assert_eq!(encode_path("a b.txt"), "a%20b.txt");
+        assert_eq!(encode_path("what?.txt"), "what%3F.txt");
+        assert_eq!(encode_path("a#b.txt"), "a%23b.txt");
+        assert_eq!(
+            encode_path("a%b.txt"),
+            "a%25b.txt",
+            "an existing % is escaped"
+        );
+        assert_eq!(
+            encode_path("naïve.txt"),
+            "na%C3%AFve.txt",
+            "per byte, not per char"
+        );
+        assert_eq!(encode_path("keep-._~"), "keep-._~", "unreserved bytes stay");
+    }
+
+    #[test]
+    fn two_presses_carry_two_different_idempotency_keys() {
+        // A key names one user action. Deriving it from the request's content
+        // would make a second, deliberate attempt at the same resolution look
+        // like a retry of the first and replay its answer instead of running.
+        let (mut client, posted) = recording_client(
+            |_| HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: b"Resolved.".to_vec(),
+            },
+            |path| panic!("unexpected GET {path}"),
+        );
+        let request = || Fetch::ResolveWholeFile {
+            repo: "w1".to_string(),
+            path: "a.txt".to_string(),
+            resolution: Resolution::TakeOurs,
+        };
+        client.serve(request());
+        client.serve(request());
+        let posted = posted.lock().unwrap();
+        let keys: Vec<&str> = posted
+            .iter()
+            .filter_map(|(path, _, key)| {
+                (path == "/api/resolve-conflict")
+                    .then_some(key.as_deref())
+                    .flatten()
+            })
+            .collect();
+        assert_eq!(keys.len(), 2);
+        assert_ne!(
+            keys[0], keys[1],
+            "two identical presses shared a key, so the second would replay the first"
+        );
+    }
+
+    #[test]
+    fn a_stopped_worker_never_claims_a_file_is_absent() {
+        // A request that never left the process observed nothing about what is
+        // on disk. `NoFile` here would assert a fact nobody looked for.
+        match stopped_answer(Fetch::ConflictResult {
+            repo: "w1".to_string(),
+            path: "a.txt".to_string(),
+        }) {
+            Data::ConflictResult {
+                read: ResultRead::Failed(_),
+                ..
+            } => {}
+            other => panic!("a dead worker reported {other:?} about a file it never read"),
+        }
     }
 
     #[test]
