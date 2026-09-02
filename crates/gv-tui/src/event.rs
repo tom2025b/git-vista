@@ -72,7 +72,12 @@ pub fn run<B: Backend>(
                     }
                 }
             }
-            Input::Resize | Input::Tick => {}
+            Input::Tick => {
+                for fetch in app.tick() {
+                    port.request(fetch);
+                }
+            }
+            Input::Resize => {}
         }
         while let Some(data) = port.poll() {
             app.receive(data);

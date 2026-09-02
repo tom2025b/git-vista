@@ -99,6 +99,35 @@ Checkpoint verification: `cargo test -p gv-tui --all-targets` counted 99 unit
 tests plus 1 write-boundary integration test, all passing; clippy over all
 targets with warnings denied is clean.
 
+## 8. Transfer progress and cancellation checkpoint
+
+- The authenticated client now shares its in-memory session across clones.
+  A generation-aware 401 refresh prevents two concurrent requests from both
+  consuming bootstrap tokens: if another request already replaced the stale
+  cookie, the retry reuses that fresh session.
+- Only approved execution moves to a second worker thread. Catalog/history,
+  selection, planning, tags, and polling retain their ordered worker. This is
+  the minimum concurrency needed for `GET /api/operations/by-key/<key>` to
+  answer while `/api/execute-plan` is still blocked on the remote operation.
+- The review pane derives a non-authoritative `cancellable` display fact from
+  the same three typed variants the server supports: FetchRemote, PullBranch,
+  PushBranch. It retains no editable Plan. Approval starts by-key lookup with
+  the exact idempotency key, then bounded 500 ms status polling renders the
+  typed stage, transfer phase, and optional percent.
+- `c` queues cancellation even before the operation id is discoverable, then
+  posts to the typed id's cancel route once admitted. Push copy deliberately
+  warns that cancellation cannot establish that nothing was published.
+- The server already globally sets `GIT_TERMINAL_PROMPT=0`, forces
+  `-c core.askpass=` for Remote network need, retains sanctioned credential
+  helpers/SSH agents, redacts remote output, and returns actionable typed
+  authentication failures. The TUI neither prompts nor interprets prose; its
+  bounded HTTP transport surfaces the server response.
+
+Checkpoint verification: 104 TUI unit tests plus 1 write-boundary integration
+test pass. The concurrency test blocks execute-plan deliberately and proves
+by-key lookup answers before releasing it. Clippy over all targets with
+warnings denied is clean.
+
 ## Acceptance evidence
 
 Populated with final file:line locations and an explicit `NOT MET` for any gap

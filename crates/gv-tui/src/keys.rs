@@ -62,6 +62,7 @@ pub fn dispatch(key: KeyEvent, pane: Pane) -> Option<Action> {
         KeyCode::Char('[') if pane == Pane::Main => Some(Action::ParentPrev),
         KeyCode::Char(']') if pane == Pane::Main => Some(Action::ParentNext),
         KeyCode::F(5) | KeyCode::Char('r') => Some(Action::Refresh),
+        KeyCode::Char('c') => Some(Action::CancelOperation),
         KeyCode::Char('a') => Some(Action::ApprovePlan),
         KeyCode::Esc => Some(Action::RefusePlan),
         KeyCode::Char(':') => Some(Action::OpenCommand),
@@ -222,6 +223,10 @@ mod tests {
     fn a_approves_and_escape_refuses_a_plan_review() {
         assert_eq!(global(press(KeyCode::Char('a'))), Some(Action::ApprovePlan));
         assert_eq!(global(press(KeyCode::Esc)), Some(Action::RefusePlan));
+        assert_eq!(
+            global(press(KeyCode::Char('c'))),
+            Some(Action::CancelOperation)
+        );
     }
 
     #[test]

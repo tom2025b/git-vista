@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use git_vista_protocol::{
-    explain, Advisory, ExplanationFact, IndexEffect, NetworkNeed, Plan, Precondition,
+    explain, Advisory, ExplanationFact, GitOperation, IndexEffect, NetworkNeed, Plan, Precondition,
     RecoveryStrategy, RefState, RiskLevel, Topic, WorktreeEffect,
 };
 
@@ -333,6 +333,7 @@ pub struct PlanReviewPane {
     wire: Arc<[u8]>,
     key: String,
     projection: PlanProjection,
+    cancellable: bool,
     state: ReviewState,
     scroll: usize,
 }
@@ -343,11 +344,18 @@ impl PlanReviewPane {
         let plan: Plan = serde_json::from_slice(&wire)
             .map_err(|error| format!("/api/plan did not return a valid Plan: {error}"))?;
         let projection = project(&plan);
+        let cancellable = matches!(
+            plan.operation,
+            GitOperation::FetchRemote { .. }
+                | GitOperation::PullBranch { .. }
+                | GitOperation::PushBranch { .. }
+        );
         let key = format!("tui-{}-{}", plan.operation_hash.as_str(), plan.issued_at.0);
         Ok(PlanReviewPane {
             wire: Arc::from(wire),
             key,
             projection,
+            cancellable,
             state: ReviewState::AwaitingDecision,
             scroll: 0,
         })
@@ -373,6 +381,10 @@ impl PlanReviewPane {
 
     pub fn is_submitting(&self) -> bool {
         self.state == ReviewState::Submitting
+    }
+
+    pub fn cancellable(&self) -> bool {
+        self.cancellable
     }
 
     pub fn scroll(&mut self, delta: isize) {
@@ -403,6 +415,9 @@ impl PlanReviewPane {
     pub fn help(&self) -> &'static str {
         match self.state {
             ReviewState::AwaitingDecision => "a approve · Esc refuse · j/k scroll",
+            ReviewState::Submitting if self.cancellable => {
+                "c cancel transfer · waiting for server re-validation"
+            }
             ReviewState::Submitting => "waiting for server re-validation",
             ReviewState::Refused(_) => "Esc close · j/k scroll",
         }
@@ -703,6 +718,45 @@ mod tests {
                 SubmissionOutcome::from_response(status, b"not done"),
                 SubmissionOutcome::Executed(_)
             ));
+        }
+    }
+
+    #[test]
+    fn only_server_supported_transfer_operations_offer_cancellation() {
+        let mut local = plan();
+        local.operation = GitOperation::CreateBranch {
+            name: BranchName::new("topic").unwrap(),
+            at: oid('a'),
+        };
+        assert!(
+            !PlanReviewPane::from_wire(serde_json::to_vec(&local).unwrap())
+                .unwrap()
+                .cancellable()
+        );
+
+        for operation in [
+            GitOperation::FetchRemote {
+                remote: RemoteName::new("origin").unwrap(),
+            },
+            GitOperation::PullBranch {
+                remote: RemoteName::new("origin").unwrap(),
+                branch: BranchName::new("main").unwrap(),
+                strategy: git_vista_protocol::MergeStrategy::Merge,
+            },
+            GitOperation::PushBranch {
+                branch: BranchName::new("main").unwrap(),
+                remote: RemoteName::new("origin").unwrap(),
+                set_upstream: false,
+                force: git_vista_protocol::ForcePublish::None,
+            },
+        ] {
+            let mut remote = plan();
+            remote.operation = operation;
+            assert!(
+                PlanReviewPane::from_wire(serde_json::to_vec(&remote).unwrap())
+                    .unwrap()
+                    .cancellable()
+            );
         }
     }
 }
