@@ -422,15 +422,29 @@ cmd_report() {
   echo "── branches (origin) ──────────────────────────────"
   local total merged open
   total="$(git for-each-ref --format='%(refname:short)' refs/remotes/origin/ | grep -vc '/HEAD$' || true)"
-  merged="$(git branch -r --merged origin/main | grep -v '\->' | wc -l)"
-  open=$((total - merged))
+  # Every figure here counts the SAME population: origin only.
+  #
+  # It did not used to. `total` counts refs/remotes/origin/, but a bare
+  # `git branch -r --merged` counts every remote-tracking namespace, and this
+  # repository fetches PR heads into refs/remotes/pr/. Those 167 `pr/*` refs
+  # were in `merged` and not in `total`, so merged (440) exceeded total (367)
+  # and the report printed `open: -73`.
+  #
+  # `open` is now derived from the very command that prints the list below, so
+  # the number and the list it heads cannot disagree — the earlier arithmetic
+  # was off by one against its own list even after the namespace was filtered.
+  # `merged` is then the remainder, which keeps total = merged + open true by
+  # construction rather than by coincidence.
+  open="$(git branch -r --no-merged origin/main | grep -v '\->' | sed 's/^ *//' | grep -c '^origin/' || true)"
+  merged=$((total - open))
   echo "  total:  $total"
   echo "  merged: $merged"
   echo "  open:   $open"
   echo
 
   echo "── open branches (not yet merged into main) ────────"
-  git branch -r --no-merged origin/main | grep -v '\->' | sed 's/^ */  /'
+  git branch -r --no-merged origin/main | grep -v '\->' | sed 's/^ *//' \
+    | grep '^origin/' | sed 's/^/  /'
   echo
 
   echo "── WIP / auto-checkpoint commits, all branches ─────"
