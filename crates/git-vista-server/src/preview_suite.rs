@@ -3651,6 +3651,26 @@ fn the_sweep_removes_only_old_directories_it_named_itself() {
 
     ScratchStore::sweep_stale(commondir);
 
+    if stale.exists() {
+        let meta = std::fs::metadata(&stale).expect("stat the surviving stale store");
+        let modified = meta.modified().expect("read the surviving store's mtime");
+        let observed_age = std::time::SystemTime::now()
+            .duration_since(modified)
+            .expect("the surviving store's mtime is not in the future");
+        let marker = stale.join(STORE_MARKER);
+        let marker_bytes = std::fs::read(&marker).expect("read the surviving store's marker");
+        let lease_is_free = ScratchStore::abandoned_store_lease(&stale).is_some();
+        eprintln!(
+            "surviving stale-store diagnosis: age={observed_age:?}, is_dir={}, \
+             marker_is_file={}, marker_matches={}, lease_is_free={lease_is_free}",
+            meta.is_dir(),
+            std::fs::metadata(&marker)
+                .map(|marker_meta| marker_meta.is_file())
+                .unwrap_or(false),
+            marker_bytes.starts_with(STORE_MARKER_MAGIC),
+        );
+    }
+
     assert!(
         !stale.exists(),
         "a marked, unleased `gv-preview-*` directory older than the bound must \
@@ -4090,6 +4110,42 @@ async fn a_live_store_is_never_swept_however_old_it_looks() {
     drop(lease);
     filetime_set(&path, long_ago);
     ScratchStore::sweep_stale(&commondir);
+    if path.exists() {
+        let meta = std::fs::metadata(&path).expect("stat the surviving abandoned store");
+        let modified = meta.modified().expect("read the surviving store's mtime");
+        let observed_age = std::time::SystemTime::now()
+            .duration_since(modified)
+            .expect("the surviving store's mtime is not in the future");
+        let marker = path.join(STORE_MARKER);
+        let marker_bytes = std::fs::read(&marker).expect("read the surviving store's marker");
+        let lease_is_free = ScratchStore::abandoned_store_lease(&path).is_some();
+        use std::os::unix::fs::MetadataExt;
+        let marker_meta = std::fs::metadata(&marker).expect("stat the surviving marker");
+        let open_here: Vec<String> = std::fs::read_dir("/proc/self/fd")
+            .expect("read this test process's file descriptors")
+            .flatten()
+            .filter_map(|entry| {
+                let target = std::fs::read_link(entry.path()).ok()?;
+                (target == marker).then(|| entry.file_name().to_string_lossy().into_owned())
+            })
+            .collect();
+        let lock_rows: Vec<String> = std::fs::read_to_string("/proc/locks")
+            .expect("read the kernel lock table")
+            .lines()
+            .filter(|line| line.ends_with(&format!(":{} 0 EOF", marker_meta.ino())))
+            .map(str::to_owned)
+            .collect();
+        eprintln!(
+            "surviving abandoned-store diagnosis: age={observed_age:?}, is_dir={}, \
+             marker_is_file={}, marker_matches={}, lease_is_free={lease_is_free}, \
+             marker_dev={}, marker_ino={}, open_here={open_here:?}, lock_rows={lock_rows:?}",
+            meta.is_dir(),
+            marker_meta.is_file(),
+            marker_bytes.starts_with(STORE_MARKER_MAGIC),
+            marker_meta.dev(),
+            marker_meta.ino(),
+        );
+    }
     assert!(
         !path.exists(),
         "an abandoned, marked, unleased store older than the bound must still \

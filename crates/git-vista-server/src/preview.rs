@@ -1561,7 +1561,14 @@ impl ScratchStore {
             let Some(lease) = Self::abandoned_store_lease(&path) else {
                 continue;
             };
-            let _ = std::fs::remove_dir_all(&path);
+            let removed = std::fs::remove_dir_all(&path);
+            #[cfg(test)]
+            if let Err(error) = &removed {
+                eprintln!(
+                    "sweep_stale could not remove candidate `{}`: {error}",
+                    path.display()
+                );
+            }
             drop(lease);
         }
     }
