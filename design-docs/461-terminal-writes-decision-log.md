@@ -130,10 +130,76 @@ warnings denied is clean.
 
 ## Acceptance evidence
 
-Populated with final file:line locations and an explicit `NOT MET` for any gap
-before merge.
+- **Branch create/checkout/merge/delete; commit, amend, hooks and signing; tag
+  create/list/delete; fetch, pull, push — MET.** The closed grammar builds the
+  branch operations at `crates/gv-tui/src/commands.rs:52-76`, commit/amend at
+  `:79-99`, every tag form (including signed annotated tags and scoped listing)
+  at `:101-142`, and fetch/pull/push at `:42-47` and `:144-191`. Planning is
+  one typed POST at `crates/gv-tui/src/data.rs:150-153`; tag listing is the
+  read-only scoped GET at `:154-157`. Commit and amend deliberately retain the
+  server's existing policy: hooks run inside the same sealed commit spawn
+  (`crates/git-vista-server/src/planner/commit_exec.rs:349-360`), effective
+  `commit.gpgsign` is read at `:542-558`, and hook/signing failures remain typed
+  at `:637-654` and `:657-704`. There is no unsupported caller-side promise to
+  toggle commit signing or bypass hooks.
+- **Force-with-lease advisories before approval — MET.** Only the explicit
+  `--force-with-lease=<OID>` form can build `ForcePublish::WithLease`
+  (`crates/gv-tui/src/commands.rs:163-190`); bare `--force` is rejected. The
+  existing pane renders every server `ExplainMode` section
+  (`crates/gv-tui/src/panes/plan_review.rs:67-77`) and maps every typed advisory
+  to an advisory row at `:109-133`, before its sole approval method at
+  `:368-378`.
+- **Network progress and supported cancellation — MET.** Approval uses its
+  exact idempotency key to discover the typed operation id; status and cancel
+  answers are scoped to that id (`crates/gv-tui/src/app.rs:536-615`). The 500 ms
+  bounded poll and queued-cancel path are at `:638-689`; only the server-backed
+  FetchRemote/PullBranch/PushBranch set advertises cancellation at
+  `crates/gv-tui/src/panes/plan_review.rs:341-348`. The corresponding by-key,
+  status and cancel endpoints are `crates/gv-tui/src/data.rs:159-176`. Approved
+  execution alone is concurrent, leaving those reads serviceable while the
+  execute POST runs (`:316-345`).
+- **Credentials never silently hang — MET.** The server globally disables
+  terminal prompting (`crates/git-vista-server/src/main.rs:185-194`) and the
+  remote sandbox forces an empty askpass configuration through the real spawn
+  seam (`crates/git-vista-server/src/git_cmd.rs:1588-1625`). The wire retains
+  distinct actionable authentication and blocked-helper outcomes
+  (`crates/git-vista-protocol/src/dto.rs:605-651`); the terminal displays the
+  server response and does not infer a refusal kind from its prose.
+- **No new git spawn sites — MET.** The TUI's complete production-source census
+  rejects process, file and environment write APIs
+  (`crates/gv-tui/src/main.rs:378-403`), and its dependency boundary keeps the
+  server out of the client. The repository-wide native spawn allowlist remains
+  unchanged and is checked at
+  `crates/git-vista-server/src/argv_boundary.rs:484-539`; its reverse/live-entry
+  check is at `:541-603`.
 
 ## Mutation evidence
 
-Each invariant test will be mutation-proved in two distinct ways and recorded
-here with the changed line, failing test and different failure mode.
+Every temporary mutation below was restored before the green run.
+
+| Invariant | Mutation A -> observed RED | Mutation B -> different observed RED |
+|---|---|---|
+| Closed grammar; no argv language | Unknown top-level input returned `Help` -> `unknown_or_malformed_input_never_becomes_an_operation` reported `git status unexpectedly parsed`. | Bare `--force` was accepted -> the same matrix reported `push main origin --force unexpectedly parsed`. |
+| Writable selection precedes the shared review pane | Removed the acknowledged-worktree gate -> `writable_selection_precedes_a_closed_command_and_shared_plan_review` reported `selection was not acknowledged`. | Replaced the parsed delete operation with `StageAll` -> typed equality reported `DeleteBranch` versus `StageAll`. |
+| Exact typed plan transport | Changed `PLAN_PATH` to `/api/execute-plan` -> `selection_and_planning_use_plain_posts_with_typed_exact_bodies` panicked `unexpected POST /api/execute-plan`. This initially **survived** because the test reused the production constant; the test now pins literal wire paths. | Serialized `StageAll` instead of the requested delete -> the strengthened test reached the right endpoint but failed typed body equality (`StageAll` versus `DeleteBranch { topic }`). |
+| Typed progress and supported cancellation | Rendered `percent - 1` -> `remote_execution_lookup_drives_typed_progress_and_cancellation` observed `receiving 41%`, not 42%. | Removed `FetchRemote` from the supported cancel set -> the same flow produced no `CancelOperation` request for the typed id. |
+| Execution concurrency without reordering ordinary reads | Served execute-plan inline -> `operation_lookup_is_served_while_the_approved_execution_is_still_running` timed out after five seconds with `lookup was blocked behind the running execution`. | Spawned every ordinary read concurrently -> `the_worker_answers_every_request_in_order_without_blocking_the_caller` received `[beta, alpha]`, not `[alpha, beta]`. |
+| Tag listing is a scoped read, never a disguised write | Dropped `?repo=w1` -> `tag_listing_is_a_scoped_read_not_a_write_disguised_as_a_plan` failed endpoint equality. | Parsed `tag list` as `Plan(StageAll)` -> `all_tag_forms_are_closed_and_signing_is_never_silently_dropped` failed `ListTags` equality. |
+| No client-side process/file write seam | Inserted a production `Command::new` probe -> `production_code_never_writes_files_env_or_spawns_processes` named the forbidden spawn token and file. | Replaced it with an `fs::write` probe -> the same complete-source census failed through its distinct file-write arm. |
+| 409 classification uses wire status, never English prose | Classified 409 as generic `Refused` -> `a_generation_conflict_says_only_that_the_plan_is_stale` failed `Refused` versus `Stale`. | Reintroduced an `expired` substring branch -> `every_409_is_stale_regardless_of_english_prose` failed on the different body `refs/heads/main moved`. |
+
+## Final verification
+
+- `cargo test -p gv-tui --all-targets`: **104** bin-unit tests plus **1**
+  dependency-boundary integration test passed; zero failed.
+- `cargo clippy -p gv-tui --all-targets -- -D warnings`: clean.
+- `cargo fmt --all -- --check`: clean.
+- `cargo test -p git-vista --bins`: **806 discovered; 804 passed, 2 ignored**;
+  zero failed. This is the real bin target, not the one-byte `lib.rs` false
+  green.
+- `cargo test -p git-vista-server argv_boundary::`: **11 passed**; zero failed.
+- `sandboxed_forces_askpass_hardening_for_remote_network_need`: **1 passed**.
+- `network_command_prepends_forced_askpass_hardening_before_user_args`:
+  **1 passed** when rerun with the required user-namespace permission (the
+  restricted first run stopped in bubblewrap fixture setup before the product
+  assertion).
