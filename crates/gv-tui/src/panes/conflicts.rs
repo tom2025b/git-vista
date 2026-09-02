@@ -1315,3 +1315,851 @@ impl RowWindow {
         self.rows.len() < self.limit
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use git_vista_conflicts::core::Withheld;
+    use git_vista_core::diff::WorktreeFileContent;
+    use git_vista_protocol::conflict::{NotTextResolvable, Stage};
+    use git_vista_protocol::status::ConflictKind;
+    use git_vista_protocol::GenerationToken;
+
+    use super::*;
+
+    const REPO: &str = "repo-1";
+    const PATH: &str = "a.txt";
+    const MARKER: &str =
+        "before\n<<<<<<< HEAD\nours line\n=======\ntheirs line\n>>>>>>> theirs\nafter\n";
+
+    fn oid(seed: char) -> CommitOid {
+        CommitOid::new(std::iter::repeat(seed).take(40).collect::<String>()).unwrap()
+    }
+
+    fn present(seed: char) -> Stage {
+        Stage::Present {
+            oid: oid(seed),
+            binary: false,
+            size_bytes: 10,
+        }
+    }
+
+    /// An ordinary text conflict with **no common ancestor** — the add/add
+    /// shape, and the fixture criterion 1 is about.
+    fn text_conflict() -> ConflictedFile {
+        ConflictedFile {
+            path: PATH.to_string(),
+            kind: ConflictKind::BothAdded,
+            base: Stage::Absent {},
+            ours: present('a'),
+            theirs: present('b'),
+            not_text_resolvable: None,
+        }
+    }
+
+    fn binary_conflict() -> ConflictedFile {
+        ConflictedFile {
+            path: PATH.to_string(),
+            kind: ConflictKind::BothModified,
+            base: present('c'),
+            ours: Stage::Present {
+                oid: oid('a'),
+                binary: true,
+                size_bytes: 4096,
+            },
+            theirs: present('b'),
+            not_text_resolvable: Some(NotTextResolvable::Binary {
+                ours: true,
+                theirs: false,
+            }),
+        }
+    }
+
+    /// They deleted it; our side still has it. `theirs` holds nothing to take.
+    fn delete_modify_conflict() -> ConflictedFile {
+        ConflictedFile {
+            path: PATH.to_string(),
+            kind: ConflictKind::DeletedByThem,
+            base: present('c'),
+            ours: present('a'),
+            theirs: Stage::Absent {},
+            not_text_resolvable: Some(NotTextResolvable::Deletion {
+                ours_deleted: false,
+                theirs_deleted: true,
+            }),
+        }
+    }
+
+    fn unreadable_conflict() -> ConflictedFile {
+        ConflictedFile {
+            path: PATH.to_string(),
+            kind: ConflictKind::BothModified,
+            base: present('c'),
+            ours: Stage::Unreadable {
+                reason: "loose object corrupt".to_string(),
+            },
+            theirs: present('b'),
+            not_text_resolvable: None,
+        }
+    }
+
+    fn source(content: &str) -> ConflictSource {
+        ConflictSource {
+            path: PATH.to_string(),
+            content: content.to_string(),
+            truncated: false,
+            binary: false,
+            source: GenerationToken::new("conflict-v1:9f86d081").unwrap(),
+            stages: [None, Some(oid('a')), Some(oid('b'))],
+        }
+    }
+
+    fn listing(files: Vec<ConflictedFile>) -> ConflictsPane {
+        let mut pane = ConflictsPane::default();
+        pane.open(REPO.to_string());
+        pane.receive_conflicts(REPO, Ok(files));
+        pane
+    }
+
+    fn inspecting(file: ConflictedFile) -> ConflictsPane {
+        let mut pane = listing(vec![file]);
+        pane.apply(Act::Open);
+        pane
+    }
+
+    fn editing(marker: &str) -> ConflictsPane {
+        let mut pane = inspecting(text_conflict());
+        pane.apply(Act::OpenEditor);
+        pane.receive_source(REPO, PATH, Ok(source(marker)));
+        pane
+    }
+
+    fn rows(pane: &ConflictsPane) -> Vec<Row> {
+        pane.window(0, usize::MAX)
+    }
+
+    fn texts(pane: &ConflictsPane) -> Vec<String> {
+        rows(pane).into_iter().map(|row| row.text).collect()
+    }
+
+    fn body(pane: &ConflictsPane) -> String {
+        texts(pane).join("\n")
+    }
+
+    // ---- the two implementations of the layout, pinned together ---------
+
+    #[test]
+    fn row_count_agrees_with_the_rows_actually_emitted_on_every_screen() {
+        // `row_count` is arithmetic and `visit_rows` is a walk. Two
+        // implementations of one layout, and the scroll clamp trusts the
+        // arithmetic one — so a screen whose count is short scrolls to a row
+        // that is not there, and one whose count is long refuses to reach the
+        // last row of a file.
+        //
+        // MUTATION A: drop the `+ note` term from `inspect_row_count`.
+        // MUTATION B: drop the ancestor's row from `block_row_count`.
+        // Either passes every other test in this module.
+        let mut cases: Vec<(&str, ConflictsPane)> = vec![
+            ("list", listing(vec![text_conflict()])),
+            ("list, empty", listing(Vec::new())),
+            ("inspect, no note", inspecting(text_conflict())),
+            ("inspect, with a note", inspecting(binary_conflict())),
+            ("inspect, unreadable", inspecting(unreadable_conflict())),
+            ("editor, merge-style", editing(MARKER)),
+            (
+                "editor, diff3-style",
+                editing(
+                    "a\n<<<<<<< HEAD\nours\n||||||| base\nancestor\n=======\ntheirs\n>>>>>>> t\nz\n",
+                ),
+            ),
+            ("editor, no conflict at all", editing("plain text\n")),
+        ];
+
+        // …and one with content actually loaded into the focused pane, which
+        // is the arm where the count stops being a constant.
+        let mut loaded = inspecting(text_conflict());
+        loaded.receive_stage(
+            REPO,
+            PATH,
+            View::Ours,
+            Ok(BlobContent {
+                oid: oid('a').as_str().to_string(),
+                content: "one\ntwo\nthree\n".to_string(),
+                truncated: false,
+                binary: false,
+            }),
+        );
+        cases.push(("inspect, ours loaded", loaded));
+
+        let mut chosen = editing(MARKER);
+        chosen.apply(Act::Choose(Choice::Ours));
+        cases.push(("editor, one block chosen", chosen));
+
+        for (name, pane) in cases {
+            assert_eq!(
+                pane.row_count(),
+                rows(&pane).len(),
+                "{name}: row_count() and visit_rows() disagree"
+            );
+        }
+    }
+
+    // ---- criterion 1: a pane that has nothing says so -------------------
+
+    #[test]
+    fn a_pane_with_no_ancestor_says_so_and_is_never_a_blank_row() {
+        // #462's first criterion, and the one an empty box would silently
+        // fail. The words are the model's (`PaneState::describe`), asserted
+        // here as a literal rather than by calling `describe()` — a test that
+        // calls the function that defines the mapping proves only that the
+        // function is itself.
+        let mut pane = inspecting(text_conflict());
+        pane.apply(Act::FocusPane(View::Base));
+
+        let drawn = rows(&pane);
+        let base_rows: Vec<&Row> = drawn
+            .iter()
+            .filter(|row| row.text.contains("Not present on this side"))
+            .collect();
+        assert!(
+            !base_rows.is_empty(),
+            "the absent ancestor never said so:\n{}",
+            body(&pane)
+        );
+
+        // And the focused body is that sentence, not an empty row. Find the
+        // "Base" heading and check what follows it.
+        let heading = drawn
+            .iter()
+            .position(|row| row.text == "Base" && row.tone == Tone::Heading)
+            .expect("the focused pane's heading is missing");
+        assert_eq!(
+            drawn[heading + 1].text, "Not present on this side",
+            "the focused ancestor pane drew something other than its own sentence"
+        );
+        assert_ne!(
+            drawn[heading + 1].text.trim(),
+            "",
+            "an empty row claims the ancestor existed and was blank"
+        );
+    }
+
+    #[test]
+    fn all_four_panes_state_themselves_at_once_not_only_the_focused_one() {
+        // The reason this overlay is a summary strip plus one body rather than
+        // a 2x2 grid: whichever pane is being read, every pane's own sentence
+        // stays on screen, so "there is no ancestor" is never something the
+        // user has to go looking for.
+        let pane = inspecting(text_conflict());
+        let drawn = body(&pane);
+        for label in ["Base", "Ours", "Theirs", "Result (read-only)"] {
+            assert!(
+                drawn.contains(label),
+                "pane {label} was not stated at all:\n{drawn}"
+            );
+        }
+        assert!(drawn.contains("Not present on this side"));
+        assert!(drawn.contains("Loading…"), "an unfetched side must say so");
+    }
+
+    #[test]
+    fn an_unreadable_stage_is_a_fault_and_never_reads_as_empty() {
+        let pane = inspecting(unreadable_conflict());
+        let drawn = rows(&pane);
+        let row = drawn
+            .iter()
+            .find(|row| row.text.contains("loose object corrupt"))
+            .unwrap_or_else(|| panic!("the unreadable side did not say why:\n{}", body(&pane)));
+        assert_eq!(
+            row.tone,
+            Tone::Fault,
+            "an unreadable side must read as a fault, not as an ordinary state"
+        );
+    }
+
+    #[test]
+    fn a_missing_worktree_file_reads_as_absent_and_a_failed_read_as_a_fault() {
+        // The result pane's two non-content answers are different facts. In a
+        // delete/modify conflict git legitimately leaves nothing on disk, and
+        // reporting that as a failed read tells the user something broke when
+        // nothing did.
+        let mut absent = inspecting(delete_modify_conflict());
+        absent.receive_result(REPO, PATH, ResultRead::NoFile);
+        absent.apply(Act::FocusPane(View::Result));
+        assert!(
+            body(&absent).contains("Not present on this side"),
+            "a missing worktree file did not read as absent:\n{}",
+            body(&absent)
+        );
+
+        let mut failed = inspecting(delete_modify_conflict());
+        failed.receive_result(REPO, PATH, ResultRead::Failed("permission denied".into()));
+        failed.apply(Act::FocusPane(View::Result));
+        let drawn = rows(&failed);
+        let row = drawn
+            .iter()
+            .find(|row| row.text.contains("permission denied"))
+            .expect("a failed read did not say why");
+        assert_eq!(row.tone, Tone::Fault);
+    }
+
+    #[test]
+    fn an_empty_version_says_it_is_empty_rather_than_drawing_nothing() {
+        // `Text { content: "" }` is the ONE state entitled to claim this
+        // version was blank (ADR 0063). A claim nobody can see is not made, so
+        // it is said in words.
+        let mut pane = inspecting(text_conflict());
+        pane.receive_stage(
+            REPO,
+            PATH,
+            View::Ours,
+            Ok(BlobContent {
+                oid: oid('a').as_str().to_string(),
+                content: String::new(),
+                truncated: false,
+                binary: false,
+            }),
+        );
+        pane.apply(Act::FocusPane(View::Ours));
+        assert!(
+            body(&pane).contains("(this version is empty)"),
+            "an empty side drew a blank row:\n{}",
+            body(&pane)
+        );
+    }
+
+    // ---- criterion 3: the refusal is rendered, the action is not offered -
+
+    #[test]
+    fn a_withheld_control_is_drawn_with_no_key_and_refuses_when_pressed() {
+        // Both halves of "not offered": the row carries no key to press, and
+        // pressing it anyway is refused in the model's own words rather than
+        // walking the user into a 409. They agree because both read the same
+        // `Result` on the surface.
+        let mut pane = inspecting(delete_modify_conflict());
+        let drawn = body(&pane);
+
+        assert!(
+            drawn.contains("  o   Take ours"),
+            "the offered control lost its key:\n{drawn}"
+        );
+        assert!(
+            !drawn.contains("  t   Take theirs"),
+            "a control for an absent side was offered a key:\n{drawn}"
+        );
+        assert!(
+            drawn.contains(&Withheld::SideAbsent.describe()),
+            "the withheld control did not say why:\n{drawn}"
+        );
+
+        let requests = pane.apply(Act::Take(Resolution::TakeTheirs));
+        assert!(
+            requests.is_empty(),
+            "pressing a withheld control still asked the server to do it"
+        );
+        assert_eq!(
+            pane.message().map(|(text, _)| text.to_string()),
+            Some(Withheld::SideAbsent.describe()),
+            "the refusal did not reach the user"
+        );
+
+        // The control that IS offered still works, or this test would pass on
+        // a pane that refuses everything.
+        let requests = pane.apply(Act::Take(Resolution::TakeOurs));
+        assert_eq!(
+            requests,
+            vec![Request::ResolveWholeFile {
+                path: PATH.to_string(),
+                resolution: Resolution::TakeOurs
+            }]
+        );
+    }
+
+    #[test]
+    fn nothing_is_offered_at_all_while_a_side_could_not_be_read() {
+        // `all_sides_readable` outranks everything, deletion included: the
+        // decision to delete is still made against a file the user cannot
+        // fully inspect.
+        let mut pane = inspecting(unreadable_conflict());
+        let drawn = body(&pane);
+        assert!(!drawn.contains("  o   Take ours"), "{drawn}");
+        assert!(!drawn.contains("  t   Take theirs"), "{drawn}");
+        assert!(!drawn.contains("  d   Delete the file"), "{drawn}");
+        for resolution in [
+            Resolution::TakeOurs,
+            Resolution::TakeTheirs,
+            Resolution::TakeDeletion,
+        ] {
+            assert!(
+                pane.apply(Act::Take(resolution)).is_empty(),
+                "{resolution:?} was sent for a file with an unreadable side"
+            );
+        }
+    }
+
+    #[test]
+    fn the_line_editor_opens_only_on_the_flag_the_server_computed() {
+        // Criterion 3's other half. `text_resolution_allowed` traces to
+        // `ConflictedFile::text_resolvable` — the identical question the
+        // server asks before executing a content resolution. Recomputed here,
+        // the two could disagree and the editor would open on a file the
+        // executor refuses.
+        //
+        // MUTATION: replace the flag with `file.not_text_resolvable.is_none()`
+        // — a plausible-looking local re-derivation that drops the per-side
+        // `is_text()` clause. It agrees on the fixtures below EXCEPT the
+        // binary one, which is why that case is here.
+        let mut binary = inspecting(binary_conflict());
+        assert!(
+            binary.apply(Act::OpenEditor).is_empty(),
+            "the line editor was offered for a binary conflict"
+        );
+        assert!(
+            body(&binary).contains("not available for this file"),
+            "the binary conflict did not say the editor is unavailable:\n{}",
+            body(&binary)
+        );
+        assert!(
+            binary
+                .message()
+                .is_some_and(|(text, error)| error && text.contains("binary")),
+            "pressing `e` on a binary conflict said nothing useful: {:?}",
+            binary.message()
+        );
+
+        let mut text = inspecting(text_conflict());
+        assert_eq!(
+            text.apply(Act::OpenEditor),
+            vec![Request::Source {
+                path: PATH.to_string()
+            }],
+            "the editor refused an ordinary text conflict"
+        );
+    }
+
+    #[test]
+    fn a_conflicts_shape_is_named_in_the_list_and_on_the_pane() {
+        // The note is the model's sentence, and #430's second criterion is
+        // that a delete/modify conflict names which side did what. Asserted as
+        // the literal words rather than by calling `note_for` again.
+        let pane = listing(vec![delete_modify_conflict()]);
+        assert!(
+            body(&pane).contains("They deleted this file; our side still has it"),
+            "the list did not name the conflict's shape:\n{}",
+            body(&pane)
+        );
+        let ordinary = listing(vec![text_conflict()]);
+        assert_eq!(
+            texts(&ordinary)[1],
+            PATH,
+            "an ordinary text conflict was given a note it does not need"
+        );
+    }
+
+    // ---- criterion 4: a hand-edit is never silently discarded ------------
+
+    #[test]
+    fn a_hand_edit_makes_block_choices_inert_and_keeps_every_typed_character() {
+        // THE test of this module. Criterion 4, and the worst failure
+        // available in an editor: re-composing from the buttons after somebody
+        // has typed throws their work away without a word.
+        //
+        // MUTATION A: delete the `if editor.hand_edited { return }` guard in
+        // `choose`. MUTATION B: make `apply_content` prefer the composition
+        // over the buffer. Each one silently discards the typing, and each
+        // fails a different assertion below.
+        let mut pane = editing(MARKER);
+        pane.apply(Act::Choose(Choice::Ours));
+        pane.apply(Act::BeginEdit);
+        for ch in "ZZZ".chars() {
+            pane.apply(Act::Type(ch));
+        }
+        pane.apply(Act::EndEdit);
+        let typed = pane.editor.as_ref().unwrap().buffer.as_ref().unwrap().text().to_string();
+        assert!(typed.contains("ZZZ"), "the typing never landed: {typed:?}");
+
+        // Now press the block buttons. Nothing about the text may move.
+        pane.apply(Act::Choose(Choice::Theirs));
+        pane.apply(Act::Choose(Choice::Both));
+        assert_eq!(
+            pane.editor.as_ref().unwrap().buffer.as_ref().unwrap().text(),
+            typed,
+            "a block choice rewrote text the user had typed"
+        );
+        assert_eq!(
+            pane.editor.as_ref().unwrap().choices[0],
+            Choice::Ours,
+            "a block choice was recorded while the text was hand-edited"
+        );
+        assert!(
+            pane.message()
+                .is_some_and(|(text, _)| text.contains("edited by hand")),
+            "the user was not told why the buttons stopped working"
+        );
+
+        // …and the submission carries the typed text, not the composition.
+        let requests = pane.apply(Act::Apply);
+        match requests.as_slice() {
+            [Request::ResolveContent { content, .. }] => {
+                assert_eq!(content, &typed, "the submission discarded the hand-edit");
+            }
+            other => panic!("expected one content resolution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reopening_the_buffer_before_any_edit_reseeds_from_the_current_choices() {
+        // Until a real edit exists the buffer is only a view of the
+        // composition, so opening it again after changing a block must show
+        // that change. After one, it is the user's text and must not be
+        // reseeded — which is the previous test.
+        let mut pane = editing(MARKER);
+        pane.apply(Act::Choose(Choice::Ours));
+        pane.apply(Act::BeginEdit);
+        assert_eq!(
+            pane.editor.as_ref().unwrap().buffer.as_ref().unwrap().text(),
+            "before\nours line\nafter\n"
+        );
+        pane.apply(Act::EndEdit);
+        pane.apply(Act::Choose(Choice::Theirs));
+        pane.apply(Act::BeginEdit);
+        assert_eq!(
+            pane.editor.as_ref().unwrap().buffer.as_ref().unwrap().text(),
+            "before\ntheirs line\nafter\n",
+            "the buffer kept a stale composition after the choice changed"
+        );
+    }
+
+    #[test]
+    fn entering_and_leaving_the_buffer_without_typing_does_not_freeze_the_buttons() {
+        // The flag is "a keystroke changed it", not "the buffer exists".
+        // Merely looking at the composed text must not make the block choices
+        // inert — that would be criterion 4 firing on someone who did nothing.
+        let mut pane = editing(MARKER);
+        pane.apply(Act::BeginEdit);
+        pane.apply(Act::EndEdit);
+        pane.apply(Act::Choose(Choice::Theirs));
+        assert_eq!(pane.editor.as_ref().unwrap().choices[0], Choice::Theirs);
+        assert!(!pane.editor.as_ref().unwrap().hand_edited);
+    }
+
+    #[test]
+    fn an_unchosen_block_asks_for_nothing_and_says_how_many_are_open() {
+        // `compose` returns None while any block is unchosen, and this refuses
+        // rather than submitting a guess. A resolution invented on the user's
+        // behalf is the failure `markers::compose`'s own return type exists to
+        // prevent, and it must not be reintroduced one layer out.
+        let mut pane = editing(MARKER);
+        let requests = pane.apply(Act::Apply);
+        assert!(
+            requests.is_empty(),
+            "an unresolved conflict was submitted anyway"
+        );
+        assert!(
+            pane.message()
+                .is_some_and(|(text, error)| error && text.contains("1 conflict(s) still need")),
+            "the refusal did not say what is missing: {:?}",
+            pane.message()
+        );
+    }
+
+    #[test]
+    fn a_content_resolution_echoes_the_served_stages_and_token_unchanged() {
+        // ADR 0069 gates 3 and 4 compare these against a fresh scan and a
+        // re-minted token inside the executor's lock. A client that computed
+        // its own could only ever agree with itself — the gates would pass by
+        // construction and prove nothing.
+        //
+        // MUTATION: rebuild `expected_stages` from anything local. The gate
+        // still passes server-side on an unchanged repository, so only an
+        // assertion on identity catches it.
+        let served = source(MARKER);
+        let mut pane = editing(MARKER);
+        pane.apply(Act::Choose(Choice::Both));
+        match pane.apply(Act::Apply).as_slice() {
+            [Request::ResolveContent {
+                path,
+                expected_stages,
+                expected_source,
+                content,
+            }] => {
+                assert_eq!(path, PATH);
+                assert_eq!(expected_stages, &served.stages);
+                assert_eq!(expected_source, &served.source);
+                assert_eq!(
+                    content, "before\nours line\ntheirs line\nafter\n",
+                    "the composed content is not what the shared composer produces"
+                );
+            }
+            other => panic!("expected one content resolution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_marker_file_with_no_recorded_ancestor_says_so_inside_the_editor_too() {
+        // ADR 0063's distinction, one layer in: git omits the ancestor under
+        // the default merge style, and an empty ancestor section would claim a
+        // common ancestor existed and was blank.
+        let plain = editing(MARKER);
+        assert!(
+            body(&plain).contains("no recorded ancestor in this marker file"),
+            "a merge-style block drew a blank ancestor:\n{}",
+            body(&plain)
+        );
+
+        let diff3 = editing(
+            "<<<<<<< HEAD\nours\n||||||| base\nancestor text\n=======\ntheirs\n>>>>>>> t\n",
+        );
+        let drawn = body(&diff3);
+        assert!(
+            drawn.contains("| ancestor text"),
+            "a diff3 block lost its ancestor:\n{drawn}"
+        );
+        assert!(
+            !drawn.contains("no recorded ancestor"),
+            "a diff3 block claimed it had no ancestor:\n{drawn}"
+        );
+    }
+
+    // ---- reads, request keys, and answers for the wrong thing ------------
+
+    #[test]
+    fn opening_a_conflict_asks_only_for_the_panes_that_await_content() {
+        // The model resolves an absent or binary side from metadata alone, so
+        // a conflict with a 200 MB binary side costs one listing, not a
+        // download. The same rule the browser client's assembler follows.
+        let mut pane = listing(vec![binary_conflict()]);
+        let requests = pane.apply(Act::Open);
+        assert!(requests.contains(&Request::Result {
+            path: PATH.to_string()
+        }));
+        let stages: Vec<View> = requests
+            .iter()
+            .filter_map(|request| match request {
+                Request::Stage { pane, .. } => Some(*pane),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            stages,
+            vec![View::Base, View::Theirs],
+            "the binary side was fetched, or a readable one was skipped"
+        );
+
+        // An absent side is not fetched either.
+        let mut absent = listing(vec![text_conflict()]);
+        let stages: Vec<View> = absent
+            .apply(Act::Open)
+            .iter()
+            .filter_map(|request| match request {
+                Request::Stage { pane, .. } => Some(*pane),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stages, vec![View::Ours, View::Theirs]);
+    }
+
+    #[test]
+    fn an_answer_for_another_repository_or_another_path_is_dropped() {
+        // The same request-key discipline `DetailPane` uses. A late answer
+        // must not repaint a view the user has already left.
+        let mut pane = inspecting(text_conflict());
+        pane.receive_stage(
+            "another-repo",
+            PATH,
+            View::Ours,
+            Ok(BlobContent {
+                oid: oid('a').as_str().to_string(),
+                content: "wrong repository".to_string(),
+                truncated: false,
+                binary: false,
+            }),
+        );
+        pane.receive_result(
+            REPO,
+            "some/other/path",
+            ResultRead::Wrote(WorktreeFileContent {
+                path: "some/other/path".to_string(),
+                content: "wrong path".to_string(),
+                truncated: false,
+                binary: false,
+            }),
+        );
+        let drawn = body(&pane);
+        assert!(!drawn.contains("wrong repository"), "{drawn}");
+        assert!(!drawn.contains("wrong path"), "{drawn}");
+    }
+
+    #[test]
+    fn a_stale_blob_answer_cannot_turn_an_absent_pane_into_empty_text() {
+        // Delegated to `PaneState::with_content`, which returns any pane that
+        // is not `AwaitingContent` unchanged. Pinned here because this overlay
+        // is the thing that would otherwise let it through the back door.
+        let mut pane = inspecting(text_conflict());
+        pane.receive_stage(
+            REPO,
+            PATH,
+            View::Base,
+            Ok(BlobContent {
+                oid: oid('a').as_str().to_string(),
+                content: String::new(),
+                truncated: false,
+                binary: false,
+            }),
+        );
+        pane.apply(Act::FocusPane(View::Base));
+        assert!(
+            body(&pane).contains("Not present on this side"),
+            "a late blob answer overwrote an absent ancestor:\n{}",
+            body(&pane)
+        );
+    }
+
+    #[test]
+    fn a_successful_resolution_drops_the_list_rather_than_editing_it() {
+        // `conflicts::scan` is stateless and re-reads git on every call (ADR
+        // 0063). A client that removed the row itself would be asserting an
+        // outcome it never observed — resolving one path can change others.
+        let mut pane = inspecting(text_conflict());
+        let refetch = pane.receive_resolved(REPO, PATH, Ok(()));
+        assert!(refetch, "a successful resolution did not ask for a refetch");
+        assert_eq!(pane.screen(), Screen::List);
+        assert!(
+            pane.files.is_none(),
+            "the stale list survived a resolution"
+        );
+        assert!(body(&pane).contains("loading"), "{}", body(&pane));
+    }
+
+    #[test]
+    fn a_refused_resolution_keeps_the_view_and_the_servers_own_sentence() {
+        // The four content refusals name four different things that moved, and
+        // collapsing them into "it failed" throws away the only part that says
+        // what to do next.
+        let mut pane = editing(MARKER);
+        pane.apply(Act::Choose(Choice::Ours));
+        pane.apply(Act::Apply);
+        let refetch = pane.receive_resolved(
+            REPO,
+            PATH,
+            Err("a.txt changed since you opened it — the version you resolved \
+                 against is no longer current. Reopen it and try again."
+                .to_string()),
+        );
+        assert!(!refetch, "a refusal asked for a refetch");
+        assert_eq!(pane.screen(), Screen::Editor, "a refusal closed the editor");
+        assert!(pane
+            .message()
+            .is_some_and(|(text, error)| error && text.contains("no longer current")));
+        // …and the controls are live again, so a refusal is recoverable.
+        assert!(!pane.apply(Act::Apply).is_empty(), "the pane stayed busy after a refusal");
+    }
+
+    #[test]
+    fn a_second_press_while_a_write_is_out_asks_for_nothing() {
+        let mut pane = inspecting(text_conflict());
+        assert_eq!(pane.apply(Act::Take(Resolution::TakeOurs)).len(), 1);
+        assert!(
+            pane.apply(Act::Take(Resolution::TakeOurs)).is_empty(),
+            "a held key sent the same resolution twice"
+        );
+    }
+
+    // ---- the keymap's modes ---------------------------------------------
+
+    #[test]
+    fn the_key_mode_follows_the_screen_and_insert_is_its_own() {
+        let mut pane = ConflictsPane::default();
+        assert_eq!(pane.key_mode(), KeyMode::List);
+        pane.open(REPO.to_string());
+        pane.receive_conflicts(REPO, Ok(vec![text_conflict()]));
+        pane.apply(Act::Open);
+        assert_eq!(pane.key_mode(), KeyMode::Inspect);
+        pane.apply(Act::OpenEditor);
+        pane.receive_source(REPO, PATH, Ok(source(MARKER)));
+        assert_eq!(pane.key_mode(), KeyMode::Editor);
+        pane.apply(Act::BeginEdit);
+        assert_eq!(pane.key_mode(), KeyMode::Insert);
+        pane.apply(Act::EndEdit);
+        assert_eq!(pane.key_mode(), KeyMode::Editor);
+    }
+
+    #[test]
+    fn back_walks_out_one_screen_at_a_time_and_then_closes() {
+        let mut pane = editing(MARKER);
+        pane.apply(Act::Back);
+        assert_eq!(pane.screen(), Screen::Inspect);
+        pane.apply(Act::Back);
+        assert_eq!(pane.screen(), Screen::List);
+        assert!(pane.is_open());
+        pane.apply(Act::Back);
+        assert!(!pane.is_open());
+    }
+
+    // ---- the text buffer -------------------------------------------------
+
+    #[test]
+    fn the_buffer_inserts_deletes_and_moves_across_multibyte_characters() {
+        // The caret is a byte offset, so every one of these is a chance to
+        // land inside a character and panic on the next slice.
+        let mut buffer = TextEdit::new("héllo".to_string());
+        assert_eq!(buffer.position(), (0, 5));
+        buffer.left();
+        buffer.left();
+        buffer.left();
+        buffer.left();
+        assert_eq!(buffer.position(), (0, 1));
+        buffer.insert('ü');
+        assert_eq!(buffer.text(), "hüéllo");
+        buffer.backspace();
+        assert_eq!(buffer.text(), "héllo");
+        buffer.right();
+        buffer.insert('\n');
+        assert_eq!(buffer.text(), "hé\nllo");
+        assert_eq!(buffer.position(), (1, 0));
+    }
+
+    #[test]
+    fn the_buffer_moves_between_lines_and_stops_at_both_ends() {
+        let mut buffer = TextEdit::new("one\ntwo\nthree".to_string());
+        assert_eq!(buffer.position(), (2, 5));
+        buffer.vertical(-1);
+        assert_eq!(buffer.position(), (1, 3), "column clamps to a shorter line");
+        buffer.vertical(-1);
+        assert_eq!(buffer.position(), (0, 3));
+        buffer.vertical(-1);
+        assert_eq!(buffer.position(), (0, 3), "moved above the first line");
+        buffer.vertical(1);
+        buffer.vertical(1);
+        buffer.vertical(1);
+        assert_eq!(buffer.position(), (2, 3), "moved below the last line");
+    }
+
+    #[test]
+    fn backspace_at_the_very_start_does_nothing_rather_than_wrapping() {
+        let mut buffer = TextEdit::new(String::new());
+        buffer.backspace();
+        assert_eq!(buffer.text(), "");
+        buffer.right();
+        assert_eq!(buffer.position(), (0, 0));
+    }
+
+    #[test]
+    fn the_viewport_follows_the_caret_out_of_the_visible_window() {
+        // An invisible caret in a buffer that accepts every keystroke is a way
+        // to type into a line you are not looking at.
+        let mut pane = editing(MARKER);
+        pane.apply(Act::Choose(Choice::Both));
+        pane.apply(Act::BeginEdit);
+        let caret = pane.caret_row().expect("insert mode has a caret row");
+        assert!(
+            pane.view_offset(3) <= caret && caret < pane.view_offset(3) + 3,
+            "the caret at row {caret} fell outside the window at offset {}",
+            pane.view_offset(3)
+        );
+        // With no insert mode there is no caret to follow, and the scroll is
+        // the user's own, clamped.
+        pane.apply(Act::EndEdit);
+        assert!(pane.caret_row().is_none());
+        assert_eq!(pane.view_offset(usize::MAX), 0);
+    }
+}

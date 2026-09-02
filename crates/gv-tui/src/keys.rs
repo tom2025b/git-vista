@@ -269,14 +269,120 @@ mod tests {
 
     #[test]
     fn an_unbound_key_is_none() {
+        // `x` used to be in this list and is now the conflict overlay
+        // (M10.07, #462) — this test is what noticed, which is the whole point
+        // of keeping an explicit unbound set rather than trusting the match's
+        // fall-through.
         for key in [
-            press(KeyCode::Char('x')),
+            press(KeyCode::Char('z')),
             press(KeyCode::Esc),
             press(KeyCode::Char(' ')),
             press(KeyCode::F(1)),
         ] {
             assert_eq!(global(key), None, "{key:?}");
         }
+    }
+
+    #[test]
+    fn x_opens_the_conflict_overlay_from_every_pane() {
+        for pane in Pane::ALL {
+            assert_eq!(
+                dispatch(press(KeyCode::Char('x')), pane),
+                Some(Action::OpenConflicts),
+                "{pane:?}"
+            );
+        }
+    }
+
+    // ---- the overlay's own keymap (M10.07, #462) ------------------------
+
+    #[test]
+    fn insert_mode_types_the_letters_that_are_commands_everywhere_else() {
+        // The reason `dispatch_conflict` is a second table at all. Under one
+        // shared keymap, typing `q` into a file you were resolving would quit
+        // the program and lose the edit.
+        //
+        // MUTATION: move the insert-mode block below the shared `q`/`j`/`k`
+        // arms. Every other key test still passes and this one fails.
+        for (ch, _) in [('q', ()), ('j', ()), ('k', ()), ('o', ()), ('e', ()), ('i', ())] {
+            assert_eq!(
+                dispatch_conflict(press(KeyCode::Char(ch)), KeyMode::Insert),
+                Some(Action::Conflict(Act::Type(ch))),
+                "{ch} was claimed as a command inside the text buffer"
+            );
+        }
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Enter), KeyMode::Insert),
+            Some(Action::Conflict(Act::Newline))
+        );
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Esc), KeyMode::Insert),
+            Some(Action::Conflict(Act::EndEdit))
+        );
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_from_inside_the_text_buffer() {
+        // A terminal program you cannot interrupt is one somebody has to kill
+        // from another window.
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        for mode in [
+            KeyMode::List,
+            KeyMode::Inspect,
+            KeyMode::Editor,
+            KeyMode::Insert,
+        ] {
+            assert_eq!(
+                dispatch_conflict(ctrl_c, mode),
+                Some(Action::Quit),
+                "{mode:?}"
+            );
+        }
+        // …and `c` on its own is a character there, not a quit.
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Char('c')), KeyMode::Insert),
+            Some(Action::Conflict(Act::Type('c')))
+        );
+    }
+
+    #[test]
+    fn the_resolution_keys_are_live_only_on_the_screen_that_offers_them() {
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Char('o')), KeyMode::Inspect),
+            Some(Action::Conflict(Act::Take(Resolution::TakeOurs)))
+        );
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Char('d')), KeyMode::Inspect),
+            Some(Action::Conflict(Act::Take(Resolution::TakeDeletion)))
+        );
+        // The same letter is a BLOCK choice one screen further in, and must
+        // never reach `Take` there — that would resolve a whole file while the
+        // user was picking one hunk of it.
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Char('o')), KeyMode::Editor),
+            Some(Action::Conflict(Act::Choose(Choice::Ours)))
+        );
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Char('d')), KeyMode::Editor),
+            None
+        );
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Char('o')), KeyMode::List),
+            None
+        );
+    }
+
+    #[test]
+    fn a_key_release_is_ignored_in_the_overlay_too() {
+        // Terminals with the kitty protocol on deliver two events per
+        // keystroke; in the text buffer that would double every character.
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            crossterm::event::KeyEventKind::Release,
+        );
+        assert_eq!(dispatch_conflict(release, KeyMode::Insert), None);
+        assert_eq!(dispatch_conflict(release, KeyMode::List), None);
     }
 
     #[test]
