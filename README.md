@@ -106,7 +106,7 @@ the repository's public-facing docs.
 
 ## Workspace layout
 
-The workspace has six crates:
+The workspace is split into focused crates:
 
 ```
 git-vista/
@@ -123,6 +123,7 @@ git-vista/
     │                             #   middleware, sandboxed Git execution, state
     ├── git-vista-mcp/            # MCP stdio bridge: agents drive git-vista
     │                             #   through the same HTTP API the browser uses
+    ├── git-vista-plan-runner/    # exact-argv YAML manifests + resumable gv-run
     └── git-vista/                # the Leptos wasm UI (bin: git-vista-ui)
         ├── index.html            # Trunk entry point
         ├── styles.css
@@ -144,8 +145,10 @@ through JSON into the UI with no duplication.
 links `git-vista-protocol` and `git-vista-core` for the shared wire types but
 never the server crate, so an agent talking MCP reaches the repository only
 through the same loopback HTTP API and the same reviewable planner the browser
-uses — never a shell, never raw argv. A dependency-graph test proves the write
-path is structurally unreachable from this crate, not merely unrouted. See
+uses. Its local export tools can render a returned plan as a checklist, an
+explicit fish script, or exact-argv YAML, but execute none of them. A
+dependency-graph test proves the server write path is structurally unreachable
+from this crate, not merely unrouted. See
 [ADR 0046](docs/adr/0046-mcp-plan-tool-surface.md).
 
 V2 will split pure domain, versioned protocol, graph, repository application,
@@ -219,6 +222,11 @@ The server serves both the WASM bundle and same-origin API on `:8080`.
   touching the repository. Submitting an approved plan for execution is a
   separate, later stage. See
   [ADR 0046](docs/adr/0046-mcp-plan-tool-surface.md).
+- **Operator-controlled plan export**: local MCP tools turn reviewed `plan_*`
+  results into a printable numbered checklist, an explicitly fish-targeted
+  fail-fast script, or an ordered exact-argv YAML manifest. `gv-run` executes
+  that manifest without a shell, stops at the first non-zero status, and
+  checkpoints each successful step for resume.
 
 See the [feature matrix](docs/FEATURE_MATRIX.md) for the target/current split
 (the matrix predates the M2 work above and is due a refresh; the ADR index is
@@ -276,6 +284,38 @@ work: on the iPad, `127.0.0.1` means the iPad itself.
 Direct LAN access is deliberately disabled. `./gv --lan` is rejected, and the
 server also refuses a non-loopback `GIT_VISTA_BIND_ADDR` override. This keeps the
 plain-HTTP Git control surface off Wi-Fi, VPN, container, and public interfaces.
+
+### Printable plans and `gv-run`
+
+After an MCP `plan_*` tool returns a reviewed `plan`, the local
+`export_plan_checklist` and `export_plan_fish_script` tools produce the human
+and script forms without contacting the server or executing anything. The
+script header says it targets fish, and every command exits on failure.
+
+For a batch, pass the ordered plan objects to `export_plans_yaml_manifest` and
+save its returned string as `operations.yaml`. Build and run the small native
+runner with:
+
+```sh
+cargo build --release -p git-vista-plan-runner
+target/release/gv-run operations.yaml
+```
+
+Run it from the worktree those plans target; the manifest deliberately keeps
+repository paths out of the transport contract.
+
+The manifest stores `program: git` and an argv array for every step; `gv-run`
+passes those arguments directly to the process API rather than parsing a shell
+command. It stops at the first non-zero exit. Its default checkpoint is
+`operations.yaml.gv-state.yaml`, written after every successful step, so the
+same command resumes after the last durable success. Use
+`--state another-state.yaml` to choose a different checkpoint path.
+
+A command interrupted while it is still running is deliberately not marked
+complete and can run again on resume. Check the repository before resuming if
+the machine or runner was killed mid-command. Changing even one manifest byte
+invalidates the old checkpoint rather than applying its progress to a different
+operation list.
 
 ### SSH tunnel workflow and diagnostics
 

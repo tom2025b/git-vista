@@ -258,6 +258,33 @@ pub struct BranchRequest {
     pub branch: String,
 }
 
+/// Body of a `POST /api/cherry-pick` request (M10.09, #596): apply the changes
+/// of `commit` on top of the checked-out branch as a new commit.
+///
+/// # Why a full hex id and nothing else
+///
+/// `commit` is the id the user reviewed in the confirm dialog, taken from the
+/// graph row they tapped. The handler parses it with [`CommitOid::new`] and
+/// never runs it through `rev-parse`, so a symbolic name is a 400 rather than
+/// a silent re-resolution against whatever the ref points at *now* — the same
+/// reviewed-value-or-refuse posture [`AmendCommitRequest`]'s `expected_tip`
+/// takes, and for the same reason: the commit that gets picked must be the
+/// commit that was on screen.
+///
+/// Ordinary commits only, mirroring [`GitOperation::CherryPick`]. A merge has
+/// two parents, so "apply this merge's changes" is ambiguous until a mainline
+/// is named; that is [`GitOperation::CherryPickMerge`], a separate operation
+/// with no route of its own yet.
+///
+/// [`CommitOid::new`]: crate::CommitOid::new
+/// [`GitOperation::CherryPick`]: crate::plan::GitOperation::CherryPick
+/// [`GitOperation::CherryPickMerge`]: crate::plan::GitOperation::CherryPickMerge
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CherryPickRequest {
+    pub commit: String,
+}
+
 /// Body of a `POST /api/tag` request (M2.21d, #238): create the tag `name` at
 /// the commit `commit` (full hex id, or a symbolic start point the server
 /// resolves — same posture as [`CreateBranchRequest`]).
