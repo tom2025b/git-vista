@@ -5,5 +5,6 @@
 //! seams. Keeping the detail logic here prevents #458's diff vocabulary and
 //! windowing rules from turning `app.rs` or `ui.rs` into a second monolith.
 
+pub mod conflicts;
 pub mod detail;
 pub mod graph;

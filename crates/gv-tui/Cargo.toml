@@ -19,6 +19,11 @@ repository.workspace = true
 
 [dependencies]
 git-vista-core = { workspace = true }
+# M10.07 (#462), ADR 0104: the conflict view model M4.31 shipped — four-pane
+# inspection, the resolution surface, and the marker-file block composer. The
+# terminal draws what these decide; it re-decides none of it. Depending on the
+# crate rather than copying it is the whole point of the issue.
+git-vista-conflicts = { workspace = true }
 git-vista-protocol = { workspace = true }
 git-vista-session = { workspace = true }
 serde = { workspace = true }

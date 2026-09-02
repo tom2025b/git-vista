@@ -1043,12 +1043,12 @@ fn conflict_editor(
                                                 on:click=pick(Choice::Both)
                                             >"Both"</button>
                                             <span class="conflict-blk-state">
-                                                {move || match chosen() {
-                                                    Choice::Unchosen => "not chosen yet",
-                                                    Choice::Ours => "keeping ours",
-                                                    Choice::Theirs => "keeping theirs",
-                                                    Choice::Both => "keeping both",
-                                                }}
+                                                // The words come from the
+                                                // shared vocabulary, not from
+                                                // here: the terminal shows the
+                                                // same four, and two copies of
+                                                // the wording drift.
+                                                {move || chosen().describe()}
                                             </span>
                                         </div>
                                     </div>
