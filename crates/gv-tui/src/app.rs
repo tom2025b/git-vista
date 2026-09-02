@@ -31,10 +31,15 @@
 //! - Refresh coalesces: while a catalog fetch is in flight, another `r` asks
 //!   nothing. A held-down key must not queue fifty reads behind a slow server.
 
-use git_vista_core::diff::CommitDiff;
+use git_vista_conflicts::core::{Pane as ConflictView, ResultRead};
+use git_vista_core::diff::{BlobContent, CommitDiff};
 use git_vista_core::model::{CommitDetail, Edge, FrameStub, GraphRow};
-use git_vista_protocol::{HistoryPage, RepositoryDescriptor, RepositoryKind};
+use git_vista_protocol::conflict::{ConflictedFile, Resolution};
+use git_vista_protocol::{
+    CommitOid, ConflictSource, GenerationToken, HistoryPage, RepositoryDescriptor, RepositoryKind,
+};
 
+use crate::panes::conflicts::{self, ConflictsPane};
 use crate::panes::detail::DetailPane;
 
 /// The existing paged-history wire shape, instantiated with the lane core's
@@ -111,15 +116,66 @@ pub enum Action {
     ParentNext,
     HorizontalLeft,
     HorizontalRight,
+    /// Open the conflict overlay (M10.07, #462).
+    OpenConflicts,
+    /// One key press inside the conflict overlay. The overlay owns its own
+    /// keymap: while its text buffer has focus, `q` is a letter somebody
+    /// typed, not a request to quit the program.
+    Conflict(conflicts::Act),
 }
 
 /// A read the loop must hand to the data layer. Phase 2a has one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Fetch {
     Catalog,
-    History { repo: String },
-    Commit { repo: String, id: String },
-    Diff { repo: String, id: String },
+    History {
+        repo: String,
+    },
+    Commit {
+        repo: String,
+        id: String,
+    },
+    Diff {
+        repo: String,
+        id: String,
+    },
+    /// `GET /api/conflicts` (M10.07, #462).
+    Conflicts {
+        repo: String,
+    },
+    /// `GET /api/blob/{oid}` — one stage of one conflicted path.
+    ConflictStage {
+        repo: String,
+        path: String,
+        pane: ConflictView,
+        oid: String,
+    },
+    /// `GET /api/worktree-file/{*path}` — the result pane.
+    ConflictResult {
+        repo: String,
+        path: String,
+    },
+    /// `GET /api/conflict-source/{*path}` — the marker file and its
+    /// `conflict-v1:` token (ADR 0069).
+    ConflictSource {
+        repo: String,
+        path: String,
+    },
+    /// `POST /api/resolve-conflict` — take a whole side, or the deletion.
+    ResolveWholeFile {
+        repo: String,
+        path: String,
+        resolution: Resolution,
+    },
+    /// `POST /api/resolve-conflict-content` — a block/line/hand-edited
+    /// resolution (ADR 0069).
+    ResolveContent {
+        repo: String,
+        path: String,
+        expected_stages: [Option<CommitOid>; 3],
+        expected_source: GenerationToken,
+        content: String,
+    },
 }
 
 /// A read's answer, back from the data layer.
@@ -139,6 +195,34 @@ pub enum Data {
         repo: String,
         id: String,
         result: Result<CommitDiff, String>,
+    },
+    Conflicts {
+        repo: String,
+        result: Result<Vec<ConflictedFile>, String>,
+    },
+    ConflictStage {
+        repo: String,
+        path: String,
+        pane: ConflictView,
+        result: Result<BlobContent, String>,
+    },
+    /// The result pane's read. A [`ResultRead`] rather than a `Result`
+    /// because "there is no file at this path" is one of its three answers
+    /// and is information, not a failure.
+    ConflictResult {
+        repo: String,
+        path: String,
+        read: ResultRead,
+    },
+    ConflictSource {
+        repo: String,
+        path: String,
+        result: Result<ConflictSource, String>,
+    },
+    Resolved {
+        repo: String,
+        path: String,
+        result: Result<(), String>,
     },
 }
 
@@ -170,6 +254,9 @@ pub struct App {
     pub stubs: Vec<FrameStub>,
     pub lane_count: usize,
     pub detail: DetailPane,
+    /// The conflict overlay (M10.07, #462). It takes the whole frame when
+    /// open, so it is not a fifth member of the focus ring.
+    pub conflicts: ConflictsPane,
     cursors: [usize; 4],
     pub status: Status,
     /// Catalog reads dispatched and not yet answered.
@@ -195,6 +282,7 @@ impl App {
             stubs: Vec::new(),
             lane_count: 0,
             detail: DetailPane::default(),
+            conflicts: ConflictsPane::default(),
             cursors: [0; 4],
             status: Status {
                 text: String::from("connecting to git-vista-server…"),
@@ -272,11 +360,32 @@ impl App {
                 }
                 Vec::new()
             }
+            Action::OpenConflicts => self.open_conflicts(),
+            Action::Conflict(act) => {
+                let requests = self.conflicts.apply(act);
+                self.status = Status {
+                    text: self.conflicts_status_text(),
+                    tone: Tone::Info,
+                };
+                self.dispatch_conflict(requests)
+            }
         }
     }
 
-    /// Fold one answer in.
-    pub fn receive(&mut self, data: Data) {
+    /// Fold one answer in, and hand back any read the answer itself asks
+    /// for.
+    ///
+    /// Symmetric with [`App::apply`] rather than silent, because one answer
+    /// does need a follow-up read: a resolution that succeeded makes the
+    /// conflict list it was showing stale, and the honest way to find out what
+    /// is conflicted now is to ask git again.
+    pub fn receive(&mut self, data: Data) -> Vec<Fetch> {
+        let mut follow_up = Vec::new();
+        self.receive_into(data, &mut follow_up);
+        follow_up
+    }
+
+    fn receive_into(&mut self, data: Data, follow_up: &mut Vec<Fetch>) {
         match data {
             Data::Catalog(result) => {
                 self.in_flight = self.in_flight.saturating_sub(1);
@@ -359,6 +468,39 @@ impl App {
                     );
                 }
             }
+            Data::Conflicts { repo, result } => {
+                self.conflicts.receive_conflicts(&repo, result);
+                self.refresh_conflicts_status();
+            }
+            Data::ConflictStage {
+                repo,
+                path,
+                pane,
+                result,
+            } => {
+                self.conflicts.receive_stage(&repo, &path, pane, result);
+            }
+            Data::ConflictResult { repo, path, read } => {
+                self.conflicts.receive_result(&repo, &path, read);
+            }
+            Data::ConflictSource { repo, path, result } => {
+                self.conflicts.receive_source(&repo, &path, result);
+                self.refresh_conflicts_status();
+            }
+            Data::Resolved { repo, path, result } => {
+                // A resolution changes the working tree and the index, so the
+                // list this overlay is showing is stale by definition. It is
+                // refetched rather than patched in place: `conflicts::scan` is
+                // stateless and re-reads git on every call (ADR 0063), and a
+                // client that edited its own copy of the list would be
+                // asserting an outcome it never observed.
+                let refetch = self.conflicts.receive_resolved(&repo, &path, result);
+                self.refresh_conflicts_status();
+                if refetch {
+                    let requests = vec![conflicts::Request::Conflicts];
+                    follow_up.extend(self.dispatch_conflict(requests));
+                }
+            }
             Data::Diff { repo, id, result } => {
                 let error = result.as_ref().err().cloned();
                 if self.detail.receive_diff(&repo, &id, result) {
@@ -406,6 +548,96 @@ impl App {
                 };
                 self.open_detail(repo, id)
             }
+        }
+    }
+
+    /// Open the conflict overlay on the active repository.
+    ///
+    /// Refused with a sentence when nothing is selected. The overlay reads and
+    /// writes one repository, and there is no defensible default for which —
+    /// picking one would be resolving conflicts in a repository the user never
+    /// chose.
+    fn open_conflicts(&mut self) -> Vec<Fetch> {
+        let Some(repo) = self.active_repo.clone() else {
+            self.status = Status {
+                text: String::from("select a repository first — Enter on a row in Repositories"),
+                tone: Tone::Error,
+            };
+            return Vec::new();
+        };
+        let requests = self.conflicts.open(repo);
+        let fetches = self.dispatch_conflict(requests);
+        self.refresh_conflicts_status();
+        fetches
+    }
+
+    /// Give the overlay's requests the repository they act on.
+    ///
+    /// The pane names a path; which repository that path is in belongs to the
+    /// shell, and keeping it here means the overlay cannot address one
+    /// repository while the shell believes it is showing another.
+    fn dispatch_conflict(&mut self, requests: Vec<conflicts::Request>) -> Vec<Fetch> {
+        let Some(repo) = self.conflicts.repo().map(str::to_string) else {
+            return Vec::new();
+        };
+        requests
+            .into_iter()
+            .map(|request| match request {
+                conflicts::Request::Conflicts => Fetch::Conflicts { repo: repo.clone() },
+                conflicts::Request::Stage { path, pane, oid } => Fetch::ConflictStage {
+                    repo: repo.clone(),
+                    path,
+                    pane,
+                    oid,
+                },
+                conflicts::Request::Result { path } => Fetch::ConflictResult {
+                    repo: repo.clone(),
+                    path,
+                },
+                conflicts::Request::Source { path } => Fetch::ConflictSource {
+                    repo: repo.clone(),
+                    path,
+                },
+                conflicts::Request::ResolveWholeFile { path, resolution } => {
+                    Fetch::ResolveWholeFile {
+                        repo: repo.clone(),
+                        path,
+                        resolution,
+                    }
+                }
+                conflicts::Request::ResolveContent {
+                    path,
+                    expected_stages,
+                    expected_source,
+                    content,
+                } => Fetch::ResolveContent {
+                    repo: repo.clone(),
+                    path,
+                    expected_stages,
+                    expected_source,
+                    content,
+                },
+            })
+            .collect()
+    }
+
+    fn refresh_conflicts_status(&mut self) {
+        if !self.conflicts.is_open() {
+            return;
+        }
+        let error = self.conflicts.message().is_some_and(|(_, error)| error);
+        self.status = Status {
+            text: self.conflicts_status_text(),
+            tone: if error { Tone::Error } else { Tone::Info },
+        };
+    }
+
+    /// The overlay's status line: whatever it last had to say, then the keys
+    /// that are live on the screen it is showing.
+    fn conflicts_status_text(&self) -> String {
+        match self.conflicts.message() {
+            Some((message, _)) => format!("{message} · {}", self.conflicts.hint()),
+            None => self.conflicts.hint(),
         }
     }
 

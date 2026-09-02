@@ -14,13 +14,23 @@
 //! and quitting the terminal must not wait for it.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use git_vista_conflicts::core::ResultRead;
+use git_vista_core::diff::WorktreeFileContent;
+use git_vista_protocol::conflict::Resolution;
+use git_vista_protocol::{
+    CommitOid, GenerationToken, RepoMode, ResolveConflictContentRequest, ResolveConflictRequest,
+    SelectRequest, WorktreePath,
+};
 use git_vista_session::auth::{self, Session};
 use git_vista_session::http::{self, HttpResponse};
 use git_vista_session::retry;
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 
 use crate::app::{Data, Fetch};
 
@@ -28,11 +38,21 @@ pub const CATALOG_PATH: &str = "/api/catalog";
 pub const HISTORY_LIMIT: usize = 250;
 
 pub type FetchFn = Box<dyn FnMut(&str, &str) -> Result<HttpResponse, String> + Send>;
+/// The injected POST seam: `(path, body, cookie, csrf, idempotency key)`.
+///
+/// The key is an `Option` because one of this client's three POSTs does not
+/// take one. `/api/select` never reaches the planner — it moves this session's
+/// own selection and runs no git — and the planner is where the key
+/// requirement lives, deliberately at the chokepoint rather than in a route
+/// list that drifts.
+pub type PostFn =
+    Box<dyn FnMut(&str, &[u8], &str, &str, Option<&str>) -> Result<HttpResponse, String> + Send>;
 pub type AuthFn = Box<dyn FnMut() -> Result<Session, String> + Send>;
 
 pub struct Client {
     session: Option<Session>,
     fetch: FetchFn,
+    post: PostFn,
     auth: AuthFn,
 }
 
@@ -40,14 +60,21 @@ impl Client {
     pub fn live() -> Client {
         Client::with(
             Box::new(|path, cookie| http::get(path, Some(cookie))),
+            Box::new(|path, body, cookie, csrf, key| match key {
+                Some(key) => {
+                    http::post_json_idempotent(path, body, Some(cookie), Some(csrf), key)
+                }
+                None => http::post_json(path, body, Some(cookie), Some(csrf)),
+            }),
             Box::new(auth::authenticate),
         )
     }
 
-    pub fn with(fetch: FetchFn, auth: AuthFn) -> Client {
+    pub fn with(fetch: FetchFn, post: PostFn, auth: AuthFn) -> Client {
         Client {
             session: None,
             fetch,
+            post,
             auth,
         }
     }
@@ -56,6 +83,99 @@ impl Client {
         let body = retry::authed_fetch(path, &mut self.session, &mut *self.fetch, &mut *self.auth)?;
         serde_json::from_slice(&body)
             .map_err(|error| format!("{path} did not return valid JSON: {error}"))
+    }
+
+    /// A read whose 404 is an answer rather than a failure.
+    ///
+    /// `Ok(None)` means the server said 404. Only `GET /api/worktree-file`
+    /// uses this, and it is the reason `authed_fetch_response` exists: in a
+    /// delete/modify conflict git legitimately leaves nothing on disk, so
+    /// "there is no file at this path" is what the result pane must say. Read
+    /// through the ordinary `get_json`, that fact would arrive as the sentence
+    /// "content could not be loaded" — a fault reported where nothing went
+    /// wrong, which is the collapse ADR 0063 exists to prevent.
+    fn get_json_or_missing<T: DeserializeOwned>(
+        &mut self,
+        path: &str,
+    ) -> Result<Option<T>, String> {
+        let (response, reauthenticated) = retry::authed_fetch_response(
+            path,
+            &mut self.session,
+            &mut *self.fetch,
+            &mut *self.auth,
+        )?;
+        match response.status {
+            404 => Ok(None),
+            200 => serde_json::from_slice(&response.body)
+                .map(Some)
+                .map_err(|error| format!("{path} did not return valid JSON: {error}")),
+            status => {
+                let after = if reauthenticated {
+                    " even after re-authenticating"
+                } else {
+                    ""
+                };
+                Err(format!(
+                    "GET {path} answered {status}{after}: {}",
+                    String::from_utf8_lossy(&response.body)
+                ))
+            }
+        }
+    }
+
+    /// POST a JSON body through the session, with an optional idempotency key.
+    fn post_json<T: Serialize>(
+        &mut self,
+        path: &str,
+        body: &T,
+        key: Option<&str>,
+    ) -> Result<Vec<u8>, String> {
+        let body = serde_json::to_vec(body)
+            .map_err(|error| format!("could not encode the request for {path}: {error}"))?;
+        // Destructured so the session and the POST closure are two disjoint
+        // borrows rather than one of `self`.
+        let Client {
+            session, post, ..
+        } = self;
+        let auth = &mut *self.auth;
+        retry::authed_post(
+            path,
+            &body,
+            session,
+            &mut |path, body, cookie, csrf| post(path, body, cookie, csrf, key),
+            auth,
+        )
+    }
+
+    /// Point this session at `repo` in a mode that admits writes, immediately
+    /// before the write itself.
+    ///
+    /// **Not once when the overlay opens — every time, paired with the
+    /// write.** The reads in this client address a repository explicitly with
+    /// `?repo=`, but `/api/resolve-conflict` carries no repository at all: it
+    /// goes through the planner, which acts on *this session's* selection
+    /// (ADR 0103 made that per-session; before #588 it was per-process). A
+    /// client that listed one repository's conflicts and posted a resolution
+    /// without selecting would write to whichever repository the server
+    /// launched with — and if that one happened to have a conflict at the same
+    /// path, the write would succeed, in the wrong repository, silently.
+    ///
+    /// Pairing the two makes "the write lands where the user was looking" true
+    /// by construction rather than by an earlier call having been remembered.
+    /// `Active` because it is the only mode a write is legal in
+    /// (`reject_if_read_only` refuses `Visualize`), and the selection is this
+    /// terminal session's own — the browser's session keeps whatever it had.
+    fn select_for_write(&mut self, repo: &str) -> Result<(), String> {
+        self.post_json(
+            "/api/select",
+            &SelectRequest {
+                worktree: repo.to_string(),
+                mode: RepoMode::Active,
+            },
+            None,
+        )
+        .map(|_| ())
+        .map_err(|error| format!("could not select the repository to write to: {error}"))
     }
 
     pub fn serve(&mut self, fetch: Fetch) -> Data {

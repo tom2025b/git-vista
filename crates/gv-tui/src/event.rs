@@ -61,7 +61,16 @@ pub fn run<B: Backend>(
         }
         match inputs.next(TICK)? {
             Input::Key(key) => {
-                if let Some(action) = keys::dispatch(key, app.focus) {
+                // The conflict overlay owns the keyboard while it is up. It
+                // has to: its text buffer accepts every printable key, so a
+                // shared keymap would quit the program the first time somebody
+                // typed a `q` into a file they were resolving.
+                let action = if app.conflicts.is_open() {
+                    keys::dispatch_conflict(key, app.conflicts.key_mode())
+                } else {
+                    keys::dispatch(key, app.focus)
+                };
+                if let Some(action) = action {
                     for fetch in app.apply(action) {
                         port.request(fetch);
                     }
@@ -70,7 +79,9 @@ pub fn run<B: Backend>(
             Input::Resize | Input::Tick => {}
         }
         while let Some(data) = port.poll() {
-            app.receive(data);
+            for fetch in app.receive(data) {
+                port.request(fetch);
+            }
         }
     }
     Ok(())

@@ -50,10 +50,18 @@ pub fn authed_fetch(
     fetch: &mut dyn FnMut(&str, &str) -> Result<HttpResponse, String>,
     auth: &mut dyn FnMut() -> Result<Session, String>,
 ) -> Result<Vec<u8>, String> {
-    let resp = authed_fetch_response(path, session, fetch, auth)?;
+    let (resp, reauthenticated) = authed_fetch_response(path, session, fetch, auth)?;
     if resp.status != 200 {
+        // The "even after re-authenticating" half is kept because it answers
+        // the first question a failed read raises. Without it a 503 on a fresh
+        // cookie reads exactly like a 503 on an expired one.
+        let after = if reauthenticated {
+            " even after re-authenticating"
+        } else {
+            ""
+        };
         return Err(format!(
-            "GET {path} answered {}: {}",
+            "GET {path} answered {}{after}: {}",
             resp.status,
             String::from_utf8_lossy(&resp.body)
         ));
@@ -76,19 +84,24 @@ pub fn authed_fetch(
 ///
 /// A 401 that survives one re-authentication is still an `Err`: that is not a
 /// status a caller can interpret, it is the session boundary refusing twice.
+///
+/// The `bool` is "this answer arrived on a freshly minted session", so a
+/// caller can keep saying so in its own wording rather than losing the
+/// difference between a server that refused a stale cookie and one that
+/// refused a new one.
 pub fn authed_fetch_response(
     path: &str,
     session: &mut Option<Session>,
     fetch: &mut dyn FnMut(&str, &str) -> Result<HttpResponse, String>,
     auth: &mut dyn FnMut() -> Result<Session, String>,
-) -> Result<HttpResponse, String> {
+) -> Result<(HttpResponse, bool), String> {
     if session.is_none() {
         *session = Some(auth()?);
     }
     let cookie = session.as_ref().expect("just set").cookie.clone();
     let resp = fetch(path, &cookie)?;
     if resp.status != 401 {
-        return Ok(resp);
+        return Ok((resp, false));
     }
     *session = Some(auth()?);
     let cookie = session.as_ref().expect("just set").cookie.clone();
@@ -99,7 +112,7 @@ pub fn authed_fetch_response(
             String::from_utf8_lossy(&retry.body)
         ));
     }
-    Ok(retry)
+    Ok((retry, true))
 }
 
 /// [`authed_post`]'s injected POST closure: `(path, body, cookie, csrf) ->
