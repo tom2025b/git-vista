@@ -286,3 +286,45 @@ async fn signing_out_leaves_no_selection_for_the_next_session() {
     })
     .await;
 }
+
+/// #614: a selection written inside a spawned task is visible to the session
+/// that spawned it.
+///
+/// `inherit_selection` shares the cell's `Arc`. Snapshotting the *value* into a
+/// fresh `Arc` leaves child *reads* working — which is why
+/// `detached_tasks_inherit_their_session_selection` stayed green on that
+/// mutation — while a child's *write* vanishes. Planner and preview only ever
+/// read, so this invariant had no test until now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_selection_written_inside_a_spawned_task_is_visible_to_the_parent() {
+    state::with_isolated_test_current(async {
+        let (_dir_a, repo_a) = seeded_files(&[("a.txt", "a\n")], "alpha seed");
+        let (_dir_b, repo_b) = seeded_files(&[("b.txt", "b\n")], "beta seed");
+
+        let handle_a = state::set_current(&repo_a, RepoMode::Active).expect("alpha registers");
+        let alpha_path = state::current().0;
+        let _handle_b = state::set_current(&repo_b, RepoMode::Active).expect("beta registers");
+        let beta_path = state::current().0;
+        assert_ne!(
+            alpha_path, beta_path,
+            "the two fixtures must resolve to different paths or a vanished write is invisible"
+        );
+
+        let child_worktree = handle_a.worktree;
+        tokio::spawn(state::inherit_selection(async move {
+            assert!(
+                state::select_registered(child_worktree, RepoMode::Active),
+                "the child must be able to write a selection the catalog already holds"
+            );
+        }))
+        .await
+        .expect("child task completed");
+
+        assert_eq!(
+            state::current().0,
+            alpha_path,
+            "parent still sees {beta_path:?}; the child's write to {alpha_path:?} did not share the cell"
+        );
+    })
+    .await;
+}
