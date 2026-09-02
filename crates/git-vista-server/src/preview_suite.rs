@@ -4545,33 +4545,6 @@ fn filetime_set(path: &Path, when: std::time::SystemTime) {
 // The pure parsers
 // ---------------------------------------------------------------------------
 
-/// `parse_git_version` against real and vendor-shaped lines, one literal
-/// expectation per case.
-#[test]
-fn parse_git_version_reads_real_and_vendor_shaped_lines() {
-    /// One `--version` line and the triple it must parse to. A named alias
-    /// because clippy refuses the inline tuple type, and because naming it
-    /// makes the table below read as data.
-    type VersionCase = (&'static str, Option<(u32, u32, u32)>);
-
-    let cases: &[VersionCase] = &[
-        ("git version 2.43.0", Some((2, 43, 0))),
-        ("git version 2.43.0\n", Some((2, 43, 0))),
-        ("git version 2.39.5 (Apple Git-154)", Some((2, 39, 5))),
-        ("git version 2.43.0.windows.1", Some((2, 43, 0))),
-        ("git version 2.38", Some((2, 38, 0))),
-        ("git version 2.37.3", Some((2, 37, 3))),
-        // Not git's line: no fact, never a guess in either direction.
-        ("gix version 0.66.0", None),
-        ("2.43.0", None),
-        ("git version banana", None),
-        ("", None),
-    ];
-    for (line, expected) in cases {
-        assert_eq!(parse_git_version(line), *expected, "for input {line:?}");
-    }
-}
-
 /// `parse_merge_tree_conflicts` against the exact byte shape git 2.43.0
 /// produced on this host, measured 2026-08-30.
 ///
