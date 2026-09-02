@@ -481,22 +481,32 @@ pub(crate) fn current_handle() -> Option<RepositoryHandle> {
 /// record, same as before D2. The grant only matters for writes, and reads
 /// don't care whether they get an `rw_trees` or `ro_trees` grant.
 ///
-/// **Known residual gap, not closed by this function alone (adversarial
-/// review, 2026-07-30):** this reads `CURRENT` fresh at call time, not at the
-/// moment a write request's target was resolved. Between
+/// **Known residual gap, narrowed by #588 but not closed (adversarial review,
+/// 2026-07-30; re-stated 2026-09-01):** this reads the selection fresh at call
+/// time, not at the moment a write request's target was resolved. Between
 /// `state::resolve_target()` capturing "repo B, Active" for an in-flight
 /// mutation and that mutation's eventual `git_cmd::sandboxed` spawn — real
 /// `.await` points sit in between (durable persistence, task admission) — a
-/// *different* request can reselect `CURRENT` to repo C. The in-flight write
-/// to B then finds `CURRENT.path != B` here, falls through to the catalog,
-/// and can get spuriously denied by a stale flag even though B was
-/// legitimately Active when the write was authorized. This is **fail-closed
-/// only** (a legitimate write can be wrongly refused; nothing insecure can
-/// succeed) — same-path mode flips, the case this fix targets and the
-/// regression test proves, are unaffected. Closing it properly means
-/// `resolve_target` capturing `read_only` alongside the path and threading
-/// that snapshot through to `sandbox::policy_for` instead of re-deriving it
-/// here at spawn time; not done tonight — named so it isn't silently lost.
+/// reselection can land in between. The in-flight write to B then finds
+/// `path != B` here, falls through to the catalog, and can get spuriously
+/// denied by a stale flag even though B was legitimately Active when the write
+/// was authorized. This is **fail-closed only** (a legitimate write can be
+/// wrongly refused; nothing insecure can succeed) — same-path mode flips, the
+/// case that fix targets and its regression test proves, are unaffected.
+///
+/// What #588 changed: the reselection that can do this must now come from the
+/// **same session**. It used to be any request on the server, because the
+/// selection was one process-global value; it is now that session's own cell,
+/// and a detached task inherits the cell of the request that spawned it
+/// (`inherit_selection`) rather than falling through to a process global. A
+/// second browser session, or a second device, can no longer perturb an
+/// in-flight write it has nothing to do with.
+///
+/// What is still owed, and is deliberately NOT part of #588: closing it
+/// properly still means `resolve_target` capturing `read_only` alongside the
+/// path and threading that snapshot through to `sandbox::policy_for` instead
+/// of re-deriving it here at spawn time. That crosses the planner/sandbox
+/// boundary and is its own change — named so it isn't silently lost.
 pub(crate) fn read_only_for_path(path: &Path) -> bool {
     if let Some(current) = current_snapshot() {
         if current.path == path {
