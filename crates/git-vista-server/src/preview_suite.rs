@@ -3652,22 +3652,39 @@ fn the_sweep_removes_only_old_directories_it_named_itself() {
     ScratchStore::sweep_stale(commondir);
 
     if stale.exists() {
-        let meta = std::fs::metadata(&stale).expect("stat the surviving stale store");
-        let modified = meta.modified().expect("read the surviving store's mtime");
-        let observed_age = std::time::SystemTime::now()
-            .duration_since(modified)
-            .expect("the surviving store's mtime is not in the future");
+        // Every read here reports rather than unwraps. A marker that is gone
+        // or unreadable is one of the *interesting* failures — an `expect`
+        // would replace the diagnosis with a different panic and tell us
+        // nothing, which is the one thing an instrumentation-only change must
+        // not do.
+        let meta = std::fs::metadata(&stale);
+        let observed_age = meta
+            .as_ref()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .map(
+                |modified| match std::time::SystemTime::now().duration_since(modified) {
+                    Ok(age) => format!("{age:?}"),
+                    Err(err) => format!("mtime is in the FUTURE by {:?}", err.duration()),
+                },
+            );
         let marker = stale.join(STORE_MARKER);
-        let marker_bytes = std::fs::read(&marker).expect("read the surviving store's marker");
+        let marker_bytes = std::fs::read(&marker);
         let lease_is_free = ScratchStore::abandoned_store_lease(&stale).is_some();
         eprintln!(
-            "surviving stale-store diagnosis: age={observed_age:?}, is_dir={}, \
-             marker_is_file={}, marker_matches={}, lease_is_free={lease_is_free}",
-            meta.is_dir(),
-            std::fs::metadata(&marker)
-                .map(|marker_meta| marker_meta.is_file())
-                .unwrap_or(false),
-            marker_bytes.starts_with(STORE_MARKER_MAGIC),
+            "surviving stale-store diagnosis: age={observed_age:?}, stat={:?}, \
+             is_dir={:?}, marker_read={}, marker_matches={:?}, \
+             lease_is_free={lease_is_free}",
+            meta.as_ref().err(),
+            meta.as_ref().map(std::fs::Metadata::is_dir).ok(),
+            match &marker_bytes {
+                Ok(bytes) => format!("{} bytes", bytes.len()),
+                Err(err) => format!("FAILED: {err}"),
+            },
+            marker_bytes
+                .as_ref()
+                .map(|bytes| bytes.starts_with(STORE_MARKER_MAGIC))
+                .ok(),
         );
     }
 
@@ -4111,39 +4128,63 @@ async fn a_live_store_is_never_swept_however_old_it_looks() {
     filetime_set(&path, long_ago);
     ScratchStore::sweep_stale(&commondir);
     if path.exists() {
-        let meta = std::fs::metadata(&path).expect("stat the surviving abandoned store");
-        let modified = meta.modified().expect("read the surviving store's mtime");
-        let observed_age = std::time::SystemTime::now()
-            .duration_since(modified)
-            .expect("the surviving store's mtime is not in the future");
-        let marker = path.join(STORE_MARKER);
-        let marker_bytes = std::fs::read(&marker).expect("read the surviving store's marker");
-        let lease_is_free = ScratchStore::abandoned_store_lease(&path).is_some();
+        // Every read here reports rather than unwraps. "The store is still
+        // there but its marker is gone or unreadable" is one of the failures
+        // worth catching, and an `expect` on that path would swap the
+        // diagnosis for an unrelated panic — exactly what an
+        // instrumentation-only change must never do.
         use std::os::unix::fs::MetadataExt;
-        let marker_meta = std::fs::metadata(&marker).expect("stat the surviving marker");
+        let meta = std::fs::metadata(&path);
+        let observed_age = meta
+            .as_ref()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .map(
+                |modified| match std::time::SystemTime::now().duration_since(modified) {
+                    Ok(age) => format!("{age:?}"),
+                    Err(err) => format!("mtime is in the FUTURE by {:?}", err.duration()),
+                },
+            );
+        let marker = path.join(STORE_MARKER);
+        let marker_bytes = std::fs::read(&marker);
+        let marker_meta = std::fs::metadata(&marker);
+        let lease_is_free = ScratchStore::abandoned_store_lease(&path).is_some();
         let open_here: Vec<String> = std::fs::read_dir("/proc/self/fd")
-            .expect("read this test process's file descriptors")
-            .flatten()
-            .filter_map(|entry| {
-                let target = std::fs::read_link(entry.path()).ok()?;
-                (target == marker).then(|| entry.file_name().to_string_lossy().into_owned())
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|entry| {
+                        let target = std::fs::read_link(entry.path()).ok()?;
+                        (target == marker).then(|| entry.file_name().to_string_lossy().into_owned())
+                    })
+                    .collect()
             })
-            .collect();
-        let lock_rows: Vec<String> = std::fs::read_to_string("/proc/locks")
-            .expect("read the kernel lock table")
-            .lines()
-            .filter(|line| line.ends_with(&format!(":{} 0 EOF", marker_meta.ino())))
-            .map(str::to_owned)
-            .collect();
+            .unwrap_or_default();
+        let lock_rows: Vec<String> = match (std::fs::read_to_string("/proc/locks"), &marker_meta) {
+            (Ok(locks), Ok(marker_meta)) => locks
+                .lines()
+                .filter(|line| line.ends_with(&format!(":{} 0 EOF", marker_meta.ino())))
+                .map(str::to_owned)
+                .collect(),
+            _ => Vec::new(),
+        };
         eprintln!(
-            "surviving abandoned-store diagnosis: age={observed_age:?}, is_dir={}, \
-             marker_is_file={}, marker_matches={}, lease_is_free={lease_is_free}, \
-             marker_dev={}, marker_ino={}, open_here={open_here:?}, lock_rows={lock_rows:?}",
-            meta.is_dir(),
-            marker_meta.is_file(),
-            marker_bytes.starts_with(STORE_MARKER_MAGIC),
-            marker_meta.dev(),
-            marker_meta.ino(),
+            "surviving abandoned-store diagnosis: age={observed_age:?}, stat={:?}, \
+             is_dir={:?}, marker_read={}, marker_matches={:?}, \
+             lease_is_free={lease_is_free}, marker_dev={:?}, marker_ino={:?}, \
+             open_here={open_here:?}, lock_rows={lock_rows:?}",
+            meta.as_ref().err(),
+            meta.as_ref().map(std::fs::Metadata::is_dir).ok(),
+            match &marker_bytes {
+                Ok(bytes) => format!("{} bytes", bytes.len()),
+                Err(err) => format!("FAILED: {err}"),
+            },
+            marker_bytes
+                .as_ref()
+                .map(|bytes| bytes.starts_with(STORE_MARKER_MAGIC))
+                .ok(),
+            marker_meta.as_ref().map(MetadataExt::dev).ok(),
+            marker_meta.as_ref().map(MetadataExt::ino).ok(),
         );
     }
     assert!(
