@@ -22,10 +22,14 @@
 
 ## In flight
 
-- Commit, push, open PR, and record CI result.
+- Implementation committed at `ccd04cfd3ab191056f566d128ace6c5d68aefd62`.
+- Push was blocked by the managed approval layer because it could not establish
+  `https://github.com/tom2025b/git-vista.git` as an explicitly trusted export
+  destination. Awaiting explicit user authorization for this exact branch and
+  remote, then open the PR and record CI.
 
 ## Single next command
 
 ```bash
-git status --short --branch
+git push -u origin feature/m10.05-460-plan-review-pane
 ```
