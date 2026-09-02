@@ -22,13 +22,16 @@
 - Branch pushed to
   `origin/feature/m10.05-460-plan-review-pane`; post-reboot focused gate
   reverified 90/90 green.
+- PR #615 opened: <https://github.com/tom2025b/git-vista/pull/615>.
+- Current `origin/main` at `e52d9dd8` merged cleanly; focused tests remain
+  90/90 green and workspace clippy remains green on the merged head.
 
 ## In flight
 
-- Open the PR and record CI.
+- Push the merged head and record PR #615's final CI result.
 
 ## Single next command
 
 ```bash
-gh pr create --base main --head feature/m10.05-460-plan-review-pane
+gh pr view 615 --json number,state,isDraft,mergeStateStatus,headRefOid,statusCheckRollup,url
 ```
