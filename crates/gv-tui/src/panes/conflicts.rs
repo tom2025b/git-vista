@@ -140,8 +140,18 @@ pub enum Act {
 pub enum Tone {
     Heading,
     Plain,
-    /// A fact that is not content: a state sentence, a note, a withheld
-    /// control.
+    /// A sentence the model produced about state or about what is on offer:
+    /// "Not present on this side", a conflict's shape note, a withheld
+    /// control's reason.
+    ///
+    /// Its own tone rather than sharing [`Tone::Muted`], and the difference is
+    /// not cosmetic. These sentences ARE the content on the screens where they
+    /// appear — "there is no ancestor" is what criterion 1 asks the terminal to
+    /// say — so they are drawn at full weight. Dimming them would leave the
+    /// most important line on the pane as the faintest thing on it.
+    State,
+    /// Genuinely secondary text: file context between conflicts, the ancestor
+    /// body.
     Muted,
     /// Something that failed — an unreadable stage, a refused write.
     Fault,
@@ -271,10 +281,6 @@ impl TextEdit {
             lines.push("");
         }
         lines
-    }
-
-    fn line_count(&self) -> usize {
-        self.text.split('\n').count().max(1)
     }
 }
 
@@ -940,7 +946,7 @@ impl ConflictsPane {
         }
         match self.files.as_ref() {
             None => {
-                let _ = emit(row("Reading the index…", Tone::Muted));
+                let _ = emit(row("Reading the index…", Tone::State));
             }
             Some(Err(message)) => {
                 let _ = emit(row(message.clone(), Tone::Fault));
@@ -950,7 +956,7 @@ impl ConflictsPane {
                 // indistinguishable from a list that failed to draw.
                 let _ = emit(row(
                     "Nothing is conflicted in this repository.",
-                    Tone::Muted,
+                    Tone::State,
                 ));
             }
             Some(Ok(files)) => {
@@ -1010,14 +1016,14 @@ fn visit_content(state: &PaneState, emit: &mut impl FnMut(Row) -> bool) -> bool 
             }
             true
         }
-        PaneState::Text { .. } => emit(row("(this version is empty)", Tone::Muted)),
+        PaneState::Text { .. } => emit(row("(this version is empty)", Tone::State)),
         // Absent, Unreadable, Binary, AwaitingContent and ContentUnavailable
         // each say what they are, in the model's own words. The two that are
         // faults rather than facts are marked as such.
         other => {
             let tone = match other {
                 PaneState::Unreadable { .. } | PaneState::ContentUnavailable { .. } => Tone::Fault,
-                _ => Tone::Muted,
+                _ => Tone::State,
             };
             emit(row(other.describe(), tone))
         }
@@ -1029,7 +1035,7 @@ fn visit_inspect(inspect: &Inspect, emit: &mut impl FnMut(Row) -> bool) {
         return;
     }
     if let Some(note) = &inspect.panes.surface.note {
-        if !emit(row(note.clone(), Tone::Muted)) {
+        if !emit(row(note.clone(), Tone::State)) {
             return;
         }
     }
@@ -1045,7 +1051,7 @@ fn visit_inspect(inspect: &Inspect, emit: &mut impl FnMut(Row) -> bool) {
         let text = format!("{:<18} {}", pane.label(), state.describe());
         let tone = match state {
             PaneState::Unreadable { .. } | PaneState::ContentUnavailable { .. } => Tone::Fault,
-            _ => Tone::Muted,
+            _ => Tone::State,
         };
         let line = if pane == inspect.focus {
             selected_row(text, tone)
@@ -1087,7 +1093,7 @@ fn visit_inspect(inspect: &Inspect, emit: &mut impl FnMut(Row) -> bool) {
             Ok(()) => row(format!("  {key}   {label}"), Tone::Plain),
             Err(withheld) => row(
                 format!("      {label} — {}", withheld.describe()),
-                Tone::Muted,
+                Tone::State,
             ),
         };
         if !emit(line) {
@@ -1102,7 +1108,7 @@ fn visit_inspect(inspect: &Inspect, emit: &mut impl FnMut(Row) -> bool) {
     } else {
         row(
             "      Resolve line by line — not available for this file",
-            Tone::Muted,
+            Tone::State,
         )
     };
     let _ = emit(editor_row);
@@ -1167,7 +1173,7 @@ fn editor_row_count(editor: &Editor) -> usize {
 fn visit_editor(editor: &Editor, emit: &mut impl FnMut(Row) -> bool) {
     for head in [
         row(editor.path.clone(), Tone::Heading),
-        row(editor_state_sentence(editor), Tone::Muted),
+        row(editor_state_sentence(editor), Tone::State),
         row("", Tone::Plain),
         row("Blocks", Tone::Heading),
     ] {
@@ -1218,7 +1224,7 @@ fn visit_editor(editor: &Editor, emit: &mut impl FnMut(Row) -> bool) {
                     None => {
                         if !emit(row(
                             "| no recorded ancestor in this marker file",
-                            Tone::Muted,
+                            Tone::State,
                         )) {
                             return;
                         }
@@ -1250,7 +1256,7 @@ fn visit_editor(editor: &Editor, emit: &mut impl FnMut(Row) -> bool) {
         .flatten();
     match editor_result(editor) {
         None => {
-            let _ = emit(row(editor_state_sentence(editor), Tone::Muted));
+            let _ = emit(row(editor_state_sentence(editor), Tone::State));
         }
         Some(text) => {
             for (index, line) in lines_or_one(&text).into_iter().enumerate() {

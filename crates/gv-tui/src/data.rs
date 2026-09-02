@@ -198,8 +198,170 @@ impl Client {
                 let result = self.get_json(&path);
                 Data::Diff { repo, id, result }
             }
+            Fetch::Conflicts { repo } => {
+                let path = format!("/api/conflicts?repo={repo}");
+                let result = self.get_json(&path);
+                Data::Conflicts { repo, result }
+            }
+            Fetch::ConflictStage {
+                repo,
+                path,
+                pane,
+                oid,
+            } => {
+                // The oid goes into the URL unencoded on purpose: the server
+                // admits only 40 or 64 lowercase hex characters and answers
+                // 400 to anything else before it spawns git, so there is no
+                // byte here that percent-encoding would protect. The path
+                // below is arbitrary user text and is a different matter.
+                let url = format!("/api/blob/{oid}?repo={repo}");
+                let result = self.get_json(&url);
+                Data::ConflictStage {
+                    repo,
+                    path,
+                    pane,
+                    result,
+                }
+            }
+            Fetch::ConflictResult { repo, path } => {
+                let url = format!("/api/worktree-file/{}?repo={repo}", encode_path(&path));
+                let read = match self.get_json_or_missing::<WorktreeFileContent>(&url) {
+                    Ok(Some(file)) => ResultRead::Wrote(file),
+                    Ok(None) => ResultRead::NoFile,
+                    Err(error) => ResultRead::Failed(error),
+                };
+                Data::ConflictResult { repo, path, read }
+            }
+            Fetch::ConflictSource { repo, path } => {
+                let url = format!("/api/conflict-source/{}?repo={repo}", encode_path(&path));
+                let result = self.get_json(&url);
+                Data::ConflictSource { repo, path, result }
+            }
+            Fetch::ResolveWholeFile {
+                repo,
+                path,
+                resolution,
+            } => {
+                let result = self.resolve_whole_file(&repo, &path, resolution);
+                Data::Resolved { repo, path, result }
+            }
+            Fetch::ResolveContent {
+                repo,
+                path,
+                expected_stages,
+                expected_source,
+                content,
+            } => {
+                let result =
+                    self.resolve_content(&repo, &path, expected_stages, expected_source, content);
+                Data::Resolved { repo, path, result }
+            }
         }
     }
+
+    /// `POST /api/resolve-conflict` — take a whole side, or the deletion.
+    fn resolve_whole_file(
+        &mut self,
+        repo: &str,
+        path: &str,
+        resolution: Resolution,
+    ) -> Result<(), String> {
+        // The DTO's `path` is a `WorktreePath`, so a traversal cannot be built
+        // into a request here at all — the same wire-boundary guarantee the
+        // server relies on, enforced one process earlier. In practice this
+        // never fails: the path came from `/api/conflicts`, which reports what
+        // git itself listed. It is checked rather than unwrapped because "git
+        // said so" is an assumption, and a panic in a program that has taken
+        // over the terminal is worse than a sentence on the status line.
+        let path = WorktreePath::new(path.to_string()).map_err(|e| e.to_string())?;
+        self.select_for_write(repo)?;
+        self.post_json(
+            "/api/resolve-conflict",
+            &ResolveConflictRequest { path, resolution },
+            Some(&mint_idempotency_key()),
+        )
+        .map(|_| ())
+    }
+
+    /// `POST /api/resolve-conflict-content` — a block, line or hand-edited
+    /// resolution (ADR 0069).
+    ///
+    /// `expected_stages` and `expected_source` travel back exactly as they
+    /// were served. Nothing here recomputes either: the executor compares them
+    /// against a fresh scan and a re-minted token inside its lock, and a client
+    /// that computed its own would only ever agree with itself — gates 3 and 4
+    /// would pass by construction and prove nothing.
+    fn resolve_content(
+        &mut self,
+        repo: &str,
+        path: &str,
+        expected_stages: [Option<CommitOid>; 3],
+        expected_source: GenerationToken,
+        content: String,
+    ) -> Result<(), String> {
+        let path = WorktreePath::new(path.to_string()).map_err(|e| e.to_string())?;
+        self.select_for_write(repo)?;
+        self.post_json(
+            "/api/resolve-conflict-content",
+            &ResolveConflictContentRequest {
+                path,
+                expected_stages,
+                expected_source,
+                content,
+            },
+            Some(&mint_idempotency_key()),
+        )
+        .map(|_| ())
+    }
+}
+
+/// Percent-encode one worktree path for the server's wildcard routes.
+///
+/// Slashes stay literal — the route is `/{*path}` and those separators are the
+/// path's own. Everything outside RFC 3986's unreserved set is escaped, which
+/// is stricter than the minimum and deliberately so: a `#` in a filename would
+/// otherwise cut the request short at a fragment, a `?` would start a query
+/// string, and a space would end the request line early. The browser client
+/// reaches the same set by calling `encodeURIComponent` per segment; this is
+/// that rule written out where there is no JS engine to call.
+fn encode_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                out.push(byte as char);
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// One key press that asks for a write is one intent, and gets one key.
+///
+/// Unique per press rather than derived from the request's content. An
+/// idempotency key names *one user action*, and the server replays the
+/// recorded outcome for a key it has already seen — so a key derived from the
+/// resolution itself would make a second, deliberate attempt at the same
+/// resolution look like a retry of the first and replay its answer instead of
+/// running. For a refusal that means being told again about a repository state
+/// that has since changed.
+///
+/// The wall-clock nanosecond is in there because the operation registry is
+/// durable across server restarts (#62): a bare counter would restart at 1 in
+/// a fresh `gv-tui` and collide with the previous run's keys, and a collision
+/// here is a write that silently does not happen. The counter covers two
+/// presses inside one clock tick.
+///
+/// The 401 retry inside [`retry::authed_post`] reuses this call's key, which
+/// is the case the mechanism exists for: same intent, second attempt.
+fn mint_idempotency_key() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos() as u64);
+    let seq = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("gvtui-{nanos}-{seq}")
 }
 
 pub trait DataPort {
@@ -265,6 +427,39 @@ fn stopped_answer(fetch: Fetch) -> Data {
             id,
             result: Err(message()),
         },
+        Fetch::Conflicts { repo } => Data::Conflicts {
+            repo,
+            result: Err(message()),
+        },
+        Fetch::ConflictStage {
+            repo, path, pane, ..
+        } => Data::ConflictStage {
+            repo,
+            path,
+            pane,
+            result: Err(message()),
+        },
+        // `Failed`, never `NoFile`. A request that never left this process
+        // observed nothing about what is on disk, and answering "there is no
+        // file at that path" would assert a fact nobody looked for — the exact
+        // collapse `Stage::Absent` versus `Stage::Unreadable` exists to stop.
+        Fetch::ConflictResult { repo, path } => Data::ConflictResult {
+            repo,
+            path,
+            read: ResultRead::Failed(message()),
+        },
+        Fetch::ConflictSource { repo, path } => Data::ConflictSource {
+            repo,
+            path,
+            result: Err(message()),
+        },
+        Fetch::ResolveWholeFile { repo, path, .. } | Fetch::ResolveContent { repo, path, .. } => {
+            Data::Resolved {
+                repo,
+                path,
+                result: Err(message()),
+            }
+        }
     }
 }
 
@@ -293,6 +488,13 @@ mod tests {
         }
     }
 
+    /// The POST seam for a test that only reads. It panics rather than
+    /// returning a benign answer: a read-only test that starts posting has
+    /// changed what it is testing, and should say so loudly.
+    fn never_posts() -> PostFn {
+        Box::new(|path, _, _, _, _| panic!("this test never posts, but something posted to {path}"))
+    }
+
     fn response(status: u16, body: impl AsRef<[u8]>) -> HttpResponse {
         HttpResponse {
             status,
@@ -318,6 +520,7 @@ mod tests {
                     _ => panic!("unexpected fetch {call} with {cookie}"),
                 }
             }),
+            never_posts(),
             Box::new(move || {
                 let generation = auth_count.fetch_add(1, Ordering::SeqCst) + 1;
                 Ok(session(generation))
@@ -348,6 +551,7 @@ mod tests {
                 "/api/broken" => Ok(response(200, "<html>not json</html>")),
                 _ => panic!("unexpected path {path}"),
             }),
+            never_posts(),
             Box::new(|| Ok(session(1))),
         );
 
@@ -369,6 +573,7 @@ mod tests {
     fn serve_maps_a_catalog_fetch_to_a_catalog_answer_carrying_the_error() {
         let mut client = Client::with(
             Box::new(|_, _| Ok(response(503, "catalog rebuilding"))),
+            never_posts(),
             Box::new(|| Ok(session(1))),
         );
         match client.serve(Fetch::Catalog) {
@@ -400,6 +605,7 @@ mod tests {
                     _ => panic!("unexpected fetch {call} with {cookie}"),
                 }
             }),
+            never_posts(),
             Box::new(move || {
                 let generation = auth_count.fetch_add(1, Ordering::SeqCst) + 1;
                 Ok(session(generation))
@@ -446,6 +652,7 @@ mod tests {
                 let _held = &held;
                 Ok(response(200, ALPHA))
             }),
+            never_posts(),
             Box::new(|| Ok(session(1))),
         );
         let worker = spawn(client);

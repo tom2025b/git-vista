@@ -14,6 +14,7 @@ use ratatui::Frame;
 
 use crate::app::{App, Pane, Tone};
 use crate::layout;
+use crate::panes::conflicts::{self, Screen};
 use crate::panes::detail::RowTone;
 use crate::panes::graph::{self, ColorDepth, Emphasis, Foreground, GraphLine, LayoutData};
 
@@ -34,6 +35,22 @@ pub fn draw(frame: &mut Frame, app: &App) {
         );
         return;
     };
+
+    // The conflict overlay takes the whole body when it is up (M10.07,
+    // #462), leaving only the status strip. Four panes of source do not fit
+    // beside a shell that is already two columns wide — and the four-pane
+    // view is the thing #462 exists to make readable, so it gets the frame.
+    if app.conflicts.is_open() {
+        let body = Rect::new(
+            area.x,
+            area.y,
+            area.width,
+            panes.status.y.saturating_sub(area.y),
+        );
+        draw_conflicts(frame, body, app);
+        draw_status(frame, panes.status, app);
+        return;
+    }
 
     let rows: Vec<ListItem<'_>> = app
         .catalog
@@ -62,14 +79,94 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_commits(frame, panes.of(Pane::Commits), app, detect_color_depth());
     draw_main(frame, panes.of(Pane::Main), app);
 
+    draw_status(frame, panes.status, app);
+}
+
+fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let status_style = match app.status.tone {
         Tone::Info => Style::default(),
         Tone::Error => Style::default().fg(Color::Red),
     };
     frame.render_widget(
         Paragraph::new(app.status.text.as_str()).style(status_style),
-        panes.status,
+        area,
     );
+}
+
+/// The conflict overlay (M10.07, #462).
+///
+/// A pure projection like every other pane here: the state machine in
+/// `panes::conflicts` already decided which rows exist and what each one says,
+/// and this only assigns colours and places the caret. Nothing about a
+/// conflict is decided in this file — `cargo test` never draws a frame with a
+/// real terminal behind it, so a decision made here would be pinned by
+/// nothing.
+fn draw_conflicts(frame: &mut Frame, area: Rect, app: &App) {
+    let title = match app.conflicts.screen() {
+        Screen::List => " Conflicts ",
+        Screen::Inspect => " Conflict — inspect ",
+        Screen::Editor => " Conflict — resolve line by line ",
+    };
+    let block = Block::bordered()
+        .title(Line::styled(
+            title,
+            Style::default()
+                .fg(Color::Reset)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(Color::Cyan));
+    let height = block.inner(area).height as usize;
+    let offset = app.conflicts.view_offset(height);
+    let lines: Vec<Line<'static>> = app
+        .conflicts
+        .window(offset, height)
+        .iter()
+        .map(conflict_line)
+        .collect();
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn conflict_line(row: &conflicts::Row) -> Line<'static> {
+    let mut style = conflict_tone_style(row.tone);
+    if row.selected {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    let Some(column) = row.caret else {
+        return Line::styled(row.text.clone(), style);
+    };
+    // The caret is drawn by reversing one cell, and a caret past the last
+    // character reverses a trailing space instead of vanishing: an invisible
+    // caret in a buffer that accepts every keystroke is a way to type into a
+    // line you are not looking at.
+    let mut chars = row.text.chars();
+    let before: String = chars.by_ref().take(column).collect();
+    let under = chars.next();
+    let after: String = chars.collect();
+    let caret = style.add_modifier(Modifier::REVERSED);
+    let mut spans = vec![Span::styled(before, style)];
+    spans.push(Span::styled(
+        under.map_or_else(|| " ".to_string(), |ch| ch.to_string()),
+        caret,
+    ));
+    if !after.is_empty() {
+        spans.push(Span::styled(after, style));
+    }
+    Line::from(spans)
+}
+
+fn conflict_tone_style(tone: conflicts::Tone) -> Style {
+    match tone {
+        conflicts::Tone::Heading => Style::default().add_modifier(Modifier::BOLD),
+        conflicts::Tone::Plain => Style::default(),
+        // Full weight, deliberately. These are the sentences that say a side
+        // is absent or a control is withheld, which on those screens is the
+        // content — see `conflicts::Tone::State`.
+        conflicts::Tone::State => Style::default(),
+        conflicts::Tone::Muted => Style::default().fg(Color::DarkGray),
+        conflicts::Tone::Fault => Style::default().fg(Color::Red),
+        conflicts::Tone::Ours => Style::default().fg(Color::Green),
+        conflicts::Tone::Theirs => Style::default().fg(Color::Cyan),
+    }
 }
 
 fn pane_block(pane: Pane, focus: Pane) -> Block<'static> {
