@@ -39,6 +39,10 @@ pub struct GraphLine {
 }
 
 impl GraphLine {
+    /// Concatenates every span's text with no styling — a test convenience
+    /// for asserting on glyph shape and ref badges; `ui.rs` renders spans
+    /// directly so their colour and emphasis survive.
+    #[cfg(test)]
     pub fn plain_text(&self) -> String {
         self.spans.iter().map(|span| span.text.as_str()).collect()
     }
@@ -232,6 +236,17 @@ fn render_commit_line<S: BranchAnchor>(
     }
 
     let mut spans = cells_to_spans(cells);
+    // The glyph gutter identifies a commit's lane, not the commit itself —
+    // callers (ui.rs's Commits pane, a plain `git log --graph`) need the
+    // short id on the row too. Appended after the gutter so every existing
+    // `.starts_with(...)` assertion on the gutter's own characters still
+    // holds.
+    spans.push(span(" ", Foreground::Default, Emphasis::Normal));
+    spans.push(span(
+        row.commit.id.short().to_string(),
+        foreground,
+        Emphasis::Normal,
+    ));
     for git_ref in &row.refs {
         let (label, foreground) = match git_ref.kind {
             RefKind::Head => ("[HEAD]".to_string(), fixed_foreground(HEAD_BADGE, colors)),

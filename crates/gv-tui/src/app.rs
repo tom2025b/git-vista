@@ -163,6 +163,12 @@ pub struct App {
     pub catalog: Vec<RepositoryDescriptor>,
     pub active_repo: Option<String>,
     pub commits: Vec<GraphRow>,
+    /// The rest of the fetched [`CommitPage`], kept beside `commits` so
+    /// `ui.rs` can hand the graph renderer the same lanes core computed —
+    /// no relayout, no separate fetch.
+    pub edges: Vec<Edge>,
+    pub stubs: Vec<FrameStub>,
+    pub lane_count: usize,
     pub detail: DetailPane,
     cursors: [usize; 4],
     pub status: Status,
@@ -185,6 +191,9 @@ impl App {
             catalog: Vec::new(),
             active_repo: None,
             commits: Vec::new(),
+            edges: Vec::new(),
+            stubs: Vec::new(),
+            lane_count: 0,
             detail: DetailPane::default(),
             cursors: [0; 4],
             status: Status {
@@ -279,6 +288,9 @@ impl App {
                         }) {
                             self.active_repo = None;
                             self.commits.clear();
+                            self.edges.clear();
+                            self.stubs.clear();
+                            self.lane_count = 0;
                             self.detail = DetailPane::default();
                         }
                         self.clamp_cursors();
@@ -309,6 +321,9 @@ impl App {
                 match result {
                     Ok(page) => {
                         self.commits = page.rows;
+                        self.edges = page.edges;
+                        self.stubs = page.stubs;
+                        self.lane_count = page.lane_count;
                         self.clamp_cursors();
                         self.status = Status {
                             text: format!(
@@ -407,6 +422,9 @@ impl App {
         }
         if self.active_repo.as_deref() != Some(repo.as_str()) {
             self.commits.clear();
+            self.edges.clear();
+            self.stubs.clear();
+            self.lane_count = 0;
             self.cursors[Pane::Commits.index()] = 0;
             self.cursors[Pane::Main.index()] = 0;
             self.detail = DetailPane::default();
@@ -484,11 +502,6 @@ impl App {
         };
         let read_only = if repo.read_only { ", read-only" } else { "" };
         format!("{} ({kind}{read_only})", repo.name)
-    }
-
-    /// A narrow selector row; the lane-and-badge renderer remains #457's.
-    pub fn commit_row(row: &GraphRow) -> String {
-        format!("{} {}", row.commit.id.short(), row.commit.summary)
     }
 }
 
