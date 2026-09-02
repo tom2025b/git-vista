@@ -59,6 +59,35 @@ pub const BROWSER: Ident = Ident {
 /// Signing is forced off in both forms: a developer with `commit.gpgsign` or
 /// `tag.gpgsign` set globally would otherwise be prompted for a passphrase by
 /// a unit test, or simply watch it fail.
+///
+/// # Auto-maintenance is off, and `GIT_CONFIG_GLOBAL=/dev/null` is not enough
+///
+/// Every `git commit` spawns `git maintenance run --auto --quiet --detach`
+/// unless told otherwise. That janitor creates an empty
+/// `objects/maintenance.lock`, then unlinks it when it finishes — asynchronously,
+/// after the commit that spawned it has already returned.
+///
+/// Emptying the global and system config does NOT prevent this: `maintenance.auto`
+/// and `gc.auto` default to on in git's own compiled-in defaults, with no file to
+/// blank. The setting has to arrive on the command line, which is why it lives
+/// here rather than in the environment beside `GIT_CONFIG_GLOBAL`.
+///
+/// This is #598. Tests that photograph `.git` before and after an operation caught
+/// the lock in one snapshot and not the other, and failed on a file the code under
+/// test never touched:
+///
+/// ```text
+/// left: ["- objects/maintenance.lock len=0 hash=bd60acb658c79e45"]
+/// right: []
+/// ```
+///
+/// It reproduced in CI and not locally because the window is version-dependent:
+/// git 2.55 (CI) defaults manual maintenance to the *geometric* strategy, which
+/// does more work and holds the lock across `daemonize()`; git 2.53 (dev box)
+/// still defaults to `gc`, whose window measured **~0.7 ms** — never lost in 80
+/// natural runs, and only reproducible under an `LD_PRELOAD` that widened it.
+///
+/// A fixture must not race a background process it never asked for.
 fn ident_args(ident: Ident) -> Vec<String> {
     let Ident { name, email } = ident;
     vec![
@@ -70,6 +99,13 @@ fn ident_args(ident: Ident) -> Vec<String> {
         "commit.gpgsign=false".into(),
         "-c".into(),
         "tag.gpgsign=false".into(),
+        // #598 — see the note above. Both, deliberately: `maintenance.auto`
+        // governs the modern janitor, `gc.auto` the legacy path some
+        // subcommands still consult.
+        "-c".into(),
+        "maintenance.auto=false".into(),
+        "-c".into(),
+        "gc.auto=0".into(),
     ]
 }
 
@@ -240,4 +276,67 @@ pub fn write(repo: &Path, name: &str, content: &[u8]) {
         std::fs::create_dir_all(parent).expect("create fixture file parent");
     }
     std::fs::write(&path, content).unwrap_or_else(|e| panic!("write {path:?}: {e}"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #598 — every fixture git invocation must disable auto-maintenance.
+    ///
+    /// # Why this is a unit test on the argument vector, and not a behavioural one
+    ///
+    /// The obvious test — build a fixture repo, assert no `objects/maintenance.lock`
+    /// is left behind — was written first and **proved inert**. Both mutations
+    /// survived it:
+    ///
+    /// - the lock's lifetime on a fast box measured **~0.7 ms**, so the check
+    ///   almost never catches it even with maintenance fully enabled; and
+    /// - `git config --get maintenance.auto` reads the *repository* config, which
+    ///   never contains a value passed as `-c` on the command line, so that
+    ///   assertion passed no matter what.
+    ///
+    /// A test that cannot fail on the break it names is worse than no test. The
+    /// argument vector is where the setting actually lives, so that is what this
+    /// asserts. It fails immediately if either override is dropped, renamed, or
+    /// flipped.
+    ///
+    /// # Two mutations
+    ///
+    /// 1. **Removes the mechanism** — delete both `-c` pairs. Both `assert!`s below
+    ///    fire.
+    /// 2. **Weakens it** — keep the flag but set `maintenance.auto=true`. The
+    ///    value assertion fires on a *different* line than mutation 1.
+    #[test]
+    fn every_fixture_git_call_disables_auto_maintenance() {
+        let args = ident_args(CATALOGUE);
+
+        assert!(
+            args.iter().any(|a| a == "maintenance.auto=false"),
+            "fixture git invocations no longer pass `-c maintenance.auto=false`. \
+             Every `git commit` then spawns `git maintenance run --auto --detach`, \
+             which creates and asynchronously unlinks `objects/maintenance.lock`. \
+             Tests that photograph .git before and after an operation catch that \
+             file in one snapshot and not the other and fail on something they \
+             never touched. That is #598. Note that GIT_CONFIG_GLOBAL=/dev/null \
+             does NOT cover this: the default is compiled in, not in a file. \
+             Args were: {args:?}"
+        );
+
+        assert!(
+            args.iter().any(|a| a == "gc.auto=0"),
+            "fixture git invocations no longer pass `-c gc.auto=0`, so the legacy \
+             auto-gc path can still spawn background work. See #598. Args were: \
+             {args:?}"
+        );
+
+        // Vacuity guard, checked last on purpose: if `ident_args` ever returned
+        // an empty vector, the two `any()` checks above would fail with a
+        // confusing message about maintenance rather than the real fault.
+        assert!(
+            args.iter().any(|a| a.starts_with("user.email=")),
+            "ident_args returned something that is not a git argument vector at \
+             all — fix that before trusting the checks above. Got: {args:?}"
+        );
+    }
 }
