@@ -23,6 +23,7 @@
 //!   * [`confirm`]  — the branch-op / undo confirmation (the largest, many arms).
 //!   * [`reset`]    — the Reset Test Repo confirmation.
 //!   * [`open_url`] — the clone-by-URL dialog.
+//!   * [`preview_panel`] — the before/after graph a confirmation draws (#594).
 //!
 //! [`DIALOG_GUARD_MS`]: crate::features::dialogs::core::DIALOG_GUARD_MS
 //! [`Dialogs`]: crate::features::dialogs::signals::Dialogs
@@ -32,11 +33,14 @@ use leptos::*;
 mod commit;
 mod confirm;
 mod open_url;
+// M10.08 A6 (#594): the before/after graph drawn inside a confirmation.
+mod preview_panel;
 mod reset;
 
 pub use commit::commit_dialog_view;
 pub use confirm::{confirm_modal_view, error_modal_view, pull_picker_view};
 pub use open_url::open_url_view;
+pub use preview_panel::preview_panel_view;
 pub use reset::reset_repo_view;
 
 /// Pop a native alert with `msg` (there's always a window in the running SPA).

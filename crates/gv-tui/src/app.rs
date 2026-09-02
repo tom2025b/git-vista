@@ -38,6 +38,7 @@ use git_vista_protocol::{
 };
 
 use crate::panes::detail::DetailPane;
+use crate::panes::plan_review::{PlanApproval, PlanReviewPane, SubmissionOutcome};
 use crate::panes::staging::StagingPane;
 use crate::panes::worktree::WorktreePane;
 
@@ -160,6 +161,7 @@ pub enum Request {
         repo: String,
         plan: Box<Plan>,
     },
+    ExecuteReviewedPlan(PlanApproval),
     ApplyPatch {
         repo: String,
         plan: PatchPlan,
@@ -169,6 +171,8 @@ pub enum Request {
 /// A read's answer, back from the data layer.
 #[derive(Debug)]
 pub enum Data {
+    #[allow(dead_code)] // Built by #461; M10.05 owns the review/submit half.
+    PlanReady(Result<Vec<u8>, String>),
     Catalog(Result<Vec<RepositoryDescriptor>, String>),
     Selected {
         repo: String,
@@ -210,6 +214,7 @@ pub enum Data {
         repo: String,
         result: Result<String, String>,
     },
+    PlanSubmitted(SubmissionOutcome),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -266,6 +271,7 @@ pub struct App {
     pub staging: Option<StagingPane>,
     pub confirmation: Option<Confirmation>,
     pub review: Option<Review>,
+    pub plan_review: Option<PlanReviewPane>,
     pending_file: Option<PendingFile>,
     cursors: [usize; 4],
     pub status: Status,
@@ -300,6 +306,7 @@ impl App {
             staging: None,
             confirmation: None,
             review: None,
+            plan_review: None,
             pending_file: None,
             cursors: [0; 4],
             status: Status {
@@ -323,6 +330,9 @@ impl App {
 
     /// Fold one action in; the reads it asks for come back to the loop.
     pub fn apply(&mut self, action: Action) -> Vec<Request> {
+        if self.plan_review.is_some() {
+            return self.apply_plan_review(action);
+        }
         match action {
             Action::Quit => {
                 self.quit = true;
@@ -416,6 +426,25 @@ impl App {
     /// Fold one answer in.
     pub fn receive(&mut self, data: Data) -> Vec<Request> {
         match data {
+            Data::PlanReady(result) => {
+                match result {
+                    Ok(wire) => {
+                        if let Err(message) = self.present_plan(wire) {
+                            self.status = Status {
+                                text: message,
+                                tone: Tone::Error,
+                            };
+                        }
+                    }
+                    Err(message) => {
+                        self.status = Status {
+                            text: message,
+                            tone: Tone::Error,
+                        };
+                    }
+                }
+                Vec::new()
+            }
             Data::Catalog(result) => {
                 self.in_flight = self.in_flight.saturating_sub(1);
                 match result {
@@ -702,6 +731,98 @@ impl App {
                     }
                 }
             }
+            Data::PlanSubmitted(outcome) => {
+                let success = matches!(outcome, SubmissionOutcome::Executed(_));
+                let message = outcome.message();
+                if success {
+                    self.plan_review = None;
+                    self.status = Status {
+                        text: message,
+                        tone: Tone::Info,
+                    };
+                } else if let Some(review) = self.plan_review.as_mut() {
+                    review.receive(outcome);
+                    self.status = Status {
+                        text: message,
+                        tone: Tone::Error,
+                    };
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    fn present_plan(&mut self, wire: Vec<u8>) -> Result<(), String> {
+        self.plan_review = Some(PlanReviewPane::from_wire(wire)?);
+        self.status = Status {
+            text: String::from("review the plan · a approve · Esc refuse · j/k scroll"),
+            tone: Tone::Info,
+        };
+        Ok(())
+    }
+
+    fn apply_plan_review(&mut self, action: Action) -> Vec<Request> {
+        match action {
+            Action::Approve => {
+                let Some(approval) = self.plan_review.as_mut().and_then(PlanReviewPane::approve)
+                else {
+                    return Vec::new();
+                };
+                self.status = Status {
+                    text: String::from("submitting reviewed plan for server re-validation…"),
+                    tone: Tone::Info,
+                };
+                vec![Request::ExecuteReviewedPlan(approval)]
+            }
+            Action::Cancel => {
+                let submitting = self
+                    .plan_review
+                    .as_ref()
+                    .is_some_and(PlanReviewPane::is_submitting);
+                if submitting {
+                    self.status = Status {
+                        text: String::from(
+                            "approval is already submitted; wait for the server's answer",
+                        ),
+                        tone: Tone::Error,
+                    };
+                } else {
+                    self.plan_review = None;
+                    self.status = Status {
+                        text: String::from("plan refused locally · nothing was executed"),
+                        tone: Tone::Info,
+                    };
+                }
+                Vec::new()
+            }
+            Action::CursorDown => {
+                if let Some(review) = self.plan_review.as_mut() {
+                    review.scroll(1);
+                }
+                Vec::new()
+            }
+            Action::CursorUp => {
+                if let Some(review) = self.plan_review.as_mut() {
+                    review.scroll(-1);
+                }
+                Vec::new()
+            }
+            Action::Quit => {
+                self.quit = true;
+                Vec::new()
+            }
+            Action::FocusNext
+            | Action::FocusPrev
+            | Action::Focus(_)
+            | Action::Refresh
+            | Action::Activate
+            | Action::ParentPrev
+            | Action::ParentNext
+            | Action::HorizontalLeft
+            | Action::HorizontalRight
+            | Action::PreviewSelection
+            | Action::PreviewWholeTree
+            | Action::Discard => Vec::new(),
         }
     }
 
@@ -1921,5 +2042,37 @@ mod tests {
         assert_eq!(app.status.tone, Tone::Error);
         assert!(app.status.text.contains("generation did not match"));
         assert!(app.apply(Action::Approve).is_empty());
+    }
+
+    #[test]
+    fn immutable_plan_review_blocks_staging_and_submits_the_exact_wire() {
+        let mut app = loaded(THREE);
+        let wire = format!(
+            " {}\n",
+            serde_json::to_string(&plan(GitOperation::StageAll)).unwrap()
+        )
+        .into_bytes();
+        app.receive(Data::PlanReady(Ok(wire.clone())));
+
+        assert!(app.plan_review.is_some());
+        let focus = app.focus;
+        assert!(app.apply(Action::FocusNext).is_empty());
+        assert_eq!(app.focus, focus, "the modal leaked navigation to the shell");
+        assert!(app.apply(Action::PreviewWholeTree).is_empty());
+
+        let requests = app.apply(Action::Approve);
+        let [Request::ExecuteReviewedPlan(approval)] = requests.as_slice() else {
+            panic!("approval did not use the exact-wire submission path: {requests:?}");
+        };
+        assert_eq!(approval.body(), wire);
+        assert!(
+            app.apply(Action::Approve).is_empty(),
+            "double approval escaped"
+        );
+        assert!(app.apply(Action::Cancel).is_empty());
+        assert!(
+            app.plan_review.is_some(),
+            "an in-flight approval was dismissed"
+        );
     }
 }

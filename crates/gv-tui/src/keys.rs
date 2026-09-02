@@ -15,7 +15,7 @@
 //! | `k`, `↑` | cursor up |
 //! | `Enter` | load a repository, open a commit, or follow a parent |
 //! | `Space` | preview selected working-tree file / diff file / hunk / line |
-//! | `a` | preview stage-all or unstage-all from the selected status section |
+//! | `a` | preview stage-all/unstage-all in Working Tree; approve plan elsewhere |
 //! | `d` | guard discard of the selected unstaged tracked path |
 //! | `y` | approve the visible discard confirmation or plan review |
 //! | `n`, `Esc` | refuse the visible confirmation or plan review |
@@ -64,6 +64,7 @@ pub fn dispatch(key: KeyEvent, pane: Pane) -> Option<Action> {
             Some(Action::PreviewSelection)
         }
         KeyCode::Char('a') if pane == Pane::WorkingTree => Some(Action::PreviewWholeTree),
+        KeyCode::Char('a') => Some(Action::Approve),
         KeyCode::Char('d') if pane == Pane::WorkingTree => Some(Action::Discard),
         KeyCode::Char('[') if pane == Pane::Main => Some(Action::ParentPrev),
         KeyCode::Char(']') if pane == Pane::Main => Some(Action::ParentNext),
@@ -233,7 +234,7 @@ mod tests {
         assert_eq!(global(press(KeyCode::Char('y'))), Some(Action::Approve));
         assert_eq!(global(press(KeyCode::Char('n'))), Some(Action::Cancel));
         assert_eq!(global(press(KeyCode::Esc)), Some(Action::Cancel));
-        assert_eq!(global(press(KeyCode::Char('a'))), None);
+        assert_eq!(global(press(KeyCode::Char('a'))), Some(Action::Approve));
         assert_eq!(global(press(KeyCode::Char('d'))), None);
     }
 

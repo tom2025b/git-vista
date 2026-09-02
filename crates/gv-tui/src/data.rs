@@ -25,9 +25,11 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::app::{Data, Request};
+use crate::panes::plan_review::{PlanApproval, SubmissionOutcome};
 
 pub const CATALOG_PATH: &str = "/api/catalog";
 pub const HISTORY_LIMIT: usize = 250;
+pub const EXECUTE_PLAN_PATH: &str = "/api/execute-plan";
 
 pub type FetchFn = Box<dyn FnMut(&str, &str) -> Result<HttpResponse, String> + Send>;
 pub type PostFn = Box<dyn FnMut(&str, &[u8], &str, &str) -> Result<HttpResponse, String> + Send>;
@@ -196,6 +198,9 @@ impl Client {
                 let result = self.post_idempotent("/api/execute-plan", &plan, &key);
                 Data::Written { repo, result }
             }
+            Request::ExecuteReviewedPlan(approval) => {
+                Data::PlanSubmitted(self.submit_reviewed_plan(&approval))
+            }
             Request::ApplyPatch { repo, plan } => {
                 let body =
                     serde_json::to_vec(&plan).expect("PatchPlan serialization is infallible");
@@ -205,6 +210,43 @@ impl Client {
                 Data::Written { repo, result }
             }
         }
+    }
+
+    fn submit_reviewed_plan(&mut self, approval: &PlanApproval) -> SubmissionOutcome {
+        if self.session.is_none() {
+            match (self.auth)() {
+                Ok(session) => self.session = Some(session),
+                Err(message) => return SubmissionOutcome::TransportFailed(message),
+            }
+        }
+
+        let response = self.post_reviewed_approval(approval);
+        let response = match response {
+            Ok(response) if response.status == 401 => {
+                match (self.auth)() {
+                    Ok(session) => self.session = Some(session),
+                    Err(message) => return SubmissionOutcome::TransportFailed(message),
+                }
+                self.post_reviewed_approval(approval)
+            }
+            other => other,
+        };
+
+        match response {
+            Ok(response) => SubmissionOutcome::from_response(response.status, &response.body),
+            Err(message) => SubmissionOutcome::TransportFailed(message),
+        }
+    }
+
+    fn post_reviewed_approval(&mut self, approval: &PlanApproval) -> Result<HttpResponse, String> {
+        let session = self.session.as_ref().expect("authenticated above");
+        (self.post_idempotent)(
+            EXECUTE_PLAN_PATH,
+            approval.body(),
+            &session.cookie,
+            &session.csrf,
+            approval.key(),
+        )
     }
 }
 
@@ -297,6 +339,9 @@ fn stopped_answer(request: Request) -> Data {
             repo,
             result: Err(message()),
         },
+        Request::ExecuteReviewedPlan(_) => {
+            Data::PlanSubmitted(SubmissionOutcome::TransportFailed(message()))
+        }
     }
 }
 
@@ -314,6 +359,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::panes::plan_review::PlanReviewPane;
 
     const ALPHA: &str = r#"[
       {"repository":"r1","worktree":"w1","name":"alpha","kind":"main_worktree","read_only":false}
@@ -352,6 +398,12 @@ mod tests {
             advisories: Vec::new(),
             recovery: RecoveryStrategy::NotNeeded,
         }
+    }
+
+    fn reviewed_approval() -> (Vec<u8>, PlanApproval) {
+        let wire = format!(" {}\n", serde_json::to_string(&plan()).unwrap()).into_bytes();
+        let mut pane = PlanReviewPane::from_wire(wire.clone()).unwrap();
+        (wire, pane.approve().unwrap())
     }
 
     fn patch_plan() -> PatchPlan {
@@ -756,5 +808,33 @@ mod tests {
             None => panic!("a stopped worker silently lost the request"),
             Some(_) => panic!("a catalog request became a different answer kind"),
         }
+    }
+
+    #[test]
+    fn reviewed_submission_posts_exact_bytes_and_a_409_is_not_retried() {
+        let (wire, approval) = reviewed_approval();
+        let expected = wire.clone();
+        let posts = Arc::new(AtomicUsize::new(0));
+        let post_count = Arc::clone(&posts);
+        let mut client = Client::with_http(
+            Box::new(|_, _| panic!("approval is not a GET")),
+            Box::new(|_, _, _, _| panic!("approval is idempotent")),
+            Box::new(move |path, body, cookie, csrf, key| {
+                post_count.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(path, EXECUTE_PLAN_PATH);
+                assert_eq!(body, expected);
+                assert_eq!(cookie, "gv_session=gen1");
+                assert_eq!(csrf, "csrf-gen1");
+                assert!(key.starts_with("tui-"));
+                Ok(response(409, "some untyped conflict prose"))
+            }),
+            Box::new(|| Ok(session(1))),
+        );
+
+        assert!(matches!(
+            client.serve(Request::ExecuteReviewedPlan(approval)),
+            Data::PlanSubmitted(SubmissionOutcome::Stale)
+        ));
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
     }
 }

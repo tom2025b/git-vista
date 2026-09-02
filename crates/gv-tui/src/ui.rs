@@ -9,13 +9,14 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::{review_lines, App, Pane, Tone};
 use crate::layout;
 use crate::panes::detail::RowTone;
 use crate::panes::graph::{self, ColorDepth, Emphasis, Foreground, GraphLine, LayoutData};
+use crate::panes::plan_review::{PlanReviewPane, RowTone as PlanRowTone};
 use crate::panes::staging::Tone as StagingTone;
 use crate::panes::worktree::LoadState;
 
@@ -53,6 +54,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_worktree(frame, panes.of(Pane::WorkingTree), app);
     draw_commits(frame, panes.of(Pane::Commits), app, detect_color_depth());
     draw_main(frame, panes.of(Pane::Main), app);
+    if let Some(review) = &app.plan_review {
+        draw_plan_review(frame, area, review);
+    }
 
     let status_style = match app.status.tone {
         Tone::Info => Style::default(),
@@ -62,6 +66,50 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Paragraph::new(app.status.text.as_str()).style(status_style),
         panes.status,
     );
+}
+
+fn draw_plan_review(frame: &mut Frame, area: Rect, review: &PlanReviewPane) {
+    let margin_x = if area.width >= 70 { 4 } else { 1 };
+    let margin_y = if area.height >= 18 { 2 } else { 1 };
+    let modal = Rect {
+        x: area.x + margin_x,
+        y: area.y + margin_y,
+        width: area.width.saturating_sub(margin_x * 2),
+        height: area.height.saturating_sub(margin_y * 2 + 1),
+    };
+    let block = Block::bordered()
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Line::styled(
+            " Plan review — nothing runs until approval ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Line::from(format!(" {} ", review.help())));
+    let lines: Vec<Line<'static>> = review
+        .rows()
+        .into_iter()
+        .skip(review.offset())
+        .map(|row| Line::styled(row.text, plan_tone_style(row.tone)))
+        .collect();
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(block),
+        modal,
+    );
+}
+
+fn plan_tone_style(tone: PlanRowTone) -> Style {
+    match tone {
+        PlanRowTone::Plain => Style::default(),
+        PlanRowTone::Heading => Style::default().add_modifier(Modifier::BOLD),
+        PlanRowTone::Muted => Style::default().fg(Color::DarkGray),
+        PlanRowTone::Risk => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        PlanRowTone::Advisory => Style::default().fg(Color::Yellow),
+        PlanRowTone::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    }
 }
 
 fn pane_block(pane: Pane, focus: Pane) -> Block<'static> {
@@ -940,5 +988,44 @@ mod tests {
                 "missing {expected}:\n{plan_screen}"
             );
         }
+    }
+
+    #[test]
+    fn immutable_plan_review_overlays_the_worktree_and_patch_surfaces() {
+        let mut app = loaded();
+        let plan = Plan {
+            repository: RepositoryToken::new("repo-1").unwrap(),
+            worktree: WorktreeToken::new("worktree-1").unwrap(),
+            generation: GenerationToken::new("generation-reviewed").unwrap(),
+            operation: GitOperation::StageAll,
+            operation_hash: OperationHash::new("a".repeat(64)).unwrap(),
+            issued_at: UnixSeconds(1_788_365_000),
+            expires_at: UnixSeconds(1_788_365_300),
+            risk: RiskLevel::Remote,
+            preconditions: Vec::new(),
+            expected_ref_changes: Vec::new(),
+            advisories: Vec::new(),
+            recovery: RecoveryStrategy::NotNeeded,
+        };
+        app.receive(Data::PlanReady(Ok(serde_json::to_vec(&plan).unwrap())));
+        let terminal = rendered(100, 30, &app);
+        let buffer = terminal.backend().buffer();
+        let screen = text(buffer);
+        for expected in [
+            "Plan review",
+            "nothing runs until approval",
+            "a approve",
+            "Esc refuse",
+            "expires: 1788365300",
+            "Preconditions",
+            "Expected ref changes",
+            "REMOTE",
+        ] {
+            assert!(screen.contains(expected), "missing {expected:?}:\n{screen}");
+        }
+        assert!(
+            buffer.content().iter().any(|cell| cell.fg == Color::Yellow),
+            "the modal had no review/risk emphasis"
+        );
     }
 }

@@ -31,6 +31,9 @@ mod conflicts;
 mod diff;
 mod graph;
 mod operations;
+// M10.08 A6 (#594): the /api/plan -> /api/preview round trip the confirm
+// dialogs draw their before/after picture from.
+mod preview;
 mod remotes;
 mod repositories;
 mod session;
@@ -57,6 +60,7 @@ pub use graph::{fetch_frame, fetch_page};
 pub use operations::{
     cancel_operation_request, fetch_operation_status, resolve_operation_id, CancelOutcome,
 };
+pub use preview::{plan_request, preview_request};
 pub use remotes::{fetch_request, preview_push, pull_request, push_request};
 pub use repositories::{
     delete_clone_request, fetch_catalog, rescan_request, reset_test_repo_request, select_request,
