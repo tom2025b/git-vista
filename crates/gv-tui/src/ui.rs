@@ -70,10 +70,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Tone::Info => Style::default(),
         Tone::Error => Style::default().fg(Color::Red),
     };
-    frame.render_widget(
-        Paragraph::new(app.status.text.as_str()).style(status_style),
-        panes.status,
-    );
+    let status = app
+        .command_input
+        .as_ref()
+        .map_or_else(|| app.status.text.clone(), |input| format!(":{input}█"));
+    frame.render_widget(Paragraph::new(status).style(status_style), panes.status);
 }
 
 /// Draw plan review as a modal over the shell: no pane underneath can look

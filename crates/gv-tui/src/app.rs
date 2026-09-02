@@ -33,8 +33,11 @@
 
 use git_vista_core::diff::CommitDiff;
 use git_vista_core::model::{CommitDetail, Edge, FrameStub, GraphRow};
-use git_vista_protocol::{HistoryPage, RepositoryDescriptor, RepositoryKind};
+use git_vista_protocol::{
+    GitOperation, HistoryPage, RepositoryDescriptor, RepositoryKind, TagDetail,
+};
 
+use crate::commands::{self, Command};
 use crate::panes::detail::DetailPane;
 use crate::panes::plan_review::{PlanApproval, PlanReviewPane, SubmissionOutcome};
 
@@ -114,6 +117,10 @@ pub enum Action {
     HorizontalRight,
     ApprovePlan,
     RefusePlan,
+    OpenCommand,
+    CommandChar(char),
+    CommandBackspace,
+    SubmitCommand,
 }
 
 /// A read the loop must hand to the data layer. Phase 2a has one.
@@ -123,6 +130,9 @@ pub enum Fetch {
     History { repo: String },
     Commit { repo: String, id: String },
     Diff { repo: String, id: String },
+    Select { repo: String },
+    BuildPlan(GitOperation),
+    Tags { repo: String },
     ExecutePlan(PlanApproval),
 }
 
@@ -131,8 +141,15 @@ pub enum Fetch {
 pub enum Data {
     /// Exact response bytes from `/api/plan`. #461 will produce this answer;
     /// keeping the bytes here avoids a serialize-after-review seam.
-    #[allow(dead_code)] // The producer is deliberately #461, which this pane gates.
     PlanReady(Result<Vec<u8>, String>),
+    Selected {
+        repo: String,
+        result: Result<(), String>,
+    },
+    Tags {
+        repo: String,
+        result: Result<Vec<TagDetail>, String>,
+    },
     Catalog(Result<Vec<RepositoryDescriptor>, String>),
     History {
         repo: String,
@@ -171,6 +188,8 @@ pub struct App {
     pub focus: Pane,
     pub catalog: Vec<RepositoryDescriptor>,
     pub active_repo: Option<String>,
+    /// Repository last acknowledged by `/api/select` in Active mode.
+    pub writable_repo: Option<String>,
     pub commits: Vec<GraphRow>,
     /// The rest of the fetched [`CommitPage`], kept beside `commits` so
     /// `ui.rs` can hand the graph renderer the same lanes core computed —
@@ -183,6 +202,10 @@ pub struct App {
     /// approves or refuses it. #461 hands received `/api/plan` bytes to
     /// [`App::present_plan`]; this slice owns everything after that seam.
     pub plan_review: Option<PlanReviewPane>,
+    /// Text after `:` while the command palette owns the keyboard.
+    pub command_input: Option<String>,
+    /// Last explicit tag listing for the active repository.
+    pub tags: Vec<TagDetail>,
     cursors: [usize; 4],
     pub status: Status,
     /// Catalog reads dispatched and not yet answered.
@@ -203,12 +226,15 @@ impl App {
             focus: Pane::Repositories,
             catalog: Vec::new(),
             active_repo: None,
+            writable_repo: None,
             commits: Vec::new(),
             edges: Vec::new(),
             stubs: Vec::new(),
             lane_count: 0,
             detail: DetailPane::default(),
             plan_review: None,
+            command_input: None,
+            tags: Vec::new(),
             cursors: [0; 4],
             status: Status {
                 text: String::from("connecting to git-vista-server…"),
@@ -229,6 +255,9 @@ impl App {
     pub fn apply(&mut self, action: Action) -> Vec<Fetch> {
         if self.plan_review.is_some() {
             return self.apply_plan_review(action);
+        }
+        if self.command_input.is_some() {
+            return self.apply_command(action);
         }
         match action {
             Action::Quit => {
@@ -289,13 +318,66 @@ impl App {
                 }
                 Vec::new()
             }
-            Action::ApprovePlan | Action::RefusePlan => Vec::new(),
+            Action::OpenCommand => self.open_command(),
+            Action::ApprovePlan
+            | Action::RefusePlan
+            | Action::CommandChar(_)
+            | Action::CommandBackspace
+            | Action::SubmitCommand => Vec::new(),
         }
     }
 
     /// Fold one answer in.
     pub fn receive(&mut self, data: Data) {
         match data {
+            Data::Selected { repo, result } => match result {
+                Ok(()) if self.active_repo.as_deref() == Some(repo.as_str()) => {
+                    self.writable_repo = Some(repo);
+                    self.status = Status {
+                        text: String::from("repository opened for writes · : commands"),
+                        tone: Tone::Info,
+                    };
+                }
+                Ok(()) => {}
+                Err(message) if self.active_repo.as_deref() == Some(repo.as_str()) => {
+                    self.writable_repo = None;
+                    self.status = Status {
+                        text: format!("repository is not writable: {message}"),
+                        tone: Tone::Error,
+                    };
+                }
+                Err(_) => {}
+            },
+            Data::Tags { repo, result } => {
+                if self.active_repo.as_deref() != Some(repo.as_str()) {
+                    return;
+                }
+                match result {
+                    Ok(tags) => {
+                        self.tags = tags;
+                        let names = self
+                            .tags
+                            .iter()
+                            .map(|tag| tag.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        self.status = Status {
+                            text: if names.is_empty() {
+                                String::from("no tags")
+                            } else {
+                                format!("{} tag(s): {names}", self.tags.len())
+                            },
+                            tone: Tone::Info,
+                        };
+                    }
+                    Err(message) => {
+                        self.status = Status {
+                            text: message,
+                            tone: Tone::Error,
+                        };
+                    }
+                }
+            }
             Data::PlanReady(result) => match result {
                 Ok(wire) => {
                     if let Err(message) = self.present_plan(wire) {
@@ -321,6 +403,8 @@ impl App {
                             !self.catalog.iter().any(|repo| repo.worktree == *active)
                         }) {
                             self.active_repo = None;
+                            self.writable_repo = None;
+                            self.tags.clear();
                             self.commits.clear();
                             self.edges.clear();
                             self.stubs.clear();
@@ -503,7 +587,99 @@ impl App {
             | Action::ParentPrev
             | Action::ParentNext
             | Action::HorizontalLeft
-            | Action::HorizontalRight => Vec::new(),
+            | Action::HorizontalRight
+            | Action::OpenCommand
+            | Action::CommandChar(_)
+            | Action::CommandBackspace
+            | Action::SubmitCommand => Vec::new(),
+        }
+    }
+
+    fn open_command(&mut self) -> Vec<Fetch> {
+        if self.active_repo.is_none() {
+            self.status = Status {
+                text: String::from("select a repository before planning a write"),
+                tone: Tone::Error,
+            };
+        } else if self.writable_repo != self.active_repo {
+            self.status = Status {
+                text: String::from("this repository is not open for writes"),
+                tone: Tone::Error,
+            };
+        } else {
+            self.command_input = Some(String::new());
+            self.status = Status {
+                text: commands::HELP.to_string(),
+                tone: Tone::Info,
+            };
+        }
+        Vec::new()
+    }
+
+    fn apply_command(&mut self, action: Action) -> Vec<Fetch> {
+        match action {
+            Action::Quit => {
+                self.quit = true;
+                Vec::new()
+            }
+            Action::RefusePlan => {
+                self.command_input = None;
+                self.status = Status {
+                    text: String::from("command cancelled · nothing was sent"),
+                    tone: Tone::Info,
+                };
+                Vec::new()
+            }
+            Action::CommandChar(character) => {
+                if let Some(input) = self.command_input.as_mut() {
+                    input.push(character);
+                }
+                Vec::new()
+            }
+            Action::CommandBackspace => {
+                if let Some(input) = self.command_input.as_mut() {
+                    input.pop();
+                }
+                Vec::new()
+            }
+            Action::SubmitCommand => {
+                let input = self.command_input.take().unwrap_or_default();
+                match commands::parse(&input) {
+                    Ok(Command::Plan(operation)) => {
+                        self.status = Status {
+                            text: String::from("building a reviewable plan…"),
+                            tone: Tone::Info,
+                        };
+                        vec![Fetch::BuildPlan(operation)]
+                    }
+                    Ok(Command::ListTags) => {
+                        let repo = self
+                            .active_repo
+                            .clone()
+                            .expect("the palette opens only with an active repository");
+                        self.status = Status {
+                            text: String::from("loading tags…"),
+                            tone: Tone::Info,
+                        };
+                        vec![Fetch::Tags { repo }]
+                    }
+                    Ok(Command::Help) => {
+                        self.status = Status {
+                            text: commands::HELP.to_string(),
+                            tone: Tone::Info,
+                        };
+                        Vec::new()
+                    }
+                    Err(message) => {
+                        self.status = Status {
+                            text: message,
+                            tone: Tone::Error,
+                        };
+                        Vec::new()
+                    }
+                }
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -537,17 +713,16 @@ impl App {
     }
 
     fn activate_repository(&mut self) -> Vec<Fetch> {
-        let Some(repo) = self
-            .catalog
-            .get(self.cursor(Pane::Repositories))
-            .map(|repo| repo.worktree.clone())
-        else {
+        let Some(descriptor) = self.catalog.get(self.cursor(Pane::Repositories)).cloned() else {
             return Vec::new();
         };
+        let repo = descriptor.worktree;
         if self.history_in_flight.as_deref() == Some(repo.as_str()) {
             return Vec::new();
         }
         if self.active_repo.as_deref() != Some(repo.as_str()) {
+            self.writable_repo = None;
+            self.tags.clear();
             self.commits.clear();
             self.edges.clear();
             self.stubs.clear();
@@ -563,7 +738,11 @@ impl App {
             text: String::from("loading commits…"),
             tone: Tone::Info,
         };
-        vec![Fetch::History { repo }]
+        let mut requests = vec![Fetch::History { repo: repo.clone() }];
+        if !descriptor.read_only {
+            requests.push(Fetch::Select { repo });
+        }
+        requests
     }
 
     fn open_detail(&mut self, repo: String, id: String) -> Vec<Fetch> {
@@ -925,9 +1104,75 @@ mod tests {
     }
 
     #[test]
+    fn writable_selection_precedes_a_closed_command_and_shared_plan_review() {
+        let mut app = loaded(THREE);
+        let requests = app.apply(Action::Activate);
+        assert!(matches!(
+            requests.as_slice(),
+            [Fetch::History { repo: history }, Fetch::Select { repo: selected }]
+                if history == "w1" && selected == "w1"
+        ));
+
+        assert!(app.apply(Action::OpenCommand).is_empty());
+        assert!(
+            app.command_input.is_none(),
+            "selection was not acknowledged"
+        );
+        app.receive(Data::Selected {
+            repo: "w1".to_string(),
+            result: Ok(()),
+        });
+        app.apply(Action::OpenCommand);
+        assert_eq!(app.command_input.as_deref(), Some(""));
+        for character in "branch delete topic".chars() {
+            app.apply(Action::CommandChar(character));
+        }
+        assert_eq!(
+            app.apply(Action::SubmitCommand),
+            [Fetch::BuildPlan(GitOperation::DeleteBranch {
+                branch: git_vista_protocol::BranchName::new("topic").unwrap(),
+            })]
+        );
+        assert!(app.command_input.is_none());
+
+        app.receive(Data::PlanReady(Ok(plan_wire())));
+        assert!(app.plan_review.is_some());
+        assert!(app.apply(Action::FocusNext).is_empty());
+        assert!(matches!(
+            app.apply(Action::ApprovePlan).as_slice(),
+            [Fetch::ExecutePlan(_)]
+        ));
+    }
+
+    #[test]
+    fn malformed_commands_and_palette_cancellation_send_nothing() {
+        let mut app = loaded(THREE);
+        app.apply(Action::Activate);
+        app.receive(Data::Selected {
+            repo: "w1".to_string(),
+            result: Ok(()),
+        });
+
+        app.apply(Action::OpenCommand);
+        for character in "push main origin --force".chars() {
+            app.apply(Action::CommandChar(character));
+        }
+        assert!(app.apply(Action::SubmitCommand).is_empty());
+        assert!(app.status.text.contains("unknown push flag"));
+
+        app.apply(Action::OpenCommand);
+        app.apply(Action::CommandChar('x'));
+        app.apply(Action::CommandBackspace);
+        assert_eq!(app.command_input.as_deref(), Some(""));
+        assert!(app.apply(Action::RefusePlan).is_empty());
+        assert!(app.command_input.is_none());
+        assert!(app.status.text.contains("nothing was sent"));
+    }
+
+    #[test]
     fn a_history_answer_populates_commits_and_enter_requests_detail_and_diff() {
         let mut app = loaded(THREE);
-        assert_eq!(app.apply(Action::Activate).len(), 1);
+        assert_eq!(app.apply(Action::Activate).len(), 2);
         app.receive(Data::History {
             repo: "w1".to_string(),
             result: Ok(page(&[(COMMIT_1, "first"), (COMMIT_2, "second")])),

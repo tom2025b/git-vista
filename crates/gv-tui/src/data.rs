@@ -17,6 +17,7 @@ use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
+use git_vista_protocol::{RepoMode, SelectRequest};
 use git_vista_session::auth::{self, Session};
 use git_vista_session::http::{self, HttpResponse};
 use git_vista_session::retry;
@@ -28,9 +29,12 @@ use crate::panes::plan_review::{PlanApproval, SubmissionOutcome};
 pub const CATALOG_PATH: &str = "/api/catalog";
 pub const HISTORY_LIMIT: usize = 250;
 pub const EXECUTE_PLAN_PATH: &str = "/api/execute-plan";
+pub const PLAN_PATH: &str = "/api/plan";
+pub const SELECT_PATH: &str = "/api/select";
 
 pub type FetchFn = Box<dyn FnMut(&str, &str) -> Result<HttpResponse, String> + Send>;
-pub type PostFn =
+pub type PostFn = Box<dyn FnMut(&str, &[u8], &str, &str) -> Result<HttpResponse, String> + Send>;
+pub type IdempotentPostFn =
     Box<dyn FnMut(&str, &[u8], &str, &str, &str) -> Result<HttpResponse, String> + Send>;
 pub type AuthFn = Box<dyn FnMut() -> Result<Session, String> + Send>;
 
@@ -38,6 +42,7 @@ pub struct Client {
     session: Option<Session>,
     fetch: FetchFn,
     post: PostFn,
+    idempotent_post: IdempotentPostFn,
     auth: AuthFn,
 }
 
@@ -45,6 +50,9 @@ impl Client {
     pub fn live() -> Client {
         Client::with_transport(
             Box::new(|path, cookie| http::get(path, Some(cookie))),
+            Box::new(|path, body, cookie, csrf| {
+                http::post_json(path, body, Some(cookie), Some(csrf))
+            }),
             Box::new(|path, body, cookie, csrf, key| {
                 http::post_json_idempotent(path, body, Some(cookie), Some(csrf), key)
             }),
@@ -56,6 +64,9 @@ impl Client {
     pub fn with(fetch: FetchFn, auth: AuthFn) -> Client {
         Client::with_transport(
             fetch,
+            Box::new(|path, body, cookie, csrf| {
+                http::post_json(path, body, Some(cookie), Some(csrf))
+            }),
             Box::new(|path, body, cookie, csrf, key| {
                 http::post_json_idempotent(path, body, Some(cookie), Some(csrf), key)
             }),
@@ -63,11 +74,17 @@ impl Client {
         )
     }
 
-    pub fn with_transport(fetch: FetchFn, post: PostFn, auth: AuthFn) -> Client {
+    pub fn with_transport(
+        fetch: FetchFn,
+        post: PostFn,
+        idempotent_post: IdempotentPostFn,
+        auth: AuthFn,
+    ) -> Client {
         Client {
             session: None,
             fetch,
             post,
+            idempotent_post,
             auth,
         }
     }
@@ -98,8 +115,53 @@ impl Client {
                 let result = self.get_json(&path);
                 Data::Diff { repo, id, result }
             }
+            Fetch::Select { repo } => {
+                let body = serde_json::to_vec(&SelectRequest {
+                    worktree: repo.clone(),
+                    mode: RepoMode::Active,
+                })
+                .map_err(|error| error.to_string());
+                let result = body.and_then(|body| self.post_json(SELECT_PATH, &body).map(|_| ()));
+                Data::Selected { repo, result }
+            }
+            Fetch::BuildPlan(operation) => {
+                let body = serde_json::to_vec(&operation).map_err(|error| error.to_string());
+                Data::PlanReady(body.and_then(|body| self.post_json(PLAN_PATH, &body)))
+            }
+            Fetch::Tags { repo } => {
+                let path = format!("/api/tags?repo={repo}");
+                let result = self.get_json(&path);
+                Data::Tags { repo, result }
+            }
             Fetch::ExecutePlan(approval) => Data::PlanSubmitted(self.submit_plan(&approval)),
         }
+    }
+
+    fn post_json(&mut self, path: &str, body: &[u8]) -> Result<Vec<u8>, String> {
+        if self.session.is_none() {
+            self.session = Some((self.auth)()?);
+        }
+        let response = self.post_once(path, body)?;
+        let response = if response.status == 401 {
+            self.session = Some((self.auth)()?);
+            self.post_once(path, body)?
+        } else {
+            response
+        };
+        if (200..=299).contains(&response.status) {
+            Ok(response.body)
+        } else {
+            Err(format!(
+                "POST {path} answered {}: {}",
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            ))
+        }
+    }
+
+    fn post_once(&mut self, path: &str, body: &[u8]) -> Result<HttpResponse, String> {
+        let session = self.session.as_ref().expect("authenticated above");
+        (self.post)(path, body, &session.cookie, &session.csrf)
     }
 
     /// Submit exactly one reviewed plan. Only a 401 earns a retry, and that
@@ -133,7 +195,7 @@ impl Client {
 
     fn post_approval(&mut self, approval: &PlanApproval) -> Result<HttpResponse, String> {
         let session = self.session.as_ref().expect("authenticated above");
-        (self.post)(
+        (self.idempotent_post)(
             EXECUTE_PLAN_PATH,
             approval.body(),
             &session.cookie,
@@ -204,6 +266,15 @@ fn stopped_answer(fetch: Fetch) -> Data {
         Fetch::Diff { repo, id } => Data::Diff {
             repo,
             id,
+            result: Err(message()),
+        },
+        Fetch::Select { repo } => Data::Selected {
+            repo,
+            result: Err(message()),
+        },
+        Fetch::BuildPlan(_) => Data::PlanReady(Err(message())),
+        Fetch::Tags { repo } => Data::Tags {
+            repo,
             result: Err(message()),
         },
         Fetch::ExecutePlan(_) => Data::PlanSubmitted(SubmissionOutcome::TransportFailed(message())),
@@ -455,12 +526,80 @@ mod tests {
     }
 
     #[test]
+    fn selection_and_planning_use_plain_posts_with_typed_exact_bodies() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&calls);
+        let (plan_wire, _) = approval();
+        let answer = plan_wire.clone();
+        let mut client = Client::with_transport(
+            Box::new(|_, _| panic!("selection and planning are not GETs")),
+            Box::new(move |path, body, cookie, csrf| {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push((path.to_string(), body.to_vec()));
+                assert_eq!(cookie, "gv_session=gen1");
+                assert_eq!(csrf, "csrf-gen1");
+                match path {
+                    SELECT_PATH => Ok(response(200, "selected")),
+                    PLAN_PATH => Ok(response(200, &answer)),
+                    _ => panic!("unexpected POST {path}"),
+                }
+            }),
+            Box::new(|_, _, _, _, _| panic!("build-only requests are not idempotent writes")),
+            Box::new(|| Ok(session(1))),
+        );
+
+        assert!(matches!(
+            client.serve(Fetch::Select { repo: "w1".into() }),
+            Data::Selected { result: Ok(()), .. }
+        ));
+        assert!(matches!(
+            client.serve(Fetch::BuildPlan(GitOperation::StageAll)),
+            Data::PlanReady(Ok(body)) if body == plan_wire
+        ));
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, SELECT_PATH);
+        assert_eq!(
+            serde_json::from_slice::<SelectRequest>(&calls[0].1).unwrap(),
+            SelectRequest {
+                worktree: "w1".into(),
+                mode: RepoMode::Active,
+            }
+        );
+        assert_eq!(calls[1].0, PLAN_PATH);
+        assert_eq!(
+            serde_json::from_slice::<GitOperation>(&calls[1].1).unwrap(),
+            GitOperation::StageAll
+        );
+    }
+
+    #[test]
+    fn tag_listing_is_a_scoped_read_not_a_write_disguised_as_a_plan() {
+        let mut client = Client::with(
+            Box::new(|path, cookie| {
+                assert_eq!(path, "/api/tags?repo=w1");
+                assert_eq!(cookie, "gv_session=gen1");
+                Ok(response(200, "[]"))
+            }),
+            Box::new(|| Ok(session(1))),
+        );
+        assert!(matches!(
+            client.serve(Fetch::Tags { repo: "w1".into() }),
+            Data::Tags { result: Ok(tags), .. } if tags.is_empty()
+        ));
+    }
+
+    #[test]
     fn a_409_is_returned_as_stale_after_one_post_with_the_exact_reviewed_bytes() {
         let (wire, approval) = approval();
         let posts = Arc::new(AtomicUsize::new(0));
         let post_count = Arc::clone(&posts);
         let mut client = Client::with_transport(
             Box::new(|_, _| panic!("approval is not a GET")),
+            Box::new(|_, _, _, _| panic!("approval is not a plain POST")),
             Box::new(move |path, body, cookie, csrf, key| {
                 post_count.fetch_add(1, Ordering::SeqCst);
                 assert_eq!(path, EXECUTE_PLAN_PATH);
@@ -496,6 +635,7 @@ mod tests {
         let auth_count = Arc::clone(&auths);
         let mut client = Client::with_transport(
             Box::new(|_, _| panic!("approval is not a GET")),
+            Box::new(|_, _, _, _| panic!("approval is not a plain POST")),
             Box::new(move |_, body, cookie, _csrf, key| {
                 captured
                     .lock()

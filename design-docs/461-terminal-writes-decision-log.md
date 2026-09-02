@@ -78,6 +78,27 @@ that the reviewed plan cannot execute. The terminal will say that and ask for
 a fresh plan. Operation-status, fetch/pull and signing DTOs may be parsed where
 the wire actually carries typed reason fields; prose remains display text.
 
+## 7. First wired checkpoint — selection, command grammar, plan review
+
+- Activating a writable catalog row now issues the existing Active-mode
+  `/api/select` request. The command palette remains unavailable until that
+  exact worktree is acknowledged; read-only catalog rows remain readable but
+  cannot open the palette.
+- `:` owns raw character input until Enter or Esc. Its closed grammar maps
+  branch create/checkout/merge/delete/force-delete, commit, amend, every local
+  and remote tag write, fetch, pull, and push directly into `GitOperation`.
+  Unknown verbs and flags (including bare `--force`) produce no request.
+- `/api/plan` receives the serialized typed operation through the ordinary
+  authenticated POST seam. The exact response bytes go to the existing
+  `PlanReviewPane`; approval still mints the only `PlanApproval` and submits
+  those bytes unchanged through the idempotent execution transport.
+- `tag list` is deliberately a scoped `GET /api/tags?repo=<opaque id>`, not a
+  fake GitOperation and not a write wearing a plan.
+
+Checkpoint verification: `cargo test -p gv-tui --all-targets` counted 99 unit
+tests plus 1 write-boundary integration test, all passing; clippy over all
+targets with warnings denied is clean.
+
 ## Acceptance evidence
 
 Populated with final file:line locations and an explicit `NOT MET` for any gap
