@@ -19,7 +19,8 @@ use git_vista_protocol::{
 use git_vista_conflicts::core::{result_pane_state, ConflictPanes, PaneState, ResultRead};
 
 use super::{
-    network_error, refuse_if_offline, refuse_if_visualize, req_get, user_facing_error, write_json,
+    encode_component, network_error, refuse_if_offline, refuse_if_visualize, req_get,
+    user_facing_error, write_json,
 };
 
 /// Every conflicted path with its three stages described — metadata only, no
@@ -39,14 +40,40 @@ pub async fn fetch_conflicts() -> Result<Vec<ConflictedFile>, String> {
     }
 }
 
+/// [`fetch_conflicts`] pinned to the worktree id already accepted in the
+/// current Frame. Conflict inspection uses this form so every subsequent read
+/// and write names one immutable target even if session selection moves.
+async fn fetch_conflicts_for_repo(repo: &str) -> Result<Vec<ConflictedFile>, String> {
+    let url = format!(
+        "/api/conflicts?repo={}&t={}",
+        encode_component(repo),
+        js_sys::Date::now()
+    );
+    let resp = req_get(&url).send().await.map_err(network_error)?;
+    if resp.ok() {
+        resp.json::<Vec<ConflictedFile>>()
+            .await
+            .map_err(|e| e.to_string())
+    } else {
+        Err(resp
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+    }
+}
+
 /// One conflict stage's blob by object id (`GET /api/blob/{oid}`).
 ///
 /// The oid goes into the URL path unencoded on purpose: the server admits only
 /// 40 or 64 lowercase hex characters and refuses anything else with a 400
 /// before it spawns git, so there is no byte here that percent-encoding would
 /// protect — unlike `fetch_file`'s path, which is arbitrary user text.
-pub async fn fetch_blob(oid: &str) -> Result<BlobContent, String> {
-    let url = format!("/api/blob/{oid}?t={}", js_sys::Date::now());
+pub async fn fetch_blob(repo: &str, oid: &str) -> Result<BlobContent, String> {
+    let url = format!(
+        "/api/blob/{oid}?repo={}&t={}",
+        encode_component(repo),
+        js_sys::Date::now()
+    );
     let resp = req_get(&url).send().await.map_err(network_error)?;
     if resp.ok() {
         resp.json::<BlobContent>().await.map_err(|e| e.to_string())
@@ -69,7 +96,10 @@ pub async fn fetch_blob(oid: &str) -> Result<BlobContent, String> {
 /// Path segments are encoded exactly as `fetch_file` encodes them, and for the
 /// same reason: a `#` or `?` in a filename would otherwise cut the request
 /// short. Slashes stay literal for the server's wildcard route.
-pub async fn fetch_worktree_file(path: &str) -> Result<Option<WorktreeFileContent>, String> {
+pub async fn fetch_worktree_file(
+    repo: &str,
+    path: &str,
+) -> Result<Option<WorktreeFileContent>, String> {
     let encoded: Vec<String> = path
         .split('/')
         .map(|seg| {
@@ -79,8 +109,9 @@ pub async fn fetch_worktree_file(path: &str) -> Result<Option<WorktreeFileConten
         })
         .collect();
     let url = format!(
-        "/api/worktree-file/{}?t={}",
+        "/api/worktree-file/{}?repo={}&t={}",
         encoded.join("/"),
+        encode_component(repo),
         js_sys::Date::now()
     );
     let resp = req_get(&url).send().await.map_err(network_error)?;
@@ -111,8 +142,8 @@ pub async fn fetch_worktree_file(path: &str) -> Result<Option<WorktreeFileConten
 /// set of panes: it means the conflict was resolved (or the repository moved)
 /// while the viewer was open, and showing four empty panes would present that
 /// as a file with nothing on any side.
-pub async fn fetch_conflict_panes(path: &str) -> Result<ConflictPanes, String> {
-    let files = fetch_conflicts().await?;
+pub async fn fetch_conflict_panes(repo: &str, path: &str) -> Result<ConflictPanes, String> {
+    let files = fetch_conflicts_for_repo(repo).await?;
     let file = files
         .into_iter()
         .find(|f| f.path == path)
@@ -125,12 +156,12 @@ pub async fn fetch_conflict_panes(path: &str) -> Result<ConflictPanes, String> {
     // Absent or Unreadable pane into text even if a fetch somehow answered.
     for pane in [&mut panes.base, &mut panes.ours, &mut panes.theirs] {
         if let PaneState::AwaitingContent { oid } = pane.clone() {
-            let fetched = fetch_blob(&oid).await;
+            let fetched = fetch_blob(repo, &oid).await;
             *pane = pane.clone().with_content(fetched);
         }
     }
 
-    panes.result = result_pane_state(match fetch_worktree_file(path).await {
+    panes.result = result_pane_state(match fetch_worktree_file(repo, path).await {
         Ok(Some(file)) => ResultRead::Wrote(file),
         Ok(None) => ResultRead::NoFile,
         Err(e) => ResultRead::Failed(e),
@@ -146,7 +177,11 @@ pub async fn fetch_conflict_panes(path: &str) -> Result<ConflictPanes, String> {
 /// absent, or one that could not be read, each produce a *different* sentence
 /// naming which side and why, and a caller that collapses them into "it
 /// failed" throws away the only thing that tells the user what to do next.
-pub async fn resolve_conflict_request(path: &str, resolution: Resolution) -> Result<(), String> {
+pub async fn resolve_conflict_request(
+    repo: &str,
+    path: &str,
+    resolution: Resolution,
+) -> Result<(), String> {
     refuse_if_offline()?;
     refuse_if_visualize()?;
     // The DTO's `path` is a `WorktreePath`, so an invalid path cannot even be
@@ -156,7 +191,11 @@ pub async fn resolve_conflict_request(path: &str, resolution: Resolution) -> Res
     // listed. It is checked rather than unwrapped because "git said so" is an
     // assumption, and a panic in the client is a blank screen.
     let path = WorktreePath::new(path.to_string()).map_err(|e| e.to_string())?;
-    let body = ResolveConflictRequest { path, resolution };
+    let body = ResolveConflictRequest {
+        repo: repo.to_string(),
+        path,
+        resolution,
+    };
     let (resp, _key) = write_json("/api/resolve-conflict", &body).await?;
     if resp.ok() {
         Ok(())
@@ -175,7 +214,7 @@ pub async fn resolve_conflict_request(path: &str, resolution: Resolution) -> Res
 /// entire purpose is being echoed into a write. Sharing an endpoint would give
 /// every reader a token implying "this can be resubmitted", which the result
 /// pane does not mean.
-pub async fn fetch_conflict_source(path: &str) -> Result<ConflictSource, String> {
+pub async fn fetch_conflict_source(repo: &str, path: &str) -> Result<ConflictSource, String> {
     let encoded: Vec<String> = path
         .split('/')
         .map(|seg| {
@@ -185,8 +224,9 @@ pub async fn fetch_conflict_source(path: &str) -> Result<ConflictSource, String>
         })
         .collect();
     let url = format!(
-        "/api/conflict-source/{}?t={}",
+        "/api/conflict-source/{}?repo={}&t={}",
         encoded.join("/"),
+        encode_component(repo),
         js_sys::Date::now()
     );
     let resp = req_get(&url).send().await.map_err(network_error)?;
@@ -212,6 +252,7 @@ pub async fn fetch_conflict_source(path: &str) -> Result<ConflictSource, String>
 /// things that moved, and collapsing them into "it failed" throws away the
 /// only part that tells the user what to do next.
 pub async fn resolve_conflict_content_request(
+    repo: &str,
     path: &str,
     expected_stages: [Option<CommitOid>; 3],
     expected_source: GenerationToken,
@@ -221,6 +262,7 @@ pub async fn resolve_conflict_content_request(
     refuse_if_visualize()?;
     let path = WorktreePath::new(path.to_string()).map_err(|e| e.to_string())?;
     let body = ResolveConflictContentRequest {
+        repo: repo.to_string(),
         path,
         expected_stages,
         expected_source,

@@ -2,8 +2,10 @@
 //!
 //! Every write handler now does exactly three things: apply its own request
 //! validation (unchanged wording, unchanged status codes), build one variant of
-//! the closed [`GitOperation`] vocabulary (#142), and hand it to
-//! [`plan_and_execute`]. From there this module:
+//! the closed [`GitOperation`] vocabulary (#142), and hand it to this module's
+//! composed-write entry. Most use [`plan_and_execute`]; conflict writes use its
+//! explicit-worktree sibling so a body target cannot collapse back to mutable
+//! session selection (#621). From there this module:
 //!
 //!  1. **builds** the reviewable [`Plan`] — repository/worktree tokens, the
 //!     live generation, the operation's SHA-256 hash, an expiry window, and the
@@ -35,7 +37,7 @@ use axum::http::StatusCode;
 use sha2::{Digest, Sha256};
 
 use git_vista_core::activity::ActivityKind;
-use git_vista_core::identity::{GenerationInputs, RepositoryId};
+use git_vista_core::identity::{GenerationInputs, RepositoryHandle, RepositoryId, WorktreeId};
 use git_vista_core::seed::{parse_seed, Seed};
 use git_vista_protocol::{
     Advisory, BranchName, CommitOid, ForcePublish, GenerationToken, GitOperation, IdempotencyKey,
@@ -69,10 +71,34 @@ const PLAN_TTL_SECS: i64 = 300;
 // ---------------------------------------------------------------------------
 
 /// Build → validate → execute one operation against the current selection.
-/// The single entry point every write handler calls; everything below it is
-/// private to the planner.
+/// The established entry point for selection-scoped write handlers; everything
+/// below it is private to the planner.
 pub(crate) async fn plan_and_execute(op: GitOperation) -> (StatusCode, String) {
-    plan_and_execute_maybe_recovery(op, None, DropProof::Nothing).await
+    plan_and_execute_maybe_recovery(op, None, DropProof::Nothing, MutationTarget::Selection).await
+}
+
+/// Build → validate → execute one operation against an explicitly named
+/// catalog worktree. Repository resolution is independent of the session's
+/// mutable selection; the session's existing Active/Visualize mode remains the
+/// permission gate (#621).
+///
+/// This is deliberately a sibling entry point rather than a temporary
+/// selection followed by [`plan_and_execute`]. Selecting would make a conflict
+/// resolution mutate navigation state, and another request from the same
+/// session could change it again before the detached executor resolved its
+/// target. The opaque id is resolved once here and the resulting path, handle,
+/// and plan tokens travel together through the existing lifecycle funnel.
+pub(crate) async fn plan_and_execute_for_worktree(
+    worktree: WorktreeId,
+    op: GitOperation,
+) -> (StatusCode, String) {
+    plan_and_execute_maybe_recovery(
+        op,
+        None,
+        DropProof::Nothing,
+        MutationTarget::Worktree(worktree),
+    )
+    .await
 }
 
 /// [`plan_and_execute`], for a drop that must first prove the working tree
@@ -86,7 +112,7 @@ pub(crate) async fn plan_and_execute_proving(
     op: GitOperation,
     proof: DropProof,
 ) -> (StatusCode, String) {
-    plan_and_execute_maybe_recovery(op, None, proof).await
+    plan_and_execute_maybe_recovery(op, None, proof, MutationTarget::Selection).await
 }
 
 /// [`plan_and_execute`], for an operation that is itself the executed recovery
@@ -105,7 +131,21 @@ pub(crate) async fn plan_and_execute_recovery(
     op: GitOperation,
     recovers: OperationId,
 ) -> (StatusCode, String) {
-    plan_and_execute_maybe_recovery(op, Some(recovers), DropProof::Nothing).await
+    plan_and_execute_maybe_recovery(
+        op,
+        Some(recovers),
+        DropProof::Nothing,
+        MutationTarget::Selection,
+    )
+    .await
+}
+
+/// Where a composed write resolves its repository. All established writes use
+/// the session selection; the two conflict writes carry an explicit worktree
+/// id because their reads are independently addressable (#621, ADR 0109).
+enum MutationTarget {
+    Selection,
+    Worktree(WorktreeId),
 }
 
 /// The shared body of [`plan_and_execute`] and [`plan_and_execute_recovery`]:
@@ -122,6 +162,7 @@ async fn plan_and_execute_maybe_recovery(
     op: GitOperation,
     recovers: Option<OperationId>,
     proof: DropProof,
+    target: MutationTarget,
 ) -> (StatusCode, String) {
     // The write gate, kept here as well as in the handlers (defense in depth —
     // no operation executes against a Visualize-mode selection).
@@ -141,24 +182,60 @@ async fn plan_and_execute_maybe_recovery(
             ),
         );
     };
-    // D2 (#66, Task 7): the validated resolution — degraded-mode selections
-    // and hostile/out-of-managed-root `.git` geometries refuse here, before
-    // any mutating argv is built. See `state::resolve_target`'s doc comment.
-    let (repo, entry) = match crate::state::resolve_target() {
-        Ok(v) => v,
-        Err(rejected) => return rejected,
+    // D2 (#66, Task 7): resolve and revalidate the exact target before any
+    // mutating argv is built. The selection path retains its established
+    // degraded-mode refusal; an explicit id can only name a catalog entry.
+    let (repo, handle) = match target {
+        MutationTarget::Selection => match crate::state::resolve_target() {
+            Ok((repo, entry)) => (repo, entry.handle),
+            Err(rejected) => return rejected,
+        },
+        MutationTarget::Worktree(worktree) => match resolve_explicit_target(worktree) {
+            Ok(target) => target,
+            Err(rejected) => return rejected,
+        },
     };
-    let repo_id = Some(entry.handle.repository);
+    let repo_id = Some(handle.repository);
+    let tokens = tokens_for_handle(&handle);
     plan_and_execute_tracked(
         key,
         repo,
         repo_id,
-        selection_tokens(),
+        tokens,
         PlanSource::Build(op),
         recovers,
         proof,
     )
     .await
+}
+
+/// Resolve an opaque request worktree id through the server-owned catalog and
+/// freshly re-check the repository's git geometry. This is the explicit-id
+/// counterpart of `state::resolve_target`: it trusts no request path (there is
+/// none), and applies the same two fail-closed checks to the catalog path
+/// before handing it to the planner.
+fn resolve_explicit_target(
+    worktree: WorktreeId,
+) -> Result<(PathBuf, RepositoryHandle), (StatusCode, String)> {
+    let (repo, _catalog_read_only, handle) = crate::state::resolve_worktree(worktree)
+        .ok_or((StatusCode::NOT_FOUND, "No such repository.".to_string()))?;
+    let paths = crate::sandbox::repo_paths::resolve(&repo).map_err(|e| {
+        eprintln!("git-vista: explicit conflict target was refused: {e}");
+        (StatusCode::CONFLICT, e.to_string())
+    })?;
+    if !crate::state::path_is_allowed(&paths.gitdir)
+        || !crate::state::path_is_allowed(&paths.commondir)
+    {
+        eprintln!(
+            "git-vista: explicit conflict target {} was refused — its git directory resolves outside the server's managed root",
+            repo.display()
+        );
+        return Err((
+            StatusCode::CONFLICT,
+            "This repository's git directory is outside the server's managed root.".to_string(),
+        ));
+    }
+    Ok((repo, handle))
 }
 
 /// What [`plan_and_execute_tracked`] runs once admitted: build a plan from a
@@ -264,8 +341,8 @@ impl PlanSource {
 /// - **A retry replays instead of re-running.** A second request carrying the
 ///   same key never reaches the pipeline: it awaits the in-flight record, or
 ///   returns the recorded response verbatim. One user action, one git command.
-/// - **A key reused for a different operation is refused**, never answered with
-///   a result computed for something else.
+/// - **A key reused for a different operation or repository target is
+///   refused**, never answered with a result computed for something else.
 ///
 /// The response body and status are unchanged from before this existed — git's
 /// own message, forwarded verbatim. Only the operation-id response header is
@@ -299,8 +376,8 @@ async fn plan_and_execute_tracked(
         crate::operations::Admission::Conflict => {
             return (
                 StatusCode::CONFLICT,
-                "That idempotency key was already used for a different operation. \
-                 Reload and try again."
+                "That idempotency key was already used for a different operation or \
+                 repository target. Reload and try again."
                     .to_string(),
             );
         }
@@ -626,12 +703,12 @@ pub(crate) async fn submit_plan(
 /// the `PlanSource` once admitted is call [`submit_plan`] — never a second
 /// copy of validate/enforce_fresh/execute.
 ///
-/// One admission subtlety: `admit` keys the idempotency registry on this
-/// *request's* live selection tokens (via `selection_tokens()` below), not
-/// the plan's own `repository`/`worktree` fields — those are compared inside
-/// `submit_plan` itself, after admission. So a retried cross-worktree
-/// submission under the same key replays the original 409 rather than
-/// re-deriving it; that is the correct idempotent behavior, not a gap.
+/// One admission subtlety: `admit` binds the idempotency record to this
+/// *request's* live selection tokens (via `selection_tokens()` below), not the
+/// plan's own `repository`/`worktree` fields — those are compared inside
+/// `submit_plan` itself, after admission. A key retried from another selection
+/// is therefore refused at admission rather than replaying an answer from the
+/// first target (#621).
 pub(crate) async fn submit_plan_tracked(plan: Plan) -> (StatusCode, String) {
     // The write gate, exactly as `plan_and_execute` takes it — a plan is an
     // approval token for a mutation, so executing it is refused the same way
@@ -980,17 +1057,21 @@ async fn observe_for_submission(repo: &Path, plan: &Plan) -> Observed {
 /// repository or worktree" — a bug visible only across two slices.
 pub(crate) fn selection_tokens() -> (RepositoryToken, WorktreeToken) {
     match current_handle() {
-        Some(handle) => (
-            RepositoryToken::new(handle.repository.to_string())
-                .expect("a RepositoryId displays as a non-empty uuid"),
-            WorktreeToken::new(handle.worktree.to_string())
-                .expect("a WorktreeId displays as a non-empty uuid"),
-        ),
+        Some(handle) => tokens_for_handle(&handle),
         None => (
             RepositoryToken::new("unregistered").expect("literal is non-empty"),
             WorktreeToken::new("unregistered").expect("literal is non-empty"),
         ),
     }
+}
+
+fn tokens_for_handle(handle: &RepositoryHandle) -> (RepositoryToken, WorktreeToken) {
+    (
+        RepositoryToken::new(handle.repository.to_string())
+            .expect("a RepositoryId displays as a non-empty uuid"),
+        WorktreeToken::new(handle.worktree.to_string())
+            .expect("a WorktreeId displays as a non-empty uuid"),
+    )
 }
 
 /// Whether a drop may proceed (#514, ADR 0090). Called **inside the
