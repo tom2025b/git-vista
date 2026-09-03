@@ -17,29 +17,33 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Path as AxumPath, Query};
+use axum::extract::{Extension, Path as AxumPath, Query};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use git_vista_core::activity::{
-    assemble_feed, ActivityEvent, ActivityKind, ActivitySource, RefsAtEvent, UndoAction, Undoable,
+    assemble_feed, ActivityEvent, ActivityKind, ActivitySource, ReflogEntry, RefsAtEvent,
+    UndoAction, Undoable,
 };
 use git_vista_core::model::RefKind;
 use git_vista_git::{read_commit, read_reflogs, read_refs, read_remote_commits, RepoError};
-use git_vista_protocol::{BranchName, CommitOid, GitOperation};
+use git_vista_protocol::{ActivityPage, BranchName, CommitOid, GenerationToken, GitOperation};
 
 use crate::git_cmd;
+use crate::history::{CursorCodec, CursorScope};
 use crate::journal;
 
-/// How many events the feed returns by default, and at most. The panel shows
-/// a scrollable list, not an archive; anyone needing more can raise `limit`
-/// up to the cap.
+/// How many events one page returns by default, and at most. `MAX_PAGE_LIMIT`
+/// bounds one response, never the folded feed: older events remain reachable
+/// through the response cursor.
 const DEFAULT_LIMIT: usize = 100;
-const MAX_LIMIT: usize = 500;
+const MAX_PAGE_LIMIT: usize = 500;
 
 /// Reflog entries read per ref. A rebase writes one line per replayed commit,
 /// so this is deliberately far above the feed limit.
@@ -48,7 +52,19 @@ const REFLOG_PER_REF: usize = 200;
 #[derive(Deserialize)]
 pub struct ActivityParams {
     pub limit: Option<usize>,
+    pub cursor: Option<String>,
 }
+
+/// The position inside one exact folded-feed snapshot. It is never exposed
+/// directly: [`CursorCodec`] signs it together with repository scope and the
+/// feed generation before it reaches the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct ActivityCursor {
+    next_event: usize,
+}
+
+/// The server's concrete activity-page response.
+type Page = ActivityPage<ActivityEvent>;
 
 /// Unix seconds now; the timestamp journaled onto synthesized events.
 pub fn now_secs() -> i64 {
@@ -60,14 +76,29 @@ pub fn now_secs() -> i64 {
 
 /// The feed: journal + reflogs + snapshot diff, folded newest-first.
 pub async fn activity_feed(
+    Extension(codec): Extension<Arc<CursorCodec>>,
     Query(params): Query<ActivityParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let (repo, read_only) = crate::state::current();
-    let limit = params.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+    let canonical = repo.canonicalize().unwrap_or_else(|_| repo.clone());
+    let handle = crate::state::current_handle();
+    let scope = codec.scope_for_target(handle.as_ref(), &canonical);
+    let page = activity_page_for_target(&repo, read_only, scope, &params, codec.as_ref())?;
+    let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
+    Ok((no_store, Json(page)))
+}
 
+/// Collect and fold every event available in the bounded journal/reflog source
+/// windows. Paging is applied only after this returns: passing `usize::MAX`
+/// here is the mechanism that makes the old 500-event total ceiling disappear
+/// from both the query path and the cursor path.
+fn collect_activity_feed(
+    repo: &Path,
+    read_only: bool,
+) -> Result<Vec<ActivityEvent>, (StatusCode, String)> {
     // The current local branch → tip map: the baseline for undo hints and for
     // the next snapshot.
-    let refs = read_refs(&repo).map_err(|e| {
+    let refs = read_refs(repo).map_err(|e| {
         eprintln!("git-vista: /api/activity failed reading refs: {e}");
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
@@ -83,11 +114,11 @@ pub async fn activity_feed(
     // synthesized event *before* rewriting the snapshot, so it's remembered
     // exactly once, with the last tip we saw — which is what makes even a
     // terminal deletion restorable.
-    if let Some(snapshot) = journal::read_snapshot(&repo) {
+    if let Some(snapshot) = journal::read_snapshot(repo) {
         for (name, tip) in &snapshot {
             if !branches.contains_key(name) {
                 journal::append(
-                    &repo,
+                    repo,
                     &ActivityEvent {
                         time: now_secs(),
                         kind: ActivityKind::BranchDeleted,
@@ -132,10 +163,10 @@ pub async fn activity_feed(
             }
         }
     }
-    journal::write_snapshot(&repo, &branches);
+    journal::write_snapshot(repo, &branches);
 
-    let journal_events = journal::read_all(&repo);
-    let reflog = read_reflogs(&repo, REFLOG_PER_REF).map_err(|e| {
+    let journal_events = journal::read_all(repo);
+    let reflog = read_reflogs(repo, REFLOG_PER_REF).map_err(|e| {
         eprintln!("git-vista: /api/activity failed reading reflogs: {e}");
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
@@ -143,9 +174,9 @@ pub async fn activity_feed(
     // reset-style undo hints. Best-effort: no remote (or a failed walk) just
     // means no warnings.
     let remote: HashSet<String> =
-        read_remote_commits(&repo, crate::state::HISTORY_LIMIT).unwrap_or_default();
+        read_remote_commits(repo, crate::state::HISTORY_LIMIT).unwrap_or_default();
 
-    let mut feed = assemble_feed(journal_events, reflog, &branches, &remote, limit);
+    let mut feed = assemble_feed(journal_events, reflog, &branches, &remote, usize::MAX);
     // A read-only clone can't undo anything (`/api/undo` would 403), so its
     // feed carries no hints — the UI then simply never shows an Undo control.
     if read_only {
@@ -164,8 +195,103 @@ pub async fn activity_feed(
         feed.iter().filter(|e| e.undo.is_some()).count(),
     );
 
-    let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
-    Ok((no_store, Json(feed)))
+    Ok(feed)
+}
+
+/// Digest the exact fully folded response source. A cursor's row number is
+/// usable only while this token still matches; any head insertion, deletion,
+/// re-fold, changed undo hint, or changed ref capture refuses the cursor with
+/// 409 instead of applying an offset to a different sequence.
+fn activity_generation(feed: &[ActivityEvent]) -> Result<GenerationToken, (StatusCode, String)> {
+    let bytes = serde_json::to_vec(feed).map_err(|e| {
+        eprintln!("git-vista: /api/activity could not serialize its snapshot: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not serialize the activity feed".to_string(),
+        )
+    })?;
+    GenerationToken::new(format!("activity-v1:{:x}", Sha256::digest(bytes))).map_err(|e| {
+        eprintln!("git-vista: /api/activity could not build its generation: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not identify the activity feed".to_string(),
+        )
+    })
+}
+
+/// Build one page against an exact folded snapshot.
+fn activity_page_for_target(
+    repo: &Path,
+    read_only: bool,
+    scope: CursorScope,
+    params: &ActivityParams,
+    codec: &CursorCodec,
+) -> Result<Page, (StatusCode, String)> {
+    // Authenticate and scope-check before touching repository sources. The
+    // generation comparison necessarily waits for the fresh fold below, but a
+    // forged or foreign cursor should not buy an attacker a journal/reflog
+    // scan first.
+    let decoded = match params.cursor.as_deref() {
+        None => None,
+        Some(encoded) => {
+            let decoded = codec
+                .decode::<ActivityCursor>(encoded)
+                .map_err(|_| invalid_activity_cursor())?;
+            if decoded.scope != scope {
+                return Err(invalid_activity_cursor());
+            }
+            Some(decoded)
+        }
+    };
+    let feed = collect_activity_feed(repo, read_only)?;
+    let generation = activity_generation(&feed)?;
+    let start = match decoded {
+        None => 0,
+        Some(decoded) => {
+            if decoded.generation != generation {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "activity moved; restart from the first page".to_string(),
+                ));
+            }
+            if decoded.state.next_event > feed.len() {
+                return Err(invalid_activity_cursor());
+            }
+            decoded.state.next_event
+        }
+    };
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_LIMIT)
+        .clamp(1, MAX_PAGE_LIMIT);
+    let end = start.saturating_add(limit).min(feed.len());
+    let cursor = if end < feed.len() {
+        Some(
+            codec
+                .encode(scope, &generation, &ActivityCursor { next_event: end })
+                .map_err(|_| {
+                    eprintln!("git-vista: /api/activity could not sign a cursor");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "could not sign an activity cursor".to_string(),
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+
+    Ok(Page {
+        events: feed[start..end].to_vec(),
+        cursor,
+    })
+}
+
+fn invalid_activity_cursor() -> (StatusCode, String) {
+    (
+        StatusCode::BAD_REQUEST,
+        "invalid activity cursor".to_string(),
+    )
 }
 
 /// The conventional 7-char short id, for labels and log lines.
@@ -265,21 +391,7 @@ pub async fn undoables(
     let remote: HashSet<String> =
         read_remote_commits(&repo, crate::state::HISTORY_LIMIT).unwrap_or_default();
 
-    let feed = assemble_feed(journal_events, reflog, &branches, &remote, MAX_LIMIT);
-    let mut out: Vec<Undoable> = Vec::new();
-    for event in feed {
-        let Some(undoable) = event.undo else { continue };
-        // The commit each hint is "about": the state a reset would discard,
-        // or the tip a restore would bring back — i.e. the dot being tapped.
-        let about = match &undoable.action {
-            UndoAction::ResetBranch { expected_tip, .. } => expected_tip.as_str(),
-            UndoAction::RestoreBranch { tip, .. } => tip.as_str(),
-            UndoAction::RevertCommit { commit } => commit.as_str(),
-        };
-        if about == full && !out.contains(&undoable) {
-            out.push(undoable);
-        }
-    }
+    let mut out = matching_feed_undoables(journal_events, reflog, &branches, &remote, &full);
     // #327 defect A: offer the revert only once it is established live that
     // it will actually apply — see this function's doc comment for why the
     // check runs here, lazily, for this one commit.
@@ -313,6 +425,36 @@ pub async fn undoables(
         out.len()
     );
     Ok((no_store, Json(out)))
+}
+
+/// Find a commit's hints across the entire available folded feed.
+///
+/// This path deliberately does not take a page limit. An event made reachable
+/// past row 500 by `/api/activity` must also keep the undo hint that
+/// `/api/undoables/{id}` derives from the same fold.
+fn matching_feed_undoables(
+    journal_events: Vec<ActivityEvent>,
+    reflog: Vec<ReflogEntry>,
+    branches: &HashMap<String, String>,
+    remote: &HashSet<String>,
+    full: &str,
+) -> Vec<Undoable> {
+    let feed = assemble_feed(journal_events, reflog, branches, remote, usize::MAX);
+    let mut out = Vec::new();
+    for event in feed {
+        let Some(undoable) = event.undo else { continue };
+        // The commit each hint is "about": the state a reset would discard,
+        // or the tip a restore would bring back — i.e. the dot being tapped.
+        let about = match &undoable.action {
+            UndoAction::ResetBranch { expected_tip, .. } => expected_tip.as_str(),
+            UndoAction::RestoreBranch { tip, .. } => tip.as_str(),
+            UndoAction::RevertCommit { commit } => commit.as_str(),
+        };
+        if about == full && !out.contains(&undoable) {
+            out.push(undoable);
+        }
+    }
+    out
 }
 
 /// The git this check needs, which is **above the documented product floor**
@@ -670,6 +812,238 @@ mod tests {
             .unwrap();
         assert!(out.status.success(), "git rev-parse {rev} failed");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn paging_event(index: usize) -> ActivityEvent {
+        ActivityEvent {
+            time: 10_000 + index as i64,
+            kind: ActivityKind::Other,
+            ref_name: None,
+            summary: format!("paging-{index:03}"),
+            old_oid: None,
+            new_oid: None,
+            source: ActivitySource::App,
+            undo: None,
+            refs: None,
+        }
+    }
+
+    /// #559/#562 acceptance: the fixture really contains more than the former
+    /// 500-event ceiling, and repeated page requests walk every folded event
+    /// exactly once, newest-first, before an explicit end cursor terminates the
+    /// loop. This is intentionally not a cursor round-trip test: the 620
+    /// fixture summaries are enumerated independently, so truncating the fold
+    /// would leave this assertion short even if every returned cursor decoded.
+    ///
+    /// Two failure-atlas mutations for completeness: change the full-fold
+    /// `usize::MAX` to `MAX_PAGE_LIMIT` (the walk ends at 500), and advance
+    /// `next_event` by one (one summary is missing and order equality fails).
+    /// Two for termination disclosure: mint no cursor on a non-final page (the
+    /// count is short), and mint one on the final page (the page budget trips).
+    #[test]
+    fn more_than_500_folded_events_are_walked_once_in_order_and_terminate() {
+        const EVENT_COUNT: usize = 620;
+        const PAGE_LIMIT: usize = 137;
+
+        let (_dir, repo) = seeded_repo();
+        let fixture: Vec<ActivityEvent> = (0..EVENT_COUNT).map(paging_event).collect();
+        journal::append_all(&repo, &fixture);
+        assert_eq!(journal::read_all(&repo).len(), EVENT_COUNT);
+
+        let codec = CursorCodec::with_key([0x59; 32]);
+        let canonical = repo.canonicalize().unwrap();
+        let scope = codec.scope_for_target(None, &canonical);
+        let mut cursor = None;
+        let mut pages = 0;
+        let mut walked = Vec::new();
+
+        loop {
+            pages += 1;
+            assert!(pages <= 6, "the page walk did not terminate");
+            let page = activity_page_for_target(
+                &repo,
+                false,
+                scope,
+                &ActivityParams {
+                    limit: Some(PAGE_LIMIT),
+                    cursor: cursor.clone(),
+                },
+                &codec,
+            )
+            .expect("an unchanged fixture accepts its own cursor");
+            walked.extend(
+                page.events
+                    .iter()
+                    .filter(|event| event.summary.starts_with("paging-"))
+                    .map(|event| event.summary.clone()),
+            );
+            cursor = page.cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        let expected: Vec<String> = (0..EVENT_COUNT)
+            .rev()
+            .map(|index| format!("paging-{index:03}"))
+            .collect();
+        assert_eq!(
+            walked, expected,
+            "the fold was truncated, skipped, or reordered"
+        );
+        let unique: HashSet<&String> = walked.iter().collect();
+        assert_eq!(
+            unique.len(),
+            EVENT_COUNT,
+            "an event appeared more than once"
+        );
+        assert_eq!(pages, 5, "620 events at 137 per page must take five pages");
+        assert!(
+            cursor.is_none(),
+            "the final page must state that this is the end"
+        );
+    }
+
+    /// A cursor names one exact fold, not an offset in whichever live fold is
+    /// current later. Inserting a new head event must refuse with 409 rather
+    /// than shift the old offset and silently skip/repeat a row.
+    ///
+    /// Mutations: remove the generation comparison, or digest only the page
+    /// length instead of the full serialized feed; both turn this into `Ok`.
+    #[test]
+    fn a_cursor_refuses_a_feed_that_changed_at_the_head() {
+        let (_dir, repo) = seeded_repo();
+        journal::append_all(&repo, &(0..4).map(paging_event).collect::<Vec<_>>());
+        let codec = CursorCodec::with_key([0x62; 32]);
+        let canonical = repo.canonicalize().unwrap();
+        let scope = codec.scope_for_target(None, &canonical);
+        let first = activity_page_for_target(
+            &repo,
+            false,
+            scope,
+            &ActivityParams {
+                limit: Some(2),
+                cursor: None,
+            },
+            &codec,
+        )
+        .unwrap();
+        let cursor = first.cursor.expect("four events require another page");
+
+        journal::append(&repo, &paging_event(999));
+        let err = activity_page_for_target(
+            &repo,
+            false,
+            scope,
+            &ActivityParams {
+                limit: Some(2),
+                cursor: Some(cursor),
+            },
+            &codec,
+        )
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("restart from the first page"), "{}", err.1);
+    }
+
+    /// The opaque cursor is both authenticated and repository-scoped before a
+    /// source scan. It can resume neither a sibling target nor edited bytes.
+    ///
+    /// Mutations: remove the scope comparison (the foreign call succeeds), or
+    /// skip the codec decode and trust payload bytes (the tampered call stops
+    /// producing the generic bad-request refusal).
+    #[test]
+    fn an_activity_cursor_is_authenticated_and_bound_to_its_repository() {
+        let (_dir, repo) = seeded_repo();
+        journal::append_all(&repo, &(0..4).map(paging_event).collect::<Vec<_>>());
+        let codec = CursorCodec::with_key([0x63; 32]);
+        let canonical = repo.canonicalize().unwrap();
+        let scope = codec.scope_for_target(None, &canonical);
+        let first = activity_page_for_target(
+            &repo,
+            false,
+            scope,
+            &ActivityParams {
+                limit: Some(2),
+                cursor: None,
+            },
+            &codec,
+        )
+        .unwrap();
+        let cursor = first.cursor.unwrap();
+
+        let foreign_scope = codec.scope_for_target(None, &canonical.join("sibling"));
+        let foreign = activity_page_for_target(
+            &repo,
+            false,
+            foreign_scope,
+            &ActivityParams {
+                limit: Some(2),
+                cursor: Some(cursor.clone()),
+            },
+            &codec,
+        )
+        .unwrap_err();
+        assert_eq!(foreign, invalid_activity_cursor());
+
+        let mut tampered = cursor.into_bytes();
+        let last = tampered.last_mut().unwrap();
+        *last = if *last == b'A' { b'B' } else { b'A' };
+        let tampered = String::from_utf8(tampered).unwrap();
+        let refused = activity_page_for_target(
+            &repo,
+            false,
+            scope,
+            &ActivityParams {
+                limit: Some(2),
+                cursor: Some(tampered),
+            },
+            &codec,
+        )
+        .unwrap_err();
+        assert_eq!(refused, invalid_activity_cursor());
+    }
+
+    /// The undo-hints path had its own 500-row cap. Put the only matching hint
+    /// behind 600 newer folded rows so this test fails if that second cap ever
+    /// returns, independently of query pagination.
+    ///
+    /// Mutations: cap assembly at `MAX_PAGE_LIMIT`, or cap it at one event;
+    /// both erase the restore hint and fail this exact action assertion.
+    #[test]
+    fn undo_hints_search_past_the_former_500_event_ceiling() {
+        let target = "a".repeat(40);
+        let mut journal_events = vec![ActivityEvent {
+            time: 1,
+            kind: ActivityKind::BranchDeleted,
+            ref_name: Some("old-topic".to_string()),
+            summary: "deleted old-topic".to_string(),
+            old_oid: Some(target.clone()),
+            new_oid: None,
+            source: ActivitySource::App,
+            undo: None,
+            refs: None,
+        }];
+        journal_events.extend((0..600).map(|index| ActivityEvent {
+            time: 2 + index as i64,
+            ..paging_event(index)
+        }));
+
+        let hints = matching_feed_undoables(
+            journal_events,
+            Vec::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &target,
+        );
+        assert_eq!(hints.len(), 1);
+        assert_eq!(
+            hints[0].action,
+            UndoAction::RestoreBranch {
+                name: "old-topic".to_string(),
+                tip: target,
+            }
+        );
     }
 
     /// #327 defect A: the exact repro shape from the owner's session log —
