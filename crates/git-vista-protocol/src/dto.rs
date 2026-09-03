@@ -501,6 +501,14 @@ pub struct WorktreePathsRequest {
 /// variant names a side. Line-level resolution needs the `patch_plan`
 /// machinery and its own decision (#432); it is not smuggled in here.
 ///
+/// # `repo` is required
+///
+/// Conflict reads are explicitly scoped to an opaque worktree id. The write
+/// carries that same id in its body so the path and the repository it means
+/// are one request, independent of the session's mutable selection. It is a
+/// required field on purpose: falling back to the selection when it is absent
+/// recreates the wrong-repository success this field closes (#621, ADR 0109).
+///
 /// # `path` is a `WorktreePath`, not a `String`
 ///
 /// The newtype deserializes through its own validator, so a body naming
@@ -517,6 +525,8 @@ pub struct WorktreePathsRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolveConflictRequest {
+    /// Opaque worktree id used by the conflict reads' `?repo=` selector.
+    pub repo: String,
     /// Repository-relative path, exactly as the conflict scan reported it.
     pub path: crate::plan::WorktreePath,
     pub resolution: crate::conflict::Resolution,
@@ -530,10 +540,15 @@ pub struct ResolveConflictRequest {
 /// fails to deserialize and never reaches handler code. `expected_stages` and
 /// `expected_source` are opaque to this DTO; the executor is the only thing
 /// that interprets them, inside the coordinator lock, immediately before
-/// writing anything.
+/// writing anything. Required `repo` is the third part of that identity:
+/// without it, both anchors can be checked against a different selected
+/// repository and a coincidental match would still admit the wrong write
+/// (#621, ADR 0109).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolveConflictContentRequest {
+    /// Opaque worktree id used by the conflict reads' `?repo=` selector.
+    pub repo: String,
     /// Repository-relative path, exactly as the conflict scan reported it.
     pub path: crate::plan::WorktreePath,
     /// The stage OID triple the user resolved against, echoed back from
@@ -2086,6 +2101,37 @@ mod tests {
             r#"{"message":"m","allow_empty":false,"cwd":"/x"}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn conflict_write_bodies_require_and_round_trip_the_repository() {
+        let whole = r#"{"repo":"11111111-1111-5111-8111-111111111111","path":"src/a.rs","resolution":{"choice":"take_ours"}}"#;
+        let request: ResolveConflictRequest = serde_json::from_str(whole).unwrap();
+        assert_eq!(request.repo, "11111111-1111-5111-8111-111111111111");
+        assert_eq!(serde_json::to_string(&request).unwrap(), whole);
+        assert!(
+            serde_json::from_str::<ResolveConflictRequest>(
+                r#"{"path":"src/a.rs","resolution":{"choice":"take_ours"}}"#,
+            )
+            .is_err(),
+            "an omitted repo must never fall back to session selection"
+        );
+
+        let content = format!(
+            r#"{{"repo":"22222222-2222-5222-8222-222222222222","path":"src/a.rs","expected_stages":[null,"{}","{}"],"expected_source":"conflict-v1:served","content":"resolved\n"}}"#,
+            "a".repeat(40),
+            "b".repeat(40),
+        );
+        let request: ResolveConflictContentRequest = serde_json::from_str(&content).unwrap();
+        assert_eq!(request.repo, "22222222-2222-5222-8222-222222222222");
+        assert_eq!(serde_json::to_string(&request).unwrap(), content);
+        assert!(
+            serde_json::from_str::<ResolveConflictContentRequest>(
+                &content.replace(r#""repo":"22222222-2222-5222-8222-222222222222","#, "",)
+            )
+            .is_err(),
+            "content resolution must carry the same required target"
+        );
     }
 
     #[test]

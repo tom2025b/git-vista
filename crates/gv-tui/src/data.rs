@@ -371,19 +371,10 @@ impl Client {
 
     /// `POST /api/resolve-conflict` — take a whole side, or the deletion.
     ///
-    /// **The select is paired with the write, every time, and is not an
-    /// artefact of the merge with #461.** The shell does select a repository
-    /// when one is activated, so in the ordinary flow this is a second
-    /// select — but "the resolution lands where the user was looking" then
-    /// depends on that earlier call having run and nothing having changed the
-    /// selection since. `/api/resolve-conflict` carries no repository at all:
-    /// it goes through the planner, which acts on this session's selection
-    /// (ADR 0103). Pairing makes the guarantee structural rather than
-    /// remembered, and the failure it prevents is silent — a conflict at the
-    /// same path in another repository resolves successfully, in the wrong
-    /// one. ADR 0105 decision 5 records that the real fix is for the endpoint
-    /// to carry the repository, the way every conflict READ already does;
-    /// that is issue #621, and this pairing goes away when it lands.
+    /// The repository travels in the resolution body itself (#621, ADR 0109),
+    /// exactly as the conflict reads carry it in `?repo=`. No preparatory
+    /// `/api/select`: targeting a write must neither depend on nor mutate the
+    /// session's navigation state.
     fn resolve_whole_file(
         &self,
         repo: &str,
@@ -398,9 +389,12 @@ impl Client {
         // panic in a program that has taken over the terminal is worse than a
         // sentence on the status line.
         let path = WorktreePath::new(path.to_string()).map_err(|e| e.to_string())?;
-        self.select_for_write(repo)?;
-        let body = serde_json::to_vec(&ResolveConflictRequest { path, resolution })
-            .map_err(|error| error.to_string())?;
+        let body = serde_json::to_vec(&ResolveConflictRequest {
+            repo: repo.to_string(),
+            path,
+            resolution,
+        })
+        .map_err(|error| error.to_string())?;
         self.post_json_keyed(RESOLVE_CONFLICT_PATH, &body, &mint_idempotency_key())
             .map(|_| ())
     }
@@ -422,8 +416,8 @@ impl Client {
         content: String,
     ) -> Result<(), String> {
         let path = WorktreePath::new(path.to_string()).map_err(|e| e.to_string())?;
-        self.select_for_write(repo)?;
         let body = serde_json::to_vec(&ResolveConflictContentRequest {
+            repo: repo.to_string(),
             path,
             expected_stages,
             expected_source,
@@ -436,11 +430,6 @@ impl Client {
             &mint_idempotency_key(),
         )
         .map(|_| ())
-    }
-
-    fn select_for_write(&self, repo: &str) -> Result<(), String> {
-        self.select_active(repo)
-            .map_err(|error| format!("could not select the repository to write to: {error}"))
     }
 
     fn post_json(&self, path: &str, body: &[u8]) -> Result<Vec<u8>, String> {
@@ -871,17 +860,10 @@ mod tests {
     }
 
     #[test]
-    fn a_write_selects_the_repository_it_is_about_to_write_to_first() {
-        // `/api/resolve-conflict` carries no repository — it goes through the
-        // planner, which acts on this session's selection (ADR 0103). Without
-        // the select, a resolution lands in whichever repository the session
-        // last pointed at, and if that one happens to have a conflict at the
-        // same path it SUCCEEDS, in the wrong repository, silently.
-        //
-        // MUTATION A: delete the `select_for_write` call. MUTATION B: move it
-        // after the resolution post. Both leave the write working against
-        // whatever was already selected, so only the ORDER assertion catches
-        // them.
+    fn a_write_names_its_repository_without_selecting_it() {
+        // The body is now the authority (#621). Reintroducing the old select
+        // would add a redundant round trip and make resolving a file change
+        // this session's navigation as a side effect.
         let (client, posted) = recording_client(
             |_| ok_body("Resolved."),
             |path| panic!("a whole-side resolution should not GET {path}"),
@@ -907,71 +889,22 @@ mod tests {
         let paths: Vec<&str> = posted.iter().map(|(path, _, _)| path.as_str()).collect();
         assert_eq!(
             paths,
-            [SELECT_PATH, RESOLVE_CONFLICT_PATH],
-            "the write did not select the repository it wrote to, first"
+            [RESOLVE_CONFLICT_PATH],
+            "a targeted conflict write must not mutate session selection"
         );
 
-        let select: serde_json::Value = serde_json::from_slice(&posted[0].1).unwrap();
-        assert_eq!(select["worktree"], "worktree-77");
-        assert_eq!(
-            select["mode"], "active",
-            "a write selected a mode that refuses writes"
-        );
-        assert!(
-            posted[0].2.is_none(),
-            "the select carried an idempotency key it does not need"
-        );
-
-        let write: serde_json::Value = serde_json::from_slice(&posted[1].1).unwrap();
+        let write: serde_json::Value = serde_json::from_slice(&posted[0].1).unwrap();
+        assert_eq!(write["repo"], "worktree-77");
         assert_eq!(write["path"], "src/a.txt");
         assert_eq!(write["resolution"]["choice"], "take_theirs");
         assert!(
-            posted[1]
+            posted[0]
                 .2
                 .as_deref()
                 .is_some_and(|key| key.starts_with("gvtui-")),
             "the planner write carried no idempotency key: {:?}",
-            posted[1].2
+            posted[0].2
         );
-    }
-
-    #[test]
-    fn a_failed_select_fails_the_write_and_never_posts_the_resolution() {
-        // If selecting is refused and the write goes out anyway, it goes out
-        // against the previous selection.
-        let (client, posted) = recording_client(
-            |path| HttpResponse {
-                status: if path == SELECT_PATH { 404 } else { 200 },
-                headers: Vec::new(),
-                body: b"No such repository.".to_vec(),
-            },
-            |path| panic!("unexpected GET {path}"),
-        );
-
-        match client.serve(Request::ResolveWholeFile {
-            repo: "gone".to_string(),
-            path: "a.txt".to_string(),
-            resolution: Resolution::TakeOurs,
-        }) {
-            Data::Resolved {
-                result: Err(message),
-                ..
-            } => {
-                assert!(
-                    message.contains("select the repository"),
-                    "the failure did not say what went wrong: {message}"
-                );
-                assert!(message.contains("No such repository"), "{message}");
-            }
-            other => panic!("a refused select still produced {other:?}"),
-        }
-        let posted = posted.lock().unwrap();
-        assert_eq!(
-            posted.len(),
-            1,
-            "the resolution was posted after the select was refused"
-        );
-        assert_eq!(posted[0].0, SELECT_PATH);
     }
 
     #[test]
@@ -991,8 +924,9 @@ mod tests {
             content: "resolved\n".to_string(),
         });
         let posted = posted.lock().unwrap();
-        assert_eq!(posted[1].0, RESOLVE_CONFLICT_CONTENT_PATH);
-        let body: serde_json::Value = serde_json::from_slice(&posted[1].1).unwrap();
+        assert_eq!(posted[0].0, RESOLVE_CONFLICT_CONTENT_PATH);
+        let body: serde_json::Value = serde_json::from_slice(&posted[0].1).unwrap();
+        assert_eq!(body["repo"], "w1");
         assert_eq!(body["path"], "dir/a b.txt");
         assert_eq!(body["content"], "resolved\n");
         assert_eq!(body["expected_source"], "conflict-v1:deadbeef");
