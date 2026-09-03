@@ -12,7 +12,7 @@ use crossterm::event::{self, Event, KeyEvent};
 use ratatui::backend::Backend;
 use ratatui::Terminal;
 
-use crate::app::App;
+use crate::app::{App, Viewport};
 use crate::data::DataPort;
 use crate::{keys, ui};
 
@@ -53,9 +53,16 @@ pub fn run<B: Backend>(
         port.request(request);
     }
     loop {
+        // Drawing is also the measurement (#625): the frame reports how many
+        // rows each surface had room for, and the app is told before the next
+        // key is read. So a page key always moves by the height of the frame
+        // the user is looking at — after a resize, and after a zoom, without
+        // either having to be re-derived from anything.
+        let mut measured = Viewport::default();
         terminal
-            .draw(|frame| ui::draw(frame, app))
+            .draw(|frame| measured = ui::draw(frame, app))
             .map_err(|error| error.to_string())?;
+        app.observe(measured);
         if app.quit {
             break;
         }

@@ -277,12 +277,14 @@ fn pane_block(pane: Pane, focus: Pane) -> Block<'static> {
     }
 }
 
-fn draw_worktree(frame: &mut Frame, area: Rect, app: &App) {
+/// Returns the rows of file list the pane had room for — its heading is not
+/// one of them, which is why this cannot be inferred from the pane's rect.
+fn draw_worktree(frame: &mut Frame, area: Rect, app: &App) -> usize {
     let block = pane_block(Pane::WorkingTree, app.focus);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.is_empty() {
-        return;
+        return 0;
     }
 
     let state_line = match app.worktree.state() {
@@ -308,8 +310,9 @@ fn draw_worktree(frame: &mut Frame, area: Rect, app: &App) {
     };
     frame.render_widget(Paragraph::new(state_line).style(heading_style), heading);
 
+    let visible_rows = list_area.height as usize;
     if list_area.is_empty() {
-        return;
+        return 0;
     }
     if app.worktree.rows().is_empty() {
         let message = match app.worktree.state() {
@@ -318,7 +321,7 @@ fn draw_worktree(frame: &mut Frame, area: Rect, app: &App) {
             LoadState::Failed(_) => "No successful status snapshot.",
         };
         frame.render_widget(Paragraph::new(message), list_area);
-        return;
+        return visible_rows;
     }
     let rows: Vec<ListItem<'_>> = app
         .worktree
@@ -331,12 +334,19 @@ fn draw_worktree(frame: &mut Frame, area: Rect, app: &App) {
         .highlight_symbol("> ");
     let mut state = ListState::default().with_selected(Some(app.cursor(Pane::WorkingTree)));
     frame.render_stateful_widget(list, list_area, &mut state);
+    visible_rows
 }
 
 /// The commit graph (#457): core's lanes and edges, windowed to the pane's
 /// visible rows and scrolled to keep the cursor's commit on screen.
-fn draw_commits(frame: &mut Frame, area: Rect, app: &App, colors: ColorDepth) {
+///
+/// Returns the number of **commits** on screen, not lines: the graph draws a
+/// connector row between every pair of commits, so a page of this pane is
+/// half its height. Its cursor counts commits, and a page has to be in the
+/// same units as the cursor it moves (#625).
+fn draw_commits(frame: &mut Frame, area: Rect, app: &App, colors: ColorDepth) -> usize {
     let inner = pane_block(Pane::Commits, app.focus).inner(area);
+    let visible_commits = inner.height as usize / 2;
     if app.commits.is_empty() {
         let message = if app.active_repo.is_some() {
             "No commits."
@@ -347,7 +357,7 @@ fn draw_commits(frame: &mut Frame, area: Rect, app: &App, colors: ColorDepth) {
             Paragraph::new(message).block(pane_block(Pane::Commits, app.focus)),
             area,
         );
-        return;
+        return visible_commits;
     }
 
     let layout = LayoutData {
@@ -379,6 +389,7 @@ fn draw_commits(frame: &mut Frame, area: Rect, app: &App, colors: ColorDepth) {
         Paragraph::new(lines).block(pane_block(Pane::Commits, app.focus)),
         area,
     );
+    visible_commits
 }
 
 /// One [`GraphLine`] as a styled Ratatui [`Line`]; `selected` reverses the
@@ -407,7 +418,11 @@ fn graph_line(line: &GraphLine, selected: bool) -> Line<'static> {
 /// The commit detail and diff (#458): [`DetailPane`](crate::panes::detail::DetailPane)
 /// already windows its own rows, so this hands it the pane's cursor as a
 /// vertical offset and lets Ratatui's own scroll carry the horizontal one.
-fn draw_main(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_main(frame: &mut Frame, area: Rect, app: &App) -> usize {
+    // Every branch below draws inside the same bordered block, so the rows
+    // available are the same whichever of them runs — the branches differ in
+    // what they put there, not in how much room there is.
+    let visible_rows = pane_block(Pane::Main, app.focus).inner(area).height as usize;
     if let Some(review) = &app.review {
         let lines = review_lines(review);
         let offset = app.cursor(Pane::Main).min(lines.len().saturating_sub(1));
@@ -416,7 +431,7 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &App) {
             Paragraph::new(lines).block(pane_block(Pane::Main, app.focus)),
             area,
         );
-        return;
+        return visible_rows;
     }
     if let Some(confirmation) = &app.confirmation {
         frame.render_widget(
@@ -425,11 +440,11 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &App) {
                 .block(pane_block(Pane::Main, app.focus)),
             area,
         );
-        return;
+        return visible_rows;
     }
     if let Some(staging) = &app.staging {
         draw_staging(frame, area, app, staging);
-        return;
+        return visible_rows;
     }
     let inner = pane_block(Pane::Main, app.focus).inner(area);
     let rows = app
@@ -445,6 +460,7 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &App) {
             .block(pane_block(Pane::Main, app.focus)),
         area,
     );
+    visible_rows
 }
 
 fn draw_staging(
