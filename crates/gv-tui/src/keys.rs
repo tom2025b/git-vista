@@ -14,11 +14,14 @@
 //! | `j`, `↓` | cursor down |
 //! | `k`, `↑` | cursor up |
 //! | `Enter` | load a repository, open a commit, or follow a parent |
+//! | `Space` | preview selected working-tree file / diff file / hunk / line |
+//! | `a` | preview stage-all/unstage-all in Working Tree; approve plan elsewhere |
+//! | `d` | guard discard of the selected unstaged tracked path |
+//! | `y` | approve the visible discard confirmation or plan review |
+//! | `n`, `Esc` | refuse the visible confirmation or plan review |
 //! | `[` / `]` | select the previous/next parent in Main |
 //! | `r`, `F5` | refresh |
 //! | `x` | open the conflict overlay (M10.07, #462) |
-//! | `a` | approve the open plan review |
-//! | `Esc` | refuse/close the open plan review |
 //!
 //! The vi-shaped `hjkl` set is lazygit's, and lazygit is the interface this
 //! milestone is modelled on; the arrow and Tab set is for everyone else.
@@ -30,12 +33,8 @@
 //! ignores `Release` and `Repeat` is treated as a press — so `q` quits once,
 //! not twice, and a held `j` still scrolls.
 //!
-//! # Where per-pane keys will go
-//!
-//! Phase 2a's bindings are the same in every pane. The first pane-specific
-//! key (#459's `s` to stage, say) adds a layer here that consults the
-//! focused pane; the signature grows a `Pane` when that key exists, not
-//! before.
+//! The staging bindings are pane-specific. Dispatch only identifies intent;
+//! `App` decides whether the selected row can honestly perform it.
 
 //! # The conflict overlay has its own keymap, and that is not a style choice
 //!
@@ -70,6 +69,9 @@ pub fn dispatch(key: KeyEvent, pane: Pane) -> Option<Action> {
         KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => Some(Action::Quit),
         _ if !plain => None,
         KeyCode::Char('q') => Some(Action::Quit),
+        KeyCode::Char('y') => Some(Action::Approve),
+        KeyCode::Char('n') => Some(Action::Cancel),
+        KeyCode::Esc => Some(Action::RefusePlan),
         KeyCode::Tab | KeyCode::Char('l') => Some(Action::FocusNext),
         KeyCode::BackTab | KeyCode::Char('h') => Some(Action::FocusPrev),
         KeyCode::Right if pane == Pane::Main => Some(Action::HorizontalRight),
@@ -78,14 +80,18 @@ pub fn dispatch(key: KeyEvent, pane: Pane) -> Option<Action> {
         KeyCode::Left => Some(Action::FocusPrev),
         KeyCode::Down | KeyCode::Char('j') => Some(Action::CursorDown),
         KeyCode::Up | KeyCode::Char('k') => Some(Action::CursorUp),
-        KeyCode::Enter if pane != Pane::Branches => Some(Action::Activate),
+        KeyCode::Enter => Some(Action::Activate),
+        KeyCode::Char(' ') if matches!(pane, Pane::WorkingTree | Pane::Main) => {
+            Some(Action::PreviewSelection)
+        }
+        KeyCode::Char('a') if pane == Pane::WorkingTree => Some(Action::PreviewWholeTree),
+        KeyCode::Char('a') => Some(Action::ApprovePlan),
+        KeyCode::Char('d') if pane == Pane::WorkingTree => Some(Action::Discard),
         KeyCode::Char('[') if pane == Pane::Main => Some(Action::ParentPrev),
         KeyCode::Char(']') if pane == Pane::Main => Some(Action::ParentNext),
         KeyCode::F(5) | KeyCode::Char('r') => Some(Action::Refresh),
         KeyCode::Char('x') => Some(Action::OpenConflicts),
         KeyCode::Char('c') => Some(Action::CancelOperation),
-        KeyCode::Char('a') => Some(Action::ApprovePlan),
-        KeyCode::Esc => Some(Action::RefusePlan),
         KeyCode::Char(':') => Some(Action::OpenCommand),
         KeyCode::Char(d @ '1'..='9') => Pane::from_number(d.to_digit(10)? as u8).map(Action::Focus),
         _ => None,
@@ -224,7 +230,7 @@ mod tests {
         );
         assert_eq!(
             global(press(KeyCode::Char('2'))),
-            Some(Action::Focus(Pane::Branches))
+            Some(Action::Focus(Pane::WorkingTree))
         );
         assert_eq!(
             global(press(KeyCode::Char('3'))),
@@ -294,17 +300,23 @@ mod tests {
 
     #[test]
     fn an_unbound_key_is_none() {
-        // This list has now lost TWO members to real bindings: `x` to the
-        // conflict overlay (#462) and `Esc` to plan refusal (#461). Both were
-        // caught by this test failing rather than by anyone remembering, which
-        // is why an explicit unbound set beats trusting the match's
+        // This list has now lost THREE members to real bindings across three
+        // slices: `Esc` to plan refusal (#461), `Space` to the staging
+        // preview (#459), and `x` to the conflict overlay (#462). Each was
+        // caught by this test failing rather than by anyone remembering,
+        // which is why an explicit unbound set beats trusting the match's
         // fall-through.
-        for key in [
-            press(KeyCode::Char('z')),
-            press(KeyCode::Char(' ')),
-            press(KeyCode::F(1)),
-        ] {
+        for key in [press(KeyCode::Char('z')), press(KeyCode::F(1))] {
             assert_eq!(global(key), None, "{key:?}");
+        }
+        assert_eq!(global(press(KeyCode::Char(' '))), None);
+    }
+
+    #[test]
+    fn enter_activates_rows_in_all_four_built_panes() {
+        let enter = press(KeyCode::Enter);
+        for pane in Pane::ALL {
+            assert_eq!(dispatch(enter, pane), Some(Action::Activate), "{pane:?}");
         }
     }
 
@@ -340,13 +352,34 @@ mod tests {
         assert_eq!(dispatch_command(ctrl('c')), Some(Action::Quit));
     }
 
+    /// INVARIANT: every #459 action is keyboard-reachable only in the panes
+    /// where its selection has meaning, while approval/refusal remain global.
+    ///
+    /// MUTATION 1 (remove): make Space inert in Working Tree and Main.
+    /// MUTATION 2 (weaken): make the all-tree shortcut active in every pane.
     #[test]
-    fn enter_activates_rows_that_open_something_but_not_the_branches_placeholder() {
-        let enter = press(KeyCode::Enter);
-        for pane in [Pane::Repositories, Pane::Commits, Pane::Main] {
-            assert_eq!(dispatch(enter, pane), Some(Action::Activate), "{pane:?}");
-        }
-        assert_eq!(dispatch(enter, Pane::Branches), None);
+    fn staging_and_review_keys_are_scoped_without_hiding_cancel() {
+        assert_eq!(
+            dispatch(press(KeyCode::Char(' ')), Pane::WorkingTree),
+            Some(Action::PreviewSelection)
+        );
+        assert_eq!(
+            dispatch(press(KeyCode::Char(' ')), Pane::Main),
+            Some(Action::PreviewSelection)
+        );
+        assert_eq!(
+            dispatch(press(KeyCode::Char('a')), Pane::WorkingTree),
+            Some(Action::PreviewWholeTree)
+        );
+        assert_eq!(
+            dispatch(press(KeyCode::Char('d')), Pane::WorkingTree),
+            Some(Action::Discard)
+        );
+        assert_eq!(global(press(KeyCode::Char('y'))), Some(Action::Approve));
+        assert_eq!(global(press(KeyCode::Char('n'))), Some(Action::Cancel));
+        assert_eq!(global(press(KeyCode::Esc)), Some(Action::RefusePlan));
+        assert_eq!(global(press(KeyCode::Char('a'))), Some(Action::ApprovePlan));
+        assert_eq!(global(press(KeyCode::Char('d'))), None);
     }
 
     #[test]

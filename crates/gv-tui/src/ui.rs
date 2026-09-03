@@ -1,4 +1,4 @@
-//! Ratatui rendering for the four-pane shell (M10.02, #457 — phase 2a).
+//! Ratatui rendering for the four-pane shell (M10.02/#457 through #459).
 //!
 //! Drawing is a pure projection of [`App`]. Every event-loop turn draws;
 //! Ratatui's terminal diff suppresses unchanged writes, keeping invalidation
@@ -12,12 +12,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, Pane, Tone};
+use crate::app::{review_lines, App, Pane, Tone};
 use crate::layout;
 use crate::panes::conflicts::{self, Screen};
 use crate::panes::detail::RowTone;
 use crate::panes::graph::{self, ColorDepth, Emphasis, Foreground, GraphLine, LayoutData};
 use crate::panes::plan_review::{PlanReviewPane, RowTone as PlanRowTone};
+use crate::panes::staging::Tone as StagingTone;
+use crate::panes::worktree::LoadState;
 
 /// Draw one complete frame from the current application state.
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -66,7 +68,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let mut state = ListState::default().with_selected(selected);
     frame.render_stateful_widget(repositories, panes.of(Pane::Repositories), &mut state);
 
-    draw_refs(frame, panes.of(Pane::Branches), app);
+    draw_worktree(frame, panes.of(Pane::WorkingTree), app);
     draw_commits(frame, panes.of(Pane::Commits), app, detect_color_depth());
     draw_main(frame, panes.of(Pane::Main), app);
     if let Some(review) = &app.plan_review {
@@ -86,41 +88,6 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         .as_ref()
         .map_or_else(|| app.status.text.clone(), |input| format!(":{input}█"));
     frame.render_widget(Paragraph::new(status).style(status_style), area);
-}
-
-fn draw_refs(frame: &mut Frame, area: Rect, app: &App) {
-    if !app.tags_loaded {
-        draw_placeholder(
-            frame,
-            area,
-            Pane::Branches,
-            app.focus,
-            "tags: run :tag list",
-        );
-        return;
-    }
-    let lines: Vec<Line<'static>> = if app.tags.is_empty() {
-        vec![Line::from("No tags.")]
-    } else {
-        app.tags
-            .iter()
-            .map(|tag| {
-                let kind = match tag.kind {
-                    git_vista_protocol::TagKind::Lightweight => "light",
-                    git_vista_protocol::TagKind::Annotated => "annotated",
-                };
-                Line::from(format!(
-                    "{} [{kind}] {}",
-                    tag.name.as_str(),
-                    &tag.target.as_str()[..7]
-                ))
-            })
-            .collect()
-    };
-    frame.render_widget(
-        Paragraph::new(lines).block(pane_block(Pane::Branches, app.focus)),
-        area,
-    );
 }
 
 /// The conflict overlay (M10.07, #462).
@@ -208,7 +175,6 @@ fn draw_plan_review(frame: &mut Frame, area: Rect, review: &PlanReviewPane) {
         x: area.x + margin_x,
         y: area.y + margin_y,
         width: area.width.saturating_sub(margin_x * 2),
-        // Leave the shell's final status row visible.
         height: area.height.saturating_sub(margin_y * 2 + 1),
     };
     let block = Block::bordered()
@@ -218,13 +184,12 @@ fn draw_plan_review(frame: &mut Frame, area: Rect, review: &PlanReviewPane) {
             Style::default().add_modifier(Modifier::BOLD),
         ))
         .title_bottom(Line::from(format!(" {} ", review.help())));
-    let rows = review.rows();
-    let lines: Vec<Line<'static>> = rows
+    let lines: Vec<Line<'static>> = review
+        .rows()
         .into_iter()
         .skip(review.offset())
         .map(|row| Line::styled(row.text, plan_tone_style(row.tone)))
         .collect();
-
     frame.render_widget(Clear, modal);
     frame.render_widget(
         Paragraph::new(lines)
@@ -266,14 +231,60 @@ fn pane_block(pane: Pane, focus: Pane) -> Block<'static> {
     }
 }
 
-fn draw_placeholder(
-    frame: &mut Frame,
-    area: ratatui::layout::Rect,
-    pane: Pane,
-    focus: Pane,
-    message: &'static str,
-) {
-    frame.render_widget(Paragraph::new(message).block(pane_block(pane, focus)), area);
+fn draw_worktree(frame: &mut Frame, area: Rect, app: &App) {
+    let block = pane_block(Pane::WorkingTree, app.focus);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.is_empty() {
+        return;
+    }
+
+    let state_line = match app.worktree.state() {
+        LoadState::Loading => match app.worktree.branch_line() {
+            Some(branch) => format!("Refreshing… {branch}"),
+            None => String::from("Loading working tree…"),
+        },
+        LoadState::Ready => app
+            .worktree
+            .branch_line()
+            .unwrap_or_else(|| String::from("Working tree")),
+        LoadState::Failed(message) => format!("Status unavailable: {message}"),
+    };
+    let [heading, list_area] = ratatui::layout::Layout::vertical([
+        ratatui::layout::Constraint::Length(1),
+        ratatui::layout::Constraint::Fill(1),
+    ])
+    .areas(inner);
+    let heading_style = if matches!(app.worktree.state(), LoadState::Failed(_)) {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    frame.render_widget(Paragraph::new(state_line).style(heading_style), heading);
+
+    if list_area.is_empty() {
+        return;
+    }
+    if app.worktree.rows().is_empty() {
+        let message = match app.worktree.state() {
+            LoadState::Ready => "Clean working tree.",
+            LoadState::Loading => "Waiting for status…",
+            LoadState::Failed(_) => "No successful status snapshot.",
+        };
+        frame.render_widget(Paragraph::new(message), list_area);
+        return;
+    }
+    let rows: Vec<ListItem<'_>> = app
+        .worktree
+        .rows()
+        .iter()
+        .map(|row| ListItem::new(row.render()))
+        .collect();
+    let list = List::new(rows)
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("> ");
+    let mut state = ListState::default().with_selected(Some(app.cursor(Pane::WorkingTree)));
+    frame.render_stateful_widget(list, list_area, &mut state);
 }
 
 /// The commit graph (#457): core's lanes and edges, windowed to the pane's
@@ -351,6 +362,29 @@ fn graph_line(line: &GraphLine, selected: bool) -> Line<'static> {
 /// already windows its own rows, so this hands it the pane's cursor as a
 /// vertical offset and lets Ratatui's own scroll carry the horizontal one.
 fn draw_main(frame: &mut Frame, area: Rect, app: &App) {
+    if let Some(review) = &app.review {
+        let lines = review_lines(review);
+        let offset = app.cursor(Pane::Main).min(lines.len().saturating_sub(1));
+        let lines: Vec<Line<'static>> = lines.into_iter().skip(offset).map(Line::from).collect();
+        frame.render_widget(
+            Paragraph::new(lines).block(pane_block(Pane::Main, app.focus)),
+            area,
+        );
+        return;
+    }
+    if let Some(confirmation) = &app.confirmation {
+        frame.render_widget(
+            Paragraph::new(confirmation.prompt.as_str())
+                .wrap(Wrap { trim: false })
+                .block(pane_block(Pane::Main, app.focus)),
+            area,
+        );
+        return;
+    }
+    if let Some(staging) = &app.staging {
+        draw_staging(frame, area, app, staging);
+        return;
+    }
     let inner = pane_block(Pane::Main, app.focus).inner(area);
     let rows = app
         .detail
@@ -365,6 +399,50 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &App) {
             .block(pane_block(Pane::Main, app.focus)),
         area,
     );
+}
+
+fn draw_staging(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    staging: &crate::panes::staging::StagingPane,
+) {
+    let block = pane_block(Pane::Main, app.focus);
+    let inner = block.inner(area);
+    let visible_height = inner.height as usize;
+    let selected = app.cursor(Pane::Main);
+    let max_offset = staging.rows().len().saturating_sub(visible_height);
+    let offset = if visible_height == 0 || selected < visible_height {
+        0
+    } else {
+        (selected + 1 - visible_height).min(max_offset)
+    };
+    let lines: Vec<Line<'static>> = staging
+        .rows()
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(visible_height)
+        .map(|(index, row)| {
+            let mut style = staging_tone_style(row.tone);
+            if index == selected {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            Line::styled(row.text.clone(), style)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn staging_tone_style(tone: StagingTone) -> Style {
+    match tone {
+        StagingTone::Plain => Style::default(),
+        StagingTone::File => Style::default().add_modifier(Modifier::BOLD),
+        StagingTone::Hunk => Style::default().fg(Color::Cyan),
+        StagingTone::Added => Style::default().fg(Color::Green),
+        StagingTone::Removed => Style::default().fg(Color::Red),
+        StagingTone::Muted => Style::default().fg(Color::DarkGray),
+    }
 }
 
 fn tone_style(tone: RowTone) -> Style {
@@ -409,10 +487,11 @@ mod tests {
 
     use git_vista_core::diff::{CommitDiff, DiffFile};
     use git_vista_core::model::{CommitDetail, CommitSummary, GraphRow, Oid};
-    use git_vista_core::status::ChangeKind;
+    use git_vista_core::status::ChangeKind as CoreChangeKind;
     use git_vista_protocol::{
-        GenerationToken, GitOperation, OperationHash, Plan, RecoveryStrategy, RepositoryDescriptor,
-        RepositoryToken, RiskLevel, UnixSeconds, WorktreeToken,
+        ChangeKind, ChangeSides, ConflictKind, GenerationToken, GitOperation, OperationHash, Plan,
+        Precondition, RecoveryStrategy, RepositoryDescriptor, RepositoryToken, RiskLevel,
+        StatusEntry, UnixSeconds, WorktreeStatus, WorktreeToken,
     };
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -421,7 +500,7 @@ mod tests {
     use ratatui::Terminal;
 
     use super::*;
-    use crate::app::{Action, App, CommitPage, Data, Pane};
+    use crate::app::{Action, App, CommitPage, Data, Pane, Review};
     use crate::layout;
 
     const THREE: &str = r#"[
@@ -432,7 +511,7 @@ mod tests {
 
     fn loaded() -> App {
         let mut app = App::new();
-        assert_eq!(app.start(), [crate::app::Fetch::Catalog]);
+        assert_eq!(app.start(), [crate::app::Request::Catalog]);
         let catalog: Vec<RepositoryDescriptor> =
             serde_json::from_str(THREE).expect("the wire literal is valid");
         app.receive(Data::Catalog(Ok(catalog)));
@@ -457,6 +536,14 @@ mod tests {
         };
         app.receive(Data::PlanReady(Ok(serde_json::to_vec(&plan).unwrap())));
         app
+    }
+
+    fn select_first(app: &mut App) {
+        app.apply(Action::Activate);
+        app.receive(Data::Selected {
+            repo: "w1".to_string(),
+            result: Ok(()),
+        });
     }
 
     fn rendered(width: u16, height: u16, app: &App) -> Terminal<TestBackend> {
@@ -534,11 +621,12 @@ mod tests {
 
     fn detailed(patch: &str, files: Vec<DiffFile>) -> App {
         let mut app = loaded();
-        app.apply(Action::Activate);
+        select_first(&mut app);
         app.receive(Data::History {
             repo: "w1".to_string(),
             result: Ok(page()),
         });
+        app.apply(Action::Focus(Pane::Commits));
         app.apply(Action::Activate);
         app.receive(Data::Commit {
             repo: "w1".to_string(),
@@ -640,16 +728,13 @@ mod tests {
     }
 
     #[test]
-    fn refs_pane_names_the_tag_command_then_renders_an_empty_tag_result() {
-        let mut app = loaded();
+    fn the_working_tree_pane_names_loading_instead_of_claiming_clean() {
+        let app = loaded();
         let terminal = rendered(80, 24, &app);
         let screen = text(terminal.backend().buffer());
-        assert!(screen.contains("tags: run :tag list"), "{screen}");
-
-        app.tags_loaded = true;
-        let terminal = rendered(80, 24, &app);
-        let screen = text(terminal.backend().buffer());
-        assert!(screen.contains("No tags."), "{screen}");
+        assert!(screen.contains("Loading working tree"), "{screen}");
+        assert!(screen.contains("Waiting for status"), "{screen}");
+        assert!(!screen.contains("Clean working tree"), "{screen}");
     }
 
     #[test]
@@ -753,7 +838,7 @@ mod tests {
     #[test]
     fn the_commit_selector_renders_the_existing_summary_and_selection() {
         let mut app = loaded();
-        app.apply(Action::Activate);
+        select_first(&mut app);
         app.receive(Data::History {
             repo: "w1".to_string(),
             result: Ok(page()),
@@ -807,11 +892,12 @@ mod tests {
     #[test]
     fn the_commits_pane_scrolls_to_keep_the_cursor_on_screen() {
         let mut app = loaded();
-        app.apply(Action::Activate);
+        select_first(&mut app);
         app.receive(Data::History {
             repo: "w1".to_string(),
             result: Ok(many_commits(200)),
         });
+        app.apply(Action::Focus(Pane::Commits));
         for _ in 0..199 {
             app.apply(Action::CursorDown);
         }
@@ -834,7 +920,7 @@ mod tests {
         let files = vec![DiffFile {
             path: "logo.png".to_string(),
             old_path: None,
-            kind: ChangeKind::Modified,
+            kind: CoreChangeKind::Modified,
             additions: None,
             deletions: None,
         }];
@@ -935,9 +1021,113 @@ mod tests {
         );
     }
 
+    /// INVARIANT: the terminal itself renders the shared five-section status
+    /// vocabulary and swaps Main to the complete server-plan review surface.
+    ///
+    /// MUTATION 1 (remove): bypass `draw_worktree` or the review branch.
+    /// MUTATION 2 (weaken): render only paths/status counts or a Plan summary.
     #[test]
-    fn plan_review_is_a_visible_modal_with_decision_keys_and_expiry() {
-        let app = reviewing();
+    fn terminal_renders_all_status_sections_and_the_server_plan_before_approval() {
+        let mut app = loaded();
+        select_first(&mut app);
+        app.receive(Data::Status {
+            repo: "w1".to_string(),
+            result: Ok(WorktreeStatus {
+                generation: GenerationToken::new("status-v1:test").unwrap(),
+                branch: Some("main".to_string()),
+                upstream: Some("origin/main".to_string()),
+                ahead: 0,
+                behind: 0,
+                entries: vec![
+                    StatusEntry::Conflicted {
+                        path: "clash.rs".to_string(),
+                        kind: ConflictKind::BothModified,
+                        submodule: None,
+                    },
+                    StatusEntry::Changed {
+                        path: "both.rs".to_string(),
+                        sides: ChangeSides::Both {
+                            staged: ChangeKind::Added,
+                            unstaged: ChangeKind::Modified,
+                        },
+                        submodule: None,
+                        binary: false,
+                    },
+                    StatusEntry::Untracked {
+                        path: "new.txt".to_string(),
+                        binary: false,
+                    },
+                    StatusEntry::Ignored {
+                        path: "target/".to_string(),
+                    },
+                ],
+            }),
+        });
+        let status_terminal = rendered(120, 40, &app);
+        let status_screen = text(status_terminal.backend().buffer());
+        for expected in [
+            "[Conflicted] clash.rs",
+            "[Staged changes] both.rs",
+            "[Unstaged changes] both.rs",
+            "[Untracked files] new.txt",
+            "[Ignored files] target/",
+        ] {
+            assert!(
+                status_screen.contains(expected),
+                "missing {expected}:\n{status_screen}"
+            );
+        }
+
+        app.review = Some(Review::Operation(Box::new(Plan {
+            repository: RepositoryToken::new("r1").unwrap(),
+            worktree: WorktreeToken::new("w1").unwrap(),
+            generation: GenerationToken::new("status-v1:test").unwrap(),
+            operation: GitOperation::StageAll,
+            operation_hash: OperationHash::new("a".repeat(64)).unwrap(),
+            issued_at: UnixSeconds(100),
+            expires_at: UnixSeconds(200),
+            risk: RiskLevel::Safe,
+            preconditions: vec![Precondition::CleanWorktree],
+            expected_ref_changes: Vec::new(),
+            advisories: Vec::new(),
+            recovery: RecoveryStrategy::NotNeeded,
+        })));
+        app.focus = Pane::Main;
+        let plan_terminal = rendered(120, 40, &app);
+        let plan_screen = text(plan_terminal.backend().buffer());
+        for expected in [
+            "SERVER PLAN",
+            "stage_all",
+            "operation_hash",
+            "expires_at",
+            "clean_worktree",
+            "approve unchanged",
+        ] {
+            assert!(
+                plan_screen.contains(expected),
+                "missing {expected}:\n{plan_screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn immutable_plan_review_overlays_the_worktree_and_patch_surfaces() {
+        let mut app = loaded();
+        let plan = Plan {
+            repository: RepositoryToken::new("repo-1").unwrap(),
+            worktree: WorktreeToken::new("worktree-1").unwrap(),
+            generation: GenerationToken::new("generation-reviewed").unwrap(),
+            operation: GitOperation::StageAll,
+            operation_hash: OperationHash::new("a".repeat(64)).unwrap(),
+            issued_at: UnixSeconds(1_788_365_000),
+            expires_at: UnixSeconds(1_788_365_300),
+            risk: RiskLevel::Remote,
+            preconditions: Vec::new(),
+            expected_ref_changes: Vec::new(),
+            advisories: Vec::new(),
+            recovery: RecoveryStrategy::NotNeeded,
+        };
+        app.receive(Data::PlanReady(Ok(serde_json::to_vec(&plan).unwrap())));
         let terminal = rendered(100, 30, &app);
         let buffer = terminal.backend().buffer();
         let screen = text(buffer);
@@ -958,7 +1148,6 @@ mod tests {
             "the modal had no review/risk emphasis"
         );
     }
-
     #[test]
     fn stale_refusal_replaces_server_cause_with_the_honest_message() {
         let mut app = reviewing();

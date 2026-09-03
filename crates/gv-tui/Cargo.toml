@@ -28,6 +28,7 @@ git-vista-protocol = { workspace = true }
 git-vista-session = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+uuid = { workspace = true }
 
 # The terminal toolkit (M10.02, #457 — phase 2a, the shell). Both pinned
 # EXACTLY (`=`), not caret: a terminal toolkit's minor releases change key
