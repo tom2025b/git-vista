@@ -1,4 +1,4 @@
-# ADR 0105 — Share the measurement, not the floor
+# ADR 0106 — Share the measurement, not the floor
 
 **Status:** Accepted — implemented
 **Date:** 2026-09-02

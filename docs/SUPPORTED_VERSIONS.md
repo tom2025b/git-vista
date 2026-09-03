@@ -134,7 +134,7 @@ feature keeps its own floor constant — `preview::MIN_GIT_FOR_PREVIEW` and
 coincidence of the same plumbing, not a shared policy: folding them into one
 constant would quietly recreate a second product floor, which is the thing this
 section exists to avoid. Both are deliberately separate from the number in the
-heading above. Reasoning in full: **ADR 0099** (the gate) and **ADR 0105** (why
+heading above. Reasoning in full: **ADR 0099** (the gate) and **ADR 0106** (why
 the measurement is shared and the floors are not).
 
 Do not fold this number into the `## Git:` heading. That heading is parsed by
