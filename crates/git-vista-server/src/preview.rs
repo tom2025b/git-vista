@@ -1487,8 +1487,22 @@ impl ScratchStore {
         if head != STORE_MARKER_MAGIC {
             return None;
         }
-        f.try_lock().ok()?;
-        Some(f)
+        match f.try_lock() {
+            Ok(()) => Some(f),
+            Err(error) => {
+                // #598, instrumentation only. Both variants still refuse,
+                // exactly as `.ok()?` did — this arm changes no decision. The
+                // probe fires *here*, on the error arm, with the refusing fd
+                // still open, because the earlier probes ran from the test
+                // body milliseconds later and by then read an empty
+                // `/proc/locks` and an empty fd table.
+                #[cfg(test)]
+                suite::note_lease_refusal(candidate, &f, &error);
+                #[cfg(not(test))]
+                let _ = error;
+                None
+            }
+        }
     }
 
     /// The `--git-dir=<abs>` token.

@@ -5270,3 +5270,138 @@ fn the_wrapper_hands_the_layout_the_window_it_documents() {
          caller asked for. This is #576 finding 7 at the wrapper"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #598 — the lease-refusal probe
+// ---------------------------------------------------------------------------
+
+/// Report a `try_lock` refusal at the instant it happens, from inside
+/// [`ScratchStore::abandoned_store_lease`]'s error arm.
+///
+/// # Why this cannot live in the test body
+///
+/// The first diagnostic (#610) read `/proc/self/fd` and `/proc/locks` from the
+/// test, after the sweep had returned. Both came back empty while `try_lock`
+/// had refused — a contradiction that turned out to be a measurement artefact:
+/// the holder had let go by then. `strace -y` cannot settle it either, because
+/// under `strace` the failure stops reproducing at all (0 of 4 runs).
+///
+/// So the probe runs here, on the error arm, with the refusing descriptor still
+/// open. Two deliberate differences from the earlier probe:
+///
+/// * the identity comes from an **`fstat` on the refusing fd**, not a fresh
+///   `stat` on the path, so it describes the file that actually refused;
+/// * open descriptors are matched by **`(dev, ino)`**, not by comparing
+///   `read_link` output against the marker path. `flock` is per-inode, so a
+///   holder that reached the same inode by a different spelling — a resolved
+///   versus unresolved temp dir, a symlinked `/tmp` — is invisible to a path
+///   comparison and obvious to this one. `/proc/self/fd` is process-wide, so
+///   any thread's descriptor shows up here.
+///
+/// The cross-process scan is skipped whenever an in-process holder was found:
+/// a legitimate refusal (a live store's own lease) always has one, and walking
+/// every `/proc/<pid>/fd` on the common path would perturb the timing this
+/// whole investigation depends on.
+pub(super) fn note_lease_refusal(
+    candidate: &Path,
+    refused: &std::fs::File,
+    error: &std::fs::TryLockError,
+) {
+    use std::os::unix::fs::MetadataExt;
+
+    let variant = match error {
+        std::fs::TryLockError::WouldBlock => "WouldBlock".to_string(),
+        std::fs::TryLockError::Error(e) => {
+            format!("Error(kind={:?} errno={:?})", e.kind(), e.raw_os_error())
+        }
+    };
+    let (dev, ino) = match refused.metadata() {
+        Ok(meta) => (meta.dev(), meta.ino()),
+        Err(err) => {
+            eprintln!(
+                "LEASE-REFUSAL candidate={} variant={variant} fstat=UNPROBED: {err}",
+                candidate.display()
+            );
+            return;
+        }
+    };
+
+    let locks = match std::fs::read_to_string("/proc/locks") {
+        Ok(text) => {
+            let rows: Vec<&str> = text
+                .lines()
+                .filter(|line| line.contains(&format!(":{ino} ")))
+                .collect();
+            format!("{rows:?}")
+        }
+        Err(err) => format!("UNPROBED: {err}"),
+    };
+
+    let mine = fds_on_inode(std::path::Path::new("/proc/self/fd"), dev, ino);
+    let in_process = match &mine {
+        Ok(found) => format!("{found:?}"),
+        Err(err) => format!("UNPROBED: {err}"),
+    };
+
+    // Only when nothing in this process explains it: who else on the box?
+    let elsewhere = match &mine {
+        Ok(found) if found.is_empty() => other_processes_on_inode(dev, ino),
+        Ok(_) => "(not scanned: an in-process holder was found)".to_string(),
+        Err(_) => "(not scanned: the in-process probe failed)".to_string(),
+    };
+
+    eprintln!(
+        "LEASE-REFUSAL candidate={} thread={:?} variant={variant} dev={dev} ino={ino} \
+         locks={locks} in_process_fds={in_process} other_processes={elsewhere}",
+        candidate.display(),
+        std::thread::current().name(),
+    );
+}
+
+/// Descriptors under `fd_dir` whose target is exactly `(dev, ino)`.
+///
+/// `Err` is "could not look", which must never render as "found nothing".
+fn fds_on_inode(fd_dir: &Path, dev: u64, ino: u64) -> std::io::Result<Vec<String>> {
+    use std::os::unix::fs::MetadataExt;
+    let mut found = vec![];
+    for entry in std::fs::read_dir(fd_dir)? {
+        let Ok(entry) = entry else { continue };
+        // Follows the /proc symlink, so this stats the target, not the link.
+        let Ok(meta) = std::fs::metadata(entry.path()) else {
+            continue;
+        };
+        if meta.dev() == dev && meta.ino() == ino {
+            found.push(format!(
+                "fd {} -> {:?}",
+                entry.file_name().to_string_lossy(),
+                std::fs::read_link(entry.path()).ok()
+            ));
+        }
+    }
+    Ok(found)
+}
+
+/// The same question asked of every other process this user can read.
+fn other_processes_on_inode(dev: u64, ino: u64) -> String {
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return "UNPROBED: /proc unreadable".to_string();
+    };
+    let mut hits = vec![];
+    for entry in procs.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        // Unreadable is normal here (other users, exited processes) and is not
+        // reported per-pid; the summary line below says how many were skipped.
+        if let Ok(found) = fds_on_inode(&entry.path().join("fd"), dev, ino) {
+            if !found.is_empty() {
+                let comm = std::fs::read_to_string(entry.path().join("comm"))
+                    .unwrap_or_else(|_| "?".into());
+                hits.push(format!("pid {name} ({}) {found:?}", comm.trim()));
+            }
+        }
+    }
+    format!("{hits:?}")
+}
