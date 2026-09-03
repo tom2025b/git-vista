@@ -4,23 +4,50 @@
 //! Split out of the former monolithic `api.rs`.
 
 use git_vista_core::activity::{ActivityEvent, UndoAction, Undoable};
-use git_vista_protocol::operation::IdempotencyKey;
+use git_vista_protocol::{operation::IdempotencyKey, ActivityPage};
 
 use super::{
     network_error, receipt, refuse_if_offline, refuse_if_visualize, req_get, send_write_with_key,
     WriteReceipt, REQUEST_TIMEOUT_MS,
 };
 
-/// Fetch the activity feed (`GET /api/activity`): the chronological list of
-/// repo events — commits, merges, rebases, branch creations/deletions,
-/// pushes… — each attributed app-vs-terminal and carrying an undo hint when
-/// the event is still undoable. Fetched fresh every time the panel opens,
-/// cache-busted like the other live reads.
+/// Fetch the whole available activity feed by walking its cursor pages.
+///
+/// Each request is still bounded by `limit`; the browser follows the opaque
+/// cursor until the server explicitly returns `None`, so a 500-event response
+/// ceiling can never become a silent 500-event history ceiling again. A stale
+/// cursor is a server error and restarts on the panel's next refresh rather
+/// than splicing two different live snapshots together.
 pub async fn fetch_activity(limit: usize) -> Result<Vec<ActivityEvent>, String> {
-    let url = format!("/api/activity?limit={limit}&t={}", js_sys::Date::now());
+    let mut events = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = fetch_activity_page(limit, cursor.as_deref()).await?;
+        events.extend(page.events);
+        match page.cursor {
+            Some(next) if cursor.as_deref() != Some(next.as_str()) => cursor = Some(next),
+            Some(_) => return Err("activity paging returned the same cursor twice".to_string()),
+            None => return Ok(events),
+        }
+    }
+}
+
+/// Fetch one activity page. Kept separate from the aggregate loop so the wire
+/// shape is read and named at the boundary rather than deserialized ad hoc.
+async fn fetch_activity_page(
+    limit: usize,
+    cursor: Option<&str>,
+) -> Result<ActivityPage<ActivityEvent>, String> {
+    let cursor = cursor
+        .map(|value| format!("&cursor={value}"))
+        .unwrap_or_default();
+    let url = format!(
+        "/api/activity?limit={limit}{cursor}&t={}",
+        js_sys::Date::now()
+    );
     let resp = req_get(&url).send().await.map_err(network_error)?;
     if resp.ok() {
-        resp.json::<Vec<ActivityEvent>>()
+        resp.json::<ActivityPage<ActivityEvent>>()
             .await
             .map_err(|e| e.to_string())
     } else {

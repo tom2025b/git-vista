@@ -100,19 +100,25 @@ use serde::{Deserialize, Serialize};
 /// back to exactly the unchecked drop this bump exists to remove, and nothing
 /// would be red. A client that has not been taught to send it must be refused
 /// at the version gate, not served the old unsafe path.
-pub const PROTOCOL_VERSION: u32 = 9;
+///
+/// **v10 (#559/#562)** — `GET /api/activity` replaces its bare event array
+/// with [`crate::ActivityPage`], whose cursor makes older folded events
+/// reachable and says explicitly whether another page exists. A v9 client
+/// expects an array and cannot deserialize the envelope; accepting it through
+/// negotiation would turn a deliberate update into a late panel failure.
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// The oldest client protocol version this server build still accepts. Together
 /// with [`MAX_CLIENT_PROTOCOL`] it is the compatibility window a client's version
 /// must fall inside. Equal to [`PROTOCOL_VERSION`] until a compatible-but-older
 /// contract must be supported.
-pub const MIN_CLIENT_PROTOCOL: u32 = 9;
+pub const MIN_CLIENT_PROTOCOL: u32 = 10;
 
 /// The newest client protocol version this server build can accept. A client
 /// reporting a version above this is *ahead* of the server (the server was
 /// downgraded, or the client cache is from a newer deploy) and is refused the
 /// same way as one that is too old.
-pub const MAX_CLIENT_PROTOCOL: u32 = 9;
+pub const MAX_CLIENT_PROTOCOL: u32 = 10;
 
 /// Request header a client must send on every `/api/*` call **except**
 /// `GET /api/protocol`, carrying the [`PROTOCOL_VERSION`] it was built against.
@@ -290,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v9_is_hard_compatibility_window() {
+    fn protocol_v10_is_a_hard_compatibility_window() {
         // M1.10 (#63) bumped the wire protocol to 4 and moved the whole window,
         // not just the ceiling: a v3 client cannot page history, so v3 must be
         // refused exactly like any other out-of-window version, not tolerated.
@@ -336,12 +342,15 @@ mod tests {
         // quietly skips its new proof. That refusal is the point — the
         // alternative shape (`Option<OperationId>`) would have let a caller
         // stop proving anything with nothing red. Whole window again.
-        assert_eq!(PROTOCOL_VERSION, 9);
-        assert_eq!(MIN_CLIENT_PROTOCOL, 9);
-        assert_eq!(MAX_CLIENT_PROTOCOL, 9);
-        assert_eq!(check_compatibility(8, 9, 9), Compatibility::ClientTooOld);
-        assert_eq!(check_compatibility(9, 9, 9), Compatibility::Compatible);
-        assert_eq!(check_compatibility(10, 9, 9), Compatibility::ClientTooNew);
+        // #559/#562 moves the activity response from a bare array to a page
+        // envelope. A v9 client cannot deserialize it, so the window moves
+        // whole rather than letting the Activity panel fail after startup.
+        assert_eq!(PROTOCOL_VERSION, 10);
+        assert_eq!(MIN_CLIENT_PROTOCOL, 10);
+        assert_eq!(MAX_CLIENT_PROTOCOL, 10);
+        assert_eq!(check_compatibility(9, 10, 10), Compatibility::ClientTooOld);
+        assert_eq!(check_compatibility(10, 10, 10), Compatibility::Compatible);
+        assert_eq!(check_compatibility(11, 10, 10), Compatibility::ClientTooNew);
     }
 
     #[test]
