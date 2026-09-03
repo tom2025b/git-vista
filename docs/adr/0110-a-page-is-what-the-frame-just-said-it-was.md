@@ -220,6 +220,19 @@ decided the geometry is the only one that can report it without guessing.
 - A page is deliberately the **full** visible count, not height-minus-one. A
   pane squeezed to no interior still moves by one, so `PageDown` degrades to
   `j` rather than being silently inert.
+- **A cursor that can now move a page at a time is a cursor the viewport has
+  to follow.** Found in review after this PR was opened, not before it: the
+  conflict overlay's `view_offset` pulled the window back to the selection on
+  `Screen::Editor` only, through `caret_row`. `Screen::List` had no
+  scroll-following at all, because before the page keys nothing could move the
+  file cursor further than one row from where the window already was. `End` in
+  a list longer than the overlay moved `cursor` and never touched `scroll`, so
+  the highlighted row left the drawn window entirely — the key looked inert,
+  and `Enter` then opened a path that was nowhere on screen. `caret_row` is now
+  one arm of `focus_row`, which answers the same question for whichever screen
+  is up; the three-way clamp above it is unchanged. The general lesson is the
+  narrower one worth writing down: **a new way to move a cursor is a change to
+  every viewport that was only ever asked to follow small movements.**
 
 ## Verification
 
@@ -251,5 +264,24 @@ a small pane and wrong the moment somebody zooms one.
 Two further invariants carry their own mutation notes in the source rather
 than a separate run: the zoomed-layout tiling invariant in `layout.rs` and the
 per-pane unit measurement in `ui.rs`.
+
+### The scroll-following defect, and why this matrix did not catch it
+
+The mutations above exercise `page()` and `observe()` — **height**, not
+scroll-following. Nothing in them draws the list and asks where the selection
+ended up, so the missing `Screen::List` arm of `view_offset` survived a green
+matrix untouched. Its own two mutations ran against committed HEAD `5ba45ef8`,
+working tree clean, both baselines green at 178 passed:
+
+| Invariant | Mutation | Result |
+|---|---|---|
+| The drawn window contains the row the file cursor is on | **remove**: `Screen::List => None` — the arm is gone, exactly the code as it stood when the PR was opened | **caught** (record 189) — offset stayed at `0` showing `file-00`…`file-03` with the cursor on `file-19` |
+| The drawn window contains the row the file cursor is on | **weaken**: `Some(self.cursor.min(last))` — the follow is there but forgets that row 0 is the heading | **caught** (record 190) — offset `15`, one row short: `file-14`…`file-18`, cursor on `file-19` |
+
+They fail differently, which is the point: the first is the mechanism absent,
+the second is the mechanism present and off by one at the bottom edge only.
+The test asserts that exactly one row of `window(view_offset(h), h)` is marked
+selected **and that it is the file the cursor names** — an assertion that the
+cursor reached the last file would have passed throughout the defect's life.
 
 **Signed:** max · 2026-09-03
