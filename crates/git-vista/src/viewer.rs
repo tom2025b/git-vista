@@ -752,6 +752,15 @@ fn conflict_pane(pane: Pane, state: &PaneState) -> View {
     .into_view()
 }
 
+/// The two coordinates of one conflict document. Keeping them in one value
+/// makes it impossible for the editor callbacks to clone a path without also
+/// carrying the Frame's latched repository (#621, ADR 0109).
+#[derive(Clone)]
+struct ConflictTarget {
+    repo: String,
+    path: String,
+}
+
 /// The four-pane conflict view (M4.31a, #428).
 ///
 /// Iterates [`Pane::ALL`] rather than naming four fields, so a pane cannot be
@@ -766,6 +775,10 @@ fn conflict_body(
     graph: RwSignal<GraphCore>,
     shell: Shell,
 ) -> View {
+    let target = ConflictTarget {
+        repo,
+        path: panes.path.clone(),
+    };
     let rendered: Vec<View> = Pane::ALL
         .iter()
         .map(|p| conflict_pane(*p, panes.pane(*p)))
@@ -777,8 +790,6 @@ fn conflict_body(
     // same outcome but different requests, and only one of them stays correct
     // if the user has misread which side deleted what (see `Resolution`'s own
     // doc comment).
-    let path = panes.path.clone();
-
     // M4.31d (#430): the conflict's shape, in a sentence, above the controls.
     // `None` for an ordinary text conflict — a note on every conflict would
     // train the eye to skip it, and then the binary and delete/modify cases
@@ -820,15 +831,13 @@ fn conflict_body(
             }
             .into_view();
         }
-        let path = path.clone();
-        let repo = repo.clone();
+        let target = target.clone();
         let on = move |_| {
-            let path = path.clone();
-            let repo = repo.clone();
+            let target = target.clone();
             error.set(None);
             busy.set(true);
             spawn_local(async move {
-                match resolve_conflict_request(&repo, &path, resolution).await {
+                match resolve_conflict_request(&target.repo, &target.path, resolution).await {
                     Ok(()) => {
                         // BOTH, and the second one is the load-bearing half.
                         // `status.refetch()` updates the topbar chip's v1
@@ -876,8 +885,7 @@ fn conflict_body(
     // M4.31c (#432): the line/block resolver, gated on the SAME predicate the
     // server asks before executing one.
     let editor = conflict_editor(
-        repo,
-        panes.path.clone(),
+        target,
         panes.surface.text_resolution_allowed,
         busy,
         error,
@@ -918,8 +926,7 @@ fn conflict_body(
 /// never compiles this file, so a decision made here would be pinned by
 /// nothing. This function fetches, renders, and submits.
 fn conflict_editor(
-    repo: String,
-    path: String,
+    target: ConflictTarget,
     allowed: bool,
     busy: RwSignal<bool>,
     error: RwSignal<Option<String>>,
@@ -944,15 +951,13 @@ fn conflict_editor(
     // editor must never do.
     let edited = create_rw_signal::<Option<String>>(None);
 
-    let open_path = path.clone();
-    let open_repo = repo.clone();
+    let open_target = target.clone();
     let open = move |_| {
-        let p = open_path.clone();
-        let repo = open_repo.clone();
+        let target = open_target.clone();
         error.set(None);
         busy.set(true);
         spawn_local(async move {
-            match fetch_conflict_source(&repo, &p).await {
+            match fetch_conflict_source(&target.repo, &target.path).await {
                 Ok(src) => {
                     let n = conflict_count(&parse(&src.content));
                     choices.set(vec![Choice::Unchosen; n]);
@@ -965,8 +970,7 @@ fn conflict_editor(
         });
     };
 
-    let submit_path = path.clone();
-    let submit_repo = repo;
+    let submit_target = target;
     let submit = move |_| {
         let Some(src) = source.get() else { return };
         let blocks = parse(&src.content);
@@ -980,8 +984,7 @@ fn conflict_editor(
             ));
             return;
         };
-        let p = submit_path.clone();
-        let repo = submit_repo.clone();
+        let target = submit_target.clone();
         // Echoed back unchanged — never recomputed here. A client that
         // recomputed the stages it was given could only ever agree with itself.
         let stages = src.stages.clone();
@@ -989,7 +992,15 @@ fn conflict_editor(
         error.set(None);
         busy.set(true);
         spawn_local(async move {
-            match resolve_conflict_content_request(&repo, &p, stages, token, content).await {
+            match resolve_conflict_content_request(
+                &target.repo,
+                &target.path,
+                stages,
+                token,
+                content,
+            )
+            .await
+            {
                 Ok(()) => {
                     // BOTH refreshes, for the reason #429 documents: the topbar
                     // chip and the Activity panel's conflicted list are
