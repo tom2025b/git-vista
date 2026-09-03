@@ -188,29 +188,48 @@ Named invariants and their direct tests:
 |---|---|
 | Every available folded event is returned exactly once, in stable newest-first order, and the walk terminates | `more_than_500_folded_events_are_walked_once_in_order_and_terminate` |
 | A cursor never applies its offset to a changed live fold | `a_cursor_refuses_a_feed_that_changed_at_the_head` |
+| A cursor is authenticated and bound to one repository/worktree scope | `an_activity_cursor_is_authenticated_and_bound_to_its_repository` |
 | The wire tells “more” from “end” | `the_wire_distinguishes_more_events_from_the_end` plus the first/final cursor assertions in the 620-event walk |
 | The second, undo-hints fold also searches past 500 | `undo_hints_search_past_the_former_500_event_ceiling` |
 | MCP actually forwards both paging fields, rather than merely advertising them | `activity_path_passes_the_opaque_cursor_and_page_limit` |
-| A cached incompatible client is stopped at negotiation | `protocol_version_is_pinned` (v10 whole window) |
+| A cached incompatible client is stopped at negotiation | `protocol_v10_is_a_hard_compatibility_window` |
 
 ### Mutation matrix
 
-`failure-atlas mutation_check` runs from committed HEAD. Every invariant is
+`failure-atlas mutation_check` ran from commit `94df313f`. Every invariant was
 broken two different ways: one removes its mechanism, one weakens or misroutes
-it. The final run and exact failing assertions are recorded here after the
-commit-backed mutation pass.
+it. Every unmutated baseline was green and every mutated leg reached and failed
+an assertion; no compiler failure is counted as a catch. The first invocation
+also demonstrated the tool's containment gate by refusing `/tmp`, which is a
+Git work tree on this host. Those inconclusive refusal records are deliberately
+excluded from the evidence below; the conclusive rerun used the atlas's
+validated `/var/tmp/failure-atlas-codex` workspace.
 
-| Invariant | Remove mutation | Weaken/misroute mutation | Result |
+| Invariant | Remove mutation | Weaken/misroute mutation | failure-atlas result |
 |---|---|---|---|
-| complete, ordered, terminating walk | pending | pending | pending |
-| live-fold drift refusal | pending | pending | pending |
-| explicit more/end wire state | pending | pending | pending |
-| undo hints past 500 | pending | pending | pending |
-| MCP cursor + limit forwarding | pending | pending | pending |
-| protocol v10 negotiation gate | pending | pending | pending |
+| complete, ordered, terminating walk | restore `MAX_PAGE_LIMIT` on the query fold | advance the encoded next position by one | caught/caught — records 141–142; exact 620-row equality fails |
+| live-fold drift refusal | remove the generation comparison | hash only the unchanged tail event | caught/caught — records 143–144; the expected 409 becomes an `Ok` page |
+| authenticated, repository-bound cursor | remove the activity scope comparison | remove the shared codec's HMAC comparison | caught/caught — records 153–154; foreign and edited cursors respectively become `Ok` pages |
+| explicit more/end wire state | omit `cursor` when it is `None` | rename the wire field to `next_cursor` | caught/caught — records 145–146; exact JSON differs |
+| undo hints past 500 | restore `MAX_PAGE_LIMIT` on the undo fold | cap that fold at one | caught/caught — records 147–148; expected hint count is one, actual is zero |
+| MCP cursor + limit forwarding | discard the cursor argument | serialize the cursor under `limit=` | caught/caught — records 149–150; exact request path differs |
+| protocol v10 negotiation gate | move `PROTOCOL_VERSION` back to 9 | weaken `MIN_CLIENT_PROTOCOL` to 9 | caught/caught — records 151–152; exact whole-window assertions differ |
+
+Total: **14/14 conclusive catches**, two independent mutations for each named
+invariant.
 
 ### Verification
 
-Pending final full-suite, clippy, formatting and mutation runs.
+- `cargo test -p git-vista-server -j 1`: **1,137 passed, 0 failed, 6 ignored**
+  across the main binary, sandbox binary and four integration targets.
+- `cargo test -p git-vista-protocol -j 8`: **226 passed, 0 failed, 1 ignored**.
+- `cargo test -p git-vista-mcp -j 8`: **72 passed, 0 failed, 7 ignored**.
+- `cargo check -p git-vista --bin git-vista-ui -j 8`: passed.
+- `cargo check -p git-vista --bins --target wasm32-unknown-unknown -j 8`:
+  passed, compiling the browser consumer on its real target.
+- `cargo clippy --workspace -j 8 -- -D warnings`: passed.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+- failure-atlas: **14 caught, 0 survived, 0 baseline/build failures** in the
+  conclusive run (records 141–154).
 
 **Signed:** max · 2026-09-02
