@@ -82,11 +82,14 @@ pub const fn preview_pending_message() -> &'static str {
     "Checking whether this listener can provide a preview…"
 }
 
-/// Copy shown after the preview round trip fails.  The reason may be a
-/// capability refusal, so this function reports only the failed request and
-/// never reassures past what the response established.
+/// Copy shown after the preview round trip fails.
+///
+/// The panel heading already supplies the "No preview" context, and the reason
+/// may itself be a complete capability refusal.  Preserve that answer verbatim
+/// instead of awkwardly prefixing one complete sentence with another, and
+/// never reassure past what the response established.
 pub fn preview_failure_message(reason: &str) -> String {
-    format!("The preview could not be fetched: {reason}")
+    reason.to_owned()
 }
 
 #[cfg(test)]
@@ -197,6 +200,10 @@ mod tests {
             capability_refusal(405, "/api/plan", Some(ListenerProfile::ReadOnly)).unwrap();
         let rendered = preview_failure_message(&refusal);
 
+        assert_eq!(
+            rendered, refusal,
+            "a complete refusal must be shown exactly once"
+        );
         assert!(rendered.contains("/api/plan"), "{rendered}");
         assert!(rendered.contains("unavailable"), "{rendered}");
         assert!(!rendered.contains("still available"), "{rendered}");

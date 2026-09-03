@@ -384,6 +384,7 @@ mod tests {
             CSRF_HEADER,
             IDEMPOTENCY_HEADER,
             OPERATION_HEADER,
+            crate::LISTENER_PROFILE_HEADER,
         ];
         for name in names {
             assert_eq!(name, name.to_ascii_lowercase(), "{name} must be lowercase");
