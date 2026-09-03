@@ -72,6 +72,7 @@
 #[macro_use]
 pub mod newtype;
 
+pub mod activity;
 pub mod effects;
 
 pub mod conflict;
@@ -90,6 +91,7 @@ pub mod status;
 pub mod version;
 pub mod worktree;
 
+pub use activity::ActivityPage;
 pub use conflict::{
     ConflictSource, ConflictedFile, ContentResolutionRefused, Continuation, NotTextResolvable,
     Stage,

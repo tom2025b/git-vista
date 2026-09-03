@@ -210,16 +210,22 @@ fn read_tool_catalog() -> serde_json::Value {
         },
         {
             "name": "get_activity",
-            "description": "The chronological activity feed for the server's current \
-                            repository — journal + reflogs + snapshot diffs, folded and \
-                            attributed, newest first (GET /api/activity).",
+            "description": "One cursor-paginated window of the chronological activity feed \
+                            for the server's current repository — journal + reflogs + snapshot \
+                            diffs, folded and attributed, newest first (GET /api/activity). \
+                            Pass the response cursor back to continue; null means the end.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "cursor": {
+                        "type": "string",
+                        "description": "Opaque cursor from a prior get_activity response. \
+                                        Omit for the newest page."
+                    },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Max events returned (server default 100, capped at 500)."
+                        "description": "Events per page (server default 100, clamped to 500)."
                     }
                 },
                 "additionalProperties": false
@@ -351,12 +357,10 @@ pub fn call_tool(
             get_json::<git_vista_protocol::WorktreeStatus>(&path, session)
         }
         "get_activity" => {
-            let mut qs = String::new();
-            if let Some(limit) = optional_u64(arguments, "limit")? {
-                qs.push_str(&format!("?limit={limit}"));
-            }
-            let path = format!("/api/activity{qs}");
-            get_json::<Vec<git_vista_core::activity::ActivityEvent>>(&path, session)
+            let path = activity_path(arguments)?;
+            get_json::<git_vista_protocol::ActivityPage<git_vista_core::activity::ActivityEvent>>(
+                &path, session,
+            )
         }
         // M12/CLOUD-4 (#450): local — no HTTP call. See `lesson`'s module doc
         // for why explaining a `plan` object needs no network round trip.
@@ -481,6 +485,23 @@ fn repo_suffix(args: &serde_json::Value, sep: &str) -> Result<String, ToolError>
     Ok(match optional_url_safe(args, "repo")? {
         Some(repo) => format!("{sep}repo={repo}"),
         None => String::new(),
+    })
+}
+
+/// The activity tool's cursor/limit query, kept pure so passing the cursor
+/// through is a tested contract rather than an unobserved formatting branch.
+fn activity_path(args: &serde_json::Value) -> Result<String, ToolError> {
+    let mut query = Vec::new();
+    if let Some(cursor) = optional_url_safe(args, "cursor")? {
+        query.push(format!("cursor={cursor}"));
+    }
+    if let Some(limit) = optional_u64(args, "limit")? {
+        query.push(format!("limit={limit}"));
+    }
+    Ok(if query.is_empty() {
+        "/api/activity".to_string()
+    } else {
+        format!("/api/activity?{}", query.join("&"))
     })
 }
 
@@ -619,6 +640,25 @@ mod tests {
 
     fn no_args() -> serde_json::Value {
         serde_json::json!({})
+    }
+
+    /// #562: `get_activity` must hand both paging fields to the server. A
+    /// schema-only test would stay green if the dispatcher silently fetched
+    /// page one forever.
+    ///
+    /// Mutations: drop the cursor branch, or format it under `limit=`; both
+    /// fail the exact path while the no-argument assertion guards the base.
+    #[test]
+    fn activity_path_passes_the_opaque_cursor_and_page_limit() {
+        assert_eq!(activity_path(&no_args()).unwrap(), "/api/activity");
+        assert_eq!(
+            activity_path(&serde_json::json!({
+                "cursor": "signed.payload",
+                "limit": 321
+            }))
+            .unwrap(),
+            "/api/activity?cursor=signed.payload&limit=321"
+        );
     }
 
     #[test]

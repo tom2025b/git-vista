@@ -37,8 +37,9 @@ use crate::icons::icon_set;
 use crate::menu;
 use crate::state::{Features, PendingOp, Settings};
 
-/// How many events to request. The panel is a scrollable feed, not an
-/// archive; the backend caps harder anyway.
+/// How many events to request per page. `fetch_activity` follows the server's
+/// cursor to exhaustion, so this bounds each response without truncating the
+/// panel's history.
 const FEED_LIMIT: usize = 100;
 
 /// Build the Activity panel view. Rendered inside the overlays wrapper, so it
