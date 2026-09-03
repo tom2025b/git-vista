@@ -108,6 +108,44 @@ impl Pane {
     }
 }
 
+/// What the frame that was just drawn can actually show.
+///
+/// `ui.rs` measures this from the very rects it rendered each widget into and
+/// the event loop hands it to [`App::observe`] before the next key is read.
+/// That indirection is the whole point: a page is then the pane's **current**
+/// visible row count, which is what #625 asks for and what a constant cannot
+/// be. A constant would be right in a one-third-height pane and wrong the
+/// moment [`Action::ToggleMaximize`] gives that same pane the whole window —
+/// wrong, that is, in exactly the state the zoom key exists to create, while
+/// looking correct in every small-pane test.
+///
+/// The unit is the one that pane's cursor counts, not always a terminal row:
+/// the graph draws a connector line between commits, so its viewport is
+/// **commits** per screen rather than lines.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Viewport {
+    panes: [usize; 4],
+    overlay: usize,
+}
+
+impl Viewport {
+    /// `panes` in [`Pane::ALL`] order; `overlay` is the body of whichever
+    /// full-frame surface was up (the conflict overlay, a plan review).
+    pub fn new(panes: [usize; 4], overlay: usize) -> Viewport {
+        Viewport { panes, overlay }
+    }
+
+    /// Rows of that pane's own content the last frame had room for.
+    pub fn rows(&self, pane: Pane) -> usize {
+        self.panes[pane.index()]
+    }
+
+    /// Rows the last frame's overlay had room for.
+    pub fn overlay(&self) -> usize {
+        self.overlay
+    }
+}
+
 /// What a key press means, after `keys.rs` has translated it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -117,6 +155,16 @@ pub enum Action {
     Focus(Pane),
     CursorDown,
     CursorUp,
+    /// `PageDown` / `PageUp` — one visible page of the focused pane (#625).
+    /// How far that is comes from [`Viewport`], never from a constant.
+    CursorPageDown,
+    CursorPageUp,
+    /// `Home` / `End` — the first and last row of the focused pane (#625).
+    CursorTop,
+    CursorBottom,
+    /// `z` — give the focused pane the whole window, or put the four-pane
+    /// shape back (#625).
+    ToggleMaximize,
     Refresh,
     Activate,
     ParentPrev,
@@ -414,6 +462,11 @@ pub struct App {
     pub execution: Option<TrackedExecution>,
     refresh_after_write: bool,
     cursors: [usize; 4],
+    /// What the last drawn frame could show (#625). Written by
+    /// [`App::observe`] once a frame; read whenever a page has to be a page.
+    viewport: Viewport,
+    /// Whether the focused pane currently has the whole window (#625).
+    maximized: bool,
     pub status: Status,
     /// Catalog reads dispatched and not yet answered.
     pub in_flight: u32,
@@ -456,6 +509,8 @@ impl App {
             execution: None,
             refresh_after_write: false,
             cursors: [0; 4],
+            viewport: Viewport::default(),
+            maximized: false,
             status: Status {
                 text: String::from("connecting to git-vista-server…"),
                 tone: Tone::Info,
@@ -514,6 +569,31 @@ impl App {
                 if cursor > 0 {
                     self.cursors[pane.index()] = cursor - 1;
                 }
+                Vec::new()
+            }
+            Action::CursorPageDown => {
+                let pane = self.focus;
+                let page = self.page(pane);
+                self.move_cursor_by(pane, page as isize);
+                Vec::new()
+            }
+            Action::CursorPageUp => {
+                let pane = self.focus;
+                let page = self.page(pane);
+                self.move_cursor_by(pane, -(page as isize));
+                Vec::new()
+            }
+            Action::CursorTop => {
+                self.cursors[self.focus.index()] = 0;
+                Vec::new()
+            }
+            Action::CursorBottom => {
+                let pane = self.focus;
+                self.cursors[pane.index()] = self.rows(pane).saturating_sub(1);
+                Vec::new()
+            }
+            Action::ToggleMaximize => {
+                self.maximized = !self.maximized;
                 Vec::new()
             }
             Action::Refresh => {
@@ -1218,6 +1298,33 @@ impl App {
                 }
                 Vec::new()
             }
+            Action::CursorPageDown | Action::CursorPageUp => {
+                // The modal's own body, not a pane's — it is drawn inside a
+                // margin over the whole frame, so it is taller than any of
+                // them and pages by more.
+                let page = self.viewport.overlay().max(1) as isize;
+                let delta = if action == Action::CursorPageDown {
+                    page
+                } else {
+                    -page
+                };
+                if let Some(review) = self.plan_review.as_mut() {
+                    review.scroll(delta);
+                }
+                Vec::new()
+            }
+            Action::CursorTop => {
+                if let Some(review) = self.plan_review.as_mut() {
+                    review.scroll_to(0);
+                }
+                Vec::new()
+            }
+            Action::CursorBottom => {
+                if let Some(review) = self.plan_review.as_mut() {
+                    review.scroll_to(usize::MAX);
+                }
+                Vec::new()
+            }
             Action::Quit => {
                 self.quit = true;
                 Vec::new()
@@ -1244,7 +1351,11 @@ impl App {
             // neither given nor refused. The modal is dismissed by deciding,
             // never by navigating away from it.
             | Action::OpenConflicts
-            | Action::Conflict(_) => Vec::new(),
+            | Action::Conflict(_)
+            // Zoom is a shape the panes take, and no pane is reachable while
+            // a plan is waiting to be approved or refused. Toggling it under
+            // the modal would rearrange a frame the user cannot see.
+            | Action::ToggleMaximize => Vec::new(),
         }
     }
 
@@ -1826,6 +1937,40 @@ impl App {
     /// The selected row of a pane.
     pub fn cursor(&self, pane: Pane) -> usize {
         self.cursors[pane.index()]
+    }
+
+    /// Record what the frame just drawn could show (#625). The event loop
+    /// calls this after every draw, so by the time a key is read the numbers
+    /// describe the frame the user is looking at — including a terminal that
+    /// was resized and a pane that was just zoomed.
+    pub fn observe(&mut self, viewport: Viewport) {
+        self.viewport = viewport;
+        self.conflicts.observe(viewport.overlay());
+    }
+
+    /// The pane the zoom key has maximized, if any.
+    ///
+    /// Zoom follows focus rather than pinning the pane it was pressed on:
+    /// `z` and then Tab shows the next pane full-height, which is what
+    /// somebody who wants a big look at something else means. It also means
+    /// there is no stale "zoomed pane" to reconcile when focus moves.
+    pub fn maximized(&self) -> Option<Pane> {
+        self.maximized.then_some(self.focus)
+    }
+
+    /// One page of a pane, in the units that pane's cursor counts.
+    ///
+    /// Never zero: a pane squeezed to no interior still moves by one row, so
+    /// `PageDown` degrades to `j` rather than silently doing nothing.
+    fn page(&self, pane: Pane) -> usize {
+        self.viewport.rows(pane).max(1)
+    }
+
+    /// Move a pane's cursor by `delta`, clamped to the rows it actually has.
+    fn move_cursor_by(&mut self, pane: Pane, delta: isize) {
+        let last = self.rows(pane).saturating_sub(1);
+        let slot = &mut self.cursors[pane.index()];
+        *slot = slot.saturating_add_signed(delta).min(last);
     }
 
     /// How many rows a pane has to select among.
