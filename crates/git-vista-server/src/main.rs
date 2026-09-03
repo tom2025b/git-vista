@@ -152,7 +152,7 @@ use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
-use git_vista_protocol::RepoMode;
+use git_vista_protocol::{ListenerProfile, RepoMode, LISTENER_PROFILE_HEADER};
 use handlers::branch::{
     checkout_branch, create_branch, delete_branch, force_delete_branch, merge_branch, push_branch,
 };
@@ -438,6 +438,11 @@ fn api_router(
     full_routes: bool,
     codec: Arc<CursorCodec>,
 ) -> Router {
+    // #589: declare the profile from the exact boolean that selects the route
+    // table below.  It is not reconstructed from Host, peer address, or
+    // `SessionState::via_lan`, any of which would create a second source of
+    // truth about what this router can honour.
+    let listener_profile = ListenerProfile::from_write_routes(full_routes);
     let auth_state = AuthState {
         manager: session_state.manager.clone(),
         hosts,
@@ -763,6 +768,13 @@ fn api_router(
         // The session store the session handlers (and the auth layer) resolve
         // against. Erases the router's state type back to `()`.
         .with_state(session_state)
+        // The profile is a property of the listener, not of any one handler.
+        // Stamp it at the router boundary so every registered API response
+        // declares the capability table that served it.
+        .layer(SetResponseHeaderLayer::overriding(
+            header::HeaderName::from_static(LISTENER_PROFILE_HEADER),
+            HeaderValue::from_static(listener_profile.as_header_value()),
+        ))
 }
 
 /// Assemble one full application — [`api_router`] plus the static SPA fallback
@@ -773,6 +785,7 @@ fn build_app(
     full_routes: bool,
     codec: Arc<CursorCodec>,
 ) -> Router {
+    let listener_profile = ListenerProfile::from_write_routes(full_routes);
     // Serve the SPA bundle with `Cache-Control: no-cache` so the browser always
     // revalidates index.html (and thus picks up a freshly built wasm hash) instead
     // of running a stale, cached frontend — the cache layered on top of the live
@@ -798,6 +811,14 @@ fn build_app(
         // cross-origin embedding, and off-origin script/connect are denied
         // everywhere the app is served.
         .layer(axum::middleware::from_fn(security::security_headers))
+        // Also cover the static fallback's response to an absent API route.
+        // That is the live LAN failure shape: POST /api/select falls through
+        // to the file service and receives an ordinary 405.  The response must
+        // still say which listener profile produced it.
+        .layer(SetResponseHeaderLayer::overriding(
+            header::HeaderName::from_static(LISTENER_PROFILE_HEADER),
+            HeaderValue::from_static(listener_profile.as_header_value()),
+        ))
 }
 
 /// Turn a caught handler panic into a `500` carrying the panic text, instead of a
@@ -852,7 +873,9 @@ mod tests {
     use axum::body::{to_bytes, Body};
     use axum::extract::ConnectInfo;
     use axum::http::Request;
-    use git_vista_protocol::{SessionInfo, PROTOCOL_HEADER, PROTOCOL_VERSION};
+    use git_vista_protocol::{
+        ListenerProfile, SessionInfo, LISTENER_PROFILE_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION,
+    };
     use tower::ServiceExt;
 
     /// Establish a session against `router` (whichever host it expects) and
@@ -890,6 +913,95 @@ mod tests {
         cookie
     }
 
+    /// Read the declaration from a real response. `/api/protocol` is present
+    /// on both route tables and needs no session, so this measures only the
+    /// listener profile rather than coupling the assertion to repository state.
+    async fn declared_profile(router: Router, host: &str) -> ListenerProfile {
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/protocol")
+                    .header(header::HOST, host)
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 55000))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let wire = resp
+            .headers()
+            .get(LISTENER_PROFILE_HEADER)
+            .expect("every API response declares its listener profile")
+            .to_str()
+            .unwrap();
+        ListenerProfile::from_header_value(wire).expect("server emitted a known profile")
+    }
+
+    /// The exact live-server symptom behind #589, through `build_app` rather
+    /// than the API-only test router: the LAN request falls through to the
+    /// static service and receives an ordinary 405, while loopback reaches the
+    /// registered route and is stopped by authentication. Both responses still
+    /// declare the profile that explains the difference.
+    #[tokio::test]
+    async fn select_route_presence_and_listener_declaration_cannot_disagree() {
+        for (full_routes, via_lan, host, status, profile) in [
+            (
+                false,
+                true,
+                "192.168.1.42:8080",
+                StatusCode::METHOD_NOT_ALLOWED,
+                ListenerProfile::ReadOnly,
+            ),
+            (
+                true,
+                false,
+                "localhost:8080",
+                StatusCode::UNAUTHORIZED,
+                ListenerProfile::Full,
+            ),
+        ] {
+            let sessions = Arc::new(SessionManager::new(None));
+            let app = build_app(
+                SessionState {
+                    manager: sessions,
+                    via_lan,
+                    rate_limiter: None,
+                },
+                if via_lan {
+                    HostPolicy::lan("192.168.1.42".parse().unwrap(), PORT)
+                } else {
+                    HostPolicy::loopback(PORT)
+                },
+                full_routes,
+                Arc::new(CursorCodec::new()),
+            );
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/select")
+                        .header(header::HOST, host)
+                        .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 55000))))
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), status, "profile {profile:?}");
+            assert_eq!(
+                resp.headers()
+                    .get(LISTENER_PROFILE_HEADER)
+                    .and_then(|value| value.to_str().ok()),
+                Some(profile.as_header_value()),
+                "response and route table disagree for {profile:?}"
+            );
+        }
+    }
+
     /// Proves the spec's required case directly against the real route table:
     /// a GET to a write-only path passes the session gate (needs only a live
     /// session, not CSRF) and reaches axum's own routing — distinguishing
@@ -911,6 +1023,10 @@ mod tests {
             HostPolicy::lan("192.168.1.42".parse().unwrap(), PORT),
             false,
             Arc::new(CursorCodec::new()),
+        );
+        assert_eq!(
+            declared_profile(router.clone(), "192.168.1.42:8080").await,
+            ListenerProfile::ReadOnly
         );
         let cookie = bootstrap_cookie(router.clone(), "192.168.1.42:8080", &token).await;
         // `/api/plan` (M2.23d, #248) is checked here beside `/api/commit`:
@@ -957,6 +1073,10 @@ mod tests {
             HostPolicy::loopback(PORT),
             true,
             Arc::new(CursorCodec::new()),
+        );
+        assert_eq!(
+            declared_profile(router.clone(), "localhost:8080").await,
+            ListenerProfile::Full
         );
         let cookie = bootstrap_cookie(router.clone(), "localhost:8080", &token).await;
         // /api/commit is registered POST-only; a GET reaches real routing and

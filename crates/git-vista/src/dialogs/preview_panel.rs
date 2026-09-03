@@ -10,12 +10,15 @@
 //! which is the reason a second static renderer exists rather than a reuse of
 //! the first.
 //!
-//! # The preview informs; it never gates
+//! # A computed preview informs; a failed request makes no promise
 //!
-//! Nothing in here touches the confirm button. Every arm that has no picture
-//! prints [`reassurance`]'s sentence saying the operation is still available,
-//! and that sentence is wired to `PreviewView::advisory_only` so it stops being
-//! printed if the rule it promises ever stops being true.
+//! Nothing in here touches the confirm button. Every *computed* preview arm
+//! that has no picture prints [`reassurance`]'s sentence saying the operation
+//! is still available, wired to `PreviewView::advisory_only` so it stops being
+//! printed if the rule it promises ever stops being true. A transport failure
+//! is different: a 405 from `/api/plan` establishes that the operation is not
+//! available on this listener, so pending/failed request copy comes from the
+//! host-tested listener policy and makes no availability claim.
 
 use leptos::*;
 
@@ -24,6 +27,7 @@ use crate::features::preview::scene::{
     scene_of, HalfScene, LegendEntry, PreviewScene, SceneNode, MARK_ADDED,
 };
 use crate::features::preview::signals::{Preview, PreviewSlot};
+use crate::listener_policy::{preview_failure_message, preview_pending_message};
 
 /// Panel chrome, matching `explanation_panel_view`'s box in `confirm.rs` so
 /// the two read as siblings under one confirmation.
@@ -47,24 +51,20 @@ pub fn preview_panel_view(preview: Preview) -> impl IntoView {
                 <div style=PANEL>
                     <div style=PANEL_HEAD>"What this would do"</div>
                     <div style=format!("{PANEL_BODY}{MUTED}")>
-                        "Drawing the result… the operation is ready either way."
+                        {preview_pending_message()}
                     </div>
                 </div>
             }
             .into_view(),
         ),
-        // A failed round trip is a fact about the connection, never about the
-        // repository — so it says so, and says the operation is unaffected.
+        // A failed round trip may be a capability refusal from `/api/plan`, not
+        // merely a connection failure. Report the answer; never promise through it.
         PreviewSlot::Failed(why) => Some(
             view! {
                 <div style=PANEL>
                     <div style=PANEL_HEAD>"No preview"</div>
                     <div style=PANEL_BODY>
-                        <div style=MUTED>{format!("The preview could not be fetched: {why}")}</div>
-                        <div style=format!("{MUTED} margin-top:6px;")>
-                            "This says nothing about the operation itself, which is \
-                             unchanged and still available — confirm below to run it."
-                        </div>
+                        <div style=MUTED>{preview_failure_message(&why)}</div>
                     </div>
                 </div>
             }
