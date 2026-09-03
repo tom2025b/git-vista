@@ -219,14 +219,14 @@ then verifies that the DOM and `gloo-net` glue consume those answers.
 | Invariant | Executable check |
 |---|---|
 | `full_routes` and the response declaration use one closed mapping | `listener::tests::the_route_switch_and_header_declaration_are_one_mapping` |
-| Unknown declarations fail closed | `listener::tests::an_unknown_or_weakened_declaration_never_defaults_to_full` |
+| Unknown declarations fail closed and the new header cannot collide with another shared header | `listener::tests::an_unknown_or_weakened_declaration_never_defaults_to_full`; `version::tests::header_names_are_lowercase_and_distinct` |
 | Real loopback/LAN route tables declare `full`/`read-only` | `tests::the_loopback_router_still_has_write_routes_registered`; `tests::the_lan_router_has_no_write_routes` |
 | The measured 401/405 pair and the header cannot disagree | `tests::select_route_presence_and_listener_declaration_cannot_disagree` |
 | A read-only picker policy is disabled and carries visible remedy text | `listener_policy::tests::a_read_only_profile_never_offers_repository_selection_and_says_why`; `listener_policy::tests::the_picker_wires_the_policy_to_both_action_and_explanation` |
 | Only 405 becomes this capability refusal, and both POST funnels ask that classifier | `listener_policy::tests::only_method_not_allowed_becomes_a_listener_capability_refusal`; `listener_policy::tests::both_wasm_post_funnels_consult_the_host_tested_405_classifier` |
 | `/api/plan` 405 cannot be followed by availability reassurance in either policy or DOM glue | `listener_policy::tests::a_plan_405_can_never_be_followed_by_an_availability_promise`; `listener_policy::tests::the_failed_preview_arm_cannot_append_reassurance_behind_the_policy` |
 
-Local verification before mutation proof:
+Local verification on the reviewed tree:
 
 - `cargo test -p git-vista`: **773 passed, 2 ignored** in the real
   `git-vista-ui` binary; the 0-test `lib.rs` target is reported separately and
@@ -235,7 +235,7 @@ Local verification before mutation proof:
   the workspace.)
 - `cargo test -p git-vista-protocol`: **229 passed** across unit/integration
   targets, with one ignored doctest.
-- `cargo test -p git-vista-server`: **1,138 passed, 6 ignored** across its
+- `cargo test -p git-vista-server`: **1,143 passed, 6 ignored** across its
   binary/integration targets; the three named router/profile tests pass
   against real Axum routers.
 - `cargo check -p git-vista --target wasm32-unknown-unknown` passes.
@@ -244,9 +244,16 @@ Local verification before mutation proof:
 - `trunk build` passes and produces the real wasm bundle.
 - `cargo fmt --all -- --check` and `git diff --check` pass.
 
+Claude's cross-family ultrareview reported two findings. The first identified
+that the preview panel prefixed a complete 405 refusal with a second sentence;
+the failure formatter now preserves the server-derived refusal exactly once,
+and its test asserts exact equality. The second identified that the new header
+had not joined the shared lowercase/distinct header census; the census now
+includes it. Both focused regressions pass.
+
 ### Mutation matrix
 
-`failure-atlas mutation_check` ran against committed HEAD `600ee784`. Every
+`failure-atlas mutation_check` ran against follow-up commit `5cb675bc`. Every
 unmutated baseline was green, every edit applied exactly once inside the
 atlas's contained clone, and every mutated leg reached and failed an assertion;
 no compiler failure is counted as a catch. The atlas reported the source tree
@@ -256,10 +263,10 @@ change was pending.
 
 | Invariant | Remove mechanism | Weaken / misroute | Result |
 |---|---|---|---|
-| Read-only profile does not offer repository selection and carries the remedy | map `ReadOnly` to `Offered` | replace the row's `disabled=!can_select` with `disabled=false` | caught/caught — records 155–156; the policy assertion and wasm-seam assertion fail independently |
-| A 405 becomes a visible listener refusal, while other statuses retain their meaning | make the classifier always return false | widen it to every status ≥400 | caught/caught — records 157–158; 405 disappears in the first and ordinary statuses are misclassified in the second |
-| `/api/plan` 405 never produces availability reassurance | append “still available” in the host-tested failed-preview formatter | append the same promise directly in the wasm failed arm | caught/caught — records 159–160; the rendered-line assertion and failed-arm seam assertion each fail |
-| Router profile declaration matches the route set | map `full_routes == false` to `Full` | make only the assembled app stamp `Full` over its read-only API router | caught/caught — records 161–162; the closed mapping and live 405/header assertions fail respectively |
+| Read-only profile does not offer repository selection and carries the remedy | map `ReadOnly` to `Offered` | replace the row's `disabled=!can_select` with `disabled=false` | caught/caught — records 171–172; the policy assertion and wasm-seam assertion fail independently |
+| A 405 becomes a visible listener refusal, while other statuses retain their meaning | make the classifier always return false | widen it to every status ≥400 | caught/caught — records 173–174; 405 disappears in the first and ordinary statuses are misclassified in the second |
+| `/api/plan` 405 never produces availability reassurance | append “still available” in the host-tested failed-preview formatter | append the same promise directly in the wasm failed arm | caught/caught — records 175–176; the exact rendered-refusal assertion and failed-arm seam assertion each fail |
+| Router profile declaration matches the route set | map `full_routes == false` to `Full` | make only the assembled app stamp `Full` over its read-only API router | caught/caught — records 177–178; the closed mapping and live 405/header assertions fail respectively |
 
 The assertion that detects the original silent path is the 405 classifier test:
 removing classification makes it receive `None` rather than a listener-specific

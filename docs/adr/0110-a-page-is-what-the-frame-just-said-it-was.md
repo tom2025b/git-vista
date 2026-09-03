@@ -1,4 +1,4 @@
-# ADR 0109 — A page is what the frame just said it was, and zoom is why that matters
+# ADR 0110 — A page is what the frame just said it was, and zoom is why that matters
 
 - **Status:** Accepted — implemented, mutation-proved two ways
 - **Date:** 2026-09-03
