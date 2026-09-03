@@ -122,6 +122,11 @@ pub enum Act {
     Refresh,
     Down,
     Up,
+    /// One visible page of the overlay body, and its two ends (#625).
+    PageDown,
+    PageUp,
+    Top,
+    Bottom,
     Open,
     FocusPane(View),
     NextPane,
@@ -136,6 +141,13 @@ pub enum Act {
     Newline,
     CaretLeft,
     CaretRight,
+}
+
+/// Which end of a screen [`Act::Top`] and [`Act::Bottom`] mean (#625).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Edge {
+    Start,
+    End,
 }
 
 /// How one row of the overlay body is styled.
@@ -332,6 +344,11 @@ pub struct ConflictsPane {
     busy: bool,
     /// The last thing worth saying: a refusal, a server sentence, a success.
     message: Option<(String, bool)>,
+    /// Rows the overlay's body had in the last drawn frame (#625). The
+    /// overlay owns the whole window, so this is the biggest page in the
+    /// program — and it changes with the terminal, which is why it is
+    /// observed rather than assumed.
+    viewport: usize,
 }
 
 impl ConflictsPane {
@@ -519,6 +536,16 @@ impl ConflictsPane {
             }
             Act::Down => self.move_cursor(1),
             Act::Up => self.move_cursor(-1),
+            Act::PageDown => {
+                let page = self.page();
+                self.move_cursor(page)
+            }
+            Act::PageUp => {
+                let page = self.page();
+                self.move_cursor(-page)
+            }
+            Act::Top => self.jump(Edge::Start),
+            Act::Bottom => self.jump(Edge::End),
             Act::Open => self.open_selected(),
             Act::NextPane => {
                 if let Some(inspect) = self.inspect.as_mut() {
@@ -596,6 +623,45 @@ impl ConflictsPane {
         Vec::new()
     }
 
+    /// Record the overlay body's height from the frame just drawn (#625).
+    pub fn observe(&mut self, rows: usize) {
+        self.viewport = rows;
+    }
+
+    /// One page of the overlay, never zero.
+    fn page(&self) -> isize {
+        // A terminal deeper than `isize::MAX` rows is not a case; the
+        // saturating cast is here so no arithmetic in this file can panic.
+        self.viewport.max(1).min(isize::MAX as usize) as isize
+    }
+
+    /// Jump to the first or last row of whatever this screen is showing.
+    fn jump(&mut self, edge: Edge) -> Vec<Request> {
+        let target = match edge {
+            Edge::Start => 0,
+            Edge::End => usize::MAX,
+        };
+        match self.screen {
+            Screen::List => {
+                let last = self.files_ref().map_or(0, <[_]>::len).saturating_sub(1);
+                self.cursor = target.min(last);
+            }
+            Screen::Inspect => {
+                self.scroll = target.min(self.row_count().saturating_sub(1));
+            }
+            Screen::Editor => {
+                if let Some(editor) = self.editor.as_mut() {
+                    if editor.inserting {
+                        return Vec::new();
+                    }
+                    let last = editor.choices.len().saturating_sub(1);
+                    editor.block = target.min(last);
+                }
+            }
+        }
+        Vec::new()
+    }
+
     fn move_cursor(&mut self, delta: isize) -> Vec<Request> {
         match self.screen {
             Screen::List => {
@@ -603,7 +669,15 @@ impl ConflictsPane {
                 self.cursor = self.cursor.saturating_add_signed(delta).min(last);
             }
             Screen::Inspect => {
-                self.scroll = self.scroll.saturating_add_signed(delta);
+                // Clamped to the rows there are, not left to run off the end
+                // and be clamped again at draw time. Unbounded, a `PageDown`
+                // held down would build a scroll position hundreds of pages
+                // past the file, and the first `PageUp` after it would appear
+                // to do nothing at all.
+                self.scroll = self
+                    .scroll
+                    .saturating_add_signed(delta)
+                    .min(self.row_count().saturating_sub(1));
             }
             Screen::Editor => {
                 if let Some(editor) = self.editor.as_mut() {

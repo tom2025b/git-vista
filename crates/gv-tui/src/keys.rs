@@ -13,6 +13,9 @@
 //! | `1`–`4` | focus that pane |
 //! | `j`, `↓` | cursor down |
 //! | `k`, `↑` | cursor up |
+//! | `PageDown` / `PageUp` | one visible page of the focused pane |
+//! | `Home` / `End` | the first / last row of the focused pane |
+//! | `z` | maximize the focused pane, or restore the four-pane shape |
 //! | `Enter` | load a repository, open a commit, or follow a parent |
 //! | `Space` | preview selected working-tree file / diff file / hunk / line |
 //! | `a` | preview stage-all/unstage-all in Working Tree; approve plan elsewhere |
@@ -22,6 +25,21 @@
 //! | `[` / `]` | select the previous/next parent in Main |
 //! | `r`, `F5` | refresh |
 //! | `x` | open the conflict overlay (M10.07, #462) |
+//!
+//! # The page keys, and why not the mouse wheel (#625)
+//!
+//! The issue proposed capturing the mouse. Four key bindings buy the same
+//! thing without any of its costs: capture takes **text selection** away in
+//! most terminals, so copying a commit hash out of a pane would stop working
+//! without a modifier; it has to be torn down on panic as well as on exit, or
+//! a crash leaves the terminal swallowing the user's mouse; and a wheel event
+//! would have to be routed to the pane under the pointer rather than the
+//! focused one. `PageUp`/`PageDown`/`Home`/`End` were unbound, are on every
+//! keyboard, and follow focus like every other navigation key here.
+//!
+//! `z` is the zoom key. It was the mnemonic left free: `x` is the conflict
+//! overlay, `a`, `d` and `Space` belong to the working tree, `c` cancels,
+//! `r` refreshes, `:` opens the command line, and `1`-`9` focus panes.
 //!
 //! The vi-shaped `hjkl` set is lazygit's, and lazygit is the interface this
 //! milestone is modelled on; the arrow and Tab set is for everyone else.
@@ -80,6 +98,11 @@ pub fn dispatch(key: KeyEvent, pane: Pane) -> Option<Action> {
         KeyCode::Left => Some(Action::FocusPrev),
         KeyCode::Down | KeyCode::Char('j') => Some(Action::CursorDown),
         KeyCode::Up | KeyCode::Char('k') => Some(Action::CursorUp),
+        KeyCode::PageDown => Some(Action::CursorPageDown),
+        KeyCode::PageUp => Some(Action::CursorPageUp),
+        KeyCode::Home => Some(Action::CursorTop),
+        KeyCode::End => Some(Action::CursorBottom),
+        KeyCode::Char('z') => Some(Action::ToggleMaximize),
         KeyCode::Enter => Some(Action::Activate),
         KeyCode::Char(' ') if matches!(pane, Pane::WorkingTree | Pane::Main) => {
             Some(Action::PreviewSelection)
@@ -136,6 +159,10 @@ pub fn dispatch_conflict(key: KeyEvent, mode: KeyMode) -> Option<Action> {
         (_, KeyCode::Char('q')) => Act::Close,
         (_, KeyCode::Down | KeyCode::Char('j')) => Act::Down,
         (_, KeyCode::Up | KeyCode::Char('k')) => Act::Up,
+        (_, KeyCode::PageDown) => Act::PageDown,
+        (_, KeyCode::PageUp) => Act::PageUp,
+        (_, KeyCode::Home) => Act::Top,
+        (_, KeyCode::End) => Act::Bottom,
 
         (KeyMode::List, KeyCode::Enter) => Act::Open,
         (KeyMode::List, KeyCode::Char('r') | KeyCode::F(5)) => Act::Refresh,
@@ -300,16 +327,78 @@ mod tests {
 
     #[test]
     fn an_unbound_key_is_none() {
-        // This list has now lost THREE members to real bindings across three
+        // This list has now lost FOUR members to real bindings across four
         // slices: `Esc` to plan refusal (#461), `Space` to the staging
-        // preview (#459), and `x` to the conflict overlay (#462). Each was
-        // caught by this test failing rather than by anyone remembering,
-        // which is why an explicit unbound set beats trusting the match's
-        // fall-through.
-        for key in [press(KeyCode::Char('z')), press(KeyCode::F(1))] {
+        // preview (#459), `x` to the conflict overlay (#462), and `z` to the
+        // zoom toggle (#625). Each was caught by this test failing rather
+        // than by anyone remembering, which is why an explicit unbound set
+        // beats trusting the match's fall-through.
+        for key in [press(KeyCode::Char('w')), press(KeyCode::F(1))] {
             assert_eq!(global(key), None, "{key:?}");
         }
         assert_eq!(global(press(KeyCode::Char(' '))), None);
+    }
+
+    /// INVARIANT (#625): the four page keys reach every pane, and `z` is the
+    /// zoom toggle everywhere — none of them is pane-scoped the way `d` or
+    /// `[` are, because "show me more of this" means the same thing wherever
+    /// the cursor is.
+    ///
+    /// MUTATION 1 (remove): drop the `PageDown`/`PageUp` arms.
+    /// MUTATION 2 (weaken): scope `z` to `Pane::Commits` only.
+    #[test]
+    fn the_page_keys_and_the_zoom_key_work_in_every_pane() {
+        for pane in Pane::ALL {
+            for (code, expected) in [
+                (KeyCode::PageDown, Action::CursorPageDown),
+                (KeyCode::PageUp, Action::CursorPageUp),
+                (KeyCode::Home, Action::CursorTop),
+                (KeyCode::End, Action::CursorBottom),
+                (KeyCode::Char('z'), Action::ToggleMaximize),
+            ] {
+                assert_eq!(dispatch(press(code), pane), Some(expected), "{pane:?}");
+            }
+        }
+        // Main is the one pane that steals the side arrows for horizontal
+        // scrolling; the vertical page keys must not have been caught by it.
+        assert_eq!(
+            dispatch(press(KeyCode::PageDown), Pane::Main),
+            Some(Action::CursorPageDown)
+        );
+    }
+
+    #[test]
+    fn the_page_keys_scroll_the_overlay_but_never_reach_its_text_buffer() {
+        for mode in [KeyMode::List, KeyMode::Inspect, KeyMode::Editor] {
+            assert_eq!(
+                dispatch_conflict(press(KeyCode::PageDown), mode),
+                Some(Action::Conflict(Act::PageDown)),
+                "{mode:?}"
+            );
+            assert_eq!(
+                dispatch_conflict(press(KeyCode::Home), mode),
+                Some(Action::Conflict(Act::Top)),
+                "{mode:?}"
+            );
+            assert_eq!(
+                dispatch_conflict(press(KeyCode::End), mode),
+                Some(Action::Conflict(Act::Bottom)),
+                "{mode:?}"
+            );
+        }
+        // Insert mode owns the keyboard outright (see the module doc); an
+        // unhandled key there is unbound, never a scroll under the caret.
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::PageDown), KeyMode::Insert),
+            None
+        );
+        // …and `z` is a character being typed, not a zoom, in every overlay
+        // mode — the overlay already has the whole window.
+        assert_eq!(dispatch_conflict(press(KeyCode::Char('z')), KeyMode::List), None);
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Char('z')), KeyMode::Insert),
+            Some(Action::Conflict(Act::Type('z')))
+        );
     }
 
     #[test]

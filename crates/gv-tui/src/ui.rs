@@ -5,6 +5,20 @@
 //! logic out of the state model. The palette is intentionally limited to
 //! ANSI names: cyan marks the focused border, red marks an error status, and
 //! selection uses the terminal's own reversed modifier.
+//!
+//! # Drawing also measures (#625)
+//!
+//! [`draw`] returns a [`Viewport`]: how many rows of its own content each
+//! surface had room for in the frame it just drew. The event loop hands that
+//! straight back to [`App::observe`](crate::app::App::observe), so `PageDown`
+//! moves by the height the user is actually looking at.
+//!
+//! The measurement is taken from the very rects the widgets were rendered
+//! into — never recomputed from the terminal size — because the two could
+//! then disagree, and the one that would be believed is the one nobody can
+//! see. Each `draw_*` helper returns its own number for the same reason: the
+//! function that decided the geometry is the only one that can report it
+//! without guessing.
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -12,7 +26,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{review_lines, App, Pane, Tone};
+use crate::app::{review_lines, App, Pane, Tone, Viewport};
 use crate::layout;
 use crate::panes::conflicts::{self, Screen};
 use crate::panes::detail::RowTone;
@@ -21,10 +35,11 @@ use crate::panes::plan_review::{PlanReviewPane, RowTone as PlanRowTone};
 use crate::panes::staging::Tone as StagingTone;
 use crate::panes::worktree::LoadState;
 
-/// Draw one complete frame from the current application state.
-pub fn draw(frame: &mut Frame, app: &App) {
+/// Draw one complete frame from the current application state, and report
+/// what it could show (#625).
+pub fn draw(frame: &mut Frame, app: &App) -> Viewport {
     let area = frame.area();
-    let Some(panes) = layout::split(area) else {
+    let Some(panes) = layout::split(area, app.maximized()) else {
         frame.render_widget(
             Paragraph::new(format!(
                 "gv-tui needs at least {}x{}; this terminal is {}x{}",
@@ -36,7 +51,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
             .wrap(Wrap { trim: false }),
             area,
         );
-        return;
+        // Nothing was drawn but one sentence, so nothing can be paged.
+        return Viewport::default();
     };
 
     // The conflict overlay takes the whole body when it is up (M10.07,
@@ -50,9 +66,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
             area.width,
             panes.status.y.saturating_sub(area.y),
         );
-        draw_conflicts(frame, body, app);
+        let rows = draw_conflicts(frame, body, app);
         draw_status(frame, panes.status, app);
-        return;
+        return Viewport::new([0; 4], rows);
     }
 
     let rows: Vec<ListItem<'_>> = app
@@ -66,16 +82,25 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .highlight_symbol("> ");
     let selected = (app.rows(Pane::Repositories) > 0).then(|| app.cursor(Pane::Repositories));
     let mut state = ListState::default().with_selected(selected);
-    frame.render_stateful_widget(repositories, panes.of(Pane::Repositories), &mut state);
+    let repositories_area = panes.of(Pane::Repositories);
+    let repository_rows = pane_block(Pane::Repositories, app.focus)
+        .inner(repositories_area)
+        .height as usize;
+    frame.render_stateful_widget(repositories, repositories_area, &mut state);
 
-    draw_worktree(frame, panes.of(Pane::WorkingTree), app);
-    draw_commits(frame, panes.of(Pane::Commits), app, detect_color_depth());
-    draw_main(frame, panes.of(Pane::Main), app);
-    if let Some(review) = &app.plan_review {
-        draw_plan_review(frame, area, review);
-    }
+    let worktree_rows = draw_worktree(frame, panes.of(Pane::WorkingTree), app);
+    let commit_rows = draw_commits(frame, panes.of(Pane::Commits), app, detect_color_depth());
+    let main_rows = draw_main(frame, panes.of(Pane::Main), app);
+    let overlay_rows = match &app.plan_review {
+        Some(review) => draw_plan_review(frame, area, review),
+        None => 0,
+    };
 
     draw_status(frame, panes.status, app);
+    Viewport::new(
+        [repository_rows, worktree_rows, commit_rows, main_rows],
+        overlay_rows,
+    )
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
@@ -83,11 +108,29 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         Tone::Info => Style::default(),
         Tone::Error => Style::default().fg(Color::Red),
     };
-    let status = app
-        .command_input
-        .as_ref()
-        .map_or_else(|| app.status.text.clone(), |input| format!(":{input}█"));
+    let status = app.command_input.as_ref().map_or_else(
+        // The zoom key is appended here rather than written into each of the
+        // dozen status sentences: a binding nobody can discover is a binding
+        // nobody has, and this strip is already where this shell says what is
+        // possible. While the palette owns the keyboard the line is the
+        // command being typed, and nothing may be appended to that.
+        || format!("{}{}", app.status.text, zoom_hint(app)),
+        |input| format!(":{input}█"),
+    );
     frame.render_widget(Paragraph::new(status).style(status_style), area);
+}
+
+/// The tail of the status line that names the zoom key — and, once a pane is
+/// zoomed, names the way back out of it.
+fn zoom_hint(app: &App) -> &'static str {
+    if app.conflicts.is_open() || app.plan_review.is_some() {
+        // Neither surface is a pane, and neither honours the key.
+        ""
+    } else if app.maximized().is_some() {
+        " · z unzoom"
+    } else {
+        " · z zoom"
+    }
 }
 
 /// The conflict overlay (M10.07, #462).
@@ -98,7 +141,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
 /// conflict is decided in this file — `cargo test` never draws a frame with a
 /// real terminal behind it, so a decision made here would be pinned by
 /// nothing.
-fn draw_conflicts(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_conflicts(frame: &mut Frame, area: Rect, app: &App) -> usize {
     let title = match app.conflicts.screen() {
         Screen::List => " Conflicts ",
         Screen::Inspect => " Conflict — inspect ",
@@ -121,6 +164,7 @@ fn draw_conflicts(frame: &mut Frame, area: Rect, app: &App) {
         .map(conflict_line)
         .collect();
     frame.render_widget(Paragraph::new(lines).block(block), area);
+    height
 }
 
 fn conflict_line(row: &conflicts::Row) -> Line<'static> {
@@ -168,7 +212,7 @@ fn conflict_tone_style(tone: conflicts::Tone) -> Style {
 
 /// Draw plan review as a modal over the shell: no pane underneath can look
 /// actionable while the reducer is deliberately ignoring its navigation.
-fn draw_plan_review(frame: &mut Frame, area: Rect, review: &PlanReviewPane) {
+fn draw_plan_review(frame: &mut Frame, area: Rect, review: &PlanReviewPane) -> usize {
     let margin_x = if area.width >= 70 { 4 } else { 1 };
     let margin_y = if area.height >= 18 { 2 } else { 1 };
     let modal = Rect {
@@ -190,6 +234,7 @@ fn draw_plan_review(frame: &mut Frame, area: Rect, review: &PlanReviewPane) {
         .skip(review.offset())
         .map(|row| Line::styled(row.text, plan_tone_style(row.tone)))
         .collect();
+    let rows = block.inner(modal).height as usize;
     frame.render_widget(Clear, modal);
     frame.render_widget(
         Paragraph::new(lines)
@@ -197,6 +242,7 @@ fn draw_plan_review(frame: &mut Frame, area: Rect, review: &PlanReviewPane) {
             .block(block),
         modal,
     );
+    rows
 }
 
 fn plan_tone_style(tone: PlanRowTone) -> Style {
