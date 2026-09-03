@@ -61,7 +61,18 @@ pub fn run<B: Backend>(
         }
         match inputs.next(TICK)? {
             Input::Key(key) => {
-                let action = if app.command_input.is_some() {
+                // Three keymaps, and the ORDER of these two arms is a
+                // decision rather than a merge artefact. Both #461's command
+                // prompt and #462's conflict overlay capture the keyboard so
+                // that a printable key is text and not a command; the overlay
+                // is checked first because it is a full-screen takeover whose
+                // own keymap has no binding that opens a command prompt, so
+                // "both at once" is a state the two keymaps cannot produce.
+                // If a later slice makes it reachable, the overlay is still
+                // the right winner: it is the one holding an unsaved edit.
+                let action = if app.conflicts.is_open() {
+                    keys::dispatch_conflict(key, app.conflicts.key_mode())
+                } else if app.command_input.is_some() {
                     keys::dispatch_command(key)
                 } else {
                     keys::dispatch(key, app.focus)

@@ -67,6 +67,32 @@ pub enum Choice {
     Both,
 }
 
+impl Choice {
+    /// The words a client shows beside a block for this choice.
+    ///
+    /// Here rather than in each client because it is the same four-way
+    /// vocabulary in every one of them, and two copies of it drift: the
+    /// browser viewer and the terminal would eventually disagree about what
+    /// "keeping both" is called, in a UI whose entire job is telling someone
+    /// exactly which version they are about to keep. Same argument, one size
+    /// down, as [`ConflictedFile::text_resolvable`] being asked once rather
+    /// than recomputed per client.
+    ///
+    /// `Unchosen` reads as an open question rather than a blank, deliberately:
+    /// a client that rendered it as an empty label would show a block that
+    /// looks decided and is not.
+    ///
+    /// [`ConflictedFile::text_resolvable`]: git_vista_protocol::conflict::ConflictedFile::text_resolvable
+    pub fn describe(self) -> &'static str {
+        match self {
+            Choice::Unchosen => "not chosen yet",
+            Choice::Ours => "keeping ours",
+            Choice::Theirs => "keeping theirs",
+            Choice::Both => "keeping both",
+        }
+    }
+}
+
 /// The `<<<<<<<`, `=======`, `>>>>>>>` and `|||||||` line prefixes git writes.
 ///
 /// Matched as a **prefix on a line**, never anywhere in a line: a diff of a

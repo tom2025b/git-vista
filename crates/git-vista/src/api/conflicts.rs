@@ -3,7 +3,7 @@
 //!
 //! Three reads and one assembler. The assembler
 //! ([`fetch_conflict_panes`]) is the only thing outside
-//! [`crate::features::conflicts::core`] that knows all four panes belong
+//! [`git_vista_conflicts::core`] that knows all four panes belong
 //! together, and it delegates every *decision* about what a pane shows back to
 //! that host-tested core — it fetches, and the core folds. Nothing here
 //! decides whether an absent stage renders as empty, because that is exactly
@@ -16,7 +16,7 @@ use git_vista_protocol::{
     ResolveConflictRequest, WorktreePath,
 };
 
-use crate::features::conflicts::core::{result_pane_state, ConflictPanes, PaneState, ResultRead};
+use git_vista_conflicts::core::{result_pane_state, ConflictPanes, PaneState, ResultRead};
 
 use super::{
     network_error, refuse_if_offline, refuse_if_visualize, req_get, user_facing_error, write_json,

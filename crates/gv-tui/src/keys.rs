@@ -21,6 +21,7 @@
 //! | `n`, `Esc` | refuse the visible confirmation or plan review |
 //! | `[` / `]` | select the previous/next parent in Main |
 //! | `r`, `F5` | refresh |
+//! | `x` | open the conflict overlay (M10.07, #462) |
 //!
 //! The vi-shaped `hjkl` set is lazygit's, and lazygit is the interface this
 //! milestone is modelled on; the arrow and Tab set is for everyone else.
@@ -35,9 +36,28 @@
 //! The staging bindings are pane-specific. Dispatch only identifies intent;
 //! `App` decides whether the selected row can honestly perform it.
 
+//! # The conflict overlay has its own keymap, and that is not a style choice
+//!
+//! [`dispatch_conflict`] is a second table rather than more arms in
+//! [`dispatch`], because the overlay's editor accepts **every printable
+//! character** as text. Under one shared table, typing `q` into a file you
+//! were resolving would quit the program and throw the edit away, and `j`
+//! would scroll instead of appearing in the line. So while the overlay is up
+//! it owns the keyboard, and [`KeyMode::Insert`] is the mode where the
+//! ordinary meanings of letters are suspended entirely.
+//!
+//! `x` opens it. `c` was the obvious mnemonic and is deliberately left alone:
+//! the working-tree slice (#459) is the natural owner of a commit key, and
+//! taking it here would mean renaming a binding somebody had already learned.
+
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use git_vista_conflicts::core::Pane as ConflictView;
+use git_vista_conflicts::markers::Choice;
+use git_vista_protocol::conflict::Resolution;
+
 use crate::app::{Action, Pane};
+use crate::panes::conflicts::{Act, KeyMode};
 
 /// Translate one key event. `None` means the key is unbound.
 pub fn dispatch(key: KeyEvent, pane: Pane) -> Option<Action> {
@@ -70,11 +90,75 @@ pub fn dispatch(key: KeyEvent, pane: Pane) -> Option<Action> {
         KeyCode::Char('[') if pane == Pane::Main => Some(Action::ParentPrev),
         KeyCode::Char(']') if pane == Pane::Main => Some(Action::ParentNext),
         KeyCode::F(5) | KeyCode::Char('r') => Some(Action::Refresh),
+        KeyCode::Char('x') => Some(Action::OpenConflicts),
         KeyCode::Char('c') => Some(Action::CancelOperation),
         KeyCode::Char(':') => Some(Action::OpenCommand),
         KeyCode::Char(d @ '1'..='9') => Pane::from_number(d.to_digit(10)? as u8).map(Action::Focus),
         _ => None,
     }
+}
+
+/// Translate one key event for the conflict overlay. `None` means unbound.
+///
+/// `Ctrl-C` still quits from every mode including [`KeyMode::Insert`] — a
+/// terminal program that cannot be interrupted is a terminal program somebody
+/// has to kill from another window. Nothing else survives insert mode.
+pub fn dispatch_conflict(key: KeyEvent, mode: KeyMode) -> Option<Action> {
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+        return Some(Action::Quit);
+    }
+    if !(key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) {
+        return None;
+    }
+
+    // Insert mode first and on its own, so no later arm can claim a character
+    // out from under the buffer. Every printable key is text here.
+    if mode == KeyMode::Insert {
+        return Some(Action::Conflict(match key.code {
+            KeyCode::Esc => Act::EndEdit,
+            KeyCode::Enter => Act::Newline,
+            KeyCode::Backspace => Act::Backspace,
+            KeyCode::Left => Act::CaretLeft,
+            KeyCode::Right => Act::CaretRight,
+            KeyCode::Up => Act::Up,
+            KeyCode::Down => Act::Down,
+            KeyCode::Char(ch) => Act::Type(ch),
+            KeyCode::Tab => Act::Type('\t'),
+            _ => return None,
+        }));
+    }
+
+    let act = match (mode, key.code) {
+        (_, KeyCode::Esc) => Act::Back,
+        (_, KeyCode::Char('q')) => Act::Close,
+        (_, KeyCode::Down | KeyCode::Char('j')) => Act::Down,
+        (_, KeyCode::Up | KeyCode::Char('k')) => Act::Up,
+
+        (KeyMode::List, KeyCode::Enter) => Act::Open,
+        (KeyMode::List, KeyCode::Char('r') | KeyCode::F(5)) => Act::Refresh,
+
+        (KeyMode::Inspect, KeyCode::Tab) => Act::NextPane,
+        (KeyMode::Inspect, KeyCode::Char(d @ '1'..='4')) => {
+            let index = d.to_digit(10)? as usize - 1;
+            Act::FocusPane(*ConflictView::ALL.get(index)?)
+        }
+        (KeyMode::Inspect, KeyCode::Char('o')) => Act::Take(Resolution::TakeOurs),
+        (KeyMode::Inspect, KeyCode::Char('t')) => Act::Take(Resolution::TakeTheirs),
+        (KeyMode::Inspect, KeyCode::Char('d')) => Act::Take(Resolution::TakeDeletion),
+        (KeyMode::Inspect, KeyCode::Char('e')) => Act::OpenEditor,
+
+        (KeyMode::Editor, KeyCode::Char('o')) => Act::Choose(Choice::Ours),
+        (KeyMode::Editor, KeyCode::Char('t')) => Act::Choose(Choice::Theirs),
+        (KeyMode::Editor, KeyCode::Char('b')) => Act::Choose(Choice::Both),
+        (KeyMode::Editor, KeyCode::Char('i')) => Act::BeginEdit,
+        (KeyMode::Editor, KeyCode::Enter) => Act::Apply,
+
+        _ => return None,
+    };
+    Some(Action::Conflict(act))
 }
 
 /// Translate input while the `:` command palette owns the keyboard.
@@ -216,7 +300,13 @@ mod tests {
 
     #[test]
     fn an_unbound_key_is_none() {
-        for key in [press(KeyCode::Char('x')), press(KeyCode::F(1))] {
+        // This list has now lost THREE members to real bindings across three
+        // slices: `Esc` to plan refusal (#461), `Space` to the staging
+        // preview (#459), and `x` to the conflict overlay (#462). Each was
+        // caught by this test failing rather than by anyone remembering,
+        // which is why an explicit unbound set beats trusting the match's
+        // fall-through.
+        for key in [press(KeyCode::Char('z')), press(KeyCode::F(1))] {
             assert_eq!(global(key), None, "{key:?}");
         }
         assert_eq!(global(press(KeyCode::Char(' '))), None);
@@ -331,5 +421,114 @@ mod tests {
             dispatch(press(KeyCode::Char(']')), Pane::Repositories),
             None
         );
+    }
+
+    #[test]
+    fn x_opens_the_conflict_overlay_from_every_pane() {
+        for pane in Pane::ALL {
+            assert_eq!(
+                dispatch(press(KeyCode::Char('x')), pane),
+                Some(Action::OpenConflicts),
+                "{pane:?}"
+            );
+        }
+    }
+
+    // ---- the overlay's own keymap (M10.07, #462) ------------------------
+
+    #[test]
+    fn insert_mode_types_the_letters_that_are_commands_everywhere_else() {
+        // The reason `dispatch_conflict` is a second table at all. Under one
+        // shared keymap, typing `q` into a file you were resolving would quit
+        // the program and lose the edit.
+        //
+        // MUTATION: move the insert-mode block below the shared `q`/`j`/`k`
+        // arms. Every other key test still passes and this one fails.
+        for (ch, _) in [
+            ('q', ()),
+            ('j', ()),
+            ('k', ()),
+            ('o', ()),
+            ('e', ()),
+            ('i', ()),
+        ] {
+            assert_eq!(
+                dispatch_conflict(press(KeyCode::Char(ch)), KeyMode::Insert),
+                Some(Action::Conflict(Act::Type(ch))),
+                "{ch} was claimed as a command inside the text buffer"
+            );
+        }
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Enter), KeyMode::Insert),
+            Some(Action::Conflict(Act::Newline))
+        );
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Esc), KeyMode::Insert),
+            Some(Action::Conflict(Act::EndEdit))
+        );
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_from_inside_the_text_buffer() {
+        // A terminal program you cannot interrupt is one somebody has to kill
+        // from another window.
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        for mode in [
+            KeyMode::List,
+            KeyMode::Inspect,
+            KeyMode::Editor,
+            KeyMode::Insert,
+        ] {
+            assert_eq!(
+                dispatch_conflict(ctrl_c, mode),
+                Some(Action::Quit),
+                "{mode:?}"
+            );
+        }
+        // …and `c` on its own is a character there, not a quit.
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Char('c')), KeyMode::Insert),
+            Some(Action::Conflict(Act::Type('c')))
+        );
+    }
+
+    #[test]
+    fn the_resolution_keys_are_live_only_on_the_screen_that_offers_them() {
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Char('o')), KeyMode::Inspect),
+            Some(Action::Conflict(Act::Take(Resolution::TakeOurs)))
+        );
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Char('d')), KeyMode::Inspect),
+            Some(Action::Conflict(Act::Take(Resolution::TakeDeletion)))
+        );
+        // The same letter is a BLOCK choice one screen further in, and must
+        // never reach `Take` there — that would resolve a whole file while the
+        // user was picking one hunk of it.
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Char('o')), KeyMode::Editor),
+            Some(Action::Conflict(Act::Choose(Choice::Ours)))
+        );
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Char('d')), KeyMode::Editor),
+            None
+        );
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Char('o')), KeyMode::List),
+            None
+        );
+    }
+
+    #[test]
+    fn a_key_release_is_ignored_in_the_overlay_too() {
+        // Terminals with the kitty protocol on deliver two events per
+        // keystroke; in the text buffer that would double every character.
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            crossterm::event::KeyEventKind::Release,
+        );
+        assert_eq!(dispatch_conflict(release, KeyMode::Insert), None);
+        assert_eq!(dispatch_conflict(release, KeyMode::List), None);
     }
 }
