@@ -133,14 +133,16 @@ test.describe('the graph preview inside a confirmation', () => {
       await new Promise((r) => setTimeout(r, 4000))
       await route.continue()
     })
+    const previewRequest = page.waitForRequest('**/api/preview')
 
     await openMergePreviewRepo(page)
     const merge = await openBranchMenu(page, PREVIEW_BRANCH)
     await merge.click()
     await expect(dialog(page)).toBeVisible()
     // The request is genuinely in flight — otherwise this test proves nothing
-    // about a late reply, only about a preview that never started.
-    await expect(page.getByText(/Drawing the result/)).toBeVisible()
+    // about a late reply, only about a preview that never started. Observe the
+    // request itself instead of coupling that precondition to pending copy.
+    await previewRequest
 
     await page.getByRole('button', { name: 'Cancel' }).click()
     await expect(dialog(page)).toHaveCount(0)
@@ -268,19 +270,24 @@ test.describe('the arms with no picture', () => {
     await page.getByRole('button', { name: 'Cancel' }).click()
   })
 
-  test('a round trip that fails is not reported as a fact about the repository', async ({
-    page,
-  }) => {
-    await page.route('**/api/preview', (route) => route.fulfill({ status: 500, body: 'boom' }))
+  test('a plan capability refusal makes no operation-availability promise', async ({ page }) => {
+    await page.route('**/api/plan', (route) =>
+      route.fulfill({
+        status: 405,
+        headers: { 'x-git-vista-listener-profile': 'read-only' },
+        body: '',
+      }),
+    )
     await openMergeConfirm(page)
 
-    // Distinct from `Unavailable`, and that distinction is the whole reason
-    // `PreviewSlot::Failed` exists: the server saying "this host's git is too
-    // old" is a fact about the repository, and the fetch never arriving is a
-    // fact about the connection. Telling a user the second when the first is
-    // true sends them somewhere useless.
-    await expect(page.getByText('No preview')).toBeVisible()
-    await expect(page.getByText(/says nothing about the operation itself/)).toBeVisible()
+    // A plan 405 is a listener capability refusal, not evidence that the
+    // operation can still run. Pin the response's structural facts and the
+    // dangerous promise we must never append, without pinning every word.
+    const failurePanel = page.getByText('No preview', { exact: true }).locator('..')
+    await expect(failurePanel).toContainText('read-only LAN listener')
+    await expect(failurePanel).toContainText('/api/plan')
+    await expect(failurePanel).toContainText(/operation is unavailable/)
+    await expect(failurePanel).not.toContainText(/unchanged|still available|ready either way/i)
 
     const confirm = page.getByRole('button', { name: 'Merge', exact: true })
     await expect(confirm).toBeEnabled()
