@@ -479,6 +479,27 @@ impl ConflictPanes {
             Pane::Result => &self.result,
         }
     }
+
+    /// The same lookup, for a client folding a completed fetch back in
+    /// (M10.07, #462).
+    ///
+    /// Added when the terminal client arrived, because the alternative was
+    /// worse than a second accessor: `gv-tui` receives one blob answer at a
+    /// time, tagged with the [`Pane`] it was asked for, and without this it
+    /// would write its own `match pane { Base => &mut self.base, … }` — a
+    /// second copy of the one mapping in this file that says which field is
+    /// which side. A mapping duplicated is a mapping that can be got wrong in
+    /// exactly one of its copies, silently, with both compiling; #612 found
+    /// precisely that shape when `CherryPick` and `RevertCommit` turned out to
+    /// be interchangeable to the type checker.
+    pub fn pane_mut(&mut self, pane: Pane) -> &mut PaneState {
+        match pane {
+            Pane::Base => &mut self.base,
+            Pane::Ours => &mut self.ours,
+            Pane::Theirs => &mut self.theirs,
+            Pane::Result => &mut self.result,
+        }
+    }
 }
 
 #[cfg(test)]

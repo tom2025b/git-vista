@@ -29,7 +29,6 @@ use crate::api::{
 // different numbers is how a window and its scrollbar drift apart.
 use crate::detail::{accessible_rows_window, file_change_marker, DIFF_LINE_PX, DIFF_OVERSCAN};
 use crate::features::a11y::focus::GraphFocus;
-use crate::features::conflicts::core::{ConflictPanes, Pane, PaneState};
 use crate::features::diff::core::{render_window, LineWrap};
 use crate::features::diff::rows::{flatten, row_heights};
 use crate::features::diff::selection::DiffSelection;
@@ -40,6 +39,7 @@ use crate::features::shell::signals::Shell;
 use crate::features::status::signals::StatusResource;
 use crate::icons::icon_set;
 use crate::state::{Features, Settings, ViewerDoc};
+use git_vista_conflicts::core::{ConflictPanes, Pane, PaneState};
 use git_vista_protocol::conflict::Resolution;
 use git_vista_protocol::diff::parse_unified_diff;
 
@@ -885,8 +885,8 @@ fn conflict_body(
 ///
 /// Nothing here decides what content a choice produces. Parsing the marker
 /// file and composing the result are
-/// [`markers::parse`](crate::features::conflicts::markers::parse) and
-/// [`markers::compose`](crate::features::conflicts::markers::compose), both
+/// [`markers::parse`](git_vista_conflicts::markers::parse) and
+/// [`markers::compose`](git_vista_conflicts::markers::compose), both
 /// framework-free and host-tested, for the reason ADR 0066 gives: `cargo test`
 /// never compiles this file, so a decision made here would be pinned by
 /// nothing. This function fetches, renders, and submits.
@@ -899,7 +899,7 @@ fn conflict_editor(
     graph: RwSignal<GraphCore>,
     shell: Shell,
 ) -> View {
-    use crate::features::conflicts::markers::{compose, conflict_count, parse, unchosen, Choice};
+    use git_vista_conflicts::markers::{compose, conflict_count, parse, unchosen, Choice};
 
     if !allowed {
         return ().into_view();
@@ -994,11 +994,11 @@ fn conflict_editor(
                     let rows: Vec<View> = blocks
                         .iter()
                         .map(|b| match b {
-                            crate::features::conflicts::markers::Block::Context { text } => {
+                            git_vista_conflicts::markers::Block::Context { text } => {
                                 view! { <pre class="conflict-blk conflict-blk-context">{text.clone()}</pre> }
                                     .into_view()
                             }
-                            crate::features::conflicts::markers::Block::Conflict {
+                            git_vista_conflicts::markers::Block::Conflict {
                                 ours, theirs, ..
                             } => {
                                 let i = nth;
@@ -1043,12 +1043,12 @@ fn conflict_editor(
                                                 on:click=pick(Choice::Both)
                                             >"Both"</button>
                                             <span class="conflict-blk-state">
-                                                {move || match chosen() {
-                                                    Choice::Unchosen => "not chosen yet",
-                                                    Choice::Ours => "keeping ours",
-                                                    Choice::Theirs => "keeping theirs",
-                                                    Choice::Both => "keeping both",
-                                                }}
+                                                // The words come from the
+                                                // shared vocabulary, not from
+                                                // here: the terminal shows the
+                                                // same four, and two copies of
+                                                // the wording drift.
+                                                {move || chosen().describe()}
                                             </span>
                                         </div>
                                     </div>
