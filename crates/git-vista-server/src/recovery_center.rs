@@ -177,6 +177,20 @@ pub(crate) enum CheckFailedReason {
     /// plan existed, or one whose strategy did not decode. Nothing was
     /// established either way, so it is "no fact", not "no".
     NoStrategyRecorded,
+    /// This host's git predates `merge-tree --write-tree` (2.38), so a
+    /// `RevertCommit` row's conflict check cannot be asked at all (#581).
+    ///
+    /// A `CheckFailed` arm and not `Unsupported`, deliberately: the operation
+    /// is perfectly recoverable, and will be the moment the host's git is new
+    /// enough. `Unsupported` is for effects git-vista will never undo. This is
+    /// "we could not check *here*", which is what `CheckFailed` means.
+    ///
+    /// Carries no version, because [`CheckFailedReason`] is `Copy` and a
+    /// caller-facing enum is the wrong place for a host detail that changes
+    /// under it; the numbers live in
+    /// [`crate::activity::RevertCheckError::GitTooOld`], which this arm is
+    /// built from.
+    GitTooOld,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -533,7 +547,13 @@ async fn classify_revert_commit(
             label: format!("Revert {} (adds an inverse commit)", short(commit.as_str())),
             warn_pushed: tip_is_pushed(repo, commit.as_str()).await,
         },
-        Err(_) => check_failed_spawn(),
+        // #581: the two ways the check can fail are different facts, and this
+        // is the arm that carries the difference to the user. Both are still
+        // `CheckFailed` — neither may ever read as "safe to offer".
+        Err(crate::activity::RevertCheckError::GitTooOld { .. }) => RecoveryClass::CheckFailed {
+            detail: CheckFailedReason::GitTooOld,
+        },
+        Err(crate::activity::RevertCheckError::CheckFailed(_)) => check_failed_spawn(),
     }
 }
 

@@ -56,6 +56,10 @@ mod coordinator;
 // private git recovery refs a completed mutation's recovery strategy pins.
 mod durable;
 mod git_cmd;
+// #581: the running git's version, established once for every feature whose
+// floor is above the documented product floor of 2.32 — the graph preview
+// (2.38, ADR 0099) and the revert offer (2.38, same plumbing).
+mod git_version;
 mod handlers;
 // M1.10 Task 3 (#63): the paged-history snapshot (refs + HEAD + shallow), its
 // `history-v1` generation token, and the Frame/Page representation validators.

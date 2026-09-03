@@ -457,6 +457,71 @@ fn matching_feed_undoables(
     out
 }
 
+/// The git this check needs, which is **above the documented product floor**
+/// of 2.32 (`docs/SUPPORTED_VERSIONS.md`).
+///
+/// `git merge-tree --write-tree` arrived in **2.38.0** (October 2022). Below
+/// it, `merge-tree` is the older positional-argument command that does not
+/// understand the flag at all.
+///
+/// Deliberately its own constant rather than a shared one with
+/// [`crate::preview::MIN_GIT_FOR_PREVIEW`], even though both are 2.38 for the
+/// same reason: they are two features' floors that happen to coincide, and a
+/// single shared number would quietly become a second product floor. What the
+/// two share is the *measurement* ([`crate::git_version`]), not the policy.
+pub(crate) const MIN_GIT_FOR_MERGE_TREE: (u32, u32) = (2, 38);
+
+/// Why [`revert_would_conflict`] could not answer.
+///
+/// #581: before this existed, both arms were one `Err(String)` and the caller
+/// could only say "the check failed". They are different facts and the
+/// distinction is the same one this module already keeps elsewhere
+/// (`RecoveryClass::CheckFailed` vs `Expired { WouldConflict }`): *this host
+/// cannot answer the question* is a property of the host that will be true
+/// again next time, while *the check ran and errored* may not be.
+///
+/// Neither is ever grounds to offer a revert. The distinction buys the user an
+/// explanation, not a different safety posture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RevertCheckError {
+    /// This git predates `merge-tree --write-tree`, so the question cannot be
+    /// asked of it at all.
+    ///
+    /// **Measured 2026-09-02** on git 2.34.1 (Ubuntu 22.04, inside the
+    /// documented 2.32 product floor): the exact argv below exits **129** with
+    /// `usage: git merge-tree <base-tree> <branch1> <branch2>`. 129 is neither
+    /// 0 nor 1, so before #581 it landed in the arm below and the revert offer
+    /// silently never appeared, with nothing said about why.
+    GitTooOld {
+        /// The host's version, `major.minor.patch`.
+        found: String,
+        /// The floor, `major.minor`.
+        minimum: String,
+    },
+    /// The check ran and did not produce an answer — the sandboxed spawn
+    /// failed, or `merge-tree` exited some other way (e.g. a genuinely bad
+    /// revision).
+    CheckFailed(String),
+}
+
+/// Whether `found` is too old to be asked the revert-conflict question, as the
+/// error to report.
+///
+/// Pure and separate from the probe so the *decision* can be tested with
+/// literal versions on both sides of the floor, rather than only on whatever
+/// git the host running the tests happens to have — which on every machine
+/// this project has ever run on is far above it. The same shape, and the same
+/// reason, as [`crate::preview`]'s `version_gate` (#576, ADR 0099).
+fn merge_tree_version_gate(found: (u32, u32, u32)) -> Option<RevertCheckError> {
+    if crate::git_version::meets(found, MIN_GIT_FOR_MERGE_TREE) {
+        return None;
+    }
+    Some(RevertCheckError::GitTooOld {
+        found: crate::git_version::render(found),
+        minimum: crate::git_version::render_floor(MIN_GIT_FOR_MERGE_TREE),
+    })
+}
+
 /// Whether reverting `commit` (whose sole parent is `parent`) onto `head`
 /// would conflict — established, not guessed (#327 defect A).
 ///
@@ -477,10 +542,16 @@ fn matching_feed_undoables(
 /// contract — unlike git's prose — doesn't shift with locale or version.
 /// Verified against this server's git (2.43.0; see the tests).
 ///
-/// `Err` means the check itself did not produce an answer (the sandboxed
-/// spawn failed, or `merge-tree` exited some other way, e.g. a genuinely bad
-/// revision). The caller's job is to treat that exactly like a conflict —
-/// "couldn't tell" must never read as "safe to offer".
+/// `Err` means the check did not produce an answer, and since #581 it says
+/// **which** of two reasons: [`RevertCheckError::GitTooOld`] (this host's git
+/// predates `--write-tree`, so the question cannot be asked of it) or
+/// [`RevertCheckError::CheckFailed`] (the sandboxed spawn failed, or
+/// `merge-tree` exited some other way, e.g. a genuinely bad revision).
+///
+/// The caller's job is unchanged and the safety posture is unchanged: both
+/// arms are treated exactly like a conflict — "couldn't tell" must never read
+/// as "safe to offer". What the split buys is that a user on an old git can be
+/// told why the offer is missing, instead of watching it silently not appear.
 ///
 /// `pub(crate)` since M3.25 (#78): [`crate::recovery_center::classify_recovery`]
 /// reuses this directly rather than [`revert_offer_established`] below, which
@@ -492,18 +563,52 @@ pub(crate) async fn revert_would_conflict(
     commit: &str,
     parent: &str,
     head: &str,
-) -> Result<bool, String> {
+) -> Result<bool, RevertCheckError> {
+    // #581: ask what git this is BEFORE asking it a question it may not
+    // understand. Cached per process by `crate::git_version`, so this costs one
+    // `git --version` for the life of the server, not one per menu-open.
+    let found = crate::git_version::current(repo)
+        .await
+        .map_err(RevertCheckError::CheckFailed)?;
+    revert_would_conflict_at_version(repo, commit, parent, head, found).await
+}
+
+/// [`revert_would_conflict`] with the host's git version supplied rather than
+/// probed.
+///
+/// Split out for one reason, and it is a testing reason worth stating plainly:
+/// [`crate::git_version::current`] caches per process, so no test can make the
+/// running host's git look old. Without this arity the gate's *wiring* — as
+/// opposed to [`merge_tree_version_gate`]'s pure decision — could only be
+/// pinned by a source scan, and deleting the gate call would leave every test
+/// in this file green. With it, a test drives the real function with a literal
+/// 2.34.1 against a real repository and sees the real refusal.
+///
+/// The version is the only injected value. The repository, the spawn and the
+/// exit-code reading are all the production path.
+async fn revert_would_conflict_at_version(
+    repo: &Path,
+    commit: &str,
+    parent: &str,
+    head: &str,
+    found: (u32, u32, u32),
+) -> Result<bool, RevertCheckError> {
+    if let Some(too_old) = merge_tree_version_gate(found) {
+        return Err(too_old);
+    }
     let merge_base = format!("--merge-base={commit}");
     let output = git_cmd::git_output(
         repo,
         &["merge-tree", "--write-tree", &merge_base, head, parent],
     )
     .await
-    .map_err(|e| format!("couldn't run git merge-tree: {e}"))?;
+    .map_err(|e| RevertCheckError::CheckFailed(format!("couldn't run git merge-tree: {e}")))?;
     match output.status.code() {
         Some(0) => Ok(false),
         Some(1) => Ok(true),
-        _ => Err(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+        _ => Err(RevertCheckError::CheckFailed(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        )),
     }
 }
 
@@ -992,6 +1097,129 @@ mod tests {
         assert!(
             !conflicts,
             "reverting the tip with nothing built on top must be clean"
+        );
+    }
+
+    /// #581: the version gate, decided with literal versions on both sides.
+    ///
+    /// This is the whole point of the issue. `merge-tree --write-tree` arrived
+    /// in git 2.38, the documented product floor is 2.32, and every host this
+    /// project has run on is far above both — so a test that used the host's
+    /// git could never reach the arm that matters. These literals can.
+    ///
+    /// 2.34.1 is not an arbitrary example: it is what Ubuntu 22.04 LTS ships,
+    /// measured 2026-09-02, and running this function's argv against it exits
+    /// **129** with `usage: git merge-tree <base-tree> <branch1> <branch2>`.
+    #[test]
+    fn the_merge_tree_gate_refuses_below_2_38_and_allows_2_38_itself() {
+        // At the floor and above: no gate, the check proceeds.
+        assert!(
+            merge_tree_version_gate((2, 38, 0)).is_none(),
+            "2.38.0 is the floor itself and must be allowed"
+        );
+        assert!(
+            merge_tree_version_gate((2, 38, 7)).is_none(),
+            "a patch level above the floor must be allowed"
+        );
+        assert!(
+            merge_tree_version_gate((2, 53, 0)).is_none(),
+            "this host's git must be allowed"
+        );
+
+        // Below: refused, and refused with the numbers, not a bare failure.
+        assert_eq!(
+            merge_tree_version_gate((2, 34, 1)),
+            Some(RevertCheckError::GitTooOld {
+                found: String::from("2.34.1"),
+                minimum: String::from("2.38"),
+            }),
+            "Ubuntu 22.04's git must be named as too old, with both numbers"
+        );
+        assert_eq!(
+            merge_tree_version_gate((2, 37, 9)),
+            Some(RevertCheckError::GitTooOld {
+                found: String::from("2.37.9"),
+                minimum: String::from("2.38"),
+            }),
+            "the last version below the floor must still be refused"
+        );
+        // The documented product floor is inside the refused band. That is the
+        // fact #581 exists to state: a fully supported host on which this one
+        // check cannot run.
+        assert!(
+            merge_tree_version_gate((2, 32, 0)).is_some(),
+            "the documented product floor 2.32 is below merge-tree's 2.38"
+        );
+    }
+
+    /// #581: the gate is reached *through the real function*, not only in
+    /// isolation.
+    ///
+    /// The pure test above proves the decision; this proves the decision is
+    /// wired in. It cannot force an old git — [`crate::git_version`] caches the
+    /// host's version per process — so it asserts the other half: on this
+    /// host's new-enough git the gate does **not** fire, and the function still
+    /// answers the real question rather than refusing.
+    ///
+    #[tokio::test]
+    async fn a_new_enough_git_passes_the_gate_and_answers_the_real_question() {
+        let (_dir, repo) = seeded_repo();
+        std::fs::write(repo.join("f.txt"), "line1\nline2\n").unwrap();
+        run(&repo, &["add", "f.txt"]);
+        run(&repo, &["commit", "-q", "-m", "add line2"]);
+        let tip = rev_parse_plain(&repo, "HEAD");
+        let parent = rev_parse_plain(&repo, "HEAD^");
+
+        match revert_would_conflict(&repo, &tip, &parent, &tip).await {
+            Ok(_) => {}
+            Err(RevertCheckError::GitTooOld { found, minimum }) => panic!(
+                "the gate fired on this host's git ({found} < {minimum}); either \
+                 this machine's git is genuinely below {minimum}, or the gate's \
+                 comparison is inverted"
+            ),
+            Err(RevertCheckError::CheckFailed(detail)) => {
+                panic!("the check itself failed: {detail}")
+            }
+        }
+    }
+
+    /// #581: the gate is actually *wired in*, proven against a real repository
+    /// on the production path with only the version supplied.
+    ///
+    /// This is the test that makes deleting the gate a red build. The pure test
+    /// above proves the decision is right; this proves the decision is
+    /// consulted. Without it, removing the `if let Some(too_old)` block would
+    /// leave every other test in this file green — the host's git is 2.5x, so
+    /// nothing else can reach the refusal.
+    ///
+    /// The repository, the argv and the exit-code reading are all production;
+    /// only the version is injected, because
+    /// [`crate::git_version::current`] caches per process and cannot be made
+    /// to lie.
+    #[tokio::test]
+    async fn an_old_git_is_refused_by_name_before_merge_tree_is_ever_run() {
+        let (_dir, repo) = seeded_repo();
+        std::fs::write(repo.join("f.txt"), "line1\nline2\n").unwrap();
+        run(&repo, &["add", "f.txt"]);
+        run(&repo, &["commit", "-q", "-m", "add line2"]);
+        let tip = rev_parse_plain(&repo, "HEAD");
+        let parent = rev_parse_plain(&repo, "HEAD^");
+
+        // 2.34.1 is Ubuntu 22.04's git, measured 2026-09-02. On this exact
+        // repository shape the same call with the host's real git answers
+        // `Ok(false)` — the test above pins that — so an `Err` here can only
+        // come from the gate.
+        let refused =
+            revert_would_conflict_at_version(&repo, &tip, &parent, &tip, (2, 34, 1)).await;
+
+        assert_eq!(
+            refused,
+            Err(RevertCheckError::GitTooOld {
+                found: String::from("2.34.1"),
+                minimum: String::from("2.38"),
+            }),
+            "an old git must be refused by name, not fall through to merge-tree \
+             and surface as an unexplained CheckFailed"
         );
     }
 
