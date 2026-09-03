@@ -1,4 +1,4 @@
-# ADR 0106 — An activity cursor names one fold, not an offset in a live feed
+# ADR 0107 — An activity cursor names one fold, not an offset in a live feed
 
 **Status:** Accepted — implemented; verification and mutation evidence below
 **Date:** 2026-09-02
