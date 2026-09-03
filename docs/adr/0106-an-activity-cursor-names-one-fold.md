@@ -1,12 +1,12 @@
 # ADR 0106 — An activity cursor names one fold, not an offset in a live feed
 
-**Status:** Accepted — implemented; verification and mutation evidence below  
-**Date:** 2026-09-02  
+**Status:** Accepted — implemented; verification and mutation evidence below
+**Date:** 2026-09-02
 **Issues:** [#559](https://github.com/tom2025b/git-vista/issues/559),
-[#562](https://github.com/tom2025b/git-vista/issues/562)  
+[#562](https://github.com/tom2025b/git-vista/issues/562)
 **Follows:** ADR 0002 (wire-protocol negotiation), ADR 0013 and the M1.10
-paged-history contract (signed, scoped cursors)  
-**Supersedes:** the undocumented whole-feed `MAX_LIMIT = 500` behavior  
+paged-history contract (signed, scoped cursors)
+**Supersedes:** the undocumented whole-feed `MAX_LIMIT = 500` behavior
 **Superseded by:** nothing
 
 ---
