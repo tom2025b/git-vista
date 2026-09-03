@@ -108,6 +108,44 @@ impl Pane {
     }
 }
 
+/// What the frame that was just drawn can actually show.
+///
+/// `ui.rs` measures this from the very rects it rendered each widget into and
+/// the event loop hands it to [`App::observe`] before the next key is read.
+/// That indirection is the whole point: a page is then the pane's **current**
+/// visible row count, which is what #625 asks for and what a constant cannot
+/// be. A constant would be right in a one-third-height pane and wrong the
+/// moment [`Action::ToggleMaximize`] gives that same pane the whole window —
+/// wrong, that is, in exactly the state the zoom key exists to create, while
+/// looking correct in every small-pane test.
+///
+/// The unit is the one that pane's cursor counts, not always a terminal row:
+/// the graph draws a connector line between commits, so its viewport is
+/// **commits** per screen rather than lines.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Viewport {
+    panes: [usize; 4],
+    overlay: usize,
+}
+
+impl Viewport {
+    /// `panes` in [`Pane::ALL`] order; `overlay` is the body of whichever
+    /// full-frame surface was up (the conflict overlay, a plan review).
+    pub fn new(panes: [usize; 4], overlay: usize) -> Viewport {
+        Viewport { panes, overlay }
+    }
+
+    /// Rows of that pane's own content the last frame had room for.
+    pub fn rows(&self, pane: Pane) -> usize {
+        self.panes[pane.index()]
+    }
+
+    /// Rows the last frame's overlay had room for.
+    pub fn overlay(&self) -> usize {
+        self.overlay
+    }
+}
+
 /// What a key press means, after `keys.rs` has translated it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -117,6 +155,16 @@ pub enum Action {
     Focus(Pane),
     CursorDown,
     CursorUp,
+    /// `PageDown` / `PageUp` — one visible page of the focused pane (#625).
+    /// How far that is comes from [`Viewport`], never from a constant.
+    CursorPageDown,
+    CursorPageUp,
+    /// `Home` / `End` — the first and last row of the focused pane (#625).
+    CursorTop,
+    CursorBottom,
+    /// `z` — give the focused pane the whole window, or put the four-pane
+    /// shape back (#625).
+    ToggleMaximize,
     Refresh,
     Activate,
     ParentPrev,
@@ -414,6 +462,11 @@ pub struct App {
     pub execution: Option<TrackedExecution>,
     refresh_after_write: bool,
     cursors: [usize; 4],
+    /// What the last drawn frame could show (#625). Written by
+    /// [`App::observe`] once a frame; read whenever a page has to be a page.
+    viewport: Viewport,
+    /// Whether the focused pane currently has the whole window (#625).
+    maximized: bool,
     pub status: Status,
     /// Catalog reads dispatched and not yet answered.
     pub in_flight: u32,
@@ -456,6 +509,8 @@ impl App {
             execution: None,
             refresh_after_write: false,
             cursors: [0; 4],
+            viewport: Viewport::default(),
+            maximized: false,
             status: Status {
                 text: String::from("connecting to git-vista-server…"),
                 tone: Tone::Info,
@@ -514,6 +569,31 @@ impl App {
                 if cursor > 0 {
                     self.cursors[pane.index()] = cursor - 1;
                 }
+                Vec::new()
+            }
+            Action::CursorPageDown => {
+                let pane = self.focus;
+                let page = self.page(pane);
+                self.move_cursor_by(pane, page as isize);
+                Vec::new()
+            }
+            Action::CursorPageUp => {
+                let pane = self.focus;
+                let page = self.page(pane);
+                self.move_cursor_by(pane, -(page as isize));
+                Vec::new()
+            }
+            Action::CursorTop => {
+                self.cursors[self.focus.index()] = 0;
+                Vec::new()
+            }
+            Action::CursorBottom => {
+                let pane = self.focus;
+                self.cursors[pane.index()] = self.rows(pane).saturating_sub(1);
+                Vec::new()
+            }
+            Action::ToggleMaximize => {
+                self.maximized = !self.maximized;
                 Vec::new()
             }
             Action::Refresh => {
@@ -1218,6 +1298,33 @@ impl App {
                 }
                 Vec::new()
             }
+            Action::CursorPageDown | Action::CursorPageUp => {
+                // The modal's own body, not a pane's — it is drawn inside a
+                // margin over the whole frame, so it is taller than any of
+                // them and pages by more.
+                let page = self.viewport.overlay().max(1) as isize;
+                let delta = if action == Action::CursorPageDown {
+                    page
+                } else {
+                    -page
+                };
+                if let Some(review) = self.plan_review.as_mut() {
+                    review.scroll(delta);
+                }
+                Vec::new()
+            }
+            Action::CursorTop => {
+                if let Some(review) = self.plan_review.as_mut() {
+                    review.scroll_to(0);
+                }
+                Vec::new()
+            }
+            Action::CursorBottom => {
+                if let Some(review) = self.plan_review.as_mut() {
+                    review.scroll_to(usize::MAX);
+                }
+                Vec::new()
+            }
             Action::Quit => {
                 self.quit = true;
                 Vec::new()
@@ -1244,7 +1351,11 @@ impl App {
             // neither given nor refused. The modal is dismissed by deciding,
             // never by navigating away from it.
             | Action::OpenConflicts
-            | Action::Conflict(_) => Vec::new(),
+            | Action::Conflict(_)
+            // Zoom is a shape the panes take, and no pane is reachable while
+            // a plan is waiting to be approved or refused. Toggling it under
+            // the modal would rearrange a frame the user cannot see.
+            | Action::ToggleMaximize => Vec::new(),
         }
     }
 
@@ -1828,6 +1939,40 @@ impl App {
         self.cursors[pane.index()]
     }
 
+    /// Record what the frame just drawn could show (#625). The event loop
+    /// calls this after every draw, so by the time a key is read the numbers
+    /// describe the frame the user is looking at — including a terminal that
+    /// was resized and a pane that was just zoomed.
+    pub fn observe(&mut self, viewport: Viewport) {
+        self.viewport = viewport;
+        self.conflicts.observe(viewport.overlay());
+    }
+
+    /// The pane the zoom key has maximized, if any.
+    ///
+    /// Zoom follows focus rather than pinning the pane it was pressed on:
+    /// `z` and then Tab shows the next pane full-height, which is what
+    /// somebody who wants a big look at something else means. It also means
+    /// there is no stale "zoomed pane" to reconcile when focus moves.
+    pub fn maximized(&self) -> Option<Pane> {
+        self.maximized.then_some(self.focus)
+    }
+
+    /// One page of a pane, in the units that pane's cursor counts.
+    ///
+    /// Never zero: a pane squeezed to no interior still moves by one row, so
+    /// `PageDown` degrades to `j` rather than silently doing nothing.
+    fn page(&self, pane: Pane) -> usize {
+        self.viewport.rows(pane).max(1)
+    }
+
+    /// Move a pane's cursor by `delta`, clamped to the rows it actually has.
+    fn move_cursor_by(&mut self, pane: Pane, delta: isize) {
+        let last = self.rows(pane).saturating_sub(1);
+        let slot = &mut self.cursors[pane.index()];
+        *slot = slot.saturating_add_signed(delta).min(last);
+    }
+
     /// How many rows a pane has to select among.
     pub fn rows(&self, pane: Pane) -> usize {
         match pane {
@@ -1949,6 +2094,19 @@ mod tests {
         serde_json::from_str(wire).expect("the literal is a valid catalog")
     }
 
+    /// A catalog of `n` entries, for the paging tests: they need more rows
+    /// than a page so that a clamp at the end cannot be mistaken for a page.
+    fn long_catalog(n: usize) -> Vec<RepositoryDescriptor> {
+        let entries: Vec<String> = (0..n)
+            .map(|i| {
+                format!(
+                    r#"{{"repository":"r{i}","worktree":"w{i}","name":"repo-{i}","kind":"bare","read_only":true}}"#
+                )
+            })
+            .collect();
+        catalog(&format!("[{}]", entries.join(",")))
+    }
+
     fn loaded(wire: &str) -> App {
         let mut app = App::new();
         assert_eq!(app.start(), [Request::Catalog]);
@@ -2024,6 +2182,150 @@ mod tests {
                 total_objects: Some(100),
             }),
         }
+    }
+
+    /// INVARIANT (#625): a page is what the LAST FRAME said that pane could
+    /// show — per pane, in that pane's own units, and re-read every time.
+    ///
+    /// Observed twice at two different sizes on purpose. One observation
+    /// proves only that some number was used; two prove the number is the
+    /// current one. A page size captured once at startup, or fixed at a
+    /// constant, passes the first half of this test and fails the second —
+    /// and that is the bug this slice exists not to ship, because it would
+    /// be invisible until somebody zoomed a pane.
+    ///
+    /// MUTATION 1 (remove): move one row, ignoring the viewport.
+    /// MUTATION 2 (weaken): use a constant page size.
+    #[test]
+    fn a_page_is_the_observed_height_of_the_focused_pane_and_is_re_read_every_time() {
+        let mut app = App::new();
+        app.receive(Data::Catalog(Ok(long_catalog(400))));
+
+        app.observe(Viewport::new([6, 4, 3, 21], 0));
+        app.apply(Action::CursorPageDown);
+        assert_eq!(app.cursor(Pane::Repositories), 6);
+        app.apply(Action::CursorPageDown);
+        assert_eq!(app.cursor(Pane::Repositories), 12);
+        app.apply(Action::CursorPageUp);
+        assert_eq!(app.cursor(Pane::Repositories), 6);
+
+        // The terminal grew, or the pane was zoomed. The next page is the
+        // new height, not the one that was true a frame ago.
+        app.observe(Viewport::new([18, 16, 9, 57], 0));
+        app.apply(Action::CursorPageDown);
+        assert_eq!(
+            app.cursor(Pane::Repositories),
+            24,
+            "the page was still measured against the old, smaller frame"
+        );
+    }
+
+    /// INVARIANT (#625): each pane pages by ITS OWN height, so moving focus
+    /// changes how far a page goes. One shared page size would be right for
+    /// at most one pane of four.
+    #[test]
+    fn each_pane_pages_by_its_own_measured_height() {
+        let mut app = loaded(THREE);
+        select_first(&mut app);
+        app.receive(Data::History {
+            repo: "w1".to_string(),
+            result: Ok(page(&[
+                ("a".repeat(40).as_str(), "first"),
+                ("b".repeat(40).as_str(), "second"),
+                ("c".repeat(40).as_str(), "third"),
+                ("d".repeat(40).as_str(), "fourth"),
+            ])),
+        });
+        app.observe(Viewport::new([6, 4, 3, 21], 0));
+
+        app.apply(Action::Focus(Pane::Commits));
+        app.apply(Action::CursorPageDown);
+        assert_eq!(
+            app.cursor(Pane::Commits),
+            3,
+            "the graph pages by commits, and three fit"
+        );
+
+        app.apply(Action::Focus(Pane::Repositories));
+        app.apply(Action::CursorPageDown);
+        assert_eq!(
+            app.cursor(Pane::Repositories),
+            2,
+            "three repositories, so a six-row page stops at the last one"
+        );
+    }
+
+    #[test]
+    fn paging_stops_at_both_ends_and_home_and_end_reach_them_directly() {
+        let mut app = App::new();
+        app.receive(Data::Catalog(Ok(long_catalog(20))));
+        app.observe(Viewport::new([6, 4, 3, 21], 0));
+
+        app.apply(Action::CursorPageUp);
+        assert_eq!(app.cursor(Pane::Repositories), 0, "no wrap off the top");
+
+        for _ in 0..10 {
+            app.apply(Action::CursorPageDown);
+        }
+        assert_eq!(
+            app.cursor(Pane::Repositories),
+            19,
+            "paging past the end must stop on the last row, not run off it"
+        );
+
+        app.apply(Action::CursorTop);
+        assert_eq!(app.cursor(Pane::Repositories), 0);
+        app.apply(Action::CursorBottom);
+        assert_eq!(app.cursor(Pane::Repositories), 19);
+    }
+
+    /// An empty pane, and a pane too short to hold a row, are both real: the
+    /// catalog is empty before the first answer, and a pane can be squeezed
+    /// to nothing by a small terminal. Neither may panic, and neither may
+    /// leave the cursor pointing at a row that is not there.
+    #[test]
+    fn paging_an_empty_or_squeezed_pane_is_safe_and_still_moves_by_one() {
+        let mut empty = App::new();
+        empty.observe(Viewport::new([6, 4, 3, 21], 0));
+        for action in [
+            Action::CursorPageDown,
+            Action::CursorPageUp,
+            Action::CursorTop,
+            Action::CursorBottom,
+        ] {
+            empty.apply(action);
+            assert_eq!(empty.cursor(Pane::Repositories), 0, "{action:?}");
+        }
+
+        // A frame so short the pane has no interior at all. `PageDown` then
+        // behaves like `j` rather than doing nothing — a key that is silently
+        // inert is worse than one that under-delivers.
+        let mut squeezed = App::new();
+        squeezed.receive(Data::Catalog(Ok(long_catalog(20))));
+        squeezed.observe(Viewport::new([0, 0, 0, 0], 0));
+        squeezed.apply(Action::CursorPageDown);
+        assert_eq!(squeezed.cursor(Pane::Repositories), 1);
+    }
+
+    /// INVARIANT (#625): zoom is a toggle on whatever has focus, and it
+    /// follows focus rather than pinning the pane it was pressed on.
+    #[test]
+    fn the_zoom_toggle_names_the_focused_pane_and_follows_focus() {
+        let mut app = App::new();
+        assert_eq!(app.maximized(), None, "the shell opens with four panes");
+
+        app.apply(Action::ToggleMaximize);
+        assert_eq!(app.maximized(), Some(Pane::Repositories));
+
+        app.apply(Action::FocusNext);
+        assert_eq!(
+            app.maximized(),
+            Some(Pane::WorkingTree),
+            "zoom follows focus; a stale zoomed pane would need reconciling"
+        );
+
+        app.apply(Action::ToggleMaximize);
+        assert_eq!(app.maximized(), None, "the same key puts the shape back");
     }
 
     fn page(rows: &[(&str, &str)]) -> CommitPage {

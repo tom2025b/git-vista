@@ -5,6 +5,20 @@
 //! logic out of the state model. The palette is intentionally limited to
 //! ANSI names: cyan marks the focused border, red marks an error status, and
 //! selection uses the terminal's own reversed modifier.
+//!
+//! # Drawing also measures (#625)
+//!
+//! [`draw`] returns a [`Viewport`]: how many rows of its own content each
+//! surface had room for in the frame it just drew. The event loop hands that
+//! straight back to [`App::observe`](crate::app::App::observe), so `PageDown`
+//! moves by the height the user is actually looking at.
+//!
+//! The measurement is taken from the very rects the widgets were rendered
+//! into — never recomputed from the terminal size — because the two could
+//! then disagree, and the one that would be believed is the one nobody can
+//! see. Each `draw_*` helper returns its own number for the same reason: the
+//! function that decided the geometry is the only one that can report it
+//! without guessing.
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -12,7 +26,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{review_lines, App, Pane, Tone};
+use crate::app::{review_lines, App, Pane, Tone, Viewport};
 use crate::layout;
 use crate::panes::conflicts::{self, Screen};
 use crate::panes::detail::RowTone;
@@ -21,10 +35,11 @@ use crate::panes::plan_review::{PlanReviewPane, RowTone as PlanRowTone};
 use crate::panes::staging::Tone as StagingTone;
 use crate::panes::worktree::LoadState;
 
-/// Draw one complete frame from the current application state.
-pub fn draw(frame: &mut Frame, app: &App) {
+/// Draw one complete frame from the current application state, and report
+/// what it could show (#625).
+pub fn draw(frame: &mut Frame, app: &App) -> Viewport {
     let area = frame.area();
-    let Some(panes) = layout::split(area) else {
+    let Some(panes) = layout::split(area, app.maximized()) else {
         frame.render_widget(
             Paragraph::new(format!(
                 "gv-tui needs at least {}x{}; this terminal is {}x{}",
@@ -36,7 +51,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
             .wrap(Wrap { trim: false }),
             area,
         );
-        return;
+        // Nothing was drawn but one sentence, so nothing can be paged.
+        return Viewport::default();
     };
 
     // The conflict overlay takes the whole body when it is up (M10.07,
@@ -50,9 +66,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
             area.width,
             panes.status.y.saturating_sub(area.y),
         );
-        draw_conflicts(frame, body, app);
+        let rows = draw_conflicts(frame, body, app);
         draw_status(frame, panes.status, app);
-        return;
+        return Viewport::new([0; 4], rows);
     }
 
     let rows: Vec<ListItem<'_>> = app
@@ -66,16 +82,25 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .highlight_symbol("> ");
     let selected = (app.rows(Pane::Repositories) > 0).then(|| app.cursor(Pane::Repositories));
     let mut state = ListState::default().with_selected(selected);
-    frame.render_stateful_widget(repositories, panes.of(Pane::Repositories), &mut state);
+    let repositories_area = panes.of(Pane::Repositories);
+    let repository_rows = pane_block(Pane::Repositories, app.focus)
+        .inner(repositories_area)
+        .height as usize;
+    frame.render_stateful_widget(repositories, repositories_area, &mut state);
 
-    draw_worktree(frame, panes.of(Pane::WorkingTree), app);
-    draw_commits(frame, panes.of(Pane::Commits), app, detect_color_depth());
-    draw_main(frame, panes.of(Pane::Main), app);
-    if let Some(review) = &app.plan_review {
-        draw_plan_review(frame, area, review);
-    }
+    let worktree_rows = draw_worktree(frame, panes.of(Pane::WorkingTree), app);
+    let commit_rows = draw_commits(frame, panes.of(Pane::Commits), app, detect_color_depth());
+    let main_rows = draw_main(frame, panes.of(Pane::Main), app);
+    let overlay_rows = match &app.plan_review {
+        Some(review) => draw_plan_review(frame, area, review),
+        None => 0,
+    };
 
     draw_status(frame, panes.status, app);
+    Viewport::new(
+        [repository_rows, worktree_rows, commit_rows, main_rows],
+        overlay_rows,
+    )
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
@@ -83,11 +108,29 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         Tone::Info => Style::default(),
         Tone::Error => Style::default().fg(Color::Red),
     };
-    let status = app
-        .command_input
-        .as_ref()
-        .map_or_else(|| app.status.text.clone(), |input| format!(":{input}█"));
+    let status = app.command_input.as_ref().map_or_else(
+        // The zoom key is appended here rather than written into each of the
+        // dozen status sentences: a binding nobody can discover is a binding
+        // nobody has, and this strip is already where this shell says what is
+        // possible. While the palette owns the keyboard the line is the
+        // command being typed, and nothing may be appended to that.
+        || format!("{}{}", app.status.text, zoom_hint(app)),
+        |input| format!(":{input}█"),
+    );
     frame.render_widget(Paragraph::new(status).style(status_style), area);
+}
+
+/// The tail of the status line that names the zoom key — and, once a pane is
+/// zoomed, names the way back out of it.
+fn zoom_hint(app: &App) -> &'static str {
+    if app.conflicts.is_open() || app.plan_review.is_some() {
+        // Neither surface is a pane, and neither honours the key.
+        ""
+    } else if app.maximized().is_some() {
+        " · z unzoom"
+    } else {
+        " · z zoom"
+    }
 }
 
 /// The conflict overlay (M10.07, #462).
@@ -98,7 +141,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
 /// conflict is decided in this file — `cargo test` never draws a frame with a
 /// real terminal behind it, so a decision made here would be pinned by
 /// nothing.
-fn draw_conflicts(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_conflicts(frame: &mut Frame, area: Rect, app: &App) -> usize {
     let title = match app.conflicts.screen() {
         Screen::List => " Conflicts ",
         Screen::Inspect => " Conflict — inspect ",
@@ -121,6 +164,7 @@ fn draw_conflicts(frame: &mut Frame, area: Rect, app: &App) {
         .map(conflict_line)
         .collect();
     frame.render_widget(Paragraph::new(lines).block(block), area);
+    height
 }
 
 fn conflict_line(row: &conflicts::Row) -> Line<'static> {
@@ -168,7 +212,7 @@ fn conflict_tone_style(tone: conflicts::Tone) -> Style {
 
 /// Draw plan review as a modal over the shell: no pane underneath can look
 /// actionable while the reducer is deliberately ignoring its navigation.
-fn draw_plan_review(frame: &mut Frame, area: Rect, review: &PlanReviewPane) {
+fn draw_plan_review(frame: &mut Frame, area: Rect, review: &PlanReviewPane) -> usize {
     let margin_x = if area.width >= 70 { 4 } else { 1 };
     let margin_y = if area.height >= 18 { 2 } else { 1 };
     let modal = Rect {
@@ -190,6 +234,7 @@ fn draw_plan_review(frame: &mut Frame, area: Rect, review: &PlanReviewPane) {
         .skip(review.offset())
         .map(|row| Line::styled(row.text, plan_tone_style(row.tone)))
         .collect();
+    let rows = block.inner(modal).height as usize;
     frame.render_widget(Clear, modal);
     frame.render_widget(
         Paragraph::new(lines)
@@ -197,6 +242,7 @@ fn draw_plan_review(frame: &mut Frame, area: Rect, review: &PlanReviewPane) {
             .block(block),
         modal,
     );
+    rows
 }
 
 fn plan_tone_style(tone: PlanRowTone) -> Style {
@@ -231,12 +277,14 @@ fn pane_block(pane: Pane, focus: Pane) -> Block<'static> {
     }
 }
 
-fn draw_worktree(frame: &mut Frame, area: Rect, app: &App) {
+/// Returns the rows of file list the pane had room for — its heading is not
+/// one of them, which is why this cannot be inferred from the pane's rect.
+fn draw_worktree(frame: &mut Frame, area: Rect, app: &App) -> usize {
     let block = pane_block(Pane::WorkingTree, app.focus);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.is_empty() {
-        return;
+        return 0;
     }
 
     let state_line = match app.worktree.state() {
@@ -262,8 +310,9 @@ fn draw_worktree(frame: &mut Frame, area: Rect, app: &App) {
     };
     frame.render_widget(Paragraph::new(state_line).style(heading_style), heading);
 
+    let visible_rows = list_area.height as usize;
     if list_area.is_empty() {
-        return;
+        return 0;
     }
     if app.worktree.rows().is_empty() {
         let message = match app.worktree.state() {
@@ -272,7 +321,7 @@ fn draw_worktree(frame: &mut Frame, area: Rect, app: &App) {
             LoadState::Failed(_) => "No successful status snapshot.",
         };
         frame.render_widget(Paragraph::new(message), list_area);
-        return;
+        return visible_rows;
     }
     let rows: Vec<ListItem<'_>> = app
         .worktree
@@ -285,12 +334,19 @@ fn draw_worktree(frame: &mut Frame, area: Rect, app: &App) {
         .highlight_symbol("> ");
     let mut state = ListState::default().with_selected(Some(app.cursor(Pane::WorkingTree)));
     frame.render_stateful_widget(list, list_area, &mut state);
+    visible_rows
 }
 
 /// The commit graph (#457): core's lanes and edges, windowed to the pane's
 /// visible rows and scrolled to keep the cursor's commit on screen.
-fn draw_commits(frame: &mut Frame, area: Rect, app: &App, colors: ColorDepth) {
+///
+/// Returns the number of **commits** on screen, not lines: the graph draws a
+/// connector row between every pair of commits, so a page of this pane is
+/// half its height. Its cursor counts commits, and a page has to be in the
+/// same units as the cursor it moves (#625).
+fn draw_commits(frame: &mut Frame, area: Rect, app: &App, colors: ColorDepth) -> usize {
     let inner = pane_block(Pane::Commits, app.focus).inner(area);
+    let visible_commits = inner.height as usize / 2;
     if app.commits.is_empty() {
         let message = if app.active_repo.is_some() {
             "No commits."
@@ -301,7 +357,7 @@ fn draw_commits(frame: &mut Frame, area: Rect, app: &App, colors: ColorDepth) {
             Paragraph::new(message).block(pane_block(Pane::Commits, app.focus)),
             area,
         );
-        return;
+        return visible_commits;
     }
 
     let layout = LayoutData {
@@ -333,6 +389,7 @@ fn draw_commits(frame: &mut Frame, area: Rect, app: &App, colors: ColorDepth) {
         Paragraph::new(lines).block(pane_block(Pane::Commits, app.focus)),
         area,
     );
+    visible_commits
 }
 
 /// One [`GraphLine`] as a styled Ratatui [`Line`]; `selected` reverses the
@@ -361,7 +418,11 @@ fn graph_line(line: &GraphLine, selected: bool) -> Line<'static> {
 /// The commit detail and diff (#458): [`DetailPane`](crate::panes::detail::DetailPane)
 /// already windows its own rows, so this hands it the pane's cursor as a
 /// vertical offset and lets Ratatui's own scroll carry the horizontal one.
-fn draw_main(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_main(frame: &mut Frame, area: Rect, app: &App) -> usize {
+    // Every branch below draws inside the same bordered block, so the rows
+    // available are the same whichever of them runs — the branches differ in
+    // what they put there, not in how much room there is.
+    let visible_rows = pane_block(Pane::Main, app.focus).inner(area).height as usize;
     if let Some(review) = &app.review {
         let lines = review_lines(review);
         let offset = app.cursor(Pane::Main).min(lines.len().saturating_sub(1));
@@ -370,7 +431,7 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &App) {
             Paragraph::new(lines).block(pane_block(Pane::Main, app.focus)),
             area,
         );
-        return;
+        return visible_rows;
     }
     if let Some(confirmation) = &app.confirmation {
         frame.render_widget(
@@ -379,11 +440,11 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &App) {
                 .block(pane_block(Pane::Main, app.focus)),
             area,
         );
-        return;
+        return visible_rows;
     }
     if let Some(staging) = &app.staging {
         draw_staging(frame, area, app, staging);
-        return;
+        return visible_rows;
     }
     let inner = pane_block(Pane::Main, app.focus).inner(area);
     let rows = app
@@ -399,6 +460,7 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &App) {
             .block(pane_block(Pane::Main, app.focus)),
         area,
     );
+    visible_rows
 }
 
 fn draw_staging(
@@ -546,11 +608,24 @@ mod tests {
         });
     }
 
+    /// What [`draw`] reported it had room for, at a given terminal size.
+    fn measured(width: u16, height: u16, app: &App) -> Viewport {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("a test terminal");
+        let mut viewport = Viewport::default();
+        terminal
+            .draw(|frame| viewport = draw(frame, app))
+            .expect("the test backend draws");
+        viewport
+    }
+
     fn rendered(width: u16, height: u16, app: &App) -> Terminal<TestBackend> {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("a test terminal");
         terminal
-            .draw(|frame| draw(frame, app))
+            .draw(|frame| {
+                draw(frame, app);
+            })
             .expect("drawing to TestBackend succeeds");
         terminal
     }
@@ -671,7 +746,7 @@ mod tests {
             app.apply(Action::Focus(focus));
             let terminal = rendered(80, 24, &app);
             let buffer = terminal.backend().buffer();
-            let focused = layout::split(buffer.area).unwrap().of(focus);
+            let focused = layout::split(buffer.area, None).unwrap().of(focus);
             let mut cyan = 0;
             for y in buffer.area.y..buffer.area.bottom() {
                 for x in buffer.area.x..buffer.area.right() {
@@ -846,7 +921,11 @@ mod tests {
         let terminal = rendered(80, 24, &app);
         let buffer = terminal.backend().buffer();
         let y = row_containing(buffer, "1111111 render the detail pane");
-        assert!(inside(layout::split(buffer.area).unwrap().commits, 1, y));
+        assert!(inside(
+            layout::split(buffer.area, None).unwrap().commits,
+            1,
+            y
+        ));
         assert!(line(buffer, y).contains("1111111 render the detail pane"));
         assert!(
             (0..buffer.area.width).any(|x| buffer
@@ -882,6 +961,105 @@ mod tests {
             cursor: None,
             generation: GenerationToken::new("generation-1").unwrap(),
         }
+    }
+
+    /// INVARIANT (#625): the [`Viewport`] a frame reports is the geometry it
+    /// actually drew, in each pane's own units — the graph in **commits**
+    /// (it draws a connector row between every pair, so its page is half its
+    /// height), the working tree **minus its heading row**, which is not one
+    /// of the rows its cursor can select.
+    ///
+    /// The units matter more than they look: a page has to be in the same
+    /// units as the cursor it moves, or `PageDown` on the graph would jump
+    /// twice as far as a screen and skip half the history it claimed to page
+    /// through.
+    ///
+    /// MUTATION 1 (remove): report the pane's whole rect height for the graph.
+    /// MUTATION 2 (weaken): count the working tree's heading row as usable.
+    #[test]
+    fn the_frame_reports_the_rows_it_actually_drew_in_each_panes_own_units() {
+        let mut app = loaded();
+        select_first(&mut app);
+        app.receive(Data::History {
+            repo: "w1".to_string(),
+            result: Ok(many_commits(200)),
+        });
+
+        // (terminal, repositories, working tree, commits, main)
+        for (width, height, repositories, worktree, commits, main) in
+            [(80u16, 24u16, 6, 4, 3, 21), (80, 60, 18, 16, 9, 57)]
+        {
+            let viewport = measured(width, height, &app);
+            assert_eq!(
+                viewport.rows(Pane::Repositories),
+                repositories,
+                "{width}x{height} Repositories"
+            );
+            assert_eq!(
+                viewport.rows(Pane::WorkingTree),
+                worktree,
+                "{width}x{height} Working Tree — its heading is not a row it can select"
+            );
+            assert_eq!(
+                viewport.rows(Pane::Commits),
+                commits,
+                "{width}x{height} Commits — in commits, not lines"
+            );
+            assert_eq!(viewport.rows(Pane::Main), main, "{width}x{height} Main");
+        }
+    }
+
+    /// INVARIANT (#625): a zoomed pane reports the whole body, and the panes
+    /// that are no longer drawn report nothing — a page must never be
+    /// measured against a pane the user cannot see.
+    #[test]
+    fn a_zoomed_pane_reports_the_whole_body_and_the_hidden_panes_report_nothing() {
+        let mut app = loaded();
+        select_first(&mut app);
+        app.receive(Data::History {
+            repo: "w1".to_string(),
+            result: Ok(many_commits(200)),
+        });
+        app.apply(Action::Focus(Pane::Commits));
+
+        let before = measured(80, 24, &app);
+        app.apply(Action::ToggleMaximize);
+        let after = measured(80, 24, &app);
+
+        assert_eq!(before.rows(Pane::Commits), 3);
+        assert_eq!(
+            after.rows(Pane::Commits),
+            10,
+            "the body is 23 rows; less a border, 21 lines, which is 10 commits              and a connector"
+        );
+        for hidden in [Pane::Repositories, Pane::WorkingTree, Pane::Main] {
+            assert_eq!(
+                after.rows(hidden),
+                0,
+                "{hidden:?} is not on screen and must not offer a page"
+            );
+        }
+    }
+
+    /// The zoom key has to be findable, and once used, escapable.
+    #[test]
+    fn the_status_strip_names_the_zoom_key_and_then_names_the_way_back() {
+        let app = loaded();
+        let terminal = rendered(80, 24, &app);
+        assert!(
+            line(terminal.backend().buffer(), 23).contains("z zoom"),
+            "the status strip does not name the zoom key: {:?}",
+            line(terminal.backend().buffer(), 23)
+        );
+
+        let mut zoomed = loaded();
+        zoomed.apply(Action::ToggleMaximize);
+        let terminal = rendered(80, 24, &zoomed);
+        let strip = line(terminal.backend().buffer(), 23);
+        assert!(
+            strip.contains("z unzoom"),
+            "a zoomed frame must say how to get back: {strip:?}"
+        );
     }
 
     /// Pins the scroll-follows-cursor behaviour `draw_commits` adds on top of
@@ -967,7 +1145,7 @@ mod tests {
         let mut app = detailed(&patch, Vec::new());
         let first = rendered(80, 24, &app);
         let first_buffer = first.backend().buffer();
-        let panes = layout::split(first_buffer.area).unwrap();
+        let panes = layout::split(first_buffer.area, None).unwrap();
         let first_y = row_containing(first_buffer, "+012345");
         assert!(!line(first_buffer, first_y).contains("-END"));
         for y in panes.main.y + 1..panes.main.bottom() - 1 {

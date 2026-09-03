@@ -398,6 +398,13 @@ impl PlanReviewPane {
             .min(self.rows().len().saturating_sub(1));
     }
 
+    /// Put the top of the view on `row`, clamped to the rows there are.
+    /// `usize::MAX` is therefore "the last row" — how `End` asks for the end
+    /// of a plan whose length only this pane knows (#625).
+    pub fn scroll_to(&mut self, row: usize) {
+        self.scroll = row.min(self.rows().len().saturating_sub(1));
+    }
+
     pub fn offset(&self) -> usize {
         self.scroll
     }

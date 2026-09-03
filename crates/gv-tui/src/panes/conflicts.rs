@@ -122,6 +122,11 @@ pub enum Act {
     Refresh,
     Down,
     Up,
+    /// One visible page of the overlay body, and its two ends (#625).
+    PageDown,
+    PageUp,
+    Top,
+    Bottom,
     Open,
     FocusPane(View),
     NextPane,
@@ -136,6 +141,13 @@ pub enum Act {
     Newline,
     CaretLeft,
     CaretRight,
+}
+
+/// Which end of a screen [`Act::Top`] and [`Act::Bottom`] mean (#625).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Edge {
+    Start,
+    End,
 }
 
 /// How one row of the overlay body is styled.
@@ -332,6 +344,11 @@ pub struct ConflictsPane {
     busy: bool,
     /// The last thing worth saying: a refusal, a server sentence, a success.
     message: Option<(String, bool)>,
+    /// Rows the overlay's body had in the last drawn frame (#625). The
+    /// overlay owns the whole window, so this is the biggest page in the
+    /// program — and it changes with the terminal, which is why it is
+    /// observed rather than assumed.
+    viewport: usize,
 }
 
 impl ConflictsPane {
@@ -519,6 +536,16 @@ impl ConflictsPane {
             }
             Act::Down => self.move_cursor(1),
             Act::Up => self.move_cursor(-1),
+            Act::PageDown => {
+                let page = self.page();
+                self.move_cursor(page)
+            }
+            Act::PageUp => {
+                let page = self.page();
+                self.move_cursor(-page)
+            }
+            Act::Top => self.jump(Edge::Start),
+            Act::Bottom => self.jump(Edge::End),
             Act::Open => self.open_selected(),
             Act::NextPane => {
                 if let Some(inspect) = self.inspect.as_mut() {
@@ -596,6 +623,45 @@ impl ConflictsPane {
         Vec::new()
     }
 
+    /// Record the overlay body's height from the frame just drawn (#625).
+    pub fn observe(&mut self, rows: usize) {
+        self.viewport = rows;
+    }
+
+    /// One page of the overlay, never zero.
+    fn page(&self) -> isize {
+        // A terminal deeper than `isize::MAX` rows is not a case; the
+        // saturating cast is here so no arithmetic in this file can panic.
+        self.viewport.max(1).min(isize::MAX as usize) as isize
+    }
+
+    /// Jump to the first or last row of whatever this screen is showing.
+    fn jump(&mut self, edge: Edge) -> Vec<Request> {
+        let target = match edge {
+            Edge::Start => 0,
+            Edge::End => usize::MAX,
+        };
+        match self.screen {
+            Screen::List => {
+                let last = self.files_ref().map_or(0, <[_]>::len).saturating_sub(1);
+                self.cursor = target.min(last);
+            }
+            Screen::Inspect => {
+                self.scroll = target.min(self.row_count().saturating_sub(1));
+            }
+            Screen::Editor => {
+                if let Some(editor) = self.editor.as_mut() {
+                    if editor.inserting {
+                        return Vec::new();
+                    }
+                    let last = editor.choices.len().saturating_sub(1);
+                    editor.block = target.min(last);
+                }
+            }
+        }
+        Vec::new()
+    }
+
     fn move_cursor(&mut self, delta: isize) -> Vec<Request> {
         match self.screen {
             Screen::List => {
@@ -603,7 +669,15 @@ impl ConflictsPane {
                 self.cursor = self.cursor.saturating_add_signed(delta).min(last);
             }
             Screen::Inspect => {
-                self.scroll = self.scroll.saturating_add_signed(delta);
+                // Clamped to the rows there are, not left to run off the end
+                // and be clamped again at draw time. Unbounded, a `PageDown`
+                // held down would build a scroll position hundreds of pages
+                // past the file, and the first `PageUp` after it would appear
+                // to do nothing at all.
+                self.scroll = self
+                    .scroll
+                    .saturating_add_signed(delta)
+                    .min(self.row_count().saturating_sub(1));
             }
             Screen::Editor => {
                 if let Some(editor) = self.editor.as_mut() {
@@ -879,26 +953,46 @@ impl ConflictsPane {
 
     /// Where the body should be scrolled to for a `height`-row viewport:
     /// the user's own scroll, clamped to the end, and pulled far enough to
-    /// keep the text caret on screen while they are typing.
+    /// keep this screen's selection on screen.
     ///
     /// A caret the viewport has scrolled away from is a caret the user cannot
     /// see, and an invisible caret in a buffer that accepts every keystroke is
-    /// a way to edit the wrong line of a file you are about to write.
+    /// a way to edit the wrong line of a file you are about to write. The file
+    /// list has the same hazard with a slower fuse: `End` in a list longer than
+    /// the overlay moves the cursor and nothing else, so the highlight leaves
+    /// the window entirely and `Enter` opens a path that is nowhere on screen.
     pub fn view_offset(&self, height: usize) -> usize {
         let max = self.row_count().saturating_sub(height);
         let offset = self.scroll.min(max);
-        let Some(caret) = self.caret_row() else {
+        let Some(focus) = self.focus_row() else {
             return offset;
         };
         if height == 0 {
             return offset;
         }
-        if caret < offset {
-            caret
-        } else if caret >= offset + height {
-            caret + 1 - height
+        if focus < offset {
+            focus
+        } else if focus >= offset + height {
+            focus + 1 - height
         } else {
             offset
+        }
+    }
+
+    /// The absolute row index of the thing the viewport must not lose: the
+    /// file cursor on the list, the text caret while hand-editing.
+    ///
+    /// `None` on `Inspect`, and on the editor outside insert mode, because
+    /// there the user's own `scroll` *is* the cursor and follows itself.
+    fn focus_row(&self) -> Option<usize> {
+        match self.screen {
+            Screen::List => {
+                // Row 0 is the heading; file `n` is drawn at row `n + 1`.
+                let last = self.files_ref().filter(|f| !f.is_empty())?.len() - 1;
+                Some(1 + self.cursor.min(last))
+            }
+            Screen::Inspect => None,
+            Screen::Editor => self.caret_row(),
         }
     }
 
@@ -2246,5 +2340,80 @@ mod tests {
         pane.apply(Act::EndEdit);
         assert!(pane.caret_row().is_none());
         assert_eq!(pane.view_offset(usize::MAX), 0);
+    }
+
+    #[test]
+    fn the_viewport_follows_the_file_cursor_out_of_the_visible_window() {
+        // The list's own version of the hazard above, and the one the paging
+        // keys created: `End` moves `cursor` and nothing else, so in a list
+        // longer than the overlay the highlight left the drawn window
+        // entirely — and `Enter` then opened a path that was nowhere on
+        // screen. Asserting the cursor reached the last file would have
+        // passed throughout; what has to hold is that the row the cursor is
+        // on is among the rows actually drawn.
+        const HEIGHT: usize = 5;
+        let files: Vec<ConflictedFile> = (0..20)
+            .map(|n| ConflictedFile {
+                path: format!("file-{n:02}.txt"),
+                ..text_conflict()
+            })
+            .collect();
+        let mut pane = listing(files);
+        pane.observe(HEIGHT);
+
+        for (act, expected) in [
+            (Act::Bottom, "file-19.txt"),
+            (Act::PageUp, "file-14.txt"),
+            (Act::Top, "file-00.txt"),
+            (Act::PageDown, "file-05.txt"),
+        ] {
+            pane.apply(act);
+            let offset = pane.view_offset(HEIGHT);
+            let drawn = pane.window(offset, HEIGHT);
+            let selected: Vec<&Row> = drawn.iter().filter(|row| row.selected).collect();
+            assert_eq!(
+                selected.len(),
+                1,
+                "after {act:?} the selected row is not among the {} rows drawn at offset {offset}: {:?}",
+                drawn.len(),
+                drawn.iter().map(|row| &row.text).collect::<Vec<_>>()
+            );
+            assert!(
+                selected[0].text.contains(expected),
+                "after {act:?} the drawn selection is {:?}, not {expected}",
+                selected[0].text
+            );
+        }
+    }
+
+    #[test]
+    fn a_visible_file_cursor_does_not_move_the_list_window() {
+        // The other half of the clamp: following the cursor must not become
+        // recentring on every keystroke. A cursor already inside the window
+        // leaves the offset exactly where the user put it.
+        const HEIGHT: usize = 5;
+        let files: Vec<ConflictedFile> = (0..20)
+            .map(|n| ConflictedFile {
+                path: format!("file-{n:02}.txt"),
+                ..text_conflict()
+            })
+            .collect();
+        let mut pane = listing(files);
+        pane.observe(HEIGHT);
+        assert_eq!(pane.view_offset(HEIGHT), 0, "the list opens at the top");
+        pane.apply(Act::Down);
+        pane.apply(Act::Down);
+        assert_eq!(
+            pane.view_offset(HEIGHT),
+            0,
+            "a cursor still on screen scrolled the window anyway"
+        );
+
+        // An empty list has no cursor to follow and must not scroll off its
+        // own explanatory row.
+        let mut empty = listing(Vec::new());
+        empty.observe(HEIGHT);
+        empty.apply(Act::Bottom);
+        assert_eq!(empty.view_offset(HEIGHT), 0);
     }
 }
