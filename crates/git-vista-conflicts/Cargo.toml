@@ -1,0 +1,34 @@
+# git-vista-conflicts — the conflict view model, shared by every client that
+# resolves a conflict (M10.07, #462; ADR 0105).
+#
+# It exists because M4.31's conflict model was correct and in the wrong place.
+# `features/conflicts/{core,markers}.rs` were already framework-free and
+# host-tested — deliberately so, ADR 0066's argument — but they lived inside
+# `git-vista`, a wasm binary crate with nothing to depend on. The terminal
+# client could not reach them, and #462's whole instruction is "using the same
+# model M4.31 shipped — not a second conflict implementation."
+#
+# So the files moved here verbatim, tests included, and `git-vista` re-exports
+# them under their old paths. Nothing about the model changed.
+#
+# Why its own crate rather than a module of an existing one: `core.rs` reads
+# both `git_vista_core::diff` (the blob/worktree payloads) and
+# `git_vista_protocol::conflict` (the stages), and those two crates each state
+# a dependency invariant this would have broken —
+# `git-vista-protocol`'s lib doc says "git-vista-core does not depend on it,
+# keeping the domain model free of transport concerns", and describes itself as
+# depending on neither. A crate that depends on both breaks neither claim, and
+# follows ADR 0101's precedent exactly: when a second non-browser client needed
+# a first client's logic, the answer was to extract a crate.
+[package]
+name = "git-vista-conflicts"
+description = "git-vista's conflict view model: four-pane inspection, the resolution surface, and the marker-file block editor's composing core."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+git-vista-core = { workspace = true }
+git-vista-protocol = { workspace = true }

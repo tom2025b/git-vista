@@ -15,6 +15,11 @@ path = "src/main.rs"
 [dependencies]
 # Shared data models (compiles for wasm too — pure logic, no UI deps).
 git-vista-core = { workspace = true }
+# The conflict view model (M10.07, #462; ADR 0105) — four-pane inspection, the
+# resolution surface, and the marker-file block editor's composing core. These
+# were files in `features/conflicts/` until gv-tui needed the same model; the
+# module there now re-exports this crate so no call site here changed.
+git-vista-conflicts = { workspace = true }
 # The versioned HTTP transport contract (M1.02): protocol version + negotiation,
 # the API error envelope, and the shared request/response DTOs. Pure/wasm-safe.
 git-vista-protocol = { workspace = true }
