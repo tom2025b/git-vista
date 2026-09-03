@@ -228,9 +228,11 @@ then verifies that the DOM and `gloo-net` glue consume those answers.
 
 Local verification before mutation proof:
 
-- `cargo test -p git-vista`: **810 passed, 2 ignored** in the real
+- `cargo test -p git-vista`: **773 passed, 2 ignored** in the real
   `git-vista-ui` binary; the 0-test `lib.rs` target is reported separately and
-  was not used as evidence.
+  was not used as evidence. (The post-proof main merge moved the conflict-core
+  tests into the new `git-vista-conflicts` crate; it did not remove them from
+  the workspace.)
 - `cargo test -p git-vista-protocol`: **229 passed** across unit/integration
   targets, with one ignored doctest.
 - `cargo test -p git-vista-server`: **1,138 passed, 6 ignored** across its
