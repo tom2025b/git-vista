@@ -4,23 +4,52 @@
 //!
 //! Split out of the former monolithic `api.rs`.
 
-use git_vista_protocol::{DeleteCloneRequest, RepoMode, RepositoryDescriptor, SelectRequest};
-
-use super::{
-    network_error, refuse_if_lan_view, refuse_if_offline, refuse_if_visualize, req_get,
-    response_error, user_facing_error, write_empty, write_json,
+use git_vista_protocol::{
+    DeleteCloneRequest, ListenerProfile, RepoMode, RepositoryDescriptor, SelectRequest,
+    LISTENER_PROFILE_HEADER,
 };
 
-/// The servable repositories (`GET /api/catalog`) — M1.03 built the endpoint,
-/// the repo picker finally consumes it. Cache-busted like every live read: the
-/// catalog changes at runtime (clones, rescans).
-pub async fn fetch_catalog() -> Result<Vec<RepositoryDescriptor>, String> {
+use super::{
+    network_error, refuse_if_offline, refuse_if_visualize, req_get, response_error,
+    user_facing_error, write_empty, write_json,
+};
+
+/// The catalog together with the capability profile of the listener that
+/// served it.  Keeping the two in one value prevents the picker from rendering
+/// rows first and guessing their interactivity from unrelated session state.
+#[derive(Debug, Clone)]
+pub struct RepositoryCatalog {
+    pub repositories: Vec<RepositoryDescriptor>,
+    pub listener_profile: ListenerProfile,
+}
+
+/// The servable repositories (`GET /api/catalog`) plus that response's declared
+/// listener profile. M1.03 built the endpoint; #589 makes its profile header
+/// part of the picker's input. Cache-busted like every live read: the catalog
+/// changes at runtime (clones, rescans).
+pub async fn fetch_catalog() -> Result<RepositoryCatalog, String> {
     let url = format!("/api/catalog?t={}", js_sys::Date::now());
     let resp = req_get(&url).send().await.map_err(network_error)?;
     if resp.ok() {
-        resp.json::<Vec<RepositoryDescriptor>>()
+        let declared = resp.headers().get(LISTENER_PROFILE_HEADER).ok_or_else(|| {
+            "The server did not declare this listener's capability profile. \
+             Reload git-vista before choosing a repository."
+                .to_string()
+        })?;
+        let listener_profile = ListenerProfile::from_header_value(&declared).ok_or_else(|| {
+            format!(
+                "The server declared an unknown listener capability profile ({declared:?}). \
+                 Reload git-vista before choosing a repository."
+            )
+        })?;
+        let repositories = resp
+            .json::<Vec<RepositoryDescriptor>>()
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        Ok(RepositoryCatalog {
+            repositories,
+            listener_profile,
+        })
     } else {
         Err(response_error(resp).await)
     }
@@ -31,7 +60,6 @@ pub async fn fetch_catalog() -> Result<Vec<RepositoryDescriptor>, String> {
 /// shows the server's reason.
 pub async fn select_request(worktree: &str, mode: RepoMode) -> Result<(), String> {
     refuse_if_offline()?;
-    refuse_if_lan_view()?;
     let body = SelectRequest {
         worktree: worktree.to_string(),
         mode,
@@ -48,7 +76,6 @@ pub async fn select_request(worktree: &str, mode: RepoMode) -> Result<(), String
 /// the server's one-line summary for the picker to show.
 pub async fn rescan_request() -> Result<String, String> {
     refuse_if_offline()?;
-    refuse_if_lan_view()?;
     let (resp, _key) = write_empty("/api/rescan").await?;
     if resp.ok() {
         Ok(resp.text().await.unwrap_or_default())
@@ -62,7 +89,6 @@ pub async fn rescan_request() -> Result<String, String> {
 /// clone, currently open, unknown id) come back as `Err` with the reason.
 pub async fn delete_clone_request(worktree: &str) -> Result<String, String> {
     refuse_if_offline()?;
-    refuse_if_lan_view()?;
     let body = DeleteCloneRequest {
         worktree: worktree.to_string(),
     };
