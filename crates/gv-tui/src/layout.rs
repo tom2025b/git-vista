@@ -214,11 +214,15 @@ mod tests {
                 Rect::new(0, 0, 90, 30),
                 "{zoomed:?} is zoomed and must fill the body"
             );
+            // Cells, not rows: Main is already full-height unzoomed (it is
+            // the right HALF), so what zooming buys it is width. Asserting
+            // height alone would have passed for three panes and been wrong
+            // about the fourth.
             assert!(
-                panes.of(zoomed).height > unzoomed.of(zoomed).height,
-                "{zoomed:?} zoomed ({}) is no taller than unzoomed ({}) —                  the whole point of the key",
-                panes.of(zoomed).height,
-                unzoomed.of(zoomed).height
+                cells(panes.of(zoomed)) > cells(unzoomed.of(zoomed)),
+                "{zoomed:?} zoomed ({:?}) is no bigger than unzoomed ({:?}) — the whole point of the key",
+                panes.of(zoomed),
+                unzoomed.of(zoomed)
             );
             for other in Pane::ALL.into_iter().filter(|p| *p != zoomed) {
                 assert!(

@@ -136,6 +136,44 @@ mod tests {
         Input::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
     }
 
+    fn press(code: KeyCode) -> Input {
+        Input::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// More repositories than any page under test, so nothing below is
+    /// measuring a clamp at the end of the list instead of a page.
+    fn a_long_catalog() -> Vec<RepositoryDescriptor> {
+        let entries: Vec<String> = (0..400)
+            .map(|i| {
+                format!(
+                    r#"{{"repository":"r{i}","worktree":"w{i}","name":"repo-{i}","kind":"bare","read_only":true}}"#
+                )
+            })
+            .collect();
+        catalog(&format!("[{}]", entries.join(",")))
+    }
+
+    /// Drive the real loop at a real terminal size: the catalog arrives, then
+    /// `keys` are pressed, then `q`. Answers the Repositories cursor.
+    ///
+    /// Going through [`run`] rather than calling `App::apply` directly is the
+    /// point — the page size only exists because a frame was drawn and
+    /// measured, and this is the only way to test that the measurement
+    /// reaches the key press.
+    fn cursor_after(width: u16, height: u16, keys: Vec<Input>) -> usize {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("a test terminal");
+        let mut app = App::new();
+        let mut events: Vec<Result<Input, String>> = vec![Ok(Input::Tick)];
+        events.extend(keys.into_iter().map(Ok));
+        events.push(Ok(key('q')));
+        let mut port = FakePort {
+            seen: Vec::new(),
+            answers: VecDeque::from([Data::Catalog(Ok(a_long_catalog()))]),
+        };
+        run(&mut terminal, &mut app, &mut Script::new(events), &mut port).unwrap();
+        app.cursor(Pane::Repositories)
+    }
+
     type ResizeSignal = (Rc<SizeCell<(u16, u16)>>, (u16, u16));
 
     struct Script {
@@ -282,6 +320,76 @@ mod tests {
 
         assert_eq!(error, "the input stream vanished");
         assert_eq!(port.seen, [Request::Catalog]);
+    }
+
+    /// INVARIANT (#625): one `PageDown` moves by the pane's CURRENT visible
+    /// row count, so the same key reaches further in a taller terminal.
+    ///
+    /// **Two heights, and that is the whole point.** At a single height a
+    /// hardcoded page size and a measured one are indistinguishable — and a
+    /// constant is exactly the defect this slice would otherwise ship
+    /// silently, because it would look right in every small-pane test and be
+    /// wrong the moment the zoom key handed that pane the whole window.
+    ///
+    /// The numbers are the pane's drawn interior: at 80x24 the Repositories
+    /// pane is 8 rows with a border top and bottom, at 80x60 it is 20.
+    ///
+    /// MUTATION 1 (remove): page by one row, as `j` does.
+    /// MUTATION 2 (weaken): page by a constant — any constant, since no
+    /// single number can satisfy both heights.
+    #[test]
+    fn a_page_is_the_panes_current_height_so_the_same_key_reaches_further_in_a_taller_terminal() {
+        let short = cursor_after(80, 24, vec![press(KeyCode::PageDown)]);
+        let tall = cursor_after(80, 60, vec![press(KeyCode::PageDown)]);
+
+        assert_eq!(short, 6, "80x24: the pane shows 6 rows, so a page is 6");
+        assert_eq!(tall, 18, "80x60: the pane shows 18 rows, so a page is 18");
+        assert!(
+            tall > short,
+            "a taller terminal must page further; both landed on {short}"
+        );
+    }
+
+    /// INVARIANT (#625): a maximized pane pages by its NEW, larger height.
+    ///
+    /// This is the interaction the two halves of the issue have with each
+    /// other. A page size measured once, or read from the four-pane layout,
+    /// would be right until somebody pressed `z` — and `z` exists precisely
+    /// so that the pane is bigger than the layout says.
+    ///
+    /// MUTATION 1 (remove): ignore `maximized` in `layout::split`.
+    /// MUTATION 2 (weaken): measure the viewport once, before the key loop,
+    /// instead of after every frame.
+    #[test]
+    fn zooming_a_pane_makes_its_pages_bigger_in_the_same_terminal() {
+        let plain = cursor_after(80, 24, vec![press(KeyCode::PageDown)]);
+        let zoomed = cursor_after(80, 24, vec![key('z'), press(KeyCode::PageDown)]);
+
+        assert_eq!(plain, 6, "one third of the left column, less its border");
+        assert_eq!(zoomed, 21, "the whole body, less its border");
+        assert!(
+            zoomed > plain,
+            "the zoom key changed nothing about how far a page goes"
+        );
+
+        // …and pressing it again puts the small page back, so the toggle is a
+        // toggle rather than a one-way door.
+        let unzoomed = cursor_after(80, 24, vec![key('z'), key('z'), press(KeyCode::PageDown)]);
+        assert_eq!(unzoomed, plain);
+    }
+
+    #[test]
+    fn home_and_end_reach_the_ends_of_the_list_whatever_the_terminal_size() {
+        assert_eq!(cursor_after(80, 24, vec![press(KeyCode::End)]), 399);
+        assert_eq!(
+            cursor_after(80, 24, vec![press(KeyCode::End), press(KeyCode::Home)]),
+            0
+        );
+        assert_eq!(
+            cursor_after(80, 24, vec![press(KeyCode::PageUp)]),
+            0,
+            "a page up from the top stays at the top rather than wrapping"
+        );
     }
 
     struct ResizeBackend {

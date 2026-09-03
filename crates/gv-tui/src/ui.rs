@@ -608,6 +608,17 @@ mod tests {
         });
     }
 
+    /// What [`draw`] reported it had room for, at a given terminal size.
+    fn measured(width: u16, height: u16, app: &App) -> Viewport {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("a test terminal");
+        let mut viewport = Viewport::default();
+        terminal
+            .draw(|frame| viewport = draw(frame, app))
+            .expect("the test backend draws");
+        viewport
+    }
+
     fn rendered(width: u16, height: u16, app: &App) -> Terminal<TestBackend> {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("a test terminal");
@@ -910,7 +921,11 @@ mod tests {
         let terminal = rendered(80, 24, &app);
         let buffer = terminal.backend().buffer();
         let y = row_containing(buffer, "1111111 render the detail pane");
-        assert!(inside(layout::split(buffer.area, None).unwrap().commits, 1, y));
+        assert!(inside(
+            layout::split(buffer.area, None).unwrap().commits,
+            1,
+            y
+        ));
         assert!(line(buffer, y).contains("1111111 render the detail pane"));
         assert!(
             (0..buffer.area.width).any(|x| buffer
@@ -946,6 +961,105 @@ mod tests {
             cursor: None,
             generation: GenerationToken::new("generation-1").unwrap(),
         }
+    }
+
+    /// INVARIANT (#625): the [`Viewport`] a frame reports is the geometry it
+    /// actually drew, in each pane's own units — the graph in **commits**
+    /// (it draws a connector row between every pair, so its page is half its
+    /// height), the working tree **minus its heading row**, which is not one
+    /// of the rows its cursor can select.
+    ///
+    /// The units matter more than they look: a page has to be in the same
+    /// units as the cursor it moves, or `PageDown` on the graph would jump
+    /// twice as far as a screen and skip half the history it claimed to page
+    /// through.
+    ///
+    /// MUTATION 1 (remove): report the pane's whole rect height for the graph.
+    /// MUTATION 2 (weaken): count the working tree's heading row as usable.
+    #[test]
+    fn the_frame_reports_the_rows_it_actually_drew_in_each_panes_own_units() {
+        let mut app = loaded();
+        select_first(&mut app);
+        app.receive(Data::History {
+            repo: "w1".to_string(),
+            result: Ok(many_commits(200)),
+        });
+
+        // (terminal, repositories, working tree, commits, main)
+        for (width, height, repositories, worktree, commits, main) in
+            [(80u16, 24u16, 6, 4, 3, 21), (80, 60, 18, 16, 9, 57)]
+        {
+            let viewport = measured(width, height, &app);
+            assert_eq!(
+                viewport.rows(Pane::Repositories),
+                repositories,
+                "{width}x{height} Repositories"
+            );
+            assert_eq!(
+                viewport.rows(Pane::WorkingTree),
+                worktree,
+                "{width}x{height} Working Tree — its heading is not a row it can select"
+            );
+            assert_eq!(
+                viewport.rows(Pane::Commits),
+                commits,
+                "{width}x{height} Commits — in commits, not lines"
+            );
+            assert_eq!(viewport.rows(Pane::Main), main, "{width}x{height} Main");
+        }
+    }
+
+    /// INVARIANT (#625): a zoomed pane reports the whole body, and the panes
+    /// that are no longer drawn report nothing — a page must never be
+    /// measured against a pane the user cannot see.
+    #[test]
+    fn a_zoomed_pane_reports_the_whole_body_and_the_hidden_panes_report_nothing() {
+        let mut app = loaded();
+        select_first(&mut app);
+        app.receive(Data::History {
+            repo: "w1".to_string(),
+            result: Ok(many_commits(200)),
+        });
+        app.apply(Action::Focus(Pane::Commits));
+
+        let before = measured(80, 24, &app);
+        app.apply(Action::ToggleMaximize);
+        let after = measured(80, 24, &app);
+
+        assert_eq!(before.rows(Pane::Commits), 3);
+        assert_eq!(
+            after.rows(Pane::Commits),
+            10,
+            "the body is 23 rows; less a border, 21 lines, which is 10 commits              and a connector"
+        );
+        for hidden in [Pane::Repositories, Pane::WorkingTree, Pane::Main] {
+            assert_eq!(
+                after.rows(hidden),
+                0,
+                "{hidden:?} is not on screen and must not offer a page"
+            );
+        }
+    }
+
+    /// The zoom key has to be findable, and once used, escapable.
+    #[test]
+    fn the_status_strip_names_the_zoom_key_and_then_names_the_way_back() {
+        let app = loaded();
+        let terminal = rendered(80, 24, &app);
+        assert!(
+            line(terminal.backend().buffer(), 23).contains("z zoom"),
+            "the status strip does not name the zoom key: {:?}",
+            line(terminal.backend().buffer(), 23)
+        );
+
+        let mut zoomed = loaded();
+        zoomed.apply(Action::ToggleMaximize);
+        let terminal = rendered(80, 24, &zoomed);
+        let strip = line(terminal.backend().buffer(), 23);
+        assert!(
+            strip.contains("z unzoom"),
+            "a zoomed frame must say how to get back: {strip:?}"
+        );
     }
 
     /// Pins the scroll-follows-cursor behaviour `draw_commits` adds on top of

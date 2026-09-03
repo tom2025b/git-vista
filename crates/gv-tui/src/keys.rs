@@ -394,7 +394,10 @@ mod tests {
         );
         // …and `z` is a character being typed, not a zoom, in every overlay
         // mode — the overlay already has the whole window.
-        assert_eq!(dispatch_conflict(press(KeyCode::Char('z')), KeyMode::List), None);
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Char('z')), KeyMode::List),
+            None
+        );
         assert_eq!(
             dispatch_conflict(press(KeyCode::Char('z')), KeyMode::Insert),
             Some(Action::Conflict(Act::Type('z')))
