@@ -235,7 +235,7 @@ Local verification on the reviewed tree:
   the workspace.)
 - `cargo test -p git-vista-protocol`: **229 passed** across unit/integration
   targets, with one ignored doctest.
-- `cargo test -p git-vista-server`: **1,138 passed, 6 ignored** across its
+- `cargo test -p git-vista-server`: **1,143 passed, 6 ignored** across its
   binary/integration targets; the three named router/profile tests pass
   against real Axum routers.
 - `cargo check -p git-vista --target wasm32-unknown-unknown` passes.
@@ -253,7 +253,7 @@ includes it. Both focused regressions pass.
 
 ### Mutation matrix
 
-`failure-atlas mutation_check` ran against reviewed commit `446953bd`. Every
+`failure-atlas mutation_check` ran against follow-up commit `5cb675bc`. Every
 unmutated baseline was green, every edit applied exactly once inside the
 atlas's contained clone, and every mutated leg reached and failed an assertion;
 no compiler failure is counted as a catch. The atlas reported the source tree
@@ -263,10 +263,10 @@ change was pending.
 
 | Invariant | Remove mechanism | Weaken / misroute | Result |
 |---|---|---|---|
-| Read-only profile does not offer repository selection and carries the remedy | map `ReadOnly` to `Offered` | replace the row's `disabled=!can_select` with `disabled=false` | caught/caught — records 163–164; the policy assertion and wasm-seam assertion fail independently |
-| A 405 becomes a visible listener refusal, while other statuses retain their meaning | make the classifier always return false | widen it to every status ≥400 | caught/caught — records 165–166; 405 disappears in the first and ordinary statuses are misclassified in the second |
-| `/api/plan` 405 never produces availability reassurance | append “still available” in the host-tested failed-preview formatter | append the same promise directly in the wasm failed arm | caught/caught — records 167–168; the exact rendered-refusal assertion and failed-arm seam assertion each fail |
-| Router profile declaration matches the route set | map `full_routes == false` to `Full` | make only the assembled app stamp `Full` over its read-only API router | caught/caught — records 169–170; the closed mapping and live 405/header assertions fail respectively |
+| Read-only profile does not offer repository selection and carries the remedy | map `ReadOnly` to `Offered` | replace the row's `disabled=!can_select` with `disabled=false` | caught/caught — records 171–172; the policy assertion and wasm-seam assertion fail independently |
+| A 405 becomes a visible listener refusal, while other statuses retain their meaning | make the classifier always return false | widen it to every status ≥400 | caught/caught — records 173–174; 405 disappears in the first and ordinary statuses are misclassified in the second |
+| `/api/plan` 405 never produces availability reassurance | append “still available” in the host-tested failed-preview formatter | append the same promise directly in the wasm failed arm | caught/caught — records 175–176; the exact rendered-refusal assertion and failed-arm seam assertion each fail |
+| Router profile declaration matches the route set | map `full_routes == false` to `Full` | make only the assembled app stamp `Full` over its read-only API router | caught/caught — records 177–178; the closed mapping and live 405/header assertions fail respectively |
 
 The assertion that detects the original silent path is the 405 classifier test:
 removing classification makes it receive `None` rather than a listener-specific
