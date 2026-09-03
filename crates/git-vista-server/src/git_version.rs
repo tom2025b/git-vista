@@ -170,6 +170,12 @@ mod tests {
         let cases: &[VersionCase] = &[
             ("git version 2.43.0", Some((2, 43, 0))),
             ("git version 2.43.0\n", Some((2, 43, 0))),
+            // #581: the exact bytes Ubuntu 22.04's git prints, captured from
+            // `git --version | od -c` in a container on 2026-09-02 —
+            // `git version 2.34.1\n`. This is the version whose `merge-tree
+            // --write-tree` exits 129, so it is the one input the gate must
+            // read correctly or the whole issue's fix reads the wrong number.
+            ("git version 2.34.1\n", Some((2, 34, 1))),
             ("git version 2.39.5 (Apple Git-154)", Some((2, 39, 5))),
             ("git version 2.43.0.windows.1", Some((2, 43, 0))),
             ("git version 2.38", Some((2, 38, 0))),

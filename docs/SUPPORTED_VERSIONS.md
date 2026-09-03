@@ -88,13 +88,34 @@ git fails rather than comparing a version with itself.
 ### Feature floors above the product floor
 
 The heading above is the **product** floor: everything git-vista does works at
-2.32, and #365 builds and exercises a real 2.32 binary to prove it. One feature
-needs more than that, and it degrades rather than raising the floor for
-everyone.
+2.32, and #365 builds and exercises a real 2.32 binary to prove it. **Two**
+features need more than that, and both degrade rather than raising the floor
+for everyone.
 
 | Feature | Needs | Why | Below it |
 |---|---|---|---|
 | Graph preview (M10.08, #576) | **git 2.38** | `git merge-tree --write-tree` — the plumbing that computes the real three-way merge without a worktree or an index — arrived in 2.38.0 | The server starts, everything else works, and the preview alone answers `Unavailable { GitTooOld { found, minimum } }` |
+| Revert offer (#327, corrected by #581) | **git 2.38** | the same `merge-tree --write-tree`: `activity::revert_would_conflict` uses it to establish whether reverting a commit would conflict, rather than guessing | The server starts, everything else works, and the revert offer alone is withheld — `RevertCheckError::GitTooOld { found, minimum }`, surfaced by the Recovery Center as `CheckFailedReason::GitTooOld` |
+
+**#581 — the row that was missing, and what it cost.** The revert row above was
+true from #327 onward and undocumented until #581. `revert_would_conflict` ran
+`--write-tree` with no version check of any kind, so on a host inside the
+documented 2.32–2.37 band the call failed and the revert offer simply never
+appeared, with no reason given to the user. It degraded fail-closed, which is
+exactly why it went unnoticed: the posture was right and only the explanation
+was missing.
+
+**Measured 2026-09-02**, running the argv `revert_would_conflict` builds against
+two real gits in containers:
+
+| git | exit | output |
+|---|---|---|
+| 2.34.1 (Ubuntu 22.04 LTS) | **129** | `usage: git merge-tree <base-tree> <branch1> <branch2>` |
+| 2.43.0 (Ubuntu 24.04 LTS) | 0 | the merged tree oid |
+
+129 is neither the documented 0 (clean) nor 1 (conflict), so it fell into the
+"the check itself did not answer" arm and stayed there. Ubuntu 22.04 LTS is the
+distribution that matters here: it is inside the supported band and ships 2.34.1.
 
 **Why this is a table and not a second floor.** A host on 2.32–2.37 is a fully
 supported host. Raising the product floor to 2.38 for one feature would refuse
@@ -104,10 +125,17 @@ this codebase with no degraded outcome at all — "a verdict other than
 `Contained` means no server, full stop" (ADR 0029). A capability question does
 not belong in a gate whose whole argument is that it has none.
 
-The check therefore lives in the feature: a lazily-initialised, once-per-process
-probe in `crates/git-vista-server/src/preview.rs`, whose floor constant
-`MIN_GIT_FOR_PREVIEW` is deliberately separate from the number in the heading
-above. Reasoning in full: **ADR 0099**.
+The check therefore lives in the feature, not in the boot gate. Since #581 the
+*measurement* is shared and the *policy* is not:
+`crates/git-vista-server/src/git_version.rs` establishes the running git's
+version once per process (one probe, one parser, one comparison), and each
+feature keeps its own floor constant — `preview::MIN_GIT_FOR_PREVIEW` and
+`activity::MIN_GIT_FOR_MERGE_TREE`. Both are 2.38 today and that is a
+coincidence of the same plumbing, not a shared policy: folding them into one
+constant would quietly recreate a second product floor, which is the thing this
+section exists to avoid. Both are deliberately separate from the number in the
+heading above. Reasoning in full: **ADR 0099** (the gate) and **ADR 0105** (why
+the measurement is shared and the floors are not).
 
 Do not fold this number into the `## Git:` heading. That heading is parsed by
 the `core` job's floor check (#67) and names the tag #365's floor test builds;
