@@ -18,10 +18,12 @@
 //! truncated worktree file report the identical fact the same way a
 //! truncated commit file already does.
 //!
-//! Every handler is a thin wrapper over a `..._for_repo` function, same shape
-//! as `handlers::read`: the handler resolves `?repo=` from the process-wide
-//! `CURRENT` selection (no test-time setter), so the seam a test actually
-//! drives is the `_for_repo` function with an explicit repository.
+//! Every read handler is a thin wrapper over a `..._for_repo` function, same
+//! shape as `handlers::read`: `?repo=` resolves to an explicit catalog entry,
+//! with the legacy absent-query fallback retained for older read callers. The
+//! two writes do not share that fallback. Their required body `repo` resolves
+//! through the catalog and travels into the planner as the authoritative
+//! mutation target (#621, ADR 0109).
 
 use std::path::{Path, PathBuf};
 
@@ -32,6 +34,7 @@ use axum::Json;
 use tokio::io::AsyncReadExt;
 
 use git_vista_core::diff::{BlobContent, WorktreeFileContent};
+use git_vista_core::identity::WorktreeId;
 use git_vista_protocol::conflict::ConflictedFile;
 use git_vista_protocol::plan::CommitOid;
 use git_vista_protocol::{GitOperation, ResolveConflictRequest, WorktreePath};
@@ -274,11 +277,11 @@ async fn worktree_file_for_repo(
 /// express "still conflicted, and this side is still readable". The issue's
 /// own words: *this is the missing surface, not a missing mechanism.*
 ///
-/// So this handler only guards read-only mode and hands over. The path is a
-/// `WorktreePath` on the DTO itself, so a traversal body fails to deserialize
-/// and never reaches here — structural rather than remembered (see
-/// `ResolveConflictRequest`'s own doc for why that replaced a check written
-/// out in this function).
+/// So this handler guards read-only mode, parses the required opaque target,
+/// and hands both target and operation over. The path is a `WorktreePath` on
+/// the DTO itself, so a traversal body fails to deserialize and never reaches
+/// here — structural rather than remembered (see `ResolveConflictRequest`'s
+/// own doc for why that replaced a check written out in this function).
 ///
 /// It deliberately does **not** pre-check `refuses` here either: a check at
 /// the HTTP boundary would be a second, racier copy of the one that actually
@@ -290,11 +293,26 @@ pub(crate) async fn resolve_conflict(
     if let Some(rejected) = reject_if_read_only() {
         return rejected;
     }
-    planner::plan_and_execute(GitOperation::ResolveConflict {
-        path: req.path,
-        resolution: req.resolution,
-    })
+    let worktree = match conflict_write_target(&req.repo) {
+        Ok(worktree) => worktree,
+        Err(rejected) => return rejected,
+    };
+    planner::plan_and_execute_for_worktree(
+        worktree,
+        GitOperation::ResolveConflict {
+            path: req.path,
+            resolution: req.resolution,
+        },
+    )
     .await
+}
+
+/// Parse the required opaque target shared by both conflict writes. Resolution
+/// through the catalog happens in the planner, beside the fresh git-geometry
+/// check; the HTTP boundary owns only the malformed-id `400`.
+fn conflict_write_target(repo: &str) -> Result<WorktreeId, (StatusCode, String)> {
+    repo.parse()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Not a repository id.".to_string()))
 }
 
 /// `GET /api/conflict-source/{*path}` (M4.31c, #432, ADR 0069): the marker
@@ -395,12 +413,19 @@ pub(crate) async fn resolve_conflict_content(
     if let Some(rejected) = reject_if_read_only() {
         return rejected;
     }
-    planner::plan_and_execute(GitOperation::ResolveConflictContent {
-        path: req.path,
-        expected_stages: req.expected_stages,
-        expected_source: req.expected_source,
-        content: req.content,
-    })
+    let worktree = match conflict_write_target(&req.repo) {
+        Ok(worktree) => worktree,
+        Err(rejected) => return rejected,
+    };
+    planner::plan_and_execute_for_worktree(
+        worktree,
+        GitOperation::ResolveConflictContent {
+            path: req.path,
+            expected_stages: req.expected_stages,
+            expected_source: req.expected_source,
+            content: req.content,
+        },
+    )
     .await
 }
 
@@ -699,6 +724,7 @@ mod tests {
         // something this endpoint honours — silently dropping it is how a
         // user ends up with a resolution they did not ask for.
         let stray = serde_json::json!({
+            "repo": "11111111-1111-5111-8111-111111111111",
             "path": "a.txt",
             "resolution": {"choice": "take_ours"},
             "also_stage": true,
@@ -714,6 +740,7 @@ mod tests {
         // undifferentiated refusal #429 exists to prevent.
         for choice in ["take_ours", "take_theirs", "take_deletion"] {
             let body = serde_json::json!({
+                "repo": "11111111-1111-5111-8111-111111111111",
                 "path": "src/a.rs",
                 "resolution": {"choice": choice},
             });
@@ -741,6 +768,7 @@ mod tests {
         // skip it.
         for bad in ["../escape.txt", "/etc/passwd", "-rf", ""] {
             let body = serde_json::json!({
+                "repo": "11111111-1111-5111-8111-111111111111",
                 "path": bad,
                 "resolution": {"choice": "take_ours"},
             });
@@ -751,11 +779,83 @@ mod tests {
         }
 
         let ok = serde_json::json!({
+            "repo": "11111111-1111-5111-8111-111111111111",
             "path": "src/a.rs",
             "resolution": {"choice": "take_deletion"},
         });
         let req: ResolveConflictRequest = serde_json::from_value(ok).expect("a plain path");
         assert_eq!(req.path.as_str(), "src/a.rs");
+    }
+
+    #[test]
+    fn a_conflict_write_cannot_omit_its_repository() {
+        let missing = serde_json::json!({
+            "path": "a.txt",
+            "resolution": {"choice": "take_ours"},
+        });
+        assert!(
+            serde_json::from_value::<ResolveConflictRequest>(missing).is_err(),
+            "an omitted repo must not fall back to the session selection"
+        );
+    }
+
+    /// #621's dangerous case is a successful write to the wrong repository,
+    /// so this drives the real handler and planner against two real conflicts
+    /// at the same path. Merely proving `repo` deserializes would stay green if
+    /// the handler ignored it and the planner still resolved the selection.
+    #[tokio::test]
+    async fn a_whole_side_resolution_acts_on_the_named_repo_not_the_selection() {
+        crate::state::with_isolated_test_current(async {
+            let (_a_dir, repo_a) = conflicted_repo();
+            let (_b_dir, repo_b) = conflicted_repo();
+
+            let inspected = list_conflicts_for_repo(&repo_a)
+                .await
+                .expect("repository A can be inspected explicitly");
+            assert_eq!(inspected.len(), 1);
+            assert_eq!(inspected[0].path, "a.txt");
+
+            let handle_a = crate::state::set_current(&repo_a, git_vista_protocol::RepoMode::Active)
+                .expect("repository A registers");
+            let handle_b = crate::state::set_current(&repo_b, git_vista_protocol::RepoMode::Active)
+                .expect("repository B registers and becomes the selection");
+            assert_ne!(handle_a.worktree, handle_b.worktree);
+
+            let b_index_before = out(&repo_b, &["ls-files", "-u", "--", "a.txt"]);
+            let b_file_before = std::fs::read(repo_b.join("a.txt")).unwrap();
+            assert!(!b_index_before.is_empty(), "B must really be conflicted");
+
+            let request = ResolveConflictRequest {
+                repo: handle_a.worktree.to_string(),
+                path: WorktreePath::new("a.txt").unwrap(),
+                resolution: git_vista_protocol::conflict::Resolution::TakeOurs,
+            };
+            let (status, body) = crate::operations::with_key(
+                git_vista_protocol::IdempotencyKey::new("issue-621-explicit-conflict-repository")
+                    .unwrap(),
+                std::sync::Arc::new(std::sync::Mutex::new(None)),
+                resolve_conflict(Json(request)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "body: {body}");
+
+            assert_eq!(
+                out(&repo_b, &["ls-files", "-u", "--", "a.txt"]),
+                b_index_before,
+                "B's conflict index changed: the request's repo was ignored"
+            );
+            assert_eq!(
+                std::fs::read(repo_b.join("a.txt")).unwrap(),
+                b_file_before,
+                "B's conflicted worktree file changed: the write followed the selection"
+            );
+            assert_eq!(
+                out(&repo_a, &["ls-files", "-u", "--", "a.txt"]),
+                "",
+                "the named repository A was not resolved"
+            );
+        })
+        .await;
     }
 
     #[test]

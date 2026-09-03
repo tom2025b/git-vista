@@ -19,10 +19,13 @@
 //!
 //! ## The one invariant
 //!
-//! **A key binds to an operation, not just to a name.** The record stores the
-//! plan's `operation_hash`, and a key presented with a *different* operation is
-//! refused with 409 rather than answered with someone else's result. Without
-//! that, an idempotency key is a way to get the wrong answer confidently.
+//! **A key binds to an operation and its repository target, not just to a
+//! name.** The record stores the plan's `operation_hash` plus its repository
+//! and worktree tokens, and a key presented with a different operation *or
+//! target* is refused with 409 rather than answered with someone else's
+//! result. The target half becomes directly observable now that conflict
+//! writes carry a repository (#621): without it, moving only `repo` on a retry
+//! would replay success from another worktree.
 //!
 //! ## Shape of the state
 //!
@@ -459,7 +462,13 @@ pub(crate) fn admit(
 
     if let Some(existing) = reg.by_key.get(key) {
         let existing = Arc::clone(existing);
-        return if &existing.status.borrow().operation_hash == operation_hash {
+        let same_intent = {
+            let status = existing.status.borrow();
+            &status.operation_hash == operation_hash
+                && status.repository == repository
+                && status.worktree == worktree
+        };
+        return if same_intent {
             Admission::Existing(existing)
         } else {
             Admission::Conflict
@@ -865,6 +874,60 @@ mod tests {
             admit_op(&k, &op("something else entirely"), &hash('d')),
             Admission::Conflict
         ));
+    }
+
+    /// A conflict request's target lives beside, not inside, `GitOperation`.
+    /// Idempotency must still bind both target tokens: otherwise the same key
+    /// and resolution against B would replay the successful answer recorded
+    /// for A. The two cases keep linked worktrees (same repository, different
+    /// worktree) distinct as well as unrelated repositories.
+    #[test]
+    fn the_same_key_and_operation_with_a_different_target_is_a_conflict() {
+        let operation = op("same operation");
+        let operation_hash = hash('7');
+        let (repository_a, worktree_a) = tokens();
+        let cases = [
+            (
+                "repository",
+                RepositoryToken::new("different-repository").unwrap(),
+                worktree_a.clone(),
+            ),
+            (
+                "worktree",
+                repository_a.clone(),
+                WorktreeToken::new("different-worktree").unwrap(),
+            ),
+        ];
+
+        for (changed, retried_repository, retried_worktree) in cases {
+            let k = key(&format!("different-{changed}-target"));
+            let Admission::Fresh(handle, _) = admit(
+                &k,
+                &operation,
+                &operation_hash,
+                repository_a.clone(),
+                worktree_a.clone(),
+                None,
+            ) else {
+                panic!("first admission for the {changed} case");
+            };
+            handle.finish(StatusCode::OK, "done".into(), None);
+
+            assert!(
+                matches!(
+                    admit(
+                        &k,
+                        &operation,
+                        &operation_hash,
+                        retried_repository,
+                        retried_worktree,
+                        None,
+                    ),
+                    Admission::Conflict
+                ),
+                "changing only the {changed} token replayed another target's answer"
+            );
+        }
     }
 
     /// #509, acceptance 4: a key that names a journal row this build cannot

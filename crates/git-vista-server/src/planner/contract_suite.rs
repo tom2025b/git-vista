@@ -2667,6 +2667,17 @@ fn every_git_write_route_reaches_the_planner() {
         );
     }
 
+    // #621's conflict writes enter the same funnel through its explicit-target
+    // sibling. They cannot call `plan_and_execute`: that would deliberately
+    // discard the required body repository and resolve the session selection.
+    let conflicts_src = source("src/handlers/conflicts.rs");
+    for handler in ["resolve_conflict", "resolve_conflict_content"] {
+        assert!(
+            fn_body(&conflicts_src, handler).contains("plan_and_execute_for_worktree("),
+            "src/handlers/conflicts.rs::{handler} no longer reaches the explicit-target planner entry — the required repo could be parsed and ignored"
+        );
+    }
+
     // The recovery chain (M3.25, #78): `recover_operation` is the third way
     // into the funnel, alongside `plan_and_execute` and `execute_plan`.
     //
@@ -2961,7 +2972,11 @@ fn the_recovery_pin_is_composed_inside_the_guard_before_execution() {
 fn the_global_entry_point_delegates_through_the_lifecycle_to_the_pipeline() {
     let src = source("src/planner.rs");
 
-    for entry in ["plan_and_execute", "plan_and_execute_recovery"] {
+    for entry in [
+        "plan_and_execute",
+        "plan_and_execute_for_worktree",
+        "plan_and_execute_recovery",
+    ] {
         assert!(
             fn_body(&src, entry).contains("plan_and_execute_maybe_recovery("),
             "‘{entry}’ must delegate into the one gated block, never carry its \
