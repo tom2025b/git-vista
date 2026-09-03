@@ -612,7 +612,9 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("a test terminal");
         terminal
-            .draw(|frame| draw(frame, app))
+            .draw(|frame| {
+                draw(frame, app);
+            })
             .expect("drawing to TestBackend succeeds");
         terminal
     }
@@ -733,7 +735,7 @@ mod tests {
             app.apply(Action::Focus(focus));
             let terminal = rendered(80, 24, &app);
             let buffer = terminal.backend().buffer();
-            let focused = layout::split(buffer.area).unwrap().of(focus);
+            let focused = layout::split(buffer.area, None).unwrap().of(focus);
             let mut cyan = 0;
             for y in buffer.area.y..buffer.area.bottom() {
                 for x in buffer.area.x..buffer.area.right() {
@@ -908,7 +910,7 @@ mod tests {
         let terminal = rendered(80, 24, &app);
         let buffer = terminal.backend().buffer();
         let y = row_containing(buffer, "1111111 render the detail pane");
-        assert!(inside(layout::split(buffer.area).unwrap().commits, 1, y));
+        assert!(inside(layout::split(buffer.area, None).unwrap().commits, 1, y));
         assert!(line(buffer, y).contains("1111111 render the detail pane"));
         assert!(
             (0..buffer.area.width).any(|x| buffer
@@ -1029,7 +1031,7 @@ mod tests {
         let mut app = detailed(&patch, Vec::new());
         let first = rendered(80, 24, &app);
         let first_buffer = first.backend().buffer();
-        let panes = layout::split(first_buffer.area).unwrap();
+        let panes = layout::split(first_buffer.area, None).unwrap();
         let first_y = row_containing(first_buffer, "+012345");
         assert!(!line(first_buffer, first_y).contains("-END"));
         for y in panes.main.y + 1..panes.main.bottom() - 1 {
