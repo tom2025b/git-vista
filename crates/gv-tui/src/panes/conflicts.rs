@@ -980,10 +980,20 @@ impl ConflictsPane {
     }
 
     /// The absolute row index of the thing the viewport must not lose: the
-    /// file cursor on the list, the text caret while hand-editing.
+    /// file cursor on the list, the text caret while hand-editing, and the
+    /// block cursor on the editor the rest of the time.
     ///
-    /// `None` on `Inspect`, and on the editor outside insert mode, because
-    /// there the user's own `scroll` *is* the cursor and follows itself.
+    /// `None` only on `Inspect`, which has no cursor of its own — there the
+    /// user's own `scroll` *is* the cursor and follows itself.
+    ///
+    /// # The editor answers twice, and the caret wins
+    ///
+    /// In insert mode `visit_editor` marks **two** rows selected: the block
+    /// heading the cursor is on, and the line the caret is on down in the
+    /// Result section. They are both real, and the one the viewport must not
+    /// lose is the caret — that is the buffer taking keystrokes. So
+    /// [`Self::caret_row`] is asked first and only falls through to the block
+    /// heading when there is no caret to follow.
     fn focus_row(&self) -> Option<usize> {
         match self.screen {
             Screen::List => {
@@ -992,7 +1002,7 @@ impl ConflictsPane {
                 Some(1 + self.cursor.min(last))
             }
             Screen::Inspect => None,
-            Screen::Editor => self.caret_row(),
+            Screen::Editor => self.caret_row().or_else(|| self.selected_row_index()),
         }
     }
 
@@ -1004,6 +1014,40 @@ impl ConflictsPane {
         }
         let (line, _) = editor.buffer.as_ref()?.position();
         Some(editor_result_first_row(editor) + line)
+    }
+
+    /// Where the first row this screen marks selected is drawn — **found in
+    /// the rows the screen actually emits**, not recomputed from the widths
+    /// of the blocks above it.
+    ///
+    /// # Why this walks instead of doing the arithmetic (#634)
+    ///
+    /// The obvious implementation is `4 + the widths of every block before
+    /// this one`, and it would have been the **third** copy of the editor's
+    /// row arithmetic: `editor_result_first_row` and `visit_editor` are
+    /// already the two that the comment above [`Self::row_count`] warns about
+    /// and that `row_count_agrees_with_the_rows_actually_emitted_on_every_screen`
+    /// exists to hold together. A third could drift from both, and a
+    /// selection offset by one block is a viewport that scrolls to the wrong
+    /// conflict while looking entirely correct.
+    ///
+    /// Walking removes the possibility rather than testing for it: this
+    /// returns an index *into* `visit_rows`' own output, so it cannot
+    /// disagree with what is drawn. It stops at the first selected row, and
+    /// the caller decides which selection matters when a screen marks more
+    /// than one.
+    fn selected_row_index(&self) -> Option<usize> {
+        let mut index = 0usize;
+        let mut found = None;
+        self.visit_rows(|row| {
+            if row.selected {
+                found = Some(index);
+                return false;
+            }
+            index += 1;
+            true
+        });
+        found
     }
 
     fn list_body_len(&self) -> usize {
@@ -2340,6 +2384,77 @@ mod tests {
         pane.apply(Act::EndEdit);
         assert!(pane.caret_row().is_none());
         assert_eq!(pane.view_offset(usize::MAX), 0);
+    }
+
+    #[test]
+    fn the_viewport_follows_the_block_cursor_out_of_the_visible_window() {
+        // The third face of the same hazard (#634), and the last one the page
+        // keys opened. Outside insert mode `move_cursor` and `jump` move
+        // `editor.block` and nothing else, `caret_row` answers `None`, and
+        // `scroll` is never touched on this screen — so `End` and `PageDown`
+        // looked inert, and the choice keys then acted on a conflict that was
+        // nowhere on screen.
+        //
+        // Asserting that `editor.block` reached the last index would have
+        // passed throughout the defect's life. What has to hold is that the
+        // row the block cursor is on is among the rows actually DRAWN.
+        const HEIGHT: usize = 6;
+        const BLOCKS: usize = 12;
+
+        let mut marker = String::new();
+        for n in 0..BLOCKS {
+            marker.push_str(&format!("context {n}\n"));
+            marker.push_str(&format!(
+                "<<<<<<< HEAD\nours {n}\n=======\ntheirs {n}\n>>>>>>> theirs\n"
+            ));
+        }
+        let mut pane = editing(&marker);
+        pane.observe(HEIGHT);
+
+        assert!(
+            pane.row_count() > HEIGHT,
+            "the fixture must be TALLER than the viewport or this test cannot \
+             fail: {} rows in a {HEIGHT}-row window",
+            pane.row_count()
+        );
+        assert_eq!(
+            rows(&pane).iter().filter(|row| row.selected).count(),
+            1,
+            "outside insert mode exactly one row is selected — the block \
+             heading. More than one and the assertion below is measuring \
+             something else"
+        );
+
+        for (act, expected) in [
+            (Act::Bottom, format!("Conflict {BLOCKS} of {BLOCKS}")),
+            (
+                Act::PageUp,
+                format!("Conflict {} of {BLOCKS}", BLOCKS - HEIGHT),
+            ),
+            (Act::Top, format!("Conflict 1 of {BLOCKS}")),
+            (
+                Act::PageDown,
+                format!("Conflict {} of {BLOCKS}", HEIGHT + 1),
+            ),
+        ] {
+            pane.apply(act);
+            let offset = pane.view_offset(HEIGHT);
+            let drawn = pane.window(offset, HEIGHT);
+            let selected: Vec<&Row> = drawn.iter().filter(|row| row.selected).collect();
+            assert_eq!(
+                selected.len(),
+                1,
+                "after {act:?} the selected block is not among the {} rows \
+                 drawn at offset {offset}: {:?}",
+                drawn.len(),
+                drawn.iter().map(|row| &row.text).collect::<Vec<_>>()
+            );
+            assert!(
+                selected[0].text.contains(&expected),
+                "after {act:?} the drawn selection is {:?}, not {expected}",
+                selected[0].text
+            );
+        }
     }
 
     #[test]
