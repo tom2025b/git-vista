@@ -859,11 +859,12 @@ pub(crate) struct HistoryPage {
 
 /// How many rows the history returns by default, and at most.
 ///
-/// Deliberately far below `crate::activity`'s `MAX_LIMIT = 500`: every row on a
-/// page costs at least one sandboxed `git rev-parse` (and up to three, plus a
-/// `merge-tree`, for a revert), because classification is live. That per-row
-/// cost has to be bounded by something well under an audit-log page size.
-/// Chosen and justified here rather than carried over from anywhere else — the
+/// This bound is this module's own, not borrowed from `crate::activity`'s
+/// paging cap: every row on a page costs at least one sandboxed
+/// `git rev-parse` (and up to three, plus a `merge-tree`, for a revert),
+/// because classification is live. That per-row cost has to be bounded by
+/// something well under an audit-log page size — 100 is that bound, chosen
+/// and justified here rather than carried over from anywhere else. The
 /// design's Corrections section records that an earlier draft cited a wrong
 /// line number and an invented figure for exactly this constant.
 const DEFAULT_LIMIT: u32 = 25;
