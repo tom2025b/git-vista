@@ -19,7 +19,7 @@ use crate::features::dialogs::core::{
     cherry_pick_confirm_prompt, delete_confirm_prompt, merge_confirm_prompt, worktree_confirm,
     ConfirmPrompt, Dialog, PullTarget, WorktreeAction, TOUCH_TARGET_STYLE,
 };
-use crate::features::preview::core::previewable;
+use crate::features::preview::core::{preview_action, PreviewAction};
 
 use crate::features::preview::signals::PreviewSlot;
 
@@ -99,12 +99,29 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
     //    dialog with the last one's picture.
     //  * It never touches `enabled`. The preview informs and does not gate —
     //    every operation here was confirmable before previews existed.
-    create_effect(move |_| match shell.confirm_op() {
-        Some(op) => match previewable(preview_subject(&op)) {
-            Some(operation) => preview.start(operation),
-            None => preview.clear(),
-        },
-        None => preview.clear(),
+    //
+    // #612: all three of those used to be decided by a `match` written right
+    // here, in a file `#[cfg(target_arch = "wasm32")]` keeps out of every test
+    // runner — so #594's "both caught" mutation proof reached `preview_subject`
+    // and `previewable` and never touched the line that composed them. The
+    // composition is now `preview_action`, host-tested, and
+    // `the_confirm_dialog_routes_its_preview_through_core` reads this very file
+    // back to pin that these two arms stay its only outlets.
+    //
+    // `preview_subject` is spelled as a call in both arms rather than handed to
+    // `.map()` as a function value, on purpose: `reachability_census` reads
+    // call sites, and a core function reachable only as a value looks dead to
+    // it. Trading one line for a call a reader and a test can both see is the
+    // right side of that trade in a file this issue is about.
+    create_effect(move |_| {
+        let action = match &shell.confirm_op() {
+            Some(op) => preview_action(Some(preview_subject(op))),
+            None => preview_action(None),
+        };
+        match action {
+            PreviewAction::Start(operation) => preview.start(operation),
+            PreviewAction::Clear => preview.clear(),
+        }
     });
 
     move || {

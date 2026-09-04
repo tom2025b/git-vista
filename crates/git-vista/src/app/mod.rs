@@ -41,6 +41,9 @@ use crate::features::dialogs::signals::Dialogs;
 use crate::features::graph::core::{
     print_button_copy, Frame, GraphCore, HistoryInvariantError, LoadedHistory, DEFAULT_PAGE_LIMIT,
 };
+use crate::features::history::core::{
+    phase_for_epoch_bump, promote_seed, seed_retry_still_wanted, SeedPromotion,
+};
 use crate::features::operations::core::OperationsCore;
 use crate::features::operations::signals::Operations;
 use crate::features::operations::view::operations_status_view;
@@ -104,16 +107,12 @@ impl fmt::Display for HistorySeedError {
     }
 }
 
-/// What the graph panel is doing, independent of what the seed resource happens
-/// to be holding. Each variant carries the reload epoch it belongs to, so a
-/// reply for an earlier epoch can never advance the phase.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HistoryPhase {
-    SeedLoading { epoch: u64 },
-    Ready { epoch: u64 },
-    DriftReloading { epoch: u64 },
-    SeedError { epoch: u64 },
-}
+// #612: `HistoryPhase` and the three rules that move it are decisions, not
+// markup, and now live in `features::history::core` where a host test can run
+// them. Re-exported rather than repointed at every call site: `canvas.rs`
+// writes `use super::HistoryPhase` and the name it writes is unchanged, so the
+// move is provably behaviour-free.
+pub use crate::features::history::core::HistoryPhase;
 
 /// The history signals the App owns and the canvas drives: which phase the
 /// panel is in, whether the whole history is loaded (Print needs all of it),
@@ -276,11 +275,13 @@ pub fn App() -> impl IntoView {
         let epoch = graph.get().epoch();
         history_ui.print_open.set(false);
         history_ui.complete.set(false);
-        // A drift reload has already announced itself with the epoch it is
-        // reloading *into*; overwriting that with SeedLoading would drop the
-        // "History moved" copy that explains why the graph vanished.
-        if history_ui.phase.get_untracked() != (HistoryPhase::DriftReloading { epoch }) {
-            history_ui.phase.set(HistoryPhase::SeedLoading { epoch });
+        // Whether this bump gets to announce itself, and as what, is
+        // `phase_for_epoch_bump`'s call — including the 409 exception, where a
+        // drift reload has already announced the epoch it is reloading *into*
+        // and must not be overwritten. The rule is host-tested there; asking
+        // for it here is what keeps it from growing a second copy (#612).
+        if let Some(next) = phase_for_epoch_bump(history_ui.phase.get_untracked(), epoch) {
+            history_ui.phase.set(next);
         }
     });
 
@@ -302,11 +303,13 @@ pub fn App() -> impl IntoView {
         }) else {
             return;
         };
-        if epoch != graph.get_untracked().epoch() {
-            return;
-        }
-        match complete {
-            Some(complete) => {
+        // Which of the three answers this reply earns — ignore it, mount it,
+        // or fail it — is `promote_seed`'s call, host-tested (#612). This
+        // effect only carries out the answer, and the signal writes are the
+        // part that genuinely needs Leptos.
+        match promote_seed(epoch, graph.get_untracked().epoch(), complete) {
+            SeedPromotion::Ignore => {}
+            SeedPromotion::Ready { epoch, complete } => {
                 history_ui.complete.set(complete);
                 // #217: a repository small enough to be complete on page 1
                 // still counts as "the user has a complete history" — latch
@@ -318,7 +321,9 @@ pub fn App() -> impl IntoView {
                 }
                 history_ui.phase.set(HistoryPhase::Ready { epoch });
             }
-            None => history_ui.phase.set(HistoryPhase::SeedError { epoch }),
+            SeedPromotion::Failed { epoch } => {
+                history_ui.phase.set(HistoryPhase::SeedError { epoch })
+            }
         }
     });
 
@@ -360,7 +365,7 @@ pub fn App() -> impl IntoView {
                 // timer was armed, the panel is no longer showing the epoch
                 // this retry was for — firing anyway would race a reload
                 // that's already in flight, so skip it.
-                if history_ui.phase.get_untracked() != (HistoryPhase::SeedError { epoch }) {
+                if !seed_retry_still_wanted(history_ui.phase.get_untracked(), epoch) {
                     return;
                 }
                 let new_epoch = graph.try_update(|g| g.force_bump()).unwrap_or_default();
