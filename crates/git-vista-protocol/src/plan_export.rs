@@ -640,8 +640,21 @@ pub enum Export {
         /// The shape of the chain, in plain language.
         why: String,
     },
-    /// Not expressible as command arguments at any amount of quoting — the
-    /// operation's input is bytes on stdin or a file's contents.
+    /// The checklist cannot carry this command. Two different reasons land
+    /// here, and `why` says which:
+    ///
+    ///  1. **The operation's input is not arguments** — bytes on stdin, or a
+    ///     file's contents. No amount of quoting expresses it.
+    ///  2. **An argument is a location this application chooses**, not one the
+    ///     user supplied (M11.04, #549: `AddWorktree`, under ADR 0118's
+    ///     managed root). The command shape is ordinary; the literal path
+    ///     depends on where git-vista stores its data on that machine, and
+    ///     this crate is wasm-safe and cannot resolve it. Printing a guess
+    ///     would print a *working* command that does the wrong thing, which is
+    ///     worse than printing none.
+    ///
+    /// Both reasons share the consequence this variant exists for: there is no
+    /// line a reader can copy that is the line the app runs.
     NotACommandLine {
         /// What the operation needs that arguments cannot carry.
         why: String,
@@ -1057,6 +1070,36 @@ pub fn export_operation(operation: &GitOperation) -> Export {
             ),
         },
 
+        // M11.04 (#549), ADR 0118. This one is different from the three
+        // `NotACommandLine` cases below it, and the difference is worth
+        // stating rather than letting the shared variant blur it: those
+        // operations cannot be expressed as arguments at all. This one can —
+        // `git worktree add <path> <branch>` is an ordinary command line. What
+        // is missing is the **path**, and it is missing on purpose.
+        //
+        // ADR 0118 puts new worktrees under a root this application owns and
+        // computes, so the location is not part of what the user asked for and
+        // is not carried by the operation. This crate is wasm-safe and reads
+        // no environment, so it cannot resolve that root — and a printed
+        // command carrying a *guessed* path would not be an approximation of
+        // what the app does. It would be a working command that creates a
+        // worktree somewhere else, which is precisely the failure this
+        // module's "no wildcard, ever" rule exists to prevent.
+        //
+        // So it refuses to print one, and tells the reader the command shape
+        // they would use to do it themselves, where the path is genuinely
+        // theirs to choose.
+        GitOperation::AddWorktree { branch, .. } => Export::NotACommandLine {
+            why: format!(
+                "This opens a second working tree on ‘{branch}’ inside a folder git-vista \
+                 owns and names itself, so the path is not something you chose and is not \
+                 part of this operation. Printing a command with a guessed path would \
+                 create a worktree somewhere else rather than the one described here. To \
+                 do it by hand in a folder of your own choosing, the command is \
+                 `git worktree add <path> {branch}`."
+            ),
+        },
+
         GitOperation::ResetTestRepo => Export::NotACommandLine {
             why: "Resetting the built-in demo repository is a program, not a command: \
                   it unbundles a seed, rewrites every ref to match it, forces the \
@@ -1466,6 +1509,7 @@ pub fn operation_name(operation: &GitOperation) -> &'static str {
         GitOperation::StageAll => "stage everything",
         GitOperation::UnstageAll => "unstage everything",
         GitOperation::CheckoutBranch { .. } => "switch branch",
+        GitOperation::AddWorktree { .. } => "open a second desk (add a worktree)",
         GitOperation::MergeBranch { .. } => "merge a branch",
         GitOperation::PushBranch { .. } => "push a branch",
         GitOperation::ResolveConflict { .. } => "resolve a conflict by taking a side",

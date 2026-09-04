@@ -237,6 +237,73 @@ fn sandboxed(
     })
 }
 
+/// [`sandboxed`] plus **one** extra read-write grant (M11.04, #549, ADR 0118).
+///
+/// # One caller, and why it needs this at all
+///
+/// `git worktree add` is the only operation whose destination is outside the
+/// repository it runs in: ADR 0118 puts new worktrees under an app-owned
+/// managed root, so the spawn needs write access to a tree `policy_for` would
+/// never grant, because `policy_for` grants the repository and the system
+/// trees and nothing else.
+///
+/// # It composes `policy_for` rather than replacing it — the inverse of clone
+///
+/// `policy_for_clone` is an *independent* constructor precisely because clone
+/// has no repository to look a trust flag up for, and must never be able to
+/// reach `Tier::Unsandboxed`. Worktree-add is the opposite case: it has a
+/// repository, and it must inherit **exactly** that repository's tier, trust
+/// state, hook mode and secret excludes — anything else would mean an
+/// operation on a repository ran under a policy that repository never earned.
+/// So this takes the policy the operation would otherwise have had and adds
+/// one grant to it, changing nothing else.
+///
+/// # `grant` is never request-derived, and that is the guarantee
+///
+/// The only argument ever passed here is `state::worktrees_root()` — a
+/// constant of the installation, resolved from the environment at startup, and
+/// never assembled from anything a client sent. The client supplies a
+/// [`WorktreeName`](git_vista_protocol::WorktreeName), which cannot hold a
+/// separator, a `..`, a leading dot or an absolute path, and the server joins
+/// it to that root itself. If a request could ever choose `grant`, this
+/// function would be a way to hand any directory on the filesystem to a git
+/// spawn — so the single call site is the whole safety argument, and it is
+/// pinned as such rather than left to inspection.
+fn sandboxed_with_grant(
+    repo: &Path,
+    args: &[&str],
+    declared: crate::sandbox::NetworkNeed,
+    grant: &Path,
+) -> Result<crate::sandbox::spawn::SandboxedCommand, String> {
+    let read_only = crate::state::read_only_for_path(repo);
+    let need = crate::sandbox::reconcile_need(declared, args);
+    // A grant plus a socket is a strictly larger surface than either alone,
+    // and no caller needs both. Refusing here keeps that combination
+    // unreachable rather than merely unused.
+    if need == crate::sandbox::NetworkNeed::Remote {
+        return Err("a worktree-creating command may not also reach the network".to_string());
+    }
+    let mut policy =
+        crate::sandbox::policy_for(repo, read_only, need).map_err(|e| e.to_string())?;
+    policy.rw_trees.push(grant.to_path_buf());
+    Ok(crate::sandbox::spawn::command_async(&policy, repo, args))
+}
+
+/// [`git_output`] for the one operation that writes outside its repository
+/// (M11.04, #549): `git worktree add`, whose destination is the managed
+/// worktrees root. See [`sandboxed_with_grant`] for why the grant is safe and
+/// why it is not a general-purpose escape hatch.
+pub(crate) async fn git_output_in_managed_root(
+    repo: &Path,
+    args: &[&str],
+    grant: &Path,
+) -> std::io::Result<Output> {
+    sandboxed_with_grant(repo, args, crate::sandbox::NetworkNeed::Local, grant)
+        .map_err(std::io::Error::other)?
+        .output()
+        .await
+}
+
 /// Run `git -C <repo> <args…>` through the sealed launcher and collect its
 /// full [`Output`] — the one path from "a module needs git's `Output`" to
 /// `sandboxed` above, for callers that want status/stdout/stderr together

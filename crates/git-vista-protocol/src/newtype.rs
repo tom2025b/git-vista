@@ -47,6 +47,9 @@ pub enum PlanFieldError {
     /// would resolve it as a transport target rather than looking it up in
     /// the repository's configuration (ADR 0047).
     NotRemoteName(&'static str),
+    /// The value is not a single, safe path segment — see
+    /// [`require_worktree_name`].
+    NotWorktreeName(&'static str),
 }
 
 impl fmt::Display for PlanFieldError {
@@ -74,6 +77,13 @@ impl fmt::Display for PlanFieldError {
                     f,
                     "{field} must be relative to the worktree root — no leading '/' and \
                      no '..' component"
+                )
+            }
+            PlanFieldError::NotWorktreeName(field) => {
+                write!(
+                    f,
+                    "{field} must be a simple folder name — letters, digits, dot, dash \
+                     or underscore, no slashes and no ‘..’"
                 )
             }
             PlanFieldError::NotRemoteName(field) => {
@@ -163,6 +173,63 @@ pub(crate) fn require_worktree_relative_path(
         .any(|component| component == ".." || component == ".")
     {
         return Err(PlanFieldError::NotWorktreeRelative(field));
+    }
+    Ok(())
+}
+
+/// The wire-boundary gate for the *name of a new worktree's directory*
+/// (M11.04, #549, ADR 0118): a **single, safe path segment** — never a path,
+/// never a traversal, never hidden.
+///
+/// # Why this is the whole containment argument
+///
+/// ADR 0118 decides that new worktrees live under an app-owned managed root
+/// and that the operation carries a **name** rather than a path, so the server
+/// computes the location itself as `worktrees_root().join(name)`. That join is
+/// only safe if `name` cannot be anything but a direct child: a `/` would
+/// descend, a `..` would escape, and an absolute path would replace the root
+/// outright (`Path::join` with an absolute argument discards the base — the
+/// single most surprising line in this reasoning, and the reason this
+/// validator exists rather than a comment asking callers to be careful).
+///
+/// Containment is therefore a property of this function, not of any call site.
+/// There is no per-call check to forget, which is the entire point of the
+/// managed root.
+///
+/// # Deliberately its own function, with the same rules as [`require_remote_name`]
+///
+/// The rules are currently identical, and they are **not shared on purpose**.
+/// A remote name is constrained so it can never be read as a transport target
+/// (ADR 0047); a worktree name is constrained so it can never be read as a
+/// path. Those are two different security decisions that happen to land on the
+/// same character set today, and folding them into one function would mean a
+/// future loosening argued for one silently applies to the other. The same
+/// posture `require_remote_name` and [`require_worktree_relative_path`] already
+/// take toward each other — separate functions that cite each other's
+/// reasoning.
+pub(crate) fn require_worktree_name(
+    value: &str,
+    field: &'static str,
+    max: usize,
+) -> Result<(), PlanFieldError> {
+    require_git_safe(value, field)?;
+    if value.len() > max {
+        return Err(PlanFieldError::TooLong { field, max });
+    }
+    // No separator of any kind, and nothing that could be read as one. NUL is
+    // refused explicitly rather than left to the charset check, because a NUL
+    // is what truncates a path at the syscall boundary rather than at the
+    // validator.
+    let charset_ok = value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_');
+    // A leading `.` is refused for [`require_worktree_relative_path`]'s reason:
+    // `.` and `..` are paths, and `.anything` is the shape a hidden entry
+    // takes — including `.git`, which must never be a worktree's directory
+    // name. `..` is refused anywhere, not only at the start, so `a..b` cannot
+    // become a traversal after some later join.
+    if !charset_ok || value.starts_with('.') || value.contains("..") || value.contains('\0') {
+        return Err(PlanFieldError::NotWorktreeName(field));
     }
     Ok(())
 }

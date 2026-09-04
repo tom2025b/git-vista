@@ -219,6 +219,9 @@ fn covered_by(op: &GitOperation) -> &'static str {
         GitOperation::StageAll => "stage_all_executes_through_the_pipeline",
         GitOperation::UnstageAll => "unstage_all_executes_through_the_pipeline",
         GitOperation::CheckoutBranch { .. } => "checkout_branch_executes_through_the_pipeline",
+        GitOperation::AddWorktree { .. } => {
+            "add_worktree_opens_a_second_desk_under_the_managed_root"
+        }
         GitOperation::MergeBranch { .. } => "merge_branch_executes_through_the_pipeline",
         GitOperation::PushBranch { .. } => "push_branch_executes_through_the_pipeline",
         GitOperation::DeleteBranch { .. } => "delete_branch_executes_through_the_pipeline",
@@ -280,6 +283,7 @@ fn covered_on_split_path(op: &GitOperation) -> &'static str {
         | GitOperation::StageAll
         | GitOperation::UnstageAll
         | GitOperation::CheckoutBranch { .. }
+        | GitOperation::AddWorktree { .. }
         | GitOperation::MergeBranch { .. }
         | GitOperation::PushBranch { .. }
         | GitOperation::DeleteBranch { .. }
@@ -2504,6 +2508,10 @@ fn every_git_write_route_reaches_the_planner() {
             "handlers::tags::delete_remote_tag",
         ),
         ("/api/checkout", "checkout_branch"),
+        // M11.04 (#549): a git write — it reaches the planner and runs
+        // `git worktree add` — so it is a funnel row below like every other
+        // mutation, not a catalog write.
+        ("/api/add-worktree", "handlers::branch::add_worktree"),
         ("/api/force-delete-branch", "force_delete_branch"),
         ("/api/rebase", "rebase"),
         ("/api/reset-test-repo", "reset_test_repo"),

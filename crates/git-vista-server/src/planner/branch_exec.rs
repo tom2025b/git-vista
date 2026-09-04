@@ -22,7 +22,9 @@ use std::path::Path;
 
 use axum::http::StatusCode;
 
-use git_vista_protocol::{plan_export, BranchName, CommitOid, MergeStrategy, RefName};
+use git_vista_protocol::{
+    plan_export, BranchName, CommitOid, MergeStrategy, RefName, WorktreeName,
+};
 
 use git_vista_core::activity::ActivityKind;
 
@@ -445,4 +447,88 @@ pub(super) async fn exec_reset_branch(
             (StatusCode::BAD_REQUEST, msg)
         }
     }
+}
+
+/// `git worktree add <worktrees_root>/<name> <branch>` (M11.04, #549, ADR 0118).
+///
+/// # The path is computed here, and that is the containment argument
+///
+/// Nothing in the request names a location. The client sends a
+/// [`WorktreeName`] — a validated single path segment that cannot hold a
+/// separator, a `..`, a leading dot or an absolute path — and this function
+/// joins it to [`crate::state::worktrees_root`], which is a constant of the
+/// installation. A single segment joined to a fixed root can only ever be a
+/// direct child of that root, so "is the destination inside the fence?" is not
+/// a question this code asks. It is a question the types already answered.
+///
+/// # It does NOT allow a new root, and that omission is load-bearing
+///
+/// The managed root is admitted to the allowed roots **once**, at startup,
+/// exactly as the clones root is. Every child of it is therefore already
+/// servable, and the new worktree is discoverable by the census and openable
+/// by the drawer with no further grant. Adding `allow_repo_root(&dest)` here
+/// would "work", would look like a fix if anyone ever thought it was needed,
+/// and would grow the allowlist by one permanent entry per worktree created —
+/// each outliving the directory it was added for. See ADR 0117 and ADR 0118:
+/// this is the second place the same omission carries the fence, and it is
+/// pinned by reading this function's body rather than by running it, because a
+/// widening makes the app serve *more* and no behavioural test goes red.
+pub(super) async fn exec_add_worktree(
+    repo: &Path,
+    name: &WorktreeName,
+    branch: &BranchName,
+) -> (StatusCode, String) {
+    let root = crate::state::worktrees_root();
+    if let Err(e) = std::fs::create_dir_all(&root) {
+        eprintln!(
+            "git-vista: /api/add-worktree couldn't create {}: {e}",
+            root.display()
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Couldn't prepare the worktrees folder: {e}"),
+        );
+    }
+    let dest = root.join(name.as_str());
+    // Refuse rather than let git decide: `git worktree add` onto an existing
+    // non-empty directory fails with a message about the path, and the path is
+    // the one thing the user did not choose and cannot see. Saying it in terms
+    // of the name they DID choose is the whole difference.
+    if dest.exists() {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "There is already a desk called ‘{name}’. Pick another name, or open \
+                 the existing one from the worktree list."
+            ),
+        );
+    }
+    let Some(dest_str) = dest.to_str() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The worktrees folder's path is not valid UTF-8.".to_string(),
+        );
+    };
+    let args = ["worktree", "add", dest_str, branch.as_str()];
+    // The one spawn in this server that writes outside its repository, through
+    // the one helper that grants it — with the managed root, never anything
+    // request-derived. See `git_cmd::sandboxed_with_grant`.
+    let output = match crate::git_cmd::git_output_in_managed_root(repo, &args, &root).await {
+        Ok(output) => output,
+        Err(e) => return crate::planner::couldnt_run("/api/add-worktree", &e),
+    };
+    if !output.status.success() {
+        let why = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let why = if why.is_empty() {
+            "git worktree add failed.".to_string()
+        } else {
+            why
+        };
+        eprintln!("git-vista: /api/add-worktree failed: {why}");
+        return (StatusCode::CONFLICT, why);
+    }
+    (
+        StatusCode::OK,
+        format!("Opened a second desk called ‘{name}’ on ‘{branch}’."),
+    )
 }

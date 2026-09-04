@@ -230,6 +230,12 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
         Authz::SessionAndCsrf,
     ),
     ("/api/checkout", Method::POST, Authz::SessionAndCsrf),
+    // M11.04 (#549): creates a directory under the app's managed worktrees
+    // root and runs `git worktree add`. A git write, so the full write
+    // posture. It is also the only route that creates a directory outside the
+    // clones root, which is why its spawn carries an explicit extra grant —
+    // see `git_cmd::sandboxed_with_grant`.
+    ("/api/add-worktree", Method::POST, Authz::SessionAndCsrf),
     (
         "/api/force-delete-branch",
         Method::POST,
