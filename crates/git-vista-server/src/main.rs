@@ -534,6 +534,16 @@ fn api_router(
             .route("/api/delete-clone", post(delete_clone_repo))
             // ADR 0007: pick the current repository + Visualize/Active mode by id.
             .route("/api/select", post(select_repo))
+            // M11.03 (#548): switch to a linked worktree of the served
+            // repository, addressed by the opaque id the census reports. A
+            // second door rather than a widening of `/api/select` — see
+            // `SelectWorktreeRequest`'s doc for the authority each one uses,
+            // and why the fail-closed 404 above must keep meaning what it
+            // means. `full_routes` only, like the census read it depends on.
+            .route(
+                "/api/select-worktree",
+                post(handlers::select::select_discovered_worktree),
+            )
             // ADR 0009: re-scan the configured repo root without a restart.
             .route("/api/rescan", post(rescan))
             // Issue #18: create a branch at a commit (shells out to `git branch`).

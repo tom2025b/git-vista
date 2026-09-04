@@ -59,3 +59,6 @@ pub mod status;
 // and the client-composed pop.
 pub mod stash;
 pub mod tags;
+// M11.03 (#548): the worktree drawer — every desk this repository has, git's
+// flags and this app's fence kept as separate statements, and the switch.
+pub mod worktrees;

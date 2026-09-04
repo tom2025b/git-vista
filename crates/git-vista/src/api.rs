@@ -66,6 +66,7 @@ pub use preview::{plan_request, preview_request};
 pub use remotes::{fetch_request, preview_push, pull_request, push_request};
 pub use repositories::{
     delete_clone_request, fetch_catalog, rescan_request, reset_test_repo_request, select_request,
+    select_worktree_request,
 };
 pub use session::{fetch_protocol, get_session, post_session};
 pub use staging::{

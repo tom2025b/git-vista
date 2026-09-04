@@ -363,3 +363,59 @@ export async function openBranchMenu(page, branch) {
 
 /** The preview panel's heading, when a picture (or a pending one) is showing. */
 export const PREVIEW_HEADING = 'What this would do'
+
+// --- #548: the worktree drawer ---------------------------------------------
+
+/** The drawer's landmark label — mirrors `worktrees::view::DRAWER_REGION_LABEL`. */
+export const WORKTREE_REGION_LABEL = 'Worktrees'
+
+/** The fence sentence, mirrored from `Serviceable::refusal` and pinned there
+ *  too (`the_fence_sentence_is_the_one_the_issue_names`), so a reword is a
+ *  deliberate edit in both places rather than a spec failing for a reason
+ *  nobody expects. */
+export const OUTSIDE_ROOTS_SENTENCE =
+  'This worktree is outside the folders you allowed, so it cannot be opened.'
+
+/**
+ * Open the worktree repo in FULL mode.
+ *
+ * Full, not Visualize, for the reason `openStashRepo` is: this spec switches
+ * the served repository, and the drawer inherits the session's mode rather
+ * than escalating it — so a spec that landed in Visualize would be asserting
+ * about a different posture than the one it means to.
+ */
+export async function openWorktreeRepo(page) {
+  await forceOnline(page)
+  const { base } = runtime()
+  await page.goto(base)
+  await expect(page.getByRole('heading', { name: 'git-vista' })).toBeVisible()
+
+  const entry = page.getByRole('button', { name: /worktree-repo/i }).first()
+  await expect(entry).toBeVisible()
+  await entry.click()
+
+  const full = page.getByRole('button', { name: /full git operations/ })
+  if (await full.isVisible().catch(() => false)) {
+    await full.click()
+  }
+  await expect(page.getByRole('region', { name: 'Commit history graph' })).toBeVisible()
+}
+
+/**
+ * Open the Activity panel and return the worktree drawer's own region.
+ *
+ * Scoped for the reason `openDrawer` is: a branch name shown in the drawer is
+ * also drawn in the graph's SVG titles, so a page-wide locator would resolve
+ * to several elements and Playwright would refuse to guess.
+ *
+ * Waits on a ROW, not on the region: the region renders before the census
+ * fetch resolves, so asserting on it alone would let a spec proceed against
+ * "Loading worktrees…".
+ */
+export async function openWorktreeDrawer(page) {
+  await page.getByRole('button', { name: /activity/i }).first().click()
+  const drawer = page.getByRole('region', { name: WORKTREE_REGION_LABEL })
+  await expect(drawer).toBeVisible()
+  await expect(drawer.getByText('desk-two', { exact: true })).toBeVisible({ timeout: 20_000 })
+  return drawer
+}

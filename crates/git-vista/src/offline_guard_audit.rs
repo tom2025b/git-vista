@@ -212,6 +212,11 @@ const OFFLINE_GUARDED: &[&str] = &[
     // classified guarded rather than exempted.
     "cancel_operation_request",
     "select_request",
+    // M11.03 (#548). Selects a linked worktree of the served repository, and
+    // unlike `select_request` it can also ADMIT that worktree to the catalog
+    // first — so it is a write in two senses and carries the guard as its
+    // first action like every other write here.
+    "select_worktree_request",
     "rescan_request",
     "delete_clone_request",
     "staging_preview_request",

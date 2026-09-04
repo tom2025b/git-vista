@@ -2473,16 +2473,27 @@ mod branch_prompt_tests {
     #[test]
     fn only_the_open_worktree_arm_can_select_a_worktree() {
         assert_eq!(
-            CONFIRM.matches("select_request(").count(),
+            CONFIRM.matches("select_worktree_request(").count(),
             1,
-            "`select_request` is reachable from more than one place in confirm.rs"
+            "`select_worktree_request` is reachable from more than one place in confirm.rs"
+        );
+        // M11.03 (#548): and it must be the *worktree* route. `/api/select`
+        // resolves ids through the catalog, which a discovered sibling is not
+        // in — routing this offer back there is the regression that made it
+        // answer `404 No such repository.` on a perfectly serviceable desk.
+        // `select_worktree_request` does not contain `select_request` as a
+        // substring, so this counts what it means to count.
+        assert_eq!(
+            CONFIRM.matches("select_request(").count(),
+            0,
+            "confirm.rs reaches the catalog-only `select_request` again"
         );
         let body = run_confirmed_body();
         let arm = body
             .find("CheckoutAction::OpenWorktree")
             .expect("`run_confirmed` no longer matches on `CheckoutAction::OpenWorktree`");
         let call = body
-            .find("select_request(")
+            .find("select_worktree_request(")
             .expect("`run_confirmed` no longer selects the worktree it offered");
         assert!(
             arm < call,
@@ -2501,7 +2512,7 @@ mod branch_prompt_tests {
     fn the_open_worktree_redirect_returns_instead_of_also_dispatching() {
         let body = run_confirmed_body();
         let call = body
-            .find("select_request(")
+            .find("select_worktree_request(")
             .expect("`run_confirmed` no longer selects the worktree it offered");
         let dispatch = body
             .find("operations.dispatch(")
