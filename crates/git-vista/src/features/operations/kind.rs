@@ -5,9 +5,10 @@
 //! so this is a re-home and a rename, not a redesign.
 //!
 //! Framework-free by construction: the payloads are `String`, `Option<String>`, `bool`,
-//! `git_vista_core::activity::Undoable`, [`HeadBranch`], and (since #233's
-//! `ForceWithLease`) `git_vista_protocol`'s own validated `CommitOid`/`RiskLevel` — none
-//! of them tied to a UI framework, so the operations core stays host-testable.
+//! `git_vista_core::activity::Undoable`, [`HeadBranch`], [`CheckoutElsewhere`], and
+//! (since #233's `ForceWithLease`) `git_vista_protocol`'s own validated
+//! `CommitOid`/`RiskLevel`/`Serviceable` — none of them tied to a UI framework, so the
+//! operations core stays host-testable.
 //!
 //! `Debug`/`PartialEq`/`Eq` are new (the old `PendingOp` derived only `Clone`). The core
 //! needs equality to enforce ADR 0020's rule that one idempotency key may not be rebound to
@@ -15,7 +16,10 @@
 
 use git_vista_core::activity::Undoable;
 use git_vista_protocol::plan::Advisory;
-use git_vista_protocol::{CommitOid, Explanation, MergeStrategy, RiskLevel};
+use git_vista_protocol::{
+    branch_holder, BranchHolder, BranchName, CommitOid, Explanation, MergeStrategy, RiskLevel,
+    Serviceable, WorktreeCensus,
+};
 
 use crate::features::graph::core::short_oid;
 
@@ -66,9 +70,16 @@ pub enum OperationKind {
     /// tree to it. `current` is the live HEAD branch, fetched on click; when it
     /// equals `branch` the confirm button is disabled (nothing to switch to).
     /// `None` => detached HEAD — checkout is *allowed* there, it re-attaches HEAD.
+    ///
+    /// `elsewhere` is the worktree census's answer for this branch, fetched on
+    /// the same click (M11.02, #547). Git refuses a branch that is live in
+    /// another linked worktree, so a checkout offered without asking is one
+    /// offered on a check that was never made — and the dialog needs the
+    /// answer to name the worktree and offer to open it instead.
     Checkout {
         branch: String,
         current: Option<String>,
+        elsewhere: CheckoutElsewhere,
     },
     /// Force-delete `branch` (`git branch -D <branch>`), discarding unmerged commits.
     /// Only reached after the safe [`OperationKind::Delete`] is refused with "not fully
@@ -234,6 +245,84 @@ impl HeadBranch {
             Ok(Some(branch)) => Self::Known(branch),
             Ok(None) => Self::Detached,
             Err(err) => Self::Unknown(err),
+        }
+    }
+}
+
+/// One linked worktree that has a branch checked out (M11.02, #547).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HoldingWorktree {
+    /// The opaque worktree id — what `POST /api/select` takes, and the reason
+    /// "open that one instead" can be a button rather than an instruction.
+    pub id: String,
+    /// The short, non-path display label the census carries.
+    pub name: String,
+    /// Whether this application may open it. Kept as the census's own
+    /// three-state answer rather than flattened to a `bool`, because the two
+    /// refusals read differently to a user: a worktree outside the allowed
+    /// roots is somewhere they can go in a terminal, and a missing one is
+    /// somewhere nobody can go until `git worktree prune` runs.
+    pub serviceable: Serviceable,
+}
+
+impl HoldingWorktree {
+    /// Whether this application may open this worktree — the one place the
+    /// three-state answer becomes the yes/no the button needs.
+    pub fn is_openable(&self) -> bool {
+        matches!(self.serviceable, Serviceable::Yes)
+    }
+}
+
+/// What the worktree census said about a branch when the user clicked
+/// Checkout (M11.02, #547) — the frontend's half of
+/// `Precondition::BranchFreeInEveryOtherWorktree`.
+///
+/// Three states, and the third is the one that matters: a census that could
+/// not be read establishes nothing, and folding it into [`Self::Free`] would
+/// offer a checkout on a check that never ran. Exactly [`HeadBranch`]'s
+/// discipline one type over, for exactly its reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckoutElsewhere {
+    /// The census was read and no other worktree has this branch.
+    Free,
+    /// Another worktree has it. Git will refuse the checkout.
+    HeldBy(HoldingWorktree),
+    /// The census could not be read — the request failed, or the server
+    /// answered `CensusFailed`. Carries the reason so the dialog can say
+    /// *why* it declines rather than a bare "no".
+    Unknown(String),
+}
+
+impl CheckoutElsewhere {
+    /// Classify `api::fetch_worktree_census`'s exact return shape for
+    /// `branch` — the one place its `Result` is allowed to disappear.
+    ///
+    /// Two different failures collapse into [`Self::Unknown`] and neither may
+    /// become [`Self::Free`]: a transport/JSON `Err` (this client could not
+    /// reach the server) and a `WorktreeCensus::CensusFailed` (the server
+    /// could not read the list). A third would-be failure is ruled out by
+    /// construction: an `Observed` census with an empty sibling list cannot
+    /// occur — the server refuses to report one, since every repository has
+    /// at least its own worktree — but even if it did, it would correctly
+    /// mean "nobody else holds this branch".
+    pub fn classify(fetched: Result<WorktreeCensus, String>, branch: &str) -> Self {
+        let census = match fetched {
+            Ok(census) => census,
+            Err(err) => return Self::Unknown(err),
+        };
+        let Ok(name) = BranchName::new(branch) else {
+            // A branch name the protocol will not accept cannot be looked up,
+            // and "could not look it up" is this variant's whole meaning.
+            return Self::Unknown(format!("‘{branch}’ is not a name git-vista can look up"));
+        };
+        match branch_holder(&census, &name) {
+            BranchHolder::Free => Self::Free,
+            BranchHolder::HeldBy(sibling) => Self::HeldBy(HoldingWorktree {
+                id: sibling.id.clone(),
+                name: sibling.name.clone(),
+                serviceable: sibling.serviceable.clone(),
+            }),
+            BranchHolder::Unknown(reason) => Self::Unknown(reason.to_string()),
         }
     }
 }
@@ -410,6 +499,7 @@ mod tests {
             OperationKind::Checkout {
                 branch: "feature".into(),
                 current: None,
+                elsewhere: CheckoutElsewhere::Free,
             },
             OperationKind::Rebase {
                 current: None,
@@ -625,6 +715,7 @@ mod fetch_pull_tests {
             OperationKind::Checkout {
                 branch: "feature".into(),
                 current: None,
+                elsewhere: CheckoutElsewhere::Free,
             },
             OperationKind::Rebase {
                 current: None,

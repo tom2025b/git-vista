@@ -632,6 +632,7 @@ mod preview_action_tests {
             action(OperationKind::Checkout {
                 branch: "main".into(),
                 current: None,
+                elsewhere: crate::features::operations::kind::CheckoutElsewhere::Free,
             }),
             PreviewAction::Clear,
         );

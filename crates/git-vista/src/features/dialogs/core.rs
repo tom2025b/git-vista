@@ -19,7 +19,9 @@
 
 use git_vista_core::activity::UndoAction;
 
-use crate::features::operations::kind::{HeadBranch, OperationKind};
+use git_vista_protocol::Serviceable;
+
+use crate::features::operations::kind::{CheckoutElsewhere, HeadBranch, OperationKind};
 use crate::features::preview::core::DialogSubject;
 
 /// A modal that dismisses by backdrop tap, and therefore needs the guard.
@@ -728,6 +730,170 @@ pub fn delete_confirm_prompt(branch: &str, current: &HeadBranch) -> ConfirmPromp
             ),
             "Delete",
             true,
+            false,
+        ),
+    }
+}
+
+/// What the confirm button on a checkout dialog actually does (M11.02, #547).
+///
+/// A checkout dialog has two possible outcomes now, and which one it is
+/// depends on a fact about the repository rather than on which menu item was
+/// tapped. Making that a typed decision — rather than an `if` inside the
+/// wasm-only click handler — is what lets
+/// [`the_offered_button_and_the_action_it_runs_agree`] exist at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckoutAction {
+    /// Run the checkout (`POST /api/checkout`).
+    Checkout,
+    /// Don't. Select the worktree that already has the branch instead
+    /// (`POST /api/select`) — the offer `docs/superpowers/specs/m3.23-worktrees.md`
+    /// §2 asks for in place of a button git would refuse.
+    OpenWorktree { id: String, name: String },
+}
+
+/// Which action [`checkout_confirm_prompt`]'s confirm button runs.
+///
+/// Exactly one case redirects: a holder this application may actually open.
+/// Every other case runs the checkout — and every other case in which the
+/// checkout would be wrong is `enabled: false` in the prompt, so the button
+/// is never live to reach it.
+pub fn checkout_confirm_action(elsewhere: &CheckoutElsewhere) -> CheckoutAction {
+    match elsewhere {
+        CheckoutElsewhere::HeldBy(worktree) if worktree.is_openable() => {
+            CheckoutAction::OpenWorktree {
+                id: worktree.id.clone(),
+                name: worktree.name.clone(),
+            }
+        }
+        CheckoutElsewhere::Free
+        | CheckoutElsewhere::HeldBy(_)
+        | CheckoutElsewhere::Unknown(_) => CheckoutAction::Checkout,
+    }
+}
+
+/// The branch-checkout confirmation (`PendingOp::Checkout`), decided here —
+/// pure and host-tested — the same extraction [`delete_confirm_prompt`] and
+/// [`merge_confirm_prompt`] already had.
+///
+/// # The rule it exists to state (M11.02, #547)
+///
+/// **Git refuses a branch that is already checked out in another linked
+/// worktree.** That refusal is correct: two worktrees on one branch would let
+/// the same branch move underneath itself from two directions. Until this
+/// function existed the app did not know the rule — it offered the button,
+/// ran the command, and relayed `fatal: 'x' is already used by worktree at
+/// '/some/path'`, which is a dead end in a browser.
+///
+/// So the button is not offered, the worktree holding the branch is *named*,
+/// and — when the app may open it — opening it is offered in the checkout's
+/// place. "Already checked out somewhere" is explicitly not good enough:
+/// it is the same dead end with the one actionable word removed.
+///
+/// # This is a courtesy, not the enforcement
+///
+/// The server attaches `Precondition::BranchFreeInEveryOtherWorktree` to
+/// every checkout plan and refuses execution when it does not hold, whatever
+/// this function decides. A client that offers the button anyway is refused,
+/// not obeyed. What this adds is that the user finds out *before* spending a
+/// round trip on a certainty.
+///
+/// # Order of questions
+///
+/// "Is this already the branch I'm on?" is asked first, from a local fact
+/// that is definitive. It also cannot collide: git will not let another
+/// worktree hold the branch this one has checked out, so a no-op checkout
+/// never needs the census — and asking the census first would let a failed
+/// read turn a harmless no-op into "couldn't check".
+pub fn checkout_confirm_prompt(
+    branch: &str,
+    current: &Option<String>,
+    elsewhere: &CheckoutElsewhere,
+) -> ConfirmPrompt {
+    const TITLE: &str = "Checkout branch";
+
+    // Local, definitive, and collision-proof — see the doc comment.
+    if current.as_deref() == Some(branch) {
+        return ConfirmPrompt::plain(
+            TITLE,
+            format!("‘{branch}’ is already the branch you're on — nothing to switch."),
+            "Checkout",
+            false,
+            false,
+        );
+    }
+
+    match elsewhere {
+        // A different branch, or detached HEAD (which a checkout re-attaches),
+        // and no other worktree holds it.
+        CheckoutElsewhere::Free => ConfirmPrompt::plain(
+            TITLE,
+            format!(
+                "Check out ‘{branch}’? This switches the working tree and HEAD to ‘{branch}’."
+            ),
+            "Checkout",
+            false,
+            true,
+        ),
+        CheckoutElsewhere::HeldBy(worktree) if worktree.is_openable() => ConfirmPrompt::plain(
+            "Branch is open at another worktree",
+            format!(
+                "‘{branch}’ is already checked out in the worktree ‘{}’. Git allows a branch \
+                 in only one worktree at a time, so checking it out here would be refused — \
+                 open ‘{}’ instead and the work is already there.",
+                worktree.name, worktree.name
+            ),
+            "Open Worktree",
+            false,
+            true,
+        ),
+        // It holds the branch, and this application may not open it. Still
+        // named — git's refusal does not consult the app's fence, so this is
+        // a real answer — but nothing is offered, because the offer would be
+        // one the server refuses. Visibility for a collision check must never
+        // widen the boundary.
+        CheckoutElsewhere::HeldBy(worktree) => ConfirmPrompt::plain(
+            "Branch is open at another worktree",
+            match worktree.serviceable {
+                Serviceable::OutsideAllowedRoots => format!(
+                    "‘{branch}’ is already checked out in the worktree ‘{}’, which lies \
+                     outside the folders this app is allowed to open. Git allows a branch \
+                     in only one worktree at a time, so switch to it in a terminal, or \
+                     check out a different branch here.",
+                    worktree.name
+                ),
+                Serviceable::Missing => format!(
+                    "‘{branch}’ is still held by the worktree ‘{}’, whose folder is gone \
+                     from disk though git has not been told. Git allows a branch in only \
+                     one worktree at a time; `git worktree prune` releases it.",
+                    worktree.name
+                ),
+                // `is_openable()` is exactly `Yes`, so this arm is the
+                // compiler's, not the reader's. Worded honestly anyway rather
+                // than left to a panic or a blank.
+                Serviceable::Yes => format!(
+                    "‘{branch}’ is already checked out in the worktree ‘{}’.",
+                    worktree.name
+                ),
+            },
+            "Checkout",
+            false,
+            false,
+        ),
+        // The census could not be read. "Couldn't tell" is never "safe to
+        // offer" — the same rule `delete_confirm_prompt`'s `Unknown` arm
+        // states, and the frontend's half of the server's refusal to spend an
+        // unread enumeration as evidence about a branch.
+        CheckoutElsewhere::Unknown(why) => ConfirmPrompt::plain(
+            TITLE,
+            format!(
+                "Couldn't check whether another worktree already has ‘{branch}’ checked out \
+                 — {why}\n\n\
+                 Checking out ‘{branch}’ isn't offered without that answer, because git \
+                 refuses a branch that is open at another worktree. Close this and try again."
+            ),
+            "Checkout",
+            false,
             false,
         ),
     }

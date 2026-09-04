@@ -47,7 +47,7 @@ mod tags;
 pub use activity::{fetch_activity, fetch_undoables, undo_request};
 pub use branches::{
     branch_op_request, create_branch_request, fetch_head_branch, fetch_rebase_status,
-    rebase_request,
+    fetch_worktree_census, rebase_request,
 };
 pub use clone::clone_request;
 pub use commits::{

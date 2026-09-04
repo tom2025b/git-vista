@@ -649,7 +649,7 @@ mod tests {
     #[test]
     fn every_explain_fact_variant_projects_to_a_nonempty_terminal_row() {
         let facts = every_fact_variant();
-        assert_eq!(facts.len(), 46, "the typed-fact corpus quietly thinned");
+        assert_eq!(facts.len(), 47, "the typed-fact corpus quietly thinned");
         for fact in facts {
             let rendered = fact_row(&fact);
             assert!(
