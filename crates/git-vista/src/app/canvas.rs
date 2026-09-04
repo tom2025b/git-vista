@@ -41,6 +41,7 @@ use crate::features::graph::core::{
     should_prefetch, show_fixed_loading_overlay, PageLoadState, PageRequestKey, PageRetry,
     RenderCtx, DEFAULT_PAGE_LIMIT,
 };
+use crate::features::history::core::drift_reload;
 use crate::geometry::stub_headroom_for;
 use crate::gestures::{self, GestureState};
 use crate::lod::detail_for;
@@ -427,24 +428,27 @@ pub(super) fn graph_canvas(
 
             let page = match fetched {
                 Ok(page) => page,
-                // History moved under this canvas. Announce the drift *before*
-                // bumping the epoch: the App's reload effect refuses to overwrite
-                // `DriftReloading` for the same epoch, so setting them the other
-                // way round would replace the copy explaining why the graph
-                // vanished with a bare "Loading…". Print can't span two
-                // generations, so it closes with the epoch it was opened over.
-                // The canvas is unmounted by the phase branch that follows, which
-                // is what disposes this aggregate — never a manual `dispose()`.
+                // History moved under this canvas. What that means for the
+                // panel — which phase, print's fate, the completeness flag, and
+                // the ordering rule that ties the announcement to the epoch the
+                // bump produced — is `drift_reload`'s to decide, in
+                // `features::history::core` where a host test runs it. This arm
+                // performs the bump it is handed and writes the three signals;
+                // it does not restate the rule. A source census in that module
+                // pins this arm to the call.
+                //
+                // The canvas is unmounted by the phase branch that follows,
+                // which is what disposes this aggregate — never a manual
+                // `dispose()`.
                 Err(HistoryFetchError::Http {
                     status: HTTP_CONFLICT,
                     ..
                 }) => {
-                    let next = graph.try_update(|g| g.force_bump()).unwrap_or_default();
-                    history_ui
-                        .phase
-                        .set(HistoryPhase::DriftReloading { epoch: next });
-                    history_ui.print_open.set(false);
-                    history_ui.complete.set(false);
+                    let reload =
+                        drift_reload(|| graph.try_update(|g| g.force_bump()).unwrap_or_default());
+                    history_ui.phase.set(reload.phase);
+                    history_ui.print_open.set(reload.print_open);
+                    history_ui.complete.set(reload.complete);
                     return;
                 }
                 Err(err) => {
