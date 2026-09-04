@@ -219,8 +219,13 @@ pub fn link_target(fact: &ExplanationFact) -> Option<LinkTarget> {
             | Precondition::RefExists { ref_name }
             | Precondition::RefAbsent { ref_name } => Some(LinkTarget::Ref(ref_name.to_string())),
             // A branch name is a ref the graph draws, under its full name.
+            // The collision precondition (M11.02, #547) names a branch too —
+            // and links to *that* branch, not to the worktree holding it: the
+            // graph draws refs, and there is no worktree object on it to
+            // point at.
             Precondition::BranchCheckedOut { branch }
-            | Precondition::BranchNotCheckedOut { branch } => {
+            | Precondition::BranchNotCheckedOut { branch }
+            | Precondition::BranchFreeInEveryOtherWorktree { branch } => {
                 Some(LinkTarget::Ref(format!("refs/heads/{branch}")))
             }
             // Neither names anything the graph draws. A clean worktree is a
@@ -309,6 +314,22 @@ fn precondition(p: &Precondition) -> String {
         Precondition::SeedRecorded => {
             "The demo repository's seed must be on record, so it can be rebuilt from it."
                 .to_string()
+        }
+        // M11.02 (#547). The sentence cannot name the holding worktree — the
+        // precondition carries the branch and nothing else, because *which*
+        // worktree holds it is an observation that can change between this
+        // preview and the moment the operation runs. So it teaches the rule
+        // and points at the one command that answers "which one?", which is
+        // what a learner can act on. The refusal, when it happens, does name
+        // the worktree: the server has the census in hand there.
+        Precondition::BranchFreeInEveryOtherWorktree { branch } => {
+            format!(
+                "`{branch}` must not be checked out in any OTHER worktree of this \
+                 repository. Git allows a branch in only one working tree at a time — \
+                 two would let the same branch move from two directions at once — so \
+                 if another worktree has it, this is refused instead of attempted. \
+                 `git worktree list` shows which worktree holds what."
+            )
         }
     }
 }
@@ -555,6 +576,9 @@ mod tests {
                 remote: RemoteName::new("origin").unwrap(),
             }),
             F::Precondition(Precondition::SeedRecorded),
+            F::Precondition(Precondition::BranchFreeInEveryOtherWorktree {
+                branch: branch("feature/x"),
+            }),
             F::Recovery(RecoveryStrategy::NotNeeded),
             F::Recovery(RecoveryStrategy::ResetRef {
                 ref_name: rname("refs/heads/main"),
@@ -676,8 +700,8 @@ mod tests {
         let count = |f: fn(&ExplanationFact) -> bool| facts.iter().filter(|x| f(x)).count();
         assert_eq!(
             count(|f| matches!(f, ExplanationFact::Precondition(_))),
-            8,
-            "Precondition has 8 variants"
+            9,
+            "Precondition has 9 variants"
         );
         assert_eq!(
             count(|f| matches!(f, ExplanationFact::Recovery(_))),

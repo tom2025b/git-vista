@@ -663,7 +663,7 @@ fn remote_name_refuses_every_url_and_path_shape() {
 }
 
 /// The census of preconditions that refuse when they were already false at
-/// build time is exactly `{RemoteConfigured}`.
+/// build time is exactly `{RemoteConfigured, BranchFreeInEveryOtherWorktree}`.
 ///
 /// `super::refuses_when_unmet_at_build`'s match is exhaustive, so a new
 /// [`Precondition`] variant cannot compile without an arm — but nothing in the
@@ -680,8 +680,27 @@ fn remote_name_refuses_every_url_and_path_shape() {
 /// asserts that exact 404. Flipping `SeedRecorded` to `true` would replace a
 /// real, tested executor refusal with a paraphrase from the gate — and that
 /// test would catch it.
+///
+/// # Why the second member is not a counter-example to any of that
+///
+/// `BranchFreeInEveryOtherWorktree` (M11.02, #547) joined the `true` side
+/// even though `git checkout` *does* refuse a branch held by another linked
+/// worktree. The narrow question the classification asks — "if this is false
+/// and we run the executor anyway, does the executor refuse?" — is not the
+/// whole question for this one, and answering only that gets it backwards:
+///
+///  * git refuses with `fatal: 'x' is already used by worktree at
+///    '/some/path'` — a dead end at the end of an operation the application
+///    already offered. Naming the worktree, and offering to open it, is the
+///    entire feature; leaving it to the executor is the outcome #547 exists
+///    to remove.
+///  * `held_now` collapses a *failed census* to the same `false` as a
+///    genuinely-held branch. A `false` here would send "nobody looked"
+///    straight to the executor, where git's own refusal is the only remaining
+///    check — spending "could not check" as though it were "checked, and
+///    fine".
 #[test]
-fn only_remote_configured_refuses_when_unmet_at_build() {
+fn the_two_preconditions_with_no_usable_downstream_guard_refuse_at_the_gate() {
     let all = every_precondition_variant();
     let refusing: Vec<&Precondition> = all
         .iter()
@@ -689,15 +708,23 @@ fn only_remote_configured_refuses_when_unmet_at_build() {
         .collect();
     assert_eq!(
         refusing.len(),
-        1,
-        "the census changed — a `true` arm asserts that no executor refuses \
-         when this precondition is unmet, which is a claim about every \
-         executor that carries it: {refusing:?}"
+        2,
+        "the census changed — a `true` arm asserts that the executor's own \
+         refusal is not good enough for this precondition, which is a claim \
+         about every executor that carries it: {refusing:?}"
     );
     assert!(
-        matches!(refusing[0], Precondition::RemoteConfigured { .. }),
-        "only RemoteConfigured has no downstream guard today, got {:?}",
-        refusing[0]
+        refusing
+            .iter()
+            .any(|p| matches!(p, Precondition::RemoteConfigured { .. })),
+        "RemoteConfigured has no downstream guard at all, got {refusing:?}"
+    );
+    assert!(
+        refusing
+            .iter()
+            .any(|p| matches!(p, Precondition::BranchFreeInEveryOtherWorktree { .. })),
+        "the collision precondition must refuse here rather than relay git's \
+         raw `fatal:`, got {refusing:?}"
     );
 }
 
@@ -730,6 +757,9 @@ fn every_precondition_variant() -> Vec<Precondition> {
             remote: RemoteName::new("origin").unwrap(),
         },
         Precondition::SeedRecorded,
+        Precondition::BranchFreeInEveryOtherWorktree {
+            branch: BranchName::new("main").unwrap(),
+        },
     ];
     for precondition in &all {
         match precondition {
@@ -740,7 +770,8 @@ fn every_precondition_variant() -> Vec<Precondition> {
             | Precondition::BranchNotCheckedOut { .. }
             | Precondition::CleanWorktree
             | Precondition::RemoteConfigured { .. }
-            | Precondition::SeedRecorded => {}
+            | Precondition::SeedRecorded
+            | Precondition::BranchFreeInEveryOtherWorktree { .. } => {}
         }
     }
     all

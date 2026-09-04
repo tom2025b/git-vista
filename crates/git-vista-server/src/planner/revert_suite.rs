@@ -98,7 +98,7 @@ async fn a_conflicting_revert_is_reported_as_a_classified_conflict() {
     run(&repo, &["add", "a.txt"]);
     run(&repo, &["commit", "-q", "-m", "add c, needs b"]);
 
-    let observed = observe_live(&repo).await;
+    let observed = observe_live_for_generation(&repo).await;
     let (status, message) =
         exec_revert(&repo, NetworkNeed::Local, &to_revert, None, &observed).await;
 
@@ -152,7 +152,7 @@ async fn a_non_conflict_revert_failure_keeps_forwarding_gits_words_verbatim() {
     // attempts the merge, so this is never classified a conflict.
     std::fs::write(repo.join("a.txt"), "a\nb\ndirty, not committed\n").unwrap();
 
-    let observed = observe_live(&repo).await;
+    let observed = observe_live_for_generation(&repo).await;
     let (status, message) =
         exec_revert(&repo, NetworkNeed::Local, &to_revert, None, &observed).await;
 

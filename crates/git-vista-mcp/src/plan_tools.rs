@@ -950,6 +950,14 @@ fn precondition_sentence(check: &Precondition) -> String {
         Precondition::SeedRecorded => {
             "The repository must carry a recorded `gv --seed`.".to_string()
         }
+        // M11.02 (#547). An agent reading this needs the rule and the way to
+        // check it; which worktree actually holds the branch is in the
+        // server's refusal, not in the precondition.
+        Precondition::BranchFreeInEveryOtherWorktree { branch } => format!(
+            "No other worktree of this repository may have `{}` checked out \
+             (`git worktree list`).",
+            branch.as_str()
+        ),
     }
 }
 
