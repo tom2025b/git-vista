@@ -339,8 +339,8 @@ const THRESHOLD_LINES: usize = 150;
 /// `features::history::core::drift_reload`; the entry naming it is gone
 /// because [`exempt_entries_still_need_exempting`] demanded it the moment a
 /// host test started reading the file, which is this table working as
-/// intended rather than a courtesy someone remembered. Others are argued thin on inspection
-/// (`state.rs`, `session.rs`, `prefs.rs`, `features/stash/signals.rs`,
+/// intended rather than a courtesy someone remembered. Others are argued thin
+/// on inspection (`state.rs`, `session.rs`, `prefs.rs`, `features/stash/signals.rs`,
 /// `update_required.rs`) — the decision they would otherwise hide already
 /// lives in a host-tested `core` module, and what remains in the wasm-only
 /// file is sequencing or type definitions, not a decision this census's
