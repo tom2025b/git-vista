@@ -1,4 +1,4 @@
-# ADR 0111 — One refusal is not evidence of an owner
+# ADR 0112 — One refusal is not evidence of an owner
 
 - **Status:** Accepted — implemented, mutation-proved two ways per test
 - **Date:** 2026-09-03

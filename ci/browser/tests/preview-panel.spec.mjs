@@ -30,6 +30,7 @@ import { expect, test } from '@playwright/test'
 
 import {
   openBranchMenu,
+  openApp,
   openMergePreviewRepo,
   PREVIEW_BRANCH,
   PREVIEW_HEADING,
@@ -40,6 +41,103 @@ import {
 function dialog(page) {
   return page.getByText(`Merge ‘${PREVIEW_BRANCH}’ into ‘${PREVIEW_INTO}’?`)
 }
+
+test('#633: the repo opener waits for the selected repository\'s graph', async ({ page }) => {
+  // The server selection is shared across this single-worker suite, so choose
+  // repo A explicitly instead of assuming global setup (or the previous test)
+  // left it selected. The repo-labelled wait also prevents openApp's generic
+  // node check from accepting an older selection here.
+  await openApp(page)
+  await expect(page.locator('p.status.repo')).toContainText(/fixture-repo/i, {
+    timeout: 20_000,
+  })
+
+  // Keep the picker from offering repo B until the launch repo (A) has drawn.
+  // This makes the stale graph the old helper accidentally accepted a hard
+  // precondition rather than a timing accident.
+  let releaseCatalog
+  const catalogGate = new Promise((resolve) => {
+    releaseCatalog = resolve
+  })
+  await page.route('**/api/catalog?*', async (route) => {
+    await catalogGate
+    await route.continue()
+  })
+
+  // Learn B's opaque worktree id from its own Frame, then hold only B's first
+  // commit page. The Frame is the authority for which repository a page
+  // belongs to; request order or a guessed catalogue id would recreate the
+  // same wait-for-the-wrong-thing mistake in the regression itself.
+  let selectedWorktree
+  await page.route('**/api/frame?*', async (route) => {
+    const response = await route.fetch()
+    const frame = await response.json()
+    if (/merge-preview-repo/i.test(frame.repo_label ?? '')) {
+      selectedWorktree = frame.worktree_id
+    }
+    await route.fulfill({ response })
+  })
+
+  let markSelectedPageRequested
+  const selectedPageRequested = new Promise((resolve) => {
+    markSelectedPageRequested = resolve
+  })
+  let releaseSelectedPage
+  const selectedPageGate = new Promise((resolve) => {
+    releaseSelectedPage = resolve
+  })
+  await page.route('**/api/commits?*', async (route) => {
+    const requestedWorktree = new URL(route.request().url()).searchParams.get('repo')
+    if (selectedWorktree && requestedWorktree === selectedWorktree) {
+      markSelectedPageRequested()
+      await selectedPageGate
+    }
+    await route.continue()
+  })
+
+  let openerFinished = false
+  const opening = openMergePreviewRepo(page).then(() => {
+    openerFinished = true
+  })
+
+  try {
+    await expect(page.locator('p.status.repo')).toContainText(/fixture-repo/i, {
+      timeout: 20_000,
+    })
+    await expect(page.locator('circle.node-hit').first()).toBeAttached()
+    await page.evaluate(() => {
+      window.__gv633StaleGraph = document.querySelector('section.graph svg').cloneNode(true)
+    })
+    releaseCatalog()
+
+    await selectedPageRequested
+    await expect(page.getByText('Loading history…', { exact: true })).toBeVisible()
+    await page.evaluate(async () => {
+      // Reattach repo A's real graph while B is still on the wire. This is the
+      // stale-node state the race exposed, held long enough to make the helper
+      // choose between "a node exists" and "the selected graph is ready".
+      document.querySelector('section.graph').append(window.__gv633StaleGraph)
+      await new Promise((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(resolve)),
+      )
+    })
+    await page.waitForTimeout(100)
+    expect(
+      openerFinished,
+      'the opener must remain pending while the selected repository graph is still loading',
+    ).toBe(false)
+
+    releaseSelectedPage()
+    await opening
+    await expect(page.locator('p.status.repo')).toContainText(/merge-preview-repo/i)
+    await expect(page.locator('circle.node-hit').first()).toBeAttached()
+  } finally {
+    // Let intercepted requests drain even when an assertion fails, so teardown
+    // never inherits a route handler blocked on this test's proof gates.
+    releaseCatalog()
+    releaseSelectedPage()
+  }
+})
 
 test.describe('the graph preview inside a confirmation', () => {
   test('A6: a merge confirmation draws both halves, with the new commit marked', async ({
