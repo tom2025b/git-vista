@@ -332,9 +332,18 @@ const THRESHOLD_LINES: usize = 150;
 /// These are not all the same kind of gap, and the reasons say so plainly.
 /// Several are real, unpinned debt named here for the first time by this
 /// census (`gestures.rs`, `print.rs`, `render/labels.rs`,
-/// `features/diff/staging_view.rs`) — landing this module does not close
-/// those gaps, it is what makes them visible instead of requiring another
-/// by-hand read of the tree to rediscover; #653 tracks the four that remain.
+/// `features/diff/staging_view.rs`, `dialogs/open_url.rs`) — landing this
+/// module does not close those gaps, it is what makes them visible instead
+/// of requiring another by-hand read of the tree to rediscover; #653 tracks
+/// the five that remain.
+///
+/// `dialogs/open_url.rs` is on that list because *this table* says it is.
+/// #649's PR body filed it under "argued thin" while the entry it landed
+/// called it "unpinned, smaller-scale debt"; the two disagreed for as long
+/// as both existed. The entry wins — a reason sitting next to the exemption
+/// it justifies is the thing a later reader checks, and the thing
+/// [`exempt_entries_still_need_exempting`] is written against. A prose
+/// summary elsewhere that drifts from it is the summary that is wrong.
 ///
 /// Two have already left. `app/canvas.rs` went when its 409 handler moved to
 /// `features::history::core::drift_reload`; `features/shell/signals.rs` went
