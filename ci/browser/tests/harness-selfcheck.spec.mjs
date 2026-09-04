@@ -51,16 +51,36 @@ const grouping = (page) =>
  *  `wip-collapse.spec.mjs` rather than imported, for the same reason every
  *  other mutation here is written out: this file must be able to fail on its
  *  own terms, and a shared opener that broke would silently turn these
- *  self-checks into "the page never loaded" passes. */
+ *  self-checks into "the page never loaded" passes. (#644: `wip-collapse.spec.mjs`
+ *  carries the identical point-in-time sample below and is out of scope here —
+ *  each copy is fixed, and stays broken, entirely on its own.)
+ *
+ *  The mode dialog is waited for, not sampled: `picker_open` is seeded `true`
+ *  (app/mod.rs, ADR 0006 "ask every time"), so it follows every repository
+ *  open with no exception — `openApp` in `helpers.mjs` established this for
+ *  `fixture-repo` (#623), and it holds just as much for `interleaved-repo`.
+ *  `if (await visualize.isVisible())` asked a question with no false case: hit
+ *  before the dialog painted and the answer was always "no dialog", the click
+ *  was skipped, and the picker's full-viewport overlay stayed up underneath
+ *  everything this test goes on to assert. */
 async function openTwinRepo(page) {
   await forceOnline(page)
   await page.goto(runtime().base)
   await expect(page.getByRole('heading', { name: 'git-vista' })).toBeVisible()
   const entry = page.getByRole('button', { name: /interleaved-repo/i }).first()
-  await expect(entry).toBeVisible()
+  await expect(entry, 'the picker lists the interleaved-twin repository').toBeVisible({
+    timeout: 20_000,
+  })
   await entry.click()
   const visualize = page.getByRole('button', { name: /look only/ })
-  if (await visualize.isVisible().catch(() => false)) await visualize.click()
+  await expect(visualize, 'the mode dialog follows opening a repository').toBeVisible({
+    timeout: 20_000,
+  })
+  await visualize.click()
+  await expect(entry, 'the picker must be dismissed, not merely unsampled').toHaveCount(0)
+  await expect(visualize, 'the mode dialog must be dismissed, not merely unsampled').toHaveCount(
+    0,
+  )
   await expect(page.locator('p.status.repo')).toContainText(/interleaved-repo/i)
   await expect(page.locator('.wip-group')).toHaveCount(2)
 }
@@ -73,16 +93,26 @@ async function openTwinRepo(page) {
  *
  *  Opened in VISUALIZE, not full mode. The self-check only reads the drawer,
  *  and a read-only session cannot mutate the fixture that
- *  `stash-drawer.spec.mjs` — which runs after this file — depends on. */
+ *  `stash-drawer.spec.mjs` — which runs after this file — depends on.
+ *
+ *  Same wait-not-sample gate as `openTwinRepo` above, same reason (#644): the
+ *  mode dialog is guaranteed, not merely possible. */
 async function openStashDrawer(page) {
   await forceOnline(page)
   await page.goto(runtime().base)
   await expect(page.getByRole('heading', { name: 'git-vista' })).toBeVisible()
   const entry = page.getByRole('button', { name: /stash-repo/i }).first()
-  await expect(entry).toBeVisible()
+  await expect(entry, 'the picker lists the stash repository').toBeVisible({ timeout: 20_000 })
   await entry.click()
   const visualize = page.getByRole('button', { name: /look only/ })
-  if (await visualize.isVisible().catch(() => false)) await visualize.click()
+  await expect(visualize, 'the mode dialog follows opening a repository').toBeVisible({
+    timeout: 20_000,
+  })
+  await visualize.click()
+  await expect(entry, 'the picker must be dismissed, not merely unsampled').toHaveCount(0)
+  await expect(visualize, 'the mode dialog must be dismissed, not merely unsampled').toHaveCount(
+    0,
+  )
   await expect(page.locator('p.status.repo')).toContainText(/stash-repo/i)
   await page.getByRole('button', { name: /activity/i }).first().click()
   const drawer = page.getByRole('region', { name: 'Stashes' })
