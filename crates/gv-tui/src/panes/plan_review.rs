@@ -151,6 +151,11 @@ fn precondition(value: &Precondition) -> String {
         Precondition::CleanWorktree => "working tree and staging area are clean".to_string(),
         Precondition::RemoteConfigured { remote } => format!("remote {remote} is configured"),
         Precondition::SeedRecorded => "the demo repository seed is recorded".to_string(),
+        // M11.02 (#547). One line in a review pane, so it states the rule
+        // rather than teaching it; Explain Mode carries the reasoning.
+        Precondition::BranchFreeInEveryOtherWorktree { branch } => {
+            format!("no other worktree has {branch} checked out")
+        }
     }
 }
 
@@ -510,6 +515,7 @@ mod tests {
                 remote: RemoteName::new("origin").unwrap(),
             }),
             Fact::Precondition(Precondition::SeedRecorded),
+            Fact::Precondition(Precondition::BranchFreeInEveryOtherWorktree { branch: branch() }),
             Fact::Recovery(RecoveryStrategy::NotNeeded),
             Fact::Recovery(RecoveryStrategy::ResetRef {
                 ref_name: ref_name(),
@@ -643,7 +649,7 @@ mod tests {
     #[test]
     fn every_explain_fact_variant_projects_to_a_nonempty_terminal_row() {
         let facts = every_fact_variant();
-        assert_eq!(facts.len(), 46, "the typed-fact corpus quietly thinned");
+        assert_eq!(facts.len(), 47, "the typed-fact corpus quietly thinned");
         for fact in facts {
             let rendered = fact_row(&fact);
             assert!(

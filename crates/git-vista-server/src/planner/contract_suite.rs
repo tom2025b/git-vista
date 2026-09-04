@@ -5287,7 +5287,8 @@ async fn building_a_plan_takes_no_guard_and_submitting_takes_the_real_one() {
     };
 
     let fingerprint_before = repo_fingerprint(&repo);
-    let generation_before = generation_token(&repo, &observe_live(&repo).await).await;
+    let generation_before =
+        generation_token(&repo, &observe_live_for_generation(&repo).await).await;
 
     // Hold the exact guard the pipeline serializes on (repo_id None ⇒ the
     // Unregistered bucket, the one every injected-token suite drive uses).
@@ -5305,7 +5306,7 @@ async fn building_a_plan_takes_no_guard_and_submitting_takes_the_real_one() {
         fingerprint_before,
         "build_plan_only must leave the repository byte-identical"
     );
-    let generation_after = generation_token(&repo, &observe_live(&repo).await).await;
+    let generation_after = generation_token(&repo, &observe_live_for_generation(&repo).await).await;
     assert_eq!(
         generation_after.as_str(),
         generation_before.as_str(),

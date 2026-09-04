@@ -872,6 +872,45 @@ pub(crate) async fn head_branch(
     Ok((no_store, Json(git_vista_git::read_head_branch(&repo))))
 }
 
+/// The worktree census (M11.01 #546, exposed by M11.02 #547): every linked
+/// worktree of the served repository, and which branch each one holds.
+///
+/// # Why a read route exists before M11.03 builds the list UI
+///
+/// #547's acceptance says the UI must *decline to offer* a checkout git would
+/// refuse, and name the worktree holding the branch. It cannot do either
+/// without the census, and deriving the answer a second way — a
+/// per-branch "is this free?" endpoint, say — is precisely the divergence
+/// between the path that offers an operation and the path that permits it
+/// that `docs/superpowers/specs/m3.23-worktrees.md` §1 forbids. So the
+/// primitive is exposed once, whole, and both the frontend's offer and the
+/// planner's precondition read it through
+/// `git_vista_protocol::branch_holder`. M11.03's list UI is the third
+/// consumer and needs nothing new.
+///
+/// # Failure is in the body, not the status
+///
+/// A `CensusFailed` is a **200** carrying `{"outcome":"census_failed",…}`,
+/// not a 500. The distinction is the whole point of the type: "I read the
+/// list and it says this" and "I could not read the list" are both answers,
+/// and a client that got a 500 would have to decide for itself what an
+/// absent census means about a branch — which is the fail-open this design
+/// exists to close. Sent `no-store`, like every other live read here: another
+/// worktree can open or close at any moment.
+pub(crate) async fn worktree_list(
+    Query(q): Query<RepoQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let repo = resolve_repo(q.repo.as_deref())?.0;
+    let census = crate::worktree_census::worktree_census(
+        &repo,
+        crate::state::expose_paths(),
+        &crate::state::path_is_allowed,
+    )
+    .await;
+    let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
+    Ok((no_store, Json(census)))
+}
+
 /// The working-tree status (Activity/Undo feature, step 1): the parsed output
 /// of `git status --porcelain=v2 --branch`, resolved fresh on every request.
 ///

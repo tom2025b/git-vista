@@ -142,6 +142,13 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     // full_routes-only, with the staging reads: two of its four modes show
     // uncommitted worktree and index content (ADR 0005).
     ("/api/diff/spec", Method::POST, Authz::SessionAndCsrf),
+    // M11.02 (#547): the worktree census. A GET (no CSRF surface), and
+    // `SessionRequired` rather than unauthenticated because it discloses the
+    // directory base names of every linked worktree — and, when the operator
+    // has set `GIT_VISTA_EXPOSE_PATHS`, their absolute paths. That is
+    // filesystem shape, not published history, which is why it is also
+    // registered only on the full (loopback) router; see `main.rs`.
+    ("/api/worktrees", Method::GET, Authz::SessionRequired),
     // M4.31a (#428): inspect a conflict. Every GET, `SessionRequired` (no
     // CSRF surface — these are reads), full_routes-only — recorded on the
     // issue itself before this landed. `/api/conflicts` reports uncommitted
@@ -308,7 +315,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// dropped by a `main.rs` refactor that this scanner's pattern-matching
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
-const EXPECTED_ROUTE_COUNT: usize = 69;
+const EXPECTED_ROUTE_COUNT: usize = 70;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in

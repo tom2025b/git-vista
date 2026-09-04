@@ -39,6 +39,7 @@ use sha2::{Digest, Sha256};
 use git_vista_core::activity::ActivityKind;
 use git_vista_core::identity::{GenerationInputs, RepositoryHandle, RepositoryId, WorktreeId};
 use git_vista_core::seed::{parse_seed, Seed};
+use git_vista_protocol::{branch_holder, BranchHolder, Serviceable, WorktreeCensus};
 use git_vista_protocol::{
     Advisory, BranchName, CommitOid, ForcePublish, GenerationToken, GitOperation, IdempotencyKey,
     MergeStrategy, OperationHash, OperationId, OperationStage, Plan, Precondition,
@@ -423,7 +424,8 @@ async fn plan_and_execute_tracked(
             // The generation *after* execution: the datum a reconnecting client
             // uses to decide whether its cached graph is stale, without re-reading
             // the repository. Best-effort, like every other observation here.
-            let generation = Some(generation_token(&repo, &observe_live(&repo).await).await);
+            let generation =
+                Some(generation_token(&repo, &observe_live_for_generation(&repo).await).await);
 
             // M1.09: the terminal record and its recovery ref, persisted
             // *before* `finish` publishes the same snapshot in-memory —
@@ -925,6 +927,68 @@ struct Observed {
     /// to the executor's own legacy guard (same refusal text as ever), while
     /// one that held and then broke is a race — refused, fail-closed (#145).
     held_at_build: Vec<bool>,
+    /// The worktree census (M11.01, #546) behind the one precondition that
+    /// reads it: [`Precondition::BranchFreeInEveryOtherWorktree`] (M11.02,
+    /// #547).
+    ///
+    /// Taken only for the operations [`needs_worktree_census`] names, so no
+    /// other plan pays for a `git worktree list`. Every other operation gets
+    /// [`no_census_taken`] — a `CensusFailed`, **not** an empty
+    /// `Observed`. That placeholder is the point: `CensusFailed` is the value
+    /// every consumer must already treat as *"nothing was observed"*, so a
+    /// future operation that acquires this precondition without acquiring its
+    /// census refuses rather than silently passes. `Obs::Unknown` takes the
+    /// same posture one field up.
+    ///
+    /// **Deliberately not a generation input.** `generation_token` digests
+    /// HEAD, the named branch's tip and the status; the census is none of
+    /// those, and another worktree taking a branch moves no ref this
+    /// repository can see. Folding it in would also make every plan on a host
+    /// where `git worktree list` fails refuse as "the repository changed" —
+    /// a claim about the repository nothing observed. The precondition, which
+    /// says what actually happened, is the right place for it.
+    census: WorktreeCensus,
+}
+
+/// Whether `operation`'s plan can carry
+/// [`Precondition::BranchFreeInEveryOtherWorktree`], and therefore whether an
+/// observation must pay for a `git worktree list`.
+///
+/// One function, read by [`observe_operation`] on the plan-building side and
+/// by [`observe_live`] on the execution side, so the two cannot drift into
+/// building a plan *with* a census and enforcing it *without* one — which
+/// would leave the enforcement reading [`no_census_taken`] and refusing every
+/// honest checkout.
+fn needs_worktree_census(operation: &GitOperation) -> bool {
+    matches!(operation, GitOperation::CheckoutBranch { .. })
+}
+
+/// The census placeholder for an operation that never needed one. See
+/// [`Observed::census`] for why this is a failure rather than an empty list.
+fn no_census_taken() -> WorktreeCensus {
+    WorktreeCensus::CensusFailed {
+        reason: "no worktree census was taken for this operation".to_string(),
+    }
+}
+
+/// Read the worktree census for `operation`, or [`no_census_taken`] when it
+/// does not need one.
+///
+/// This is the production call site `worktree_census`'s module doc
+/// anticipated: the allowed-roots fence and the path-exposure flag arrive as
+/// parameters precisely so that every test can supply its own, and this is
+/// the one place that supplies the process-global pair.
+async fn census_for(repo: &Path, operation: &GitOperation) -> WorktreeCensus {
+    if needs_worktree_census(operation) {
+        crate::worktree_census::worktree_census(
+            repo,
+            crate::state::expose_paths(),
+            &crate::state::path_is_allowed,
+        )
+        .await
+    } else {
+        no_census_taken()
+    }
 }
 
 /// Build the reviewable [`Plan`] for `operation` against the live repository.
@@ -1013,6 +1077,7 @@ async fn observe_operation(repo: &Path, operation: &GitOperation) -> Observed {
         branch_tip,
         status: worktree_status(repo).await,
         held_at_build: Vec::new(),
+        census: census_for(repo, operation).await,
     }
 }
 
@@ -1156,7 +1221,7 @@ async fn proof_holds(repo: &Path, proof: &DropProof) -> Result<(), (StatusCode, 
         ));
     };
 
-    let live = generation_token(repo, &observe_live(repo).await).await;
+    let live = generation_token(repo, &observe_live_for_generation(repo).await).await;
     if live != recorded {
         return Err((
             StatusCode::CONFLICT,
@@ -1440,13 +1505,36 @@ async fn worktree_status(repo: &Path) -> Obs<String> {
 
 /// Fresh observations for the execution-time check (#145): same reads as
 /// plan-building, minus the per-operation `branch_tip`.
-async fn observe_live(repo: &Path) -> Observed {
+///
+/// It takes `operation` for one reason (M11.02, #547): the worktree census is
+/// operation-shaped, and re-reading it *here* is the whole point of the
+/// collision precondition — a worktree that took the branch between planning
+/// and executing must be a refused race, not git's raw `fatal:`.
+async fn observe_live(repo: &Path, operation: &GitOperation) -> Observed {
+    Observed {
+        census: census_for(repo, operation).await,
+        ..observe_live_for_generation(repo).await
+    }
+}
+
+/// The half of [`observe_live`] that [`generation_token`] digests — HEAD, its
+/// tip, and the status — for the two callers that want a generation token and
+/// have no operation in hand (the post-execution generation stamped onto an
+/// operation record, and the stash pop's apply-to-drop comparison).
+///
+/// Its `census` is [`no_census_taken`], and that is safe *because* neither
+/// caller verifies a precondition: both take the result straight to
+/// `generation_token`, which does not read the field. Spelled as its own
+/// function rather than reached by passing a made-up operation, so the
+/// distinction is a thing a reader can see rather than a convention.
+async fn observe_live_for_generation(repo: &Path) -> Observed {
     Observed {
         head_branch: read_head_branch_blocking(repo).await,
         head_tip: Obs::from_read(rev_parse(repo, "HEAD").await),
         branch_tip: Obs::Absent,
         status: worktree_status(repo).await,
         held_at_build: Vec::new(),
+        census: no_census_taken(),
     }
 }
 
@@ -1467,7 +1555,7 @@ async fn enforce_fresh(
     plan: &Plan,
     observed: &Observed,
 ) -> Result<(), (StatusCode, String)> {
-    let live = observe_live(repo).await;
+    let live = observe_live(repo, &plan.operation).await;
     // D5: an observation that never happened cannot certify freshness. The
     // generation digest already fails closed here — `Obs::Unknown` carries a
     // nonce, so an unknown on either side makes the tokens differ — but that
@@ -1496,7 +1584,7 @@ async fn enforce_fresh(
         if observed.held_at_build.get(i).copied().unwrap_or(false) {
             verify_precondition(repo, precondition, &live).await?;
         } else if refuses_when_unmet_at_build(precondition) {
-            return Err(unmet_at_build(precondition));
+            return Err(unmet_at_build(precondition, &live.census));
         }
     }
     Ok(())
@@ -1556,6 +1644,27 @@ pub(crate) fn refuses_when_unmet_at_build(precondition: &Precondition) -> bool {
         | Precondition::BranchNotCheckedOut { .. }
         | Precondition::CleanWorktree
         | Precondition::SeedRecorded => false,
+        // M11.02 (#547) — and the one arm where the narrow question above
+        // ("does the executor refuse?") gets the *right* answer for the
+        // *wrong* reason if answered too quickly.
+        //
+        // git does refuse: `git checkout x` with `x` live in another linked
+        // worktree exits non-zero with `fatal: 'x' is already used by
+        // worktree at '/some/path'`. Read only as "does something downstream
+        // say no?", that is a `false` — and `false` is precisely the defect
+        // this feature exists to remove. The spec names the trap by name
+        // (`docs/superpowers/specs/m3.23-worktrees.md` §1, "the specific trap
+        // to avoid when implementing"): the precondition looks
+        // downstream-guarded, this gate skips it, and the user meets a raw
+        // `fatal:` they cannot act on from a browser.
+        //
+        // The second reason is sharper still. `false` also means the census
+        // failing at build time — "nobody looked" — reaches the executor,
+        // where git's refusal is the *only* remaining check and an unread
+        // enumeration has already been folded into a bare `false` by
+        // `held_now`. `true` is what keeps "could not check" from being spent
+        // as "checked, and fine".
+        Precondition::BranchFreeInEveryOtherWorktree { .. } => true,
     }
 }
 
@@ -1566,7 +1675,14 @@ pub(crate) fn refuses_when_unmet_at_build(precondition: &Precondition) -> bool {
 /// against the same repository with the remote configured would be accepted —
 /// this is a statement about the repository, which is what every other
 /// precondition refusal in `verify_precondition` is too.
-fn unmet_at_build(precondition: &Precondition) -> (StatusCode, String) {
+fn unmet_at_build(precondition: &Precondition, census: &WorktreeCensus) -> (StatusCode, String) {
+    // M11.02 (#547): this one's whole answer lives in the census rather than
+    // in the precondition's own fields, and the honest response differs by
+    // what the census says — so it composes a full response of its own
+    // instead of a sentence to be wrapped in a 409.
+    if let Precondition::BranchFreeInEveryOtherWorktree { branch } = precondition {
+        return collision_refusal(branch, census, CollisionMoment::AlreadySo);
+    }
     let why = match precondition {
         Precondition::RemoteConfigured { remote } => format!(
             "Remote ‘{}’ is not configured in this repository — nothing was contacted. \
@@ -1580,6 +1696,108 @@ fn unmet_at_build(precondition: &Precondition) -> (StatusCode, String) {
     };
     eprintln!("git-vista: refusing an unmet precondition: {why}");
     (StatusCode::CONFLICT, why)
+}
+
+/// Which gate is refusing a [`Precondition::BranchFreeInEveryOtherWorktree`]
+/// — the only thing the two refusals differ on (M11.02, #547).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CollisionMoment {
+    /// The branch was free when the plan was built and is not now: another
+    /// worktree took it in between. A race, in this codebase's usual sense.
+    Race,
+    /// It was not free (or could not be checked) when the plan was built.
+    AlreadySo,
+}
+
+/// The refusal for [`Precondition::BranchFreeInEveryOtherWorktree`], composed
+/// in exactly one place (M11.02, #547).
+///
+/// Two gates can reach it — [`verify_precondition`] when the precondition held
+/// at build time and broke, and [`unmet_at_build`] when it never held — and a
+/// user meeting one has no way of knowing which. One composer is what stops
+/// them drifting into saying different things about the same repository, the
+/// divergence between "what offers an operation" and "what permits it" that
+/// the spec calls out by name.
+///
+/// # It names the worktree, because that is the whole point
+///
+/// `git checkout` already refuses this, with `fatal: 'x' is already used by
+/// worktree at '/some/path'`. Relaying that is not a feature. "Already
+/// checked out somewhere" is not one either: it is the same dead end with the
+/// one actionable word removed. So every branch below that *knows* a holder
+/// names it, and says what can be done about it.
+fn collision_refusal(
+    branch: &BranchName,
+    census: &WorktreeCensus,
+    moment: CollisionMoment,
+) -> (StatusCode, String) {
+    let holder = branch_holder(census, branch);
+    let branch = branch.as_str();
+    match holder {
+        BranchHolder::HeldBy(sibling) => {
+            // The path only when the operator opted into path exposure; the
+            // short name is always there and is what the picker shows.
+            let where_it_is = match &sibling.path {
+                Some(path) => format!("‘{}’ ({path})", sibling.name),
+                None => format!("‘{}’", sibling.name),
+            };
+            let taken = match moment {
+                CollisionMoment::Race => format!(
+                    "The worktree {where_it_is} checked out ‘{branch}’ while this plan was pending."
+                ),
+                CollisionMoment::AlreadySo => {
+                    format!("‘{branch}’ is already checked out in the worktree {where_it_is}.")
+                }
+            };
+            // What to do about it — and the offer is only honest when the
+            // sibling is one this application may actually open. A worktree
+            // outside the allowed roots is visible for exactly this check and
+            // for nothing else; a missing one has no directory left to open.
+            let offer = match sibling.serviceable {
+                Serviceable::Yes => format!(
+                    "Git allows a branch in only one worktree at a time. Open ‘{}’ instead \
+                     of checking it out here.",
+                    sibling.name
+                ),
+                Serviceable::OutsideAllowedRoots => format!(
+                    "Git allows a branch in only one worktree at a time. ‘{}’ lies outside \
+                     the folders this app is allowed to open, so switch to it in a terminal, \
+                     or check out a different branch here.",
+                    sibling.name
+                ),
+                Serviceable::Missing => format!(
+                    "Git allows a branch in only one worktree at a time. ‘{}’ has no directory \
+                     left on disk but git still holds its entry — `git worktree prune` releases \
+                     the branch.",
+                    sibling.name
+                ),
+            };
+            (StatusCode::CONFLICT, format!("{taken} {offer}"))
+        }
+        // Nobody looked. The one thing this must not do is claim a worktree —
+        // "another worktree has this branch" would be a fabricated fact about
+        // a worktree nobody observed, which is worse than the raw `fatal:`
+        // this feature replaces.
+        BranchHolder::Unknown(reason) => couldnt_run(
+            &format!("precondition on ‘{branch}’"),
+            &format!(
+                "couldn't check whether another worktree has ‘{branch}’ checked out, so this \
+                 plan cannot be verified: {reason}"
+            ),
+        ),
+        // Reachable only from `AlreadySo`, and only for the narrow case where
+        // the build-time census failed (or found a holder) and the live one
+        // says the branch is free. The plan was still built on a view where
+        // this check did not pass, so it is refused — but it says what
+        // actually happened rather than inventing a holder to blame.
+        BranchHolder::Free => (
+            StatusCode::CONFLICT,
+            format!(
+                "Couldn't confirm ‘{branch}’ was free of other worktrees when this plan was \
+                 built — refresh and try again."
+            ),
+        ),
+    }
 }
 
 /// Check one [`Precondition`] against the live repository. `live` supplies the
@@ -1734,6 +1952,34 @@ async fn verify_precondition(
             Some(Ok(_)) => Ok(()),
             _ => refuse("The recorded seed is gone or unreadable — refusing to reset.".to_string()),
         },
+        // M11.02 (#547). Three-valued, from `live.census`, and the third
+        // value is not a `false`:
+        //
+        //   Observed, no other worktree holds it  -> the checkout may run
+        //   Observed, a sibling holds it          -> refused, and NAMED
+        //   CensusFailed                          -> refused as unverifiable
+        //
+        // Reached here only when the precondition *held* when the plan was
+        // built, so arriving at either refusal means the repository moved
+        // under a plan the user had already approved — a race, refused,
+        // rather than the raw `fatal:` git would have produced a moment
+        // later. The already-taken-at-build-time case is
+        // `refuses_when_unmet_at_build`'s, and both go through
+        // `collision_refusal` so they cannot say different things.
+        //
+        // No git call of its own: the census was read by `observe_live` as
+        // part of this same observation, which is what makes it the *live*
+        // answer and not the plan's.
+        Precondition::BranchFreeInEveryOtherWorktree { branch } => {
+            match branch_holder(&live.census, branch) {
+                BranchHolder::Free => Ok(()),
+                BranchHolder::HeldBy(_) | BranchHolder::Unknown(_) => Err(collision_refusal(
+                    branch,
+                    &live.census,
+                    CollisionMoment::Race,
+                )),
+            }
+        }
     }
 }
 
@@ -2125,12 +2371,26 @@ async fn shape(
         ),
         GitOperation::CheckoutBranch { branch } => {
             let target = heads(branch);
-            let preconditions = target
+            let mut preconditions: Vec<Precondition> = target
                 .iter()
                 .map(|r| Precondition::RefExists {
                     ref_name: r.clone(),
                 })
                 .collect();
+            // M11.02 (#547): git refuses a branch that is live in another
+            // linked worktree, and that refusal is correct. Stating it as a
+            // precondition is what lets the UI decline to offer the button
+            // and lets the server refuse in words that name the worktree —
+            // instead of running the command and relaying `fatal: 'x' is
+            // already used by worktree at '/some/path'`.
+            //
+            // Attached unconditionally, exactly like every other precondition
+            // here: whether it *holds* is `held_now`'s question, asked
+            // against the census `observe_operation` just took, and asked
+            // again by `enforce_fresh` against a fresh one.
+            preconditions.push(Precondition::BranchFreeInEveryOtherWorktree {
+                branch: branch.clone(),
+            });
             // HEAD's symbolic move: from the current branch (or, detached, the
             // exact commit it sits on) to the named branch.
             let before = match (&head_ref, &head_oid) {
@@ -3699,6 +3959,12 @@ mod commit_classification_suite;
 // every remote-reaching operation.
 #[cfg(test)]
 mod remote_operation_shape_suite;
+
+// M11.02 (#547): the checkout-collision precondition — the planner attaching
+// it, the server enforcing it with no UI in the call stack, and the one place
+// the three census outcomes become English.
+#[cfg(test)]
+mod worktree_collision_suite;
 
 // M10 (#590): the plan export's one seam into this crate — proof that every
 // printable operation's argv is built by the shared builder the export reads,

@@ -147,5 +147,6 @@ pub use version::{
     PROTOCOL_HEADER, PROTOCOL_QUERY, PROTOCOL_VERSION, REQUEST_ID_HEADER,
 };
 pub use worktree::{
-    parse_worktree_porcelain, Serviceable, WorktreeCensus, WorktreeListRecord, WorktreeSibling,
+    branch_holder, parse_worktree_porcelain, BranchHolder, Serviceable, WorktreeCensus,
+    WorktreeListRecord, WorktreeSibling,
 };

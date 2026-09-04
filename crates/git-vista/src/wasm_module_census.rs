@@ -331,27 +331,25 @@ const THRESHOLD_LINES: usize = 150;
 ///
 /// These are not all the same kind of gap, and the reasons say so plainly.
 /// Several are real, unpinned debt named here for the first time by this
-/// census (`app/canvas.rs`, `gestures.rs`, `print.rs`, `render/labels.rs`,
-/// `dialogs/open_url.rs`, `features/diff/staging_view.rs`) — landing this
-/// module does not close those gaps, it is what makes them visible instead
-/// of requiring another by-hand read of the tree to rediscover.
-/// `features/shell/signals.rs` was one of them and is the first to leave:
-/// its overlay rules moved into `features::shell::core`, whose tests read it
-/// with `include_str!`, so `exempt_entries_still_need_exempting` would now
-/// reject the entry as stale. Others are argued thin on inspection
+/// census (`gestures.rs`, `print.rs`, `render/labels.rs`,
+/// `features/diff/staging_view.rs`) — landing this module does not close
+/// those gaps, it is what makes them visible instead of requiring another
+/// by-hand read of the tree to rediscover; #653 tracks the four that remain.
+///
+/// Two have already left. `app/canvas.rs` went when its 409 handler moved to
+/// `features::history::core::drift_reload`; `features/shell/signals.rs` went
+/// when its overlay payload map moved to `features::shell::core`. Neither
+/// entry was removed as a courtesy someone remembered —
+/// [`exempt_entries_still_need_exempting`] demanded it the moment a host test
+/// started reading the file, which is this table working as intended.
+///
+/// Others are argued thin on inspection
 /// (`state.rs`, `session.rs`, `prefs.rs`, `features/stash/signals.rs`,
 /// `update_required.rs`) — the decision they would otherwise hide already
 /// lives in a host-tested `core` module, and what remains in the wasm-only
 /// file is sequencing or type definitions, not a decision this census's
 /// coverage proxy would usefully pin.
 const EXEMPT: &[(&str, &str)] = &[
-    (
-        "app/canvas.rs",
-        "808 lines, the append-loop and gesture/camera wiring layer between \
-         `App` and the render builders. Real, known debt: #645's own PR body \
-         names this file's 409 handler (`DriftReloading`) as an unpinned \
-         decision left outside that slice's allowed_paths. Not fixed here.",
-    ),
     (
         "gestures.rs",
         "511 lines, 11 free functions classifying pointer count into pan / \

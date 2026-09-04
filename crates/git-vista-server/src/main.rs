@@ -588,6 +588,14 @@ fn api_router(
             // commit?" to make `/api/blob` LAN-safe — that is exactly the
             // by-variant gating `/api/diff/spec`'s own comment above rejects,
             // one call site over: the whole route is withheld instead.
+            // M11.02 (#547): the worktree census. `full_routes` only, on the
+            // same line ADR 0005 draws for the three routes below it — a
+            // sibling's directory base name (and, when the operator opts in,
+            // its absolute path) is filesystem shape, which is not something
+            // the LAN router discloses. The frontend needs it to decline a
+            // checkout git would refuse; the LAN router offers no checkout to
+            // decline.
+            .route("/api/worktrees", get(handlers::read::worktree_list))
             .route("/api/conflicts", get(list_conflicts))
             .route("/api/blob/{oid}", get(blob_content))
             .route("/api/worktree-file/{*path}", get(worktree_file))

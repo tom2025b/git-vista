@@ -263,6 +263,7 @@ fn live_observed() -> Observed {
         branch_tip: Obs::Absent,
         status: Obs::Known(String::new()),
         held_at_build: Vec::new(),
+        census: super::no_census_taken(),
     }
 }
 
@@ -433,6 +434,7 @@ async fn two_unknown_observations_never_compare_equal() {
         branch_tip: Obs::Absent,
         status: Obs::Known(String::new()),
         held_at_build: Vec::new(),
+        census: super::no_census_taken(),
     };
     let known = || Observed {
         head_branch: Some("main".to_string()),
@@ -440,6 +442,7 @@ async fn two_unknown_observations_never_compare_equal() {
         branch_tip: Obs::Absent,
         status: Obs::Known(String::new()),
         held_at_build: Vec::new(),
+        census: super::no_census_taken(),
     };
     let absent = || Observed {
         head_branch: Some("main".to_string()),
@@ -447,6 +450,7 @@ async fn two_unknown_observations_never_compare_equal() {
         branch_tip: Obs::Absent,
         status: Obs::Known(String::new()),
         held_at_build: Vec::new(),
+        census: super::no_census_taken(),
     };
 
     // Control: two identical real observations DO compare equal. Without
@@ -491,6 +495,7 @@ async fn a_clean_worktree_does_not_hash_like_an_unreadable_one() {
         branch_tip: Obs::Absent,
         status,
         held_at_build: Vec::new(),
+        census: super::no_census_taken(),
     };
     assert_ne!(
         generation_token(&repo, &with(Obs::Known(String::new())))
@@ -637,7 +642,7 @@ async fn a_stage_entry_moving_with_the_worktree_untouched_moves_the_generation()
             &format!("100644,{blob_one},staged.txt"),
         ],
     );
-    let before = generation_token(&repo, &observe_live(&repo).await)
+    let before = generation_token(&repo, &observe_live_for_generation(&repo).await)
         .await
         .as_str()
         .to_string();
@@ -651,7 +656,7 @@ async fn a_stage_entry_moving_with_the_worktree_untouched_moves_the_generation()
             &format!("100644,{blob_two},staged.txt"),
         ],
     );
-    let after = generation_token(&repo, &observe_live(&repo).await)
+    let after = generation_token(&repo, &observe_live_for_generation(&repo).await)
         .await
         .as_str()
         .to_string();
@@ -723,7 +728,7 @@ async fn rewriting_one_conflict_stage_moves_the_generation() {
     // The conflict markers git wrote. Captured so the assertion at the end can
     // prove the working tree never moved.
     let worktree_before = std::fs::read(repo.join("a.txt")).unwrap();
-    let before = generation_token(&repo, &observe_live(&repo).await)
+    let before = generation_token(&repo, &observe_live_for_generation(&repo).await)
         .await
         .as_str()
         .to_string();
@@ -768,7 +773,7 @@ async fn rewriting_one_conflict_stage_moves_the_generation() {
     }
     assert!(child.wait().unwrap().success(), "update-index must succeed");
 
-    let after = generation_token(&repo, &observe_live(&repo).await)
+    let after = generation_token(&repo, &observe_live_for_generation(&repo).await)
         .await
         .as_str()
         .to_string();
