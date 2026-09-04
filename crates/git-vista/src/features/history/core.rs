@@ -191,11 +191,18 @@ mod tests {
             SeedPromotion::Ignore,
             "a retired epoch's failure must not raise an error over a live load"
         );
-        assert_eq!(
-            promote_seed(6, 5, Some(false)),
-            SeedPromotion::Ignore,
-            "and a reply from an epoch the shell has not reached yet is stale too"
-        );
+    }
+
+    #[test]
+    fn a_reply_from_an_epoch_the_shell_has_not_reached_is_stale_too() {
+        // The half a `seed_epoch < live_epoch` guard would silently drop.
+        // `force_bump` is not the only writer of the epoch, and a signal read
+        // with `get_untracked` inside an effect can lag the resource that was
+        // keyed on it — so "ahead" is reachable, and mounting off it would put
+        // a graph on screen for an epoch the rest of the shell has not
+        // switched to. Equality is the rule; ordering is not.
+        assert_eq!(promote_seed(6, 5, Some(false)), SeedPromotion::Ignore);
+        assert_eq!(promote_seed(6, 5, None), SeedPromotion::Ignore);
     }
 
     #[test]
@@ -246,16 +253,17 @@ mod tests {
     // ---- seed_retry_still_wanted ----------------------------------------
 
     #[test]
-    fn an_armed_retry_fires_only_into_the_failure_it_was_armed_for() {
+    fn an_armed_retry_fires_into_the_failure_it_was_armed_for() {
         assert!(
             seed_retry_still_wanted(HistoryPhase::SeedError { epoch: 5 }, 5),
             "the failure is still on screen — the retry is exactly what it is for"
         );
-        assert!(
-            !seed_retry_still_wanted(HistoryPhase::SeedError { epoch: 6 }, 5),
-            "a later failure is a new chain with its own budget; firing into it \
-             spends an attempt that chain never counted"
-        );
+    }
+
+    #[test]
+    fn an_armed_retry_does_not_fire_once_the_failure_is_off_screen() {
+        // The user refreshed manually, or a drift reload superseded the
+        // failure. Firing now races a reload already in flight.
         for superseded in [
             HistoryPhase::SeedLoading { epoch: 5 },
             HistoryPhase::Ready { epoch: 5 },
@@ -267,6 +275,24 @@ mod tests {
                  a reload already in flight"
             );
         }
+    }
+
+    #[test]
+    fn an_armed_retry_does_not_fire_into_a_different_failure_chain() {
+        // Still a SeedError, so a phase-only check would wave this through —
+        // and the phase-only check is the plausible simplification, because
+        // `HistoryPhase::SeedError` reads like the whole condition. It is not:
+        // #218 budgets attempts *per failure chain*, so a timer armed for
+        // epoch 5 firing into epoch 6's failure spends an attempt that chain
+        // never counted, and the give-up arrives early and unexplained.
+        assert!(!seed_retry_still_wanted(
+            HistoryPhase::SeedError { epoch: 6 },
+            5
+        ));
+        assert!(!seed_retry_still_wanted(
+            HistoryPhase::SeedError { epoch: 4 },
+            5
+        ));
     }
 
     // ---- the seam ------------------------------------------------------
