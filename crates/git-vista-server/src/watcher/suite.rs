@@ -240,3 +240,39 @@ fn a_symlinked_refs_root_is_named_as_watch_loss_not_followed() {
             if path == refs && reason == "refs root is not a real directory"
     ));
 }
+
+/// PROBE (review only, not part of #655): a watched ref namespace replaced
+/// **in place** by a fresh inode. This is the miss mode #552 names — "inotify
+/// watches are lost on directory replacement" — and it is the one case
+/// `reconcile_watches` alone cannot repair, because the path is in both
+/// `wanted` and `installed` before and after, so the diff is empty and the
+/// watch is left pointing at the dead inode.
+#[tokio::test]
+async fn a_namespace_replaced_in_place_keeps_a_live_watch() {
+    let repo = repository();
+    git(repo.path(), &["branch", "team/one"]);
+    let heads = repo.path().join(".git/refs/heads");
+    let team = heads.join("team");
+    let spare = heads.join("spare");
+
+    let mut watcher = RepositoryWatcher::start(repo.path());
+    assert!(matches!(
+        next_notice(&mut watcher).await,
+        WatcherNotice::Health(WatcherHealth::Watching { .. })
+    ));
+
+    // One atomic syscall: `team`'s inode is unlinked and a different empty
+    // directory takes its name. Nothing before or after distinguishes the two
+    // by path, which is exactly why the diff-based reconcile cannot see it.
+    std::fs::create_dir(&spare).unwrap();
+    std::fs::remove_file(team.join("one")).unwrap();
+    std::fs::rename(&spare, &team).expect("replace the namespace inode in place");
+
+    tokio::time::sleep(MAX_DEBOUNCE_DELAY + Duration::from_millis(100)).await;
+    while watcher.notices.try_recv().is_ok() {}
+
+    // A ref inside the replaced namespace. The parent watch is non-recursive,
+    // so only a live watch on `team` itself can hint this.
+    std::fs::write(team.join("two"), "0000000000000000000000000000000000000000\n").unwrap();
+    assert_eq!(next_notice(&mut watcher).await, WatcherNotice::Sweep);
+}
