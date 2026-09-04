@@ -18,6 +18,10 @@ pub mod dialogs;
 pub mod diff;
 pub mod explain;
 pub mod graph;
+// #612: the graph panel's load phase. The signal lives in the `App` shell
+// (wasm-only); the three rules that move it are here, where a host test runs
+// them and a source census pins the shell to their answers.
+pub mod history;
 pub mod operations;
 pub mod preview;
 // #387: the full-screen viewer's readiness predicate — derived from the same

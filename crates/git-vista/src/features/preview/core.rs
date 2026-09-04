@@ -391,6 +391,309 @@ pub fn reassurance(view: &PreviewView) -> Option<&'static str> {
     }
 }
 
+/// What the confirm dialog's preview slot should do, for one state of that
+/// dialog.
+///
+/// Two arms, not three: "no dialog is open" and "this dialog has no picture"
+/// are the same instruction to the slot, and collapsing them **here** rather
+/// than in the caller is the whole point of this type existing. See
+/// [`preview_action`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewAction {
+    /// Ask the engine for this operation's picture.
+    Start(GitOperation),
+    /// Show no picture, and invalidate any request already on the wire.
+    Clear,
+}
+
+/// What the preview slot should do for the confirm dialog's current subject.
+///
+/// # Why this is a function and not four lines in the effect
+///
+/// It *was* four lines in the effect — a `match` in `dialogs/confirm.rs`, which
+/// is `#[cfg(target_arch = "wasm32")]`. [`previewable`] and
+/// `features::dialogs::core::preview_subject` were both already here in core
+/// and both host-tested, and #594's mutation proof duly reported "both caught"
+/// — while only ever reaching those two. The line that *composed* them was
+/// invisible to every runner, so swapping `preview.clear()` for `preview.start`
+/// on the wrong arm, or dropping the `None` arm entirely, would have compiled,
+/// shipped and stayed green. That is #612's premise, and this is the instance
+/// #612's own body names. Moving the composition here is what makes the
+/// original proof honest in retrospect.
+///
+/// # Both "no dialog" and "not previewable" clear
+///
+/// A close is what invalidates an in-flight request: clearing bumps the
+/// preview generation, so a reply already on the wire cannot paint the *next*
+/// dialog with the last one's picture. An unpreviewable dialog needs the same
+/// treatment for the same reason — it may well be the dialog that opened over
+/// a previewable one. The two paths must not diverge, so they are one arm.
+///
+/// # It never gates
+///
+/// There is deliberately no third arm meaning "refuse". Every operation
+/// reaching a confirm dialog was confirmable before previews existed and stays
+/// confirmable when there is no picture — the rule
+/// [`PreviewView::advisory_only`] states, kept unrepresentable here.
+pub fn preview_action(subject: Option<DialogSubject<'_>>) -> PreviewAction {
+    match subject.and_then(previewable) {
+        Some(operation) => PreviewAction::Start(operation),
+        None => PreviewAction::Clear,
+    }
+}
+
+#[cfg(test)]
+mod preview_action_tests {
+    use super::*;
+
+    use crate::features::dialogs::core::preview_subject;
+    use crate::features::operations::kind::{HeadBranch, OperationKind};
+    use git_vista_core::activity::{UndoAction, Undoable};
+
+    /// The wasm-only confirm modal, read as text. `dialogs/confirm.rs` is
+    /// `#[cfg(target_arch = "wasm32")]`, so this is the only way a host test
+    /// can see what it does with the answers below — the same thing
+    /// `features::a11y::audit` does for markup it cannot mount.
+    const CONFIRM: &str = include_str!("../../dialogs/confirm.rs");
+
+    const OID: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn undoable(action: UndoAction) -> Undoable {
+        Undoable {
+            action,
+            label: "undo".to_string(),
+            warn_pushed: false,
+        }
+    }
+
+    /// The effect body in `confirm.rs` that drives the preview slot.
+    fn preview_effect_body() -> String {
+        let after = CONFIRM
+            .split_once("let action = match &shell.confirm_op() {")
+            .expect("dialogs/confirm.rs no longer contains the preview effect")
+            .1;
+        let end = after
+            .find("    });")
+            .expect("the preview effect is no longer a closed block");
+        after[..end].to_string()
+    }
+
+    #[test]
+    fn every_previewable_dialog_asks_for_the_operation_it_is_about() {
+        assert_eq!(
+            preview_action(Some(DialogSubject::Merge { branch: "feature" })),
+            PreviewAction::Start(GitOperation::MergeBranch {
+                branch: BranchName::new("feature").expect("a valid branch name"),
+            }),
+        );
+        assert_eq!(
+            preview_action(Some(DialogSubject::Revert { commit: OID })),
+            PreviewAction::Start(GitOperation::RevertCommit {
+                commit: CommitOid::new(OID).expect("a valid oid"),
+            }),
+        );
+        assert_eq!(
+            preview_action(Some(DialogSubject::CherryPick { commit: OID })),
+            PreviewAction::Start(GitOperation::CherryPick {
+                commit: CommitOid::new(OID).expect("a valid oid"),
+            }),
+        );
+    }
+
+    #[test]
+    fn a_dialog_with_no_picture_and_no_dialog_at_all_give_the_same_instruction() {
+        // The collapse this function exists for. `confirm.rs` used to make it
+        // itself, in a nested match no runner could reach: an unpreviewable
+        // dialog opening over a previewable one must invalidate the picture
+        // already on the wire exactly as a close does, or the new dialog
+        // inherits the old one's graph.
+        assert_eq!(
+            preview_action(Some(DialogSubject::NotPreviewable)),
+            PreviewAction::Clear,
+        );
+        assert_eq!(preview_action(None), PreviewAction::Clear);
+    }
+
+    #[test]
+    fn a_name_this_app_could_not_have_produced_draws_no_picture_and_does_not_panic() {
+        // `BranchName`/`CommitOid` validate on construction, and the right
+        // behaviour in a dialog is no picture — the operation itself is still
+        // confirmable, and it is the server that must refuse a bad name.
+        assert_eq!(
+            preview_action(Some(DialogSubject::Merge { branch: "" })),
+            PreviewAction::Clear,
+        );
+        assert_eq!(
+            preview_action(Some(DialogSubject::Revert { commit: "nope" })),
+            PreviewAction::Clear,
+        );
+    }
+
+    #[test]
+    fn every_dialog_subject_is_routed_and_only_the_engines_three_get_a_picture() {
+        // Completeness in the shape #531 taught: one flag per variant, ticked
+        // by an exhaustive match so a new `DialogSubject` is a *compile* error
+        // here, then asserted by name so a missing entry is a named red
+        // assertion rather than a stale count.
+        #[derive(Default)]
+        struct Census {
+            merge: bool,
+            revert: bool,
+            cherry_pick: bool,
+            not_previewable: bool,
+        }
+        let mut census = Census::default();
+        let mut started = 0usize;
+        for subject in [
+            DialogSubject::Merge { branch: "b" },
+            DialogSubject::Revert { commit: OID },
+            DialogSubject::CherryPick { commit: OID },
+            DialogSubject::NotPreviewable,
+        ] {
+            match subject {
+                DialogSubject::Merge { .. } => census.merge = true,
+                DialogSubject::Revert { .. } => census.revert = true,
+                DialogSubject::CherryPick { .. } => census.cherry_pick = true,
+                DialogSubject::NotPreviewable => census.not_previewable = true,
+            }
+            if matches!(preview_action(Some(subject)), PreviewAction::Start(_)) {
+                started += 1;
+            }
+        }
+        assert!(census.merge, "Merge is not in the list above");
+        assert!(census.revert, "Revert is not in the list above");
+        assert!(census.cherry_pick, "CherryPick is not in the list above");
+        assert!(
+            census.not_previewable,
+            "NotPreviewable is not in the list above"
+        );
+        assert_eq!(
+            started, 3,
+            "the engine previews exactly three operations \
+             (git-vista-server/src/preview.rs) and this side must ask for the \
+             same three — no more, or the dialog spends two round trips to be \
+             told Unsupported; no fewer, and #594 is back"
+        );
+    }
+
+    /// The two host-tested halves, composed — which is the one thing neither
+    /// half could prove on its own.
+    ///
+    /// `preview_subject`'s variant mapping is already pinned next door in
+    /// `features::dialogs::core`, and `previewable`'s table is pinned above.
+    /// What was never checked is that an `OperationKind` as the modal actually
+    /// holds it comes out the far end as the *right instruction*, because the
+    /// line joining them lived in `dialogs/confirm.rs`. So this asserts the
+    /// composed answer, not the intermediate subject.
+    #[test]
+    fn an_operation_the_modal_holds_composes_all_the_way_to_its_picture() {
+        let action = |kind: OperationKind| preview_action(Some(preview_subject(&kind)));
+
+        assert_eq!(
+            action(OperationKind::Merge {
+                branch: "feature".into(),
+                into: HeadBranch::Known("main".into()),
+            }),
+            PreviewAction::Start(GitOperation::MergeBranch {
+                branch: BranchName::new("feature").expect("a valid branch name"),
+            }),
+        );
+        assert_eq!(
+            action(OperationKind::CherryPick {
+                commit: OID.into(),
+                onto: HeadBranch::Known("main".into()),
+            }),
+            PreviewAction::Start(GitOperation::CherryPick {
+                commit: CommitOid::new(OID).expect("a valid oid"),
+            }),
+            "a cherry-pick must reach a CherryPick preview — Revert carries the \
+             same single commit id and is the exact inverse"
+        );
+        assert_eq!(
+            action(OperationKind::Undo(undoable(UndoAction::RevertCommit {
+                commit: OID.into()
+            }))),
+            PreviewAction::Start(GitOperation::RevertCommit {
+                commit: CommitOid::new(OID).expect("a valid oid"),
+            }),
+        );
+        // And an undo that moves a ref reaches the same `Undo` arm as the one
+        // that IS previewable, so it is the case most likely to leak a picture
+        // of the wrong operation.
+        assert_eq!(
+            action(OperationKind::Undo(undoable(UndoAction::ResetBranch {
+                branch: "main".into(),
+                to: OID.into(),
+                expected_tip: OID.into(),
+            }))),
+            PreviewAction::Clear,
+        );
+        assert_eq!(
+            action(OperationKind::Checkout {
+                branch: "main".into(),
+                current: None,
+            }),
+            PreviewAction::Clear,
+        );
+    }
+
+    #[test]
+    fn the_confirm_dialog_routes_its_preview_through_core() {
+        let body = preview_effect_body();
+        assert!(
+            body.contains("preview_action("),
+            "the confirm dialog no longer calls `preview_action`, so every test \
+             above proves a rule nothing uses. Effect body was:\n{body}"
+        );
+        assert!(
+            !body.contains("previewable("),
+            "the confirm dialog calls `previewable` directly again. That is the \
+             composition #594's mutation proof could not see, back in a wasm-only \
+             file. Effect body was:\n{body}"
+        );
+        assert_eq!(
+            CONFIRM.matches("preview.start(").count(),
+            1,
+            "`preview.start` is reachable from more than one place in confirm.rs; \
+             only the `PreviewAction::Start` arm may ask for a picture"
+        );
+        assert_eq!(
+            CONFIRM.matches("preview.clear(").count(),
+            1,
+            "`preview.clear` is reachable from more than one place in confirm.rs; \
+             only the `PreviewAction::Clear` arm may invalidate one"
+        );
+    }
+
+    #[test]
+    fn the_confirm_dialog_does_not_have_the_two_arms_the_wrong_way_round() {
+        // The mutation this whole slice exists to make catchable. Both method
+        // names appear in the file either way, so counting them proves nothing
+        // about which arm reaches which — pair each arm with the first
+        // `preview.` call that follows it, in source order.
+        let body = preview_effect_body();
+        for (arm, expected) in [
+            ("PreviewAction::Start", "preview.start("),
+            ("PreviewAction::Clear", "preview.clear("),
+        ] {
+            let at = body
+                .find(arm)
+                .unwrap_or_else(|| panic!("confirm.rs no longer matches on `{arm}`:\n{body}"));
+            let rest = &body[at + arm.len()..];
+            let call = rest
+                .find("preview.")
+                .unwrap_or_else(|| panic!("the `{arm}` arm calls nothing on the preview slot"));
+            assert!(
+                rest[call..].starts_with(expected),
+                "the `{arm}` arm reaches `{}` and not `{expected}` — the two arms \
+                 are swapped, which draws the last dialog's picture over this one \
+                 (or draws none at all for a dialog that has one)",
+                &rest[call..rest[call..].find('(').map_or(rest.len(), |o| call + o + 1)],
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "core_suite.rs"]
 mod core_suite;
