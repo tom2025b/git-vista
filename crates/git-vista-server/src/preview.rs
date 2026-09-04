@@ -240,6 +240,22 @@ const STORE_MARKER_MAGIC: &[u8] = b"git-vista preview scratch store v1\n";
 ///   a directory alone.
 const STALE_SCRATCH_AGE: Duration = Duration::from_secs(60 * 60);
 
+/// How many times [`ScratchStore::lease_if_free`] asks before it believes a
+/// `WouldBlock`, and how long it waits between asks.
+///
+/// Sized against measurement, not taste: every spurious refusal captured on
+/// #598 cleared within ~35 µs, and the immediately-repeated call on the same
+/// descriptor always succeeded. Eight asks a millisecond apart is roughly two
+/// hundred times the longest window observed, which leaves room for a loaded
+/// CI runner without letting the sweep block a runtime worker for long. The
+/// whole budget is spent only on a candidate that is stale, marked, and
+/// refused once — see [`ScratchStore::lease_if_free`] for why a live store
+/// cannot be reaped however many times it is asked.
+const LEASE_ATTEMPTS: u32 = 8;
+
+/// The pause between the asks [`LEASE_ATTEMPTS`] counts.
+const LEASE_RETRY_PAUSE: Duration = Duration::from_millis(1);
+
 /// Every git spawn this module makes: the sealed launcher, `NetworkNeed::Local`,
 /// one place.
 ///
@@ -1468,8 +1484,60 @@ impl ScratchStore {
         if head != STORE_MARKER_MAGIC {
             return None;
         }
-        f.try_lock().ok()?;
-        Some(f)
+        Self::lease_if_free(&f).then_some(f)
+    }
+
+    /// Take `marker`'s lease, asking [`LEASE_ATTEMPTS`] times before believing
+    /// a refusal.
+    ///
+    /// # Why once is not enough (#598)
+    ///
+    /// A single `try_lock` is not evidence that anybody owns this store. On
+    /// titan, running the whole `preview::` module in one process, the sweep
+    /// was measured refusing stores that **nothing on the box held**:
+    ///
+    /// ```text
+    /// LEASE-REFUSAL ... variant=WouldBlock dev=66310 ino=25562238
+    ///   locks=[] in_process_fds=[] other_processes=[] freed_after=27.315µs
+    /// LEASE-REFUSAL-SAMEFD ino=25562238 spins_until_free=0
+    /// ```
+    ///
+    /// No row in `/proc/locks`, no descriptor on that inode in this process or
+    /// any other the user can read — and the very next `try_lock`, on the
+    /// *same* descriptor with nothing in between, succeeded. Every captured
+    /// occurrence answered at spin 0; the longest observed window was ~35 µs.
+    /// Some captures did show a `/proc/locks` row naming this process while no
+    /// descriptor anywhere pointed at the inode, which is what a close whose
+    /// lock has not finished being released looks like from outside.
+    ///
+    /// So `WouldBlock` conflates two opposite facts — "a live preview owns
+    /// this" and "a descriptor that is already gone has not finished letting
+    /// go" — and the sweep was drawing the destructive-by-omission conclusion
+    /// from both. It skipped genuinely abandoned stores, which is the exact
+    /// leak `sweep_stale` exists to prevent, and it did so at random.
+    ///
+    /// # Why this cannot reap a live store
+    ///
+    /// A live store's lease is held from [`Self::claim`] until the
+    /// [`ScratchStore`] drops — continuously, never reopened. Every one of the
+    /// [`LEASE_ATTEMPTS`] asks therefore refuses, and the answer for a live
+    /// store is unchanged. Only a lock that is *already gone* can flip, which
+    /// is the definition of abandoned. Retrying narrows the false negatives
+    /// and cannot create a false positive.
+    ///
+    /// The whole budget is [`LEASE_ATTEMPTS`] × [`LEASE_RETRY_PAUSE`] and is
+    /// paid only by a candidate that is already past [`STALE_SCRATCH_AGE`],
+    /// carries the magic, and refused once — never on the normal path.
+    fn lease_if_free(marker: &std::fs::File) -> bool {
+        for attempt in 1..=LEASE_ATTEMPTS {
+            if marker.try_lock().is_ok() {
+                return true;
+            }
+            if attempt < LEASE_ATTEMPTS {
+                std::thread::sleep(LEASE_RETRY_PAUSE);
+            }
+        }
+        false
     }
 
     /// The `--git-dir=<abs>` token.

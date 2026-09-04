@@ -5373,3 +5373,120 @@ fn the_wrapper_hands_the_layout_the_window_it_documents() {
          caller asked for. This is #576 finding 7 at the wrapper"
     );
 }
+// ---------------------------------------------------------------------------
+// #598 — the sweep's lease gate
+// ---------------------------------------------------------------------------
+
+/// A lease nobody holds is taken on the **first** ask, with no waiting.
+///
+/// [`ScratchStore::lease_if_free`] exists because a single `try_lock` refusal
+/// is not evidence of an owner (#598). The budget it spends to establish that
+/// must be spent only when it is refused — the free case is the one every
+/// store-creating preview walks, and a gate that always sleeps its whole
+/// budget would put [`LEASE_ATTEMPTS`] × [`LEASE_RETRY_PAUSE`] in front of
+/// every reclaimable store in a user's `.git`.
+///
+/// # Two mutations, failing differently
+///
+/// 1. **Removes the mechanism** — `lease_if_free` returns `false` without ever
+///    calling `try_lock`. The `assert!` on the answer goes red; the timing
+///    assertion stays green, because refusing instantly is still instant.
+/// 2. **Weakens it** — the successful ask stops returning early and lets the
+///    loop run out, so the gate still answers correctly but always spends its
+///    whole budget. The first assertion stays green; the timing assertion goes
+///    red at ~7 ms against a bound of 4.
+#[test]
+fn a_free_lease_is_taken_on_the_first_ask() {
+    let dir = TempDir::new().expect("tempdir");
+    let store = dir.path().join(format!("{SCRATCH_PREFIX}free"));
+    std::fs::create_dir_all(&store).expect("create the store");
+    drop(ScratchStore::claim(&store).expect("claim it, then let go"));
+
+    let marker = std::fs::File::open(store.join(STORE_MARKER)).expect("open the marker");
+    let started = std::time::Instant::now();
+    let taken = ScratchStore::lease_if_free(&marker);
+    let elapsed = started.elapsed();
+
+    assert!(
+        taken,
+        "an unheld lease must be taken: without this the sweep can never \
+         reclaim anything, and every test that asserts a store was removed is \
+         satisfied by a sweep that has stopped working"
+    );
+    // A literal for the same reason the held-lease test uses one: a bound
+    // spelled `LEASE_RETRY_PAUSE * n` shrinks to nothing the moment the pause
+    // is the thing mutated. 4 ms sits well above a single uncontended
+    // `try_lock` even on a box running twenty test threads, and well below the
+    // 7 ms a gate that spent its whole budget would take.
+    const A_FIRST_ASK: Duration = Duration::from_millis(4);
+    assert!(
+        elapsed < A_FIRST_ASK,
+        "the free path must not pay the retry budget — it is walked on every \
+         reclaimable store in a user's `.git`, and this took {elapsed:?}"
+    );
+}
+
+/// A lease somebody really holds is refused — and only after **every** ask.
+///
+/// This is the half that proves the retry is there at all. A live store holds
+/// its marker's lease continuously from [`ScratchStore::claim`] until the
+/// store drops, so every ask refuses and the answer is unchanged; what the
+/// elapsed time proves is that the gate asked more than once before drawing
+/// that conclusion.
+///
+/// The holder is a **second open of the same file**. `flock` is per open file
+/// description, not per process, so a descriptor opened here conflicts with
+/// one opened there even though both live in this test — which is exactly the
+/// relationship a sweeper has with a live store in another process.
+///
+/// # Two mutations, failing differently
+///
+/// 1. **Removes the mechanism** — `LEASE_ATTEMPTS` drops to 1, the shape this
+///    code had before #598. The answer is still `false`, so the first
+///    assertion stays green; the elapsed assertion goes red at ~0 against a
+///    floor of 7 ms.
+/// 2. **Weakens it** — the refusal arm returns `true` instead of continuing,
+///    so a held lease reads as free. The elapsed assertion is unreachable and
+///    the first goes red — a live preview's store handed to `remove_dir_all`.
+#[test]
+fn a_held_lease_is_refused_only_after_every_ask() {
+    let dir = TempDir::new().expect("tempdir");
+    let store = dir.path().join(format!("{SCRATCH_PREFIX}held"));
+    std::fs::create_dir_all(&store).expect("create the store");
+    let held = ScratchStore::claim(&store).expect("claim it and keep holding");
+
+    let marker = std::fs::File::open(store.join(STORE_MARKER)).expect("open the marker");
+    assert!(
+        matches!(marker.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+        "the holder must really conflict with this descriptor, or the test \
+         below proves nothing about a lease that is genuinely held"
+    );
+
+    let started = std::time::Instant::now();
+    let taken = ScratchStore::lease_if_free(&marker);
+    let elapsed = started.elapsed();
+
+    assert!(
+        !taken,
+        "a lease held by a live store must be refused: taking it hands a \
+         running preview's scratch store to `remove_dir_all`"
+    );
+    // A LITERAL, deliberately not `LEASE_RETRY_PAUSE * (LEASE_ATTEMPTS - 1)`.
+    // Deriving the floor from the constants under test makes the assertion
+    // move with the mutation: cut `LEASE_ATTEMPTS` to 1 and the floor becomes
+    // zero, which every elapsed time clears. That is a test asserting a
+    // mapping by calling the function that defines it, and this repository has
+    // shipped one before. 7 ms is eight asks a millisecond apart, minus the
+    // pause the eighth does not take; changing either constant is meant to
+    // land here.
+    const ASKING_EVERY_TIME_COSTS: Duration = Duration::from_millis(7);
+    assert!(
+        elapsed >= ASKING_EVERY_TIME_COSTS,
+        "the gate must ask every time before believing a refusal — a single \
+         `try_lock` says `WouldBlock` for a descriptor that is already gone as \
+         readily as for a live store (#598). It answered in {elapsed:?}, under \
+         the {ASKING_EVERY_TIME_COSTS:?} that asking {LEASE_ATTEMPTS} times \
+         costs"
+    );
+    drop(held);
+}
