@@ -1128,15 +1128,13 @@ pub fn verdict_after_drop(drop: &DropOutcome) -> PopVerdict {
     }
 }
 
-// ── What the drawer is doing, and what it last said (#612) ──────────────────
+// ── What the drawer is doing, and what it last said ─────────────────────────
 //
-// These three items lived in the wasm-only `signals.rs` until #612. Nothing in
-// them ever needed a DOM — the busy map is a `HashMap<String, &'static str>`
-// and the notice is a plain struct built from this module's own verdicts — but
-// sitting beside `RwSignal` put them where `cargo test -p git-vista --bins`
-// never compiled them, so the #515 and #518 invariants their own doc comments
-// assert were held by code review and by nothing else. Both are now pinned by
-// host tests below. `signals.rs` re-exports all three, so no call site moved.
+// Framework-free on purpose: the busy map is a `HashMap<String, &'static str>`
+// and the notice is a plain struct built from this module's own verdicts, so
+// `cargo test -p git-vista --bins` compiles and runs all of it. That is what
+// pins the #515 and #518 invariants their doc comments assert. `signals.rs`
+// re-exports all three, so no call site names this module directly.
 
 /// The busy key for the push control, which has no stash entry of its own.
 ///

@@ -1,10 +1,9 @@
-//! What the graph panel is doing, and the three rules that move it (#612).
+//! What the graph panel is doing, and the three rules that move it.
 //!
-//! Framework-free on purpose. Every function here used to be an expression
-//! inside a `create_effect` in [`crate::app`], which is wasm-only — so the
-//! rules were readable, reviewable, and unprovable. Nothing in this file
-//! touches Leptos or `crate::api`, so `cargo test -p git-vista --bins`
-//! compiles and runs all of it.
+//! Framework-free on purpose: nothing here touches Leptos or `crate::api`, so
+//! `cargo test -p git-vista --bins` compiles and runs all of it. The shell in
+//! [`crate::app`] is wasm-only and drives these rules rather than restating
+//! them; a source census pins it to their answers.
 
 /// What the graph panel is doing, independent of what the seed resource
 /// happens to be holding. Each variant carries the reload epoch it belongs to,
