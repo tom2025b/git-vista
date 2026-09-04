@@ -1,4 +1,4 @@
-# ADR 0113 — The launch selection is written once, and the lock is what says so
+# ADR 0114 — The launch selection is written once, and the lock is what says so
 
 - **Status:** Accepted — implemented, mutation-proved two ways failing differently
 - **Date:** 2026-09-03
