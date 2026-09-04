@@ -5373,138 +5373,106 @@ fn the_wrapper_hands_the_layout_the_window_it_documents() {
          caller asked for. This is #576 finding 7 at the wrapper"
     );
 }
-
 // ---------------------------------------------------------------------------
-// #598 — the lease-refusal probe
+// #598 — the sweep's lease gate
 // ---------------------------------------------------------------------------
 
-/// Report a `try_lock` refusal at the instant it happens, from inside
-/// [`ScratchStore::abandoned_store_lease`]'s error arm.
+/// A lease nobody holds is taken on the **first** ask, with no waiting.
 ///
-/// # Why this cannot live in the test body
+/// [`ScratchStore::lease_if_free`] exists because a single `try_lock` refusal
+/// is not evidence of an owner (#598). The budget it spends to establish that
+/// must be spent only when it is refused — the free case is the one every
+/// store-creating preview walks, and a gate that always sleeps its whole
+/// budget would put [`LEASE_ATTEMPTS`] × [`LEASE_RETRY_PAUSE`] in front of
+/// every reclaimable store in a user's `.git`.
 ///
-/// The first diagnostic (#610) read `/proc/self/fd` and `/proc/locks` from the
-/// test, after the sweep had returned. Both came back empty while `try_lock`
-/// had refused — a contradiction that turned out to be a measurement artefact:
-/// the holder had let go by then. `strace -y` cannot settle it either, because
-/// under `strace` the failure stops reproducing at all (0 of 4 runs).
+/// # Two mutations, failing differently
 ///
-/// So the probe runs here, on the error arm, with the refusing descriptor still
-/// open. Two deliberate differences from the earlier probe:
-///
-/// * the identity comes from an **`fstat` on the refusing fd**, not a fresh
-///   `stat` on the path, so it describes the file that actually refused;
-/// * open descriptors are matched by **`(dev, ino)`**, not by comparing
-///   `read_link` output against the marker path. `flock` is per-inode, so a
-///   holder that reached the same inode by a different spelling — a resolved
-///   versus unresolved temp dir, a symlinked `/tmp` — is invisible to a path
-///   comparison and obvious to this one. `/proc/self/fd` is process-wide, so
-///   any thread's descriptor shows up here.
-///
-/// The cross-process scan is skipped whenever an in-process holder was found:
-/// a legitimate refusal (a live store's own lease) always has one, and walking
-/// every `/proc/<pid>/fd` on the common path would perturb the timing this
-/// whole investigation depends on.
-pub(super) fn note_lease_refusal(
-    candidate: &Path,
-    refused: &std::fs::File,
-    error: &std::fs::TryLockError,
-) {
-    use std::os::unix::fs::MetadataExt;
+/// 1. **Removes the mechanism** — `lease_if_free` returns `false` without ever
+///    calling `try_lock`. The `assert!` on the answer goes red; the timing
+///    assertion stays green, because refusing instantly is still instant.
+/// 2. **Weakens it** — the pause moves ahead of the `try_lock`, so every call
+///    sleeps at least once. The answer is still correct and the first
+///    assertion stays green; the timing assertion goes red at ~1 ms against a
+///    bound of 4.
+#[test]
+fn a_free_lease_is_taken_on_the_first_ask() {
+    let dir = TempDir::new().expect("tempdir");
+    let store = dir.path().join(format!("{SCRATCH_PREFIX}free"));
+    std::fs::create_dir_all(&store).expect("create the store");
+    drop(ScratchStore::claim(&store).expect("claim it, then let go"));
 
-    let variant = match error {
-        std::fs::TryLockError::WouldBlock => "WouldBlock".to_string(),
-        std::fs::TryLockError::Error(e) => {
-            format!("Error(kind={:?} errno={:?})", e.kind(), e.raw_os_error())
-        }
-    };
-    let (dev, ino) = match refused.metadata() {
-        Ok(meta) => (meta.dev(), meta.ino()),
-        Err(err) => {
-            eprintln!(
-                "LEASE-REFUSAL candidate={} variant={variant} fstat=UNPROBED: {err}",
-                candidate.display()
-            );
-            return;
-        }
-    };
+    let marker = std::fs::File::open(store.join(STORE_MARKER)).expect("open the marker");
+    let started = std::time::Instant::now();
+    let taken = ScratchStore::lease_if_free(&marker);
+    let elapsed = started.elapsed();
 
-    let locks = match std::fs::read_to_string("/proc/locks") {
-        Ok(text) => {
-            let rows: Vec<&str> = text
-                .lines()
-                .filter(|line| line.contains(&format!(":{ino} ")))
-                .collect();
-            format!("{rows:?}")
-        }
-        Err(err) => format!("UNPROBED: {err}"),
-    };
-
-    let mine = fds_on_inode(std::path::Path::new("/proc/self/fd"), dev, ino);
-    let in_process = match &mine {
-        Ok(found) => format!("{found:?}"),
-        Err(err) => format!("UNPROBED: {err}"),
-    };
-
-    // Only when nothing in this process explains it: who else on the box?
-    let elsewhere = match &mine {
-        Ok(found) if found.is_empty() => other_processes_on_inode(dev, ino),
-        Ok(_) => "(not scanned: an in-process holder was found)".to_string(),
-        Err(_) => "(not scanned: the in-process probe failed)".to_string(),
-    };
-
-    eprintln!(
-        "LEASE-REFUSAL candidate={} thread={:?} variant={variant} dev={dev} ino={ino} \
-         locks={locks} in_process_fds={in_process} other_processes={elsewhere}",
-        candidate.display(),
-        std::thread::current().name(),
+    assert!(
+        taken,
+        "an unheld lease must be taken: without this the sweep can never \
+         reclaim anything, and every test that asserts a store was removed is \
+         satisfied by a sweep that has stopped working"
+    );
+    assert!(
+        elapsed < LEASE_RETRY_PAUSE * 4,
+        "the free path must not pay the retry budget — it is walked on every \
+         reclaimable store in a user's `.git`, and this took {elapsed:?}"
     );
 }
 
-/// Descriptors under `fd_dir` whose target is exactly `(dev, ino)`.
+/// A lease somebody really holds is refused — and only after **every** ask.
 ///
-/// `Err` is "could not look", which must never render as "found nothing".
-fn fds_on_inode(fd_dir: &Path, dev: u64, ino: u64) -> std::io::Result<Vec<String>> {
-    use std::os::unix::fs::MetadataExt;
-    let mut found = vec![];
-    for entry in std::fs::read_dir(fd_dir)? {
-        let Ok(entry) = entry else { continue };
-        // Follows the /proc symlink, so this stats the target, not the link.
-        let Ok(meta) = std::fs::metadata(entry.path()) else {
-            continue;
-        };
-        if meta.dev() == dev && meta.ino() == ino {
-            found.push(format!(
-                "fd {} -> {:?}",
-                entry.file_name().to_string_lossy(),
-                std::fs::read_link(entry.path()).ok()
-            ));
-        }
-    }
-    Ok(found)
-}
+/// This is the half that proves the retry is there at all. A live store holds
+/// its marker's lease continuously from [`ScratchStore::claim`] until the
+/// store drops, so every ask refuses and the answer is unchanged; what the
+/// elapsed time proves is that the gate asked more than once before drawing
+/// that conclusion.
+///
+/// The holder is a **second open of the same file**. `flock` is per open file
+/// description, not per process, so a descriptor opened here conflicts with
+/// one opened there even though both live in this test — which is exactly the
+/// relationship a sweeper has with a live store in another process.
+///
+/// # Two mutations, failing differently
+///
+/// 1. **Removes the mechanism** — `LEASE_ATTEMPTS` drops to 1, the shape this
+///    code had before #598. The answer is still `false`, so the first
+///    assertion stays green; the elapsed assertion goes red at ~0 against a
+///    floor of 7 ms.
+/// 2. **Weakens it** — the refusal arm returns `true` instead of continuing,
+///    so a held lease reads as free. The elapsed assertion is unreachable and
+///    the first goes red — a live preview's store handed to `remove_dir_all`.
+#[test]
+fn a_held_lease_is_refused_only_after_every_ask() {
+    let dir = TempDir::new().expect("tempdir");
+    let store = dir.path().join(format!("{SCRATCH_PREFIX}held"));
+    std::fs::create_dir_all(&store).expect("create the store");
+    let held = ScratchStore::claim(&store).expect("claim it and keep holding");
 
-/// The same question asked of every other process this user can read.
-fn other_processes_on_inode(dev: u64, ino: u64) -> String {
-    let Ok(procs) = std::fs::read_dir("/proc") else {
-        return "UNPROBED: /proc unreadable".to_string();
-    };
-    let mut hits = vec![];
-    for entry in procs.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !name.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        // Unreadable is normal here (other users, exited processes) and is not
-        // reported per-pid; the summary line below says how many were skipped.
-        if let Ok(found) = fds_on_inode(&entry.path().join("fd"), dev, ino) {
-            if !found.is_empty() {
-                let comm = std::fs::read_to_string(entry.path().join("comm"))
-                    .unwrap_or_else(|_| "?".into());
-                hits.push(format!("pid {name} ({}) {found:?}", comm.trim()));
-            }
-        }
-    }
-    format!("{hits:?}")
+    let marker = std::fs::File::open(store.join(STORE_MARKER)).expect("open the marker");
+    assert!(
+        matches!(marker.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+        "the holder must really conflict with this descriptor, or the test \
+         below proves nothing about a lease that is genuinely held"
+    );
+
+    let started = std::time::Instant::now();
+    let taken = ScratchStore::lease_if_free(&marker);
+    let elapsed = started.elapsed();
+
+    assert!(
+        !taken,
+        "a lease held by a live store must be refused: taking it hands a \
+         running preview's scratch store to `remove_dir_all`"
+    );
+    let floor = LEASE_RETRY_PAUSE * (LEASE_ATTEMPTS - 1);
+    assert!(
+        elapsed >= floor,
+        "the gate must ask {LEASE_ATTEMPTS} times before believing a \
+         refusal — a single `try_lock` says `WouldBlock` for a descriptor \
+         that is already gone as readily as for a live store (#598). It \
+         answered in {elapsed:?}, under the {floor:?} that asking every time \
+         costs"
+    );
+    drop(held);
 }
