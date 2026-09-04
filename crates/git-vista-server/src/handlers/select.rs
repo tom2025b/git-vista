@@ -75,12 +75,26 @@ pub(crate) async fn select_repo(Json(req): Json<SelectRequest>) -> (StatusCode, 
 /// path comes from `git worktree list --porcelain` run inside the repository
 /// the session already has selected.
 ///
-/// `expose_paths: true` on that internal census is **not a disclosure**.
-/// Nothing from it is serialized to the client — this handler answers with a
-/// status and a sentence it composes itself — and the path is needed locally
-/// because registration takes a path. The operator's `GIT_VISTA_EXPOSE_PATHS`
-/// opt-in governs what leaves the process, not what the process may know about
-/// its own repository.
+/// # `expose_paths: true` on the internal census — precisely
+///
+/// The census is taken with paths on because registration takes a path. What
+/// that discloses differs by arm, and the honest statement has to say so:
+///
+/// * **`Observed`** — the sibling rows are read locally and never serialized.
+///   This handler answers with a status and a sentence it composes itself, so
+///   nothing the operator's `GIT_VISTA_EXPOSE_PATHS` opt-in would have
+///   withheld reaches the client.
+/// * **`CensusFailed`** — the `reason` **is** returned to the client, and
+///   `worktree_census` builds those reasons from porcelain output and
+///   `common_dir.display()`. Absolute paths do reach a response body on this
+///   arm, and they do so regardless of the flag.
+///
+/// The second bullet is not introduced here: `GET /api/worktrees` (M11.01,
+/// #546) already answers `CensusFailed.reason` verbatim with `expose_paths`
+/// off. It is recorded because ADR 0117 originally claimed the first bullet
+/// covered both, which was wrong (Grok, round 6, finding 4) — see that ADR's
+/// §2a for why redacting it is a separate decision with a real cost, and not
+/// one this route should make on its own.
 pub(crate) async fn select_discovered_worktree(
     Json(req): Json<SelectWorktreeRequest>,
 ) -> (StatusCode, String) {
@@ -218,8 +232,10 @@ mod worktree_admission_tests {
     /// wider fence, not a wrong value, so every behavioural test still passes.
     const STATE: &str = include_str!("../state.rs");
 
-    /// The body of `register_discovered_worktree`.
-    fn register_body() -> String {
+    /// `register_discovered_worktree`'s body, with `//` comment lines dropped
+    /// and whitespace collapsed — so the comparison below is about what the
+    /// function *does*, not how it is laid out or documented.
+    fn register_body_normalised() -> String {
         let after = STATE
             .split_once("pub(crate) fn register_discovered_worktree(")
             .expect("state.rs no longer defines `register_discovered_worktree`")
@@ -227,51 +243,107 @@ mod worktree_admission_tests {
         let end = after
             .find("\n}\n")
             .expect("`register_discovered_worktree` is no longer a closed block");
-        after[..end].to_string()
+        after[..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(|line| line.split_whitespace())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
-    /// **The security property of M11.03 (#548), stated where it can be
-    /// checked.**
+    /// **The security property of M11.03 (#548), pinned as an exact body.**
     ///
     /// `register_explicit` allows a root and then registers under it, which is
     /// right for a path an operator named on the command line. Doing the same
     /// for a *discovered* worktree would make "git listed this directory"
     /// sufficient to widen the fence — and creating a worktree would become a
     /// way to make this app serve any directory on the filesystem. That is the
-    /// second of the three options `docs/superpowers/specs/m3.23-worktrees.md`
-    /// §1 weighs, and the one it rejects in as many words.
+    /// option `docs/superpowers/specs/m3.23-worktrees.md` §1 weighs and
+    /// rejects in as many words.
     ///
     /// The whole guarantee is therefore an **omission**: this function must
-    /// call `register` and must not call `allow_root`. An omission has no
+    /// call `register` and must widen nothing first. An omission has no
     /// runtime signature — adding the call makes the app serve *more*, never
     /// less, so no existing test goes red and nothing looks wrong. Reading the
-    /// source is the only place this can be caught.
+    /// source is the only place it can be caught.
+    ///
+    /// # Why exact, and not a list of forbidden calls
+    ///
+    /// This test used to require `.register(` and forbid the substring
+    /// `allow_root`. Grok's round-6 review found the hole: the *other*
+    /// widening API in that same file is `allow_repo_root`, and the string
+    /// `allow_repo_root` does **not contain** `allow_root` — the shorter name
+    /// is not a substring of the longer one. A body calling
+    /// `allow_repo_root(path)` and then `.register(path, …)` would have stayed
+    /// green while widening the fence, and the paired catalog test would have
+    /// stayed green too, because `register` still refuses — *after* the new
+    /// root was allowed.
+    ///
+    /// Lengthening the denylist (`allow_repo_root`, `register_explicit`, …)
+    /// would fix that instance and leave the shape intact: a denylist is a
+    /// list someone has to remember to extend, and the next widening API to be
+    /// added would not be on it. An exact body has nothing to keep complete.
+    ///
+    /// This test failing is not necessarily a bug. It means a
+    /// security-critical function changed, and the change wants a human to
+    /// look at it and update the literal deliberately. That is the intended
+    /// cost.
     #[test]
     fn admitting_a_discovered_worktree_never_widens_the_allowed_roots() {
-        let body = register_body();
-        assert!(
-            body.contains(".register("),
-            "`register_discovered_worktree` no longer registers anything:\n{body}"
+        const EXPECTED: &str = concat!(
+            "path: &Path, read_only: bool, ",
+            ") -> Result<RepositoryHandle, CatalogError> { ",
+            "catalog() .write() .expect(\"catalog lock\") .register(path, read_only)",
         );
-        assert!(
-            !body.contains("allow_root"),
-            "`register_discovered_worktree` allows a new root. Discovering a \
-             worktree would then be enough to widen the fence, which is how \
-             `git worktree add` becomes a way to make this app serve any \
-             directory:\n{body}"
+        assert_eq!(
+            register_body_normalised(),
+            EXPECTED,
+            "\n`register_discovered_worktree` changed. Its guarantee is an OMISSION: it \
+             admits a path to the catalog and must widen nothing on the way. Adding any \
+             root-allowing call here — `allow_root`, `allow_repo_root`, \
+             `register_explicit`, or one that does not exist yet — makes discovering a \
+             worktree enough to widen the fence, and no behavioural test will notice. \
+             Read the diff, confirm it does not widen, then update this literal \
+             deliberately.\n"
         );
     }
 
-    /// The paired positive: the fence exists to be hit, and the function that
-    /// enforces it is the one this calls. Without this, the assertion above is
-    /// satisfied by a `register_discovered_worktree` that does nothing at all.
+    /// The paired positive for the pin above. An exact-body assertion is only
+    /// worth having if the body it pins does the safe thing, and a literal
+    /// someone updates without thinking would satisfy it either way. This
+    /// names the one fact the literal exists to protect, so the update still
+    /// has to keep it true.
+    #[test]
+    fn the_pinned_body_admits_through_the_catalog_and_nothing_else() {
+        let body = register_body_normalised();
+        assert!(
+            body.contains(".register(path, read_only)"),
+            "`register_discovered_worktree` no longer admits anything through \
+             `Catalog::register`: {body}"
+        );
+    }
+
+    /// The **second half of "enforced twice"**, which lives in another file and
+    /// which the exact-body pin above cannot see.
+    ///
+    /// The census marks a sibling `Serviceable::Yes` only when its canonical
+    /// path is already inside an allowed root; `Catalog::register` then asks
+    /// the same question again, independently, and fails closed. Grok's review
+    /// confirmed the second check is not weaker than the first — it re-derives
+    /// `facts.root` itself rather than trusting the caller's `Serviceable`.
+    ///
+    /// If that refusal ever goes away, the exact body above is still exactly
+    /// right and the fence is gone anyway. So it is asserted here, separately,
+    /// and a mutation removing it lands on *this* assertion rather than that
+    /// one.
     #[test]
     fn the_registration_it_calls_is_the_one_that_fails_closed() {
         const CATALOG: &str = include_str!("../catalog.rs");
         assert!(
             CATALOG.contains("return Err(CatalogError::OutsideAllowedRoots);"),
             "`Catalog::register` no longer refuses a path outside the allowed \
-             roots, so the second half of this route's defence is gone"
+             roots, so the second half of this route's defence is gone — and the \
+             first half is a type, which cannot notice"
         );
     }
 }

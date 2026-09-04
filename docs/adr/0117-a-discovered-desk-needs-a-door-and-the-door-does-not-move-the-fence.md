@@ -103,10 +103,52 @@ reading the source — `admitting_a_discovered_worktree_never_widens_the_allowed
 — with a paired positive asserting that the `register` it calls is still the one
 that refuses an outside path.
 
-`expose_paths: true` on the handler's internal census is **not** a disclosure.
-Nothing from it is serialized to the client; the path is needed locally because
-registration takes a path. The operator's opt-in governs what leaves the
-process, not what the process may know about its own repository.
+### 2a. `expose_paths: true` on the internal census — what it does and does not disclose
+
+The handler takes its census with `expose_paths: true` because registration
+takes a path and the handler has to have one. The question that makes that
+acceptable is narrower than "is anything disclosed": it is **does census output
+need redacting before it reaches a client?** Answered honestly, in two halves,
+because the two halves have different answers.
+
+**On the success path, no.** An `Observed` census's `WorktreeSibling::path` is
+read locally and never serialized: this handler answers with a status and a
+sentence it composes itself, and no sibling row reaches the response. So
+`expose_paths: true` here discloses nothing that the operator's
+`GIT_VISTA_EXPOSE_PATHS` opt-in would otherwise have withheld.
+
+**On the failure path, yes — and this ADR previously said otherwise.** A
+`WorktreeCensus::CensusFailed { reason }` is answered as `Couldn't read this
+repository's worktrees, so nothing was selected: {reason}`, and those reasons
+are built in `worktree_census` from porcelain output and `common_dir.display()`.
+That is an absolute path in a response body. The original sentence here —
+*"nothing from that census is serialized to the client"* — was true of
+`Observed` and false of `CensusFailed`, and it was stated as though it covered
+both (found by Grok, round 6, finding 4).
+
+Two facts bound the size of that, and neither excuses the wrong sentence:
+
+- It is **not introduced by this route.** `GET /api/worktrees` (M11.01, #546)
+  already returns `CensusFailed.reason` verbatim, and does so **with
+  `expose_paths` off** — the failure arm never consulted the flag.
+- The audience is an authenticated session on the loopback-only router, and the
+  paths are the operator's own.
+
+**So the real defect is a contract one, not a leak to a stranger:**
+`GIT_VISTA_EXPOSE_PATHS` is the control whose stated guarantee is that absolute
+paths do not leave the process unless the operator opts in, and the census's
+failure arm makes that guarantee untrue as stated. A control that is right on
+the path everyone tests and wrong on the path nobody does is the shape worth
+naming.
+
+**This ADR deliberately does not fix it**, because the fix is a real trade-off
+and belongs to whoever weighs it rather than to a slice about something else. A
+`CensusFailed` reason is *how you find out why enumeration failed*; redacting
+paths out of it costs exactly the diagnosability it exists for. The two shapes
+worth considering — strip paths from the reason, or split it into a client-safe
+summary plus a server-only detail — are a change to M11.01's wire contract, not
+to this route. Recorded here so the next reader inherits the accurate sentence
+and the open question together.
 
 ### 3. Three facts on a row, and they stay three
 
