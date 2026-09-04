@@ -43,6 +43,61 @@ pub fn phase_for_epoch_bump(current: HistoryPhase, epoch: u64) -> Option<History
     }
 }
 
+/// Everything the graph panel does when a page fetch comes back `409` — the
+/// server telling this canvas the history moved underneath it.
+///
+/// Three settings, and they travel together because they answer one question:
+/// the drift announcement, print's fate, and the completeness flag. Returned
+/// as a value rather than applied, so the wasm-only canvas is left with
+/// nothing to decide — only signals to write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriftReload {
+    /// The announcement: [`HistoryPhase::DriftReloading`] carrying the epoch
+    /// being reloaded *into*, never the one being left behind. See
+    /// [`drift_reload`] for why that distinction is the whole mechanism.
+    pub phase: HistoryPhase,
+    /// Print closes. A print sheet is rendered from one generation of history
+    /// and cannot span two, and this reply says the generation is already
+    /// gone — so there is no honest way to keep it open across the reload.
+    pub print_open: bool,
+    /// The new epoch has not been seeded yet, let alone paged to the end, so
+    /// the full-history latch drops. Leaving it set would tell the UI the
+    /// reload it is about to start has already finished.
+    pub complete: bool,
+}
+
+/// Bump the graph epoch and describe the drift announcement that goes with it.
+///
+/// # Why this takes the bump instead of the epoch
+///
+/// The announcement has to carry the epoch the bump *produced*. The App's
+/// reload effect asks [`phase_for_epoch_bump`], which preserves a
+/// `DriftReloading` only when its epoch equals the epoch that just bumped —
+/// so an announcement built from the epoch the canvas was standing on *before*
+/// the drift fails that comparison and is replaced with a plain
+/// [`HistoryPhase::SeedLoading`]. The user-visible cost of getting it backwards
+/// is precise: the "History moved" copy, which is the only thing on screen
+/// explaining why the graph they were reading vanished, is overwritten by a
+/// bare "Loading…".
+///
+/// That ordering used to live as a comment over four statements in
+/// `app/canvas.rs`, where it was a rule a reader had to honour. Taking the
+/// bump as a closure makes it a rule the type system honours instead: there is
+/// no way to call this function and get back a `DriftReloading` carrying a
+/// pre-bump epoch, because the only epoch in scope here is the one `bump`
+/// returned. The wrong order is not merely discouraged, it is unrepresentable.
+///
+/// `bump` is [`FnOnce`] on purpose — an epoch bump is not idempotent, and one
+/// 409 must advance the epoch exactly once.
+pub fn drift_reload(bump: impl FnOnce() -> u64) -> DriftReload {
+    let epoch = bump();
+    DriftReload {
+        phase: HistoryPhase::DriftReloading { epoch },
+        print_open: false,
+        complete: false,
+    }
+}
+
 /// What one seed reply is allowed to do to the phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeedPromotion {
@@ -100,6 +155,8 @@ pub fn seed_retry_still_wanted(current: HistoryPhase, armed_for: u64) -> bool {
 mod tests {
     use super::*;
 
+    use std::cell::Cell;
+
     /// The source of the wasm-only shell, read as text. Nothing below mounts a
     /// DOM; these read the effects the way `features::a11y::audit` reads the
     /// markup it cannot mount, and for the same reason — `app/mod.rs` is
@@ -107,11 +164,17 @@ mod tests {
     /// can see it at all.
     const APP_MOD: &str = include_str!("../../app/mod.rs");
 
+    /// The canvas, read as text, for the same reason and by the same means.
+    /// `app/canvas.rs` is wasm-only too, so its 409 arm is invisible to every
+    /// test above; this is how the arm gets pinned to `drift_reload` instead of
+    /// being trusted to keep calling it.
+    const CANVAS: &str = include_str!("../../app/canvas.rs");
+
     /// Text between `open` and the first `close` after it.
     fn block_after(haystack: &str, open: &str, close: &str, what: &str) -> String {
         let after = haystack
             .split_once(open)
-            .unwrap_or_else(|| panic!("app/mod.rs no longer contains {what} (anchor: {open:?})"))
+            .unwrap_or_else(|| panic!("the source no longer contains {what} (anchor: {open:?})"))
             .1;
         let end = after.find(close).unwrap_or_else(|| {
             panic!("{what} is no longer a closed block (looking for {close:?})")
@@ -169,6 +232,88 @@ mod tests {
             phase_for_epoch_bump(HistoryPhase::DriftReloading { epoch: 7 }, 6),
             Some(HistoryPhase::SeedLoading { epoch: 6 }),
             "and neither must one from a later epoch"
+        );
+    }
+
+    // ---- drift_reload ---------------------------------------------------
+
+    #[test]
+    fn a_drift_reload_announces_the_epoch_the_bump_produced() {
+        let epoch = Cell::new(5u64);
+        let reload = drift_reload(|| {
+            epoch.set(epoch.get() + 1);
+            epoch.get()
+        });
+
+        assert_eq!(
+            reload.phase,
+            HistoryPhase::DriftReloading { epoch: 6 },
+            "the announcement must carry the post-bump epoch, not the one the \
+             canvas was standing on when the 409 arrived"
+        );
+        assert!(!reload.print_open, "a 409 closes print");
+        assert!(
+            !reload.complete,
+            "the new epoch has not been seeded, so the full-history latch drops"
+        );
+    }
+
+    #[test]
+    fn the_bump_runs_exactly_once() {
+        // An epoch bump is not idempotent: calling it twice would advance past
+        // the generation the announcement names, and `phase_for_epoch_bump`
+        // would then discard that announcement as stale (see the test below).
+        let calls = Cell::new(0u32);
+        let reload = drift_reload(|| {
+            calls.set(calls.get() + 1);
+            7
+        });
+        assert_eq!(calls.get(), 1, "drift_reload must bump the epoch once");
+        assert_eq!(reload.phase, HistoryPhase::DriftReloading { epoch: 7 });
+    }
+
+    #[test]
+    fn the_drift_announcement_survives_the_reload_effect_it_triggers() {
+        // The composition, and the whole point of the pair. Everything above
+        // proves each half in isolation; #612's origin was a defect that lived
+        // in the *line joining* two host-tested halves, in wasm-only code no
+        // runner executed. So this asserts the join: the phase `drift_reload`
+        // produces is fed to the rule `app/mod.rs`'s reload effect applies when
+        // it observes the very epoch that bump created.
+        let epoch = Cell::new(5u64);
+        let reload = drift_reload(|| {
+            epoch.set(epoch.get() + 1);
+            epoch.get()
+        });
+
+        assert_eq!(
+            phase_for_epoch_bump(reload.phase, epoch.get()),
+            None,
+            "the reload effect must leave the drift announcement alone — \
+             overwriting it replaces the only copy explaining why the graph \
+             vanished with a bare \"Loading…\""
+        );
+    }
+
+    #[test]
+    fn announcing_before_the_bump_would_lose_the_drift_notice() {
+        // The ordering claim, made checkable rather than only documented.
+        //
+        // `drift_reload` takes the bump as a closure precisely so this shape is
+        // unrepresentable through it — there is no pre-bump epoch in scope to
+        // announce. This test builds the wrong announcement by hand anyway, to
+        // pin down *why* that matters: an announcement made before the bump
+        // carries the old epoch, and the reload effect then discards it.
+        //
+        // If this assertion ever flips to `None`, the epoch comparison in
+        // `phase_for_epoch_bump` has stopped discriminating and `drift_reload`'s
+        // closure signature is guarding nothing.
+        let before_the_bump = HistoryPhase::DriftReloading { epoch: 5 };
+        assert_eq!(
+            phase_for_epoch_bump(before_the_bump, 6),
+            Some(HistoryPhase::SeedLoading { epoch: 6 }),
+            "an announcement made before the bump is exactly the regression the \
+             closure signature exists to prevent: the reload effect replaces it"
         );
     }
 
@@ -296,10 +441,11 @@ mod tests {
 
     // ---- the seam ------------------------------------------------------
     //
-    // Everything above proves the rules. These prove `app/mod.rs` still asks
-    // them, which is the half that cannot be assumed: the effects are wasm-only,
-    // so a change that re-derives any of these rules inline would leave every
-    // test above passing while the shell stopped using the answer.
+    // Everything above proves the rules. These prove the shell still asks them,
+    // which is the half that cannot be assumed: `app/mod.rs`'s effects and
+    // `app/canvas.rs`'s fetch arms are both wasm-only, so a change that
+    // re-derives any of these rules inline would leave every test above passing
+    // while the shell stopped using the answer.
 
     #[test]
     fn the_epoch_reset_effect_asks_core_which_phase_to_set() {
@@ -320,6 +466,39 @@ mod tests {
              409 exception has been re-derived here instead of asked for. That is \
              precisely the shape #612 is about: this file is wasm-only, so the \
              second copy is unreachable from every test above. Effect body was:\n{body}"
+        );
+    }
+
+    #[test]
+    fn the_canvas_409_arm_asks_core_what_a_drift_reload_does() {
+        let body = block_after(
+            CANVAS,
+            "status: HTTP_CONFLICT,",
+            "\n                }\n",
+            "the canvas's 409 arm",
+        );
+        assert!(
+            body.contains("drift_reload("),
+            "the canvas's 409 arm no longer calls `drift_reload`. The drift \
+             response is a decision, and `app/canvas.rs` is wasm-only — a copy \
+             re-derived here is unreachable from every test above. Arm body \
+             was:\n{body}"
+        );
+        assert!(
+            !body.contains("HistoryPhase::DriftReloading"),
+            "the canvas's 409 arm names `DriftReloading` again, which means it \
+             is constructing the announcement itself instead of asking for it. \
+             That is the shape #612 is about, and it is also how the ordering \
+             rule gets lost: built here, the announcement can carry the \
+             pre-bump epoch, which `phase_for_epoch_bump` then discards. Arm \
+             body was:\n{body}"
+        );
+        assert!(
+            !body.contains("print_open.set(false)") && !body.contains("complete.set(false)"),
+            "the canvas's 409 arm hard-codes print_open/complete again rather \
+             than writing the values `drift_reload` returned. Those two flags \
+             are part of the same decision; restating them here lets them drift \
+             apart from the phase they travel with. Arm body was:\n{body}"
         );
     }
 
@@ -399,10 +578,9 @@ mod tests {
 
         // Which of them this crate decides where a test can watch. `Ready` and
         // `SeedError` come out of `promote_seed`, `SeedLoading` out of
-        // `phase_for_epoch_bump`. `DriftReloading` is the one exception and is
-        // set in `canvas.rs`'s 409 handler — still wasm-only, and named here so
-        // the gap is recorded rather than implied. Moving it is a later slice
-        // of #612; pretending it has already moved would be worse than the gap.
+        // `phase_for_epoch_bump`, and `DriftReloading` — the one that used to
+        // be the exception, constructed inline in `canvas.rs`'s wasm-only 409
+        // handler — now comes out of `drift_reload`. All four are decided here.
         assert_eq!(
             phase_for_epoch_bump(HistoryPhase::Ready { epoch: 0 }, 1),
             Some(HistoryPhase::SeedLoading { epoch: 1 })
@@ -415,11 +593,19 @@ mod tests {
             }
         );
         assert_eq!(promote_seed(1, 1, None), SeedPromotion::Failed { epoch: 1 });
+        // The 409 path has moved into core, so this no longer guards a
+        // decision — `the_canvas_409_arm_asks_core_what_a_drift_reload_does`
+        // does that. What is left in `app/mod.rs` is the match arm that *renders*
+        // the phase, and that is worth keeping pinned on its own account: with
+        // no arm drawing it, `drift_reload` would still set a phase nothing put
+        // on screen, and #64's drift notice would be gone with every test in
+        // this file still green.
         assert!(
             APP_MOD.contains("HistoryPhase::DriftReloading"),
-            "no code in app/mod.rs mentions DriftReloading any more. If the 409 \
-             path moved into core, delete this assertion and test the rule \
-             directly; if it was deleted, #64's drift notice went with it"
+            "no code in app/mod.rs mentions DriftReloading any more. The 409 \
+             path itself lives in `drift_reload` now, so this is about the \
+             render arm: nothing draws the drift notice, and #64's \
+             \"History moved\" copy went with it"
         );
     }
 }

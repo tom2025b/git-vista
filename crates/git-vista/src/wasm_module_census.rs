@@ -331,24 +331,21 @@ const THRESHOLD_LINES: usize = 150;
 ///
 /// These are not all the same kind of gap, and the reasons say so plainly.
 /// Several are real, unpinned debt named here for the first time by this
-/// census (`app/canvas.rs`, `features/shell/signals.rs`, `gestures.rs`,
-/// `print.rs`, `render/labels.rs`, `dialogs/open_url.rs`,
-/// `features/diff/staging_view.rs`) — landing this module does not close
-/// those gaps, it is what makes them visible instead of requiring another
-/// by-hand read of the tree to rediscover. Others are argued thin on inspection
+/// census (`features/shell/signals.rs`, `gestures.rs`, `print.rs`,
+/// `render/labels.rs`, `dialogs/open_url.rs`, `features/diff/staging_view.rs`)
+/// — landing this module does not close those gaps, it is what makes them
+/// visible instead of requiring another by-hand read of the tree to
+/// rediscover. `app/canvas.rs` was a seventh until its 409 handler moved to
+/// `features::history::core::drift_reload`; the entry naming it is gone
+/// because [`exempt_entries_still_need_exempting`] demanded it the moment a
+/// host test started reading the file, which is this table working as
+/// intended rather than a courtesy someone remembered. Others are argued thin on inspection
 /// (`state.rs`, `session.rs`, `prefs.rs`, `features/stash/signals.rs`,
 /// `update_required.rs`) — the decision they would otherwise hide already
 /// lives in a host-tested `core` module, and what remains in the wasm-only
 /// file is sequencing or type definitions, not a decision this census's
 /// coverage proxy would usefully pin.
 const EXEMPT: &[(&str, &str)] = &[
-    (
-        "app/canvas.rs",
-        "808 lines, the append-loop and gesture/camera wiring layer between \
-         `App` and the render builders. Real, known debt: #645's own PR body \
-         names this file's 409 handler (`DriftReloading`) as an unpinned \
-         decision left outside that slice's allowed_paths. Not fixed here.",
-    ),
     (
         "features/shell/signals.rs",
         "600 lines, 45 fns. Its own module doc argues the OverlayStack \
