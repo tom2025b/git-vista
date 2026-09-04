@@ -331,11 +331,14 @@ const THRESHOLD_LINES: usize = 150;
 ///
 /// These are not all the same kind of gap, and the reasons say so plainly.
 /// Several are real, unpinned debt named here for the first time by this
-/// census (`app/canvas.rs`, `features/shell/signals.rs`, `gestures.rs`,
-/// `print.rs`, `render/labels.rs`, `dialogs/open_url.rs`,
-/// `features/diff/staging_view.rs`) — landing this module does not close
-/// those gaps, it is what makes them visible instead of requiring another
-/// by-hand read of the tree to rediscover. Others are argued thin on inspection
+/// census (`app/canvas.rs`, `gestures.rs`, `print.rs`, `render/labels.rs`,
+/// `dialogs/open_url.rs`, `features/diff/staging_view.rs`) — landing this
+/// module does not close those gaps, it is what makes them visible instead
+/// of requiring another by-hand read of the tree to rediscover.
+/// `features/shell/signals.rs` was one of them and is the first to leave:
+/// its overlay rules moved into `features::shell::core`, whose tests read it
+/// with `include_str!`, so `exempt_entries_still_need_exempting` would now
+/// reject the entry as stale. Others are argued thin on inspection
 /// (`state.rs`, `session.rs`, `prefs.rs`, `features/stash/signals.rs`,
 /// `update_required.rs`) — the decision they would otherwise hide already
 /// lives in a host-tested `core` module, and what remains in the wasm-only
@@ -348,15 +351,6 @@ const EXEMPT: &[(&str, &str)] = &[
          `App` and the render builders. Real, known debt: #645's own PR body \
          names this file's 409 handler (`DriftReloading`) as an unpinned \
          decision left outside that slice's allowed_paths. Not fixed here.",
-    ),
-    (
-        "features/shell/signals.rs",
-        "600 lines, 45 fns. Its own module doc argues the OverlayStack \
-         consolidation exists BECAUSE six previously-unwatched overlay \
-         signals hid two real regressions (gestures.rs's incomplete Esc \
-         handler, the Activity/detail-panel race) — this file is exactly the \
-         kind of decision-bearing wasm-only module this census exists to \
-         flag, and it is currently unpinned. Real debt, not fixed here.",
     ),
     (
         "gestures.rs",
