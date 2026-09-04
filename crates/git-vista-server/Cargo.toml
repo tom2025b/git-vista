@@ -47,6 +47,10 @@ http-body-util = "0.1"
 # Landlock + prctl raw syscalls for the M1.13b (#66) sandbox shim
 # (`gv-sandbox`). Reviewed kernel-ABI dependency — see docs/NATIVE_DEPENDENCIES.md.
 libc = { workspace = true }
+# M12.02 (#552): filesystem events are hints that prompt the authoritative
+# repository sweep. `notify` supplies the native backends without making an
+# event itself a claim about repository state.
+notify = "8.2"
 # The durable operation journal (M1.09, #62): SQLite so operation results
 # survive a process restart. `bundled` compiles SQLite in rather than linking
 # the system library — one less thing this headless server depends on finding.
