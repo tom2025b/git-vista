@@ -147,8 +147,9 @@ and belongs to whoever weighs it rather than to a slice about something else. A
 paths out of it costs exactly the diagnosability it exists for. The two shapes
 worth considering — strip paths from the reason, or split it into a client-safe
 summary plus a server-only detail — are a change to M11.01's wire contract, not
-to this route. Recorded here so the next reader inherits the accurate sentence
-and the open question together.
+to this route. **Tracked as #657**, so the open question lives somewhere it can
+be answered rather than only in a paragraph of a decision record about something
+else.
 
 ### 3. Three facts on a row, and they stay three
 
