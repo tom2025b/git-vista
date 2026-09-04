@@ -15,8 +15,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
 use git_vista_protocol::operation::{
-    IdempotencyKey, OperationId, OperationState, OperationStatus, ProgressEvent, PROGRESS_EVENT,
-    RESULT_EVENT,
+    IdempotencyKey, OperationId, OperationStatus, ProgressEvent, PROGRESS_EVENT, RESULT_EVENT,
 };
 use git_vista_protocol::{ForcePublish, PROTOCOL_VERSION};
 
@@ -26,8 +25,9 @@ use crate::features::dialogs::core::{Dialog, ErrorNotice};
 use crate::features::dialogs::signals::Dialogs;
 use crate::features::graph::core::GraphCore;
 use crate::features::operations::core::{
-    escalation, latest_wins, remote_op_kind, resume_decision, InFlightRemoteOp, IntentSeq,
-    OperationsCore, PendingIntent, ResumeDecision, Settled, Settlement,
+    escalation, latest_wins, local_settlement, lost_contact_settlement, persisted_remote_op,
+    reattach_step, remote_op_kind, resume_decision, seq_or_no_intent, write_route, IntentSeq,
+    OperationsCore, PendingIntent, ReattachStep, ResumeDecision, Settled, Settlement,
 };
 use crate::features::operations::kind::OperationKind;
 use crate::features::shell::signals::Shell;
@@ -44,10 +44,10 @@ use crate::prefs;
 /// feature owns.
 pub fn next_seq(intent_seq: StoredValue<IntentSeq>) -> u64 {
     // `try_update_value` returns `None` only when the owning scope is already disposed, in
-    // which case the continuation cannot write anything either. Sequence 0 is the reserved
-    // "no intent" value, so falling back to it makes such an intent lose every comparison
-    // rather than spuriously win one.
-    intent_seq.try_update_value(|s| s.next()).unwrap_or(0)
+    // which case the continuation cannot write anything either. The fallback to the
+    // reserved `core::NO_INTENT_SEQ` — and the fact that it loses every `result_is_newest`
+    // comparison rather than spuriously winning one — is host-tested in `core`.
+    seq_or_no_intent(intent_seq.try_update_value(|s| s.next()))
 }
 
 /// The reactive handle every feature uses to start and watch a write.
@@ -562,8 +562,25 @@ fn report_error(sink: StoredValue<Option<ErrorSink>>, title: &'static str, body:
 /// rename rather than a redesign.
 async fn send(kind: &OperationKind, key: IdempotencyKey) -> Result<WriteReceipt, String> {
     match kind {
-        OperationKind::Merge { branch, .. } => {
-            api::branch_op_request("/api/merge", branch, key).await
+        // The four kinds that share one function and are separated by their
+        // path alone. One arm, and the path comes from `core::write_route` —
+        // NOT from four sibling arms that each spell their own string. Four
+        // arms over four structurally identical variants is the #594 shape
+        // exactly: swap two and it compiles, and `git checkout` runs where
+        // the user asked for `git branch -d`. Here a swap is a change to a
+        // host-tested table.
+        OperationKind::Merge { branch, .. }
+        | OperationKind::Checkout { branch, .. }
+        | OperationKind::Delete { branch, .. }
+        | OperationKind::ForceDelete { branch } => {
+            // `None` is unreachable: `write_route` gives every one of these
+            // four a path, and the census in `core`'s tests fails if that
+            // stops being true. Reported rather than unwrapped, because a
+            // panic in a write path is worse than a refusal.
+            let Some(path) = write_route(kind).branch_op_path else {
+                return Err("this operation has no endpoint — the write was not sent".to_string());
+            };
+            api::branch_op_request(path, branch, key).await
         }
         // #233: widened from `branch_op_request` (the shared `{branch}`-only
         // shape merge/checkout/delete still use) once `Push` gained
@@ -580,15 +597,6 @@ async fn send(kind: &OperationKind, key: IdempotencyKey) -> Result<WriteReceipt,
                 expected_remote_tip: f.expected_remote_tip.clone(),
             });
             api::push_request(branch, *set_upstream, force, key).await
-        }
-        OperationKind::Checkout { branch, .. } => {
-            api::branch_op_request("/api/checkout", branch, key).await
-        }
-        OperationKind::Delete { branch, .. } => {
-            api::branch_op_request("/api/delete-branch", branch, key).await
-        }
-        OperationKind::ForceDelete { branch } => {
-            api::branch_op_request("/api/force-delete-branch", branch, key).await
         }
         OperationKind::Rebase { .. } => api::rebase_request(key).await,
         OperationKind::Fetch { remote } => api::fetch_request(remote, key).await,
@@ -624,24 +632,12 @@ async fn send(kind: &OperationKind, key: IdempotencyKey) -> Result<WriteReceipt,
 /// (a delete, a checkout) would just leave stale storage behind for no
 /// reader to ever consult.
 fn persist_if_remote_op(kind: &OperationKind, id: &OperationId) {
-    let entry = match kind {
-        OperationKind::Fetch { remote } => InFlightRemoteOp {
-            id: id.as_str().to_string(),
-            remote: remote.clone(),
-            branch: None,
-            strategy: None,
-        },
-        OperationKind::Pull {
-            remote,
-            branch,
-            strategy,
-        } => InFlightRemoteOp {
-            id: id.as_str().to_string(),
-            remote: remote.clone(),
-            branch: Some(branch.clone()),
-            strategy: Some(*strategy),
-        },
-        _ => return,
+    // The mapping is `core::persisted_remote_op`, host-tested there and
+    // round-trip-proved against `core::remote_op_kind`, which is the exact
+    // inverse read back on boot. The two were on opposite sides of the wasm
+    // boundary until #612, so nothing could check they agreed.
+    let Some(entry) = persisted_remote_op(kind, id) else {
+        return;
     };
     prefs::store_inflight_remote_op(&entry);
 }
@@ -666,16 +662,7 @@ fn settle_locally(
     {
         return;
     }
-    let outcome = Settlement {
-        state: if ok {
-            OperationState::Succeeded
-        } else {
-            OperationState::Failed
-        },
-        message: Some(message),
-        generation: None,
-    };
-    commit_settlement(core, graph, &id, outcome);
+    commit_settlement(core, graph, &id, local_settlement(ok, message));
 }
 
 /// Apply a settlement and act on the invalidation it publishes.
@@ -728,15 +715,6 @@ const STREAM_REATTACH_MAX_ATTEMPTS: u32 = 6;
 /// out a blip without holding a stuck row on screen for a minute.
 const STREAM_REATTACH_INTERVAL_MS: u64 = 2_000;
 
-/// What a user is told when the re-attach budget runs out. Deliberately does
-/// not claim the operation failed — it claims *we lost track of it*, which is
-/// the only honest thing left to say, and points at the check that resolves it.
-/// Same posture as `clone_poll_exhausted_message` takes for #278's poll.
-const STREAM_LOST_MESSAGE: &str = "Lost contact with the server while this was running, and \
-                                   couldn't get it back. It may well have finished — check the \
-                                   graph before running it again, or you can end up doing it \
-                                   twice.";
-
 /// Re-establish a progress stream that dropped, or — once the budget is gone —
 /// settle the entry honestly so it stops blocking the menu (#232 follow-up).
 ///
@@ -782,20 +760,17 @@ fn reattach_after_stream_loss(
                 }
             }
         }
-        // Budget gone. The entry cannot stay in flight: `settle` is the only
-        // thing that removes it, the menu gate reads that list, and a row that
-        // can never leave it is a permanent lockout. So say what is true —
-        // contact was lost, the outcome is unknown — and let the user act on it.
-        commit_settlement(
-            core,
-            graph,
-            &id,
-            Settlement {
-                state: OperationState::Failed,
-                message: Some(STREAM_LOST_MESSAGE.to_string()),
-                generation: None,
-            },
-        );
+        // This attempt's status polls all failed. The entry cannot stay in
+        // flight: `settle` is the only thing that removes it, the menu gate
+        // reads that list, and a row that can never leave it is a permanent
+        // lockout. So say what is true — contact was lost, the outcome is
+        // unknown — and let the user act on it.
+        //
+        // NOTE this is a different trigger from `subscribe`'s exhausted-budget
+        // arm, not a duplicate of it: that one counts stream rejoins, this one
+        // counts status reads within a single rejoin. Only the SETTLEMENT is
+        // shared, and it is shared by calling one function (#612).
+        commit_settlement(core, graph, &id, lost_contact_settlement());
     });
 }
 
@@ -860,22 +835,18 @@ fn subscribe(
     let reattach_id = id.clone();
     let on_error = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
         on_error_source.close();
-        if reattach_budget > 0 {
-            reattach_after_stream_loss(core, graph, reattach_id.clone(), reattach_budget - 1);
-        } else {
-            // Budget exhausted upstream. Same reasoning as the exhausted arm in
-            // `reattach_after_stream_loss`: the row must not be able to outlive
+        // The budget arithmetic and its give-up boundary are
+        // `core::reattach_step`, host-tested: the budget strictly decreases,
+        // so a permanently-dead tunnel terminates rather than looping.
+        match reattach_step(reattach_budget) {
+            ReattachStep::Retry { budget } => {
+                reattach_after_stream_loss(core, graph, reattach_id.clone(), budget);
+            }
+            // Budget exhausted upstream. The row must not be able to outlive
             // every recovery path, because the menu gate reads it.
-            commit_settlement(
-                core,
-                graph,
-                &reattach_id,
-                Settlement {
-                    state: OperationState::Failed,
-                    message: Some(STREAM_LOST_MESSAGE.to_string()),
-                    generation: None,
-                },
-            );
+            ReattachStep::GiveUp => {
+                commit_settlement(core, graph, &reattach_id, lost_contact_settlement());
+            }
         }
     });
 

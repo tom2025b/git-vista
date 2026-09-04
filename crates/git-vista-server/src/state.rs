@@ -296,6 +296,12 @@ pub(crate) struct Current {
 /// session cell instead (see [`SELECTION`]), so this stays the fixed, defined
 /// place a *fresh* session begins at rather than drifting to whatever the last
 /// person happened to pick.
+///
+/// Since #614 that is **enforced rather than merely true**: the `OnceLock` is
+/// never reopened for writing, so a second no-scope write is refused by the
+/// lock itself and panics loudly instead of overwriting. See
+/// [`write_launch_selection`] for why the refusal lives there and not behind a
+/// flag `main` has to remember to set.
 static CURRENT: OnceLock<RwLock<Current>> = OnceLock::new();
 
 /// One session's selection, shared between the session record that owns it and
@@ -382,6 +388,56 @@ pub(crate) fn inherit_selection<F: std::future::Future>(
     }
 }
 
+/// What a write that arrived with **no selection scope** was permitted to do.
+///
+/// Exactly one such write is ever legitimate — startup seeding the launch
+/// selection, before any listener binds. See [`write_launch_selection`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchWrite {
+    /// The launch selection was empty, so this write is the startup seed.
+    Seeded,
+    /// The launch selection was already seeded. The write was refused and
+    /// `cell` still holds what startup put there.
+    Refused,
+}
+
+/// Seed the launch selection if nothing has, refuse otherwise (#614).
+///
+/// # Why a refusal exists at all
+///
+/// Before this, the no-scope branch of [`set_current_resolved`] *overwrote*
+/// `CURRENT` whenever it was already set, and the only thing stopping a
+/// request from reaching it was a fact about the current call graph: the two
+/// request-path writers (`POST /api/clone`, `POST /api/select`) both run
+/// inside [`with_selection`], so they take the session branch. The `panic!`
+/// that would have caught a writer arriving without a scope was
+/// `#[cfg(test)]` — **it did not exist in the release binary**. A future
+/// handler that spawned without [`inherit_selection`] would have written the
+/// process-global in production, silently restoring the cross-session leak
+/// #588 was filed to remove, while every test stayed green because under
+/// `cfg(test)` that path panics instead of running.
+///
+/// # Why `OnceLock::set` *is* the enforcement
+///
+/// The rule that needs enforcing is "no-scope writes are legitimate only
+/// before bind", and `CURRENT` is already a `OnceLock`: startup seeds it once,
+/// so every later no-scope write is by definition the illegitimate one.
+/// `set` refuses those itself, atomically — no `BOUND` flag to set from `main`
+/// and forget to set in some other entry point, and no window where two
+/// concurrent writers both observe an empty cell and both proceed. The loser
+/// of that race is `Refused` for the same reason a post-startup writer is,
+/// which is the honest answer in both cases.
+///
+/// Takes the cell rather than reading the static, so a host test can drive the
+/// release path against its own `OnceLock` without writing the process-global
+/// — the write this whole function exists to prevent.
+fn write_launch_selection(cell: &OnceLock<RwLock<Current>>, value: Current) -> LaunchWrite {
+    match cell.set(RwLock::new(value)) {
+        Ok(()) => LaunchWrite::Seeded,
+        Err(_) => LaunchWrite::Refused,
+    }
+}
+
 fn set_current_resolved(path: PathBuf, mode: RepoMode, handle: Option<RepositoryHandle>) {
     let value = Current { path, mode, handle };
     if let Ok(()) = SELECTION.try_with(|cell| {
@@ -389,16 +445,25 @@ fn set_current_resolved(path: PathBuf, mode: RepoMode, handle: Option<Repository
     }) {
         return;
     }
-    // No scope: this is startup writing the launch selection.
+    // No scope. Legitimate exactly once: startup writing the launch selection
+    // before any listener binds.
     #[cfg(test)]
     panic!("tests that select a repository must use with_isolated_test_current");
+    // The release path the test-time panic above cannot cover (#614). The
+    // write is refused by `OnceLock` either way; the panic is how the caller
+    // finds out, because `set_current` and `select_registered` both report
+    // success to their handler and a refusal they never hear about is the
+    // quiet failure this issue is about. Contained: a panic in a request task
+    // fails that one connection, and no session's selection has moved.
     #[cfg(not(test))]
-    if let Some(lock) = CURRENT.get() {
-        *lock.write().expect("CURRENT lock not poisoned") = value;
-    } else {
-        CURRENT
-            .set(RwLock::new(value))
-            .unwrap_or_else(|_| unreachable!("CURRENT set once at startup"));
+    if write_launch_selection(&CURRENT, value) == LaunchWrite::Refused {
+        panic!(
+            "git-vista: a repository selection reached the launch selection with no session \
+             scope, after startup had already set it. This is a bug in the caller, not in the \
+             request: every request-path write must run inside `with_selection`, and a detached \
+             task must be wrapped in `inherit_selection` to keep it. The write was refused; the \
+             launch selection is unchanged."
+        );
     }
 }
 
@@ -811,6 +876,56 @@ pub(crate) fn reject_if_read_only() -> Option<(StatusCode, String)> {
 mod tests {
     use super::*;
     use super::{parse_bind_addr, LOOPBACK_ADDR};
+
+    fn selection(path: &str) -> Current {
+        Current {
+            path: PathBuf::from(path),
+            mode: RepoMode::Active,
+            handle: None,
+        }
+    }
+
+    /// #614: the release path's no-scope write refuses once the launch
+    /// selection is seeded, and leaves it holding what startup put there.
+    ///
+    /// This is the branch `set_current_resolved`'s `#[cfg(test)]` panic hides:
+    /// under `cfg(test)` a scopeless write panics before it can reach the
+    /// release code, so a test that went through `set_current_resolved` would
+    /// prove the harness works and say nothing about the shipped binary. So it
+    /// drives [`write_launch_selection`] — the release branch itself,
+    /// compiled in both configurations — against its **own** `OnceLock`. Its
+    /// own, for the same reason the harness exists: writing the real `CURRENT`
+    /// from a test is the defect, not the test for it.
+    ///
+    /// The second assertion is the one that matters. A refusal that still
+    /// mutated the cell would satisfy the verdict and lose the guarantee, and
+    /// that is exactly the pre-#614 behaviour: the old branch overwrote
+    /// `CURRENT` whenever it was already set.
+    #[test]
+    fn a_no_scope_write_after_startup_is_refused_and_leaves_the_launch_selection_alone() {
+        let cell = OnceLock::new();
+
+        assert_eq!(
+            write_launch_selection(&cell, selection("/launch")),
+            LaunchWrite::Seeded,
+            "the first no-scope write is startup seeding the launch selection"
+        );
+        assert_eq!(
+            write_launch_selection(&cell, selection("/hijacked")),
+            LaunchWrite::Refused,
+            "a second no-scope write is a post-bind writer and must be refused"
+        );
+
+        assert_eq!(
+            cell.get()
+                .expect("seeded above")
+                .read()
+                .expect("CURRENT lock not poisoned")
+                .path,
+            PathBuf::from("/launch"),
+            "the refused write reached the launch selection anyway"
+        );
+    }
 
     /// #438: two test tasks that select different repositories must retain
     /// their own path and mode after both writes have happened.
