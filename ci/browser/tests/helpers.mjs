@@ -35,12 +35,34 @@ export async function forceOnline(page) {
   })
 }
 
+/** The repository `openApp` opens, as both the picker row and the status line
+ *  spell it (`global-setup.mjs` builds the fixture under this directory name). */
+const APP_REPO = 'fixture-repo'
+
 /**
  * Load the app and get as far as a rendered history graph.
  *
- * The server is started with the fixture as its repository, but the picker may
- * still be shown; handle both without branching on timing, which is the usual
- * source of flakiness here.
+ * The picker is ALWAYS shown on load -- `picker_open` is seeded `true`
+ * (app/mod.rs, ADR 0006 "ask every time"), and only a LAN session closes it
+ * unasked. So "handle both cases" was never the shape of this problem: there
+ * is one case, and the only question is whether the catalog has painted yet.
+ *
+ * That is why the old `if (await entry.isVisible())` was the bug (#623). It
+ * sampled an INSTANT. Ask before the catalog fetch lands and the answer is
+ * "no picker", the click is skipped, and the picker -- a full-viewport
+ * `position:fixed; z-index:900` div (picker.rs) -- stays up for the rest of
+ * the test.
+ *
+ * Nothing downstream noticed, which is the part worth remembering: the graph
+ * renders BEHIND that overlay, so `toBeVisible()` on the region passed (it
+ * tests layout, not occlusion) and `toBeAttached()` on a node passed (it
+ * tests the DOM, not hit-testing). The suite then failed 30 seconds later in
+ * whichever spec clicked first, as `<div> intercepts pointer events` -- one
+ * cause wearing eleven different spec names, which is what #623 was named
+ * for.
+ *
+ * So each step below WAITS for a state the app guarantees, and then asserts
+ * the overlay is gone rather than assuming the click removed it.
  */
 export async function openApp(page) {
   await forceOnline(page)
@@ -48,24 +70,42 @@ export async function openApp(page) {
   await page.goto(base)
   await expect(page.getByRole('heading', { name: 'git-vista' })).toBeVisible()
 
+  // Not "if it is up" -- it is always up. Wait for the row to paint.
   const pickerEntry = page.getByRole('button', { name: /fixture-repo/i }).first()
-  if (await pickerEntry.isVisible().catch(() => false)) {
-    await pickerEntry.click()
-  }
+  await expect(pickerEntry, 'the picker lists the fixture repository').toBeVisible({
+    timeout: 20_000,
+  })
+  await pickerEntry.click()
 
-  // The mode dialog appears whenever a repository is (re)opened. "Visualize"
-  // is read-only, which is all these tests need and cannot mutate the fixture.
+  // The mode dialog follows a choice, so it is likewise guaranteed rather
+  // than possible.
   //
   // Match on "look only", not on /Visualize/: the topbar carries a mode BADGE
   // also labelled "Visualize", and it sits behind this dialog. A loose match
   // resolves to the badge and then waits forever for an element the dialog is
   // covering -- which is exactly what a 30s timeout looked like here.
   const visualize = page.getByRole('button', { name: /look only/ })
-  if (await visualize.isVisible().catch(() => false)) {
-    await visualize.click()
-  }
+  await expect(visualize, 'the mode dialog follows opening a repository').toBeVisible({
+    timeout: 20_000,
+  })
+  await visualize.click()
+
+  // Both overlays are gone, stated rather than assumed. `toHaveCount(0)` is an
+  // assertion about the DOM, not a retry: after the two clicks above, neither
+  // dialog has any reason to be mounted, and if one is, every later click in
+  // this spec would have failed on it instead -- 30 seconds away, in a
+  // different file, as a different symptom.
+  await expect(pickerEntry, 'the picker must be dismissed, not merely unsampled').toHaveCount(0)
+  await expect(visualize, 'the mode dialog must be dismissed, not merely unsampled').toHaveCount(0)
 
   await expect(page.getByRole('region', { name: 'Commit history graph' })).toBeVisible()
+  // The seed matching the CURRENT epoch has arrived. `p.status.repo` renders
+  // only inside `Some((e, Ok(seed))) if e == epoch` (app/mod.rs), so this is
+  // the app's own statement that the graph now on screen belongs to the
+  // selection just made -- not the previous epoch's nodes, still attached
+  // while `/api/select` settles. `openPreview` below already waits on exactly
+  // this signal for exactly this reason; openApp never did.
+  await expect(page.locator('p.status.repo')).toContainText(APP_REPO, { timeout: 20_000 })
   await expect(page.locator('circle.node-hit').first()).toBeAttached()
 }
 
