@@ -74,6 +74,14 @@ mod offline_guard_audit;
 // callers). Test-only, like graph/offline_guard_audit above.
 #[cfg(test)]
 mod reachability_census;
+// #612 slice 4: an inventory over every #[cfg(target_arch = "wasm32")]-gated
+// file above a size threshold, checking that some host test's include_str!
+// reads it (or that the gap is argued in EXEMPT). Answers "which wasm-only
+// modules has nobody pinned?" as a standing test instead of a manual reread
+// of the tree. Test-only, like graph/offline_guard_audit/reachability_census
+// above.
+#[cfg(test)]
+mod wasm_module_census;
 
 // The frontend, split out of the former monolithic `app.rs`. Every one of these
 // pulls in Leptos / web-sys (wasm-only deps), so — like `app` — they compile only

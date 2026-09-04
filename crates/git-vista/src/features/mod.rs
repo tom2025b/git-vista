@@ -3,6 +3,31 @@
 //! One module per area named in the issue. Each owns its state; nothing here writes
 //! another feature's state directly (design spec D2). `core.rs` files are framework-free
 //! and host-tested; `signals.rs` files are the wasm-only reactive wrappers.
+//!
+//! # The per-seam enforcement rule (#612)
+//!
+//! `core.rs` being framework-free and host-tested does not, by itself, prove the
+//! wasm-only `signals.rs`/view code actually asks `core` the question `core` answers —
+//! `dialogs/confirm.rs`'s `preview_subject`/`previewable` composition shipped exactly
+//! that gap (#612's own origin: a mutation proof that read "both caught" while the
+//! line that *composed* the two host-tested halves lived in wasm-only code no runner
+//! executed). `crate::wasm_module_census` catches the coarser failure — a wasm-only
+//! module nobody's host test reads at all — but it is coverage bookkeeping, not a
+//! verdict on any one seam (its own module doc says so).
+//!
+//! What actually closes a seam is not a mechanism installed once; it is a habit,
+//! applied at the moment a decision moves out of wasm-only code and into a `core`
+//! module: write a source-level census, alongside the moved decision, that binds the
+//! *specific* wasm-only caller to the *specific* `core` function it must ask — the way
+//! `features::preview::core`'s `the_confirm_dialog_does_not_have_the_two_arms_the_wrong_way_round`
+//! pairs each `dialogs/confirm.rs` arm with the `preview.` call that follows it, or the
+//! way `features::history::core`'s census pins `app/mod.rs`'s `HistoryPhase` effects to
+//! the three rules that decide them. A purity lint was considered and rejected for this
+//! (#645's PR body has the argument: a wasm-only module is full of functions pure by
+//! signature — every `#[component]`, every markup helper — so a lint keyed on purity
+//! drowns in false positives). This is deliberately not mechanised further than that:
+//! it is a review question asked of every slice that moves a decision out of a
+//! `signals.rs`/view file, not a check `cargo test` can run unattended.
 
 pub mod core_traits;
 
