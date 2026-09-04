@@ -20,25 +20,19 @@ removed only when every gate answers yes:
 ```mermaid
 flowchart TD
     E["<b>An entry in the commondir</b>"]
-    G1["<b>1 · Name</b><br/>starts with gv-preview-"]
-    G2["<b>2 · Kind</b><br/>is a directory"]
-    G3["<b>3 · Age</b><br/>mtime at least STALE_SCRATCH_AGE old"]
-    G4["<b>4 · Ownership</b><br/>marker file holds the exact magic"]
-    G5["<b>5 · Liveness</b><br/>the marker's flock is free"]
+    G1["<b>1 · Name</b><br/>starts with<br/>gv-preview-"]
+    G2["<b>2 · Kind</b><br/>is a<br/>directory"]
+    G3["<b>3 · Age</b><br/>past<br/>STALE_SCRATCH_AGE"]
+    G4["<b>4 · Ownership</b><br/>the marker holds<br/>the exact magic"]
+    G5["<b>5 · Liveness</b><br/>the marker's<br/>flock is free"]
+    Q{"<b>all five say yes?</b>"}
     D["<b>remove_dir_all</b><br/>the only destructive step"]
     L["<b>Leave it alone</b><br/>the default answer"]
 
-    E --> G1
-    G1 -->|no| L
-    G1 -->|yes| G2
-    G2 -->|no| L
-    G2 -->|yes| G3
-    G3 -->|no| L
-    G3 -->|yes| G4
-    G4 -->|no| L
-    G4 -->|yes| G5
-    G5 -->|no| L
-    G5 -->|yes| D
+    E --> G1 & G2 & G3 & G4 & G5
+    G1 & G2 & G3 & G4 & G5 --> Q
+    Q -->|"any one says no"| L
+    Q -->|yes| D
 
     classDef entry fill:#1f2d3d,color:#ffffff,stroke:#0d1620,stroke-width:2px
     classDef gate fill:#e8eef5,color:#1f3a5c,stroke:#3d6591,stroke-width:1px
@@ -48,9 +42,14 @@ flowchart TD
     class E entry
     class G1,G2,G3,G4 gate
     class G5 live
+    class Q gate
     class D danger
     class L safe
 ```
+
+They are evaluated in that order, cheapest first, and the first `no` ends the
+question — so gate 5 is reached only by a directory that already looks
+abandoned on every count a filesystem can answer.
 
 Gate 5 is the interesting one. Age is a timestamp, not a lease: a preview whose
 store was created two hours ago is indistinguishable from a corpse by age
@@ -135,14 +134,18 @@ refusing descriptor still open. It asked four questions:
 
 ```mermaid
 flowchart TD
-    R["<b>try_lock refused</b><br/>with the descriptor still open"]
-    Q1["<b>What refused?</b><br/>fstat the REFUSING fd,<br/>not a fresh stat on the path"]
-    Q2["<b>Is a lock registered?</b><br/>/proc/locks rows for that inode,<br/>read immediately"]
-    Q3["<b>Do we hold it?</b><br/>/proc/self/fd matched by (dev, ino),<br/>never by read_link path"]
-    Q4["<b>Does anyone?</b><br/>every readable /proc/pid/fd"]
-    Q5["<b>How long does it last?</b><br/>ask the SAME fd again,<br/>with nothing in between"]
+    R["<b>try_lock refused</b><br/>asked here, with the descriptor still open"]
+    Q1["<b>1 · What refused?</b><br/>fstat the REFUSING fd,<br/>not a fresh stat on the path"]
+    Q2["<b>2 · Is a lock registered?</b><br/>/proc/locks rows for that inode,<br/>read immediately"]
+    Q3["<b>3 · Do we hold it?</b><br/>/proc/self/fd matched by (dev, ino),<br/>never by read_link path"]
+    Q4["<b>4 · Does anyone?</b><br/>every readable /proc/pid/fd"]
+    Q5["<b>5 · How long does it last?</b><br/>ask the SAME fd again,<br/>with nothing in between"]
 
-    R --> Q1 --> Q2 --> Q3 --> Q4 --> Q5
+    R --> Q1
+    R --> Q2
+    R --> Q3
+    R --> Q4
+    R --> Q5
 
     classDef start fill:#1f2d3d,color:#ffffff,stroke:#0d1620,stroke-width:2px
     classDef q fill:#e8eef5,color:#1f3a5c,stroke:#3d6591,stroke-width:1px
@@ -263,27 +266,30 @@ This is the load-bearing argument, and it is a property of the design rather
 than of the timing.
 
 ```mermaid
-stateDiagram-v2
-    [*] --> Created: tempdir_in
-    Created --> Leased: claim() takes the flock
-    Leased --> Leased: every ask refuses, all 8 of them
-    Leased --> Gone: ScratchStore drops
-    Gone --> [*]
+flowchart TD
+    C["<b>Created</b><br/>tempdir_in"]
+    L["<b>Leased</b><br/>claim() takes the flock"]
+    H["<b>Held, continuously</b><br/>never released,<br/>never reopened"]
+    A["<b>All 8 asks refuse</b><br/>there is no gap<br/>to fall into"]
+    G["<b>Gone</b><br/>the ScratchStore drops"]
+    N["<b>dir is declared before lease</b><br/>so the directory is removed<br/>while the lease is still held"]
 
-    note right of Leased
-        The lease is held CONTINUOUSLY and
-        is never reopened. Asking n times
-        cannot find a gap that does not exist.
-    end note
+    C --> L --> H --> A
+    H --> G --> N
 
-    note right of Gone
-        dir is declared before lease, so the
-        directory is removed while the lease
-        is still held: there is no instant at
-        which a marked store sits on disk with
-        a free lease and a live owner.
-    end note
+    classDef step fill:#e8eef5,color:#1f3a5c,stroke:#3d6591,stroke-width:1px
+    classDef key fill:#8a5200,color:#ffffff,stroke:#5c3600,stroke-width:2px
+    classDef good fill:#e8f1ea,color:#14612f,stroke:#1f5c3a,stroke-width:1px
+    class C,L,G step
+    class H key
+    class A,N good
 ```
+
+Two orderings carry that guarantee. `claim` takes the lock **before** it writes
+the magic, so a sweeper arriving mid-creation reads a zero-length file, which is
+not the magic, and leaves at gate 4. And `dir` is declared before `lease` in the
+struct, so Rust drops the directory while the lease is still held — there is no
+instant at which a marked store sits on disk with a free lease and a live owner.
 
 A live store's lease is taken by `claim` and held until the `ScratchStore`
 drops. It is never released and reacquired, so there is no window for a retry
@@ -399,8 +405,8 @@ rather than noticing the same break twice.
 
 ### The self-referential floor, and why both bounds are literals
 
-The held-lease floor was first written as `LEASE_RETRY_PAUSE * (LEASE_ATTEMPTS
-- 1)`, which reads well and is worthless:
+The held-lease floor was first written as
+`LEASE_RETRY_PAUSE * (LEASE_ATTEMPTS - 1)`, which reads well and is worthless:
 
 ```mermaid
 flowchart TD
