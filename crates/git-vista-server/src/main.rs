@@ -106,6 +106,11 @@ mod security;
 mod session;
 mod staging;
 mod state;
+// M12.02 (#552): native filesystem hints over the selected worktree's Git
+// metadata. The authoritative sweep/feed lands in later M12 slices, so this
+// tested module is intentionally staged before production wiring reaches it.
+#[cfg_attr(not(test), allow(dead_code))]
+mod watcher;
 // M11.01 (#546): the read-only worktree census (`git worktree list
 // --porcelain` resolved into `git_vista_protocol::WorktreeCensus`). Contract
 // and query land first, staged the same way `conflicts` was — no route

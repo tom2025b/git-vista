@@ -331,30 +331,34 @@ const THRESHOLD_LINES: usize = 150;
 ///
 /// These are not all the same kind of gap, and the reasons say so plainly.
 /// Several are real, unpinned debt named here for the first time by this
-/// census (`features/shell/signals.rs`, `gestures.rs`, `print.rs`,
-/// `render/labels.rs`, `dialogs/open_url.rs`, `features/diff/staging_view.rs`)
-/// — landing this module does not close those gaps, it is what makes them
-/// visible instead of requiring another by-hand read of the tree to
-/// rediscover. `app/canvas.rs` was a seventh until its 409 handler moved to
-/// `features::history::core::drift_reload`; the entry naming it is gone
-/// because [`exempt_entries_still_need_exempting`] demanded it the moment a
-/// host test started reading the file, which is this table working as
-/// intended rather than a courtesy someone remembered. Others are argued thin
-/// on inspection (`state.rs`, `session.rs`, `prefs.rs`, `features/stash/signals.rs`,
+/// census (`gestures.rs`, `print.rs`, `render/labels.rs`,
+/// `features/diff/staging_view.rs`, `dialogs/open_url.rs`) — landing this
+/// module does not close those gaps, it is what makes them visible instead
+/// of requiring another by-hand read of the tree to rediscover; #653 tracks
+/// the five that remain.
+///
+/// `dialogs/open_url.rs` is on that list because *this table* says it is.
+/// #649's PR body filed it under "argued thin" while the entry it landed
+/// called it "unpinned, smaller-scale debt"; the two disagreed for as long
+/// as both existed. The entry wins — a reason sitting next to the exemption
+/// it justifies is the thing a later reader checks, and the thing
+/// [`exempt_entries_still_need_exempting`] is written against. A prose
+/// summary elsewhere that drifts from it is the summary that is wrong.
+///
+/// Two have already left. `app/canvas.rs` went when its 409 handler moved to
+/// `features::history::core::drift_reload`; `features/shell/signals.rs` went
+/// when its overlay payload map moved to `features::shell::core`. Neither
+/// entry was removed as a courtesy someone remembered —
+/// [`exempt_entries_still_need_exempting`] demanded it the moment a host test
+/// started reading the file, which is this table working as intended.
+///
+/// Others are argued thin on inspection
+/// (`state.rs`, `session.rs`, `prefs.rs`, `features/stash/signals.rs`,
 /// `update_required.rs`) — the decision they would otherwise hide already
 /// lives in a host-tested `core` module, and what remains in the wasm-only
 /// file is sequencing or type definitions, not a decision this census's
 /// coverage proxy would usefully pin.
 const EXEMPT: &[(&str, &str)] = &[
-    (
-        "features/shell/signals.rs",
-        "600 lines, 45 fns. Its own module doc argues the OverlayStack \
-         consolidation exists BECAUSE six previously-unwatched overlay \
-         signals hid two real regressions (gestures.rs's incomplete Esc \
-         handler, the Activity/detail-panel race) — this file is exactly the \
-         kind of decision-bearing wasm-only module this census exists to \
-         flag, and it is currently unpinned. Real debt, not fixed here.",
-    ),
     (
         "gestures.rs",
         "511 lines, 11 free functions classifying pointer count into pan / \

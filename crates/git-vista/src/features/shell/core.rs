@@ -107,6 +107,153 @@ impl Overlay {
     }
 }
 
+/// One of `Shell`'s payload signals — the thing that holds *what* an overlay is
+/// showing, as opposed to [`OverlayStack`]'s record of *which* overlays are up.
+///
+/// [`OverlayStack`] deliberately knows nothing about payloads: `present` returns the
+/// overlay it evicted and leaves blanking it to the caller. That split is right, but it
+/// left the other half of the rule — *which* signal each overlay owns — as an
+/// un-modelled fact spelled out only inside `signals.rs`'s wasm-only
+/// `Shell::clear_payload`, where no host test could reach it. Rust's exhaustiveness
+/// check caught a *missing* arm there; it could not catch a *wrong* one. `Overlay::Detail
+/// => self.viewer_doc.set(None)` compiled cleanly, blanked the viewer instead of the
+/// detail panel, and left `detail_id` set forever — the same shape as the Esc bug this
+/// module's doc opens with, one layer down.
+///
+/// Naming the slots makes that mistake checkable: [`Overlay::teardown`] is a total map
+/// into this type, and `every_overlay_blanks_a_slot_no_other_overlay_owns` proves it is
+/// injective, so two overlays can never claim one signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PayloadSlot {
+    /// `Shell::menu` — the context menu's `MenuData`.
+    Menu,
+    /// `Shell::commit_dialog` — the pending `CommitIntent`.
+    CommitDialog,
+    /// `Shell::confirm_op` — the `PendingOp` awaiting confirmation.
+    ConfirmOp,
+    /// `Shell::error_notice` — the write-failure `ErrorNotice` (#316).
+    ErrorNotice,
+    /// `Shell::detail_id` — the commit id the detail panel is showing.
+    DetailId,
+    /// `Shell::viewer_doc` — the `ViewerDoc` the full-screen viewer is showing.
+    ViewerDoc,
+    /// The Activity panel's own visibility flag. The one slot that is not a `Shell`
+    /// field: it lives in `features::activity`, which has its own core and its own
+    /// tests, and `Shell` is only its writer.
+    ActivityOpen,
+}
+
+/// Everything that must be switched off when an overlay stops being presented.
+///
+/// Two fields rather than one because blanking a signal is not always the whole job.
+/// The viewer also leaves state behind *outside* the reactive graph — a stored
+/// comparison in `prefs` — and M4.27 (#80) decided that state must die with the
+/// overlay, not with the particular close path that happened to be taken. Encoding it
+/// here rather than as a hard-coded `Overlay::Viewer` arm in `signals.rs` is what lets a
+/// host test state the rule ("exactly one overlay leaves persisted state behind, and it
+/// is the viewer") instead of the rule living only in wasm-only code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Teardown {
+    /// The payload signal to blank.
+    pub slot: PayloadSlot,
+    /// Whether going away must also clear `prefs`'s stored comparison.
+    ///
+    /// True for [`Overlay::Viewer`] alone. Cleared on teardown rather than inside
+    /// `Shell::close_viewer` because Esc dismisses through `dismiss_top`, which never
+    /// calls `close_viewer` — a stored comparison left behind by that path would
+    /// reopen itself on the next load.
+    pub clears_stored_comparison: bool,
+}
+
+impl Overlay {
+    /// How many variants [`Overlay`] has.
+    ///
+    /// Hand-written, and kept honest by [`Self::ALL`]'s array length together with
+    /// `all_lists_every_overlay_exactly_once` — see [`Self::index`] for how the two
+    /// combine to make an unlisted variant impossible to ship.
+    pub const COUNT: usize = 7;
+
+    /// Every overlay, in declaration order.
+    ///
+    /// The list that did not exist when `gestures.rs`'s Esc handler was written — the
+    /// module doc's bug #1 is, exactly, a hand-copied subset of this list with one
+    /// entry missing and nothing to compare it against. Every completeness census
+    /// below iterates this, so a handler that forgets an overlay now has something to
+    /// be incomplete *against*.
+    pub const ALL: [Overlay; Self::COUNT] = [
+        Overlay::Menu,
+        Overlay::CommitDialog,
+        Overlay::Confirm,
+        Overlay::Detail,
+        Overlay::Viewer,
+        Overlay::Activity,
+        Overlay::Error,
+    ];
+
+    /// This variant's position in [`Self::ALL`].
+    ///
+    /// The load-bearing half of the completeness chain, and the reason [`Self::ALL`]
+    /// cannot silently fall behind the enum. Adding an eighth variant walks an author
+    /// through four forced steps, none of them optional and none of them a comment
+    /// asking nicely:
+    ///
+    /// 1. This match stops being exhaustive — a **compile error**. The new variant
+    ///    needs an index, and the only unused one is `7`.
+    /// 2. `all_lists_every_overlay_exactly_once` indexes a `[bool; COUNT]` with it and
+    ///    panics out of bounds — a **red test**. The fix is to raise [`Self::COUNT`].
+    /// 3. Raising `COUNT` makes [`Self::ALL`]'s declared length disagree with its seven
+    ///    elements — a **compile error**. The variant must be added to the list.
+    /// 4. [`Self::dock`] and [`Self::teardown`] are now non-exhaustive too — two more
+    ///    **compile errors**, forcing a dock and a payload slot to be chosen rather
+    ///    than defaulted.
+    const fn index(self) -> usize {
+        match self {
+            Overlay::Menu => 0,
+            Overlay::CommitDialog => 1,
+            Overlay::Confirm => 2,
+            Overlay::Detail => 3,
+            Overlay::Viewer => 4,
+            Overlay::Activity => 5,
+            Overlay::Error => 6,
+        }
+    }
+
+    /// What must be switched off when this overlay stops being presented.
+    ///
+    /// The companion to [`Self::dock`]: `dock` decides what an overlay *evicts*,
+    /// `teardown` decides what happens to whatever got evicted. Both are total maps out
+    /// of [`Overlay`], both are the one statement of their rule, and both are here
+    /// rather than in `signals.rs` for the same reason — that file is
+    /// `#[cfg(target_arch = "wasm32")]`, so a rule written there is a rule no host test
+    /// can read.
+    pub fn teardown(self) -> Teardown {
+        let slot = match self {
+            Overlay::Menu => PayloadSlot::Menu,
+            Overlay::CommitDialog => PayloadSlot::CommitDialog,
+            Overlay::Confirm => PayloadSlot::ConfirmOp,
+            Overlay::Error => PayloadSlot::ErrorNotice,
+            Overlay::Detail => PayloadSlot::DetailId,
+            Overlay::Viewer => PayloadSlot::ViewerDoc,
+            Overlay::Activity => PayloadSlot::ActivityOpen,
+        };
+        Teardown {
+            slot,
+            // M4.27 (#80). Stated as a match rather than `self == Viewer` so that an
+            // eighth overlay with persisted state of its own is a compile error here
+            // too, instead of silently inheriting `false`.
+            clears_stored_comparison: match self {
+                Overlay::Viewer => true,
+                Overlay::Menu
+                | Overlay::CommitDialog
+                | Overlay::Confirm
+                | Overlay::Error
+                | Overlay::Detail
+                | Overlay::Activity => false,
+            },
+        }
+    }
+}
+
 /// The overlays currently presented, bottom-to-top.
 ///
 /// **Invariant: at most one overlay per [`Dock`], after any sequence of operations.**
@@ -727,5 +874,230 @@ mod tests {
         c.set_online(false);
         c.set_online(false);
         assert!(!c.is_online(), "duplicate offline events change nothing");
+    }
+    // ---- the overlay census ---------------------------------------------
+    //
+    // `dock` and `present` above are proved directly. These prove the *other*
+    // half of the consolidation — that the set of overlays is closed, that each
+    // one owns exactly one payload signal, and that the wasm-only `Shell` still
+    // asks for both answers instead of keeping its own copies.
+
+    #[test]
+    fn all_lists_every_overlay_exactly_once() {
+        // The list `gestures.rs` did not have. Step 2 of the chain in
+        // `Overlay::index`'s doc: an eighth variant gets index 7, indexes this
+        // array out of bounds, and the panic is what sends the author to
+        // `COUNT` — which in turn makes `ALL`'s declared length wrong, which is
+        // a compile error they cannot ignore.
+        let mut seen = [false; Overlay::COUNT];
+        for o in Overlay::ALL {
+            let i = o.index();
+            assert!(!seen[i], "{o:?} appears in Overlay::ALL more than once");
+            seen[i] = true;
+        }
+        for (i, present) in seen.iter().enumerate() {
+            assert!(
+                *present,
+                "no overlay in Overlay::ALL has index {i} — a variant exists that ALL \
+                 does not list, so every census that iterates ALL is silently skipping it"
+            );
+        }
+    }
+
+    #[test]
+    fn every_overlay_blanks_a_slot_no_other_overlay_owns() {
+        // The check `match o { … }` in the old `clear_payload` could not make.
+        // Exhaustiveness proved every overlay had *an* arm; nothing proved the
+        // arm blanked that overlay's own signal. `Overlay::Detail =>
+        // self.viewer_doc.set(None)` compiled, closed the viewer instead of the
+        // detail panel, and stranded `detail_id` set forever.
+        let mut owner: Vec<(PayloadSlot, Overlay)> = Vec::new();
+        for o in Overlay::ALL {
+            let slot = o.teardown().slot;
+            if let Some((_, first)) = owner.iter().find(|(s, _)| *s == slot) {
+                panic!(
+                    "{o:?} and {first:?} both claim {slot:?} — one of them can never be blanked"
+                );
+            }
+            owner.push((slot, o));
+        }
+        assert_eq!(owner.len(), Overlay::COUNT, "every overlay must own a slot");
+    }
+
+    #[test]
+    fn only_the_viewer_leaves_persisted_state_behind() {
+        // M4.27 (#80) as a statement rather than an `Overlay::Viewer` arm buried
+        // in wasm-only code. Both directions matter: the viewer must clear the
+        // stored comparison (or Esc leaves one that reopens itself on the next
+        // load), and nothing else may (clearing it when the *menu* closes would
+        // silently discard a comparison the user is still in).
+        let clearing: Vec<Overlay> = Overlay::ALL
+            .into_iter()
+            .filter(|o| o.teardown().clears_stored_comparison)
+            .collect();
+        assert_eq!(
+            clearing,
+            vec![Overlay::Viewer],
+            "exactly one overlay clears prefs' stored comparison, and it is the viewer"
+        );
+    }
+
+    // ---- the seam ------------------------------------------------------
+    //
+    // Everything above proves the rules. These prove `signals.rs` still asks
+    // them. That file is `#[cfg(target_arch = "wasm32")]`, so `cargo test` never
+    // compiles it: a rule re-derived there would leave every test above green
+    // while the running app stopped using the answer. Reading the source as text
+    // is the only way a host test can see it at all — the same trade
+    // `features::history::core` makes against `app/mod.rs`, and
+    // `features::a11y::audit` against markup it cannot mount. It is a text
+    // guard, not a compiled proof, and is stated that way on purpose.
+    //
+    // This `include_str!` is also what retires `wasm_module_census::EXEMPT`'s
+    // entry for this file: that census's coverage proxy is "a host test reads
+    // this file", and this is that read.
+
+    /// The source of the wasm-only shell, read as text.
+    const SIGNALS: &str = include_str!("signals.rs");
+
+    /// Text between `open` and the first `close` after it.
+    fn block_after(haystack: &str, open: &str, close: &str, what: &str) -> String {
+        let after = haystack
+            .split_once(open)
+            .unwrap_or_else(|| panic!("signals.rs no longer contains {what} (anchor: {open:?})"))
+            .1;
+        let end = after.find(close).unwrap_or_else(|| {
+            panic!("{what} is no longer a closed block (looking for {close:?})")
+        });
+        after[..end].to_string()
+    }
+
+    /// Collapse every run of whitespace to one space, so these guards survive
+    /// rustfmt moving a line break without surviving an actual edit.
+    fn squeezed(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The body of one `Shell` method, whitespace-squeezed.
+    fn shell_fn(name: &str) -> String {
+        squeezed(&block_after(
+            SIGNALS,
+            &format!("fn {name}("),
+            "\n    }",
+            &format!("`Shell::{name}`"),
+        ))
+    }
+
+    #[test]
+    fn clear_payload_asks_core_what_to_switch_off() {
+        let body = shell_fn("clear_payload");
+        assert!(
+            body.contains("o.teardown()"),
+            "`Shell::clear_payload` no longer calls `Overlay::teardown`, so the \
+             overlay-to-signal map has a second home again and only one of them is \
+             tested. Body was:\n{body}"
+        );
+        assert!(
+            !body.contains("Overlay::"),
+            "`Shell::clear_payload` names `Overlay` variants again, which means it is \
+             re-deriving the map instead of asking for it. Body was:\n{body}"
+        );
+        assert!(
+            body.contains("teardown.clears_stored_comparison"),
+            "`Shell::clear_payload` no longer asks whether the overlay leaves persisted \
+             state behind — M4.27 (#80)'s rule is hard-coded here again. Body was:\n{body}"
+        );
+        assert!(
+            body.contains("crate::prefs::clear_comparison()"),
+            "nothing in `Shell::clear_payload` clears the stored comparison any more. \
+             If that moved elsewhere, check Esc still reaches it: `dismiss_top` never \
+             calls `close_viewer`, which is why it lives in this funnel. Body was:\n{body}"
+        );
+    }
+
+    #[test]
+    fn each_payload_slot_blanks_the_signal_it_is_named_for() {
+        // The half `clear_payload_asks_core_what_to_switch_off` cannot reach.
+        // Moving the map into core made a *wrong overlay* unrepresentable; it did
+        // not make a *wrong signal* unrepresentable, because `PayloadSlot::DetailId
+        // => self.viewer_doc.set(None)` still compiles. The slot names and the
+        // field names correspond one-for-one, so the correspondence is checkable
+        // as text — and this is the only level at which it is checkable at all.
+        //
+        // The table is built by an exhaustive match, so an eighth slot is a
+        // compile error here before it is a missing guard.
+        let body = shell_fn("clear_payload");
+        for o in Overlay::ALL {
+            let slot = o.teardown().slot;
+            let expected = match slot {
+                PayloadSlot::Menu => "PayloadSlot::Menu => self.menu.set(None)",
+                PayloadSlot::CommitDialog => {
+                    "PayloadSlot::CommitDialog => self.commit_dialog.set(None)"
+                }
+                PayloadSlot::ConfirmOp => "PayloadSlot::ConfirmOp => self.confirm_op.set(None)",
+                PayloadSlot::ErrorNotice => {
+                    "PayloadSlot::ErrorNotice => self.error_notice.set(None)"
+                }
+                PayloadSlot::DetailId => "PayloadSlot::DetailId => self.detail_id.set(None)",
+                PayloadSlot::ViewerDoc => "PayloadSlot::ViewerDoc => self.viewer_doc.set(None)",
+                PayloadSlot::ActivityOpen => "PayloadSlot::ActivityOpen => self.activity.close()",
+            };
+            assert!(
+                body.contains(expected),
+                "`Shell::clear_payload` has no arm blanking {slot:?}'s own signal \
+                 (expected {expected:?}), so {o:?} either cannot be switched off or \
+                 switches off something else. Body was:\n{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_overlay_is_raised_before_its_payload_is_filled() {
+        // The ordering half, and the one that asserting values alone cannot
+        // reach. The module doc's bug #2 was a *timing* bug: both right-edge
+        // panels rendered together for a frame because the eviction happened a
+        // reactive tick after the new panel appeared. `present` evicts
+        // synchronously now, but that only helps while the opener calls it
+        // *before* filling its own payload — Leptos `set` runs subscribers
+        // synchronously, so swapping the two lines of `open_detail` puts the
+        // detail panel on screen while Activity is still up, and every test in
+        // this file stays green.
+        //
+        // Driven by an exhaustive match so an eighth overlay must name its
+        // opener here rather than quietly having none.
+        for o in Overlay::ALL {
+            let (opener, fill) = match o {
+                Overlay::Menu => ("open_menu", "self.menu.set(Some("),
+                Overlay::CommitDialog => ("open_commit_dialog", "self.commit_dialog.set(Some("),
+                Overlay::Confirm => ("open_confirm", "self.confirm_op.set(Some("),
+                Overlay::Error => ("open_error", "self.error_notice.set(Some("),
+                Overlay::Detail => ("open_detail", "self.detail_id.set(Some("),
+                Overlay::Viewer => ("open_viewer", "self.viewer_doc.set(Some("),
+                // The one control that both opens and closes; the open branch is
+                // still an ordinary present-then-fill.
+                Overlay::Activity => ("toggle_activity", "self.activity.open()"),
+            };
+            let body = shell_fn(opener);
+            let raise = format!("self.present(Overlay::{o:?})");
+            let raise_at = body.find(&raise).unwrap_or_else(|| {
+                panic!(
+                    "`Shell::{opener}` no longer raises {o:?} through `present`, so \
+                     nothing evicts whatever shares its dock. Body was:\n{body}"
+                )
+            });
+            let fill_at = body.find(fill).unwrap_or_else(|| {
+                panic!(
+                    "`Shell::{opener}` no longer fills {o:?}'s payload with {fill:?} — \
+                     if the field was renamed, rename it here too. Body was:\n{body}"
+                )
+            });
+            assert!(
+                raise_at < fill_at,
+                "`Shell::{opener}` fills {o:?}'s payload before raising it. The evicted \
+                 overlay is blanked inside `present`, so filling first puts both \
+                 overlays on screen at once — exactly the frame this module was \
+                 written to make impossible. Body was:\n{body}"
+            );
+        }
     }
 }

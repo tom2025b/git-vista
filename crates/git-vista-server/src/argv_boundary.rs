@@ -264,6 +264,11 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // real bare remote, so the presence or absence of refs/remotes/origin/HEAD
     // — the variable the whole suite turns on — is genuine rather than mocked.
     "src/planner/advisory_suite.rs",
+    // M12.02 (#552): `#[cfg(test)]` watcher fixtures. The sole spawn runs
+    // literal `git` to build a throwaway repository and to exercise the
+    // acceptance operation itself (`git pack-refs --all`). Production
+    // `watcher.rs` constructs no process; notify events remain hints only.
+    "src/watcher/suite.rs",
     // #448 removed `src/conflicts.rs` from this list: its `#[cfg(test)]` git
     // fixtures now come from the `git-vista-fixtures` catalogue, so the file
     // constructs no `Command` at all and the entry had become a permission
