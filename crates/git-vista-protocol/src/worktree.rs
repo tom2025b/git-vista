@@ -116,6 +116,47 @@ pub enum Serviceable {
     Missing,
 }
 
+impl Serviceable {
+    /// Whether this application may open this sibling — the one place the
+    /// three-state answer becomes the yes/no a button needs (M11.03, #548).
+    ///
+    /// Spelled as a method rather than left to each call site's `matches!`,
+    /// so a caller cannot write `!matches!(s, Serviceable::Missing)` and
+    /// thereby treat a fenced-off worktree as openable.
+    pub fn is_openable(&self) -> bool {
+        matches!(self, Self::Yes)
+    }
+
+    /// Why this sibling cannot be opened, in the words a person reads —
+    /// `None` exactly when [`Self::is_openable`] is `true`.
+    ///
+    /// # One sentence, two consumers, on purpose
+    ///
+    /// The server refuses `POST /api/select-worktree` with this text, and the
+    /// drawer renders the same text beside the row *before* anyone taps it.
+    /// Those must not be two sentences maintained in two crates: M11.02's
+    /// `collision_refusal` earned that rule the hard way, and the failure mode
+    /// here is worse, because the drawer's copy is the one a user reads while
+    /// deciding whether to tap at all.
+    ///
+    /// It is deliberately a **stated fence**, never a silent omission and
+    /// never a bare greyed-out control: `docs/superpowers/specs/m3.23-worktrees.md`
+    /// §1 weighs hiding a refused sibling and rejects it — "a wrong answer
+    /// produced by a deliberate omission is the worst of the three".
+    pub fn refusal(&self) -> Option<&'static str> {
+        match self {
+            Self::Yes => None,
+            Self::OutsideAllowedRoots => {
+                Some("This worktree is outside the folders you allowed, so it cannot be opened.")
+            }
+            Self::Missing => Some(
+                "This worktree's folder is gone from disk, though git still holds its entry. \
+                 Run git worktree prune to release the branch it is holding.",
+            ),
+        }
+    }
+}
+
 /// One worktree of the repository being served, as reported by
 /// `git worktree list --porcelain` (M11.01, #546) — the app's own working
 /// tree ([`is_current`](Self::is_current)) or one of its linked siblings.
@@ -863,6 +904,60 @@ mod tests {
         assert_eq!(
             branch_holder(&census, &branch("main-2")),
             BranchHolder::Free
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // `Serviceable`'s user-facing half (M11.03, #548)
+    // -----------------------------------------------------------------
+
+    /// Exactly the openable variant has no refusal, and every refused one has
+    /// a real sentence. A `Some("")` would compile and read as done.
+    #[test]
+    fn every_refused_variant_says_why_and_the_openable_one_does_not() {
+        assert!(Serviceable::Yes.is_openable());
+        assert_eq!(Serviceable::Yes.refusal(), None);
+        for refused in [Serviceable::OutsideAllowedRoots, Serviceable::Missing] {
+            assert!(!refused.is_openable(), "{refused:?}");
+            let why = refused
+                .refusal()
+                .unwrap_or_else(|| panic!("{refused:?} refuses without saying why"));
+            assert!(why.len() > 20, "{refused:?} says only {why:?}");
+            assert!(
+                why.ends_with('.'),
+                "{refused:?} says {why:?} — not a sentence"
+            );
+        }
+    }
+
+    /// The fence sentence the issue names, pinned literally. It is read by a
+    /// person deciding whether to tap, and it is asserted by the browser
+    /// suite, so a reword is a deliberate edit in both places rather than a
+    /// silent drift that leaves the spec failing for a reason nobody expects.
+    #[test]
+    fn the_fence_sentence_is_the_one_the_issue_names() {
+        assert_eq!(
+            Serviceable::OutsideAllowedRoots.refusal(),
+            Some("This worktree is outside the folders you allowed, so it cannot be opened.")
+        );
+    }
+
+    /// The two refusals must not read alike: they are different states with
+    /// different remedies, and a user who cannot tell them apart has been
+    /// given one "unusable" badge wearing two hats — the exact failure this
+    /// issue's second acceptance criterion forbids.
+    #[test]
+    fn the_two_refusals_are_not_the_same_sentence() {
+        assert_ne!(
+            Serviceable::OutsideAllowedRoots.refusal(),
+            Serviceable::Missing.refusal()
+        );
+        assert!(
+            Serviceable::Missing
+                .refusal()
+                .expect("missing refuses")
+                .contains("prune"),
+            "the missing case must name the remedy that actually releases the branch"
         );
     }
 }

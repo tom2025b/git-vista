@@ -854,6 +854,127 @@ pub fn merge_preview_fixture(root: &Path) {
     }
 }
 
+/// The directory inside the fixture repository that holds its serviceable
+/// linked worktrees.
+///
+/// Inside the repository's own working tree, and therefore inside the allowed
+/// root the server registers for it — which is the whole point: a worktree
+/// here is `Serviceable::Yes` and yet was never scanned, so it is exactly the
+/// shape `/api/select-worktree` exists for (M11.03, #548). Dot-prefixed and
+/// added to `.git/info/exclude`, so the parent's `git status` stays clean and
+/// no other assertion in this suite moves.
+pub const WORKTREE_DESK_DIR: &str = ".desks";
+
+/// The plainly openable desk: inside the allowed root, no git flags. The row
+/// the browser spec switches to.
+pub const WORKTREE_OPEN_DESK: &str = "desk-two";
+pub const WORKTREE_OPEN_BRANCH: &str = "feature/desk-two";
+
+/// A desk git has **locked** that this application can still open.
+///
+/// The load-bearing row for #548's second acceptance criterion: git's
+/// `locked` flag and this app's `Serviceable` verdict are different facts, and
+/// a single "unusable" badge covering both would make this row unopenable for
+/// a reason nobody holds. Locking only stops `git worktree remove`/`prune`.
+pub const WORKTREE_LOCKED_DESK: &str = "locked-desk";
+pub const WORKTREE_LOCKED_BRANCH: &str = "feature/locked";
+
+/// A desk **outside** every allowed root — a sibling of the repository rather
+/// than a child of it. Discovered, real, listed, and refused with the fence
+/// sentence `Serviceable::refusal` carries.
+pub const WORKTREE_OUTSIDE_DESK: &str = "worktree-outside-desk";
+pub const WORKTREE_OUTSIDE_BRANCH: &str = "feature/outside";
+
+/// A desk whose directory has been deleted while git still holds its entry:
+/// `prunable` to git, `Serviceable::Missing` to this app. Two facts on one
+/// row, from two different sources, which is why it is the sharpest row in
+/// the fixture for the "two distinct statements" criterion.
+pub const WORKTREE_GHOST_DESK: &str = "ghost-desk";
+pub const WORKTREE_GHOST_BRANCH: &str = "feature/ghost";
+
+/// How many rows the census reports for this fixture: the main worktree plus
+/// its four linked desks.
+pub const WORKTREE_ROW_COUNT: usize = 5;
+
+/// A NINTH repository: one whose desks span every state the drawer must tell
+/// apart (M11.03, #548).
+///
+/// Its own repository, like every fixture here, and for a sharper reason than
+/// most: `git worktree add` binds a branch to a desk, and git then refuses to
+/// check that branch out anywhere else. Adding desks to a shared fixture would
+/// silently make branches other specs check out unavailable — the very
+/// collision M11.02 is about, arriving as an unrelated spec's failure.
+///
+/// The four desks, and what each one proves:
+///
+/// | desk | git says | this app says | proves |
+/// |---|---|---|---|
+/// | `desk-two` | nothing | can open | the switch works end to end |
+/// | `locked-desk` | `locked` | can open | git's flags are not the app's verdict |
+/// | `worktree-outside-desk` | nothing | outside your folders | the fence is stated, not silent |
+/// | `ghost-desk` | `prunable` | folder is gone | two sources, one row, two badges |
+pub fn worktree_fixture(root: &Path) {
+    fresh(root);
+
+    git::write(root, "tracked.txt", b"the committed line\n");
+    run(root, &["add", "-A"]);
+    run(root, &["commit", "-q", "-m", "seed: one tracked file"]);
+
+    // The desks directory lives inside the working tree so it lands inside the
+    // allowed root — and is excluded so the parent's status stays clean.
+    let exclude = root.join(".git").join("info").join("exclude");
+    if let Some(parent) = exclude.parent() {
+        std::fs::create_dir_all(parent).expect("fixture: .git/info exists");
+    }
+    let mut ignore = std::fs::read_to_string(&exclude).unwrap_or_default();
+    ignore.push_str(&format!("\n/{WORKTREE_DESK_DIR}/\n"));
+    std::fs::write(&exclude, ignore).expect("fixture: write .git/info/exclude");
+
+    let desks = root.join(WORKTREE_DESK_DIR);
+    let add = |path: &Path, branch: &str| {
+        run(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                path.to_str().expect("fixture paths are utf-8"),
+            ],
+        );
+    };
+
+    add(&desks.join(WORKTREE_OPEN_DESK), WORKTREE_OPEN_BRANCH);
+
+    let locked = desks.join(WORKTREE_LOCKED_DESK);
+    add(&locked, WORKTREE_LOCKED_BRANCH);
+    run(
+        root,
+        &[
+            "worktree",
+            "lock",
+            locked.to_str().expect("fixture paths are utf-8"),
+        ],
+    );
+
+    // A SIBLING of the repository, not a child: outside every allowed root the
+    // server registers, which is what makes it refused rather than merely
+    // inconvenient.
+    let outside = root
+        .parent()
+        .expect("the fixture root has a parent")
+        .join(WORKTREE_OUTSIDE_DESK);
+    add(&outside, WORKTREE_OUTSIDE_BRANCH);
+
+    // Added, then deleted from disk. git keeps the administrative entry and
+    // reports the desk `prunable`; the app resolves it `Serviceable::Missing`.
+    // Deliberately NOT pruned — a pruned worktree would simply be absent, and
+    // absent is the one thing this row must not be.
+    let ghost = desks.join(WORKTREE_GHOST_DESK);
+    add(&ghost, WORKTREE_GHOST_BRANCH);
+    std::fs::remove_dir_all(&ghost).expect("fixture: remove the ghost desk's directory");
+}
+
 /// Every browser shape, by the name the `gv-fixture` binary accepts.
 pub const SHAPES: &[(&str, Builder)] = &[
     ("main", main_fixture),
@@ -864,6 +985,7 @@ pub const SHAPES: &[(&str, Builder)] = &[
     ("interleaved-wip", interleaved_wip_fixture),
     ("stash", stash_fixture),
     ("merge-preview", merge_preview_fixture),
+    ("worktree", worktree_fixture),
 ];
 
 #[cfg(test)]
@@ -1301,6 +1423,72 @@ mod tests {
             "main's tip must be an ordinary commit — a merge already performed \
              would let the spec pass against a picture of the past"
         );
+    }
+    /// M11.03 (#548): the four desks must actually be in the four states the
+    /// drawer spec asserts on. Built with a real git, because every one of
+    /// these facts is git's own report and none of it can be assumed.
+    #[test]
+    fn the_worktree_fixture_puts_each_desk_in_the_state_its_row_claims() {
+        let (dir, root) = build("worktree");
+        let listing = std::process::Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(&root)
+            .output()
+            .expect("git worktree list runs");
+        assert!(listing.status.success());
+        let text = String::from_utf8_lossy(&listing.stdout);
+
+        let records = text.split("\n\n").filter(|r| !r.trim().is_empty()).count();
+        assert_eq!(
+            records, WORKTREE_ROW_COUNT,
+            "the fixture no longer has {WORKTREE_ROW_COUNT} worktrees:\n{text}"
+        );
+
+        // The locked desk is locked, and it is the ONLY locked one — a second
+        // would make the spec's "exactly one locked row" assertion pass for
+        // the wrong reason.
+        assert_eq!(
+            text.lines().filter(|l| *l == "locked").count(),
+            1,
+            "expected exactly one locked desk:\n{text}"
+        );
+        // The ghost is prunable, and it is the only one.
+        assert_eq!(
+            text.lines().filter(|l| l.starts_with("prunable")).count(),
+            1,
+            "expected exactly one prunable desk:\n{text}"
+        );
+        assert!(
+            !root
+                .join(WORKTREE_DESK_DIR)
+                .join(WORKTREE_GHOST_DESK)
+                .exists(),
+            "the ghost desk's directory is still on disk, so it would resolve \
+             serviceable rather than missing"
+        );
+        // The outside desk is a sibling of the repository, not a child of it.
+        // If it ever moved inside, it would resolve `Serviceable::Yes` and the
+        // fence sentence would never be shown.
+        let outside = root.parent().unwrap().join(WORKTREE_OUTSIDE_DESK);
+        assert!(outside.exists(), "the outside desk was not created");
+        assert!(
+            !outside.starts_with(&root),
+            "the outside desk is inside the repository, so it is not outside \
+             the allowed root either"
+        );
+        // The parent's own status stays clean: `.desks` is excluded. A dirty
+        // fixture would change what other assertions about this repo see.
+        let status = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&root)
+            .output()
+            .expect("git status runs");
+        assert_eq!(
+            String::from_utf8_lossy(&status.stdout).trim(),
+            "",
+            "the desks directory is not excluded, so the fixture repo is dirty"
+        );
+        drop(dir);
     }
 }
 

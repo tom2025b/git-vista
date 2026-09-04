@@ -15,7 +15,7 @@ use axum::http::StatusCode;
 use git_vista_core::identity::{RepositoryHandle, WorktreeId};
 use git_vista_protocol::{RepoMode, RepositoryDescriptor};
 
-use crate::catalog::{Catalog, RepoEntry};
+use crate::catalog::{Catalog, CatalogError, RepoEntry};
 
 // Which repository to visualise *initially*. Taken from the first CLI argument
 // (`git-vista-server <path>`), falling back to the current working directory (`.`,
@@ -711,6 +711,32 @@ pub(crate) fn select_registered(worktree: WorktreeId, mode: RepoMode) -> bool {
         }
         None => false,
     }
+}
+
+/// Admit a linked worktree discovered by the census (M11.03, #548), so the
+/// selection machinery can address it.
+///
+/// A thin wrapper over [`Catalog::register`], and deliberately nothing more:
+/// it does **not** call `allow_root` first. That omission is the whole point.
+/// `register_explicit` allows a root and then registers under it, which is
+/// right for a path an operator named on the command line; doing the same here
+/// would make "this worktree was discovered" sufficient to widen the fence,
+/// and creating a worktree would become a way to make the app serve any
+/// directory — the second of the three options
+/// `docs/superpowers/specs/m3.23-worktrees.md` §1 weighs and rejects.
+///
+/// So this can only ever succeed for a path that was **already** inside an
+/// allowed root, which is exactly what `Serviceable::Yes` means. The caller
+/// has checked that; this checks it again, independently, in the function that
+/// has always owned the check.
+pub(crate) fn register_discovered_worktree(
+    path: &Path,
+    read_only: bool,
+) -> Result<RepositoryHandle, CatalogError> {
+    catalog()
+        .write()
+        .expect("catalog lock")
+        .register(path, read_only)
 }
 
 /// Parent directory that holds every persistent clone (ADR 0008):

@@ -100,6 +100,14 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     ),
     ("/api/delete-clone", Method::POST, Authz::SessionAndCsrf),
     ("/api/select", Method::POST, Authz::SessionAndCsrf),
+    // M11.03 (#548): admits a discovered linked worktree to the catalog and
+    // moves the selection — a write in both senses, so the full write posture.
+    // Its `SessionAndCsrf` classification is load-bearing beyond the usual: it
+    // is the only route that can add a catalog entry without an operator
+    // naming the path, and although it can only ever admit a path already
+    // inside an allowed root, an unauthenticated caller must not be able to
+    // reach the attempt at all.
+    ("/api/select-worktree", Method::POST, Authz::SessionAndCsrf),
     ("/api/rescan", Method::POST, Authz::SessionAndCsrf),
     ("/api/branch", Method::POST, Authz::SessionAndCsrf),
     ("/api/commit", Method::POST, Authz::SessionAndCsrf),
@@ -315,7 +323,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// dropped by a `main.rs` refactor that this scanner's pattern-matching
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
-const EXPECTED_ROUTE_COUNT: usize = 70;
+const EXPECTED_ROUTE_COUNT: usize = 71;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in

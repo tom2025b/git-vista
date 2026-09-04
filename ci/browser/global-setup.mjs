@@ -18,6 +18,7 @@ import {
   buildFixture,
   buildInterleavedWipFixture,
   buildMergePreviewFixture,
+  buildWorktreeFixture,
   buildNonTextConflictFixture,
   buildStashFixture,
 } from './fixture.mjs'
@@ -103,6 +104,14 @@ export default async function globalSetup() {
   // deliberately dirty/conflicted (so it would answer a different question).
   // Nothing ever merges it — the spec opens a confirmation and cancels.
   const mergePreviewFixture = buildMergePreviewFixture(join(work, 'merge-preview-repo'))
+  // #548: a ninth repo with four linked worktrees, one per state the drawer
+  // must tell apart. Separate because `git worktree add` binds a branch to a
+  // desk and git then refuses to check that branch out anywhere else — desks
+  // in a shared fixture would break other specs' checkouts for a reason those
+  // specs are not about. Its `worktree-outside-desk` is created BESIDE it
+  // under `work`, deliberately outside every allowed root, and is never
+  // offered to the picker.
+  const worktreeFixture = buildWorktreeFixture(join(work, 'worktree-repo'))
   const { child, base, signInUrl } = await startServer({
     repoPath: fixture.root,
     extraRepos: [
@@ -113,6 +122,7 @@ export default async function globalSetup() {
       interleavedFixture.root,
       stashFixture.root,
       mergePreviewFixture.root,
+      worktreeFixture.root,
     ],
     stateHome: join(work, 'state'),
   })
@@ -137,6 +147,7 @@ export default async function globalSetup() {
         stashFixture,
         interleavedFixture,
         mergePreviewFixture,
+        worktreeFixture,
       },
       null,
       2,

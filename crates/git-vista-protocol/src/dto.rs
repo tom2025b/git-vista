@@ -899,6 +899,45 @@ pub struct SelectRequest {
     pub mode: RepoMode,
 }
 
+/// Body of `POST /api/select-worktree` (M11.03, #548): switch to a linked
+/// worktree of the **currently served repository**, addressed by the opaque id
+/// the worktree census reports for it.
+///
+/// # Why this is not `POST /api/select`
+///
+/// `/api/select` resolves an id through the server-owned catalog and answers
+/// `404` for anything the catalog does not already hold. That fail-closed
+/// contract is correct and is not being changed. But a linked worktree
+/// discovered by `git worktree list` has never been registered — nothing
+/// scanned it — so `/api/select` refuses it even when it lies inside an
+/// allowed root and is perfectly serviceable. That gap is what made M11.02's
+/// "open the worktree that has it" offer able to fail.
+///
+/// The two routes therefore differ in **what authorises the id**, which is a
+/// security-relevant difference and so gets its own door:
+///
+/// | route | authority | unknown id |
+/// |---|---|---|
+/// | `/api/select` | the catalog | `404`, and nothing is scanned |
+/// | `/api/select-worktree` | a fresh census of the served repository | `404` unless that census names it |
+///
+/// The fence is enforced **twice** on the admitting path and is never
+/// widened: the census marks a sibling `Serviceable::Yes` only when its
+/// canonical path lies inside an allowed root, and `Catalog::register` — which
+/// is what actually admits it — re-checks the allowed roots itself and fails
+/// closed. A sibling the census reports as `OutsideAllowedRoots` or `Missing`
+/// is refused here with `Serviceable::refusal`'s own words, the same sentence
+/// the drawer already showed beside the row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectWorktreeRequest {
+    /// The opaque worktree id, as `WorktreeSibling::id` reports it. Never a
+    /// path: like every other request body here, this cannot name a location
+    /// on disk.
+    pub worktree: String,
+    pub mode: RepoMode,
+}
+
 /// Body of `POST /api/delete-clone` (ADR 0008): delete the *clone* addressed by
 /// the opaque `worktree` id — its catalog entry and its directory. The server
 /// refuses any id whose path does not canonicalize inside the clones root, so

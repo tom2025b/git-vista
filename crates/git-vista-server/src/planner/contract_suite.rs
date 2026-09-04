@@ -2433,6 +2433,19 @@ fn every_git_write_route_reaches_the_planner() {
         ("/api/clone", "clone_repo"),
         ("/api/delete-clone", "delete_clone_repo"),
         ("/api/select", "select_repo"),
+        // M11.03 (#548): switch to a linked worktree of the served repository.
+        // A **catalog write, not a git write** — it can admit a discovered
+        // sibling to the catalog and move the selection, but it constructs no
+        // argv, mints no plan and touches no ref, so it has no funnel row
+        // below. Classified here rather than allowed to slip past the tally,
+        // exactly as `/api/operations/{id}/cancel` is: the whole point of this
+        // table is that a new POST cannot appear without someone deciding
+        // which kind it is. The git it does run is the census's read-only
+        // `git worktree list --porcelain`.
+        (
+            "/api/select-worktree",
+            "handlers::select::select_discovered_worktree",
+        ),
         ("/api/rescan", "rescan"),
         ("/api/branch", "create_branch"),
         ("/api/commit", "create_commit"),

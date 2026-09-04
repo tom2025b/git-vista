@@ -14,7 +14,13 @@ use leptos::*;
 use git_vista_core::activity::UndoAction;
 use git_vista_protocol::{MergeStrategy, RepoMode};
 
-use crate::api::select_request;
+// M11.03 (#548): `select_worktree_request`, not `select_request`. The offer
+// this arm makes is to open a **linked worktree** the census discovered, and
+// `/api/select` resolves ids through the catalog — which a worktree nobody
+// scanned is not in, so a serviceable sibling answered `404 No such
+// repository.` The offer was honest about failing, which is not the same as
+// working; #651's body named this gap and this is where it closes.
+use crate::api::select_worktree_request;
 use crate::features::session::signals as session_state;
 
 use crate::features::dialogs::core::preview_subject;
@@ -90,7 +96,7 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                     // the picker if they want more, which is where that
                     // choice has always been made.
                     let mode = session_state::ui_mode().unwrap_or(RepoMode::Visualize);
-                    match select_request(&id, mode).await {
+                    match select_worktree_request(&id, mode).await {
                         Ok(()) => graph.update(|g| {
                             g.force_bump();
                         }),

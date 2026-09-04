@@ -238,3 +238,40 @@ export function buildMergePreviewFixture(root) {
   build('merge-preview', root)
   return { root, branch: MERGE_PREVIEW_BRANCH, into: MERGE_PREVIEW_INTO, depth: MERGE_PREVIEW_DEPTH }
 }
+
+/** Mirrors `browser::WORKTREE_*`. The four desks and what each one proves are
+ *  documented on `git_vista_fixtures::browser::worktree_fixture`. */
+export const WORKTREE_OPEN_DESK = 'desk-two'
+export const WORKTREE_OPEN_BRANCH = 'feature/desk-two'
+export const WORKTREE_LOCKED_DESK = 'locked-desk'
+export const WORKTREE_OUTSIDE_DESK = 'worktree-outside-desk'
+export const WORKTREE_GHOST_DESK = 'ghost-desk'
+/** The main worktree plus its four linked desks. */
+export const WORKTREE_ROW_COUNT = 5
+
+/**
+ * A NINTH repository, whose desks span every state the drawer must tell apart
+ * (M11.03, #548).
+ *
+ * Its own repository for a sharper reason than most fixtures here: `git
+ * worktree add` binds a branch to a desk, and git then refuses to check that
+ * branch out anywhere else. Adding desks to a shared fixture would silently
+ * make branches other specs check out unavailable — the very collision M11.02
+ * is about, arriving as an unrelated spec's failure.
+ *
+ * Note the outside desk is created as a SIBLING of `root`, not inside it, so
+ * it lands outside every allowed root the server registers. That placement is
+ * the whole reason the fence sentence is reachable at all.
+ */
+export function buildWorktreeFixture(root) {
+  build('worktree', root)
+  return {
+    root,
+    openDesk: WORKTREE_OPEN_DESK,
+    openBranch: WORKTREE_OPEN_BRANCH,
+    lockedDesk: WORKTREE_LOCKED_DESK,
+    outsideDesk: WORKTREE_OUTSIDE_DESK,
+    ghostDesk: WORKTREE_GHOST_DESK,
+    rowCount: WORKTREE_ROW_COUNT,
+  }
+}

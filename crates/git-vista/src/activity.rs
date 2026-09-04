@@ -33,6 +33,7 @@ use crate::features::status::core::{chip_label, StatusHeadline, StatusSection, S
 use crate::features::tags::core::{
     tag_list_view, tag_row_lines, TagListView, TagRow, LOADING_TAGS, NO_TAGS,
 };
+use crate::features::worktrees::view::worktree_section_view;
 use crate::icons::icon_set;
 use crate::menu;
 use crate::state::{Features, PendingOp, Settings};
@@ -378,6 +379,7 @@ pub fn activity_panel_view(
                         </div>
                         {tags_section}
                         {stash_section_view(features, settings, read_only, status_sections, stash_drawer)}
+                        {worktree_section_view(features)}
                         <div class="detail-section-title act-feed-title">
                             "History"
                         </div>

@@ -6,7 +6,7 @@
 
 use git_vista_protocol::{
     DeleteCloneRequest, ListenerProfile, RepoMode, RepositoryDescriptor, SelectRequest,
-    LISTENER_PROFILE_HEADER,
+    SelectWorktreeRequest, LISTENER_PROFILE_HEADER,
 };
 
 use super::{
@@ -50,6 +50,33 @@ pub async fn fetch_catalog() -> Result<RepositoryCatalog, String> {
             repositories,
             listener_profile,
         })
+    } else {
+        Err(response_error(resp).await)
+    }
+}
+
+/// Switch to a **linked worktree** of the repository currently open
+/// (`POST /api/select-worktree`, M11.03 #548).
+///
+/// Deliberately not [`select_request`]. That route resolves ids through the
+/// catalog and answers `404` for anything not already registered — which is
+/// every linked worktree nobody scanned, including perfectly serviceable ones
+/// inside an allowed root. This route's authority is a fresh census of the
+/// served repository instead, and it admits the sibling before selecting it.
+///
+/// The `Err` carries the server's own sentence, which for a refused sibling is
+/// `Serviceable::refusal`'s — the same words the drawer already showed beside
+/// the row, so a user who taps anyway is told the same thing twice rather than
+/// two different things once.
+pub async fn select_worktree_request(worktree: &str, mode: RepoMode) -> Result<(), String> {
+    refuse_if_offline()?;
+    let body = SelectWorktreeRequest {
+        worktree: worktree.to_string(),
+        mode,
+    };
+    let (resp, _key) = write_json("/api/select-worktree", &body).await?;
+    if resp.ok() {
+        Ok(())
     } else {
         Err(response_error(resp).await)
     }

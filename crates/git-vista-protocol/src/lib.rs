@@ -111,9 +111,9 @@ pub use dto::{
     FetchError, FetchFailureKind, FetchRequest, FetchSuccess, HookPolicy, PullError,
     PullFailureKind, PullRequest, PullSuccess, PushRequest, PushStashRequest, PushTagRequest,
     RebaseStatus, RemoteRefUpdate, RepoMode, RepositoryDescriptor, RepositoryKind,
-    ResolveConflictContentRequest, ResolveConflictRequest, SelectRequest, SessionInfo,
-    SessionRequest, SignTagError, SignTagFailureKind, SignatureStatus, StashEntry, StashTarget,
-    TagDetail, TagKind, WorktreePathsRequest, CLONE_IN_PROGRESS_SENTINEL,
+    ResolveConflictContentRequest, ResolveConflictRequest, SelectRequest, SelectWorktreeRequest,
+    SessionInfo, SessionRequest, SignTagError, SignTagFailureKind, SignatureStatus, StashEntry,
+    StashTarget, TagDetail, TagKind, WorktreePathsRequest, CLONE_IN_PROGRESS_SENTINEL,
 };
 pub use effects::{network_need_for_operation, IndexEffect, NetworkNeed, WorktreeEffect};
 pub use error::{ApiError, ApiErrorBody, ErrorCode, RequestId};
