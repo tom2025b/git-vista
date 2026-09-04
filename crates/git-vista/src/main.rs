@@ -48,6 +48,10 @@ mod bootstrap_fragment;
 mod icons;
 #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
 mod lod;
+// #589: presentation and HTTP-failure policy for the listener profile.  Pure
+// and host-tested; picker/api/preview_panel are wasm-only glue over its answers.
+#[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
+mod listener_policy;
 #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
 mod text;
 #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]

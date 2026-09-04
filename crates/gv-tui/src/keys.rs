@@ -13,9 +13,33 @@
 //! | `1`–`4` | focus that pane |
 //! | `j`, `↓` | cursor down |
 //! | `k`, `↑` | cursor up |
+//! | `PageDown` / `PageUp` | one visible page of the focused pane |
+//! | `Home` / `End` | the first / last row of the focused pane |
+//! | `z` | maximize the focused pane, or restore the four-pane shape |
 //! | `Enter` | load a repository, open a commit, or follow a parent |
+//! | `Space` | preview selected working-tree file / diff file / hunk / line |
+//! | `a` | preview stage-all/unstage-all in Working Tree; approve plan elsewhere |
+//! | `d` | guard discard of the selected unstaged tracked path |
+//! | `y` | approve the visible discard confirmation or plan review |
+//! | `n`, `Esc` | refuse the visible confirmation or plan review |
 //! | `[` / `]` | select the previous/next parent in Main |
 //! | `r`, `F5` | refresh |
+//! | `x` | open the conflict overlay (M10.07, #462) |
+//!
+//! # The page keys, and why not the mouse wheel (#625)
+//!
+//! The issue proposed capturing the mouse. Four key bindings buy the same
+//! thing without any of its costs: capture takes **text selection** away in
+//! most terminals, so copying a commit hash out of a pane would stop working
+//! without a modifier; it has to be torn down on panic as well as on exit, or
+//! a crash leaves the terminal swallowing the user's mouse; and a wheel event
+//! would have to be routed to the pane under the pointer rather than the
+//! focused one. `PageUp`/`PageDown`/`Home`/`End` were unbound, are on every
+//! keyboard, and follow focus like every other navigation key here.
+//!
+//! `z` is the zoom key. It was the mnemonic left free: `x` is the conflict
+//! overlay, `a`, `d` and `Space` belong to the working tree, `c` cancels,
+//! `r` refreshes, `:` opens the command line, and `1`-`9` focus panes.
 //!
 //! The vi-shaped `hjkl` set is lazygit's, and lazygit is the interface this
 //! milestone is modelled on; the arrow and Tab set is for everyone else.
@@ -27,16 +51,31 @@
 //! ignores `Release` and `Repeat` is treated as a press — so `q` quits once,
 //! not twice, and a held `j` still scrolls.
 //!
-//! # Where per-pane keys will go
+//! The staging bindings are pane-specific. Dispatch only identifies intent;
+//! `App` decides whether the selected row can honestly perform it.
+
+//! # The conflict overlay has its own keymap, and that is not a style choice
 //!
-//! Phase 2a's bindings are the same in every pane. The first pane-specific
-//! key (#459's `s` to stage, say) adds a layer here that consults the
-//! focused pane; the signature grows a `Pane` when that key exists, not
-//! before.
+//! [`dispatch_conflict`] is a second table rather than more arms in
+//! [`dispatch`], because the overlay's editor accepts **every printable
+//! character** as text. Under one shared table, typing `q` into a file you
+//! were resolving would quit the program and throw the edit away, and `j`
+//! would scroll instead of appearing in the line. So while the overlay is up
+//! it owns the keyboard, and [`KeyMode::Insert`] is the mode where the
+//! ordinary meanings of letters are suspended entirely.
+//!
+//! `x` opens it. `c` was the obvious mnemonic and is deliberately left alone:
+//! the working-tree slice (#459) is the natural owner of a commit key, and
+//! taking it here would mean renaming a binding somebody had already learned.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use git_vista_conflicts::core::Pane as ConflictView;
+use git_vista_conflicts::markers::Choice;
+use git_vista_protocol::conflict::Resolution;
+
 use crate::app::{Action, Pane};
+use crate::panes::conflicts::{Act, KeyMode};
 
 /// Translate one key event. `None` means the key is unbound.
 pub fn dispatch(key: KeyEvent, pane: Pane) -> Option<Action> {
@@ -48,6 +87,9 @@ pub fn dispatch(key: KeyEvent, pane: Pane) -> Option<Action> {
         KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => Some(Action::Quit),
         _ if !plain => None,
         KeyCode::Char('q') => Some(Action::Quit),
+        KeyCode::Char('y') => Some(Action::Approve),
+        KeyCode::Char('n') => Some(Action::Cancel),
+        KeyCode::Esc => Some(Action::RefusePlan),
         KeyCode::Tab | KeyCode::Char('l') => Some(Action::FocusNext),
         KeyCode::BackTab | KeyCode::Char('h') => Some(Action::FocusPrev),
         KeyCode::Right if pane == Pane::Main => Some(Action::HorizontalRight),
@@ -56,11 +98,111 @@ pub fn dispatch(key: KeyEvent, pane: Pane) -> Option<Action> {
         KeyCode::Left => Some(Action::FocusPrev),
         KeyCode::Down | KeyCode::Char('j') => Some(Action::CursorDown),
         KeyCode::Up | KeyCode::Char('k') => Some(Action::CursorUp),
-        KeyCode::Enter if pane != Pane::Branches => Some(Action::Activate),
+        KeyCode::PageDown => Some(Action::CursorPageDown),
+        KeyCode::PageUp => Some(Action::CursorPageUp),
+        KeyCode::Home => Some(Action::CursorTop),
+        KeyCode::End => Some(Action::CursorBottom),
+        KeyCode::Char('z') => Some(Action::ToggleMaximize),
+        KeyCode::Enter => Some(Action::Activate),
+        KeyCode::Char(' ') if matches!(pane, Pane::WorkingTree | Pane::Main) => {
+            Some(Action::PreviewSelection)
+        }
+        KeyCode::Char('a') if pane == Pane::WorkingTree => Some(Action::PreviewWholeTree),
+        KeyCode::Char('a') => Some(Action::ApprovePlan),
+        KeyCode::Char('d') if pane == Pane::WorkingTree => Some(Action::Discard),
         KeyCode::Char('[') if pane == Pane::Main => Some(Action::ParentPrev),
         KeyCode::Char(']') if pane == Pane::Main => Some(Action::ParentNext),
         KeyCode::F(5) | KeyCode::Char('r') => Some(Action::Refresh),
+        KeyCode::Char('x') => Some(Action::OpenConflicts),
+        KeyCode::Char('c') => Some(Action::CancelOperation),
+        KeyCode::Char(':') => Some(Action::OpenCommand),
         KeyCode::Char(d @ '1'..='9') => Pane::from_number(d.to_digit(10)? as u8).map(Action::Focus),
+        _ => None,
+    }
+}
+
+/// Translate one key event for the conflict overlay. `None` means unbound.
+///
+/// `Ctrl-C` still quits from every mode including [`KeyMode::Insert`] — a
+/// terminal program that cannot be interrupted is a terminal program somebody
+/// has to kill from another window. Nothing else survives insert mode.
+pub fn dispatch_conflict(key: KeyEvent, mode: KeyMode) -> Option<Action> {
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+        return Some(Action::Quit);
+    }
+    if !(key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) {
+        return None;
+    }
+
+    // Insert mode first and on its own, so no later arm can claim a character
+    // out from under the buffer. Every printable key is text here.
+    if mode == KeyMode::Insert {
+        return Some(Action::Conflict(match key.code {
+            KeyCode::Esc => Act::EndEdit,
+            KeyCode::Enter => Act::Newline,
+            KeyCode::Backspace => Act::Backspace,
+            KeyCode::Left => Act::CaretLeft,
+            KeyCode::Right => Act::CaretRight,
+            KeyCode::Up => Act::Up,
+            KeyCode::Down => Act::Down,
+            KeyCode::Char(ch) => Act::Type(ch),
+            KeyCode::Tab => Act::Type('\t'),
+            _ => return None,
+        }));
+    }
+
+    let act = match (mode, key.code) {
+        (_, KeyCode::Esc) => Act::Back,
+        (_, KeyCode::Char('q')) => Act::Close,
+        (_, KeyCode::Down | KeyCode::Char('j')) => Act::Down,
+        (_, KeyCode::Up | KeyCode::Char('k')) => Act::Up,
+        (_, KeyCode::PageDown) => Act::PageDown,
+        (_, KeyCode::PageUp) => Act::PageUp,
+        (_, KeyCode::Home) => Act::Top,
+        (_, KeyCode::End) => Act::Bottom,
+
+        (KeyMode::List, KeyCode::Enter) => Act::Open,
+        (KeyMode::List, KeyCode::Char('r') | KeyCode::F(5)) => Act::Refresh,
+
+        (KeyMode::Inspect, KeyCode::Tab) => Act::NextPane,
+        (KeyMode::Inspect, KeyCode::Char(d @ '1'..='4')) => {
+            let index = d.to_digit(10)? as usize - 1;
+            Act::FocusPane(*ConflictView::ALL.get(index)?)
+        }
+        (KeyMode::Inspect, KeyCode::Char('o')) => Act::Take(Resolution::TakeOurs),
+        (KeyMode::Inspect, KeyCode::Char('t')) => Act::Take(Resolution::TakeTheirs),
+        (KeyMode::Inspect, KeyCode::Char('d')) => Act::Take(Resolution::TakeDeletion),
+        (KeyMode::Inspect, KeyCode::Char('e')) => Act::OpenEditor,
+
+        (KeyMode::Editor, KeyCode::Char('o')) => Act::Choose(Choice::Ours),
+        (KeyMode::Editor, KeyCode::Char('t')) => Act::Choose(Choice::Theirs),
+        (KeyMode::Editor, KeyCode::Char('b')) => Act::Choose(Choice::Both),
+        (KeyMode::Editor, KeyCode::Char('i')) => Act::BeginEdit,
+        (KeyMode::Editor, KeyCode::Enter) => Act::Apply,
+
+        _ => return None,
+    };
+    Some(Action::Conflict(act))
+}
+
+/// Translate input while the `:` command palette owns the keyboard.
+pub fn dispatch_command(key: KeyEvent) -> Option<Action> {
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => Some(Action::Quit),
+        KeyCode::Esc => Some(Action::RefusePlan),
+        KeyCode::Enter => Some(Action::SubmitCommand),
+        KeyCode::Backspace => Some(Action::CommandBackspace),
+        KeyCode::Char(character)
+            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+        {
+            Some(Action::CommandChar(character))
+        }
         _ => None,
     }
 }
@@ -115,7 +257,7 @@ mod tests {
         );
         assert_eq!(
             global(press(KeyCode::Char('2'))),
-            Some(Action::Focus(Pane::Branches))
+            Some(Action::Focus(Pane::WorkingTree))
         );
         assert_eq!(
             global(press(KeyCode::Char('3'))),
@@ -185,23 +327,151 @@ mod tests {
 
     #[test]
     fn an_unbound_key_is_none() {
-        for key in [
-            press(KeyCode::Char('x')),
-            press(KeyCode::Esc),
-            press(KeyCode::Char(' ')),
-            press(KeyCode::F(1)),
-        ] {
+        // This list has now lost FOUR members to real bindings across four
+        // slices: `Esc` to plan refusal (#461), `Space` to the staging
+        // preview (#459), `x` to the conflict overlay (#462), and `z` to the
+        // zoom toggle (#625). Each was caught by this test failing rather
+        // than by anyone remembering, which is why an explicit unbound set
+        // beats trusting the match's fall-through.
+        for key in [press(KeyCode::Char('w')), press(KeyCode::F(1))] {
             assert_eq!(global(key), None, "{key:?}");
+        }
+        assert_eq!(global(press(KeyCode::Char(' '))), None);
+    }
+
+    /// INVARIANT (#625): the four page keys reach every pane, and `z` is the
+    /// zoom toggle everywhere — none of them is pane-scoped the way `d` or
+    /// `[` are, because "show me more of this" means the same thing wherever
+    /// the cursor is.
+    ///
+    /// MUTATION 1 (remove): drop the `PageDown`/`PageUp` arms.
+    /// MUTATION 2 (weaken): scope `z` to `Pane::Commits` only.
+    #[test]
+    fn the_page_keys_and_the_zoom_key_work_in_every_pane() {
+        for pane in Pane::ALL {
+            for (code, expected) in [
+                (KeyCode::PageDown, Action::CursorPageDown),
+                (KeyCode::PageUp, Action::CursorPageUp),
+                (KeyCode::Home, Action::CursorTop),
+                (KeyCode::End, Action::CursorBottom),
+                (KeyCode::Char('z'), Action::ToggleMaximize),
+            ] {
+                assert_eq!(dispatch(press(code), pane), Some(expected), "{pane:?}");
+            }
+        }
+        // Main is the one pane that steals the side arrows for horizontal
+        // scrolling; the vertical page keys must not have been caught by it.
+        assert_eq!(
+            dispatch(press(KeyCode::PageDown), Pane::Main),
+            Some(Action::CursorPageDown)
+        );
+    }
+
+    #[test]
+    fn the_page_keys_scroll_the_overlay_but_never_reach_its_text_buffer() {
+        for mode in [KeyMode::List, KeyMode::Inspect, KeyMode::Editor] {
+            assert_eq!(
+                dispatch_conflict(press(KeyCode::PageDown), mode),
+                Some(Action::Conflict(Act::PageDown)),
+                "{mode:?}"
+            );
+            assert_eq!(
+                dispatch_conflict(press(KeyCode::Home), mode),
+                Some(Action::Conflict(Act::Top)),
+                "{mode:?}"
+            );
+            assert_eq!(
+                dispatch_conflict(press(KeyCode::End), mode),
+                Some(Action::Conflict(Act::Bottom)),
+                "{mode:?}"
+            );
+        }
+        // Insert mode owns the keyboard outright (see the module doc); an
+        // unhandled key there is unbound, never a scroll under the caret.
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::PageDown), KeyMode::Insert),
+            None
+        );
+        // …and `z` is a character being typed, not a zoom, in every overlay
+        // mode — the overlay already has the whole window.
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Char('z')), KeyMode::List),
+            None
+        );
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Char('z')), KeyMode::Insert),
+            Some(Action::Conflict(Act::Type('z')))
+        );
+    }
+
+    #[test]
+    fn enter_activates_rows_in_all_four_built_panes() {
+        let enter = press(KeyCode::Enter);
+        for pane in Pane::ALL {
+            assert_eq!(dispatch(enter, pane), Some(Action::Activate), "{pane:?}");
         }
     }
 
     #[test]
-    fn enter_activates_rows_that_open_something_but_not_the_branches_placeholder() {
-        let enter = press(KeyCode::Enter);
-        for pane in [Pane::Repositories, Pane::Commits, Pane::Main] {
-            assert_eq!(dispatch(enter, pane), Some(Action::Activate), "{pane:?}");
-        }
-        assert_eq!(dispatch(enter, Pane::Branches), None);
+    fn a_approves_and_escape_refuses_a_plan_review() {
+        assert_eq!(global(press(KeyCode::Char('a'))), Some(Action::ApprovePlan));
+        assert_eq!(global(press(KeyCode::Esc)), Some(Action::RefusePlan));
+        assert_eq!(
+            global(press(KeyCode::Char('c'))),
+            Some(Action::CancelOperation)
+        );
+    }
+
+    #[test]
+    fn colon_opens_the_palette_and_palette_keys_do_not_leak_navigation() {
+        assert_eq!(global(press(KeyCode::Char(':'))), Some(Action::OpenCommand));
+        assert_eq!(
+            dispatch_command(press(KeyCode::Char('j'))),
+            Some(Action::CommandChar('j'))
+        );
+        assert_eq!(
+            dispatch_command(press(KeyCode::Backspace)),
+            Some(Action::CommandBackspace)
+        );
+        assert_eq!(
+            dispatch_command(press(KeyCode::Enter)),
+            Some(Action::SubmitCommand)
+        );
+        assert_eq!(
+            dispatch_command(press(KeyCode::Esc)),
+            Some(Action::RefusePlan)
+        );
+        assert_eq!(dispatch_command(ctrl('c')), Some(Action::Quit));
+    }
+
+    /// INVARIANT: every #459 action is keyboard-reachable only in the panes
+    /// where its selection has meaning, while approval/refusal remain global.
+    ///
+    /// MUTATION 1 (remove): make Space inert in Working Tree and Main.
+    /// MUTATION 2 (weaken): make the all-tree shortcut active in every pane.
+    #[test]
+    fn staging_and_review_keys_are_scoped_without_hiding_cancel() {
+        assert_eq!(
+            dispatch(press(KeyCode::Char(' ')), Pane::WorkingTree),
+            Some(Action::PreviewSelection)
+        );
+        assert_eq!(
+            dispatch(press(KeyCode::Char(' ')), Pane::Main),
+            Some(Action::PreviewSelection)
+        );
+        assert_eq!(
+            dispatch(press(KeyCode::Char('a')), Pane::WorkingTree),
+            Some(Action::PreviewWholeTree)
+        );
+        assert_eq!(
+            dispatch(press(KeyCode::Char('d')), Pane::WorkingTree),
+            Some(Action::Discard)
+        );
+        assert_eq!(global(press(KeyCode::Char('y'))), Some(Action::Approve));
+        assert_eq!(global(press(KeyCode::Char('n'))), Some(Action::Cancel));
+        assert_eq!(global(press(KeyCode::Esc)), Some(Action::RefusePlan));
+        assert_eq!(global(press(KeyCode::Char('a'))), Some(Action::ApprovePlan));
+        assert_eq!(global(press(KeyCode::Char('d'))), None);
     }
 
     #[test]
@@ -243,5 +513,114 @@ mod tests {
             dispatch(press(KeyCode::Char(']')), Pane::Repositories),
             None
         );
+    }
+
+    #[test]
+    fn x_opens_the_conflict_overlay_from_every_pane() {
+        for pane in Pane::ALL {
+            assert_eq!(
+                dispatch(press(KeyCode::Char('x')), pane),
+                Some(Action::OpenConflicts),
+                "{pane:?}"
+            );
+        }
+    }
+
+    // ---- the overlay's own keymap (M10.07, #462) ------------------------
+
+    #[test]
+    fn insert_mode_types_the_letters_that_are_commands_everywhere_else() {
+        // The reason `dispatch_conflict` is a second table at all. Under one
+        // shared keymap, typing `q` into a file you were resolving would quit
+        // the program and lose the edit.
+        //
+        // MUTATION: move the insert-mode block below the shared `q`/`j`/`k`
+        // arms. Every other key test still passes and this one fails.
+        for (ch, _) in [
+            ('q', ()),
+            ('j', ()),
+            ('k', ()),
+            ('o', ()),
+            ('e', ()),
+            ('i', ()),
+        ] {
+            assert_eq!(
+                dispatch_conflict(press(KeyCode::Char(ch)), KeyMode::Insert),
+                Some(Action::Conflict(Act::Type(ch))),
+                "{ch} was claimed as a command inside the text buffer"
+            );
+        }
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Enter), KeyMode::Insert),
+            Some(Action::Conflict(Act::Newline))
+        );
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Esc), KeyMode::Insert),
+            Some(Action::Conflict(Act::EndEdit))
+        );
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_from_inside_the_text_buffer() {
+        // A terminal program you cannot interrupt is one somebody has to kill
+        // from another window.
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        for mode in [
+            KeyMode::List,
+            KeyMode::Inspect,
+            KeyMode::Editor,
+            KeyMode::Insert,
+        ] {
+            assert_eq!(
+                dispatch_conflict(ctrl_c, mode),
+                Some(Action::Quit),
+                "{mode:?}"
+            );
+        }
+        // …and `c` on its own is a character there, not a quit.
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Char('c')), KeyMode::Insert),
+            Some(Action::Conflict(Act::Type('c')))
+        );
+    }
+
+    #[test]
+    fn the_resolution_keys_are_live_only_on_the_screen_that_offers_them() {
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Char('o')), KeyMode::Inspect),
+            Some(Action::Conflict(Act::Take(Resolution::TakeOurs)))
+        );
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Char('d')), KeyMode::Inspect),
+            Some(Action::Conflict(Act::Take(Resolution::TakeDeletion)))
+        );
+        // The same letter is a BLOCK choice one screen further in, and must
+        // never reach `Take` there — that would resolve a whole file while the
+        // user was picking one hunk of it.
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Char('o')), KeyMode::Editor),
+            Some(Action::Conflict(Act::Choose(Choice::Ours)))
+        );
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Char('d')), KeyMode::Editor),
+            None
+        );
+        assert_eq!(
+            dispatch_conflict(press(KeyCode::Char('o')), KeyMode::List),
+            None
+        );
+    }
+
+    #[test]
+    fn a_key_release_is_ignored_in_the_overlay_too() {
+        // Terminals with the kitty protocol on deliver two events per
+        // keystroke; in the text buffer that would double every character.
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            crossterm::event::KeyEventKind::Release,
+        );
+        assert_eq!(dispatch_conflict(release, KeyMode::Insert), None);
+        assert_eq!(dispatch_conflict(release, KeyMode::List), None);
     }
 }

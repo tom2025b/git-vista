@@ -100,19 +100,39 @@ use serde::{Deserialize, Serialize};
 /// back to exactly the unchecked drop this bump exists to remove, and nothing
 /// would be red. A client that has not been taught to send it must be refused
 /// at the version gate, not served the old unsafe path.
-pub const PROTOCOL_VERSION: u32 = 9;
+///
+/// **v10 (#559/#562)** — `GET /api/activity` replaces its bare event array
+/// with [`crate::ActivityPage`], whose cursor makes older folded events
+/// reachable and says explicitly whether another page exists. A v9 client
+/// expects an array and cannot deserialize the envelope; accepting it through
+/// negotiation would turn a deliberate update into a late panel failure.
+///
+/// **v11 (#589)** — every listener declares its route-capability profile in
+/// [`crate::LISTENER_PROFILE_HEADER`]. A v10 client does not read that header
+/// and can render a repository-selection control against the read-only route
+/// table, then mistake the ordinary 405 for navigation/session failure. The
+/// declaration is only useful if every accepted client understands it, so the
+/// compatibility window moves whole rather than allowing an old client to
+/// ignore the fact that makes its controls honest.
+///
+/// **v12 (#621)** — both conflict-resolution request bodies carry a required
+/// `repo` worktree id. A v11 client omits it and would otherwise fall back to
+/// the session selection: the exact silent wrong-repository success this
+/// contract change closes. The field is required and the whole window moves;
+/// compatibility cannot mean retaining the unsafe fallback.
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// The oldest client protocol version this server build still accepts. Together
 /// with [`MAX_CLIENT_PROTOCOL`] it is the compatibility window a client's version
 /// must fall inside. Equal to [`PROTOCOL_VERSION`] until a compatible-but-older
 /// contract must be supported.
-pub const MIN_CLIENT_PROTOCOL: u32 = 9;
+pub const MIN_CLIENT_PROTOCOL: u32 = 12;
 
 /// The newest client protocol version this server build can accept. A client
 /// reporting a version above this is *ahead* of the server (the server was
 /// downgraded, or the client cache is from a newer deploy) and is refused the
 /// same way as one that is too old.
-pub const MAX_CLIENT_PROTOCOL: u32 = 9;
+pub const MAX_CLIENT_PROTOCOL: u32 = 12;
 
 /// Request header a client must send on every `/api/*` call **except**
 /// `GET /api/protocol`, carrying the [`PROTOCOL_VERSION`] it was built against.
@@ -290,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v9_is_hard_compatibility_window() {
+    fn protocol_v12_is_a_hard_compatibility_window() {
         // M1.10 (#63) bumped the wire protocol to 4 and moved the whole window,
         // not just the ceiling: a v3 client cannot page history, so v3 must be
         // refused exactly like any other out-of-window version, not tolerated.
@@ -336,12 +356,21 @@ mod tests {
         // quietly skips its new proof. That refusal is the point — the
         // alternative shape (`Option<OperationId>`) would have let a caller
         // stop proving anything with nothing red. Whole window again.
-        assert_eq!(PROTOCOL_VERSION, 9);
-        assert_eq!(MIN_CLIENT_PROTOCOL, 9);
-        assert_eq!(MAX_CLIENT_PROTOCOL, 9);
-        assert_eq!(check_compatibility(8, 9, 9), Compatibility::ClientTooOld);
-        assert_eq!(check_compatibility(9, 9, 9), Compatibility::Compatible);
-        assert_eq!(check_compatibility(10, 9, 9), Compatibility::ClientTooNew);
+        // #559/#562 moves the activity response from a bare array to a page
+        // envelope. A v9 client cannot deserialize it, so the window moves
+        // whole rather than letting the Activity panel fail after startup.
+        // #589 adds the listener-profile response header. A v10 client ignores
+        // it and can keep drawing a live-looking control over an absent route,
+        // so this is semantic skew even though the catalog JSON is unchanged.
+        // #621 adds a required `repo` field to both conflict write bodies. A
+        // v11 client sends neither and must be refused during negotiation,
+        // never admitted into a fallback to the session selection.
+        assert_eq!(PROTOCOL_VERSION, 12);
+        assert_eq!(MIN_CLIENT_PROTOCOL, 12);
+        assert_eq!(MAX_CLIENT_PROTOCOL, 12);
+        assert_eq!(check_compatibility(11, 12, 12), Compatibility::ClientTooOld);
+        assert_eq!(check_compatibility(12, 12, 12), Compatibility::Compatible);
+        assert_eq!(check_compatibility(13, 12, 12), Compatibility::ClientTooNew);
     }
 
     #[test]
@@ -364,6 +393,7 @@ mod tests {
             CSRF_HEADER,
             IDEMPOTENCY_HEADER,
             OPERATION_HEADER,
+            crate::LISTENER_PROFILE_HEADER,
         ];
         for name in names {
             assert_eq!(name, name.to_ascii_lowercase(), "{name} must be lowercase");

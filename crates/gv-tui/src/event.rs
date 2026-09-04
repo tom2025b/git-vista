@@ -12,7 +12,7 @@ use crossterm::event::{self, Event, KeyEvent};
 use ratatui::backend::Backend;
 use ratatui::Terminal;
 
-use crate::app::App;
+use crate::app::{App, Viewport};
 use crate::data::DataPort;
 use crate::{keys, ui};
 
@@ -49,28 +49,58 @@ pub fn run<B: Backend>(
     inputs: &mut dyn Inputs,
     port: &mut dyn DataPort,
 ) -> Result<(), String> {
-    for fetch in app.start() {
-        port.request(fetch);
+    for request in app.start() {
+        port.request(request);
     }
     loop {
+        // Drawing is also the measurement (#625): the frame reports how many
+        // rows each surface had room for, and the app is told before the next
+        // key is read. So a page key always moves by the height of the frame
+        // the user is looking at — after a resize, and after a zoom, without
+        // either having to be re-derived from anything.
+        let mut measured = Viewport::default();
         terminal
-            .draw(|frame| ui::draw(frame, app))
+            .draw(|frame| measured = ui::draw(frame, app))
             .map_err(|error| error.to_string())?;
+        app.observe(measured);
         if app.quit {
             break;
         }
         match inputs.next(TICK)? {
             Input::Key(key) => {
-                if let Some(action) = keys::dispatch(key, app.focus) {
-                    for fetch in app.apply(action) {
-                        port.request(fetch);
+                // Three keymaps, and the ORDER of these two arms is a
+                // decision rather than a merge artefact. Both #461's command
+                // prompt and #462's conflict overlay capture the keyboard so
+                // that a printable key is text and not a command; the overlay
+                // is checked first because it is a full-screen takeover whose
+                // own keymap has no binding that opens a command prompt, so
+                // "both at once" is a state the two keymaps cannot produce.
+                // If a later slice makes it reachable, the overlay is still
+                // the right winner: it is the one holding an unsaved edit.
+                let action = if app.conflicts.is_open() {
+                    keys::dispatch_conflict(key, app.conflicts.key_mode())
+                } else if app.command_input.is_some() {
+                    keys::dispatch_command(key)
+                } else {
+                    keys::dispatch(key, app.focus)
+                };
+                if let Some(action) = action {
+                    for request in app.apply(action) {
+                        port.request(request);
                     }
                 }
             }
-            Input::Resize | Input::Tick => {}
+            Input::Tick => {
+                for fetch in app.tick() {
+                    port.request(fetch);
+                }
+            }
+            Input::Resize => {}
         }
         while let Some(data) = port.poll() {
-            app.receive(data);
+            for request in app.receive(data) {
+                port.request(request);
+            }
         }
     }
     Ok(())
@@ -90,7 +120,7 @@ mod tests {
     use ratatui::layout::{Position, Size};
 
     use super::*;
-    use crate::app::{Data, Fetch, Pane};
+    use crate::app::{Data, Pane, Request};
 
     const THREE: &str = r#"[
       {"repository":"r1","worktree":"w1","name":"alpha","kind":"main_worktree","read_only":false},
@@ -104,6 +134,44 @@ mod tests {
 
     fn key(c: char) -> Input {
         Input::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+    }
+
+    fn press(code: KeyCode) -> Input {
+        Input::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// More repositories than any page under test, so nothing below is
+    /// measuring a clamp at the end of the list instead of a page.
+    fn a_long_catalog() -> Vec<RepositoryDescriptor> {
+        let entries: Vec<String> = (0..400)
+            .map(|i| {
+                format!(
+                    r#"{{"repository":"r{i}","worktree":"w{i}","name":"repo-{i}","kind":"bare","read_only":true}}"#
+                )
+            })
+            .collect();
+        catalog(&format!("[{}]", entries.join(",")))
+    }
+
+    /// Drive the real loop at a real terminal size: the catalog arrives, then
+    /// `keys` are pressed, then `q`. Answers the Repositories cursor.
+    ///
+    /// Going through [`run`] rather than calling `App::apply` directly is the
+    /// point — the page size only exists because a frame was drawn and
+    /// measured, and this is the only way to test that the measurement
+    /// reaches the key press.
+    fn cursor_after(width: u16, height: u16, keys: Vec<Input>) -> usize {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("a test terminal");
+        let mut app = App::new();
+        let mut events: Vec<Result<Input, String>> = vec![Ok(Input::Tick)];
+        events.extend(keys.into_iter().map(Ok));
+        events.push(Ok(key('q')));
+        let mut port = FakePort {
+            seen: Vec::new(),
+            answers: VecDeque::from([Data::Catalog(Ok(a_long_catalog()))]),
+        };
+        run(&mut terminal, &mut app, &mut Script::new(events), &mut port).unwrap();
+        app.cursor(Pane::Repositories)
     }
 
     type ResizeSignal = (Rc<SizeCell<(u16, u16)>>, (u16, u16));
@@ -150,13 +218,13 @@ mod tests {
 
     #[derive(Default)]
     struct FakePort {
-        seen: Vec<Fetch>,
+        seen: Vec<Request>,
         answers: VecDeque<Data>,
     }
 
     impl DataPort for FakePort {
-        fn request(&mut self, fetch: Fetch) {
-            self.seen.push(fetch);
+        fn request(&mut self, request: Request) {
+            self.seen.push(request);
         }
 
         fn poll(&mut self) -> Option<Data> {
@@ -188,7 +256,7 @@ mod tests {
 
         run(&mut terminal, &mut app, &mut script, &mut port).unwrap();
 
-        assert_eq!(port.seen, [Fetch::Catalog]);
+        assert_eq!(port.seen, [Request::Catalog]);
         assert!(app.quit);
     }
 
@@ -238,7 +306,7 @@ mod tests {
 
         run(&mut terminal, &mut app, &mut script, &mut port).unwrap();
 
-        assert_eq!(port.seen, [Fetch::Catalog, Fetch::Catalog]);
+        assert_eq!(port.seen, [Request::Catalog, Request::Catalog]);
     }
 
     #[test]
@@ -251,7 +319,77 @@ mod tests {
         let error = run(&mut terminal, &mut app, &mut script, &mut port).unwrap_err();
 
         assert_eq!(error, "the input stream vanished");
-        assert_eq!(port.seen, [Fetch::Catalog]);
+        assert_eq!(port.seen, [Request::Catalog]);
+    }
+
+    /// INVARIANT (#625): one `PageDown` moves by the pane's CURRENT visible
+    /// row count, so the same key reaches further in a taller terminal.
+    ///
+    /// **Two heights, and that is the whole point.** At a single height a
+    /// hardcoded page size and a measured one are indistinguishable — and a
+    /// constant is exactly the defect this slice would otherwise ship
+    /// silently, because it would look right in every small-pane test and be
+    /// wrong the moment the zoom key handed that pane the whole window.
+    ///
+    /// The numbers are the pane's drawn interior: at 80x24 the Repositories
+    /// pane is 8 rows with a border top and bottom, at 80x60 it is 20.
+    ///
+    /// MUTATION 1 (remove): page by one row, as `j` does.
+    /// MUTATION 2 (weaken): page by a constant — any constant, since no
+    /// single number can satisfy both heights.
+    #[test]
+    fn a_page_is_the_panes_current_height_so_the_same_key_reaches_further_in_a_taller_terminal() {
+        let short = cursor_after(80, 24, vec![press(KeyCode::PageDown)]);
+        let tall = cursor_after(80, 60, vec![press(KeyCode::PageDown)]);
+
+        assert_eq!(short, 6, "80x24: the pane shows 6 rows, so a page is 6");
+        assert_eq!(tall, 18, "80x60: the pane shows 18 rows, so a page is 18");
+        assert!(
+            tall > short,
+            "a taller terminal must page further; both landed on {short}"
+        );
+    }
+
+    /// INVARIANT (#625): a maximized pane pages by its NEW, larger height.
+    ///
+    /// This is the interaction the two halves of the issue have with each
+    /// other. A page size measured once, or read from the four-pane layout,
+    /// would be right until somebody pressed `z` — and `z` exists precisely
+    /// so that the pane is bigger than the layout says.
+    ///
+    /// MUTATION 1 (remove): ignore `maximized` in `layout::split`.
+    /// MUTATION 2 (weaken): measure the viewport once, before the key loop,
+    /// instead of after every frame.
+    #[test]
+    fn zooming_a_pane_makes_its_pages_bigger_in_the_same_terminal() {
+        let plain = cursor_after(80, 24, vec![press(KeyCode::PageDown)]);
+        let zoomed = cursor_after(80, 24, vec![key('z'), press(KeyCode::PageDown)]);
+
+        assert_eq!(plain, 6, "one third of the left column, less its border");
+        assert_eq!(zoomed, 21, "the whole body, less its border");
+        assert!(
+            zoomed > plain,
+            "the zoom key changed nothing about how far a page goes"
+        );
+
+        // …and pressing it again puts the small page back, so the toggle is a
+        // toggle rather than a one-way door.
+        let unzoomed = cursor_after(80, 24, vec![key('z'), key('z'), press(KeyCode::PageDown)]);
+        assert_eq!(unzoomed, plain);
+    }
+
+    #[test]
+    fn home_and_end_reach_the_ends_of_the_list_whatever_the_terminal_size() {
+        assert_eq!(cursor_after(80, 24, vec![press(KeyCode::End)]), 399);
+        assert_eq!(
+            cursor_after(80, 24, vec![press(KeyCode::End), press(KeyCode::Home)]),
+            0
+        );
+        assert_eq!(
+            cursor_after(80, 24, vec![press(KeyCode::PageUp)]),
+            0,
+            "a page up from the top stays at the top rather than wrapping"
+        );
     }
 
     struct ResizeBackend {

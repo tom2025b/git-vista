@@ -240,25 +240,6 @@ const STORE_MARKER_MAGIC: &[u8] = b"git-vista preview scratch store v1\n";
 ///   a directory alone.
 const STALE_SCRATCH_AGE: Duration = Duration::from_secs(60 * 60);
 
-/// The git version, probed once per process.
-///
-/// Per process, not per call and not at boot. Not per call because the git
-/// binary a process execs is a property of that process's `PATH`, not of the
-/// repository or the request. Not at boot because `sandbox::probe`'s gate has
-/// exactly one non-fatal outcome by design ("There is no degrade: a verdict
-/// other than `Contained` means no server, full stop (ADR 0029)") and putting
-/// a *capability* question into a fatal gate is how a degrade gets bolted onto
-/// a gate whose whole argument is that it has none.
-///
-/// The honest limit, stated rather than hidden: an operator who upgrades git
-/// under a running server does not get this feature until restart. That is the
-/// same posture `sandbox::capabilities::current()` already takes toward host
-/// capability.
-///
-/// Only a *success* is cached ([`tokio::sync::OnceCell::get_or_try_init`]), so
-/// a transient failure to run git does not permanently disable the feature.
-static GIT_VERSION: tokio::sync::OnceCell<(u32, u32, u32)> = tokio::sync::OnceCell::const_new();
-
 /// Every git spawn this module makes: the sealed launcher, `NetworkNeed::Local`,
 /// one place.
 ///
@@ -1818,36 +1799,16 @@ async fn read_commit_record(
         .ok_or_else(|| check_failed(format!("git show printed no readable record for `{rev}`")))
 }
 
-/// Probe the host's git version. See [`GIT_VERSION`] for why this is cached
-/// per process.
+/// The host's git version, in this module's error vocabulary.
 ///
-/// `preview_git(repo, &["--version"])` — the sealed launcher, no new
-/// spawn site. `sandbox::network_need` classifies an argv with no subcommand
-/// token at all as `NetworkNeed::Local`, so this needs no special declaration.
+/// The measurement itself lives in [`crate::git_version`] since #581, so the
+/// graph preview and the revert offer establish the same fact the same way.
+/// All this adds is the wrapping: a version that could not be read is a
+/// `CheckFailed`, never a silent "old enough" or "new enough".
 async fn git_version(repo: &Path) -> Result<(u32, u32, u32), PreviewUnavailable> {
-    GIT_VERSION
-        .get_or_try_init(|| async {
-            let out = preview_git(repo, &["--version"])
-                .await
-                .map_err(|e| check_failed(format!("could not run git --version: {e}")))?;
-            if !out.status.success() {
-                return Err(check_failed(git_said(
-                    &out.stderr,
-                    "git --version did not produce an answer",
-                )));
-            }
-            let line = String::from_utf8_lossy(&out.stdout);
-            // Never "assume new enough" and never "assume too old": a line we
-            // cannot read is no fact at all.
-            parse_git_version(&line).ok_or_else(|| {
-                check_failed(format!(
-                    "could not read a version out of git's own output: {:?}",
-                    line.trim()
-                ))
-            })
-        })
+    crate::git_version::current(repo)
         .await
-        .copied()
+        .map_err(check_failed)
 }
 
 /// git's own stderr where there is any, else `fallback` — the B3 posture the
@@ -1889,48 +1850,25 @@ async fn merge_base(repo: &Path, a: &str, b: &str) -> Result<String, PreviewUnav
 // Pure parsers
 // ---------------------------------------------------------------------------
 
-/// Parse the `major.minor.patch` at the front of git's own `--version` line.
-///
-/// git prints `git version 2.43.0`, and vendor builds append suffixes
-/// (`2.39.5 (Apple Git-154)`, `2.43.0.windows.1`), so this takes the first
-/// three dot-separated integer runs after the `git version ` prefix and stops
-/// at the first component that is not all digits. `None` means the line did not
-/// look like git's — which is a `CheckFailed`, never a silent "old enough" or
-/// "new enough".
-fn parse_git_version(line: &str) -> Option<(u32, u32, u32)> {
-    let rest = line.trim().strip_prefix("git version ")?;
-    let mut parts = rest.split('.');
-    let major: u32 = parts.next()?.parse().ok()?;
-    let minor: u32 = parts.next()?.parse().ok()?;
-    // A two-component version (`git version 2.38`) is a real, readable answer;
-    // the patch level is the only part allowed to be missing or non-numeric.
-    let patch: u32 = parts
-        .next()
-        .and_then(|p| {
-            let digits: String = p.chars().take_while(char::is_ascii_digit).collect();
-            digits.parse().ok()
-        })
-        .unwrap_or(0);
-    Some((major, minor, patch))
-}
-
 /// Whether `found` is below [`MIN_GIT_FOR_PREVIEW`], as the reason to report.
 ///
 /// Pure and separate from the probe so the *decision* can be tested with
 /// literal versions on both sides of the floor, rather than only on whatever
-/// git this host happens to have. The comparison is on `(major, minor)` alone:
+/// git this host happens to have. The comparison itself is
+/// [`crate::git_version::meets`] since #581 — shared with the revert offer, so
+/// the two gates cannot disagree about what "2.38" means. It is on
+/// `(major, minor)` alone:
 /// `merge-tree --write-tree` arrived in 2.38.0, so every 2.38.x is new enough
 /// and no patch level below it is.
 fn version_gate(found: (u32, u32, u32)) -> Option<PreviewUnavailable> {
-    let (major, minor, patch) = found;
-    if (major, minor) >= MIN_GIT_FOR_PREVIEW {
+    if crate::git_version::meets(found, MIN_GIT_FOR_PREVIEW) {
         return None;
     }
     Some(PreviewUnavailable::GitTooOld {
         // The parsed triple re-rendered, never git's raw line: a vendor suffix
         // (`2.39.5 (Apple Git-154)`) is not the caller's business.
-        found: format!("{major}.{minor}.{patch}"),
-        minimum: format!("{}.{}", MIN_GIT_FOR_PREVIEW.0, MIN_GIT_FOR_PREVIEW.1),
+        found: crate::git_version::render(found),
+        minimum: crate::git_version::render_floor(MIN_GIT_FOR_PREVIEW),
     })
 }
 

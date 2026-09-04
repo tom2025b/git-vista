@@ -1,26 +1,45 @@
-//! Ratatui rendering for the four-pane shell (M10.02, #457 — phase 2a).
+//! Ratatui rendering for the four-pane shell (M10.02/#457 through #459).
 //!
 //! Drawing is a pure projection of [`App`]. Every event-loop turn draws;
 //! Ratatui's terminal diff suppresses unchanged writes, keeping invalidation
 //! logic out of the state model. The palette is intentionally limited to
 //! ANSI names: cyan marks the focused border, red marks an error status, and
 //! selection uses the terminal's own reversed modifier.
+//!
+//! # Drawing also measures (#625)
+//!
+//! [`draw`] returns a [`Viewport`]: how many rows of its own content each
+//! surface had room for in the frame it just drew. The event loop hands that
+//! straight back to [`App::observe`](crate::app::App::observe), so `PageDown`
+//! moves by the height the user is actually looking at.
+//!
+//! The measurement is taken from the very rects the widgets were rendered
+//! into — never recomputed from the terminal size — because the two could
+//! then disagree, and the one that would be believed is the one nobody can
+//! see. Each `draw_*` helper returns its own number for the same reason: the
+//! function that decided the geometry is the only one that can report it
+//! without guessing.
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, Pane, Tone};
+use crate::app::{review_lines, App, Pane, Tone, Viewport};
 use crate::layout;
+use crate::panes::conflicts::{self, Screen};
 use crate::panes::detail::RowTone;
 use crate::panes::graph::{self, ColorDepth, Emphasis, Foreground, GraphLine, LayoutData};
+use crate::panes::plan_review::{PlanReviewPane, RowTone as PlanRowTone};
+use crate::panes::staging::Tone as StagingTone;
+use crate::panes::worktree::LoadState;
 
-/// Draw one complete frame from the current application state.
-pub fn draw(frame: &mut Frame, app: &App) {
+/// Draw one complete frame from the current application state, and report
+/// what it could show (#625).
+pub fn draw(frame: &mut Frame, app: &App) -> Viewport {
     let area = frame.area();
-    let Some(panes) = layout::split(area) else {
+    let Some(panes) = layout::split(area, app.maximized()) else {
         frame.render_widget(
             Paragraph::new(format!(
                 "gv-tui needs at least {}x{}; this terminal is {}x{}",
@@ -32,8 +51,25 @@ pub fn draw(frame: &mut Frame, app: &App) {
             .wrap(Wrap { trim: false }),
             area,
         );
-        return;
+        // Nothing was drawn but one sentence, so nothing can be paged.
+        return Viewport::default();
     };
+
+    // The conflict overlay takes the whole body when it is up (M10.07,
+    // #462), leaving only the status strip. Four panes of source do not fit
+    // beside a shell that is already two columns wide — and the four-pane
+    // view is the thing #462 exists to make readable, so it gets the frame.
+    if app.conflicts.is_open() {
+        let body = Rect::new(
+            area.x,
+            area.y,
+            area.width,
+            panes.status.y.saturating_sub(area.y),
+        );
+        let rows = draw_conflicts(frame, body, app);
+        draw_status(frame, panes.status, app);
+        return Viewport::new([0; 4], rows);
+    }
 
     let rows: Vec<ListItem<'_>> = app
         .catalog
@@ -46,30 +82,180 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .highlight_symbol("> ");
     let selected = (app.rows(Pane::Repositories) > 0).then(|| app.cursor(Pane::Repositories));
     let mut state = ListState::default().with_selected(selected);
-    frame.render_stateful_widget(repositories, panes.of(Pane::Repositories), &mut state);
+    let repositories_area = panes.of(Pane::Repositories);
+    let repository_rows = pane_block(Pane::Repositories, app.focus)
+        .inner(repositories_area)
+        .height as usize;
+    frame.render_stateful_widget(repositories, repositories_area, &mut state);
 
-    // #457's graph: refs are badged inline on their commit row (see
-    // graph.rs's ref-badge handling), not listed separately here. No issue
-    // yet owns a standalone branches list, so this stays an honest
-    // placeholder rather than a claim #457 will fill it.
-    draw_placeholder(
-        frame,
-        panes.of(Pane::Branches),
-        Pane::Branches,
-        app.focus,
-        "a branches list is not yet built",
-    );
-    draw_commits(frame, panes.of(Pane::Commits), app, detect_color_depth());
-    draw_main(frame, panes.of(Pane::Main), app);
+    let worktree_rows = draw_worktree(frame, panes.of(Pane::WorkingTree), app);
+    let commit_rows = draw_commits(frame, panes.of(Pane::Commits), app, detect_color_depth());
+    let main_rows = draw_main(frame, panes.of(Pane::Main), app);
+    let overlay_rows = match &app.plan_review {
+        Some(review) => draw_plan_review(frame, area, review),
+        None => 0,
+    };
 
+    draw_status(frame, panes.status, app);
+    Viewport::new(
+        [repository_rows, worktree_rows, commit_rows, main_rows],
+        overlay_rows,
+    )
+}
+
+fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let status_style = match app.status.tone {
         Tone::Info => Style::default(),
         Tone::Error => Style::default().fg(Color::Red),
     };
-    frame.render_widget(
-        Paragraph::new(app.status.text.as_str()).style(status_style),
-        panes.status,
+    let status = app.command_input.as_ref().map_or_else(
+        // The zoom key is appended here rather than written into each of the
+        // dozen status sentences: a binding nobody can discover is a binding
+        // nobody has, and this strip is already where this shell says what is
+        // possible. While the palette owns the keyboard the line is the
+        // command being typed, and nothing may be appended to that.
+        || format!("{}{}", app.status.text, zoom_hint(app)),
+        |input| format!(":{input}█"),
     );
+    frame.render_widget(Paragraph::new(status).style(status_style), area);
+}
+
+/// The tail of the status line that names the zoom key — and, once a pane is
+/// zoomed, names the way back out of it.
+fn zoom_hint(app: &App) -> &'static str {
+    if app.conflicts.is_open() || app.plan_review.is_some() {
+        // Neither surface is a pane, and neither honours the key.
+        ""
+    } else if app.maximized().is_some() {
+        " · z unzoom"
+    } else {
+        " · z zoom"
+    }
+}
+
+/// The conflict overlay (M10.07, #462).
+///
+/// A pure projection like every other pane here: the state machine in
+/// `panes::conflicts` already decided which rows exist and what each one says,
+/// and this only assigns colours and places the caret. Nothing about a
+/// conflict is decided in this file — `cargo test` never draws a frame with a
+/// real terminal behind it, so a decision made here would be pinned by
+/// nothing.
+fn draw_conflicts(frame: &mut Frame, area: Rect, app: &App) -> usize {
+    let title = match app.conflicts.screen() {
+        Screen::List => " Conflicts ",
+        Screen::Inspect => " Conflict — inspect ",
+        Screen::Editor => " Conflict — resolve line by line ",
+    };
+    let block = Block::bordered()
+        .title(Line::styled(
+            title,
+            Style::default()
+                .fg(Color::Reset)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(Color::Cyan));
+    let height = block.inner(area).height as usize;
+    let offset = app.conflicts.view_offset(height);
+    let lines: Vec<Line<'static>> = app
+        .conflicts
+        .window(offset, height)
+        .iter()
+        .map(conflict_line)
+        .collect();
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+    height
+}
+
+fn conflict_line(row: &conflicts::Row) -> Line<'static> {
+    let mut style = conflict_tone_style(row.tone);
+    if row.selected {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    let Some(column) = row.caret else {
+        return Line::styled(row.text.clone(), style);
+    };
+    // The caret is drawn by reversing one cell, and a caret past the last
+    // character reverses a trailing space instead of vanishing: an invisible
+    // caret in a buffer that accepts every keystroke is a way to type into a
+    // line you are not looking at.
+    let mut chars = row.text.chars();
+    let before: String = chars.by_ref().take(column).collect();
+    let under = chars.next();
+    let after: String = chars.collect();
+    let caret = style.add_modifier(Modifier::REVERSED);
+    let mut spans = vec![Span::styled(before, style)];
+    spans.push(Span::styled(
+        under.map_or_else(|| " ".to_string(), |ch| ch.to_string()),
+        caret,
+    ));
+    if !after.is_empty() {
+        spans.push(Span::styled(after, style));
+    }
+    Line::from(spans)
+}
+
+fn conflict_tone_style(tone: conflicts::Tone) -> Style {
+    match tone {
+        conflicts::Tone::Heading => Style::default().add_modifier(Modifier::BOLD),
+        conflicts::Tone::Plain => Style::default(),
+        // Full weight, deliberately. These are the sentences that say a side
+        // is absent or a control is withheld, which on those screens is the
+        // content — see `conflicts::Tone::State`.
+        conflicts::Tone::State => Style::default(),
+        conflicts::Tone::Muted => Style::default().fg(Color::DarkGray),
+        conflicts::Tone::Fault => Style::default().fg(Color::Red),
+        conflicts::Tone::Ours => Style::default().fg(Color::Green),
+        conflicts::Tone::Theirs => Style::default().fg(Color::Cyan),
+    }
+}
+
+/// Draw plan review as a modal over the shell: no pane underneath can look
+/// actionable while the reducer is deliberately ignoring its navigation.
+fn draw_plan_review(frame: &mut Frame, area: Rect, review: &PlanReviewPane) -> usize {
+    let margin_x = if area.width >= 70 { 4 } else { 1 };
+    let margin_y = if area.height >= 18 { 2 } else { 1 };
+    let modal = Rect {
+        x: area.x + margin_x,
+        y: area.y + margin_y,
+        width: area.width.saturating_sub(margin_x * 2),
+        height: area.height.saturating_sub(margin_y * 2 + 1),
+    };
+    let block = Block::bordered()
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Line::styled(
+            " Plan review — nothing runs until approval ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Line::from(format!(" {} ", review.help())));
+    let lines: Vec<Line<'static>> = review
+        .rows()
+        .into_iter()
+        .skip(review.offset())
+        .map(|row| Line::styled(row.text, plan_tone_style(row.tone)))
+        .collect();
+    let rows = block.inner(modal).height as usize;
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(block),
+        modal,
+    );
+    rows
+}
+
+fn plan_tone_style(tone: PlanRowTone) -> Style {
+    match tone {
+        PlanRowTone::Plain => Style::default(),
+        PlanRowTone::Heading => Style::default().add_modifier(Modifier::BOLD),
+        PlanRowTone::Muted => Style::default().fg(Color::DarkGray),
+        PlanRowTone::Risk => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        PlanRowTone::Advisory => Style::default().fg(Color::Yellow),
+        PlanRowTone::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    }
 }
 
 fn pane_block(pane: Pane, focus: Pane) -> Block<'static> {
@@ -91,20 +277,76 @@ fn pane_block(pane: Pane, focus: Pane) -> Block<'static> {
     }
 }
 
-fn draw_placeholder(
-    frame: &mut Frame,
-    area: ratatui::layout::Rect,
-    pane: Pane,
-    focus: Pane,
-    message: &'static str,
-) {
-    frame.render_widget(Paragraph::new(message).block(pane_block(pane, focus)), area);
+/// Returns the rows of file list the pane had room for — its heading is not
+/// one of them, which is why this cannot be inferred from the pane's rect.
+fn draw_worktree(frame: &mut Frame, area: Rect, app: &App) -> usize {
+    let block = pane_block(Pane::WorkingTree, app.focus);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.is_empty() {
+        return 0;
+    }
+
+    let state_line = match app.worktree.state() {
+        LoadState::Loading => match app.worktree.branch_line() {
+            Some(branch) => format!("Refreshing… {branch}"),
+            None => String::from("Loading working tree…"),
+        },
+        LoadState::Ready => app
+            .worktree
+            .branch_line()
+            .unwrap_or_else(|| String::from("Working tree")),
+        LoadState::Failed(message) => format!("Status unavailable: {message}"),
+    };
+    let [heading, list_area] = ratatui::layout::Layout::vertical([
+        ratatui::layout::Constraint::Length(1),
+        ratatui::layout::Constraint::Fill(1),
+    ])
+    .areas(inner);
+    let heading_style = if matches!(app.worktree.state(), LoadState::Failed(_)) {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    frame.render_widget(Paragraph::new(state_line).style(heading_style), heading);
+
+    let visible_rows = list_area.height as usize;
+    if list_area.is_empty() {
+        return 0;
+    }
+    if app.worktree.rows().is_empty() {
+        let message = match app.worktree.state() {
+            LoadState::Ready => "Clean working tree.",
+            LoadState::Loading => "Waiting for status…",
+            LoadState::Failed(_) => "No successful status snapshot.",
+        };
+        frame.render_widget(Paragraph::new(message), list_area);
+        return visible_rows;
+    }
+    let rows: Vec<ListItem<'_>> = app
+        .worktree
+        .rows()
+        .iter()
+        .map(|row| ListItem::new(row.render()))
+        .collect();
+    let list = List::new(rows)
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("> ");
+    let mut state = ListState::default().with_selected(Some(app.cursor(Pane::WorkingTree)));
+    frame.render_stateful_widget(list, list_area, &mut state);
+    visible_rows
 }
 
 /// The commit graph (#457): core's lanes and edges, windowed to the pane's
 /// visible rows and scrolled to keep the cursor's commit on screen.
-fn draw_commits(frame: &mut Frame, area: Rect, app: &App, colors: ColorDepth) {
+///
+/// Returns the number of **commits** on screen, not lines: the graph draws a
+/// connector row between every pair of commits, so a page of this pane is
+/// half its height. Its cursor counts commits, and a page has to be in the
+/// same units as the cursor it moves (#625).
+fn draw_commits(frame: &mut Frame, area: Rect, app: &App, colors: ColorDepth) -> usize {
     let inner = pane_block(Pane::Commits, app.focus).inner(area);
+    let visible_commits = inner.height as usize / 2;
     if app.commits.is_empty() {
         let message = if app.active_repo.is_some() {
             "No commits."
@@ -115,7 +357,7 @@ fn draw_commits(frame: &mut Frame, area: Rect, app: &App, colors: ColorDepth) {
             Paragraph::new(message).block(pane_block(Pane::Commits, app.focus)),
             area,
         );
-        return;
+        return visible_commits;
     }
 
     let layout = LayoutData {
@@ -147,6 +389,7 @@ fn draw_commits(frame: &mut Frame, area: Rect, app: &App, colors: ColorDepth) {
         Paragraph::new(lines).block(pane_block(Pane::Commits, app.focus)),
         area,
     );
+    visible_commits
 }
 
 /// One [`GraphLine`] as a styled Ratatui [`Line`]; `selected` reverses the
@@ -175,7 +418,34 @@ fn graph_line(line: &GraphLine, selected: bool) -> Line<'static> {
 /// The commit detail and diff (#458): [`DetailPane`](crate::panes::detail::DetailPane)
 /// already windows its own rows, so this hands it the pane's cursor as a
 /// vertical offset and lets Ratatui's own scroll carry the horizontal one.
-fn draw_main(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_main(frame: &mut Frame, area: Rect, app: &App) -> usize {
+    // Every branch below draws inside the same bordered block, so the rows
+    // available are the same whichever of them runs — the branches differ in
+    // what they put there, not in how much room there is.
+    let visible_rows = pane_block(Pane::Main, app.focus).inner(area).height as usize;
+    if let Some(review) = &app.review {
+        let lines = review_lines(review);
+        let offset = app.cursor(Pane::Main).min(lines.len().saturating_sub(1));
+        let lines: Vec<Line<'static>> = lines.into_iter().skip(offset).map(Line::from).collect();
+        frame.render_widget(
+            Paragraph::new(lines).block(pane_block(Pane::Main, app.focus)),
+            area,
+        );
+        return visible_rows;
+    }
+    if let Some(confirmation) = &app.confirmation {
+        frame.render_widget(
+            Paragraph::new(confirmation.prompt.as_str())
+                .wrap(Wrap { trim: false })
+                .block(pane_block(Pane::Main, app.focus)),
+            area,
+        );
+        return visible_rows;
+    }
+    if let Some(staging) = &app.staging {
+        draw_staging(frame, area, app, staging);
+        return visible_rows;
+    }
     let inner = pane_block(Pane::Main, app.focus).inner(area);
     let rows = app
         .detail
@@ -190,6 +460,51 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &App) {
             .block(pane_block(Pane::Main, app.focus)),
         area,
     );
+    visible_rows
+}
+
+fn draw_staging(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    staging: &crate::panes::staging::StagingPane,
+) {
+    let block = pane_block(Pane::Main, app.focus);
+    let inner = block.inner(area);
+    let visible_height = inner.height as usize;
+    let selected = app.cursor(Pane::Main);
+    let max_offset = staging.rows().len().saturating_sub(visible_height);
+    let offset = if visible_height == 0 || selected < visible_height {
+        0
+    } else {
+        (selected + 1 - visible_height).min(max_offset)
+    };
+    let lines: Vec<Line<'static>> = staging
+        .rows()
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(visible_height)
+        .map(|(index, row)| {
+            let mut style = staging_tone_style(row.tone);
+            if index == selected {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            Line::styled(row.text.clone(), style)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn staging_tone_style(tone: StagingTone) -> Style {
+    match tone {
+        StagingTone::Plain => Style::default(),
+        StagingTone::File => Style::default().add_modifier(Modifier::BOLD),
+        StagingTone::Hunk => Style::default().fg(Color::Cyan),
+        StagingTone::Added => Style::default().fg(Color::Green),
+        StagingTone::Removed => Style::default().fg(Color::Red),
+        StagingTone::Muted => Style::default().fg(Color::DarkGray),
+    }
 }
 
 fn tone_style(tone: RowTone) -> Style {
@@ -234,9 +549,12 @@ mod tests {
 
     use git_vista_core::diff::{CommitDiff, DiffFile};
     use git_vista_core::model::{CommitDetail, CommitSummary, GraphRow, Oid};
-    use git_vista_core::status::ChangeKind;
-    use git_vista_protocol::plan::GenerationToken;
-    use git_vista_protocol::RepositoryDescriptor;
+    use git_vista_core::status::ChangeKind as CoreChangeKind;
+    use git_vista_protocol::{
+        ChangeKind, ChangeSides, ConflictKind, GenerationToken, GitOperation, OperationHash, Plan,
+        Precondition, RecoveryStrategy, RepositoryDescriptor, RepositoryToken, RiskLevel,
+        StatusEntry, UnixSeconds, WorktreeStatus, WorktreeToken,
+    };
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
@@ -244,7 +562,7 @@ mod tests {
     use ratatui::Terminal;
 
     use super::*;
-    use crate::app::{Action, App, CommitPage, Data, Pane};
+    use crate::app::{Action, App, CommitPage, Data, Pane, Review};
     use crate::layout;
 
     const THREE: &str = r#"[
@@ -255,18 +573,59 @@ mod tests {
 
     fn loaded() -> App {
         let mut app = App::new();
-        assert_eq!(app.start(), [crate::app::Fetch::Catalog]);
+        assert_eq!(app.start(), [crate::app::Request::Catalog]);
         let catalog: Vec<RepositoryDescriptor> =
             serde_json::from_str(THREE).expect("the wire literal is valid");
         app.receive(Data::Catalog(Ok(catalog)));
         app
     }
 
+    fn reviewing() -> App {
+        let mut app = loaded();
+        let plan = Plan {
+            repository: RepositoryToken::new("repo-1").unwrap(),
+            worktree: WorktreeToken::new("worktree-1").unwrap(),
+            generation: GenerationToken::new("generation-reviewed").unwrap(),
+            operation: GitOperation::StageAll,
+            operation_hash: OperationHash::new("a".repeat(64)).unwrap(),
+            issued_at: UnixSeconds(1_788_365_000),
+            expires_at: UnixSeconds(1_788_365_300),
+            risk: RiskLevel::Remote,
+            preconditions: Vec::new(),
+            expected_ref_changes: Vec::new(),
+            advisories: Vec::new(),
+            recovery: RecoveryStrategy::NotNeeded,
+        };
+        app.receive(Data::PlanReady(Ok(serde_json::to_vec(&plan).unwrap())));
+        app
+    }
+
+    fn select_first(app: &mut App) {
+        app.apply(Action::Activate);
+        app.receive(Data::Selected {
+            repo: "w1".to_string(),
+            result: Ok(()),
+        });
+    }
+
+    /// What [`draw`] reported it had room for, at a given terminal size.
+    fn measured(width: u16, height: u16, app: &App) -> Viewport {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("a test terminal");
+        let mut viewport = Viewport::default();
+        terminal
+            .draw(|frame| viewport = draw(frame, app))
+            .expect("the test backend draws");
+        viewport
+    }
+
     fn rendered(width: u16, height: u16, app: &App) -> Terminal<TestBackend> {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("a test terminal");
         terminal
-            .draw(|frame| draw(frame, app))
+            .draw(|frame| {
+                draw(frame, app);
+            })
             .expect("drawing to TestBackend succeeds");
         terminal
     }
@@ -337,11 +696,12 @@ mod tests {
 
     fn detailed(patch: &str, files: Vec<DiffFile>) -> App {
         let mut app = loaded();
-        app.apply(Action::Activate);
+        select_first(&mut app);
         app.receive(Data::History {
             repo: "w1".to_string(),
             result: Ok(page()),
         });
+        app.apply(Action::Focus(Pane::Commits));
         app.apply(Action::Activate);
         app.receive(Data::Commit {
             repo: "w1".to_string(),
@@ -386,7 +746,7 @@ mod tests {
             app.apply(Action::Focus(focus));
             let terminal = rendered(80, 24, &app);
             let buffer = terminal.backend().buffer();
-            let focused = layout::split(buffer.area).unwrap().of(focus);
+            let focused = layout::split(buffer.area, None).unwrap().of(focus);
             let mut cyan = 0;
             for y in buffer.area.y..buffer.area.bottom() {
                 for x in buffer.area.x..buffer.area.right() {
@@ -442,20 +802,14 @@ mod tests {
         assert!(line(second_buffer, second_y).contains("beta"));
     }
 
-    // #457 (graph) and #458 (detail/diff) are wired now — the dedicated tests
-    // below exercise their real content. Branches has no owning issue yet and
-    // stays an honest placeholder; Commits and Main say why they are empty
-    // rather than sitting blank, which is the property this test used to pin
-    // for all three panes via their old `#457`/`#458`/`#459` placeholder text.
     #[test]
-    fn the_still_unbuilt_branches_pane_says_so_rather_than_sitting_empty() {
+    fn the_working_tree_pane_names_loading_instead_of_claiming_clean() {
         let app = loaded();
         let terminal = rendered(80, 24, &app);
         let screen = text(terminal.backend().buffer());
-        assert!(
-            screen.contains("branches list is not yet built"),
-            "{screen}"
-        );
+        assert!(screen.contains("Loading working tree"), "{screen}");
+        assert!(screen.contains("Waiting for status"), "{screen}");
+        assert!(!screen.contains("Clean working tree"), "{screen}");
     }
 
     #[test]
@@ -559,7 +913,7 @@ mod tests {
     #[test]
     fn the_commit_selector_renders_the_existing_summary_and_selection() {
         let mut app = loaded();
-        app.apply(Action::Activate);
+        select_first(&mut app);
         app.receive(Data::History {
             repo: "w1".to_string(),
             result: Ok(page()),
@@ -567,7 +921,11 @@ mod tests {
         let terminal = rendered(80, 24, &app);
         let buffer = terminal.backend().buffer();
         let y = row_containing(buffer, "1111111 render the detail pane");
-        assert!(inside(layout::split(buffer.area).unwrap().commits, 1, y));
+        assert!(inside(
+            layout::split(buffer.area, None).unwrap().commits,
+            1,
+            y
+        ));
         assert!(line(buffer, y).contains("1111111 render the detail pane"));
         assert!(
             (0..buffer.area.width).any(|x| buffer
@@ -605,6 +963,105 @@ mod tests {
         }
     }
 
+    /// INVARIANT (#625): the [`Viewport`] a frame reports is the geometry it
+    /// actually drew, in each pane's own units — the graph in **commits**
+    /// (it draws a connector row between every pair, so its page is half its
+    /// height), the working tree **minus its heading row**, which is not one
+    /// of the rows its cursor can select.
+    ///
+    /// The units matter more than they look: a page has to be in the same
+    /// units as the cursor it moves, or `PageDown` on the graph would jump
+    /// twice as far as a screen and skip half the history it claimed to page
+    /// through.
+    ///
+    /// MUTATION 1 (remove): report the pane's whole rect height for the graph.
+    /// MUTATION 2 (weaken): count the working tree's heading row as usable.
+    #[test]
+    fn the_frame_reports_the_rows_it_actually_drew_in_each_panes_own_units() {
+        let mut app = loaded();
+        select_first(&mut app);
+        app.receive(Data::History {
+            repo: "w1".to_string(),
+            result: Ok(many_commits(200)),
+        });
+
+        // (terminal, repositories, working tree, commits, main)
+        for (width, height, repositories, worktree, commits, main) in
+            [(80u16, 24u16, 6, 4, 3, 21), (80, 60, 18, 16, 9, 57)]
+        {
+            let viewport = measured(width, height, &app);
+            assert_eq!(
+                viewport.rows(Pane::Repositories),
+                repositories,
+                "{width}x{height} Repositories"
+            );
+            assert_eq!(
+                viewport.rows(Pane::WorkingTree),
+                worktree,
+                "{width}x{height} Working Tree — its heading is not a row it can select"
+            );
+            assert_eq!(
+                viewport.rows(Pane::Commits),
+                commits,
+                "{width}x{height} Commits — in commits, not lines"
+            );
+            assert_eq!(viewport.rows(Pane::Main), main, "{width}x{height} Main");
+        }
+    }
+
+    /// INVARIANT (#625): a zoomed pane reports the whole body, and the panes
+    /// that are no longer drawn report nothing — a page must never be
+    /// measured against a pane the user cannot see.
+    #[test]
+    fn a_zoomed_pane_reports_the_whole_body_and_the_hidden_panes_report_nothing() {
+        let mut app = loaded();
+        select_first(&mut app);
+        app.receive(Data::History {
+            repo: "w1".to_string(),
+            result: Ok(many_commits(200)),
+        });
+        app.apply(Action::Focus(Pane::Commits));
+
+        let before = measured(80, 24, &app);
+        app.apply(Action::ToggleMaximize);
+        let after = measured(80, 24, &app);
+
+        assert_eq!(before.rows(Pane::Commits), 3);
+        assert_eq!(
+            after.rows(Pane::Commits),
+            10,
+            "the body is 23 rows; less a border, 21 lines, which is 10 commits              and a connector"
+        );
+        for hidden in [Pane::Repositories, Pane::WorkingTree, Pane::Main] {
+            assert_eq!(
+                after.rows(hidden),
+                0,
+                "{hidden:?} is not on screen and must not offer a page"
+            );
+        }
+    }
+
+    /// The zoom key has to be findable, and once used, escapable.
+    #[test]
+    fn the_status_strip_names_the_zoom_key_and_then_names_the_way_back() {
+        let app = loaded();
+        let terminal = rendered(80, 24, &app);
+        assert!(
+            line(terminal.backend().buffer(), 23).contains("z zoom"),
+            "the status strip does not name the zoom key: {:?}",
+            line(terminal.backend().buffer(), 23)
+        );
+
+        let mut zoomed = loaded();
+        zoomed.apply(Action::ToggleMaximize);
+        let terminal = rendered(80, 24, &zoomed);
+        let strip = line(terminal.backend().buffer(), 23);
+        assert!(
+            strip.contains("z unzoom"),
+            "a zoomed frame must say how to get back: {strip:?}"
+        );
+    }
+
     /// Pins the scroll-follows-cursor behaviour `draw_commits` adds on top of
     /// `graph::render_window`'s own windowing: with more commits than fit,
     /// the cursor's row must still be visible and the off-screen head must
@@ -613,11 +1070,12 @@ mod tests {
     #[test]
     fn the_commits_pane_scrolls_to_keep_the_cursor_on_screen() {
         let mut app = loaded();
-        app.apply(Action::Activate);
+        select_first(&mut app);
         app.receive(Data::History {
             repo: "w1".to_string(),
             result: Ok(many_commits(200)),
         });
+        app.apply(Action::Focus(Pane::Commits));
         for _ in 0..199 {
             app.apply(Action::CursorDown);
         }
@@ -640,7 +1098,7 @@ mod tests {
         let files = vec![DiffFile {
             path: "logo.png".to_string(),
             old_path: None,
-            kind: ChangeKind::Modified,
+            kind: CoreChangeKind::Modified,
             additions: None,
             deletions: None,
         }];
@@ -687,7 +1145,7 @@ mod tests {
         let mut app = detailed(&patch, Vec::new());
         let first = rendered(80, 24, &app);
         let first_buffer = first.backend().buffer();
-        let panes = layout::split(first_buffer.area).unwrap();
+        let panes = layout::split(first_buffer.area, None).unwrap();
         let first_y = row_containing(first_buffer, "+012345");
         assert!(!line(first_buffer, first_y).contains("-END"));
         for y in panes.main.y + 1..panes.main.bottom() - 1 {
@@ -739,5 +1197,148 @@ mod tests {
             ColorDepth::Basic,
             "an unrecognised COLORTERM value must not be treated as rich"
         );
+    }
+
+    /// INVARIANT: the terminal itself renders the shared five-section status
+    /// vocabulary and swaps Main to the complete server-plan review surface.
+    ///
+    /// MUTATION 1 (remove): bypass `draw_worktree` or the review branch.
+    /// MUTATION 2 (weaken): render only paths/status counts or a Plan summary.
+    #[test]
+    fn terminal_renders_all_status_sections_and_the_server_plan_before_approval() {
+        let mut app = loaded();
+        select_first(&mut app);
+        app.receive(Data::Status {
+            repo: "w1".to_string(),
+            result: Ok(WorktreeStatus {
+                generation: GenerationToken::new("status-v1:test").unwrap(),
+                branch: Some("main".to_string()),
+                upstream: Some("origin/main".to_string()),
+                ahead: 0,
+                behind: 0,
+                entries: vec![
+                    StatusEntry::Conflicted {
+                        path: "clash.rs".to_string(),
+                        kind: ConflictKind::BothModified,
+                        submodule: None,
+                    },
+                    StatusEntry::Changed {
+                        path: "both.rs".to_string(),
+                        sides: ChangeSides::Both {
+                            staged: ChangeKind::Added,
+                            unstaged: ChangeKind::Modified,
+                        },
+                        submodule: None,
+                        binary: false,
+                    },
+                    StatusEntry::Untracked {
+                        path: "new.txt".to_string(),
+                        binary: false,
+                    },
+                    StatusEntry::Ignored {
+                        path: "target/".to_string(),
+                    },
+                ],
+            }),
+        });
+        let status_terminal = rendered(120, 40, &app);
+        let status_screen = text(status_terminal.backend().buffer());
+        for expected in [
+            "[Conflicted] clash.rs",
+            "[Staged changes] both.rs",
+            "[Unstaged changes] both.rs",
+            "[Untracked files] new.txt",
+            "[Ignored files] target/",
+        ] {
+            assert!(
+                status_screen.contains(expected),
+                "missing {expected}:\n{status_screen}"
+            );
+        }
+
+        app.review = Some(Review::Operation(Box::new(Plan {
+            repository: RepositoryToken::new("r1").unwrap(),
+            worktree: WorktreeToken::new("w1").unwrap(),
+            generation: GenerationToken::new("status-v1:test").unwrap(),
+            operation: GitOperation::StageAll,
+            operation_hash: OperationHash::new("a".repeat(64)).unwrap(),
+            issued_at: UnixSeconds(100),
+            expires_at: UnixSeconds(200),
+            risk: RiskLevel::Safe,
+            preconditions: vec![Precondition::CleanWorktree],
+            expected_ref_changes: Vec::new(),
+            advisories: Vec::new(),
+            recovery: RecoveryStrategy::NotNeeded,
+        })));
+        app.focus = Pane::Main;
+        let plan_terminal = rendered(120, 40, &app);
+        let plan_screen = text(plan_terminal.backend().buffer());
+        for expected in [
+            "SERVER PLAN",
+            "stage_all",
+            "operation_hash",
+            "expires_at",
+            "clean_worktree",
+            "approve unchanged",
+        ] {
+            assert!(
+                plan_screen.contains(expected),
+                "missing {expected}:\n{plan_screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn immutable_plan_review_overlays_the_worktree_and_patch_surfaces() {
+        let mut app = loaded();
+        let plan = Plan {
+            repository: RepositoryToken::new("repo-1").unwrap(),
+            worktree: WorktreeToken::new("worktree-1").unwrap(),
+            generation: GenerationToken::new("generation-reviewed").unwrap(),
+            operation: GitOperation::StageAll,
+            operation_hash: OperationHash::new("a".repeat(64)).unwrap(),
+            issued_at: UnixSeconds(1_788_365_000),
+            expires_at: UnixSeconds(1_788_365_300),
+            risk: RiskLevel::Remote,
+            preconditions: Vec::new(),
+            expected_ref_changes: Vec::new(),
+            advisories: Vec::new(),
+            recovery: RecoveryStrategy::NotNeeded,
+        };
+        app.receive(Data::PlanReady(Ok(serde_json::to_vec(&plan).unwrap())));
+        let terminal = rendered(100, 30, &app);
+        let buffer = terminal.backend().buffer();
+        let screen = text(buffer);
+        for expected in [
+            "Plan review",
+            "nothing runs until approval",
+            "a approve",
+            "Esc refuse",
+            "expires: 1788365300",
+            "Preconditions",
+            "Expected ref changes",
+            "REMOTE",
+        ] {
+            assert!(screen.contains(expected), "missing {expected:?}:\n{screen}");
+        }
+        assert!(
+            buffer.content().iter().any(|cell| cell.fg == Color::Yellow),
+            "the modal had no review/risk emphasis"
+        );
+    }
+    #[test]
+    fn stale_refusal_replaces_server_cause_with_the_honest_message() {
+        let mut app = reviewing();
+        assert_eq!(app.apply(Action::ApprovePlan).len(), 2);
+        app.receive(Data::PlanSubmitted(
+            crate::panes::plan_review::SubmissionOutcome::from_response(
+                409,
+                b"The repository changed while this plan was pending",
+            ),
+        ));
+        let terminal = rendered(100, 30, &app);
+        let screen = text(terminal.backend().buffer());
+        assert!(screen.contains("Plan is stale."), "{screen}");
+        assert!(!screen.contains("repository changed"), "{screen}");
     }
 }

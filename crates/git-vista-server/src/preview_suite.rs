@@ -674,6 +674,136 @@ fn expect_graph(outcome: PreviewResponse) -> (Halves, Vec<PreviewChange>) {
 }
 
 // ---------------------------------------------------------------------------
+// A1 — the acceptance criterion
+// ---------------------------------------------------------------------------
+
+/// Assert the direct wire shape A1 promises for one commit-producing operation:
+/// the response names one hypothetical commit, returns its row, and returns an
+/// edge from that row to every parent.
+async fn assert_a1_hypothetical_rows_and_edges(repo: &Path, operation: GitOperation, what: &str) {
+    let target = PreviewTarget::resolved_in(repo, repo.parent().expect("fixture root"))
+        .expect("a target inside the fixture root");
+    let plan = plan_for(repo, operation).await;
+    let (graph, changes) = expect_graph(preview(&target, &plan).await);
+
+    let added: Vec<Oid> = changes
+        .iter()
+        .filter_map(|change| match change {
+            PreviewChange::Added { commit } => Some(commit.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        added.len(),
+        1,
+        "{what}: a commit-producing preview must name exactly one hypothetical commit"
+    );
+    let added = &added[0];
+
+    assert!(
+        graph.before.rows.iter().all(|row| row.commit.id != *added),
+        "{what}: the Added id must be hypothetical, not a row already present before"
+    );
+    assert_eq!(
+        graph.after.rows.len(),
+        graph.before.rows.len() + 1,
+        "{what}: the returned after graph must contain one hypothetical row"
+    );
+    let row = graph
+        .after
+        .rows
+        .iter()
+        .find(|row| row.commit.id == *added)
+        .unwrap_or_else(|| {
+            panic!("{what}: the returned rows omit the hypothetical commit {added:?}")
+        });
+
+    let mut edge_targets: Vec<String> = graph
+        .after
+        .edges
+        .iter()
+        .filter(|edge| edge.from_row == row.row && edge.from_lane == row.lane)
+        .map(|edge| {
+            graph
+                .after
+                .rows
+                .iter()
+                .find(|target| target.row == edge.to_row && target.lane == edge.to_lane)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{what}: hypothetical edge ends at absent row/lane ({}, {})",
+                        edge.to_row, edge.to_lane
+                    )
+                })
+                .commit
+                .id
+                .0
+                .clone()
+        })
+        .collect();
+    edge_targets.sort();
+    let mut parents: Vec<String> = row
+        .commit
+        .parents
+        .iter()
+        .map(|parent| parent.0.clone())
+        .collect();
+    parents.sort();
+    assert_eq!(
+        edge_targets, parents,
+        "{what}: the returned edges must connect the hypothetical row to every parent"
+    );
+}
+
+/// **A1.** Preview returns hypothetical rows and edges for revert,
+/// cherry-pick, and merge.
+///
+/// This is intentionally direct rather than another real-run parity test: A5
+/// proves that the prediction is right, while this test pins A1's own named
+/// wire-shape promise so the criterion cannot disappear behind implication.
+///
+/// # Two mutations, independently measured
+///
+/// 1. Replace `rows: graph.rows` with `rows: Vec::new()` in `envelope`. The
+///    revert leg fails at "must contain one hypothetical row".
+/// 2. Replace `edges: graph.edges` with `edges: Vec::new()` in `envelope`. The
+///    revert leg reaches the row and fails at "connect ... to every parent".
+#[tokio::test]
+async fn a1_preview_returns_hypothetical_rows_and_edges_for_revert_cherry_pick_and_merge() {
+    let (_revert_dir, revert_repo) = revert_shape();
+    let revert_head = git::out(&revert_repo, &["rev-parse", "HEAD"]);
+    assert_a1_hypothetical_rows_and_edges(
+        &revert_repo,
+        GitOperation::RevertCommit {
+            commit: CommitOid::new(revert_head).expect("a full hex oid"),
+        },
+        "revert",
+    )
+    .await;
+
+    let (_pick_dir, pick_repo) = cherry_pick_shape();
+    let topic = git::out(&pick_repo, &["rev-parse", "topic"]);
+    assert_a1_hypothetical_rows_and_edges(
+        &pick_repo,
+        GitOperation::CherryPick {
+            commit: CommitOid::new(topic).expect("a full hex oid"),
+        },
+        "cherry-pick",
+    )
+    .await;
+
+    let (_merge_dir, merge_repo) = git_vista_fixtures::merge_clean_two_branch();
+    assert_a1_hypothetical_rows_and_edges(
+        &merge_repo,
+        GitOperation::MergeBranch {
+            branch: BranchName::new("feature").expect("a valid branch name"),
+        },
+        "merge",
+    )
+    .await;
+}
+
+// ---------------------------------------------------------------------------
 // A2 — the acceptance criterion
 // ---------------------------------------------------------------------------
 
@@ -4544,33 +4674,6 @@ fn filetime_set(path: &Path, when: std::time::SystemTime) {
 // ---------------------------------------------------------------------------
 // The pure parsers
 // ---------------------------------------------------------------------------
-
-/// `parse_git_version` against real and vendor-shaped lines, one literal
-/// expectation per case.
-#[test]
-fn parse_git_version_reads_real_and_vendor_shaped_lines() {
-    /// One `--version` line and the triple it must parse to. A named alias
-    /// because clippy refuses the inline tuple type, and because naming it
-    /// makes the table below read as data.
-    type VersionCase = (&'static str, Option<(u32, u32, u32)>);
-
-    let cases: &[VersionCase] = &[
-        ("git version 2.43.0", Some((2, 43, 0))),
-        ("git version 2.43.0\n", Some((2, 43, 0))),
-        ("git version 2.39.5 (Apple Git-154)", Some((2, 39, 5))),
-        ("git version 2.43.0.windows.1", Some((2, 43, 0))),
-        ("git version 2.38", Some((2, 38, 0))),
-        ("git version 2.37.3", Some((2, 37, 3))),
-        // Not git's line: no fact, never a guess in either direction.
-        ("gix version 0.66.0", None),
-        ("2.43.0", None),
-        ("git version banana", None),
-        ("", None),
-    ];
-    for (line, expected) in cases {
-        assert_eq!(parse_git_version(line), *expected, "for input {line:?}");
-    }
-}
 
 /// `parse_merge_tree_conflicts` against the exact byte shape git 2.43.0
 /// produced on this host, measured 2026-08-30.

@@ -9,6 +9,8 @@
 //!   and the pure [`check_compatibility`] verdict.
 //! - [`error`]   — the [`ApiError`] envelope every endpoint returns on failure,
 //!   its machine-readable [`ErrorCode`], and the [`RequestId`] correlation token.
+//! - [`listener`] — the declared [`ListenerProfile`] of the HTTP listener that
+//!   answered, carried on every response in [`LISTENER_PROFILE_HEADER`].
 //! - [`dto`]     — the shared request/response DTOs (branch/commit/clone bodies,
 //!   rebase-status, the stash drawer's listing and write bodies) the server and
 //!   frontend exchange.
@@ -72,6 +74,7 @@
 #[macro_use]
 pub mod newtype;
 
+pub mod activity;
 pub mod effects;
 
 pub mod conflict;
@@ -80,6 +83,7 @@ pub mod dto;
 pub mod error;
 pub mod explain;
 pub mod history;
+pub mod listener;
 pub mod operation;
 pub mod patch_build;
 pub mod patch_plan;
@@ -90,6 +94,7 @@ pub mod status;
 pub mod version;
 pub mod worktree;
 
+pub use activity::ActivityPage;
 pub use conflict::{
     ConflictSource, ConflictedFile, ContentResolutionRefused, Continuation, NotTextResolvable,
     Stage,
@@ -114,6 +119,7 @@ pub use effects::{network_need_for_operation, IndexEffect, NetworkNeed, Worktree
 pub use error::{ApiError, ApiErrorBody, ErrorCode, RequestId};
 pub use explain::{explain, Explanation, ExplanationFact, Section, Topic};
 pub use history::{HeadState, HistoryFrame, HistoryPage};
+pub use listener::{ListenerProfile, LISTENER_PROFILE_HEADER};
 pub use operation::{
     IdempotencyKey, OperationByKeyResponse, OperationId, OperationStage, OperationState,
     OperationStatus, ProgressEvent, TransferPhase, TransferProgress, MAX_IDEMPOTENCY_KEY_LEN,

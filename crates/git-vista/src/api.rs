@@ -16,11 +16,13 @@ use gloo_net::http::{Request, RequestBuilder};
 use git_vista_core::net::{network_error_text, offline_refusal_text, timeout_error_text};
 use git_vista_protocol::operation::{IdempotencyKey, OperationId};
 use git_vista_protocol::{
-    CSRF_HEADER, IDEMPOTENCY_HEADER, OPERATION_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION,
+    ListenerProfile, CSRF_HEADER, IDEMPOTENCY_HEADER, LISTENER_PROFILE_HEADER, OPERATION_HEADER,
+    PROTOCOL_HEADER, PROTOCOL_VERSION,
 };
 
 use crate::features::session::signals as session_state;
 use crate::features::shell::signals as shell_state;
+use crate::listener_policy::{capability_refusal, is_capability_refusal};
 
 mod activity;
 mod branches;
@@ -31,6 +33,9 @@ mod conflicts;
 mod diff;
 mod graph;
 mod operations;
+// M10.08 A6 (#594): the /api/plan -> /api/preview round trip the confirm
+// dialogs draw their before/after picture from.
+mod preview;
 mod remotes;
 mod repositories;
 mod session;
@@ -57,6 +62,7 @@ pub use graph::{fetch_frame, fetch_page};
 pub use operations::{
     cancel_operation_request, fetch_operation_status, resolve_operation_id, CancelOutcome,
 };
+pub use preview::{plan_request, preview_request};
 pub use remotes::{fetch_request, preview_push, pull_request, push_request};
 pub use repositories::{
     delete_clone_request, fetch_catalog, rescan_request, reset_test_repo_request, select_request,
@@ -145,11 +151,11 @@ fn timeout_error() -> String {
     timeout_error_text()
 }
 
-/// The ADR 0005 client-side counterpart of the LAN listener's structural
-/// read-only-ness: clone/select/rescan/delete refuse up front on a LAN-view
-/// session with a clear reason, instead of surfacing the bare `405` the
-/// route-less LAN listener answers with. The absent server route remains the
-/// actual boundary.
+/// The older ADR 0005 client-side counterpart of the LAN listener's structural
+/// read-only-ness. Clone still uses this early guard; #589 moved picker
+/// presentation to the server-declared listener profile and made the shared
+/// transport classify a real 405. The absent server route remains the actual
+/// boundary in either case.
 fn refuse_if_lan_view() -> Result<(), String> {
     if session_state::is_lan() {
         Err("This is a read-only LAN view session — open the localhost \
@@ -323,9 +329,20 @@ async fn send_write_with_key(
             .await
             .unwrap_or_else(|| Err(timeout_error()))
     };
-    match attempt().await {
-        Ok(resp) => Ok((resp, key)),
-        Err(_) => attempt().await.map(|resp| (resp, key)),
+    let resp = match attempt().await {
+        Ok(resp) => resp,
+        Err(_) => attempt().await?,
+    };
+    // #589: 405 is an ordinary fetch response, so it never enters either
+    // network-error arm above.  Handle it at the shared write transport before
+    // an endpoint can flatten it into an empty body or mistake it for lost
+    // authentication.  The direct, read-shaped POSTs (`/api/plan`, preview,
+    // explicit diff) bypass this retrying transport but converge on
+    // `user_facing_error`, which applies the same classification below.
+    if is_capability_refusal(resp.status()) {
+        Err(user_facing_error(url, resp).await)
+    } else {
+        Ok((resp, key))
     }
 }
 
@@ -545,16 +562,26 @@ async fn response_error_detail(resp: gloo_net::http::Response) -> Result<String,
 /// split itself is pure and host-tested (`split_error_response`).
 async fn user_facing_error(route: &str, resp: gloo_net::http::Response) -> String {
     let status = resp.status();
+    let listener_profile = resp
+        .headers()
+        .get(LISTENER_PROFILE_HEADER)
+        .and_then(|wire| ListenerProfile::from_header_value(&wire));
     let body = resp.text().await.unwrap_or_default();
     let parsed = crate::features::dialogs::core::split_error_response(status, &body);
+    // A route-less listener commonly answers with an empty 405 body.  That is
+    // still a complete, actionable answer: the current listener does not own
+    // this capability.  Prefer that established fact to an empty-body fallback
+    // (or to an error envelope's generic `bad_request` classification).
+    let message = capability_refusal(status, route, listener_profile).unwrap_or(parsed.message);
     if let Some(id) = &parsed.request_id {
         web_sys::console::error_1(
-            &format!(
-                "git-vista: POST {route} failed (request {id}): {}",
-                parsed.message
-            )
-            .into(),
+            &format!("git-vista: POST {route} failed (request {id}): {message}",).into(),
         );
+    } else if is_capability_refusal(status) {
+        // The static fallback that answers an absent route is outside the API
+        // envelope and therefore has no request id.  It should no longer be the
+        // silent response that made #589 so hard to diagnose.
+        web_sys::console::error_1(&format!("git-vista: POST {route} failed: {message}").into());
     }
-    parsed.message
+    message
 }

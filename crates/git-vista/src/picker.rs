@@ -24,6 +24,7 @@ use crate::features::shell::signals as shell_state;
 
 use crate::api::{delete_clone_request, fetch_catalog, rescan_request, select_request};
 use crate::hook_policy_disclosure;
+use crate::listener_policy::repository_selection;
 
 /// Styling for the per-row hook-policy badge (INV-15, #208). Amber — the same
 /// palette as the session-wide `hook_policy_banner` — for anything the
@@ -89,9 +90,9 @@ pub fn picker_view(
     // nothing has been shown yet.
     let rescan_msg = create_rw_signal((0_u64, String::new()));
     let msg_seq = store_value(IntentSeq::default());
-    // #380: the mindmap view of the same catalog. A display toggle only — the
-    // map's node click runs the exact `mode_for.set(...)` path a list row
-    // runs, so everything downstream (mode screen, LAN gating) is shared.
+    // #380: the mindmap view of the same catalog. It is offered only when the
+    // listener profile also offers selection: the map's nodes are action-shaped
+    // just like list rows, and `repomap` must not become a second dead control.
     let map_mode = create_rw_signal(false);
     move || {
         open.get().then(|| {
@@ -111,16 +112,30 @@ pub fn picker_view(
                             <div style="font-weight:600; font-size:1.2em; flex:1;">
                                 "Open a repository"
                             </div>
-                            // #380: list <-> map. One button, state in its label,
-                            // same idiom as the topbar toggles.
-                            <button
-                                style="padding:6px 14px; font:inherit; color:var(--fg); \
-                                       background:#0d1117; border:1px solid #30363d; \
-                                       border-radius:6px;"
-                                on:click=move |_| map_mode.update(|m| *m = !*m)
-                            >
-                                {move || if map_mode.get() { "View: map" } else { "View: list" }}
-                            </button>
+                            // #380: list <-> map. A read-only catalog remains a
+                            // list of information; it never exposes map nodes
+                            // whose button semantics the listener cannot honour.
+                            {move || {
+                                let offered = matches!(
+                                    catalog.get().flatten(),
+                                    Some(Ok(ref data))
+                                        if repository_selection(data.listener_profile).is_offered()
+                                );
+                                offered.then(|| view! {
+                                    <button
+                                        style="padding:6px 14px; font:inherit; color:var(--fg); \
+                                               background:#0d1117; border:1px solid #30363d; \
+                                               border-radius:6px;"
+                                        on:click=move |_| map_mode.update(|m| *m = !*m)
+                                    >
+                                        {move || if map_mode.get() {
+                                            "View: map"
+                                        } else {
+                                            "View: list"
+                                        }}
+                                    </button>
+                                })
+                            }}
                         </div>
                         <div style="overflow-y:auto; -webkit-overflow-scrolling:touch; \
                                     flex:1 1 auto; min-height:0;">
@@ -130,13 +145,20 @@ pub fn picker_view(
                                 <p>{format!("Couldn't list repositories: {e}")}</p>
                             }
                             .into_view(),
-                            Some(Ok(entries)) if map_mode.get() => {
-                                crate::repomap::map_view(entries, mode_for)
+                            Some(Ok(data))
+                                if map_mode.get()
+                                    && repository_selection(data.listener_profile).is_offered() =>
+                            {
+                                crate::repomap::map_view(data.repositories, mode_for)
                             }
-                            Some(Ok(entries)) => entries
+                            Some(Ok(data)) => {
+                                let selection = repository_selection(data.listener_profile);
+                                data.repositories
                                 .into_iter()
                                 .map(|d| {
                                     let is_clone = d.read_only;
+                                    let can_select = selection.is_offered();
+                                    let unavailable_notice = selection.notice();
                                     // INV-15 (#208): every row discloses the
                                     // hook policy the server computed for that
                                     // repository. Read before `d` is moved
@@ -157,10 +179,12 @@ pub fn picker_view(
                                     };
                                     let worktree = d.worktree.clone();
                                     let name = d.name.clone();
-                                    // ADR 0005: a LAN-view session can't select —
-                                    // the row stays as a label, not a dead-end.
+                                    // #589: this is a capability decision, not a
+                                    // hostname/session inference. The native-
+                                    // tested policy supplies both the disabled
+                                    // state and the visible reason.
                                     let pick = move |_| {
-                                        if !session_state::is_lan() {
+                                        if can_select {
                                             mode_for.set(Some(d.clone()));
                                         }
                                     };
@@ -204,11 +228,18 @@ pub fn picker_view(
                                         // screen; clones carry a Delete beside.
                                         <div style="display:flex; gap:4px; margin:4px 0;">
                                             <button
-                                                style="flex:1; text-align:left; \
-                                                       padding:12px; font:inherit; \
-                                                       color:var(--fg); background:#0d1117; \
-                                                       border:1px solid #30363d; \
-                                                       border-radius:6px;"
+                                                style=if can_select {
+                                                    "flex:1; text-align:left; padding:12px; \
+                                                     font:inherit; color:var(--fg); \
+                                                     background:#0d1117; border:1px solid #30363d; \
+                                                     border-radius:6px;"
+                                                } else {
+                                                    "flex:1; text-align:left; padding:12px; \
+                                                     font:inherit; color:var(--fg); opacity:0.72; \
+                                                     background:#0d1117; border:1px solid #30363d; \
+                                                     border-radius:6px; cursor:not-allowed;"
+                                                }
+                                                disabled=!can_select
                                                 on:click=pick
                                             >
                                                 <div>{label}</div>
@@ -222,13 +253,21 @@ pub fn picker_view(
                                                     {disclosure.warn.then_some("\u{26A0} ")}
                                                     {disclosure.label}
                                                 </div>
+                                                {unavailable_notice.map(|notice| view! {
+                                                    <div
+                                                        role="note"
+                                                        style="margin-top:7px; font-size:0.82em; \
+                                                               color:#f0c674; line-height:1.35;"
+                                                    >
+                                                        {notice}
+                                                    </div>
+                                                })}
                                             </button>
-                                            // ADR 0005: no Delete on a LAN-view
-                                            // session — the route doesn't even
-                                            // exist on the LAN listener. Rows
-                                            // re-render post-session (catalog is
-                                            // keyed on `reload`), so the flag is
-                                            // settled by the time it's read.
+                                            // ADR 0005/#589: no Delete when the
+                                            // listener declares its read-only
+                                            // profile — the route does not exist
+                                            // there. The catalog response and its
+                                            // profile are one render input.
                                             // M2.22b (#242): hidden offline too —
                                             // the tracked `online_signal` read
                                             // re-renders this row list when
@@ -241,7 +280,7 @@ pub fn picker_view(
                                             // over a dead tunnel; the write
                                             // boundary stays `api.rs`'s guard.
                                             {(is_clone
-                                                && !session_state::is_lan()
+                                                && can_select
                                                 && shell_state::online_signal().get())
                                             .then(|| view! {
                                                 <button
@@ -257,21 +296,25 @@ pub fn picker_view(
                                         </div>
                                     }
                                 })
-                                .collect_view(),
+                                .collect_view()
+                            },
                         }}
                         </div>
                         <div style="display:flex; gap:8px; margin-top:16px;">
-                            // ADR 0005: Clone URL…/Rescan hit routes the LAN
-                            // listener never registers — hide them there. Keyed
-                            // on `reload` so the buttons re-evaluate once the
-                            // session (and its via_lan flag) lands, the same
-                            // recovery the catalog fetch above uses.
+                            // ADR 0005/#589: Clone URL…/Rescan hit routes absent
+                            // from the read-only profile. Derive their presence
+                            // from the same server declaration as the rows, not
+                            // from `via_lan` as a proxy.
                             // M2.22b (#242): hidden offline too, reactively —
                             // both trigger writes (`/api/clone`, `/api/rescan`)
                             // that the offline guard would only refuse.
                             {move || {
-                                graph.get().epoch();
-                                (!session_state::is_lan() && shell_state::online_signal().get())
+                                let offered = matches!(
+                                    catalog.get().flatten(),
+                                    Some(Ok(ref data))
+                                        if repository_selection(data.listener_profile).is_offered()
+                                );
+                                (offered && shell_state::online_signal().get())
                                     .then(|| view! {
                                     <button
                                         style="padding:8px 16px; font:inherit; color:var(--fg); \
