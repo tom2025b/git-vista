@@ -1,4 +1,4 @@
-# Supported Git and Safari versions
+# Supported Git, Safari, and Linux kernel versions
 
 Both floors below are derived from something the codebase actually depends
 on, not asserted. Where the evidence is thin, that's said explicitly rather
@@ -174,6 +174,57 @@ which is consistent with graceful degradation rather than a hard gate.
   explicit decision and a device/BrowserStack-class check, neither of which
   exists today.
 
+## Linux kernel: 6.12 or later (Landlock ABI 6)
+
+**Why 6.12:** the M1.13b sandbox's Strict tier requires Landlock at ABI 6 —
+`crates/git-vista-server/src/sandbox/mod.rs:175`'s `LANDLOCK_ABI_FLOOR`, six
+because ABI 6 is the first with the signal and abstract-unix-socket scopes
+the design uses. Landlock ABI 6 first ships in **Linux 6.12** (November
+2024). `main.rs:218` gates every server start on this with no degraded
+path: a verdict other than `Contained` means no server, full stop — see
+[ADR 0029](adr/0029-inv-13-hard-fail-when-the-strict-tier-is-selected-but-unavailable.md)
+for why there is deliberately no fallback tier.
+
+**This is a hard requirement, not a recommendation, and it is higher than
+what current mainstream Linux LTS releases ship:**
+
+| Distribution | GA kernel | Landlock ABI | Starts? |
+|---|---|---|---|
+| Ubuntu 22.04 LTS | 5.15 | 1 | No |
+| Debian 12 bookworm | 6.1 | 2 | No |
+| RHEL 9 | 5.14 | 1 | No |
+| **Ubuntu 24.04 LTS** | **6.8** | **4 (measured)** | **No** |
+| Debian 13 trixie | 6.12 | 6 | Yes, exactly at the floor |
+| Ubuntu 26.04 | 7.0 | 8 | Yes |
+
+- **Measured, not derived, for the row that matters most:** a stock Ubuntu
+  24.04 cloud image on titan, asked directly via `syscall(444, NULL, 0, 1)`,
+  reported `kernel=6.8.0-138-generic landlock_abi=4`. On the current Ubuntu
+  LTS — supported by Canonical until 2029 — git-vista's server refuses to
+  start.
+- **The remedy:** install an HWE kernel
+  (`sudo apt install linux-generic-hwe-24.04`, which is 6.14 on 24.04.3 and
+  clears the floor) and `bwrap` (`sudo apt install bubblewrap`).
+- **Cannot be tested in a container.** A container shares the host kernel,
+  so `ubuntu:22.04` under rootless podman reports the *host's* Landlock
+  ABI, not the guest's — measured returning 8 (titan's own kernel) rather
+  than anything the 22.04 userspace could claim. There is no way to
+  simulate this floor in CI; the only trustworthy check is the real
+  boot-time probe on the real machine, which is what already runs.
+- **Why this floor has no CI-parsed check like the git floor above:** the
+  git floor is a version comparison against a binary CI can cheaply build
+  from source and run against. The kernel floor is a property of the host
+  the server itself runs on — nothing analogous to "build git 2.32 and
+  test against it" exists for a kernel, and per the point above, a
+  container cannot even approximate it. `sandbox::probe::run_at_startup()`
+  already is the single source of truth, enforced live on the real running
+  kernel on every boot — a stronger check than a doc-parsed number could
+  ever be, not a weaker one. See
+  [ADR 0111](adr/0111-the-kernel-floor-is-documented-not-negotiated.md)
+  for the full reasoning, including why this does not reopen ADR 0029.
+
 ---
 
 **Signed:** thomas2010 · 2026-07-27T20:51:16-04:00
+
+**Kernel section added:** max · 2026-09-03T20:35:00-04:00
