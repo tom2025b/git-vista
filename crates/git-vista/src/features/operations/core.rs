@@ -582,24 +582,19 @@ pub fn latest_wins(current: Option<&PendingIntent>, incoming: &PendingIntent) ->
     }
 }
 
-// ── What a write is sent as, and what it says when it is lost (#612) ────────
-//
-// Everything below lived in the wasm-only `features/operations/signals.rs`.
-// None of it needs Leptos or a DOM — these are tables and small decisions over
-// `OperationKind` — but sitting beside `RwSignal` put them where no test
-// runner in this repo compiles them, which is the whole of #612.
+// ── What a write is sent as, and what it says when it is lost ───────────────
 
 /// Which `api::` function one operation kind is sent through, and — for the
 /// four kinds that share one function — which path it posts to.
 ///
 /// # Why this is a table rather than a `match` inside `send`
 ///
-/// **This is the #594 shape.** Several `OperationKind` variants are
-/// structurally identical: `Merge`, `Delete`, `Checkout` and `ForceDelete` all
-/// carry a `branch`, and `DiscardTrackedPaths` and `DeleteUntrackedPaths` both
-/// carry `paths`. Swapping one for its sibling in a dispatch `match` therefore
-/// **compiles cleanly and runs a different git command against the user's
-/// repository** — `git checkout` where they asked for `git branch -d`.
+/// Several `OperationKind` variants are structurally identical: `Merge`,
+/// `Delete`, `Checkout` and `ForceDelete` all carry a `branch`, and
+/// `DiscardTrackedPaths` and `DeleteUntrackedPaths` both carry `paths`.
+/// Swapping one for its sibling in a dispatch `match` therefore **compiles
+/// cleanly and runs a different git command against the user's repository** —
+/// `git checkout` where they asked for `git branch -d`.
 ///
 /// Only the variant separates a write from a different write. A table a host
 /// test can read is what makes that separation checkable; a `match` inside a
