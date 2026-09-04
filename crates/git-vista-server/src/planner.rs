@@ -39,13 +39,13 @@ use sha2::{Digest, Sha256};
 use git_vista_core::activity::ActivityKind;
 use git_vista_core::identity::{GenerationInputs, RepositoryHandle, RepositoryId, WorktreeId};
 use git_vista_core::seed::{parse_seed, Seed};
+use git_vista_protocol::{branch_holder, BranchHolder, Serviceable, WorktreeCensus};
 use git_vista_protocol::{
     Advisory, BranchName, CommitOid, ForcePublish, GenerationToken, GitOperation, IdempotencyKey,
     MergeStrategy, OperationHash, OperationId, OperationStage, Plan, Precondition,
     RecoveryStrategy, RefChange, RefName, RefState, RemoteName, RepositoryToken, RiskLevel,
     TagName, UnixSeconds, WorktreePath, WorktreeToken, IDEMPOTENCY_HEADER,
 };
-use git_vista_protocol::{branch_holder, BranchHolder, Serviceable, WorktreeCensus};
 
 // The test suites under `planner/` open with `use super::*;`, and several of
 // them still speak these protocol types directly even though the executors
@@ -424,7 +424,8 @@ async fn plan_and_execute_tracked(
             // The generation *after* execution: the datum a reconnecting client
             // uses to decide whether its cached graph is stale, without re-reading
             // the repository. Best-effort, like every other observation here.
-            let generation = Some(generation_token(&repo, &observe_live_for_generation(&repo).await).await);
+            let generation =
+                Some(generation_token(&repo, &observe_live_for_generation(&repo).await).await);
 
             // M1.09: the terminal record and its recovery ref, persisted
             // *before* `finish` publishes the same snapshot in-memory —
@@ -1972,9 +1973,11 @@ async fn verify_precondition(
         Precondition::BranchFreeInEveryOtherWorktree { branch } => {
             match branch_holder(&live.census, branch) {
                 BranchHolder::Free => Ok(()),
-                BranchHolder::HeldBy(_) | BranchHolder::Unknown(_) => {
-                    Err(collision_refusal(branch, &live.census, CollisionMoment::Race))
-                }
+                BranchHolder::HeldBy(_) | BranchHolder::Unknown(_) => Err(collision_refusal(
+                    branch,
+                    &live.census,
+                    CollisionMoment::Race,
+                )),
             }
         }
     }

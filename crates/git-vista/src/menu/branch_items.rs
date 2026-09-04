@@ -5,12 +5,12 @@
 
 use leptos::*;
 
-use crate::api::{fetch_head_branch, preview_push};
+use crate::api::{fetch_head_branch, fetch_worktree_census, preview_push};
 use crate::features::core_traits::RequestTarget;
 use crate::features::dialogs::core::{Dialog, ErrorNotice};
 use crate::features::graph::core::{remote_tip_from_plan, RemoteTipKnowledge};
 use crate::features::operations::core::PendingIntent;
-use crate::features::operations::kind::{ForceWithLease, HeadBranch};
+use crate::features::operations::kind::{CheckoutElsewhere, ForceWithLease, HeadBranch};
 use crate::icons::GitIcons;
 use crate::state::{Features, MenuData, PendingOp, ViewerDoc};
 use git_vista_protocol::diff::{ComparisonBasis, DiffSpec};
@@ -59,10 +59,24 @@ pub(super) fn build_branch_items(
                     let key = operations.request_key(RequestTarget::Branch(branch.clone()));
                     spawn_local(async move {
                         let current = fetch_head_branch().await.unwrap_or(None);
+                        // M11.02 (#547): git refuses a branch that is already
+                        // checked out in another linked worktree, so the
+                        // dialog asks before offering. Read live on the click
+                        // for the same reason the HEAD branch above is —
+                        // another desk can open or close at any moment, and
+                        // the graph on screen knows nothing about either. A
+                        // failed read arrives as `CheckoutElsewhere::Unknown`
+                        // and declines; it never becomes "free".
+                        let elsewhere =
+                            CheckoutElsewhere::classify(fetch_worktree_census().await, &branch);
                         let intent = PendingIntent {
                             seq,
                             key,
-                            kind: PendingOp::Checkout { branch, current },
+                            kind: PendingOp::Checkout {
+                                branch,
+                                current,
+                                elsewhere,
+                            },
                         };
                         if !operations.admit_intent(&intent) {
                             return;

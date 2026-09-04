@@ -766,9 +766,9 @@ pub fn checkout_confirm_action(elsewhere: &CheckoutElsewhere) -> CheckoutAction 
                 name: worktree.name.clone(),
             }
         }
-        CheckoutElsewhere::Free
-        | CheckoutElsewhere::HeldBy(_)
-        | CheckoutElsewhere::Unknown(_) => CheckoutAction::Checkout,
+        CheckoutElsewhere::Free | CheckoutElsewhere::HeldBy(_) | CheckoutElsewhere::Unknown(_) => {
+            CheckoutAction::Checkout
+        }
     }
 }
 
@@ -828,9 +828,7 @@ pub fn checkout_confirm_prompt(
         // and no other worktree holds it.
         CheckoutElsewhere::Free => ConfirmPrompt::plain(
             TITLE,
-            format!(
-                "Check out ‘{branch}’? This switches the working tree and HEAD to ‘{branch}’."
-            ),
+            format!("Check out ‘{branch}’? This switches the working tree and HEAD to ‘{branch}’."),
             "Checkout",
             false,
             true,
@@ -1898,6 +1896,7 @@ mod tests {
 #[cfg(test)]
 mod branch_prompt_tests {
     use super::*;
+    use crate::features::operations::kind::HoldingWorktree;
 
     use git_vista_core::activity::Undoable;
 
@@ -2241,6 +2240,281 @@ mod branch_prompt_tests {
             preview_subject(&OperationKind::DeleteLocalTag { tag: "v1".into() }),
             DialogSubject::NotPreviewable,
             "an operation the engine cannot picture must draw no panel at all"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // The checkout confirmation (M11.02, #547)
+    // -----------------------------------------------------------------
+
+    fn holder(name: &str, serviceable: Serviceable) -> CheckoutElsewhere {
+        CheckoutElsewhere::HeldBy(HoldingWorktree {
+            id: format!("worktree-{name}"),
+            name: name.to_string(),
+            serviceable,
+        })
+    }
+
+    /// The plain case still works. Without this, a function that refused
+    /// every checkout would satisfy every other test below.
+    #[test]
+    fn a_free_branch_still_offers_the_plain_checkout() {
+        let p = checkout_confirm_prompt(
+            "feature/x",
+            &Some("main".to_string()),
+            &CheckoutElsewhere::Free,
+        );
+        assert!(p.enabled, "{p:?}");
+        assert_eq!(p.confirm_label, "Checkout");
+        assert!(p.body.contains("feature/x"), "{p:?}");
+    }
+
+    /// Acceptance: the button is not offered as a checkout, and the worktree
+    /// is **named**. "Already checked out somewhere" is explicitly not
+    /// acceptable, so the name is asserted rather than the shape of a
+    /// sentence.
+    #[test]
+    fn a_branch_held_by_another_worktree_offers_that_worktree_instead() {
+        let p = checkout_confirm_prompt(
+            "feature/x",
+            &Some("main".to_string()),
+            &holder("desk-two", Serviceable::Yes),
+        );
+        assert!(
+            p.body.contains("desk-two"),
+            "the holder must be named, not merely alluded to: {p:?}"
+        );
+        assert_eq!(
+            p.confirm_label, "Open Worktree",
+            "the confirm button must offer the worktree, not the checkout: {p:?}"
+        );
+        assert!(
+            p.enabled,
+            "the offer is useless if it cannot be taken: {p:?}"
+        );
+    }
+
+    /// A holder this application may not open is still named — git's refusal
+    /// does not consult the app's fence — but nothing is offered, because the
+    /// offer is one the server would refuse. Visibility for a collision check
+    /// must never widen the mutation boundary.
+    #[test]
+    fn a_holder_this_app_cannot_open_is_named_but_not_offered() {
+        for (serviceable, expect) in [
+            (Serviceable::OutsideAllowedRoots, "outside"),
+            (Serviceable::Missing, "prune"),
+        ] {
+            let p = checkout_confirm_prompt(
+                "feature/x",
+                &Some("main".to_string()),
+                &holder("desk-two", serviceable),
+            );
+            assert!(!p.enabled, "{p:?}");
+            assert!(p.body.contains("desk-two"), "{p:?}");
+            assert!(
+                p.body.contains(expect),
+                "the body must say what can be done about this one: {p:?}"
+            );
+        }
+    }
+
+    /// "Couldn't tell" is never "safe to offer" — the same rule
+    /// [`delete_confirm_prompt`]'s `Unknown` arm states. And it must not
+    /// claim a worktree nobody observed.
+    #[test]
+    fn an_unreadable_census_declines_without_claiming_a_worktree() {
+        let p = checkout_confirm_prompt(
+            "feature/x",
+            &Some("main".to_string()),
+            &CheckoutElsewhere::Unknown("network error".to_string()),
+        );
+        assert!(
+            !p.enabled,
+            "an unchecked collision must not be offered: {p:?}"
+        );
+        assert!(p.body.contains("network error"), "{p:?}");
+        assert!(
+            !p.body.contains("is already checked out in"),
+            "an unread census must not assert a holder: {p:?}"
+        );
+    }
+
+    /// The branch you are standing on is a no-op checkout, and that is a
+    /// local, definitive fact. Asking the census first would let a failed
+    /// read turn a harmless no-op into "couldn't check".
+    #[test]
+    fn the_branch_you_are_already_on_is_a_no_op_whatever_the_census_says() {
+        for elsewhere in [
+            CheckoutElsewhere::Free,
+            CheckoutElsewhere::Unknown("network error".to_string()),
+            holder("desk-two", Serviceable::Yes),
+        ] {
+            let p = checkout_confirm_prompt("main", &Some("main".to_string()), &elsewhere);
+            assert!(!p.enabled, "{elsewhere:?} -> {p:?}");
+            assert!(
+                p.body.contains("already the branch you're on"),
+                "{elsewhere:?} -> {p:?}"
+            );
+        }
+    }
+
+    /// The invariant that makes splitting the prompt from the action safe:
+    /// the button that says "Open Worktree" opens a worktree, and every
+    /// button that says "Checkout" either checks out or is inert.
+    ///
+    /// A label and an effect maintained in two functions is exactly how a
+    /// dialog comes to promise one thing and do another; this is the test
+    /// that would notice.
+    #[test]
+    fn the_offered_button_and_the_action_it_runs_agree() {
+        let cases = [
+            CheckoutElsewhere::Free,
+            CheckoutElsewhere::Unknown("network error".to_string()),
+            holder("desk-two", Serviceable::Yes),
+            holder("outside", Serviceable::OutsideAllowedRoots),
+            holder("ghost", Serviceable::Missing),
+        ];
+        for elsewhere in &cases {
+            let p = checkout_confirm_prompt("feature/x", &Some("main".to_string()), elsewhere);
+            match checkout_confirm_action(elsewhere) {
+                CheckoutAction::OpenWorktree { name, .. } => {
+                    assert_eq!(
+                        p.confirm_label, "Open Worktree",
+                        "{elsewhere:?} runs a worktree selection under a checkout's label"
+                    );
+                    assert!(p.body.contains(&name), "{elsewhere:?} -> {p:?}");
+                }
+                CheckoutAction::Checkout => {
+                    assert_eq!(
+                        p.confirm_label, "Checkout",
+                        "{elsewhere:?} runs a checkout under another label"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every live checkout button must be one the server will actually
+    /// permit: no arm may be both `enabled` and headed for
+    /// [`CheckoutAction::Checkout`] while a worktree holds the branch.
+    #[test]
+    fn no_enabled_button_runs_a_checkout_the_server_would_refuse() {
+        for elsewhere in [
+            CheckoutElsewhere::Unknown("network error".to_string()),
+            holder("desk-two", Serviceable::Yes),
+            holder("outside", Serviceable::OutsideAllowedRoots),
+            holder("ghost", Serviceable::Missing),
+        ] {
+            let p = checkout_confirm_prompt("feature/x", &Some("main".to_string()), &elsewhere);
+            let runs_checkout = matches!(
+                checkout_confirm_action(&elsewhere),
+                CheckoutAction::Checkout
+            );
+            assert!(
+                !(p.enabled && runs_checkout),
+                "{elsewhere:?} offers a live button that runs a checkout git would refuse: {p:?}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // The wasm-only seam (ADR 0115): `cargo test` never compiles
+    // `dialogs/confirm.rs`, so the composition that USES the two functions
+    // above is unreachable by every test in this file. It is read back as
+    // source instead — the same mechanism
+    // `the_confirm_dialog_routes_its_preview_through_core` uses, and for the
+    // same reason: #612's sharpest finding was two host-tested functions
+    // whose *composition* lived where nothing ran it, and a two-way mutation
+    // proof that reported "both caught" while never reaching that line.
+    // -----------------------------------------------------------------
+
+    const CONFIRM: &str = include_str!("../../dialogs/confirm.rs");
+
+    /// The body of `confirm.rs`'s `run_confirmed` closure.
+    fn run_confirmed_body() -> String {
+        let after = CONFIRM
+            .split_once("let run_confirmed = move || {")
+            .expect("dialogs/confirm.rs no longer defines `run_confirmed`")
+            .1;
+        let end = after
+            .find("\n    };")
+            .expect("`run_confirmed` is no longer a closed block");
+        after[..end].to_string()
+    }
+
+    /// The dialog's words come from the core, not from an inline copy that
+    /// could drift out of everything asserted above.
+    #[test]
+    fn the_confirm_dialog_words_a_checkout_through_core() {
+        assert!(
+            CONFIRM.contains("checkout_confirm_prompt(branch, current, elsewhere)"),
+            "the Checkout arm no longer calls `checkout_confirm_prompt`, so every \
+             assertion in this module proves a rule the dialog does not use"
+        );
+    }
+
+    /// And its button's effect comes from the core too. Without this, the
+    /// label could be decided here and the action decided in a wasm-only
+    /// `if`, which is exactly the pair
+    /// `the_offered_button_and_the_action_it_runs_agree` cannot see.
+    #[test]
+    fn the_confirm_button_routes_a_held_branch_through_core() {
+        let body = run_confirmed_body();
+        assert!(
+            body.contains("checkout_confirm_action("),
+            "`run_confirmed` no longer consults `checkout_confirm_action`. Body was:\n{body}"
+        );
+    }
+
+    /// Selecting a worktree is reachable from exactly one place in the
+    /// dialog, and that place is the `OpenWorktree` arm. A second outlet
+    /// would be a way to move the served repository that no test here
+    /// constrains.
+    #[test]
+    fn only_the_open_worktree_arm_can_select_a_worktree() {
+        assert_eq!(
+            CONFIRM.matches("select_request(").count(),
+            1,
+            "`select_request` is reachable from more than one place in confirm.rs"
+        );
+        let body = run_confirmed_body();
+        let arm = body
+            .find("CheckoutAction::OpenWorktree")
+            .expect("`run_confirmed` no longer matches on `CheckoutAction::OpenWorktree`");
+        let call = body
+            .find("select_request(")
+            .expect("`run_confirmed` no longer selects the worktree it offered");
+        assert!(
+            arm < call,
+            "the worktree selection is not inside the arm that decided on it:\n{body}"
+        );
+    }
+
+    /// **The mutation this seam test exists for.** The redirect must `return`
+    /// before `operations.dispatch(op)`, or confirming a held branch would
+    /// select the other worktree *and then also run the checkout git is
+    /// certain to refuse — under a button labelled "Open Worktree".
+    ///
+    /// Both statements are present in the file either way, so their presence
+    /// proves nothing; only their order does.
+    #[test]
+    fn the_open_worktree_redirect_returns_instead_of_also_dispatching() {
+        let body = run_confirmed_body();
+        let call = body
+            .find("select_request(")
+            .expect("`run_confirmed` no longer selects the worktree it offered");
+        let dispatch = body
+            .find("operations.dispatch(")
+            .expect("`run_confirmed` no longer dispatches anything");
+        let ret = body[call..]
+            .find("return;")
+            .map(|o| call + o)
+            .expect("the worktree-selection path never returns");
+        assert!(
+            ret < dispatch,
+            "the redirect falls through into `operations.dispatch`, so confirming \
+             a held branch would select the other worktree AND run the checkout \
+             git is certain to refuse:\n{body}"
         );
     }
 }

@@ -760,6 +760,7 @@ mod fetch_pull_tests {
 #[cfg(test)]
 mod head_branch_tests {
     use super::*;
+    use git_vista_protocol::WorktreeSibling;
 
     #[test]
     fn a_named_branch_classifies_as_known() {
@@ -796,5 +797,106 @@ mod head_branch_tests {
             panic!("an Err must classify as Unknown");
         };
         assert_eq!(err, "HTTP 502");
+    }
+
+    // -----------------------------------------------------------------
+    // `CheckoutElsewhere::classify` (M11.02, #547)
+    // -----------------------------------------------------------------
+
+    fn sibling_on(branch: &str, name: &str, serviceable: Serviceable) -> WorktreeSibling {
+        WorktreeSibling {
+            repository: "repo-1".to_string(),
+            id: format!("worktree-{name}"),
+            name: name.to_string(),
+            path: None,
+            branch: Some(BranchName::new(branch).unwrap()),
+            head: None,
+            is_current: false,
+            locked: false,
+            prunable: false,
+            bare: false,
+            serviceable,
+        }
+    }
+
+    fn census_with(siblings: Vec<WorktreeSibling>) -> Result<WorktreeCensus, String> {
+        Ok(WorktreeCensus::Observed { siblings })
+    }
+
+    #[test]
+    fn classify_reports_free_when_no_other_worktree_holds_the_branch() {
+        let census = census_with(vec![sibling_on("feature/y", "desk-two", Serviceable::Yes)]);
+        assert_eq!(
+            CheckoutElsewhere::classify(census, "feature/x"),
+            CheckoutElsewhere::Free
+        );
+    }
+
+    #[test]
+    fn classify_names_the_worktree_that_holds_the_branch() {
+        let census = census_with(vec![sibling_on("feature/x", "desk-two", Serviceable::Yes)]);
+        match CheckoutElsewhere::classify(census, "feature/x") {
+            CheckoutElsewhere::HeldBy(w) => {
+                assert_eq!(w.name, "desk-two");
+                assert_eq!(w.id, "worktree-desk-two");
+                assert!(w.is_openable());
+            }
+            other => panic!("expected the holder to be named, got {other:?}"),
+        }
+    }
+
+    /// A holder the app may not open is still a holder — git's refusal does
+    /// not consult this application's fence — but it is not openable.
+    #[test]
+    fn a_holder_outside_the_allowed_roots_is_reported_and_is_not_openable() {
+        let census = census_with(vec![sibling_on(
+            "feature/x",
+            "outside",
+            Serviceable::OutsideAllowedRoots,
+        )]);
+        match CheckoutElsewhere::classify(census, "feature/x") {
+            CheckoutElsewhere::HeldBy(w) => assert!(!w.is_openable(), "{w:?}"),
+            other => panic!("a fenced-off worktree still holds the branch, got {other:?}"),
+        }
+    }
+
+    /// The transport half of the fail-open this type exists to close: the
+    /// request never reached the server, so nothing is known.
+    #[test]
+    fn a_failed_census_fetch_never_becomes_free() {
+        let answer = CheckoutElsewhere::classify(Err("network error".to_string()), "feature/x");
+        assert!(
+            matches!(&answer, CheckoutElsewhere::Unknown(why) if why.contains("network error")),
+            "expected the transport failure to survive, got {answer:?}"
+        );
+        assert_ne!(answer, CheckoutElsewhere::Free);
+    }
+
+    /// The server half: it answered, and its answer was "I could not read the
+    /// list". An empty sibling list would have meant "nobody holds it"; this
+    /// does not, and the two must not converge here.
+    #[test]
+    fn a_census_failed_response_never_becomes_free() {
+        let answer = CheckoutElsewhere::classify(
+            Ok(WorktreeCensus::CensusFailed {
+                reason: "git worktree list exited 128".to_string(),
+            }),
+            "feature/x",
+        );
+        assert!(
+            matches!(&answer, CheckoutElsewhere::Unknown(why) if why.contains("exited 128")),
+            "expected the server's reason to survive, got {answer:?}"
+        );
+    }
+
+    /// A name the protocol will not accept cannot be looked up, and "could not
+    /// look it up" is `Unknown`'s whole meaning — never `Free`.
+    #[test]
+    fn a_branch_name_the_protocol_rejects_is_unknown_not_free() {
+        let census = census_with(vec![sibling_on("feature/x", "desk-two", Serviceable::Yes)]);
+        assert!(matches!(
+            CheckoutElsewhere::classify(census, ""),
+            CheckoutElsewhere::Unknown(_)
+        ));
     }
 }

@@ -59,12 +59,7 @@ fn repo_with_a_sibling_on(
     let desk_path = desks.path().join(desk);
     run(
         &repo,
-        &[
-            "worktree",
-            "add",
-            desk_path.to_str().unwrap(),
-            branch_name,
-        ],
+        &["worktree", "add", desk_path.to_str().unwrap(), branch_name],
     );
     (dir, desks, repo)
 }
@@ -131,14 +126,31 @@ async fn the_server_refuses_a_checkout_of_a_branch_another_worktree_holds() {
 }
 
 /// Acceptance 3: "already checked out somewhere" is explicitly not an
-/// acceptable message. The refusal names the desk.
+/// acceptable message. The refusal names the desk, and says what to do.
 ///
 /// A separate test from the status above on purpose: the two failures are
 /// different defects — one lets a doomed command run, the other runs the
 /// right check and reports it uselessly — and a mutation that causes one
 /// should not be able to hide behind the other.
+///
+/// # Naming the worktree is not, on its own, an assertion worth making
+///
+/// Found by the mutation proof rather than by reading it back. With the gate
+/// weakened (`refuses_when_unmet_at_build` returning `false` for this
+/// precondition), git's own words reach the client:
+///
+/// ```text
+/// fatal: 'feature/x' is already used by worktree at '/tmp/…/desk-two'
+/// ```
+///
+/// That string **contains both names**. A test asserting only
+/// `body.contains("desk-two")` therefore passes on precisely the dead end
+/// this feature exists to replace — green, and proving nothing. So it also
+/// asserts the two things git's `fatal:` cannot carry: the rule stated in
+/// words, and a next step. That is the difference between a name and an
+/// answer.
 #[tokio::test]
-async fn the_refusal_names_the_worktree_that_holds_the_branch() {
+async fn the_refusal_names_the_worktree_and_says_what_to_do_about_it() {
     let (_dir, _desks, repo) = repo_with_a_sibling_on("feature/x", "desk-two");
     let (_status, body) = pipeline(&repo, checkout("feature/x")).await;
     assert!(
@@ -148,6 +160,16 @@ async fn the_refusal_names_the_worktree_that_holds_the_branch() {
     assert!(
         body.contains("feature/x"),
         "the refusal must name the branch it is about, got: {body}"
+    );
+    assert!(
+        body.contains("only one worktree at a time"),
+        "the refusal must state the rule rather than relay git's dead end, got: {body}"
+    );
+    assert!(
+        body.contains("check out a different branch here")
+            || body.contains("Open")
+            || body.contains("prune"),
+        "the refusal must offer a next step, got: {body}"
     );
 }
 

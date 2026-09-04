@@ -806,7 +806,11 @@ mod tests {
     fn a_sibling_outside_the_allowed_roots_still_holds_the_branch() {
         let census = observed(vec![
             sibling(),
-            other("outside", Some("feature/x"), Serviceable::OutsideAllowedRoots),
+            other(
+                "outside",
+                Some("feature/x"),
+                Serviceable::OutsideAllowedRoots,
+            ),
         ]);
         match branch_holder(&census, &branch("feature/x")) {
             BranchHolder::HeldBy(s) => assert_eq!(s.name, "outside"),
