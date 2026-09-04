@@ -43,7 +43,7 @@ use super::{sheet_render_metrics, SheetDrag, SheetRenderMetrics};
 use crate::features::activity::signals::Activity;
 use crate::features::dialogs::core::ErrorNotice;
 use crate::features::shell::core::{
-    ConnectivityCore, ModeSettler, Overlay, OverlayStack, ShellMode,
+    ConnectivityCore, ModeSettler, Overlay, OverlayStack, PayloadSlot, ShellMode,
 };
 use crate::state::{CommitIntent, MenuData, PendingOp, ViewerDoc};
 
@@ -577,24 +577,34 @@ impl Shell {
     }
 
     /// The one function that knows how each overlay is switched off.
+    ///
+    /// Asks [`Overlay::teardown`] *which* things to switch off and only performs them.
+    /// The mapping used to be a `match o` right here, and this file is
+    /// `#[cfg(target_arch = "wasm32")]` — so the decision "Detail owns `detail_id`, and
+    /// only the viewer leaves persisted state behind" lived somewhere no host test could
+    /// read it. Exhaustiveness caught a missing arm; nothing caught a wrong one. With the
+    /// map in `core`, `every_overlay_blanks_a_slot_no_other_overlay_owns` proves no two
+    /// overlays claim one signal, and the source census in that module proves this
+    /// function still asks rather than re-deriving.
     fn clear_payload(&self, o: Overlay) {
-        match o {
-            Overlay::Menu => self.menu.set(None),
-            Overlay::CommitDialog => self.commit_dialog.set(None),
-            Overlay::Confirm => self.confirm_op.set(None),
-            Overlay::Error => self.error_notice.set(None),
-            Overlay::Detail => self.detail_id.set(None),
-            Overlay::Viewer => {
-                // M4.27 (#80): the viewer is gone, so there is nothing to come
-                // back to. Cleared HERE rather than in `close_viewer` because
-                // this is the one funnel every close path reaches — Esc goes
-                // through `dismiss_top`, which never calls `close_viewer` and
-                // would otherwise leave a stored comparison that reopens itself
-                // on the next load.
-                crate::prefs::clear_comparison();
-                self.viewer_doc.set(None)
-            }
-            Overlay::Activity => self.activity.close(),
+        let teardown = o.teardown();
+        if teardown.clears_stored_comparison {
+            // The viewer is gone, so there is nothing to come back to. Done HERE
+            // rather than in `close_viewer` because this is the one funnel every
+            // close path reaches — Esc goes through `dismiss_top`, which never
+            // calls `close_viewer` and would otherwise leave a stored comparison
+            // that reopens itself on the next load. Which overlays this applies to
+            // is `teardown`'s decision, not this function's.
+            crate::prefs::clear_comparison();
+        }
+        match teardown.slot {
+            PayloadSlot::Menu => self.menu.set(None),
+            PayloadSlot::CommitDialog => self.commit_dialog.set(None),
+            PayloadSlot::ConfirmOp => self.confirm_op.set(None),
+            PayloadSlot::ErrorNotice => self.error_notice.set(None),
+            PayloadSlot::DetailId => self.detail_id.set(None),
+            PayloadSlot::ViewerDoc => self.viewer_doc.set(None),
+            PayloadSlot::ActivityOpen => self.activity.close(),
         }
     }
 }
