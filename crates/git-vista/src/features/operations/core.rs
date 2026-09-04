@@ -582,6 +582,222 @@ pub fn latest_wins(current: Option<&PendingIntent>, incoming: &PendingIntent) ->
     }
 }
 
+// ── What a write is sent as, and what it says when it is lost (#612) ────────
+//
+// Everything below lived in the wasm-only `features/operations/signals.rs`.
+// None of it needs Leptos or a DOM — these are tables and small decisions over
+// `OperationKind` — but sitting beside `RwSignal` put them where no test
+// runner in this repo compiles them, which is the whole of #612.
+
+/// Which `api::` function one operation kind is sent through, and — for the
+/// four kinds that share one function — which path it posts to.
+///
+/// # Why this is a table rather than a `match` inside `send`
+///
+/// **This is the #594 shape.** Several `OperationKind` variants are
+/// structurally identical: `Merge`, `Delete`, `Checkout` and `ForceDelete` all
+/// carry a `branch`, and `DiscardTrackedPaths` and `DeleteUntrackedPaths` both
+/// carry `paths`. Swapping one for its sibling in a dispatch `match` therefore
+/// **compiles cleanly and runs a different git command against the user's
+/// repository** — `git checkout` where they asked for `git branch -d`.
+///
+/// Only the variant separates a write from a different write. A table a host
+/// test can read is what makes that separation checkable; a `match` inside a
+/// wasm-only `async fn` is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteRoute {
+    /// The `api::` function `send` must call for this kind. Enforced against
+    /// `send`'s real arms by the census in this module's tests, so the name
+    /// here is a checked fact rather than a comment that can rot.
+    pub api_fn: &'static str,
+    /// The endpoint path, for the four kinds that share
+    /// `api::branch_op_request` and are told apart by nothing else. `None`
+    /// when the function hardcodes its own single path.
+    pub branch_op_path: Option<&'static str>,
+}
+
+impl WriteRoute {
+    const fn dedicated(api_fn: &'static str) -> Self {
+        WriteRoute {
+            api_fn,
+            branch_op_path: None,
+        }
+    }
+
+    const fn branch_op(path: &'static str) -> Self {
+        WriteRoute {
+            api_fn: "branch_op_request",
+            branch_op_path: Some(path),
+        }
+    }
+}
+
+/// The one place that says where a write goes.
+///
+/// Exhaustive with no wildcard, deliberately: a new [`OperationKind`] must be
+/// routed here explicitly rather than falling into whatever arm happens to sit
+/// last. That is the same posture [`OperationsCore`] takes elsewhere, and it
+/// is what makes the completeness test below a compile-time guarantee rather
+/// than a count that can drift.
+pub fn write_route(kind: &OperationKind) -> WriteRoute {
+    match kind {
+        // The four that share one function and are separated by path alone.
+        OperationKind::Merge { .. } => WriteRoute::branch_op("/api/merge"),
+        OperationKind::Checkout { .. } => WriteRoute::branch_op("/api/checkout"),
+        OperationKind::Delete { .. } => WriteRoute::branch_op("/api/delete-branch"),
+        OperationKind::ForceDelete { .. } => WriteRoute::branch_op("/api/force-delete-branch"),
+        // #233: `Push` left the shared `{branch}` shape when it gained
+        // `set_upstream`/`force`, which need their own serialization.
+        OperationKind::Push { .. } => WriteRoute::dedicated("push_request"),
+        OperationKind::Rebase { .. } => WriteRoute::dedicated("rebase_request"),
+        OperationKind::Fetch { .. } => WriteRoute::dedicated("fetch_request"),
+        OperationKind::Pull { .. } => WriteRoute::dedicated("pull_request"),
+        OperationKind::CherryPick { .. } => WriteRoute::dedicated("cherry_pick_request"),
+        OperationKind::Undo(_) => WriteRoute::dedicated("undo_request"),
+        // Two routes, not one parameterised by a bool — mirroring the two
+        // separate `GitOperation` variants and the two separate endpoints
+        // behind them (#71, M2.18a/#219). These two are the second
+        // identical-shape pair: both carry only `paths`.
+        OperationKind::DiscardTrackedPaths { .. } => {
+            WriteRoute::dedicated("discard_tracked_paths_request")
+        }
+        OperationKind::DeleteUntrackedPaths { .. } => {
+            WriteRoute::dedicated("delete_untracked_paths_request")
+        }
+        OperationKind::DeleteLocalTag { .. } => WriteRoute::dedicated("delete_tag_request"),
+    }
+}
+
+/// The `localStorage` entry a just-bound operation should leave behind so a
+/// reload or a suspended tab can find it again (#232, M2.20f), or `None` for
+/// every kind that has no such entry.
+///
+/// Only Fetch and Pull carry the "reconnect, don't lose track" acceptance
+/// criterion; persisting an operation that settles in milliseconds would leave
+/// stale storage behind for no reader to ever consult.
+///
+/// # The exact inverse of [`remote_op_kind`]
+///
+/// That function rebuilds the kind from the stored entry on boot; this one
+/// writes the entry from the kind. They are two halves of one round trip and
+/// were on opposite sides of the wasm boundary — one host-tested, one not — so
+/// nothing could check they agreed. The round-trip test below is only possible
+/// with both here.
+pub fn persisted_remote_op(kind: &OperationKind, id: &OperationId) -> Option<InFlightRemoteOp> {
+    match kind {
+        OperationKind::Fetch { remote } => Some(InFlightRemoteOp {
+            id: id.as_str().to_string(),
+            remote: remote.clone(),
+            branch: None,
+            strategy: None,
+        }),
+        OperationKind::Pull {
+            remote,
+            branch,
+            strategy,
+        } => Some(InFlightRemoteOp {
+            id: id.as_str().to_string(),
+            remote: remote.clone(),
+            branch: Some(branch.clone()),
+            strategy: Some(*strategy),
+        }),
+        _ => None,
+    }
+}
+
+/// What a user is told when the re-attach budget runs out. Deliberately does
+/// not claim the operation failed — it claims *we lost track of it*, which is
+/// the only honest thing left to say, and points at the check that resolves it.
+/// Same posture as `clone_poll_exhausted_message` takes for #278's poll.
+pub const STREAM_LOST_MESSAGE: &str = "Lost contact with the server while this was running, and \
+                                       couldn't get it back. It may well have finished — check \
+                                       the graph before running it again, or you can end up \
+                                       doing it twice.";
+
+/// The settlement written when contact is lost for good.
+///
+/// # One value, two triggers — which are NOT the same condition
+///
+/// `signals.rs` reaches this from two places, and reading them as one rule is
+/// a mistake worth naming, because it is the reason they were duplicated:
+///
+/// 1. `subscribe`'s `on_error`, when the **re-attach budget** is spent — no
+///    further rejoining of the stream is permitted;
+/// 2. `reattach_after_stream_loss`'s exhausted arm, when the **inner status
+///    poll loop** (`STREAM_REATTACH_MAX_ATTEMPTS` reads, two seconds apart)
+///    fails every time inside a *single* attempt.
+///
+/// Different conditions, counted separately. What they share is only the
+/// answer: the entry cannot stay in flight, because `settle` is the only thing
+/// that removes it and `menu.rs`'s `remote_op_running` gate reads that list —
+/// a row that can never leave it is a permanent lockout of Fetch and Pull.
+///
+/// So the *settlement* is unified here and the two triggers stay distinct. The
+/// census in this module's tests holds that line: it fails if a second copy of
+/// this value is written inline in `signals.rs` again.
+pub fn lost_contact_settlement() -> Settlement {
+    Settlement {
+        state: OperationState::Failed,
+        message: Some(STREAM_LOST_MESSAGE.to_string()),
+        generation: None,
+    }
+}
+
+/// What to do when a progress stream drops, given what is left of the
+/// re-attach budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReattachStep {
+    /// Try to rejoin, carrying this much budget onward. Strictly less than
+    /// what was passed in — that is what stops a permanently-dead tunnel from
+    /// looping forever.
+    Retry { budget: u32 },
+    /// Nothing left. Settle the entry with [`lost_contact_settlement`] so it
+    /// stops blocking the menu.
+    GiveUp,
+}
+
+/// Spend one unit of the re-attach budget, or report that it is gone.
+///
+/// Pulled out of `subscribe`'s `on_error` because the arithmetic and the
+/// give-up boundary are the whole safety property here, and neither could be
+/// executed by any test while they lived inside an `EventSource` callback.
+pub fn reattach_step(budget: u32) -> ReattachStep {
+    match budget {
+        0 => ReattachStep::GiveUp,
+        remaining => ReattachStep::Retry {
+            budget: remaining - 1,
+        },
+    }
+}
+
+/// The settlement for a write that must be resolved from the HTTP answer
+/// alone, on the paths that have no server-side record to read.
+pub fn local_settlement(ok: bool, message: String) -> Settlement {
+    Settlement {
+        state: if ok {
+            OperationState::Succeeded
+        } else {
+            OperationState::Failed
+        },
+        message: Some(message),
+        generation: None,
+    }
+}
+
+/// The reserved "no intent" sequence.
+///
+/// `next_seq` falls back to this when the owning scope is already disposed —
+/// in which case the continuation cannot write anything either. It must lose
+/// every comparison in [`result_is_newest`] rather than spuriously win one,
+/// which is a property of the *pair* and is tested as such below.
+pub const NO_INTENT_SEQ: u64 = 0;
+
+/// A minted click-order sequence, or [`NO_INTENT_SEQ`] when the scope that
+/// owns the counter is gone.
+pub fn seq_or_no_intent(minted: Option<u64>) -> u64 {
+    minted.unwrap_or(NO_INTENT_SEQ)
+}
+
 #[cfg(test)]
 mod core_tests {
     use super::*;
@@ -1554,5 +1770,521 @@ mod progress_line_tests {
         assert!(!line.contains('%'), "invented a percentage: {line:?}");
         assert!(!line.contains('/'), "invented a denominator: {line:?}");
         assert!(!line.contains('0'), "invented a zero count: {line:?}");
+    }
+}
+
+/// #612: the write-routing table, the persistence round trip, and the two
+/// small decisions that came with them out of the wasm-only `signals.rs`.
+#[cfg(test)]
+mod write_route_tests {
+    use super::*;
+    use crate::features::operations::kind::HeadBranch;
+    use git_vista_core::activity::{UndoAction, Undoable};
+
+    fn id(s: &str) -> OperationId {
+        OperationId::new(s).expect("a valid operation id")
+    }
+
+    /// One value of every [`OperationKind`] there is, constructed by hand.
+    ///
+    /// Written out rather than derived, for the reason `stash::core`'s
+    /// `every_verdict` gives: a list built by calling the code under test lets
+    /// a new variant in unexamined, and a new variant is exactly when "where
+    /// does this get sent?" needs asking again. The census in
+    /// `every_operation_kind_is_routed` is an exhaustive match, so the next
+    /// variant is a compile error there, and an entry missing HERE is a red
+    /// assertion that names it.
+    fn every_operation_kind() -> Vec<OperationKind> {
+        vec![
+            OperationKind::Merge {
+                branch: "feature".into(),
+                into: HeadBranch::Known("main".into()),
+            },
+            OperationKind::Push {
+                branch: "feature".into(),
+                set_upstream: false,
+                force: None,
+            },
+            OperationKind::Delete {
+                branch: "feature".into(),
+                current: HeadBranch::Known("main".into()),
+            },
+            OperationKind::Checkout {
+                branch: "feature".into(),
+                current: Some("main".into()),
+            },
+            OperationKind::ForceDelete {
+                branch: "feature".into(),
+            },
+            OperationKind::Rebase {
+                current: Some("feature".into()),
+                base: "main".into(),
+            },
+            OperationKind::Fetch {
+                remote: "origin".into(),
+            },
+            OperationKind::Pull {
+                remote: "origin".into(),
+                branch: "main".into(),
+                strategy: MergeStrategy::Merge,
+            },
+            OperationKind::Undo(Undoable {
+                action: UndoAction::RevertCommit {
+                    commit: "abc123".into(),
+                },
+                label: "undo".into(),
+                warn_pushed: false,
+            }),
+            OperationKind::DiscardTrackedPaths {
+                paths: vec!["src/main.rs".into()],
+            },
+            OperationKind::DeleteUntrackedPaths {
+                paths: vec!["scratch.txt".into()],
+            },
+            OperationKind::CherryPick {
+                commit: "abc123".into(),
+                onto: HeadBranch::Known("main".into()),
+            },
+            OperationKind::DeleteLocalTag {
+                tag: "v1.0.0".into(),
+            },
+        ]
+    }
+
+    /// The whole table, stated by hand.
+    ///
+    /// This is the assertion that would have caught #594's defect: the
+    /// expectations are written out here, not read back from `write_route`,
+    /// because asking the mechanism what the mechanism decided passes over any
+    /// mapping at all — including one that sends a delete to `/api/checkout`.
+    #[test]
+    fn every_operation_kind_is_routed_to_the_endpoint_it_names() {
+        for kind in every_operation_kind() {
+            // Exhaustive and hand-stated: a new variant is a compile error
+            // here and must be argued rather than defaulted into a sibling's
+            // endpoint.
+            let (want_fn, want_path) = match &kind {
+                OperationKind::Merge { .. } => ("branch_op_request", Some("/api/merge")),
+                OperationKind::Checkout { .. } => ("branch_op_request", Some("/api/checkout")),
+                OperationKind::Delete { .. } => ("branch_op_request", Some("/api/delete-branch")),
+                OperationKind::ForceDelete { .. } => {
+                    ("branch_op_request", Some("/api/force-delete-branch"))
+                }
+                OperationKind::Push { .. } => ("push_request", None),
+                OperationKind::Rebase { .. } => ("rebase_request", None),
+                OperationKind::Fetch { .. } => ("fetch_request", None),
+                OperationKind::Pull { .. } => ("pull_request", None),
+                OperationKind::CherryPick { .. } => ("cherry_pick_request", None),
+                OperationKind::Undo(_) => ("undo_request", None),
+                OperationKind::DiscardTrackedPaths { .. } => {
+                    ("discard_tracked_paths_request", None)
+                }
+                OperationKind::DeleteUntrackedPaths { .. } => {
+                    ("delete_untracked_paths_request", None)
+                }
+                OperationKind::DeleteLocalTag { .. } => ("delete_tag_request", None),
+            };
+            let got = write_route(&kind);
+            assert_eq!(
+                (got.api_fn, got.branch_op_path),
+                (want_fn, want_path),
+                "wrong route for {kind:?}"
+            );
+        }
+    }
+
+    /// The census: `every_operation_kind` really does carry all thirteen.
+    ///
+    /// Without this, the table test above is only as complete as a
+    /// hand-written list nobody checks — the #531 failure shape, where a
+    /// literal length assertion kept a completeness claim green while two
+    /// variants were missing.
+    #[test]
+    fn every_operation_kind_is_routed() {
+        #[derive(Default)]
+        struct Census {
+            merge: bool,
+            push: bool,
+            delete: bool,
+            checkout: bool,
+            force_delete: bool,
+            rebase: bool,
+            fetch: bool,
+            pull: bool,
+            undo: bool,
+            discard_tracked: bool,
+            delete_untracked: bool,
+            cherry_pick: bool,
+            delete_local_tag: bool,
+        }
+        let mut seen = Census::default();
+        for kind in every_operation_kind() {
+            match kind {
+                OperationKind::Merge { .. } => seen.merge = true,
+                OperationKind::Push { .. } => seen.push = true,
+                OperationKind::Delete { .. } => seen.delete = true,
+                OperationKind::Checkout { .. } => seen.checkout = true,
+                OperationKind::ForceDelete { .. } => seen.force_delete = true,
+                OperationKind::Rebase { .. } => seen.rebase = true,
+                OperationKind::Fetch { .. } => seen.fetch = true,
+                OperationKind::Pull { .. } => seen.pull = true,
+                OperationKind::Undo(_) => seen.undo = true,
+                OperationKind::DiscardTrackedPaths { .. } => seen.discard_tracked = true,
+                OperationKind::DeleteUntrackedPaths { .. } => seen.delete_untracked = true,
+                OperationKind::CherryPick { .. } => seen.cherry_pick = true,
+                OperationKind::DeleteLocalTag { .. } => seen.delete_local_tag = true,
+            }
+        }
+        for (ticked, entry) in [
+            (seen.merge, "Merge"),
+            (seen.push, "Push"),
+            (seen.delete, "Delete"),
+            (seen.checkout, "Checkout"),
+            (seen.force_delete, "ForceDelete"),
+            (seen.rebase, "Rebase"),
+            (seen.fetch, "Fetch"),
+            (seen.pull, "Pull"),
+            (seen.undo, "Undo"),
+            (seen.discard_tracked, "DiscardTrackedPaths"),
+            (seen.delete_untracked, "DeleteUntrackedPaths"),
+            (seen.cherry_pick, "CherryPick"),
+            (seen.delete_local_tag, "DeleteLocalTag"),
+        ] {
+            assert!(ticked, "every_operation_kind is missing {entry}");
+        }
+    }
+
+    /// **No two operations are sent the same way.**
+    ///
+    /// This is the swap-catcher stated as a property rather than a table: if
+    /// `Checkout` and `Delete` ever route identically, one of them is running
+    /// the other's git command, and it does not matter which direction the
+    /// mistake went. Structurally identical variants — the four `{ branch }`
+    /// kinds, and the two `{ paths }` kinds — are exactly the ones a compiler
+    /// cannot tell apart, so this is the layer that has to.
+    #[test]
+    fn no_two_operation_kinds_share_a_route() {
+        let mut seen: Vec<(WriteRoute, String)> = Vec::new();
+        for kind in every_operation_kind() {
+            let route = write_route(&kind);
+            if let Some((_, other)) = seen.iter().find(|(r, _)| *r == route) {
+                panic!(
+                    "{kind:?} and {other} both route to {route:?} — one of them is \
+                     running the other's git command"
+                );
+            }
+            seen.push((route, format!("{kind:?}")));
+        }
+    }
+
+    /// `send` really calls the function the table names, for every kind.
+    ///
+    /// Without this the `api_fn` field would be a comment: a claim about
+    /// wasm-only code that nothing checks, free to drift the moment someone
+    /// edits `send`. A text census is the only way to reach it — `signals.rs`
+    /// is `#[cfg(target_arch = "wasm32")]`, no runner in this repo executes
+    /// it, and `include_str!` is what lets a host test read it at all (and
+    /// makes Cargo re-run this test when it changes).
+    ///
+    /// It pairs each arm's `OperationKind::` patterns with the `api::` call
+    /// that arm makes, in source order, and checks the result against
+    /// [`write_route`]. That is what catches a `DiscardTrackedPaths` arm
+    /// wired to `delete_untracked_paths_request`: both names are present in
+    /// the file either way, so only the PAIRING can tell.
+    #[test]
+    fn sends_dispatch_matches_the_route_table() {
+        const SIGNALS: &str = include_str!("signals.rs");
+        let body = send_body(SIGNALS);
+
+        // Walk the arm bodies in order, collecting the variants named since
+        // the last `api::` call and binding them all to it.
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut pending: Vec<String> = Vec::new();
+        for token in ordered_tokens(&body) {
+            match token {
+                Token::Variant(v) => pending.push(v),
+                Token::ApiCall(f) => {
+                    for v in pending.drain(..) {
+                        pairs.push((v, f.clone()));
+                    }
+                }
+            }
+        }
+        assert!(
+            pending.is_empty(),
+            "these arms of `send` name a kind but call no api:: function: {pending:?}"
+        );
+
+        // Every kind the table knows must appear, bound to the named function.
+        for kind in every_operation_kind() {
+            let name = variant_name(&kind);
+            let want = write_route(&kind).api_fn;
+            let found: Vec<&str> = pairs
+                .iter()
+                .filter(|(v, _)| *v == name)
+                .map(|(_, f)| f.as_str())
+                .collect();
+            assert_eq!(
+                found,
+                vec![want],
+                "`send` dispatches {name} to {found:?}, but the route table says {want:?}"
+            );
+        }
+
+        // And nothing else: an arm naming a kind the table does not know would
+        // be a write with no tested route.
+        assert_eq!(
+            pairs.len(),
+            every_operation_kind().len(),
+            "`send` has {} kind→api pairings but there are {} kinds — an arm was added, \
+             removed, or names a kind twice: {pairs:?}",
+            pairs.len(),
+            every_operation_kind().len()
+        );
+    }
+
+    /// The lost-contact settlement is written in exactly one place.
+    ///
+    /// It used to be spelled out twice in `signals.rs`, in two arms reached by
+    /// two genuinely DIFFERENT conditions (see [`lost_contact_settlement`]'s
+    /// doc), with nothing checking the two copies agreed. Unifying it is only
+    /// durable if re-duplicating it fails.
+    #[test]
+    fn the_lost_contact_message_lives_only_in_core() {
+        const SIGNALS: &str = include_str!("signals.rs");
+        assert!(
+            !SIGNALS.contains("Lost contact with the server"),
+            "signals.rs spells the lost-contact message inline again — it belongs to \
+             `core::lost_contact_settlement`, which both give-up paths must call"
+        );
+        let calls = SIGNALS.matches("lost_contact_settlement()").count();
+        assert!(
+            calls >= 2,
+            "expected both give-up paths to settle through lost_contact_settlement(), \
+             found {calls} call(s)"
+        );
+    }
+
+    // ── the persistence round trip ──────────────────────────────────────────
+
+    /// What is written on dispatch is exactly what is read back on boot.
+    ///
+    /// [`persisted_remote_op`] and [`remote_op_kind`] are inverses that sat on
+    /// opposite sides of the wasm boundary until #612 — one host-tested, one
+    /// not — so nothing could check they agreed. A `Pull` persisted without
+    /// its strategy, or a `Fetch` that came back as a `Pull`, would resume the
+    /// wrong operation after a reload.
+    #[test]
+    fn a_persisted_remote_op_round_trips_back_to_the_kind_that_wrote_it() {
+        for kind in every_operation_kind() {
+            let Some(entry) = persisted_remote_op(&kind, &id("op-1")) else {
+                continue;
+            };
+            assert_eq!(entry.id, "op-1", "the entry lost the operation id");
+            assert_eq!(
+                remote_op_kind(&entry),
+                Some(kind.clone()),
+                "{kind:?} did not survive the storage round trip"
+            );
+        }
+    }
+
+    /// Only Fetch and Pull are persisted — hand-stated, so a kind that starts
+    /// leaving storage behind has to say so here.
+    #[test]
+    fn only_the_two_resumable_kinds_are_persisted() {
+        let persisted: Vec<String> = every_operation_kind()
+            .iter()
+            .filter(|k| persisted_remote_op(k, &id("op-1")).is_some())
+            .map(variant_name)
+            .collect();
+        assert_eq!(
+            persisted,
+            vec!["Fetch".to_string(), "Pull".to_string()],
+            "only Fetch and Pull carry the reconnect criterion; anything else leaves \
+             stale storage no reader consults"
+        );
+    }
+
+    // ── the re-attach budget ────────────────────────────────────────────────
+
+    /// The budget strictly decreases and ends at `GiveUp`.
+    ///
+    /// This is what stops a permanently-dead tunnel from looping forever, and
+    /// it lived inside an `EventSource` callback where no test could run it.
+    #[test]
+    fn the_reattach_budget_always_runs_out() {
+        assert_eq!(reattach_step(0), ReattachStep::GiveUp);
+        assert_eq!(reattach_step(1), ReattachStep::Retry { budget: 0 });
+        assert_eq!(reattach_step(6), ReattachStep::Retry { budget: 5 });
+
+        // Drive it to exhaustion from a generous start: it must terminate, and
+        // every step must be strictly smaller than the last.
+        let mut budget = 32u32;
+        let mut steps = 0;
+        while let ReattachStep::Retry { budget: next } = reattach_step(budget) {
+            assert!(
+                next < budget,
+                "the budget did not decrease: {budget} → {next}"
+            );
+            budget = next;
+            steps += 1;
+            assert!(steps <= 32, "the budget did not run out in 32 steps");
+        }
+        assert_eq!(steps, 32, "a budget of 32 should permit exactly 32 retries");
+    }
+
+    /// Giving up says contact was lost — never that the operation failed.
+    #[test]
+    fn losing_contact_is_reported_as_lost_and_not_as_a_failed_operation() {
+        let settled = lost_contact_settlement();
+        let message = settled.message.expect("the user is told something");
+        assert!(
+            message.contains("Lost contact") && message.contains("check"),
+            "the message must say contact was lost and point at the check: {message:?}"
+        );
+        assert!(
+            !message.contains("failed"),
+            "an unobserved outcome must not be reported as a failure: {message:?}"
+        );
+        // The entry still has to leave the in-flight list — `settle` is the
+        // only thing that removes it, and the menu gate reads that list.
+        assert_eq!(settled.state, OperationState::Failed);
+        assert_eq!(settled.generation, None);
+    }
+
+    // ── the two small maps ──────────────────────────────────────────────────
+
+    #[test]
+    fn a_locally_settled_write_takes_its_state_from_the_http_answer() {
+        assert_eq!(
+            local_settlement(true, "done".into()).state,
+            OperationState::Succeeded
+        );
+        assert_eq!(
+            local_settlement(false, "HTTP 500".into()).state,
+            OperationState::Failed
+        );
+        assert_eq!(
+            local_settlement(false, "HTTP 500".into()).message,
+            Some("HTTP 500".to_string())
+        );
+    }
+
+    /// The disposed-scope fallback loses to every sequence a click can mint.
+    ///
+    /// Asserted against [`result_is_newest`] rather than by eyeballing the
+    /// constant: "0 is reserved" is only true if the comparison it feeds
+    /// actually treats it that way, and those two facts live in different
+    /// functions.
+    ///
+    /// # The one tie, and why it is not a defect
+    ///
+    /// `result_is_newest` is `seq >= shown_seq` — ties go to the incoming
+    /// result, exactly as [`latest_wins`] documents. So `NO_INTENT_SEQ` does
+    /// NOT lose against a shown sequence of 0. That case is "nothing has been
+    /// shown yet", not a real intent being overwritten: [`IntentSeq::next`]
+    /// increments *before* returning, so 0 is unmintable and every actual
+    /// click is 1 or more. The reserved value loses to all of those, which is
+    /// the property that matters — and that is what is asserted here, rather
+    /// than a stronger claim that would have to be false.
+    #[test]
+    fn the_no_intent_sequence_loses_to_every_sequence_a_click_can_mint() {
+        assert_eq!(seq_or_no_intent(Some(7)), 7);
+        assert_eq!(seq_or_no_intent(None), NO_INTENT_SEQ);
+
+        // 0 is unmintable: the counter increments before it answers.
+        let mut seq = IntentSeq::default();
+        assert_eq!(
+            seq.next(),
+            1,
+            "the first click must not mint the reserved value"
+        );
+        assert_ne!(NO_INTENT_SEQ, 1);
+
+        for shown in [1, 2, 9, u64::MAX] {
+            assert!(
+                !result_is_newest(shown, NO_INTENT_SEQ),
+                "the no-intent sequence beat a shown sequence of {shown}"
+            );
+        }
+    }
+
+    // ── census helpers ──────────────────────────────────────────────────────
+
+    fn variant_name(kind: &OperationKind) -> String {
+        let rendered = format!("{kind:?}");
+        rendered
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    enum Token {
+        Variant(String),
+        ApiCall(String),
+    }
+
+    /// `send`'s body, from its signature to the closing brace in column 0.
+    fn send_body(src: &str) -> String {
+        let start = src
+            .find("async fn send(")
+            .expect("signals.rs still defines `send`");
+        let rest = &src[start..];
+        let end = rest
+            .find("\n}\n")
+            .expect("`send` is closed by a brace in column 0");
+        strip_line_comments(&rest[..end])
+    }
+
+    /// Every `OperationKind::X` pattern and `api::y(` call, in source order.
+    fn ordered_tokens(body: &str) -> Vec<Token> {
+        let mut out = Vec::new();
+        // Advance by CHAR boundaries: this file is full of em dashes, and a
+        // raw byte cursor lands inside one and panics.
+        let mut i = 0;
+        while i < body.len() {
+            if !body.is_char_boundary(i) {
+                i += 1;
+                continue;
+            }
+            if body[i..].starts_with("OperationKind::") {
+                let after = i + "OperationKind::".len();
+                let name = take_ident(&body[after..]);
+                i = after + name.len();
+                out.push(Token::Variant(name));
+            } else if body[i..].starts_with("api::") {
+                let after = i + "api::".len();
+                let name = take_ident(&body[after..]);
+                i = after + name.len();
+                // Only calls, not bare paths.
+                if body[i..].starts_with('(') {
+                    out.push(Token::ApiCall(name));
+                }
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    fn take_ident(s: &str) -> String {
+        s.chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect()
+    }
+
+    /// Drop `//`-comments so a name quoted in prose is not censused as code.
+    /// Block comments are not stripped, matching every other census in this
+    /// repo; `signals.rs` uses none.
+    fn strip_line_comments(code: &str) -> String {
+        code.lines()
+            .map(|line| match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

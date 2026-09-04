@@ -1128,6 +1128,169 @@ pub fn verdict_after_drop(drop: &DropOutcome) -> PopVerdict {
     }
 }
 
+// ── What the drawer is doing, and what it last said (#612) ──────────────────
+//
+// These three items lived in the wasm-only `signals.rs` until #612. Nothing in
+// them ever needed a DOM — the busy map is a `HashMap<String, &'static str>`
+// and the notice is a plain struct built from this module's own verdicts — but
+// sitting beside `RwSignal` put them where `cargo test -p git-vista --bins`
+// never compiled them, so the #515 and #518 invariants their own doc comments
+// assert were held by code review and by nothing else. Both are now pinned by
+// host tests below. `signals.rs` re-exports all three, so no call site moved.
+
+/// The busy key for the push control, which has no stash entry of its own.
+///
+/// A reserved sentinel rather than `""`: an empty string silently matches no
+/// row, so a push in flight left every control enabled — including its own
+/// button, where a second tap would stash the already-stashed tree again. The
+/// value cannot collide with a real key: rows key on the entry's commit OID,
+/// which is hex, and this is not.
+pub const PUSH_KEY: &str = "\u{0}push";
+
+/// What the drawer is currently doing, so a view can disable controls and say
+/// why without inventing its own notion of "busy".
+///
+/// One entry per stash entry with a write in flight, not one overwriteable
+/// slot (#518): the drawer lists many entries and writes overlap — start an
+/// apply on one row and then a drop on another, and a single slot would
+/// re-enable the first row mid-flight, then let whichever write finished
+/// first unlock everything.
+///
+/// # Keys are the entry's commit OID, never its selector
+///
+/// `stash@{N}` is a *position*, and positions renumber on every drop: an
+/// apply in flight on `stash@{1}` while a drop on `stash@{0}` completes
+/// would leave a selector-keyed lock pointing at whichever entry the list
+/// now shows at `{1}` — the wrong row locked, the working row free. The
+/// commit OID names the entry itself, which no renumbering moves. (Found by
+/// the #518 review pass, both reviewers independently.) [`PUSH_KEY`] is the
+/// one non-OID key, for the control with no entry.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DrawerBusy {
+    working: std::collections::HashMap<String, &'static str>,
+}
+
+impl DrawerBusy {
+    /// Whether this entry specifically is mid-write. `key` is the entry's
+    /// commit OID (or [`PUSH_KEY`]) — see the type doc for why never a
+    /// selector.
+    pub fn locked(&self, key: &str) -> bool {
+        self.working.contains_key(key)
+    }
+
+    /// The label to show on the row that is working.
+    pub fn label(&self, key: &str) -> Option<&'static str> {
+        self.working.get(key).copied()
+    }
+
+    /// Mark this entry mid-write. `key` is the entry's commit OID (or
+    /// [`PUSH_KEY`]); inserts into the per-entry map rather than replacing a
+    /// single slot, so an overlapping write on another row neither relabels
+    /// nor re-enables this one (#518).
+    pub fn begin(&mut self, key: &str, what: &'static str) {
+        self.working.insert(key.to_string(), what);
+    }
+
+    /// Release this entry only. Takes the key for the same reason [`begin`]
+    /// does: an unconditional "everything idle" let whichever of two
+    /// overlapping writes finished first unlock the one still in flight.
+    ///
+    /// [`begin`]: Self::begin
+    pub fn finish(&mut self, key: &str) {
+        self.working.remove(key);
+    }
+}
+
+/// A finished, user-facing outcome line plus the conflicted paths it carries.
+///
+/// The paths ride along so the view can offer a route into the shared conflict
+/// workflow (A3) rather than rendering a stash-shaped conflict UI of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StashNotice {
+    pub headline: String,
+    /// True only when the operation genuinely finished. A view must scale its
+    /// styling on this and never on "the request returned".
+    pub complete: bool,
+    /// What is true of the user's working tree, carried structurally rather
+    /// than left only inside [`Self::headline`]'s prose. A user whose pop
+    /// "failed" still needs to know their files moved — and after a refused
+    /// apply with an unreadable tree, that it could not be established.
+    pub tree: Option<TreeState>,
+    /// Whether the stash entry this action targeted is still in the drawer —
+    /// `None` when this client has no way to know (a lost reply whose record
+    /// could not settle it, #515), or when the action has no target entry
+    /// (push). A `bool` here forced a guess, and the guess shipped as fact.
+    pub entry_retained: Option<bool>,
+    pub conflicted: Vec<String>,
+    pub unreadable: Vec<String>,
+}
+
+impl StashNotice {
+    /// Build the notice for a composed pop. Every field comes from the
+    /// verdict's own accessors, so the view cannot disagree with the gate about
+    /// whether the pop finished.
+    pub fn from_pop(verdict: &PopVerdict) -> Self {
+        StashNotice {
+            headline: verdict.headline(),
+            complete: verdict.is_complete(),
+            tree: Some(verdict.tree()),
+            entry_retained: verdict.entry_retained(),
+            conflicted: verdict.conflicted_paths().to_vec(),
+            unreadable: verdict.unreadable_paths().to_vec(),
+        }
+    }
+
+    /// A notice for the simple writes, honest about lost replies (#515).
+    ///
+    /// The caller states the entry's fate PER OUTCOME, because the truth
+    /// differs per action: a successful drop removed the entry
+    /// (`Some(false)`), a successful apply kept it (`Some(true)`), a push
+    /// has no target entry at all (`None`) — and an unrecoverable lost reply
+    /// is `None` for every action whose success would have changed the
+    /// drawer, because a value here is a claim the user acts on.
+    ///
+    /// `tree` stays `None` throughout: the simple writes say their effect in
+    /// prose, and only a composed pop has an effect the prose cannot fully
+    /// carry (see [`Self::from_pop`]).
+    pub fn from_write(
+        sent: Result<StashWriteOutcome, String>,
+        done: &str,
+        entry_on_success: Option<bool>,
+        entry_on_failure: Option<bool>,
+        unknown: (&str, Option<bool>),
+    ) -> Self {
+        let (headline, complete, entry_retained) = match sent {
+            // A local refusal never left the device, so nothing changed.
+            Err(local) => (local, false, entry_on_failure),
+            Ok(StashWriteOutcome::Answered { ok: true, .. })
+            | Ok(StashWriteOutcome::Reconciled { ok: true, .. }) => {
+                (done.to_string(), true, entry_on_success)
+            }
+            Ok(StashWriteOutcome::Answered {
+                ok: false, message, ..
+            })
+            | Ok(StashWriteOutcome::Reconciled {
+                ok: false, message, ..
+            }) => (message, false, entry_on_failure),
+            // Lost and unrecoverable: the one arm that may not claim an
+            // outcome. `complete` is false NOT because it failed — nobody
+            // knows — but because a view must never style this as done.
+            Ok(StashWriteOutcome::Unknown { why }) => {
+                let (hint, entry) = unknown;
+                (format!("{hint}\n\n{why}"), false, entry)
+            }
+        };
+        StashNotice {
+            headline,
+            complete,
+            tree: None,
+            entry_retained,
+            conflicted: Vec::new(),
+            unreadable: Vec::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2460,5 +2623,447 @@ mod tests {
             DropOutcome::from_write(Ok(W::Unknown { why: msg("lost") })),
             DropOutcome::Unknown(msg("lost"))
         );
+    }
+
+    // ── #612: the two invariants that moved here to be provable ─────────────
+    //
+    // `StashNotice` and `DrawerBusy` spent their whole life in the wasm-only
+    // `signals.rs`, so #515's "a lost reply may never claim an outcome" and
+    // #518's "key on the OID, never the selector" were held by review and by
+    // nothing a test runner ever executed. Both were found by a reader; the
+    // tests below are what would have found them instead.
+
+    /// Every wire outcome one stash write can produce, plus the local refusal
+    /// that never left the device.
+    ///
+    /// Hand-written for the same reason [`every_verdict`] is: a list built by
+    /// calling the code under test would let a new variant in unexamined, and
+    /// a new variant is exactly when "may this claim an outcome?" needs asking
+    /// again. The census in
+    /// `a_lost_write_reply_is_the_one_outcome_that_may_not_claim_completion`
+    /// is an exhaustive match, so the next variant is a compile error there
+    /// and a missing entry HERE is a red assertion that names it.
+    fn every_write_outcome() -> Vec<Result<StashWriteOutcome, String>> {
+        vec![
+            Err("you are offline, so nothing was sent".to_string()),
+            Ok(StashWriteOutcome::Answered {
+                ok: true,
+                message: "ignored on the success path".to_string(),
+                operation: None,
+            }),
+            Ok(StashWriteOutcome::Answered {
+                ok: false,
+                message: "HTTP 409: the stash list moved".to_string(),
+                operation: None,
+            }),
+            Ok(StashWriteOutcome::Reconciled {
+                ok: true,
+                message: "ignored on the success path".to_string(),
+                operation: None,
+            }),
+            Ok(StashWriteOutcome::Reconciled {
+                ok: false,
+                message: "HTTP 409: the stash list moved".to_string(),
+                operation: None,
+            }),
+            Ok(StashWriteOutcome::Unknown {
+                why: "both attempts were lost and the record never admitted the operation"
+                    .to_string(),
+            }),
+        ]
+    }
+
+    /// Build a notice with three *distinguishable* entry answers, so an arm
+    /// that reads the wrong parameter cannot pass by coincidence.
+    ///
+    /// `Some(true)` on success, `Some(false)` on failure, `None` on the lost
+    /// reply: no two are equal, so each assertion below pins one specific arm
+    /// rather than "some arm returned something plausible". Passing the same
+    /// value twice is how this test would quietly stop testing anything.
+    fn notice_with_marked_arms(sent: Result<StashWriteOutcome, String>) -> StashNotice {
+        StashNotice::from_write(
+            sent,
+            "Dropped the stash.",
+            Some(true),
+            Some(false),
+            ("The reply was lost and could not be recovered.", None),
+        )
+    }
+
+    /// #515, the write axis: **exactly one class of outcome may set
+    /// `complete`**, and a lost-and-unrecoverable reply is not it.
+    ///
+    /// `complete` is what a view scales its styling on — a green tick, a
+    /// dismissed drawer, a row struck through. Setting it on
+    /// `StashWriteOutcome::Unknown` would style "nobody knows" as "it worked",
+    /// which is the whole of what #515 removed.
+    #[test]
+    fn a_lost_write_reply_is_the_one_outcome_that_may_not_claim_completion() {
+        let all = every_write_outcome();
+
+        // The census, in this module's established shape: one tick per entry
+        // the list must carry. A new `StashWriteOutcome` variant cannot
+        // compile until it gets an arm here, and that arm has nothing honest
+        // to do except tick a new box the loop below then demands.
+        #[derive(Default)]
+        struct Census {
+            local_refusal: bool,
+            answered_ok: bool,
+            answered_refusal: bool,
+            reconciled_ok: bool,
+            reconciled_refusal: bool,
+            lost_and_unrecoverable: bool,
+        }
+        let mut seen = Census::default();
+        for sent in &all {
+            match sent {
+                Err(_) => seen.local_refusal = true,
+                Ok(StashWriteOutcome::Answered { ok: true, .. }) => seen.answered_ok = true,
+                Ok(StashWriteOutcome::Answered { ok: false, .. }) => seen.answered_refusal = true,
+                Ok(StashWriteOutcome::Reconciled { ok: true, .. }) => seen.reconciled_ok = true,
+                Ok(StashWriteOutcome::Reconciled { ok: false, .. }) => {
+                    seen.reconciled_refusal = true
+                }
+                Ok(StashWriteOutcome::Unknown { .. }) => seen.lost_and_unrecoverable = true,
+            }
+        }
+        for (ticked, entry) in [
+            (seen.local_refusal, "a local refusal"),
+            (seen.answered_ok, "Answered { ok: true }"),
+            (seen.answered_refusal, "Answered { ok: false }"),
+            (seen.reconciled_ok, "Reconciled { ok: true }"),
+            (seen.reconciled_refusal, "Reconciled { ok: false }"),
+            (seen.lost_and_unrecoverable, "Unknown"),
+        ] {
+            assert!(ticked, "every_write_outcome is missing {entry}");
+        }
+
+        // Named per outcome so a failure says WHICH one started claiming
+        // completion, not merely that the count moved.
+        let complete: Vec<bool> = all
+            .iter()
+            .map(|sent| notice_with_marked_arms(sent.clone()).complete)
+            .collect();
+        assert_eq!(
+            complete,
+            vec![false, true, false, true, false, false],
+            "expected completion only on the two answered-success outcomes; got {complete:?} \
+             over {all:?}"
+        );
+    }
+
+    /// #515, stated on the field a user actually acts on: a lost reply takes
+    /// its entry answer from the `unknown` arm **alone**.
+    ///
+    /// `entry_retained` drives whether the drawer keeps showing the row. The
+    /// three inputs are deliberately unequal (see
+    /// [`notice_with_marked_arms`]), so an arm wired to `entry_on_success` or
+    /// `entry_on_failure` instead of the `unknown` tuple fails here rather
+    /// than passing on a value that happened to match.
+    #[test]
+    fn a_lost_write_reply_takes_its_entry_answer_from_the_unknown_arm_alone() {
+        let lost = notice_with_marked_arms(Ok(StashWriteOutcome::Unknown {
+            why: "both attempts were lost".to_string(),
+        }));
+        assert_eq!(
+            lost.entry_retained, None,
+            "a lost reply must report the entry's fate as unobserved, never as \
+             either of the answers the caller supplied for outcomes that WERE observed"
+        );
+        assert!(!lost.complete);
+
+        // The other two arms, so the test above cannot pass by returning
+        // `None` unconditionally — which would be its own #515-shaped lie,
+        // pointing the other way.
+        assert_eq!(
+            notice_with_marked_arms(Ok(StashWriteOutcome::Answered {
+                ok: true,
+                message: "unused".to_string(),
+                operation: None,
+            }))
+            .entry_retained,
+            Some(true),
+            "a confirmed success must report the fate the caller stated for it"
+        );
+        assert_eq!(
+            notice_with_marked_arms(Err("you are offline".to_string())).entry_retained,
+            Some(false),
+            "a local refusal never left the device, so the failure answer applies"
+        );
+    }
+
+    /// The transport detail survives into the headline, under the caller's
+    /// hint rather than replacing it.
+    ///
+    /// Both halves matter and each has failed separately elsewhere in this
+    /// drawer: the hint is the actionable sentence ("reload before retrying")
+    /// and `why` is the evidence. A notice carrying only one of them either
+    /// tells the user nothing to do or gives them no reason to believe it.
+    #[test]
+    fn a_lost_reply_reports_both_what_to_do_and_what_went_wrong() {
+        let notice = StashNotice::from_write(
+            Ok(StashWriteOutcome::Unknown {
+                why: "the operation record was still running past the budget".to_string(),
+            }),
+            "Dropped the stash.",
+            Some(false),
+            Some(true),
+            ("Reload the drawer before retrying.", None),
+        );
+        assert!(
+            notice
+                .headline
+                .contains("Reload the drawer before retrying."),
+            "the caller's hint is missing: {:?}",
+            notice.headline
+        );
+        assert!(
+            notice
+                .headline
+                .contains("the operation record was still running past the budget"),
+            "the transport detail is missing: {:?}",
+            notice.headline
+        );
+        assert!(
+            !notice.headline.contains("Dropped the stash."),
+            "a lost reply must not carry the success line: {:?}",
+            notice.headline
+        );
+    }
+
+    /// The simple writes say nothing structural about the tree — only a
+    /// composed pop does (see [`StashNotice::from_pop`]).
+    ///
+    /// Pinned because `tree: None` is easy to "improve" into a guess, and a
+    /// guess here is a claim about the user's files.
+    #[test]
+    fn a_simple_write_never_describes_the_working_tree() {
+        for sent in every_write_outcome() {
+            let notice = notice_with_marked_arms(sent.clone());
+            assert_eq!(
+                notice.tree, None,
+                "a simple write described the tree for {sent:?}"
+            );
+            assert!(notice.conflicted.is_empty());
+            assert!(notice.unreadable.is_empty());
+        }
+    }
+
+    /// #515 on the pop path: the notice may not claim more than the gate did.
+    ///
+    /// The expectations are written out by hand rather than read back from
+    /// [`PopVerdict::is_complete`] and [`PopVerdict::entry_retained`] — a test
+    /// that asked the mechanism what the mechanism decided would pass over any
+    /// mapping at all, including one that answered both questions wrongly and
+    /// consistently.
+    #[test]
+    fn a_pop_notice_claims_exactly_what_its_verdict_established() {
+        for verdict in every_verdict() {
+            // Hand-stated, exhaustive: a new variant is a compile error here
+            // and must be argued rather than defaulted.
+            let (want_complete, want_retained, want_tree) = match &verdict {
+                PopVerdict::Popped => (true, Some(false), TreeState::Changed),
+                PopVerdict::ApplyRefused { .. } => (false, Some(true), TreeState::Unknown),
+                PopVerdict::Conflicted { .. } => (false, Some(true), TreeState::Changed),
+                PopVerdict::AppliedUnverified { .. } => (false, Some(true), TreeState::Changed),
+                PopVerdict::RefusedUnverified { .. } => (false, Some(true), TreeState::Unknown),
+                PopVerdict::AppliedNotDropped { .. } => (false, Some(true), TreeState::Changed),
+                // The two lost-reply verdicts. An apply never consumes the
+                // entry whether it ran or not, so ApplyUnknown can still say
+                // Some(true) honestly; a lost DROP reply leaves the entry's
+                // fate genuinely unobserved, and that is the one that must
+                // stay None.
+                PopVerdict::ApplyUnknown { .. } => (false, Some(true), TreeState::Unknown),
+                PopVerdict::DropUnknown { .. } => (false, None, TreeState::Changed),
+            };
+
+            let notice = StashNotice::from_pop(&verdict);
+            assert_eq!(
+                notice.complete, want_complete,
+                "wrong completion claim for {verdict:?}"
+            );
+            assert_eq!(
+                notice.entry_retained, want_retained,
+                "wrong entry-fate claim for {verdict:?}"
+            );
+            assert_eq!(
+                notice.tree,
+                Some(want_tree),
+                "wrong tree claim for {verdict:?}"
+            );
+            assert_eq!(
+                notice.conflicted,
+                verdict.conflicted_paths().to_vec(),
+                "the notice dropped or invented conflicted paths for {verdict:?}"
+            );
+        }
+    }
+
+    /// #518: the busy map is per entry, so a write finishing on one row does
+    /// not unlock a write still in flight on another.
+    ///
+    /// The failure this pins is not hypothetical — a single overwriteable slot
+    /// is what shipped first: start an apply on one entry, start a drop on
+    /// another, and the drop's completion re-enabled every control including
+    /// the row still mid-apply.
+    #[test]
+    fn a_write_finishing_on_one_entry_leaves_the_others_locked() {
+        // Two real stash commit OIDs, distinct.
+        let first = "1c2f0e0a1b2c3d4e5f60718293a4b5c6d7e8f900";
+        let second = "9f8e7d6c5b4a39281706f5e4d3c2b1a099887766";
+
+        let mut busy = DrawerBusy::default();
+        busy.begin(first, "applying");
+        busy.begin(second, "dropping");
+
+        // A second `begin` must not relabel or displace the first.
+        assert_eq!(busy.label(first), Some("applying"));
+        assert_eq!(busy.label(second), Some("dropping"));
+
+        busy.finish(second);
+        assert!(
+            busy.locked(first),
+            "finishing the drop unlocked the row still mid-apply"
+        );
+        assert_eq!(
+            busy.label(first),
+            Some("applying"),
+            "the surviving row lost its own label"
+        );
+        assert!(!busy.locked(second));
+        assert_eq!(busy.label(second), None);
+
+        busy.finish(first);
+        assert!(!busy.locked(first));
+        assert_eq!(busy, DrawerBusy::default(), "the map did not drain");
+    }
+
+    /// #518's sentinel: the push control's key cannot be mistaken for a row.
+    ///
+    /// The bug this replaced was `""`, which matched no row — so a push in
+    /// flight left every control live, its own button included, and a second
+    /// tap stashed the already-stashed tree again. The replacement is only
+    /// safe while it cannot collide with a real key, and real keys are commit
+    /// OIDs, which are hex.
+    #[test]
+    fn the_push_key_can_never_collide_with_a_stash_entry() {
+        assert!(
+            !PUSH_KEY.is_empty(),
+            "an empty key matches no row, which is the defect this sentinel replaced"
+        );
+        assert!(
+            !PUSH_KEY.chars().all(|c| c.is_ascii_hexdigit()),
+            "PUSH_KEY {PUSH_KEY:?} is hex-shaped and could collide with a commit OID"
+        );
+
+        let oid = "1c2f0e0a1b2c3d4e5f60718293a4b5c6d7e8f900";
+        let mut busy = DrawerBusy::default();
+        busy.begin(PUSH_KEY, "stashing");
+        assert!(busy.locked(PUSH_KEY));
+        assert!(
+            !busy.locked(oid),
+            "a push in flight locked an unrelated row"
+        );
+
+        busy.begin(oid, "applying");
+        busy.finish(oid);
+        assert!(
+            busy.locked(PUSH_KEY),
+            "finishing a row released the push, whose second tap stashes twice"
+        );
+    }
+
+    /// #518's other half, which lives at the call site: the view keys the busy
+    /// map on the entry's **OID**, never on its selector.
+    ///
+    /// `stash@{N}` is a position and positions renumber on every drop, so a
+    /// selector-keyed lock follows whichever entry the list now shows at that
+    /// index — the wrong row locked, the working row free. Nothing in
+    /// [`DrawerBusy`] can catch that: the map takes an opaque `&str` and both
+    /// spellings type-check.
+    ///
+    /// So this is a text census over `view.rs`, the same posture as
+    /// `crate::offline_guard_audit` and for the same reason — `view.rs` is
+    /// `#[cfg(target_arch = "wasm32")]`, no test runner in this repo executes
+    /// it, and `include_str!` is what lets a host test read it at all (and
+    /// makes Cargo re-run this test when it changes).
+    ///
+    /// What it proves: every busy-map call in `view.rs` passes a key naming an
+    /// OID or the push sentinel. What it does NOT prove: that the variable
+    /// spelled `oid` holds one — only that the selector, which provably is not
+    /// one, is never handed over.
+    #[test]
+    fn the_view_keys_the_busy_map_on_the_oid_and_never_on_the_selector() {
+        const VIEW: &str = include_str!("view.rs");
+        // Below this, the census has lost the call sites and proves nothing.
+        // Today’s count is 13; the floor allows a row to be removed without
+        // failing, but not the census to go vacuous.
+        const MIN_EXPECTED_CALLS: usize = 10;
+
+        let code = strip_line_comments(VIEW);
+        let mut checked = 0usize;
+        for name in ["begin", "finish", "locked", "label"] {
+            let needle = format!(".{name}(");
+            let mut from = 0usize;
+            while let Some(hit) = code[from..].find(&needle) {
+                let open = from + hit + needle.len();
+                let arg = first_argument(&code[open..]);
+                from = open;
+                // `action.label()` and friends take no argument and are a
+                // different method entirely; only keyed calls are in scope.
+                if arg.trim().is_empty() {
+                    continue;
+                }
+                checked += 1;
+                assert!(
+                    !arg.contains("selector"),
+                    "view.rs passes a selector as a busy key: `.{name}({arg})` — selectors \
+                     renumber on every drop, so this lock would follow the wrong entry (#518)"
+                );
+                assert!(
+                    arg.contains("oid") || arg.contains("PUSH_KEY"),
+                    "view.rs passes an unrecognised busy key: `.{name}({arg})` — the key must \
+                     name the entry's commit OID, or PUSH_KEY for the control that has no \
+                     entry (#518)"
+                );
+            }
+        }
+        assert!(
+            checked >= MIN_EXPECTED_CALLS,
+            "the busy-key census found only {checked} keyed calls in view.rs (expected at \
+             least {MIN_EXPECTED_CALLS}) — the drawer was rewired and this test is now \
+             vacuous rather than passing"
+        );
+    }
+
+    /// Drop `//`-comments so a call site quoted in prose is not censused as
+    /// code. Block comments are not stripped, matching every other census in
+    /// this repo; `view.rs` uses none.
+    fn strip_line_comments(code: &str) -> String {
+        code.lines()
+            .map(|line| match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The first argument of a call, given the text just after its `(`.
+    ///
+    /// Depth-aware so a nested call (`.locked(&make_key(oid))`) is returned
+    /// whole rather than cut at its inner comma.
+    fn first_argument(after_open_paren: &str) -> &str {
+        let mut depth = 0usize;
+        for (i, ch) in after_open_paren.char_indices() {
+            match ch {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' if depth == 0 => return &after_open_paren[..i],
+                ')' | ']' | '}' => depth -= 1,
+                ',' if depth == 0 => return &after_open_paren[..i],
+                _ => {}
+            }
+        }
+        after_open_paren
     }
 }

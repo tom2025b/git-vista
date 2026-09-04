@@ -21,8 +21,12 @@ use git_vista_protocol::DropContext;
 use crate::api;
 use crate::features::stash::core::{
     self as core, ApplyOutcome, ConflictScan, DropGate, DropOutcome, PopVerdict, StashWriteOutcome,
-    TreeState,
 };
+// #612: `PUSH_KEY`, `DrawerBusy` and `StashNotice` are decisions, not markup,
+// and now live in `core` where a host test can reach them. Re-exported rather
+// than repointed at every call site: `view.rs` imports all three from here and
+// the names it writes are unchanged, so the move is provably behaviour-free.
+pub use crate::features::stash::core::{DrawerBusy, StashNotice, PUSH_KEY};
 
 /// Run a pop as apply-then-drop, returning what actually happened.
 ///
@@ -96,52 +100,6 @@ pub async fn compose_pop(entry: &str, expected_oid: &str, key: IdempotencyKey) -
     }
 }
 
-/// The busy key for the push control, which has no stash entry of its own.
-///
-/// A reserved sentinel rather than `""`: an empty string silently matches no
-/// row, so a push in flight left every control enabled — including its own
-/// button, where a second tap would stash the already-stashed tree again. The
-/// value cannot collide with a real key: rows key on the entry's commit OID,
-/// which is hex, and this is not.
-pub const PUSH_KEY: &str = "\u{0}push";
-
-/// What the drawer is currently doing, so a view can disable controls and say
-/// why without inventing its own notion of "busy".
-///
-/// One entry per stash entry with a write in flight, not one overwriteable
-/// slot (#518): the drawer lists many entries and writes overlap — start an
-/// apply on one row and then a drop on another, and a single slot would
-/// re-enable the first row mid-flight, then let whichever write finished
-/// first unlock everything.
-///
-/// # Keys are the entry's commit OID, never its selector
-///
-/// `stash@{N}` is a *position*, and positions renumber on every drop: an
-/// apply in flight on `stash@{1}` while a drop on `stash@{0}` completes
-/// would leave a selector-keyed lock pointing at whichever entry the list
-/// now shows at `{1}` — the wrong row locked, the working row free. The
-/// commit OID names the entry itself, which no renumbering moves. (Found by
-/// the #518 review pass, both reviewers independently.) [`PUSH_KEY`] is the
-/// one non-OID key, for the control with no entry.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct DrawerBusy {
-    working: std::collections::HashMap<String, &'static str>,
-}
-
-impl DrawerBusy {
-    /// Whether this entry specifically is mid-write. `key` is the entry's
-    /// commit OID (or [`PUSH_KEY`]) — see the type doc for why never a
-    /// selector.
-    pub fn locked(&self, key: &str) -> bool {
-        self.working.contains_key(key)
-    }
-
-    /// The label to show on the row that is working.
-    pub fn label(&self, key: &str) -> Option<&'static str> {
-        self.working.get(key).copied()
-    }
-}
-
 /// The drawer's own signals, created once by the Activity panel.
 #[derive(Clone, Copy)]
 pub struct StashDrawer {
@@ -153,96 +111,6 @@ pub struct StashDrawer {
     inspecting: RwSignal<Option<String>>,
     /// The last thing that happened, as a finished user-facing line.
     notice: RwSignal<Option<StashNotice>>,
-}
-
-/// A finished, user-facing outcome line plus the conflicted paths it carries.
-///
-/// The paths ride along so the view can offer a route into the shared conflict
-/// workflow (A3) rather than rendering a stash-shaped conflict UI of its own.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StashNotice {
-    pub headline: String,
-    /// True only when the operation genuinely finished. A view must scale its
-    /// styling on this and never on "the request returned".
-    pub complete: bool,
-    /// What is true of the user's working tree, carried structurally rather
-    /// than left only inside [`Self::headline`]'s prose. A user whose pop
-    /// "failed" still needs to know their files moved — and after a refused
-    /// apply with an unreadable tree, that it could not be established.
-    pub tree: Option<TreeState>,
-    /// Whether the stash entry this action targeted is still in the drawer —
-    /// `None` when this client has no way to know (a lost reply whose record
-    /// could not settle it, #515), or when the action has no target entry
-    /// (push). A `bool` here forced a guess, and the guess shipped as fact.
-    pub entry_retained: Option<bool>,
-    pub conflicted: Vec<String>,
-    pub unreadable: Vec<String>,
-}
-
-impl StashNotice {
-    /// Build the notice for a composed pop. Every field comes from the
-    /// verdict's own accessors, so the view cannot disagree with the gate about
-    /// whether the pop finished.
-    pub fn from_pop(verdict: &PopVerdict) -> Self {
-        StashNotice {
-            headline: verdict.headline(),
-            complete: verdict.is_complete(),
-            tree: Some(verdict.tree()),
-            entry_retained: verdict.entry_retained(),
-            conflicted: verdict.conflicted_paths().to_vec(),
-            unreadable: verdict.unreadable_paths().to_vec(),
-        }
-    }
-
-    /// A notice for the simple writes, honest about lost replies (#515).
-    ///
-    /// The caller states the entry's fate PER OUTCOME, because the truth
-    /// differs per action: a successful drop removed the entry
-    /// (`Some(false)`), a successful apply kept it (`Some(true)`), a push
-    /// has no target entry at all (`None`) — and an unrecoverable lost reply
-    /// is `None` for every action whose success would have changed the
-    /// drawer, because a value here is a claim the user acts on.
-    ///
-    /// `tree` stays `None` throughout: the simple writes say their effect in
-    /// prose, and only a composed pop has an effect the prose cannot fully
-    /// carry (see [`Self::from_pop`]).
-    pub fn from_write(
-        sent: Result<StashWriteOutcome, String>,
-        done: &str,
-        entry_on_success: Option<bool>,
-        entry_on_failure: Option<bool>,
-        unknown: (&str, Option<bool>),
-    ) -> Self {
-        let (headline, complete, entry_retained) = match sent {
-            // A local refusal never left the device, so nothing changed.
-            Err(local) => (local, false, entry_on_failure),
-            Ok(StashWriteOutcome::Answered { ok: true, .. })
-            | Ok(StashWriteOutcome::Reconciled { ok: true, .. }) => {
-                (done.to_string(), true, entry_on_success)
-            }
-            Ok(StashWriteOutcome::Answered {
-                ok: false, message, ..
-            })
-            | Ok(StashWriteOutcome::Reconciled {
-                ok: false, message, ..
-            }) => (message, false, entry_on_failure),
-            // Lost and unrecoverable: the one arm that may not claim an
-            // outcome. `complete` is false NOT because it failed — nobody
-            // knows — but because a view must never style this as done.
-            Ok(StashWriteOutcome::Unknown { why }) => {
-                let (hint, entry) = unknown;
-                (format!("{hint}\n\n{why}"), false, entry)
-            }
-        };
-        StashNotice {
-            headline,
-            complete,
-            tree: None,
-            entry_retained,
-            conflicted: Vec::new(),
-            unreadable: Vec::new(),
-        }
-    }
 }
 
 impl StashDrawer {
@@ -287,23 +155,18 @@ impl StashDrawer {
         });
     }
 
-    /// Mark this entry mid-write. `key` is the entry's commit OID (or
-    /// [`PUSH_KEY`]); inserts into the per-entry map rather than replacing a
-    /// single slot, so an overlapping write on another row neither relabels
-    /// nor re-enables this one (#518).
+    /// Mark this entry mid-write, through [`DrawerBusy::begin`] — which owns
+    /// the per-entry rule (#518) and is host-tested there.
     pub fn begin(&self, key: &str, what: &'static str) {
-        self.busy.update(|busy| {
-            busy.working.insert(key.to_string(), what);
-        });
+        self.busy.update(|busy| busy.begin(key, what));
     }
 
-    /// Release this entry only. Takes the key for the same reason `begin`
-    /// does: an unconditional "everything idle" let whichever of two
-    /// overlapping writes finished first unlock the one still in flight.
+    /// Release this entry only, through [`DrawerBusy::finish`]. Same reason
+    /// the key is required: an unconditional "everything idle" let whichever
+    /// of two overlapping writes finished first unlock the one still in
+    /// flight (#518).
     pub fn finish(&self, key: &str) {
-        self.busy.update(|busy| {
-            busy.working.remove(key);
-        });
+        self.busy.update(|busy| busy.finish(key));
     }
 }
 
