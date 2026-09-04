@@ -664,6 +664,12 @@ fn api_router(
             )
             // iPad-testing follow-up: switch HEAD to a branch (`git checkout`).
             .route("/api/checkout", post(checkout_branch))
+            // M11.04 (#549), ADR 0118: open a second desk. `full_routes` only,
+            // like every other write here. It creates a directory under a root
+            // this application owns — the request names the desk, never its
+            // location, so there is no path in the body for a traversal to
+            // hide in.
+            .route("/api/add-worktree", post(handlers::branch::add_worktree))
             // Issue #33 follow-up: force-delete an unmerged branch (`git branch -D`),
             // offered only after the safe `-d` above is refused; and rebase the
             // checked-out branch onto main (`git rebase`).

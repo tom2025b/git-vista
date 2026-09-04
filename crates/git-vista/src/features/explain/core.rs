@@ -954,4 +954,92 @@ mod tests {
             );
         }
     }
+
+    /// M11.04 (#549): Explain Mode has its sentences for `AddWorktree` — and
+    /// it has them **without a single new arm**, which is the claim this test
+    /// exists to check rather than assert.
+    ///
+    /// The operation introduces no new fact kind: its preconditions are
+    /// `BranchNotCheckedOut`, `BranchFreeInEveryOtherWorktree` and
+    /// `RefExists`, all of which already had sentences, and its effects are
+    /// `Untouched`/`Untouched`/`Local`. So "Explain Mode is covered" is a
+    /// statement about composition, and the way to check a composition is to
+    /// build the real thing and read every line of it.
+    ///
+    /// Without this, the coverage claim would rest on the absence of a
+    /// compiler error — which proves the arms exist, never that the panel a
+    /// user opens says anything.
+    #[test]
+    fn an_add_worktree_plan_explains_itself_with_no_new_sentence() {
+        let plan = git_vista_protocol::Plan {
+            repository: git_vista_protocol::RepositoryToken::new("r").unwrap(),
+            worktree: git_vista_protocol::WorktreeToken::new("w").unwrap(),
+            generation: git_vista_protocol::GenerationToken::new("g").unwrap(),
+            operation: git_vista_protocol::GitOperation::AddWorktree {
+                name: git_vista_protocol::WorktreeName::new("review-549").unwrap(),
+                branch: branch("feature/x"),
+            },
+            operation_hash: git_vista_protocol::OperationHash::new("0".repeat(64)).unwrap(),
+            issued_at: git_vista_protocol::UnixSeconds(0),
+            expires_at: git_vista_protocol::UnixSeconds(1),
+            risk: RiskLevel::Safe,
+            preconditions: vec![
+                Precondition::BranchNotCheckedOut {
+                    branch: branch("feature/x"),
+                },
+                Precondition::BranchFreeInEveryOtherWorktree {
+                    branch: branch("feature/x"),
+                },
+            ],
+            expected_ref_changes: Vec::new(),
+            recovery: RecoveryStrategy::NotNeeded,
+            advisories: Vec::new(),
+        };
+
+        let sections = render(&git_vista_protocol::explain(&plan));
+        assert!(!sections.is_empty(), "the explanation rendered no sections");
+
+        // Every line that exists is a finished sentence, and every section
+        // that has none still says what it means — the `when_empty` rule ADR
+        // 0091 decision 5 fixed, which matters more here than usual because
+        // this operation's ref-change section is legitimately empty.
+        for section in &sections {
+            for line in &section.lines {
+                let text = line.text.trim();
+                assert!(
+                    !text.is_empty(),
+                    "{:?} rendered an empty line",
+                    section.topic
+                );
+                assert!(
+                    text.len() > 12 && text.ends_with('.'),
+                    "{:?} rendered {text:?} — not a finished sentence",
+                    section.topic
+                );
+            }
+            assert!(
+                !section.when_empty.trim().is_empty(),
+                "{:?} has no words for the empty case",
+                section.topic
+            );
+        }
+
+        // And the two halves of git's rule both reach the panel. A user
+        // reading this needs to know a second desk on the branch they are
+        // standing on is refused too — the case the other precondition
+        // deliberately does not cover.
+        let all: String = sections
+            .iter()
+            .flat_map(|s| s.lines.iter().map(|l| l.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all.contains("OTHER worktree"),
+            "the other-worktrees rule is not explained:\n{all}"
+        );
+        assert!(
+            all.contains("OTHER than the one you currently have checked out"),
+            "the this-worktree half is not explained:\n{all}"
+        );
+    }
 }

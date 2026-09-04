@@ -730,6 +730,57 @@ pub(crate) fn clones_root() -> PathBuf {
 /// read or write process env — the same pattern as `parse_bind_addr`. Empty
 /// values count as unset (a systemd unit with `Environment=X=` must not send
 /// clones to `/git-vista/clones`).
+/// The managed root every worktree this app creates lives under (M11.04,
+/// #549, ADR 0118): `GIT_VISTA_WORKTREES_ROOT` override, else
+/// `$XDG_DATA_HOME/git-vista/worktrees`, else
+/// `~/.local/share/git-vista/worktrees`.
+///
+/// The exact shape of [`clones_root`], and deliberately so — it is the same
+/// kind of thing (a directory this application owns, creates, and serves from)
+/// and ADR 0008 already argued where such a directory belongs. Sharing the
+/// resolver rather than the location keeps the two from ever nesting inside
+/// one another, which would make `delete_clone`'s "canonicalizes inside the
+/// clones root" guard start matching worktrees.
+///
+/// # Why a managed root rather than a sibling directory
+///
+/// ADR 0118, answering the spec's open question 2. A managed root is inside
+/// the fence **by construction**: it is admitted to the allowed roots once, at
+/// startup, so every child of it is servable without any per-path check. A
+/// sibling-directory convention would need containment re-checked at every
+/// site that picks a path, and "checked every time" is a rule that holds until
+/// one code path forgets.
+pub(crate) fn worktrees_root() -> PathBuf {
+    resolve_managed_root(
+        std::env::var_os("GIT_VISTA_WORKTREES_ROOT").map(PathBuf::from),
+        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+        "worktrees",
+    )
+}
+
+/// The shared resolver behind [`clones_root`] and [`worktrees_root`]: an
+/// explicit override, else XDG, else `~/.local/share`, else a temp fallback —
+/// with `leaf` naming which managed directory is wanted.
+fn resolve_managed_root(
+    override_root: Option<PathBuf>,
+    xdg_data_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+    leaf: &str,
+) -> PathBuf {
+    if let Some(root) = override_root.filter(|p| !p.as_os_str().is_empty()) {
+        return root;
+    }
+    let base = xdg_data_home
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| {
+            home.filter(|p| !p.as_os_str().is_empty())
+                .map(|h| h.join(".local/share"))
+        })
+        .unwrap_or_else(|| std::env::temp_dir().join("git-vista-data"));
+    base.join("git-vista").join(leaf)
+}
+
 fn resolve_clones_root(
     override_root: Option<PathBuf>,
     xdg_data_home: Option<PathBuf>,

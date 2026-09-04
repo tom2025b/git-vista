@@ -117,6 +117,15 @@ impl GitOperation {
             // Ref-only work. A branch, a tag, or a remote round trip moves
             // pointers and objects; no file in the working tree is opened.
             GitOperation::CreateBranch { .. } => WorktreeEffect::Untouched,
+            // M11.04 (#549): `git worktree add` writes a whole working tree —
+            // but a DIFFERENT one, in a directory that did not exist a moment
+            // ago. This field is about the worktree the user is looking at,
+            // and that one is not opened, rewritten, or read. `Untouched` is
+            // the honest answer and it is not the lazy one: the tempting
+            // wrong answer is `FilesRewritten`, from reasoning about "does
+            // this operation write files anywhere" rather than about the
+            // question the field actually asks.
+            GitOperation::AddWorktree { .. } => WorktreeEffect::Untouched,
             GitOperation::DeleteBranch { .. } => WorktreeEffect::Untouched,
             GitOperation::ForceDeleteBranch { .. } => WorktreeEffect::Untouched,
             // Recreating a deleted branch's ref at its old tip. The undo for
@@ -217,6 +226,11 @@ impl GitOperation {
         match self {
             // Ref-only and remote-only work.
             GitOperation::CreateBranch { .. } => IndexEffect::Untouched,
+            // M11.04 (#549). The new desk gets an index of its own, freshly
+            // written; this repository's index is not read or changed. Same
+            // reasoning as the worktree arm above — the field asks about the
+            // tree the user is in.
+            GitOperation::AddWorktree { .. } => IndexEffect::Untouched,
             GitOperation::DeleteBranch { .. } => IndexEffect::Untouched,
             GitOperation::ForceDeleteBranch { .. } => IndexEffect::Untouched,
             GitOperation::RestoreBranch { .. } => IndexEffect::Untouched,
@@ -407,6 +421,12 @@ pub fn network_need_for_operation(op: &GitOperation) -> NetworkNeed {
         // database, so this asks a remote nothing either.
         GitOperation::ResolveConflictContent { .. } => NetworkNeed::Local,
         GitOperation::CreateBranch { .. } => NetworkNeed::Local,
+        // M11.04 (#549): `git worktree add` writes a directory and a metadata
+        // file under the repository's own administrative area. It resolves an
+        // existing local branch and opens no socket, so it stays on the
+        // stricter tier — which is also the fail-closed side this match's
+        // header names as the tie-break.
+        GitOperation::AddWorktree { .. } => NetworkNeed::Local,
         GitOperation::CommitOnHead { .. } => NetworkNeed::Local,
         GitOperation::EmptyCommitOnBranch { .. } => NetworkNeed::Local,
         GitOperation::StageAll => NetworkNeed::Local,

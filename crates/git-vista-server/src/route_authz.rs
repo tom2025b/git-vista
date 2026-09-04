@@ -222,6 +222,12 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
         Authz::SessionAndCsrf,
     ),
     ("/api/checkout", Method::POST, Authz::SessionAndCsrf),
+    // M11.04 (#549): creates a directory under the app's managed worktrees
+    // root and runs `git worktree add`. A git write, so the full write
+    // posture. It is also the only route that creates a directory outside the
+    // clones root, which is why its spawn carries an explicit extra grant —
+    // see `git_cmd::sandboxed_with_grant`.
+    ("/api/add-worktree", Method::POST, Authz::SessionAndCsrf),
     (
         "/api/force-delete-branch",
         Method::POST,
@@ -315,7 +321,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// dropped by a `main.rs` refactor that this scanner's pattern-matching
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
-const EXPECTED_ROUTE_COUNT: usize = 70;
+const EXPECTED_ROUTE_COUNT: usize = 71;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in
