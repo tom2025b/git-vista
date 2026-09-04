@@ -255,6 +255,8 @@ export async function openDrawer(page) {
 export const PREVIEW_BRANCH = 'feature'
 /** The branch it would be merged into — the one that fixture checks out. */
 export const PREVIEW_INTO = 'main'
+/** The repository label its accepted history Frame renders above the graph. */
+const PREVIEW_REPO = 'merge-preview-repo'
 
 /**
  * Open the merge-preview repo in FULL mode.
@@ -279,6 +281,13 @@ export async function openMergePreviewRepo(page) {
     await full.click()
   }
   await expect(page.getByRole('region', { name: 'Commit history graph' })).toBeVisible()
+  // A node alone is not readiness: the previous repository's graph remains
+  // attached briefly while `/api/select` settles and the new history epoch
+  // starts. The repo line is rendered from the accepted Frame in the same
+  // Ready arm that mounts its graph, so it identifies whose nodes follow.
+  await expect(page.locator('p.status.repo')).toContainText(PREVIEW_REPO, {
+    timeout: 20_000,
+  })
   await expect(page.locator('circle.node-hit').first()).toBeAttached()
 }
 
