@@ -6,15 +6,26 @@
 //! deliberately staged the way `conflicts.rs` (M4.31, #84) and the tag
 //! contract (M2.21a, #235) were staged before it: the read primitive and its
 //! wire type land and are reviewed first, with no route yet exposing them —
-//! this issue is scoped to the query, not the UI (M11.03) or the
-//! checkout-collision precondition the spec's §2 designs next. Nothing here
-//! is called from a handler yet; [`worktree_census`] itself carries
-//! `#[allow(dead_code)]` outside tests for exactly that reason — on the
-//! function only, not the `mod worktree_census;` declaration in `main.rs`
-//! (see that declaration's own comment for why: unlike `conflicts`, which
-//! has no caller anywhere in it, everything below `worktree_census` is
-//! reached from within this module and should stay eligible for the
-//! dead-code lint).
+//! that issue was scoped to the query, not the UI (M11.03) or the
+//! checkout-collision precondition the spec's §2 designs.
+//!
+//! # Its consumers, as of M11.02 (#547)
+//!
+//! [`worktree_census`] has two callers now, and the spec's §1 requires that
+//! they be the *same* primitive rather than two derivations that can drift:
+//!
+//!  * `planner::census_for`, which puts the census into the planner's
+//!    `Observed` so
+//!    `Precondition::BranchFreeInEveryOtherWorktree` can be evaluated at plan
+//!    build **and** re-evaluated by `enforce_fresh` immediately before
+//!    executing.
+//!  * `handlers::read::worktree_list`, the `GET /api/worktrees` read the
+//!    frontend uses to decide whether to offer the checkout button at all.
+//!
+//! The decision each of them makes from the census is not made here or in
+//! either caller: `git_vista_protocol::branch_holder` is the one function
+//! that turns a census into an answer about a branch, so the path that
+//! *offers* an operation and the path that *permits* it cannot disagree.
 //!
 //! # No new sandbox tier, no new grant
 //!
@@ -100,11 +111,15 @@ const WORKTREE_LIST_STDOUT_CAP: usize = 8 * 1024 * 1024;
 /// `expose_paths`/`path_is_allowed` are the production call site's
 /// `crate::state::expose_paths()`/`&crate::state::path_is_allowed` — see the
 /// module doc for why they arrive as parameters rather than being read here.
-#[cfg_attr(not(test), allow(dead_code))]
+///
+/// The `+ Sync` on the fence is what lets this future be `Send`, which the
+/// planner's call site (M11.02, #547) needs because the whole plan pipeline
+/// runs inside a `tokio::spawn`. A bare `&dyn Fn` is neither, and the error
+/// surfaces at the spawn rather than here.
 pub(crate) async fn worktree_census(
     repo: &Path,
     expose_paths: bool,
-    path_is_allowed: &dyn Fn(&Path) -> bool,
+    path_is_allowed: &(dyn Fn(&Path) -> bool + Sync),
 ) -> WorktreeCensus {
     worktree_census_capped(
         repo,
@@ -125,7 +140,7 @@ pub(crate) async fn worktree_census(
 async fn worktree_census_capped(
     repo: &Path,
     expose_paths: bool,
-    path_is_allowed: &dyn Fn(&Path) -> bool,
+    path_is_allowed: &(dyn Fn(&Path) -> bool + Sync),
     stdout_cap: usize,
 ) -> WorktreeCensus {
     let current = match read_repo_facts(repo) {
@@ -233,7 +248,7 @@ async fn resolve_sibling(
     raw: &WorktreeListRecord,
     current: &RepoFacts,
     expose_paths: bool,
-    path_is_allowed: &dyn Fn(&Path) -> bool,
+    path_is_allowed: &(dyn Fn(&Path) -> bool + Sync),
     common_dir_cache: &mut Option<PathBuf>,
 ) -> Result<WorktreeSibling, String> {
     // `raw.path` is the string git printed; the parser (now in

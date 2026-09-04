@@ -6,7 +6,7 @@
 //! Split out of the former monolithic `api.rs`.
 
 use git_vista_protocol::operation::IdempotencyKey;
-use git_vista_protocol::{BranchRequest, CreateBranchRequest, RebaseStatus};
+use git_vista_protocol::{BranchRequest, CreateBranchRequest, RebaseStatus, WorktreeCensus};
 
 use super::{
     network_error, receipt, refuse_if_offline, refuse_if_visualize, req_get, send_write_with_key,
@@ -63,6 +63,31 @@ pub async fn fetch_rebase_status() -> Result<RebaseStatus, String> {
         .await
         .map_err(network_error)?
         .json::<RebaseStatus>()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Fetch the worktree census (`GET /api/worktrees`, M11.02 #547) — every
+/// linked worktree of this repository and the branch each one holds.
+///
+/// Read live, on the click that offers a checkout, for the same reason
+/// [`fetch_head_branch`] is: another worktree can open or close at any moment,
+/// and the graph on screen knows nothing about either.
+///
+/// A **transport or JSON failure returns `Err`**, and the caller must not
+/// turn that into an empty census. `WorktreeCensus::CensusFailed` is what the
+/// *server* says when it could not read the list; an `Err` here is what this
+/// client says when it could not reach the server. Both mean "nothing is
+/// known about any branch", and `CheckoutElsewhere::classify` is where the
+/// two become one answer — never `Ok(WorktreeCensus::Observed { siblings:
+/// vec![] })`, which would claim an observation nobody made.
+pub async fn fetch_worktree_census() -> Result<WorktreeCensus, String> {
+    let url = format!("/api/worktrees?t={}", js_sys::Date::now());
+    req_get(&url)
+        .send()
+        .await
+        .map_err(network_error)?
+        .json::<WorktreeCensus>()
         .await
         .map_err(|e| e.to_string())
 }

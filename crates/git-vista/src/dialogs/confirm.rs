@@ -12,12 +12,16 @@
 use leptos::*;
 
 use git_vista_core::activity::UndoAction;
-use git_vista_protocol::MergeStrategy;
+use git_vista_protocol::{MergeStrategy, RepoMode};
+
+use crate::api::select_request;
+use crate::features::session::signals as session_state;
 
 use crate::features::dialogs::core::preview_subject;
 use crate::features::dialogs::core::{
-    cherry_pick_confirm_prompt, delete_confirm_prompt, merge_confirm_prompt, worktree_confirm,
-    ConfirmPrompt, Dialog, PullTarget, WorktreeAction, TOUCH_TARGET_STYLE,
+    checkout_confirm_action, checkout_confirm_prompt, cherry_pick_confirm_prompt,
+    delete_confirm_prompt, merge_confirm_prompt, worktree_confirm, CheckoutAction, ConfirmPrompt,
+    Dialog, ErrorNotice, PullTarget, WorktreeAction, TOUCH_TARGET_STYLE,
 };
 use crate::features::preview::core::{preview_action, PreviewAction};
 
@@ -48,6 +52,11 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
         operations,
         shell,
         preview,
+        // M11.02 (#547): the "open that worktree instead" path selects a
+        // different worktree, which changes what every resource should be
+        // reading — the same epoch bump the picker makes after its own
+        // `/api/select`.
+        graph,
         ..
     } = features;
 
@@ -60,6 +69,42 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
         let Some(op) = shell.confirm_op_untracked() else {
             return;
         };
+        // M11.02 (#547): one dialog, two possible outcomes. When the branch a
+        // checkout names is already open at a worktree this app may serve,
+        // the confirm button says "Open Worktree" and *selects that worktree*
+        // rather than running a checkout git would certainly refuse. Which of
+        // the two it is is `checkout_confirm_action`'s decision — pure and
+        // host-tested, paired with `checkout_confirm_prompt` so the button's
+        // label and the button's effect cannot drift apart.
+        //
+        // This is a courtesy, not the enforcement: the server refuses the
+        // checkout on its own precondition whatever this file does.
+        if let PendingOp::Checkout { elsewhere, .. } = &op {
+            if let CheckoutAction::OpenWorktree { id, name } = checkout_confirm_action(elsewhere) {
+                shell.close_confirm();
+                spawn_local(async move {
+                    // The posture the session is already in, and **never an
+                    // escalation**: a refused checkout must not be a way to
+                    // acquire Active mode. An unknown mode falls back to
+                    // `Visualize`, the read-only one — the user re-picks from
+                    // the picker if they want more, which is where that
+                    // choice has always been made.
+                    let mode = session_state::ui_mode().unwrap_or(RepoMode::Visualize);
+                    match select_request(&id, mode).await {
+                        Ok(()) => graph.update(|g| {
+                            g.force_bump();
+                        }),
+                        Err(e) => shell.open_error(ErrorNotice {
+                            title: "Couldn't open that worktree",
+                            body: format!(
+                                "‘{name}’ holds the branch, but selecting it failed: {e}"
+                            ),
+                        }),
+                    }
+                });
+                return;
+            }
+        }
         shell.close_confirm();
         operations.dispatch(op);
     };
@@ -192,23 +237,16 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                         true,
                     )
                 }
-                PendingOp::Checkout { branch, current } => match current {
-                    Some(current) if current == branch => ConfirmPrompt::plain(
-                        "Checkout branch",
-                        format!("‘{branch}’ is already the branch you're on — nothing to switch."),
-                        "Checkout",
-                        false,
-                        false,
-                    ),
-                    // A different branch, or detached HEAD (which a checkout re-attaches).
-                    _ => ConfirmPrompt::plain(
-                        "Checkout branch",
-                        format!("Check out ‘{branch}’? This switches the working tree and HEAD to ‘{branch}’."),
-                        "Checkout",
-                        false,
-                        true,
-                    ),
-                },
+                // Every word — including the refusal when another worktree
+                // holds the branch, and the one when the census could not be
+                // read at all — is `checkout_confirm_prompt`'s
+                // (features::dialogs::core, pure and host-tested), the same
+                // extraction the Merge and Delete arms already had.
+                PendingOp::Checkout {
+                    branch,
+                    current,
+                    elsewhere,
+                } => checkout_confirm_prompt(branch, current, elsewhere),
                 // Same extraction as the Merge arm above: the decision — most
                 // importantly that a failed HEAD read never enables the delete
                 // — is `delete_confirm_prompt`'s, host-tested in the pure core.

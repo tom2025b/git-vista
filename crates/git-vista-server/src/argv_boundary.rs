@@ -238,6 +238,13 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // plain `git init`/`commit`/`add`/`branch`/`remote` to build and drift
     // fixture repositories, outside the sandboxed harness under test.
     "src/planner/staleness_suite.rs",
+    // #[cfg(test)] git fixtures for the M11.02 (#547) checkout-collision
+    // suite: plain `git branch` and `git worktree add` to build a repository
+    // that genuinely has a second desk open on a branch. The `worktree add`
+    // is the one shape this suite needs and the app itself does not have
+    // (M11's write path is a later slice) — it stands in for a user at a
+    // terminal, never the path being proven.
+    "src/planner/worktree_collision_suite.rs",
     // #[cfg(test)] git fixtures for the #214 (M2.17c) hunk/line-staging
     // suite: plain `git init`/`commit`/`add`/`diff` to build fixture
     // repositories and read back their state, outside the sandboxed harness

@@ -1542,6 +1542,10 @@ fn describe_precondition(precondition: &crate::plan::Precondition) -> String {
         Precondition::SeedRecorded => {
             "the demo repository's seed state has been recorded".to_string()
         }
+        Precondition::BranchFreeInEveryOtherWorktree { branch } => format!(
+            "no OTHER worktree of this repository has ‘{branch}’ checked out — \
+             check with `git worktree list`"
+        ),
     }
 }
 

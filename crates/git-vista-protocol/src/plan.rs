@@ -1341,6 +1341,30 @@ pub enum Precondition {
     RemoteConfigured { remote: RemoteName },
     /// The repository carries a recorded `gv --seed` (test-repo reset gate).
     SeedRecorded,
+    /// No **other** worktree of this repository has `branch` checked out
+    /// (M11.02, #547; `docs/superpowers/specs/m3.23-worktrees.md` §2).
+    ///
+    /// # Why a fact git already enforces is worth stating here
+    ///
+    /// Git refuses a checkout of a branch that is live in another linked
+    /// worktree, and that refusal is correct — two worktrees on one branch
+    /// would let the same branch move underneath itself from two directions.
+    /// But git says so as `fatal: 'x' is already used by worktree at
+    /// '/some/path'`, at the end of an operation the application already
+    /// offered. Stating the rule as a precondition is what lets the UI
+    /// *decline to offer* the button, and what lets the server refuse in
+    /// words that name the worktree and offer to open it instead.
+    ///
+    /// # Its evaluation is three-valued, and the third value is not `false`
+    ///
+    /// The answer comes from [`crate::WorktreeCensus`], which is itself
+    /// fallible. `CensusFailed` means nothing was observed about any branch —
+    /// it is **not** an empty sibling list, and must never be read as "the
+    /// branch is free". [`crate::branch_holder`] is the one function that
+    /// turns a census into this precondition's answer, shared by the server's
+    /// verification and by the UI's decision to offer; see its doc for the
+    /// three outcomes.
+    BranchFreeInEveryOtherWorktree { branch: BranchName },
 }
 
 /// Where one side of a [`RefChange`] stands: the shape a ref has before the

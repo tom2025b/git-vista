@@ -452,6 +452,82 @@ impl RecordBuilder {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The collision question (M11.02, #547)
+// ---------------------------------------------------------------------------
+
+/// What a [`WorktreeCensus`] says about one branch being free to check out
+/// **here** — the answer behind
+/// [`crate::plan::Precondition::BranchFreeInEveryOtherWorktree`].
+///
+/// Three values, not two, because the census has three states and the middle
+/// one must survive the trip. See [`branch_holder`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchHolder<'a> {
+    /// The census was read and no other worktree has the branch checked out.
+    /// The checkout may be offered.
+    Free,
+    /// Another worktree has it. Git will refuse the checkout; this is the
+    /// worktree to name, and (when it is [`Serviceable::Yes`]) the one to
+    /// offer to open instead.
+    HeldBy(&'a WorktreeSibling),
+    /// The census could not be read, so nothing is known about this branch or
+    /// any other. Carries [`WorktreeCensus::CensusFailed`]'s reason.
+    ///
+    /// **This is not `Free`.** A caller that folds it into either of the
+    /// other two is re-introducing the exact fail-open the census type exists
+    /// to prevent: an unread enumeration contains no conflicting checkout, so
+    /// "no conflict found" and "nobody looked" are the same bytes unless a
+    /// type keeps them apart.
+    Unknown(&'a str),
+}
+
+/// Resolve [`BranchHolder`] for `branch` from `census` — the single place a
+/// census becomes an answer about a branch, shared by the server's
+/// precondition verification and by the UI's decision whether to offer the
+/// checkout button at all.
+///
+/// # What counts as a holder, and what does not
+///
+/// * **The current worktree does not count.** The precondition is about every
+///   *other* worktree; a branch already checked out here is a no-op checkout,
+///   which is a different message and a different (already existing) check.
+/// * **A sibling outside the allowed roots counts.** git's refusal does not
+///   care about this application's fence, so a worktree it may not *open*
+///   still holds the branch and still makes the checkout fail. Hiding it here
+///   would produce a wrong answer by deliberate omission — the worst of the
+///   three options `docs/superpowers/specs/m3.23-worktrees.md` §1 weighs.
+/// * **A [`Serviceable::Missing`] sibling counts too.** Its directory is gone
+///   but its administrative entry is not, and git keeps refusing the branch
+///   until someone prunes it. The refusal a user meets is real, so the
+///   precondition must see it.
+/// * A `bare` record holds no branch (`branch: None`) and so can never match.
+///
+/// Git itself makes more than one holder impossible, so the first match is
+/// the answer; if a future git ever listed two, naming one of them is still
+/// strictly better than naming none.
+pub fn branch_holder<'a>(census: &'a WorktreeCensus, branch: &BranchName) -> BranchHolder<'a> {
+    match census {
+        WorktreeCensus::CensusFailed { reason } => BranchHolder::Unknown(reason.as_str()),
+        WorktreeCensus::Observed { siblings } => siblings
+            .iter()
+            .find(|s| !s.is_current && s.branch.as_ref() == Some(branch))
+            .map_or(BranchHolder::Free, BranchHolder::HeldBy),
+    }
+}
+
+impl BranchHolder<'_> {
+    /// Whether the checkout may be offered — true for [`Self::Free`] alone.
+    ///
+    /// Spelled as a method rather than left to each call site's `matches!`,
+    /// because the one mistake this whole type exists to prevent is a call
+    /// site that writes `!matches!(h, BranchHolder::HeldBy(_))` and thereby
+    /// treats [`Self::Unknown`] as permission.
+    pub fn permits_checkout(&self) -> bool {
+        matches!(self, Self::Free)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -667,5 +743,126 @@ mod tests {
         // zero records into a `CensusFailed` — the parser itself just reports
         // what it saw.
         assert_eq!(parse_worktree_porcelain("").unwrap().len(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // `branch_holder` — the collision question (M11.02, #547)
+    // -----------------------------------------------------------------
+
+    /// A sibling that is *not* the current worktree, on `on`.
+    fn other(name: &str, on: Option<&str>, serviceable: Serviceable) -> WorktreeSibling {
+        WorktreeSibling {
+            name: name.to_string(),
+            id: format!("worktree-{name}"),
+            branch: on.map(branch),
+            is_current: false,
+            serviceable,
+            ..sibling()
+        }
+    }
+
+    fn observed(siblings: Vec<WorktreeSibling>) -> WorktreeCensus {
+        WorktreeCensus::Observed { siblings }
+    }
+
+    #[test]
+    fn a_branch_no_other_worktree_holds_is_free() {
+        let census = observed(vec![
+            sibling(),
+            other("desk-two", Some("feature/x"), Serviceable::Yes),
+        ]);
+        let holder = branch_holder(&census, &branch("feature/y"));
+        assert_eq!(holder, BranchHolder::Free);
+        assert!(holder.permits_checkout());
+    }
+
+    #[test]
+    fn a_branch_held_by_a_sibling_names_that_sibling() {
+        let census = observed(vec![
+            sibling(),
+            other("desk-two", Some("feature/x"), Serviceable::Yes),
+        ]);
+        match branch_holder(&census, &branch("feature/x")) {
+            BranchHolder::HeldBy(s) => assert_eq!(s.name, "desk-two"),
+            other => panic!("expected the sibling to be named, got {other:?}"),
+        }
+        assert!(!branch_holder(&census, &branch("feature/x")).permits_checkout());
+    }
+
+    /// The precondition is about every **other** worktree. A branch checked
+    /// out here is a no-op checkout — a different message, decided elsewhere —
+    /// and reporting it as a collision would make every branch you are
+    /// standing on look occupied by a stranger.
+    #[test]
+    fn the_current_worktrees_own_branch_is_not_a_collision() {
+        // `sibling()` is `is_current: true` on `main`.
+        let census = observed(vec![sibling()]);
+        assert_eq!(branch_holder(&census, &branch("main")), BranchHolder::Free);
+    }
+
+    /// git's refusal does not consult this application's allowed-roots fence.
+    /// A worktree it may not open still holds the branch.
+    #[test]
+    fn a_sibling_outside_the_allowed_roots_still_holds_the_branch() {
+        let census = observed(vec![
+            sibling(),
+            other(
+                "outside",
+                Some("feature/x"),
+                Serviceable::OutsideAllowedRoots,
+            ),
+        ]);
+        match branch_holder(&census, &branch("feature/x")) {
+            BranchHolder::HeldBy(s) => assert_eq!(s.name, "outside"),
+            other => panic!("a fenced-off worktree still blocks the checkout, got {other:?}"),
+        }
+    }
+
+    /// A prunable worktree whose directory is gone keeps its administrative
+    /// entry, and git keeps refusing the branch until somebody prunes it.
+    #[test]
+    fn a_missing_sibling_still_holds_the_branch() {
+        let census = observed(vec![
+            sibling(),
+            other("ghost", Some("feature/x"), Serviceable::Missing),
+        ]);
+        match branch_holder(&census, &branch("feature/x")) {
+            BranchHolder::HeldBy(s) => assert_eq!(s.name, "ghost"),
+            other => panic!("a missing worktree still blocks the checkout, got {other:?}"),
+        }
+    }
+
+    /// The fail-open this whole type exists to prevent: an unread census
+    /// contains no conflicting checkout, so "nobody looked" must not arrive
+    /// at a call site wearing `Free`'s clothes.
+    #[test]
+    fn a_failed_census_is_never_read_as_a_free_branch() {
+        let census = WorktreeCensus::CensusFailed {
+            reason: "`git worktree list --porcelain` failed: no such command".to_string(),
+        };
+        let holder = branch_holder(&census, &branch("feature/x"));
+        assert!(
+            matches!(holder, BranchHolder::Unknown(r) if r.contains("no such command")),
+            "expected the failure reason to survive, got {holder:?}"
+        );
+        assert!(
+            !holder.permits_checkout(),
+            "an unread census must never permit the checkout"
+        );
+    }
+
+    /// A bare record names no branch, so it can never be mistaken for a
+    /// holder — including of a branch whose name is the empty-ish default a
+    /// careless `unwrap_or_default` would produce.
+    #[test]
+    fn a_bare_record_holds_no_branch() {
+        let mut bare = other("hub.git", None, Serviceable::Yes);
+        bare.bare = true;
+        bare.head = None;
+        let census = observed(vec![sibling(), bare]);
+        assert_eq!(
+            branch_holder(&census, &branch("main-2")),
+            BranchHolder::Free
+        );
     }
 }

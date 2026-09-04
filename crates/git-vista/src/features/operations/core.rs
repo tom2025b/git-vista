@@ -1807,6 +1807,7 @@ mod write_route_tests {
             OperationKind::Checkout {
                 branch: "feature".into(),
                 current: Some("main".into()),
+                elsewhere: crate::features::operations::kind::CheckoutElsewhere::Free,
             },
             OperationKind::ForceDelete {
                 branch: "feature".into(),
