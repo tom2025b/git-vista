@@ -5391,10 +5391,10 @@ fn the_wrapper_hands_the_layout_the_window_it_documents() {
 /// 1. **Removes the mechanism** — `lease_if_free` returns `false` without ever
 ///    calling `try_lock`. The `assert!` on the answer goes red; the timing
 ///    assertion stays green, because refusing instantly is still instant.
-/// 2. **Weakens it** — the pause moves ahead of the `try_lock`, so every call
-///    sleeps at least once. The answer is still correct and the first
-///    assertion stays green; the timing assertion goes red at ~1 ms against a
-///    bound of 4.
+/// 2. **Weakens it** — the successful ask stops returning early and lets the
+///    loop run out, so the gate still answers correctly but always spends its
+///    whole budget. The first assertion stays green; the timing assertion goes
+///    red at ~7 ms against a bound of 4.
 #[test]
 fn a_free_lease_is_taken_on_the_first_ask() {
     let dir = TempDir::new().expect("tempdir");
@@ -5413,8 +5413,14 @@ fn a_free_lease_is_taken_on_the_first_ask() {
          reclaim anything, and every test that asserts a store was removed is \
          satisfied by a sweep that has stopped working"
     );
+    // A literal for the same reason the held-lease test uses one: a bound
+    // spelled `LEASE_RETRY_PAUSE * n` shrinks to nothing the moment the pause
+    // is the thing mutated. 4 ms sits well above a single uncontended
+    // `try_lock` even on a box running twenty test threads, and well below the
+    // 7 ms a gate that spent its whole budget would take.
+    const A_FIRST_ASK: Duration = Duration::from_millis(4);
     assert!(
-        elapsed < LEASE_RETRY_PAUSE * 4,
+        elapsed < A_FIRST_ASK,
         "the free path must not pay the retry budget — it is walked on every \
          reclaimable store in a user's `.git`, and this took {elapsed:?}"
     );
@@ -5465,13 +5471,21 @@ fn a_held_lease_is_refused_only_after_every_ask() {
         "a lease held by a live store must be refused: taking it hands a \
          running preview's scratch store to `remove_dir_all`"
     );
-    let floor = LEASE_RETRY_PAUSE * (LEASE_ATTEMPTS - 1);
+    // A LITERAL, deliberately not `LEASE_RETRY_PAUSE * (LEASE_ATTEMPTS - 1)`.
+    // Deriving the floor from the constants under test makes the assertion
+    // move with the mutation: cut `LEASE_ATTEMPTS` to 1 and the floor becomes
+    // zero, which every elapsed time clears. That is a test asserting a
+    // mapping by calling the function that defines it, and this repository has
+    // shipped one before. 7 ms is eight asks a millisecond apart, minus the
+    // pause the eighth does not take; changing either constant is meant to
+    // land here.
+    const ASKING_EVERY_TIME_COSTS: Duration = Duration::from_millis(7);
     assert!(
-        elapsed >= floor,
-        "the gate must ask {LEASE_ATTEMPTS} times before believing a \
-         refusal — a single `try_lock` says `WouldBlock` for a descriptor \
-         that is already gone as readily as for a live store (#598). It \
-         answered in {elapsed:?}, under the {floor:?} that asking every time \
+        elapsed >= ASKING_EVERY_TIME_COSTS,
+        "the gate must ask every time before believing a refusal — a single \
+         `try_lock` says `WouldBlock` for a descriptor that is already gone as \
+         readily as for a live store (#598). It answered in {elapsed:?}, under \
+         the {ASKING_EVERY_TIME_COSTS:?} that asking {LEASE_ATTEMPTS} times \
          costs"
     );
     drop(held);
