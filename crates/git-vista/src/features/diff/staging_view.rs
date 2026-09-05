@@ -32,10 +32,10 @@ use git_vista_protocol::{
 
 use crate::api::{staging_apply_request, staging_preview_request};
 use crate::detail::diff_line_class;
-use crate::features::a11y::focus::{FocusMove, GraphFocus};
+use crate::features::a11y::focus::GraphFocus;
 use crate::features::diff::core::selectable_hunks;
 use crate::features::diff::selection::{drag_range, DiffSelection};
-use crate::features::graph::core::RenderCtx;
+use crate::features::graph::core::{roving_row_key, RenderCtx, RowKey};
 use crate::features::shell::signals::Shell;
 use crate::features::status::signals::StatusResource;
 
@@ -107,26 +107,31 @@ fn hunk_row(
     let on_keydown = {
         let file = file.clone();
         move |ev: web_sys::KeyboardEvent| {
+            // This surface ignores a press with ANY modifier held, Shift
+            // included — unlike `gestures::on_node_keydown`, which checks
+            // none. The asymmetry is real and predates #653; it is recorded
+            // in `roving_row_key`'s doc rather than resolved here, because
+            // resolving it changes behaviour on one of the two surfaces.
             if ev.alt_key() || ev.ctrl_key() || ev.meta_key() || ev.shift_key() {
                 return;
             }
-            match ev.key().as_str() {
-                "ArrowDown" | "ArrowUp" | "Home" | "End" => {
-                    let dir = match ev.key().as_str() {
-                        "ArrowDown" => FocusMove::Next,
-                        "ArrowUp" => FocusMove::Prev,
-                        "Home" => FocusMove::First,
-                        _ => FocusMove::Last,
-                    };
-                    ev.prevent_default();
-                    ev.stop_propagation();
+            // Which key means what is `features::graph::core::roving_row_key`'s
+            // to say (#653): the canvas's own row handler drives the same
+            // focus model with the same keys, and both files are wasm-only, so
+            // each held a copy no host test could reach. What each intent
+            // *does* here — toggling a hunk rather than opening a menu — stays.
+            let Some(intent) = roving_row_key(&ev.key()) else {
+                return;
+            };
+            ev.prevent_default();
+            ev.stop_propagation();
+            match intent {
+                RowKey::Move(dir) => {
                     if let Some(next) = focus.try_update(|f| f.mv(dir)).flatten() {
                         focus_hunk(next);
                     }
                 }
-                "Escape" => {
-                    ev.prevent_default();
-                    ev.stop_propagation();
+                RowKey::Dismiss => {
                     focus.update(|f| f.escape());
                     if let Some(el) = ev
                         .target()
@@ -138,12 +143,9 @@ fn hunk_row(
                 // Keyboard/VoiceOver equivalence (Task 1): whatever the
                 // checkbox's tap does, Space/Enter on the currently
                 // roving-focused header does too.
-                " " | "Enter" => {
-                    ev.prevent_default();
-                    ev.stop_propagation();
+                RowKey::Activate => {
                     selection.update(|s| s.toggle_hunk(&file, anchor));
                 }
-                _ => {}
             }
         }
     };

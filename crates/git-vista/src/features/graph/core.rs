@@ -1204,6 +1204,172 @@ pub fn badge_colors(kind: &RefKind, branch: &'static str, surface: BadgeSurface)
     }
 }
 
+// ── Keyboard policy (#653) ───────────────────────────────────────────────────
+//
+// `gestures.rs` is `#[cfg(target_arch = "wasm32")]`, so every one of the
+// shortcuts below — the whole of what the keyboard can do to this canvas —
+// used to be decided where `cargo test --workspace` compiles nothing. Per ADR
+// 0115 the mapping moves here; the wasm file keeps the listener registration,
+// the `web_sys` reads and the camera writes, which are the parts that
+// genuinely need a browser.
+
+/// What the window-level keydown listener does with one key press.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanvasKey {
+    /// Back out of whatever overlay is topmost. A desktop convenience only:
+    /// every overlay also closes by its own control, since some iPad Magic
+    /// Keyboards have no physical Esc key.
+    DismissTopOverlay,
+    ZoomIn,
+    ZoomOut,
+    /// Back to the graph's home view — not the raw identity, since a repo
+    /// whose stub cascades overshoot the top edge must reset to a view that
+    /// actually shows them.
+    ResetView,
+    /// Down the history by most of a screenful.
+    PageDown,
+    /// Back up the history by the same.
+    PageUp,
+    /// Re-read the repository, same as the Refresh button.
+    Reload,
+}
+
+/// One decided key press: what to do, and whether the browser's own default
+/// for that key must be suppressed.
+///
+/// The two travel together because they do **not** line up by action.
+/// `Home` and `0` both reset the view, but only `Home` needs its default
+/// stopped (some browsers scroll the document on it); `PageDown` and `Space`
+/// scroll by default and must be stopped, while `+`/`-`/`r` have no default
+/// worth taking. Returning the action alone and letting the caller decide the
+/// suppression is how those pairings quietly diverge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanvasKeyAction {
+    pub action: CanvasKey,
+    pub prevent_default: bool,
+}
+
+/// Which modifier keys were held. `shift` is deliberately separate from the
+/// other three: it is a *selector* here (Shift-Space pages back), not a
+/// reason to bail out, which is the asymmetry [`canvas_key_action`] exists to
+/// keep honest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KeyMods {
+    pub shift: bool,
+    pub ctrl: bool,
+    pub meta: bool,
+    pub alt: bool,
+}
+
+impl KeyMods {
+    /// Ctrl / Cmd / Alt — the modifiers that mean "this key press belongs to
+    /// the browser or the OS, not to the canvas". Shift is not among them.
+    pub const fn bails_out(self) -> bool {
+        self.ctrl || self.meta || self.alt
+    }
+}
+
+/// The whole canvas keyboard map, as one decision (M1.11 #64, plus the
+/// desktop paging keys).
+///
+/// `typing` is "focus is in a text field" — the commit box, the URL box —
+/// and `default_prevented` is whether a handler closer to the event already
+/// consumed this press.
+///
+/// # The three rules that are easy to lose
+///
+/// 1. **Escape is decided before the typing/modifier bail-out.** Backing out
+///    of an overlay has to work while the cursor is in that overlay's own
+///    text field; moving Escape below the guard would make the commit dialog
+///    un-escapable.
+/// 2. **Escape yields to a handler that already consumed it.** The diff's
+///    hunk navigation calls `prevent_default` when Escape disengages it, and
+///    that press must not *also* dismiss the overlay the reader is still
+///    inside. `stop_propagation` cannot protect it: this listener and
+///    Leptos's delegated handlers share the window target, and same-target
+///    listeners all run regardless.
+/// 3. **Shift is not part of the bail-out.** Shift-Space pages back, matching
+///    every browser and reader — Space alone is "more", Shift-Space is
+///    "back". Folding Shift in with Ctrl/Cmd/Alt silently deletes that key,
+///    and nothing about the remaining Space binding would look wrong.
+pub fn canvas_key_action(
+    key: &str,
+    mods: KeyMods,
+    typing: bool,
+    default_prevented: bool,
+) -> Option<CanvasKeyAction> {
+    // Rules 1 and 2, in that order and above the guard on purpose.
+    if key == "Escape" {
+        return (!default_prevented).then_some(CanvasKeyAction {
+            action: CanvasKey::DismissTopOverlay,
+            prevent_default: false,
+        });
+    }
+    if typing || mods.bails_out() {
+        return None;
+    }
+    let (action, prevent_default) = match key {
+        "+" | "=" => (CanvasKey::ZoomIn, false),
+        "-" | "_" => (CanvasKey::ZoomOut, false),
+        "0" => (CanvasKey::ResetView, false),
+        // Rule 3: Shift-Space pages back, so this arm must come first.
+        " " if mods.shift => (CanvasKey::PageUp, true),
+        "PageDown" | " " => (CanvasKey::PageDown, true),
+        "PageUp" => (CanvasKey::PageUp, true),
+        "Home" => (CanvasKey::ResetView, true),
+        "r" | "R" => (CanvasKey::Reload, false),
+        _ => return None,
+    };
+    Some(CanvasKeyAction {
+        action,
+        prevent_default,
+    })
+}
+
+/// What a key press means to one roving-tabindex row — a commit row's hit
+/// circle in the canvas (`gestures::on_node_keydown`), or a hunk header in
+/// the staging view (`features::diff::staging_view`).
+///
+/// Both surfaces drive the same [`GraphFocus`](crate::features::a11y::focus::GraphFocus)
+/// state machine with the same keys, and each held its own copy of this
+/// `match` inside a wasm-only file. What they do with the answer still
+/// differs — [`Self::Activate`] opens a commit's context menu on one surface
+/// and toggles a hunk's selection checkbox on the other — and that is why
+/// this returns an intent rather than performing anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowKey {
+    /// Move the roving focus.
+    Move(crate::features::a11y::focus::FocusMove),
+    /// Enter / Space: do to this row what a tap on it would.
+    Activate,
+    /// Escape: leave the roving set — update the model *and* blur the
+    /// element, or the focus ring stays painted on a row the model no longer
+    /// considers focused.
+    Dismiss,
+}
+
+/// The roving-row key map. Pure key → intent: neither caller's modifier guard
+/// lives here, because the two guards genuinely differ and folding them in
+/// would change behaviour rather than describe it. The staging view ignores a
+/// press with **any** modifier held including Shift; the canvas node handler
+/// checks none at all. That asymmetry is recorded, not resolved, by #653 —
+/// resolving it is a behaviour change and wants its own issue.
+pub fn roving_row_key(key: &str) -> Option<RowKey> {
+    use crate::features::a11y::focus::FocusMove;
+    match key {
+        "ArrowDown" => Some(RowKey::Move(FocusMove::Next)),
+        "ArrowUp" => Some(RowKey::Move(FocusMove::Prev)),
+        "Home" => Some(RowKey::Move(FocusMove::First)),
+        "End" => Some(RowKey::Move(FocusMove::Last)),
+        "Enter" | " " => Some(RowKey::Activate),
+        "Escape" => Some(RowKey::Dismiss),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod keyboard_suite;
+
 #[cfg(test)]
 mod label_link_suite;
 

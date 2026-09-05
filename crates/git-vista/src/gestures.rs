@@ -14,8 +14,10 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
 use crate::camera::{Camera, ZOOM_STEP};
-use crate::features::a11y::focus::{FocusMove, GraphFocus};
-use crate::features::graph::core::GraphCore;
+use crate::features::a11y::focus::GraphFocus;
+use crate::features::graph::core::{
+    canvas_key_action, roving_row_key, CanvasKey, GraphCore, KeyMods, RowKey,
+};
 use crate::features::shell::signals::Shell;
 use crate::geometry::{drag_threshold, node_cy};
 
@@ -266,14 +268,15 @@ pub fn on_node_keydown(
     ev: web_sys::KeyboardEvent,
     activate: &impl Fn(f64, f64),
 ) {
-    let dir = match ev.key().as_str() {
-        "ArrowDown" => Some(FocusMove::Next),
-        "ArrowUp" => Some(FocusMove::Prev),
-        "Home" => Some(FocusMove::First),
-        "End" => Some(FocusMove::Last),
-        _ => None,
+    // Which key means what is `features::graph::core::roving_row_key`'s to
+    // say (#653) — the staging view drives the same focus model with the same
+    // keys, and a second copy of the map inside a wasm-only file is a copy no
+    // host test can reach. This handler still owns what each intent *does*
+    // here, which is the part that differs between the two surfaces.
+    let Some(intent) = roving_row_key(&ev.key()) else {
+        return;
     };
-    if let Some(dir) = dir {
+    if let RowKey::Move(dir) = intent {
         // Don't let the arrow keys additionally scroll the page (there is no
         // scrollable ancestor here, but Home/End on some browsers act on the
         // document by default regardless).
@@ -295,8 +298,8 @@ pub fn on_node_keydown(
         return;
     }
 
-    match ev.key().as_str() {
-        "Enter" | " " => {
+    match intent {
+        RowKey::Activate => {
             ev.prevent_default();
             // The event's own target — this row's hit circle, since that is
             // the only thing that can have been focused — supplies the
@@ -312,7 +315,7 @@ pub fn on_node_keydown(
                 .unwrap_or((0.0, 0.0));
             activate(x, y);
         }
-        "Escape" => {
+        RowKey::Dismiss => {
             focus.update(|f| f.escape());
             // `GraphFocus::escape` only updates the model; real DOM focus has
             // to be moved off the element separately, or the ring stays
@@ -324,7 +327,8 @@ pub fn on_node_keydown(
                 let _ = el.blur();
             }
         }
-        _ => {}
+        // Handled above, which returned.
+        RowKey::Move(_) => {}
     }
 }
 
@@ -381,6 +385,15 @@ pub fn install_resize_listener(vp_h: RwSignal<f64>) {
 /// boxes) and when a modifier is held, so typing an "r" — or the browser's own
 /// Cmd/Ctrl-R reload — is left untouched. Removed on cleanup, like the resize
 /// listener above, so a reload doesn't leave duplicate handlers behind.
+///
+/// The map above is a *description* of
+/// [`canvas_key_action`](crate::features::graph::core::canvas_key_action),
+/// which decides it; this listener only performs the answer. That split is
+/// #653: this module is wasm-only, so while the map lived here `cargo test
+/// --workspace` compiled none of it, including the three ordering rules
+/// (Escape above the typing guard, Escape yielding to a handler that already
+/// consumed it, and Shift being a selector rather than a bail-out) that the
+/// bindings are wrong without.
 /// `home` is a *signal*, not a value (M1.10, #63): with paged history the home
 /// camera moves after mount — a later page can raise the lane high-water and
 /// grow the stub cascade past the top edge, which shifts `Camera::home`. Taking
@@ -398,28 +411,16 @@ pub fn install_key_listener(
     if let Some(win) = web_sys::window() {
         let cb =
             Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |ev: web_sys::KeyboardEvent| {
-                if ev.key() == "Escape" {
-                    // A handler closer to the event may have consumed this Escape —
-                    // the diff's hunk navigation calls `prevent_default` when Escape
-                    // disengages it (detail.rs), and that consumption must not ALSO
-                    // dismiss the overlay the user is still inside. stop_propagation
-                    // alone can't protect it here: this listener and Leptos's
-                    // delegated handlers share the window target, and same-target
-                    // listeners all run regardless of stop_propagation.
-                    if ev.default_prevented() {
-                        return;
-                    }
-                    // Topmost first, and "topmost" is now a fact the shell holds rather
-                    // than an `if/else if` chain this handler had to keep in step with the
-                    // overlay set. That chain is the bug this replaces: it covered five of
-                    // the six overlays and silently omitted the Activity panel, so Esc
-                    // could not close it (M1.11, #64, Task 8). (Esc is a desktop
-                    // convenience only — every overlay keeps a visible close control,
-                    // since the iPad Magic Keyboard has no Esc key.)
-                    shell.dismiss_top();
-                    return;
-                }
-                // Leave keys alone while typing in a field, or when a modifier is held.
+                // Which key means what — and which of them must have the
+                // browser's own default suppressed — is
+                // `features::graph::core::canvas_key_action`'s to decide
+                // (#653). Every rule that used to live in the `match` here was
+                // decided inside a `#[cfg(target_arch = "wasm32")]` module, so
+                // no host test could reach any of it: not the Escape ordering,
+                // not the deliberate exclusion of Shift from the modifier
+                // bail-out that makes Shift-Space page back. What is left in
+                // this closure is what genuinely needs a browser — reading the
+                // event, measuring the window, and writing the signals.
                 let typing = ev
                     .target()
                     .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
@@ -428,8 +429,21 @@ pub fn install_key_listener(
                         tag.eq_ignore_ascii_case("textarea") || tag.eq_ignore_ascii_case("input")
                     })
                     .unwrap_or(false);
-                if typing || ev.ctrl_key() || ev.meta_key() || ev.alt_key() {
+                let Some(decided) = canvas_key_action(
+                    &ev.key(),
+                    KeyMods {
+                        shift: ev.shift_key(),
+                        ctrl: ev.ctrl_key(),
+                        meta: ev.meta_key(),
+                        alt: ev.alt_key(),
+                    },
+                    typing,
+                    ev.default_prevented(),
+                ) else {
                     return;
+                };
+                if decided.prevent_default {
+                    ev.prevent_default();
                 }
                 let centre = || {
                     let vw = web_sys::window()
@@ -438,67 +452,33 @@ pub fn install_key_listener(
                         .unwrap_or(1200.0);
                     (vw / 2.0, window_inner_height() / 2.0)
                 };
-                match ev.key().as_str() {
-                    "+" | "=" => {
+                // Pans by 90% of the viewport rather than a full screen, so
+                // one row of context carries across the jump; a full-height
+                // page leaves the reader with no anchor, and it is easy to
+                // lose your place in a graph where lines matter more than
+                // rows. Sign: paging DOWN the history means moving the content
+                // up, hence the negated dy.
+                let page = || window_inner_height() * 0.9;
+                match decided.action {
+                    CanvasKey::DismissTopOverlay => shell.dismiss_top(),
+                    CanvasKey::ZoomIn => {
                         let (cx, cy) = centre();
                         camera.update(|c| *c = c.zoomed_at(ZOOM_STEP, cx, cy));
                     }
-                    "-" | "_" => {
+                    CanvasKey::ZoomOut => {
                         let (cx, cy) = centre();
                         camera.update(|c| *c = c.zoomed_at(1.0 / ZOOM_STEP, cx, cy));
                     }
-                    // The graph's home view — not the raw identity, so a repo
-                    // whose stub cascades overshoot the top edge resets to a
-                    // view that actually shows them (see `Camera::home`). Read
-                    // at press time, so it is wherever the pages landed so far
-                    // put it, never the mount-time value.
-                    "0" => camera.set(home.get_untracked()),
-                    // Desktop paging. The graph is drag-to-pan first because it
-                    // was built for the iPad, where a drag is the natural gesture
-                    // and there is no keyboard to speak of. On a mouse-only box
-                    // that leaves dragging as the ONLY way to cross a long
-                    // history, which is slow and imprecise — 2627 commits is a
-                    // lot of dragging.
-                    //
-                    // Pans by 90% of the viewport rather than a full screen, so
-                    // one row of context carries across the jump; a full-height
-                    // page leaves the reader with no anchor and it is easy to
-                    // lose your place in a graph where lines matter more than
-                    // rows. Sign: panning the camera DOWN the history means
-                    // moving the content up, hence the negated dy.
-                    //
-                    // Space/Shift-Space match the browser's own scroll idiom, and
-                    // Home/End here are the whole-graph versions of the per-node
-                    // Home/End in `on_node_keydown` — those need a focused node,
-                    // which a user who has only ever dragged will not have.
-                    // Shift-Space pages back, matching every browser and reader:
-                    // Space alone is "more", Shift-Space is "back". Shift is not
-                    // in the modifier bail-out above precisely so this works.
-                    " " if ev.shift_key() => {
-                        ev.prevent_default();
-                        let page = window_inner_height() * 0.9;
-                        camera.update(|c| *c = c.panned(0.0, page));
-                    }
-                    "PageDown" | " " => {
-                        ev.prevent_default();
-                        let page = window_inner_height() * 0.9;
-                        camera.update(|c| *c = c.panned(0.0, -page));
-                    }
-                    "PageUp" => {
-                        ev.prevent_default();
-                        let page = window_inner_height() * 0.9;
-                        camera.update(|c| *c = c.panned(0.0, page));
-                    }
-                    "Home" => {
-                        ev.prevent_default();
-                        camera.set(home.get_untracked());
-                    }
-                    "r" | "R" => {
+                    // Read at press time, so it is wherever the pages landed
+                    // so far put it, never the mount-time value.
+                    CanvasKey::ResetView => camera.set(home.get_untracked()),
+                    CanvasKey::PageDown => camera.update(|c| *c = c.panned(0.0, -page())),
+                    CanvasKey::PageUp => camera.update(|c| *c = c.panned(0.0, page())),
+                    CanvasKey::Reload => {
                         graph.update(|g| {
                             g.force_bump();
                         });
                     }
-                    _ => {}
                 }
             });
         let _ = win.add_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref());
