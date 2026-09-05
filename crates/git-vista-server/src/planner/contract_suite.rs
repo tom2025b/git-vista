@@ -2879,7 +2879,12 @@ fn every_git_write_route_reaches_the_planner() {
 #[test]
 fn the_production_entry_point_composes_the_tested_stages_in_order() {
     let src = source("src/planner.rs");
-    let body = fn_body(&src, "plan_and_execute_in");
+    // M12.04 (#554) moved the pipeline one function down: `plan_and_execute_in`
+    // is now the publish wrapper and `plan_and_execute_within` is the pipeline.
+    // The composition this census exists to pin is unchanged — it is read where
+    // it now lives, and the wrapper is pinned separately by
+    // `every_write_path_publishes_what_it_left_behind` below.
+    let body = fn_body(&src, "plan_and_execute_within");
     let mut from = 0;
     for stage in [
         "build_plan(",
@@ -2892,7 +2897,7 @@ fn the_production_entry_point_composes_the_tested_stages_in_order() {
         match body[from..].find(stage) {
             Some(at) => from += at + stage.len(),
             None => panic!(
-                "plan_and_execute_in no longer calls {stage} after the previous stage — \
+                "plan_and_execute_within no longer calls {stage} after the previous stage — \
                  the guard → build → validate → enforce_fresh → execute composition is broken"
             ),
         }
@@ -2926,7 +2931,7 @@ fn the_production_entry_point_composes_the_tested_stages_in_order() {
 #[test]
 fn the_recovery_pin_is_composed_inside_the_guard_before_execution() {
     let src = source("src/planner.rs");
-    for composition in ["plan_and_execute_in", "submit_plan"] {
+    for composition in ["plan_and_execute_within", "submit_plan_within"] {
         let body = fn_body(&src, composition);
         let mut from = 0;
         for stage in [
@@ -5245,6 +5250,40 @@ fn every_operation_kind_is_covered_on_the_split_path() {
     );
 }
 
+/// M12.04 (#554): both write paths publish what they left behind, and they do
+/// it through a wrapper the write itself cannot skip.
+///
+/// The shape is the mechanism. `with_publish` runs the pipeline and *then*
+/// publishes, so a write that panics never reaches the publish, records
+/// nothing, and leaves the next ordinary sweep free to announce what it left. A
+/// publish written *inside* the pipeline — before an early return, or in a
+/// branch — would reintroduce exactly the "I already told them about this"
+/// bookkeeping that swallows an external change landing alongside a write.
+#[test]
+fn every_write_path_publishes_what_it_left_behind_through_the_wrapper() {
+    let src = source("src/planner.rs");
+    for (entry, inner) in [
+        ("plan_and_execute_in", "plan_and_execute_within"),
+        ("submit_plan", "submit_plan_within"),
+    ] {
+        let body = fn_body(&src, entry);
+        assert!(
+            body.contains("reconciliation::with_publish("),
+            "{entry} must run the pipeline through the publish wrapper"
+        );
+        assert!(
+            body.contains(inner),
+            "{entry}'s wrapper must wrap {inner}, not something else"
+        );
+        let pipeline = fn_body(&src, inner);
+        assert!(
+            !pipeline.contains("with_publish(") && !pipeline.contains("publish_after_write("),
+            "{inner} must not publish from inside the pipeline: a publish on an \
+             early-return path is the bookkeeping #554 exists to remove"
+        );
+    }
+}
+
 /// [`the_production_entry_point_composes_the_tested_stages_in_order`]'s
 /// sibling for the submit stage: `submit_plan`'s body must re-observe through
 /// the shared eyes, then compose guard → busy-check → validate →
@@ -5255,7 +5294,7 @@ fn every_operation_kind_is_covered_on_the_split_path() {
 #[test]
 fn the_submit_stage_composes_the_same_guarded_stages_in_order() {
     let src = source("src/planner.rs");
-    let body = fn_body(&src, "submit_plan");
+    let body = fn_body(&src, "submit_plan_within");
     let mut from = 0;
     for stage in [
         "observe_for_submission(",
@@ -5268,7 +5307,7 @@ fn the_submit_stage_composes_the_same_guarded_stages_in_order() {
         match body[from..].find(stage) {
             Some(at) => from += at + stage.len(),
             None => panic!(
-                "submit_plan no longer calls {stage} after the previous stage — \
+                "submit_plan_within no longer calls {stage} after the previous stage — \
                  the re-observe → guard → validate → enforce_fresh → execute \
                  composition is broken"
             ),

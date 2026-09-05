@@ -133,10 +133,12 @@ impl FeedLog {
     /// the claim "nothing moved", which is exactly the claim a gap cannot
     /// support.
     pub fn moved_since(&self, generation: &str) -> Option<(Vec<String>, bool)> {
-        let start = self
-            .entries
-            .iter()
-            .rposition(|entry| entry.generation.as_ref().is_some_and(|g| g.as_str() == generation))?;
+        let start = self.entries.iter().rposition(|entry| {
+            entry
+                .generation
+                .as_ref()
+                .is_some_and(|g| g.as_str() == generation)
+        })?;
         let mut refs: Vec<String> = Vec::new();
         let mut other = false;
         for entry in self.entries.iter().skip(start + 1) {
@@ -190,9 +192,7 @@ pub fn freshness(plan: &PlanOnScreen, log: &FeedLog) -> PlanFreshness {
         .filter(|name| plan.expects.iter().any(|expected| expected == name))
         .collect();
     if !depended_on.is_empty() {
-        return PlanFreshness::Moved {
-            refs: depended_on,
-        };
+        return PlanFreshness::Moved { refs: depended_on };
     }
     if other {
         // Nothing this plan *names* moved, but the working tree, the index, the

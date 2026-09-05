@@ -426,11 +426,20 @@ fn run_driver(
                         return;
                     }
                 };
-                // Coverage that changed is a health transition, and it is
-                // published as one. A ref tree that grew past the budget while
-                // the process ran must not keep reporting the count it had
-                // when it still fitted.
-                if coverage != was_covering || installed.len() != before {
+                // A health notice when — and only when — the *coverage* changed.
+                //
+                // Not on every count change: a ref namespace being created
+                // grows `installed` and `wanted` together, and republishing
+                // "watching 5 of 5" after "watching 4 of 4" is noise on a feed
+                // whose whole job is that a health value means something. What
+                // must never be missed is the flip: a ref tree that grows past
+                // the budget while the process runs, and a bounded set that
+                // recovers.
+                let now_complete = installed.len() >= coverage;
+                let was_complete = before >= was_covering;
+                let bounded_and_moved =
+                    !now_complete && (installed.len() != before || coverage != was_covering);
+                if now_complete != was_complete || bounded_and_moved {
                     let _ = notices.send(WatcherNotice::Health(WatcherHealth::Watching {
                         installed: installed.len(),
                         wanted: coverage,

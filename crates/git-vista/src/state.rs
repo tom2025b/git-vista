@@ -113,9 +113,9 @@ pub use crate::features::dialogs::commit::CommitIntent;
 pub use crate::features::operations::kind::OperationKind as PendingOp;
 
 use crate::features::dialogs::signals::Dialogs;
+use crate::features::freshness::signals::Freshness;
 use crate::features::graph::core::GraphCore;
 use crate::features::operations::signals::Operations;
-use crate::features::freshness::signals::Freshness;
 use crate::features::preview::signals::Preview;
 use crate::features::shell::signals::Shell;
 use crate::features::stash::signals::StashDrawer;
