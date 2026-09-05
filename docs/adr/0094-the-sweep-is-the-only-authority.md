@@ -592,6 +592,39 @@ Three things fall out, and the third is a finding rather than a result:
   attempt asserted a resting state. The browser spec waited for the final
   picture, so it saw both ends and never the middle. The current specs hold
   `/api/plan` open and fail it.
+
+  **A third defect, in the same transition, survived both of the above being
+  fixed: nothing checked whether the transition itself was still the live
+  one.** `rebuild_lease`'s two awaited requests wrote `Preview` state and
+  re-opened the confirmation dialog unconditionally on completion — Cancel,
+  which closes the dialog and bumps `Preview`'s own generation counter for
+  every other path, did nothing to a continuation already in flight. A held
+  reply released after Cancel reopened a confirmation the user had already
+  discarded, reproduced in a real browser. The two-state fix above and this
+  one are different bugs in the same function: the first was about *what*
+  the four states mean, this one is about *whether a given transition still
+  applies* once its instigating confirmation is gone.
+
+  The review asked directly whether a mechanism should make the mistake
+  unrepresentable, rather than a fourth careful reading of the same file, and
+  whether a type could do it where a check could not. The honest answer is
+  partial. `note_rebuild_started` now returns a `RebuildToken`, and neither
+  `note_rebuild_failed` nor `note_rebuild_landed` nor the dialog re-open can
+  run without presenting one — the type system genuinely forecloses the
+  shape of bug that shipped, a completion with no proof of currency at all,
+  because there is no argument-less overload left to call. What the type
+  system cannot do is know whether a *presented* token is still fresh:
+  freshness here is a fact about wall-clock event ordering (did Cancel or a
+  newer rebuild happen before this reply landed), which is exactly the kind
+  of question `RiskLevel`/`RecoveryStrategy` case-analysis over static shapes
+  elsewhere in this codebase is well-suited to and this is not. So the token
+  is checked against `Preview`'s live generation at the moment it is spent —
+  a runtime comparison, `rebuild_token_is_current`, moved to
+  `preview::core` and host-tested for the same ADR 0115 reason the two-state
+  fix above already states, rather than left in the wasm-only wrapper a
+  mutation proof cannot reach. The type makes the omission impossible; the
+  comparison makes the staleness detectable. Neither alone would have been
+  the whole fix.
 - **A confirmation can hold a plan two ways, and both are checked.** A
   force-with-lease push has no graph preview (`preview_subject(Push)` is
   `NotPreviewable`) while displaying a server-built plan's explanation, risk and
