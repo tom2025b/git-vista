@@ -5,7 +5,7 @@
 
 use git_vista_core::status::RepoStatus;
 use git_vista_protocol::operation::IdempotencyKey;
-use git_vista_protocol::{WorktreePathsRequest, WorktreeStatus};
+use git_vista_protocol::{RemoveWorktreeRequest, WorktreePathsRequest, WorktreeStatus};
 
 use super::{
     network_error, receipt, refuse_if_offline, refuse_if_visualize, req_get, response_error,
@@ -106,5 +106,33 @@ pub async fn delete_untracked_paths_request(
         REQUEST_TIMEOUT_MS,
     )
     .await?;
+    Ok(receipt(resp).await)
+}
+
+/// Close a linked sibling worktree, addressed by its opaque census id
+/// (`POST /api/remove-worktree`, M11.05, #550).
+///
+/// Carries only `id` — never a path, and never the display name the drawer
+/// showed: the server resolves `id` to a real path itself, via a fresh
+/// census, immediately before acting (see
+/// [`GitOperation::RemoveWorktree`](git_vista_protocol::GitOperation::RemoveWorktree)'s
+/// doc comment for the compare-and-swap this reaches into). `id` comes
+/// straight from a census this client already read, so a validation failure
+/// here would be this client's own bug, not a user mistake — mapped to a
+/// string like every other client-side error in this module rather than
+/// unwrapped, so a malformed id refuses the request instead of panicking the
+/// tab.
+pub async fn remove_worktree_request(
+    id: &str,
+    key: IdempotencyKey,
+) -> Result<WriteReceipt, String> {
+    refuse_if_offline()?;
+    refuse_if_visualize()?;
+    let body = RemoveWorktreeRequest {
+        id: git_vista_protocol::WorktreeSiblingId::new(id).map_err(|e| e.to_string())?,
+    };
+    let json = serde_json::to_string(&body).map_err(|e| e.to_string())?;
+    let (resp, _key) =
+        send_write_with_key("/api/remove-worktree", Some(json), key, REQUEST_TIMEOUT_MS).await?;
     Ok(receipt(resp).await)
 }

@@ -167,6 +167,22 @@ pub enum OperationKind {
     /// the server's own `GitOperation::DeleteLocalTag`, the same naming
     /// rule `DiscardTrackedPaths`/`DeleteUntrackedPaths` above follow.
     DeleteLocalTag { tag: String },
+    /// `git worktree remove <path>` on a linked sibling (`POST
+    /// /api/remove-worktree`, M11.05/#550). `id` is the opaque census id and
+    /// the mutation authority — the server resolves it to a real path via a
+    /// fresh census immediately before acting, so this carries no path at
+    /// all. `name` is the census's own short display label, carried only for
+    /// the confirmation's wording and the status strip; it plays no part in
+    /// which desk actually closes.
+    ///
+    /// **The one operation in this vocabulary with no way back of any kind**
+    /// — an uncommitted, never-staged edit in the removed worktree was never
+    /// written to git's object database, so nothing here or on the server can
+    /// ever reconstruct it. Same class as [`Self::DeleteUntrackedPaths`]
+    /// above, and the two-tap ceremony `dialogs/core.rs`'s
+    /// `remove_worktree_confirm` gives it is that operation's, not the
+    /// single-tap ceremony the rest of this enum gets.
+    RemoveWorktree { id: String, name: String },
 }
 
 /// A force-with-lease push under review (#233): what the danger-styled
@@ -390,6 +406,11 @@ impl OperationKind {
             // Mirrors the branch `Delete`/`ForceDelete` arms' wording —
             // named subject, no type-name leak.
             Self::DeleteLocalTag { tag } => format!("Deleting tag \u{2018}{tag}\u{2019}"),
+            // Names the desk by its display label, never its id — the
+            // strip is for a person, and an id is not a name.
+            Self::RemoveWorktree { name, .. } => {
+                format!("Removing worktree \u{2018}{name}\u{2019}")
+            }
         }
     }
 
@@ -543,6 +564,10 @@ mod tests {
                 paths: vec!["scratch.txt".into(), "note.md".into()],
             },
             OperationKind::DeleteLocalTag { tag: "v1.0".into() },
+            OperationKind::RemoveWorktree {
+                id: "worktree-desk-two".into(),
+                name: "desk-two".into(),
+            },
         ];
         for k in kinds {
             let text = k.describe();
@@ -752,6 +777,10 @@ mod fetch_pull_tests {
                 paths: vec!["scratch.txt".into()],
             },
             OperationKind::DeleteLocalTag { tag: "v1.0".into() },
+            OperationKind::RemoveWorktree {
+                id: "worktree-desk-two".into(),
+                name: "desk-two".into(),
+            },
         ];
         for k in not_cancellable {
             assert!(!k.is_cancellable(), "{k:?} should not be cancellable");

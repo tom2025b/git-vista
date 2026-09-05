@@ -120,6 +120,9 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     // inside an allowed root, an unauthenticated caller must not be able to
     // reach the attempt at all.
     ("/api/select-worktree", Method::POST, Authz::SessionAndCsrf),
+    // M11.05 (#550): destructive and irrecoverable — the full write posture,
+    // same as every other mutation here.
+    ("/api/remove-worktree", Method::POST, Authz::SessionAndCsrf),
     ("/api/rescan", Method::POST, Authz::SessionAndCsrf),
     ("/api/branch", Method::POST, Authz::SessionAndCsrf),
     ("/api/commit", Method::POST, Authz::SessionAndCsrf),
@@ -341,15 +344,18 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// dropped by a `main.rs` refactor that this scanner's pattern-matching
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
-/// 73 as of the M12 merge, and the way it got there is the reason this
-/// constant exists. `/api/select-worktree` (M11.03, #548) and
-/// `/api/add-worktree` (M11.04, #549) were developed on branches that each
-/// counted 71, so the number only became wrong once both were on one trunk —
-/// and `/api/repository/events` (M12.05, #555) then made the same crossing
-/// from a third branch that counted 72. Three routes, three branches, each
-/// individually correct; only the trunk can see the total. The first two are
-/// classified `SessionAndCsrf` above and the third `SessionRequired`.
-const EXPECTED_ROUTE_COUNT: usize = 73;
+///
+/// The way this number moves is the reason the constant exists. FOUR routes
+/// crossed onto the trunk from four separate branches, each of which counted
+/// correctly for the trunk it branched from:
+/// `/api/select-worktree` (M11.03, #548), `/api/add-worktree` (M11.04, #549)
+/// and `/api/remove-worktree` (M11.05, #550) are classified `SessionAndCsrf`
+/// above; `/api/repository/events` (M12.05, #555) is `SessionRequired`.
+/// No branch could see the total — only the trunk can, which is exactly what
+/// this constant and its test are for. Derived by running
+/// `every_registered_route_is_classified`, never copied from either side of a
+/// merge.
+const EXPECTED_ROUTE_COUNT: usize = 74;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in

@@ -892,9 +892,16 @@ pub const WORKTREE_OUTSIDE_BRANCH: &str = "feature/outside";
 pub const WORKTREE_GHOST_DESK: &str = "ghost-desk";
 pub const WORKTREE_GHOST_BRANCH: &str = "feature/ghost";
 
+/// A clean, plainly openable desk that exists **only** to be closed (M11.05,
+/// #550) — kept separate from [`WORKTREE_OPEN_DESK`] deliberately: that one
+/// is switched *to* by the drawer's own "opens a desk" spec, and a shared
+/// desk would make the two specs race over whether it still exists.
+pub const WORKTREE_REMOVABLE_DESK: &str = "removable-desk";
+pub const WORKTREE_REMOVABLE_BRANCH: &str = "feature/removable";
+
 /// How many rows the census reports for this fixture: the main worktree plus
-/// its four linked desks.
-pub const WORKTREE_ROW_COUNT: usize = 5;
+/// its five linked desks.
+pub const WORKTREE_ROW_COUNT: usize = 6;
 
 /// A NINTH repository: one whose desks span every state the drawer must tell
 /// apart (M11.03, #548).
@@ -913,6 +920,7 @@ pub const WORKTREE_ROW_COUNT: usize = 5;
 /// | `locked-desk` | `locked` | can open | git's flags are not the app's verdict |
 /// | `worktree-outside-desk` | nothing | outside your folders | the fence is stated, not silent |
 /// | `ghost-desk` | `prunable` | folder is gone | two sources, one row, two badges |
+/// | `removable-desk` | nothing | can open | closing a desk works end to end (M11.05, #550) |
 pub fn worktree_fixture(root: &Path) {
     fresh(root);
 
@@ -973,6 +981,14 @@ pub fn worktree_fixture(root: &Path) {
     let ghost = desks.join(WORKTREE_GHOST_DESK);
     add(&ghost, WORKTREE_GHOST_BRANCH);
     std::fs::remove_dir_all(&ghost).expect("fixture: remove the ghost desk's directory");
+
+    // Clean and servable, and never touched by anything but the removal spec
+    // itself (M11.05, #550) — see the constant's own doc comment for why it
+    // is not `WORKTREE_OPEN_DESK`.
+    add(
+        &desks.join(WORKTREE_REMOVABLE_DESK),
+        WORKTREE_REMOVABLE_BRANCH,
+    );
 }
 
 /// Every browser shape, by the name the `gv-fixture` binary accepts.
@@ -1475,6 +1491,20 @@ mod tests {
             !outside.starts_with(&root),
             "the outside desk is inside the repository, so it is not outside \
              the allowed root either"
+        );
+        // The removable desk (M11.05, #550) exists, is inside the allowed
+        // root, and carries none of the flags the others do — a plain,
+        // clean, servable desk with nothing to distinguish it except that a
+        // spec is allowed to destroy it.
+        let removable = root.join(WORKTREE_DESK_DIR).join(WORKTREE_REMOVABLE_DESK);
+        assert!(removable.exists(), "the removable desk was not created");
+        let removable_record = text
+            .split("\n\n")
+            .find(|r| r.contains(&removable.display().to_string()))
+            .expect("git worktree list must report the removable desk");
+        assert!(
+            !removable_record.contains("locked") && !removable_record.contains("prunable"),
+            "the removable desk must carry no git flags:\n{removable_record}"
         );
         // The parent's own status stays clean: `.desks` is excluded. A dirty
         // fixture would change what other assertions about this repo see.

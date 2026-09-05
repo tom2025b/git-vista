@@ -660,6 +660,7 @@ pub fn write_route(kind: &OperationKind) -> WriteRoute {
             WriteRoute::dedicated("delete_untracked_paths_request")
         }
         OperationKind::DeleteLocalTag { .. } => WriteRoute::dedicated("delete_tag_request"),
+        OperationKind::RemoveWorktree { .. } => WriteRoute::dedicated("remove_worktree_request"),
     }
 }
 
@@ -1844,6 +1845,10 @@ mod write_route_tests {
             OperationKind::DeleteLocalTag {
                 tag: "v1.0.0".into(),
             },
+            OperationKind::RemoveWorktree {
+                id: "worktree-desk-two".into(),
+                name: "desk-two".into(),
+            },
         ]
     }
 
@@ -1879,6 +1884,7 @@ mod write_route_tests {
                     ("delete_untracked_paths_request", None)
                 }
                 OperationKind::DeleteLocalTag { .. } => ("delete_tag_request", None),
+                OperationKind::RemoveWorktree { .. } => ("remove_worktree_request", None),
             };
             let got = write_route(&kind);
             assert_eq!(
@@ -1912,6 +1918,7 @@ mod write_route_tests {
             delete_untracked: bool,
             cherry_pick: bool,
             delete_local_tag: bool,
+            remove_worktree: bool,
         }
         let mut seen = Census::default();
         for kind in every_operation_kind() {
@@ -1929,6 +1936,7 @@ mod write_route_tests {
                 OperationKind::DeleteUntrackedPaths { .. } => seen.delete_untracked = true,
                 OperationKind::CherryPick { .. } => seen.cherry_pick = true,
                 OperationKind::DeleteLocalTag { .. } => seen.delete_local_tag = true,
+                OperationKind::RemoveWorktree { .. } => seen.remove_worktree = true,
             }
         }
         for (ticked, entry) in [
@@ -1945,6 +1953,7 @@ mod write_route_tests {
             (seen.delete_untracked, "DeleteUntrackedPaths"),
             (seen.cherry_pick, "CherryPick"),
             (seen.delete_local_tag, "DeleteLocalTag"),
+            (seen.remove_worktree, "RemoveWorktree"),
         ] {
             assert!(ticked, "every_operation_kind is missing {entry}");
         }

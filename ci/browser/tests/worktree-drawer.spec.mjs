@@ -40,6 +40,7 @@ import {
   OUTSIDE_ROOTS_SENTENCE,
   openWorktreeDrawer,
   openWorktreeRepo,
+  reopenWorktreeDrawer,
 } from './helpers.mjs'
 
 test.describe.serial('the worktree drawer', () => {
@@ -123,6 +124,49 @@ test.describe.serial('the worktree drawer', () => {
     const box = await open.boundingBox()
     expect(box.width).toBeGreaterThanOrEqual(44)
     expect(box.height).toBeGreaterThanOrEqual(44)
+  })
+
+  // A6 (M11.05, #550): closing a desk. Its own dedicated fixture desk
+  // (`removable-desk`) so this test can destroy it without any other test
+  // in this file noticing — see `WORKTREE_REMOVABLE_DESK`'s own doc comment.
+  test('closing a desk needs two taps and actually removes it', async ({ page }) => {
+    await openWorktreeRepo(page)
+    let drawer = await openWorktreeDrawer(page)
+
+    const row = drawer.locator('.act-file').filter({ hasText: 'removable-desk' })
+    await expect(row).toHaveCount(1)
+    const close = row.getByRole('button', { name: /Close ‘removable-desk’/ })
+    await expect(close).toBeVisible()
+
+    // The row is offered BOTH controls at once — opening and closing are
+    // independent questions about the same servable, non-current desk.
+    await expect(row.getByRole('button', { name: /Open ‘removable-desk’/ })).toBeVisible()
+
+    await close.click()
+
+    // The two-tap ceremony: the confirm button is inert until the arm step
+    // is pressed, exactly like the delete-untracked-files ceremony this one
+    // mirrors (#220).
+    const confirm = page.getByRole('button', { name: 'Close Worktree' })
+    await expect(confirm).toBeVisible()
+    await expect(confirm).toBeDisabled()
+    await expect(page.getByText('Close the worktree ‘removable-desk’?')).toBeVisible()
+
+    const arm = page.getByRole('button', {
+      name: 'Step 1 of 2 — I understand this is permanent',
+    })
+    await expect(arm).toBeVisible()
+    await arm.click()
+
+    await expect(confirm).toBeEnabled()
+    await confirm.click()
+
+    // The modal closes on confirm; the desk is gone once the drawer is
+    // reopened (D3 correctly skips an epoch bump this operation has no
+    // reason to trigger — see `reopenWorktreeDrawer`'s own doc comment).
+    await expect(page.getByRole('button', { name: 'Close Worktree' })).toHaveCount(0)
+    drawer = await reopenWorktreeDrawer(page)
+    await expect(drawer.locator('.act-file').filter({ hasText: 'removable-desk' })).toHaveCount(0)
   })
 
   // MUST BE LAST: this switches the served repository, which is process-global.
