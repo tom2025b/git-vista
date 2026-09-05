@@ -638,24 +638,48 @@ pub fn detail_panel_view(
                                 };
                                 let file_id = d.id.clone();
                                 let file_path = f.path.clone();
-                                let open_file = move |_| {
-                                    shell.open_viewer(ViewerDoc::File {
-                                        id: file_id.clone(),
+                                let open_file = {
+                                    let file_id = file_id.clone();
+                                    let file_path = file_path.clone();
+                                    move |_| {
+                                        shell.open_viewer(ViewerDoc::File {
+                                            id: file_id.clone(),
+                                            path: file_path.clone(),
+                                        });
+                                    }
+                                };
+                                // M5.33 (#86): rename-aware history/blame for
+                                // this file, as of this commit — a sibling
+                                // button rather than nesting inside
+                                // `open_file`'s (native buttons can't nest).
+                                let open_blame = move |ev: web_sys::MouseEvent| {
+                                    ev.stop_propagation();
+                                    shell.open_viewer(ViewerDoc::Blame {
                                         path: file_path.clone(),
+                                        rev: file_id.clone(),
                                     });
                                 };
                                 view! {
-                                    <button
-                                        class="detail-file"
-                                        title="View this file's full content (with Print / Save PDF)"
-                                        on:click=open_file
-                                    >
-                                        <span class=format!("nf ctx-icon {kind_class}")>
-                                            {glyph}
-                                        </span>
-                                        <span class="detail-file-path">{label}</span>
-                                        <span class="detail-file-counts">{counts}</span>
-                                    </button>
+                                    <div class="detail-file">
+                                        <button
+                                            class="detail-file-open"
+                                            title="View this file's full content (with Print / Save PDF)"
+                                            on:click=open_file
+                                        >
+                                            <span class=format!("nf ctx-icon {kind_class}")>
+                                                {glyph}
+                                            </span>
+                                            <span class="detail-file-path">{label}</span>
+                                            <span class="detail-file-counts">{counts}</span>
+                                        </button>
+                                        <button
+                                            class="detail-file-blame"
+                                            title="View this file's rename-aware history and blame"
+                                            on:click=open_blame
+                                        >
+                                            "Blame"
+                                        </button>
+                                    </div>
                                 }
                             })
                             .collect_view();

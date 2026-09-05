@@ -499,6 +499,12 @@ fn api_router(
         // Full file viewer: one file's whole content at one commit (`git show
         // <id>:<path>`), read on demand when a file in the diff list is tapped.
         .route("/api/file/{id}/{*path}", get(file_at_commit))
+        // M5.33 (#86): rename-aware file history and line-range blame, both
+        // paged and explicit about rename limits, binary files and absent
+        // paths. Reads of committed history exactly like `/api/diff`, so
+        // registered alongside it.
+        .route("/api/file-history", get(handlers::blame::file_history))
+        .route("/api/blame", get(handlers::blame::blame))
         // Issue #33 follow-up: the live checked-out branch, resolved fresh on every
         // request so the merge dialog shows the true target even without a Refresh.
         .route("/api/head-branch", get(head_branch))
