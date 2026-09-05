@@ -74,6 +74,10 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
         Method::GET,
         Authz::SessionRequired,
     ),
+    // M5.33 (#86): committed history + blame, the same read posture as
+    // `/api/diff/{id}` and `/api/file/{id}/{*path}` immediately above.
+    ("/api/file-history", Method::GET, Authz::SessionRequired),
+    ("/api/blame", Method::GET, Authz::SessionRequired),
     ("/api/head-branch", Method::GET, Authz::SessionRequired),
     ("/api/status", Method::GET, Authz::SessionRequired),
     // #68c: the generation-tagged WorktreeStatus DTO — same read posture as
@@ -339,7 +343,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// the trunk they branched from, so the number only became wrong once all
 /// three landed on one trunk. All three are classified `SessionAndCsrf`
 /// above.
-const EXPECTED_ROUTE_COUNT: usize = 73;
+const EXPECTED_ROUTE_COUNT: usize = 75;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in

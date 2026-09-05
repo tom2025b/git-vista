@@ -87,13 +87,21 @@
 //! `git log --follow -z --name-status --format=%x00%H%x09%an%x09%at%x09%s`
 //! interleaves a NUL-prefixed pretty-printed header with `-z`'s own
 //! NUL-terminated name-status record for that commit. Verified byte-for-byte
-//! (see `docs/adr/0121-*.md`): git inserts an unrequested `\n` between the
-//! formatted header and the name-status status code, so a header token
-//! parses as `"<hash>\t<author>\t<time>\t<summary>\n<STATUS>"` — the status
-//! byte is glued onto the header token, not the path token that follows it.
-//! `--follow` combined with a single pathspec restricts the name-status
-//! listing to exactly one record per commit, which is what makes
-//! [`parse_follow_history`] a flat loop rather than a nested one.
+//! (see `docs/adr/0121-*.md`), and re-verified after an initial misreading of
+//! the same trace got the byte order backwards: `-z` NUL-terminates the
+//! **pretty-printed header itself** (a plain header token, cleanly
+//! `"<hash>\t<author>\t<time>\t<summary>"` with no NUL inside it), and git
+//! separately inserts one literal `\n` *before* the name-status listing — so
+//! that newline lands glued onto the **front of the following token**
+//! (`"\nR100"`, `"\nA"`, …), not the tail of the header. Splitting the whole
+//! buffer on NUL therefore yields, per commit: a clean header token, then a
+//! status token with a leading `\n` to strip, then its 1-2 path tokens, then
+//! one empty separator token before the next commit's header (the byte
+//! between two adjacent NULs — the previous record's terminator and the next
+//! record's own leading `%x00`). `--follow` combined with a single pathspec
+//! restricts the name-status listing to exactly one record per commit, which
+//! is what makes [`parse_follow_history`] a flat loop rather than a nested
+//! one.
 
 use serde::{Deserialize, Serialize};
 
@@ -377,16 +385,28 @@ pub fn parse_follow_history(
     while i < tokens.len() {
         let header = tokens[i].clone();
         i += 1;
-        let Some((meta, status)) = header.rsplit_once('\n') else {
-            return Err(FollowHistoryParseError::MalformedHeader(header));
-        };
-        let fields: Vec<&str> = meta.splitn(4, '\t').collect();
+        let fields: Vec<&str> = header.splitn(4, '\t').collect();
         let [hash, author, time_str, summary] = fields[..] else {
-            return Err(FollowHistoryParseError::MalformedHeader(meta.to_string()));
+            return Err(FollowHistoryParseError::MalformedHeader(header));
         };
         let time: i64 = time_str
             .parse()
             .map_err(|_| FollowHistoryParseError::BadTime(time_str.to_string()))?;
+
+        // The status token carries a leading literal `\n`: `-z` NUL-terminates
+        // the custom `--format` output as its own record, and git then always
+        // inserts one literal newline before the name-status listing — a
+        // separate byte from any of `-z`'s own NUL terminators, verified
+        // directly (see the module doc; this is the exact detail an earlier
+        // reading of the same trace got wrong: the NUL lands *before* the
+        // newline, not after it, so the newline glues onto the *next* token,
+        // not the header).
+        let status_token = tokens
+            .get(i)
+            .ok_or_else(|| FollowHistoryParseError::MissingPath(hash.to_string(), String::new()))?
+            .clone();
+        i += 1;
+        let status = status_token.strip_prefix('\n').unwrap_or(&status_token);
 
         let is_rename_or_copy = status.starts_with('R') || status.starts_with('C');
         let (path, renamed_from) = if is_rename_or_copy {
@@ -692,11 +712,11 @@ mod follow_history_tests {
     fn two_commit_stream() -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(
-            b"\x0048038450aa1a68c092cc9b1d65c7e359042b35b5\tgit-vista-ci\t1788604866\tc2\nR051\x00",
+            b"\x0048038450aa1a68c092cc9b1d65c7e359042b35b5\tgit-vista-ci\t1788604866\tc2\x00\nR051\x00",
         );
         buf.extend_from_slice(b"sub/target.txt\x00sub/renamed.txt\x00");
         buf.extend_from_slice(
-            b"\x0024909fc9812477b9fdd37a29e02a20e046541aaf\tgit-vista-ci\t1788604866\tc1\nA\x00",
+            b"\x0024909fc9812477b9fdd37a29e02a20e046541aaf\tgit-vista-ci\t1788604866\tc1\x00\nA\x00",
         );
         buf.extend_from_slice(b"sub/target.txt\x00");
         buf
@@ -737,7 +757,7 @@ mod follow_history_tests {
     fn a_copy_status_carries_two_paths_like_a_rename() {
         let mut buf = Vec::new();
         buf.extend_from_slice(
-            b"\x00cafefeedcafefeedcafefeedcafefeedcafefeed\ta\t1\tcopy\nC100\x00",
+            b"\x00cafefeedcafefeedcafefeedcafefeedcafefeed\ta\t1\tcopy\x00\nC100\x00",
         );
         buf.extend_from_slice(b"src.txt\x00dst.txt\x00");
         let entries = parse_follow_history(&buf).unwrap();
@@ -751,7 +771,7 @@ mod follow_history_tests {
         // field whole, so a pathological subject line survives intact.
         let mut buf = Vec::new();
         buf.extend_from_slice(
-            b"\x00cafefeedcafefeedcafefeedcafefeedcafefeed\ta\t1\tsummary\twith\ttabs\nA\x00",
+            b"\x00cafefeedcafefeedcafefeedcafefeedcafefeed\ta\t1\tsummary\twith\ttabs\x00\nA\x00",
         );
         buf.extend_from_slice(b"only.txt\x00");
         let entries = parse_follow_history(&buf).unwrap();
@@ -759,8 +779,10 @@ mod follow_history_tests {
     }
 
     #[test]
-    fn a_header_missing_its_newline_separated_status_is_rejected_not_panicked() {
-        let buf = b"\x00cafefeedcafefeedcafefeedcafefeedcafefeed\ta\t1\tno newline here\x00";
+    fn a_header_with_fewer_than_four_tab_fields_is_rejected_not_panicked() {
+        // Only 3 fields (hash, author, time) — the summary is missing
+        // entirely, which a capped read ending exactly on a tab could produce.
+        let buf = b"\x00cafefeedcafefeedcafefeedcafefeedcafefeed\ta\t1\x00";
         assert!(matches!(
             parse_follow_history(buf),
             Err(FollowHistoryParseError::MalformedHeader(_))
@@ -768,9 +790,20 @@ mod follow_history_tests {
     }
 
     #[test]
+    fn a_header_with_no_status_token_at_all_is_rejected_not_panicked() {
+        // A capped/truncated read can end right after a header, before the
+        // name-status listing's own NUL-delimited status token even begins.
+        let buf = b"\x00cafefeedcafefeedcafefeedcafefeedcafefeed\ta\t1\ts";
+        assert!(matches!(
+            parse_follow_history(buf),
+            Err(FollowHistoryParseError::MissingPath(_, _))
+        ));
+    }
+
+    #[test]
     fn a_status_missing_its_path_is_rejected_not_panicked() {
-        // A capped/truncated read can end right after a header.
-        let buf = b"\x00cafefeedcafefeedcafefeedcafefeedcafefeed\ta\t1\ts\nA";
+        // The status token itself arrived, but nothing follows it.
+        let buf = b"\x00cafefeedcafefeedcafefeedcafefeedcafefeed\ta\t1\ts\x00\nA";
         assert!(matches!(
             parse_follow_history(buf),
             Err(FollowHistoryParseError::MissingPath(_, _))
@@ -779,7 +812,8 @@ mod follow_history_tests {
 
     #[test]
     fn a_non_numeric_time_is_rejected_not_panicked() {
-        let buf = b"\x00cafefeedcafefeedcafefeedcafefeedcafefeed\ta\tnotanumber\ts\nA\x00p.txt\x00";
+        let buf =
+            b"\x00cafefeedcafefeedcafefeedcafefeedcafefeed\ta\tnotanumber\ts\x00\nA\x00p.txt\x00";
         assert!(matches!(
             parse_follow_history(buf),
             Err(FollowHistoryParseError::BadTime(_))
