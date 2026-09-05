@@ -406,3 +406,71 @@ fn head_oid(repo: &Path) -> String {
         .expect("run git rev-parse");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
+
+// --- #556's measurement ----------------------------------------------------
+
+/// Measure one sweep, and the watch set, against a repository named by
+/// `GV_MEASURE_REPO`. `#[ignore]`d: it needs a repository this suite does not
+/// build, and it asserts nothing about a machine it cannot see.
+///
+/// It exists as a **test rather than a script** so the numbers in #556's PR
+/// come from the production read path — `planner::live_reading` and
+/// `WatchRoots::wanted_directories` — rather than from a `git for-each-ref`
+/// standing in for them. A proxy measurement is how the previous bound came to
+/// be justified against a constant that was wrong by a factor of 63.
+///
+/// ```text
+/// GV_MEASURE_REPO=/path/to/repo cargo test -p git-vista-server \
+///     measure_one_sweep -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "needs GV_MEASURE_REPO; reports numbers rather than asserting them"]
+async fn measure_one_sweep_and_the_watch_set() {
+    let Ok(repo) = std::env::var("GV_MEASURE_REPO") else {
+        panic!("set GV_MEASURE_REPO to the repository to measure");
+    };
+    let repo = PathBuf::from(repo);
+
+    let budget = crate::watcher::budget::derive(crate::watcher::budget::InotifyLimits::read());
+    println!("repository        {}", repo.display());
+    println!("watch budget      {budget:?}");
+
+    // Ten sweeps: the first is cold, the rest are what a running feed pays.
+    let mut costs = Vec::new();
+    for _ in 0..10 {
+        let began = Instant::now();
+        let reading = crate::planner::live_reading(&repo).await;
+        costs.push(began.elapsed());
+        assert!(
+            reading.blind.is_none(),
+            "the measured repository must be readable: {:?}",
+            reading.blind
+        );
+        println!(
+            "sweep             {:>8.1} ms   refs={} generation={}",
+            costs.last().unwrap().as_secs_f64() * 1000.0,
+            reading.refs.len(),
+            reading.token.as_str()
+        );
+    }
+    let warm: Duration = costs[1..].iter().sum::<Duration>() / (costs.len() as u32 - 1);
+    let floor = warm.saturating_mul(policy::DUTY_FACTOR);
+    println!(
+        "warm mean         {:>8.1} ms  → duty-cycle floor {:.1} ms; the binding \
+         constraint is {}",
+        warm.as_secs_f64() * 1000.0,
+        floor.as_secs_f64() * 1000.0,
+        if floor > policy::SWEEP_BASE {
+            "the sweep's own measured cost"
+        } else {
+            "the base interval"
+        }
+    );
+
+    let mut watcher = crate::watcher::RepositoryWatcher::start(&repo);
+    let health = tokio::time::timeout(Duration::from_secs(20), watcher.recv())
+        .await
+        .expect("the watcher reported")
+        .expect("the watcher's stream stayed open");
+    println!("watcher           {health:?}");
+}
