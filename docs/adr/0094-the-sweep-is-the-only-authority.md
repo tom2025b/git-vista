@@ -516,13 +516,38 @@ Three things fall out, and the third is a finding rather than a result:
   not — the feed opened on the launch repository and did not follow the
   session's selection.
 
-## Open, and deliberately not decided here
+## The operator's five questions
 
-Five questions were named as the operator's in #551's spec. Four are implemented
-at the spec's own recommendation and are cheap to change: the working tree is
-not watched; `SWEEP_BASE` is 2 s backing off to 60 s; the feed runs only while a
-stream is open; the `Moved` / `MovedElsewhere` distinction is drawn. The fifth —
-whether `ChangeFeedHealth` gets a permanent, quiet affordance in the topbar or
-appears only when degraded — is **not implemented at all**: the value is on the
-wire and nothing renders it outside the plan panel. That is the honest state,
-and it is a decision about pixels in the operator's topbar.
+Five were named as the operator's in #551's spec. Four are implemented at the
+spec's own recommendation and are cheap to change: the working tree is not
+watched; `SWEEP_BASE` is 2 s backing off to 60 s; the feed runs only while a
+stream is open; the `Moved` / `MovedElsewhere` distinction is drawn.
+
+### 7. The health affordance is permanent, not conditional (the operator's call)
+
+**Decided 2026-09-05: `ChangeFeedHealth` gets a permanent, quiet affordance in
+the topbar** rather than one that appears only when the feed is degraded.
+
+The reasoning is worth recording rather than only implementing, because it is
+this milestone's own argument turned on its own user interface:
+
+> An indicator that appears only when something is wrong is indistinguishable,
+> at a glance, from an indicator that has stopped working. "Nothing there" can
+> only mean "healthy" if the healthy state is also drawn.
+
+That is the same argument decision 5 makes about a watcher that quietly reduces
+its coverage, and the same one this whole milestone exists for. A conditional
+affordance would have the UI adopt the exact failure shape the backend was built
+to avoid — and ADR 0055 already took this position once, for the status chip's
+age, on identical grounds: a trust signal that only appears when things are
+wrong is a trust signal nobody learns to read.
+
+**Design constraint carried with the decision:** healthy is the resting state and
+must be visually unremarkable — not a green badge competing for attention.
+Degraded is the thing that *changes*, against a baseline that was always there.
+
+**Not implemented in this record's slice.** The value is on the wire and the plan
+panel reads it; nothing renders it in the topbar yet. That is real UI work with
+its own a11y pass and its own browser leg, and it arrived at a review boundary —
+so it is its own issue rather than a late addition to a branch already being
+read. The decision above is settled; only the pixels are outstanding.
