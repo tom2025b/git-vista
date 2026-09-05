@@ -189,6 +189,35 @@ mod tests {
         assert_eq!(mask_token("abcde"), "...bcde");
     }
 
+    // -- keyring tier: the real glue, exercised directly --
+
+    #[test]
+    fn keyring_token_never_panics_regardless_of_platform_availability() {
+        // Whether or not this machine has a working D-Bus secret service,
+        // the call must fold every failure into `None` rather than panic —
+        // keyring absence must never surface as a server error (#583).
+        let _ = keyring_token();
+    }
+
+    #[test]
+    #[ignore = "needs a live OS keyring / D-Bus secret service; run manually with \
+                `cargo test -p git-vista-server --bins token_store::tests::keyring_round_trip_against_a_real_backend -- --ignored`"]
+    fn keyring_round_trip_against_a_real_backend() {
+        // A throwaway service/username, never the production
+        // KEYRING_SERVICE/KEYRING_USERNAME — this must not read, overwrite,
+        // or delete a real token a developer has already stored.
+        let entry = keyring::Entry::new("git-vista-test", "token-store-round-trip")
+            .expect("a live keyring backend for this manual test");
+        entry
+            .set_password("round-trip-canary")
+            .expect("writing the test entry");
+        let read_back = entry.get_password().expect("reading the test entry back");
+        assert_eq!(read_back, "round-trip-canary");
+        entry
+            .delete_credential()
+            .expect("cleaning up the test entry");
+    }
+
     // -- precedence: pure, dependency-injected, no real source touched --
 
     #[test]
