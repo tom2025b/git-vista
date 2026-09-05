@@ -190,6 +190,76 @@ test.describe('#86 blame: touch selection and its keyboard equal', () => {
     ).toBe(true)
   })
 
+  // #86 review: the comparison path had NO browser assertion, and the index
+  // bug lived exactly there — selection stores row indices, ranges carry
+  // 1-based line numbers, and the toolbar searched one space with the other.
+  // Row 0 therefore offered no comparison at all, and later rows could resolve
+  // to the wrong commit. A test that only checks "a toolbar appeared" would
+  // have passed throughout; this checks WHICH commit it names.
+  test('selecting the first row offers a comparison, and it names that row\'s commit', async ({
+    page,
+  }) => {
+    await openBlame(page)
+
+    const firstCommit = await page.evaluate(
+      () => document.querySelector('.blame-commit').textContent.trim(),
+    )
+    // Tap the first row's select target — a real click, which is also the
+    // gesture the tap-self-clear bug broke.
+    await page.locator('.blame-select').first().click()
+
+    const toolbar = page.locator('.blame-toolbar button')
+    await expect(
+      toolbar,
+      'row 0 must offer a comparison — under the index/line bug it never did',
+    ).toBeVisible({ timeout: 10_000 })
+    await expect(
+      toolbar,
+      'the offer must name the SELECTED row\'s commit, not whichever range happened to span the index',
+    ).toContainText(firstCommit)
+  })
+
+  test('a later row offers a comparison naming its own commit, not an earlier one', async ({
+    page,
+  }) => {
+    await openBlame(page)
+    const rows = await page.locator('.blame-select').count()
+    test.skip(rows < 2, 'needs at least two ranges')
+
+    const secondCommit = await page.evaluate(
+      () => [...document.querySelectorAll('.blame-commit')][1].textContent.trim(),
+    )
+    await page.locator('.blame-select').nth(1).click()
+
+    const toolbar = page.locator('.blame-toolbar button')
+    await expect(toolbar).toBeVisible({ timeout: 10_000 })
+    await expect(toolbar).toContainText(secondCommit)
+  })
+
+  // The tap that undid itself: pointerdown committed a selection and the
+  // click that follows toggled it back off, so the control looked dead. The
+  // drag tests could not see it because they never dispatch a real click.
+  test('a plain tap leaves the row selected', async ({ page }) => {
+    await openBlame(page)
+    await page.locator('.blame-select').first().click()
+    await expect(
+      page.locator('.blame-select').first(),
+      'a tap must select and STAY selected — pointerdown and click must not both decide',
+    ).toHaveAttribute('aria-pressed', 'true')
+  })
+
+  test('tapping the same row again clears it', async ({ page }) => {
+    await openBlame(page)
+    const target = page.locator('.blame-select').first()
+    await target.click()
+    await expect(target).toHaveAttribute('aria-pressed', 'true')
+    await target.click()
+    await expect(target, 'a second tap is the way back out').toHaveAttribute(
+      'aria-pressed',
+      'false',
+    )
+  })
+
   test('clicking a row opens that commit in the detail panel', async ({ page }) => {
     await openBlame(page)
 

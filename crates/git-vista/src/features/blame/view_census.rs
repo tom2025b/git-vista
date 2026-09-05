@@ -180,6 +180,60 @@ fn no_decision_logic_has_drifted_into_the_wasm_only_view() {
     }
 }
 
+/// The index-space bug the substring checks could not see (#86 review).
+///
+/// `BlameSelection` stores ROW INDICES; `BlameRange::start_line`/`end_line`
+/// are 1-based SOURCE LINE numbers. The first version of the toolbar searched
+/// the ranges for one whose line interval contained the selected row index —
+/// a category error that made row 0 offer no comparison at all (no line is
+/// numbered 0) and made later rows resolve to whichever earlier range
+/// happened to span that small integer. Every substring assertion in this
+/// file passed straight over it, which is the honest limit of a source
+/// census: it can see that `offer_for` is called, not that it is called with
+/// the right commit.
+///
+/// So this pins the one composition that carries the whole mapping.
+#[test]
+fn the_toolbar_indexes_the_range_slice_rather_than_searching_line_numbers() {
+    assert!(
+        VIEW_SRC.contains("ranges_for_toolbar\n            .get(*range.start())")
+            || VIEW_SRC.contains("ranges_for_toolbar.get(*range.start())"),
+        "the compare toolbar must index the range slice by the selected ROW, not \
+         search it by line number — the two are different coordinate spaces and \
+         mixing them silently opens a comparison on the wrong commit"
+    );
+    assert!(
+        !VIEW_SRC.contains("r.start_line <= start && start <= r.end_line"),
+        "the line-interval search is back — that is the round's index/line \
+         category error, which no other assertion in this file can see"
+    );
+}
+
+/// The tap that undid itself (#86 review). `pointerdown` committed a
+/// selection and the click that inevitably follows toggled it straight back
+/// off, so a plain tap left the control looking dead. The browser spec could
+/// not see it because it dispatched pointer events directly and never a real
+/// click.
+#[test]
+fn a_tap_is_decided_in_one_place_not_two() {
+    let down = VIEW_SRC
+        .split("let on_select_pointer_down")
+        .nth(1)
+        .and_then(|s| s.split("};").next())
+        .expect("the pointerdown handler exists");
+    assert!(
+        !down.contains("s.start("),
+        "pointerdown must only ANCHOR a possible drag, never commit a selection \
+         — committing here and toggling again on the click that follows is what \
+         made a tap select and instantly deselect"
+    );
+    assert!(
+        VIEW_SRC.contains("if dragged.get_value()"),
+        "the click handler must be able to tell a tap from the click that merely \
+         ends a drag, or ending a drag re-decides what the drag selected"
+    );
+}
+
 /// The two criteria "blame ranges map to commits and comparisons" reduce to
 /// on this surface: a row opens the existing commit-detail panel, and the
 /// toolbar opens the existing comparison viewer. Both must go through the

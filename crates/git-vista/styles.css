@@ -342,6 +342,14 @@ html, body {
 .blame-author { flex: 0 0 auto; color: var(--muted, #8b949e); }
 .blame-summary { flex: 1; word-break: break-word; }
 .blame-toolbar { display: flex; gap: 8px; margin: 0.5rem 0; }
+.blame-pager {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 0.5rem 0;
+  font-size: 0.85rem;
+}
+.blame-pager-at { color: var(--muted, #8b949e); font-variant-numeric: tabular-nums; }
 .blame-rename-warning { color: #d29922; }
 .blame-history { margin-top: 0.75rem; border-top: 1px solid #21262d; padding-top: 0.5rem; }
 .blame-history-list { list-style: none; margin: 0; padding: 0; }
@@ -1413,8 +1421,6 @@ html .detail-panel.detail-panel--full .detail-body {
 .detail-parent:focus-visible { border-color: var(--accent); }
 .detail-github:focus-visible { text-decoration: underline; }
 .detail-expand:focus-visible { border-color: var(--accent); }
-button.detail-file:focus-visible { background: #21262d; }
-button.detail-file:focus-visible .detail-file-path { color: var(--accent); }
 
 /* Activity feed. */
 .act-refresh:focus-visible { border-color: var(--accent); }

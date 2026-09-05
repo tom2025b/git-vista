@@ -187,6 +187,12 @@ pub fn viewer_view(
     // range selection — created here, above the render closures, for the
     // same reason as `hunk_focus`: a re-render must not reset the position.
     let blame_focus = create_rw_signal(GraphFocus::new(0));
+    // #86 review: the blame/history windows the user has paged to. `None` /
+    // `0` mean "the server's default first page". Held here, above the render
+    // closures, so paging survives a re-render — and reset whenever the open
+    // document changes, since a window into one file means nothing in another.
+    let blame_window = create_rw_signal(None::<(usize, usize)>);
+    let history_skip = create_rw_signal(0usize);
     let blame_selection = create_rw_signal(crate::features::blame::core::BlameSelection::new());
     let staging_preview = create_rw_signal(None::<Result<PatchPreview, String>>);
     // The exact plan `staging_preview` was built from (review finding,
@@ -208,8 +214,12 @@ pub fn viewer_view(
     // fetch picks the endpoint. A stale response is ignored via the id/path
     // echo, same rule as the detail panel's fetches.
     let doc = create_local_resource(
-        move || shell.viewer_doc(),
-        move |doc| async move {
+        // The blame window is part of the key: without it, asking for page 2
+        // changed a signal nothing re-read and the request was never made.
+        // Other document kinds ignore it, and it only ever moves while a
+        // Blame document is open.
+        move || (shell.viewer_doc(), blame_window.get()),
+        move |(doc, window)| async move {
             match doc {
                 None => None,
                 Some(ViewerDoc::Diff { id }) => Some(DocResult::Diff(fetch_diff_full(&id).await)),
@@ -230,7 +240,11 @@ pub fn viewer_view(
                     // would address ranges that may no longer exist —
                     // same rule `Staging`'s arm applies to its own selection.
                     blame_selection.update(|s| s.clear());
-                    Some(DocResult::Blame(fetch_blame(&path, &rev, None, None).await))
+                    let (start, end) = match window {
+                        Some((s, e)) => (Some(s), Some(e)),
+                        None => (None, None),
+                    };
+                    Some(DocResult::Blame(fetch_blame(&path, &rev, start, end).await))
                 }
                 Some(ViewerDoc::Conflict { path }) => {
                     // A refusal belongs to the path it was about; carrying it
@@ -255,16 +269,24 @@ pub fn viewer_view(
     // settling, so gating the whole panel on both landing together would
     // make the ranges wait on a fetch they do not need.
     let blame_history = create_local_resource(
-        move || shell.viewer_doc(),
-        |doc| async move {
+        move || (shell.viewer_doc(), history_skip.get()),
+        |(doc, skip)| async move {
             match doc {
                 Some(ViewerDoc::Blame { path, rev }) => {
-                    Some(fetch_file_history(&path, &rev, None).await)
+                    let skip = if skip == 0 { None } else { Some(skip) };
+                    Some(fetch_file_history(&path, &rev, skip).await)
                 }
                 _ => None,
             }
         },
     );
+    // A window into one file is meaningless in another, so both reset when the
+    // open document changes.
+    create_effect(move |_| {
+        let _ = shell.viewer_doc();
+        blame_window.set(None);
+        history_skip.set(0);
+    });
     move || {
         let open = shell.viewer_doc();
         // The print CSS keys off <html data-print> — set while open, cleared
@@ -385,6 +407,8 @@ pub fn viewer_view(
                         blame_selection,
                         shell,
                         compare_anchor,
+                        blame_window,
+                        history_skip,
                     )
                 }
                 Some(DocResult::Staging(Ok(d))) => {

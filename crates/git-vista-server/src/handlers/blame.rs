@@ -9,14 +9,25 @@
 //! ranges are re-derived from scratch on every call, the same stateless
 //! posture ADR 0022 established for paged commit history.
 //!
-//! # Cancellation
+//! # Cancellation, and exactly how far it goes
 //!
-//! Every git spawn here goes through [`crate::git_cmd::git_stdout_capped`] or
-//! [`crate::git_cmd::git_output`], both of which set `.kill_on_drop(true)`.
-//! Axum drops a handler's future the moment the client disconnects (a
-//! navigated-away tab, an aborted `fetch`), which drops the still-running
-//! child along with it — the same mechanism ADR 0022 documents for paged
-//! history, applied here with no extra code.
+//! The reads that carry the data — the blob, the history walk, the blame —
+//! go through [`crate::git_cmd::git_stdout_capped`] and
+//! [`crate::git_cmd::git_stdout_stderr_capped`], which set
+//! `.kill_on_drop(true)`. Axum drops a handler's future when the client
+//! disconnects, which drops those children with it (ADR 0022's mechanism,
+//! reused rather than reinvented).
+//!
+//! **The short exit-code probes do not have that property, and this doc used
+//! to claim they did.** `git cat-file -e` runs through
+//! [`crate::git_cmd::git_output`], whose `.output()` never sets
+//! `kill_on_drop` — tokio's default is `false`. A dropped future therefore
+//! leaves those probes to finish on their own. They are bounded by what they
+//! are (one object-existence check: no walk, no output to speak of) rather
+//! than by a kill signal, which is why this is recorded honestly instead of
+//! being fixed by widening a shared helper every other caller depends on.
+//! Found in review (#86): the original sentence asserted `git_output` sets
+//! the flag, and it does not.
 
 use std::path::Path;
 
@@ -31,7 +42,7 @@ use git_vista_protocol::blame::{
     BlameRange, FileHistoryPage, PathState, RenameLimitNotice,
 };
 
-use crate::git_cmd::{git_output, git_stdout_capped};
+use crate::git_cmd::{git_output, git_stdout_capped, git_stdout_stderr_capped};
 use crate::handlers::read::resolve_repo;
 
 /// Upper bound on one file-history/blame metadata read — same cap family as
@@ -40,15 +51,24 @@ use crate::handlers::read::resolve_repo;
 /// exactly the failure `commit_diff_for_repo`'s own metadata cap refuses.
 const METADATA_CAP: usize = 8 * 1024 * 1024;
 
-/// Upper bound on how many rename hops [`classify_path`] will chase before
-/// giving up and reporting what it found so far. Each hop is one `git log
-/// --diff-filter=D -1` plus (when that finds a commit) one unrestricted `git
-/// show --name-status`, so the walk's cost is `O(hops)` git spawns, never
-/// `O(history size)` — the explicit performance limit this whole feature is
-/// asked for. 20 is generous: a file renamed 20 times in one repository's
-/// life is already an extraordinary case, and the bound exists so a
-/// pathological or adversarial rename cascade cannot turn one request into an
-/// unbounded chain of spawns.
+/// Upper bound on how many rename hops [`classify_path`] will chase.
+///
+/// # What this bounds, precisely (corrected in #86 review)
+///
+/// A successful hop costs **three** spawns, not two as an earlier version of
+/// this comment said: `git log --diff-filter=D -1`, then an unrestricted
+/// `git show --name-status`, then a `git cat-file -e` liveness probe on the
+/// destination. Plus one `cat-file -e` before the walk begins. So 20 hops is
+/// bounded by ~61 spawns, not 40.
+///
+/// And it bounds the **spawn count only**. Each `git log --diff-filter=D -1`
+/// may walk from `rev` back to the commit that removed the name, so the work
+/// inside a spawn still depends on history depth — the earlier claim of
+/// "never `O(history size)`" was too strong. What the cap genuinely prevents
+/// is an unbounded *chain* of spawns from a pathological or adversarial
+/// rename cascade. 20 is generous: a file renamed 20 times in one
+/// repository's life is already extraordinary, and exceeding it now produces
+/// [`PathState::RenameChainTooLong`] rather than a confident wrong answer.
 const MAX_RENAME_HOPS: u32 = 20;
 
 fn process_error(endpoint: &str, e: std::io::Error) -> (StatusCode, String) {
@@ -116,7 +136,7 @@ async fn classify_path(
 /// wherever its identity ended up, bounded by [`MAX_RENAME_HOPS`].
 ///
 /// Why this can't be answered with one `git log --follow`: verified directly
-/// (see `docs/adr/0121-*.md`) that `--follow` only resolves a full rename
+/// (see `docs/adr/0124-a-rename-is-followed-forward-by-walking-not-by-asking-follow.md`) that `--follow` only resolves a full rename
 /// record when the queried name is the *immediate* predecessor of the file's
 /// identity at the log's starting point. Query it with a name that is itself
 /// two or more renames stale and `--follow` degrades the very next rename
@@ -186,11 +206,15 @@ async fn chase_rename_chain(
         }
     }
 
-    // Hop budget exhausted: report the furthest point actually confirmed
-    // rather than either erroring or silently pretending the chain ended.
-    Ok(PathState::RenamedAway {
+    // Hop budget exhausted. NOT `RenamedAway`: the loop only reaches here
+    // because every destination it found was proven dead at this revision, so
+    // calling the last one `current_path` would assert the opposite of what
+    // was just measured (#86 review). The incomplete answer gets its own
+    // state and says how far it got.
+    Ok(PathState::RenameChainTooLong {
         last_commit: last_commit.unwrap_or_else(|| path.to_string()),
-        current_path: current,
+        last_known_path: current,
+        hops: MAX_RENAME_HOPS,
     })
 }
 
@@ -340,7 +364,14 @@ async fn file_history_for_repo(
     let args = [
         "log".to_string(),
         "--follow".to_string(),
-        format!("-l{}", i32::MAX), // never silently substitute our own guess for the repo's configured limit — see the module doc on why the limit is detected, not overridden.
+        // No `-l` here, and that absence is the decision (#86 review).
+        // `-l<n>` is a per-invocation override of `diff.renameLimit`, so the
+        // first version of this line passed `-l<i32::MAX>` while its own
+        // trailing comment claimed the limit was "detected, not overridden".
+        // It did the exact opposite of what it said: it replaced the
+        // repository's configured policy AND suppressed the very warning this
+        // feature exists to surface. Omitting the flag is what makes the
+        // repository's own limit apply and its warning appear.
         "-z".to_string(),
         "--name-status".to_string(),
         "--format=%x00%H%x09%an%x09%at%x09%s".to_string(),
@@ -350,7 +381,12 @@ async fn file_history_for_repo(
         "--".to_string(),
         walk_from,
     ];
-    let (bytes, truncated) = git_stdout_capped(repo, &args, endpoint, METADATA_CAP).await?;
+    // Both streams from ONE child: the rename-limit warning is on stderr, and
+    // re-running the command to fetch it (as this used to) was an uncapped,
+    // un-killable second history walk whose output could disagree with the
+    // first — see `git_stdout_stderr_capped`.
+    let (bytes, errs, truncated) =
+        git_stdout_stderr_capped(repo, &args, endpoint, METADATA_CAP).await?;
     if truncated {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -370,17 +406,12 @@ async fn file_history_for_repo(
         None
     };
 
-    // Rename-limit detection scans stderr from the *same* invocation whose
-    // output was just parsed — a limit hit anywhere in this page's walk means
-    // exactly this page's chain may be missing a rename.
-    let stderr = capture_stderr_only(repo, &args, endpoint)
-        .await
-        .unwrap_or_default();
-    let newest_commit = entries
-        .first()
-        .map(|e| e.commit.clone())
-        .unwrap_or_default();
-    let rename_limit_hits = scan_rename_limit_warnings(&stderr, &newest_commit);
+    // Rename-limit detection, from the same child's stderr. A hit anywhere in
+    // this page's walk means this page's chain may be missing a rename; the
+    // notice does not claim WHICH commit, because git's warning does not say
+    // and an earlier version's guess (the newest entry of whatever page was in
+    // hand) could name a commit with nothing to do with it.
+    let rename_limit_hits = scan_rename_limit_warnings(&String::from_utf8_lossy(&errs));
 
     Ok(FileHistoryPage {
         path: path.to_string(),
@@ -390,25 +421,6 @@ async fn file_history_for_repo(
         path_state,
         rename_limit_hits,
     })
-}
-
-/// Re-run `args` once more purely to recover stderr — `git_stdout_capped`
-/// only returns stdout bytes plus a truncation flag, and the rename-limit
-/// warning lives on stderr. Re-running rather than widening
-/// `git_stdout_capped`'s return shape keeps that shared primitive's contract
-/// unchanged for its eight other call sites; the extra spawn is the same
-/// bounded, cancellable, capped read as the first, so its cost is the same
-/// order as the read whose stderr it is recovering.
-async fn capture_stderr_only(
-    repo: &Path,
-    args: &[String],
-    _endpoint: &str,
-) -> Result<String, (StatusCode, String)> {
-    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-    let output = git_output(repo, &borrowed)
-        .await
-        .map_err(|e| process_error("/api/file-history", e))?;
-    Ok(String::from_utf8_lossy(&output.stderr).into_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -431,10 +443,14 @@ pub(crate) struct BlameQuery {
 }
 
 /// Default page height for `/api/blame` — how many lines one request blames
-/// when the client does not ask for a specific window. Small enough that a
-/// blame of a huge file costs proportionally to what is actually shown, not
-/// to the file's full length (M5.33, #86's stated performance limit); large
-/// enough that most real source files fit in one page.
+/// when the client does not ask for a specific window.
+///
+/// It bounds the returned window and the porcelain this server parses, and
+/// nothing else: git's own walk still costs what the target lines' distance
+/// from the requested revision costs, and `classify_path` reads the whole
+/// blob once regardless (#86 review corrected an earlier claim here that the
+/// cost was proportional to what is shown). 500 is large enough that most
+/// real source files arrive in one page.
 const BLAME_PAGE_LINES: usize = 500;
 
 pub(crate) async fn blame(
@@ -516,7 +532,8 @@ async fn blame_for_repo(
         "--".to_string(),
         path.to_string(),
     ];
-    let (bytes, truncated) = git_stdout_capped(repo, &args, endpoint, METADATA_CAP).await?;
+    let (bytes, errs, truncated) =
+        git_stdout_stderr_capped(repo, &args, endpoint, METADATA_CAP).await?;
     if truncated {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -530,12 +547,8 @@ async fn blame_for_repo(
         )
     })?;
 
-    let stderr = capture_stderr_only(repo, &args, endpoint)
-        .await
-        .unwrap_or_default();
-    let newest_commit = ranges.first().map(|r| r.commit.clone()).unwrap_or_default();
     let rename_limit_hits: Vec<RenameLimitNotice> =
-        scan_rename_limit_warnings(&stderr, &newest_commit);
+        scan_rename_limit_warnings(&String::from_utf8_lossy(&errs));
 
     Ok(BlamePage {
         path: path.to_string(),
@@ -703,6 +716,88 @@ mod tests {
         match state {
             PathState::RenamedAway { current_path, .. } => assert_eq!(current_path, "c.txt"),
             other => panic!("expected RenamedAway to c.txt, got {other:?}"),
+        }
+    }
+
+    /// Exhausting the hop cap must not claim the file is at the last name it
+    /// tried (#86 review). Every hop only continues because its destination
+    /// was just proven absent, so `RenamedAway { current_path }` there would
+    /// assert the opposite of what the code measured one line earlier.
+    #[tokio::test]
+    async fn exhausting_the_hop_cap_reports_incompleteness_not_a_false_location() {
+        let dir = repo();
+        gf::write(dir.path(), "n0.txt", b"hello\n");
+        gf::run(dir.path(), &["add", "-A"]);
+        gf::run(dir.path(), &["commit", "-q", "-m", "add n0"]);
+        // One more rename than the chase will follow, so the walk runs out
+        // before it reaches the live name.
+        let renames = MAX_RENAME_HOPS + 1;
+        for i in 0..renames {
+            gf::run(
+                dir.path(),
+                &["mv", &format!("n{i}.txt"), &format!("n{}.txt", i + 1)],
+            );
+            gf::run(dir.path(), &["commit", "-q", "-m", &format!("rename {i}")]);
+        }
+
+        let (state, _) = classify_path(dir.path(), "HEAD", "n0.txt", "test")
+            .await
+            .unwrap();
+        match state {
+            PathState::RenameChainTooLong {
+                last_known_path,
+                hops,
+                ..
+            } => {
+                assert_eq!(hops, MAX_RENAME_HOPS);
+                // The lead is real but is NOT where the file is: the live
+                // name is the last one, which the walk never reached.
+                assert_ne!(
+                    last_known_path,
+                    format!("n{renames}.txt"),
+                    "the walk cannot have reached the live name — that is the premise"
+                );
+                // THE point of this state. The furthest name reached is dead
+                // at HEAD — which is exactly why the old code calling it
+                // `current_path` was a false statement, and why this variant
+                // says "lead" rather than "location".
+                assert!(
+                    !gf::try_run(
+                        dir.path(),
+                        &["cat-file", "-e", &format!("HEAD:{last_known_path}")]
+                    ),
+                    "last_known_path ({last_known_path}) must NOT be alive — if it \
+                     were, the chase should have returned RenamedAway"
+                );
+            }
+            other => panic!("expected RenameChainTooLong, got {other:?}"),
+        }
+    }
+
+    /// The control: one hop under the cap still resolves normally, so the
+    /// test above is about the CAP and not about long chains generally.
+    #[tokio::test]
+    async fn a_chain_just_under_the_cap_still_resolves_to_the_live_name() {
+        let dir = repo();
+        gf::write(dir.path(), "m0.txt", b"hello\n");
+        gf::run(dir.path(), &["add", "-A"]);
+        gf::run(dir.path(), &["commit", "-q", "-m", "add m0"]);
+        let renames = MAX_RENAME_HOPS - 1;
+        for i in 0..renames {
+            gf::run(
+                dir.path(),
+                &["mv", &format!("m{i}.txt"), &format!("m{}.txt", i + 1)],
+            );
+            gf::run(dir.path(), &["commit", "-q", "-m", &format!("rename {i}")]);
+        }
+        let (state, _) = classify_path(dir.path(), "HEAD", "m0.txt", "test")
+            .await
+            .unwrap();
+        match state {
+            PathState::RenamedAway { current_path, .. } => {
+                assert_eq!(current_path, format!("m{renames}.txt"));
+            }
+            other => panic!("expected RenamedAway, got {other:?}"),
         }
     }
 

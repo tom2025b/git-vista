@@ -106,6 +106,20 @@ pub fn path_state_message(state: &PathState) -> Option<String> {
             "This path was renamed to '{current_path}' in {}. Showing its history up to that point.",
             short(last_commit)
         )),
+        // Deliberately does NOT say "renamed to <last_known_path>". Every hop
+        // continues precisely because its destination was proven absent at
+        // this revision, so the furthest name reached is a lead, not a
+        // location — see `PathState::RenameChainTooLong`.
+        PathState::RenameChainTooLong {
+            last_commit,
+            last_known_path,
+            hops,
+        } => Some(format!(
+            "This path was renamed more than {hops} times and the trail is still \
+             going. The furthest name found was '{last_known_path}' at {} — it is \
+             not there now either, so where the file ended up is unknown.",
+            short(last_commit)
+        )),
     }
 }
 
@@ -117,26 +131,34 @@ pub fn rename_limit_banner(hits: &[RenameLimitNotice]) -> Option<String> {
     if hits.is_empty() {
         return None;
     }
-    let commits: Vec<String> = hits.iter().map(|h| short(&h.commit).to_string()).collect();
     let suggestion = hits
         .iter()
         .find_map(|h| h.suggested_minimum)
         .map(|n| format!(" (git suggests raising diff.renameLimit to at least {n})"))
         .unwrap_or_default();
-    if hits.len() == 1 {
-        Some(format!(
-            "Rename detection was skipped at {} because too many files changed in that commit — \
-             this history may be missing a rename before that point{suggestion}.",
-            commits[0]
-        ))
+    // git's warning names no commit, so neither does this sentence. It used
+    // to interpolate one supplied by the caller from surrounding context,
+    // which could name a commit that had nothing to do with the skip (#86
+    // review). Where a notice DOES carry a commit, it is said; otherwise the
+    // sentence stays honest about scope: somewhere in this history.
+    let named: Vec<String> = hits
+        .iter()
+        .filter_map(|h| h.commit.as_deref().map(|c| short(c).to_string()))
+        .collect();
+    let where_ = if named.is_empty() {
+        "somewhere in this file's history".to_string()
     } else {
-        Some(format!(
-            "Rename detection was skipped at {} commits ({}) because too many files changed — \
-             this history may be missing renames before those points{suggestion}.",
-            commits.len(),
-            commits.join(", ")
-        ))
-    }
+        format!("at {}", named.join(", "))
+    };
+    let times = if hits.len() == 1 {
+        "Rename detection was skipped".to_string()
+    } else {
+        format!("Rename detection was skipped {} times", hits.len())
+    };
+    Some(format!(
+        "{times} {where_} because too many files changed — this history may be missing a \
+         rename{suggestion}."
+    ))
 }
 
 /// The conventional 7-char short id, matching
@@ -290,41 +312,106 @@ mod message_tests {
     }
 
     #[test]
-    fn one_hit_states_the_commit_and_gits_own_suggestion() {
+    fn a_hit_states_gits_own_suggestion_when_it_gave_one() {
         let banner = rename_limit_banner(&[RenameLimitNotice {
-            commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            commit: None,
             suggested_minimum: Some(31),
         }])
         .unwrap();
-        assert!(banner.contains("deadbee"));
         assert!(banner.contains("31"));
     }
 
+    /// The normal case, and the one the round corrected: git's warning names
+    /// no commit, so the sentence must not either. It used to interpolate one
+    /// the caller supplied from surrounding context, which could point at a
+    /// commit with nothing to do with the skip.
     #[test]
-    fn a_hit_with_no_suggested_minimum_still_produces_a_banner() {
+    fn an_unattributed_hit_says_where_it_does_not_know_rather_than_naming_a_commit() {
         let banner = rename_limit_banner(&[RenameLimitNotice {
-            commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            commit: None,
             suggested_minimum: None,
         }])
         .unwrap();
-        assert!(banner.contains("deadbee"));
+        assert!(
+            banner.contains("somewhere in this file's history"),
+            "got: {banner}"
+        );
+        // Nothing that looks like an object id.
+        assert!(
+            !banner
+                .chars()
+                .collect::<String>()
+                .split_whitespace()
+                .any(|w| { w.len() >= 7 && w.chars().all(|c| c.is_ascii_hexdigit()) }),
+            "an unattributed notice must not appear to name a commit: {banner}"
+        );
     }
 
     #[test]
-    fn multiple_hits_are_pluralized_and_name_every_commit() {
+    fn a_hit_that_does_carry_a_commit_names_it_in_short_form() {
+        let banner = rename_limit_banner(&[RenameLimitNotice {
+            commit: Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string()),
+            suggested_minimum: None,
+        }])
+        .unwrap();
+        assert!(banner.contains("deadbee"), "got: {banner}");
+        assert!(!banner.contains("deadbeefdeadbeef"), "short form only");
+    }
+
+    #[test]
+    fn multiple_hits_are_counted() {
         let banner = rename_limit_banner(&[
             RenameLimitNotice {
-                commit: "1111111111111111111111111111111111111111".to_string(),
+                commit: None,
                 suggested_minimum: None,
             },
             RenameLimitNotice {
-                commit: "2222222222222222222222222222222222222222".to_string(),
+                commit: None,
                 suggested_minimum: None,
             },
         ])
         .unwrap();
-        assert!(banner.contains("1111111"));
-        assert!(banner.contains("2222222"));
-        assert!(banner.contains("2 commits") || banner.contains("commits"));
+        assert!(banner.contains("2 times"), "got: {banner}");
+    }
+
+    /// The hop-limit state must not read like a rename that resolved. Its
+    /// whole reason for existing is that the furthest name reached was
+    /// already proven absent.
+    #[test]
+    fn the_hop_limit_state_does_not_claim_the_file_is_at_the_last_name() {
+        let msg = path_state_message(&PathState::RenameChainTooLong {
+            last_commit: "abcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string(),
+            last_known_path: "z.rs".to_string(),
+            hops: 20,
+        })
+        .unwrap();
+        assert!(msg.contains("z.rs"), "the lead is still offered: {msg}");
+        assert!(msg.contains("20"), "it says how far it got: {msg}");
+        assert!(
+            !msg.contains("was renamed to 'z.rs'"),
+            "must not state a location it disproved: {msg}"
+        );
+        assert!(
+            msg.contains("unknown"),
+            "the honest word is the point: {msg}"
+        );
+    }
+
+    /// And it must be a different sentence from a resolved rename, or the two
+    /// are indistinguishable to a reader.
+    #[test]
+    fn the_hop_limit_state_reads_differently_from_a_resolved_rename() {
+        let resolved = path_state_message(&PathState::RenamedAway {
+            last_commit: "abcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string(),
+            current_path: "z.rs".to_string(),
+        })
+        .unwrap();
+        let capped = path_state_message(&PathState::RenameChainTooLong {
+            last_commit: "abcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string(),
+            last_known_path: "z.rs".to_string(),
+            hops: 20,
+        })
+        .unwrap();
+        assert_ne!(resolved, capped);
     }
 }

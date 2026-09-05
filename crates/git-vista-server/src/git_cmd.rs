@@ -876,6 +876,80 @@ async fn collect_child_stdout_capped(
     }
 }
 
+/// [`git_stdout_capped`], but the child's **stderr comes back too** (M5.33,
+/// #86 review).
+///
+/// # Why this exists rather than a second invocation
+///
+/// Some of git's answers are on stderr, not stdout: `--follow`'s
+/// `"exhaustive rename detection was skipped due to too many files"` is the
+/// one this was added for. The first version of that code ran the command
+/// twice — once through `git_stdout_capped` for the output, once through
+/// `git_output` to recover the warning — which was wrong three ways at once.
+/// It doubled the work; the replay went through a helper with **no cap and no
+/// `kill_on_drop`**, so a "bounded, cancellable" read had an unbounded
+/// uncancellable twin; and two runs of a history walk are two chances to
+/// disagree, so a warning could be attributed to output it did not come from.
+///
+/// One child, both streams, the same cap and the same `kill_on_drop` as its
+/// stdout-only sibling. `stderr` is bounded by [`STDERR_CAPTURE_CAP`] exactly
+/// as every other reader here bounds it.
+pub(crate) async fn git_stdout_stderr_capped(
+    repo: &Path,
+    args: &[String],
+    endpoint: &str,
+    cap: usize,
+) -> Result<(Vec<u8>, Vec<u8>, bool), (StatusCode, String)> {
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut child = sandboxed(repo, &borrowed, crate::sandbox::NetworkNeed::Local)
+        .map_err(|e| io_error(endpoint, std::io::Error::other(e)))?
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| io_error(endpoint, e))?;
+
+    let Some(stdout) = child.stdout.take() else {
+        return Err(io_error(
+            endpoint,
+            std::io::Error::other("git stdout was not piped"),
+        ));
+    };
+    let Some(stderr) = child.stderr.take() else {
+        return Err(io_error(
+            endpoint,
+            std::io::Error::other("git stderr was not piped"),
+        ));
+    };
+    // Same ordering as `collect_child_stdout_capped`: drain stderr first, so
+    // neither pipe can wedge the other.
+    let stderr_task = tokio::spawn(drain_stderr(stderr));
+
+    let capped = match read_to_cap(stdout, cap).await {
+        Ok(capped) => capped,
+        Err(e) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            stderr_task.abort();
+            return Err(io_error(endpoint, e));
+        }
+    };
+    if capped.truncated {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        let errs = stderr_task.await.unwrap_or_default();
+        return Ok((capped.bytes, errs, true));
+    }
+    let status = child.wait().await.map_err(|e| io_error(endpoint, e))?;
+    let errs = stderr_task.await.unwrap_or_default();
+    if status.success() {
+        Ok((capped.bytes, errs, false))
+    } else {
+        Err(git_error(endpoint, &errs))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // `git cat-file --batch`: one spawn, up to two queries (#221)
 //

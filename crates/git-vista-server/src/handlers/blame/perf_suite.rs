@@ -13,12 +13,16 @@
 //!
 //! # The two limits this proves
 //!
-//! 1. **A file's rename-chain classification costs `O(hops)`, never
-//!    `O(history size)`.** [`chase_rename_chain`] is bounded by
-//!    [`MAX_RENAME_HOPS`]; this fixture buries 12 renames inside 3,000 noise
-//!    commits and shows classifying the *oldest* dead name costs about the
-//!    same order of magnitude as classifying the *newest* one, rather than
-//!    scaling with the 3,000.
+//! 1. **A file's rename-chain classification is bounded in SPAWN COUNT by
+//!    the hop cap, not by history size.** Stated carefully after review:
+//!    [`MAX_RENAME_HOPS`] bounds how many git processes the chase starts, and
+//!    this fixture (12 renames buried in ~3,000 noise commits) shows the
+//!    oldest dead name costing the same order of magnitude as the newest
+//!    rather than scaling with the 3,000. It does **not** show that the work
+//!    *inside* each spawn is history-independent — each `git log
+//!    --diff-filter=D -1` can walk back to the removal it is looking for, and
+//!    this fixture holds hop spacing fixed at 250 commits, so it cannot
+//!    separate those two variables. The honest claim is the spawn bound.
 //! 2. **A blame page's cost is bounded by how far back its lines' own history
 //!    goes from the requested revision, not by the file's total length.**
 //!    Measured directly (see `blaming_the_tail_of_a_long_lived_file_is_fast`'s
@@ -168,7 +172,7 @@ fn deep_line_history(repo: &std::path::Path, lines: usize) {
 /// Measured on this host (2026-09-05, `cargo test` debug timings — the ones
 /// a CI run actually pays), across several runs including the full parallel
 /// suite (1,196 other tests competing for the sandbox): classifying the
-/// oldest name ranged **1.37s–2.9s** (12 hops × 2 git spawns each, each spawn
+/// oldest name ranged **1.37s–2.9s** (12 hops × 3 git spawns each — log, unrestricted show, liveness probe — each spawn
 /// crossing the sandbox, so per-spawn sandbox overhead dominates and varies
 /// with host load); classifying the live name took 15–60ms (one
 /// `cat-file -e`, no chase at all) — a ~40-90x ratio for 12 hops, well short

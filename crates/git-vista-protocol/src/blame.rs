@@ -87,7 +87,7 @@
 //! `git log --follow -z --name-status --format=%x00%H%x09%an%x09%at%x09%s`
 //! interleaves a NUL-prefixed pretty-printed header with `-z`'s own
 //! NUL-terminated name-status record for that commit. Verified byte-for-byte
-//! (see `docs/adr/0121-*.md`), and re-verified after an initial misreading of
+//! (see `docs/adr/0124-a-rename-is-followed-forward-by-walking-not-by-asking-follow.md`), and re-verified after an initial misreading of
 //! the same trace got the byte order backwards: `-z` NUL-terminates the
 //! **pretty-printed header itself** (a plain header token, cleanly
 //! `"<hash>\t<author>\t<time>\t<summary>"` with no NUL inside it), and git
@@ -133,9 +133,31 @@ pub enum PathState {
     /// name the rename search followed.
     Deleted { last_commit: String },
     /// The path was renamed away; its history continues at `current_path`.
+    ///
+    /// `current_path` is **alive at the requested revision** — the chase
+    /// proves that with its own `cat-file -e` before reporting this. See
+    /// [`PathState::RenameChainTooLong`] for what happens when it cannot.
     RenamedAway {
         last_commit: String,
         current_path: String,
+    },
+    /// The rename chase hit its hop limit before finding a live name (#86
+    /// review).
+    ///
+    /// This state exists because the alternative was a lie. The chase used to
+    /// return `RenamedAway { current_path: <the last hop> }` on exhaustion —
+    /// but every hop only continues *because* its destination was just proven
+    /// **dead** at this revision, so that field named a path the code had
+    /// already disproved, and the UI said "this path was renamed to X" about
+    /// a file that is not there. An incomplete answer has to be sayable, or
+    /// the incomplete case borrows the vocabulary of a complete one.
+    ///
+    /// `last_known_path` is the furthest name actually reached — offered as a
+    /// lead to follow, explicitly not as the file's current location.
+    RenameChainTooLong {
+        last_commit: String,
+        last_known_path: String,
+        hops: u32,
     },
 }
 
@@ -147,7 +169,18 @@ pub enum PathState {
 /// file's history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenameLimitNotice {
-    pub commit: String,
+    /// The commit whose diff hit the limit — **`None` whenever git did not
+    /// say**, which is the normal case.
+    ///
+    /// git's warning names no commit. An earlier version of this type
+    /// declared `commit: String` and the server filled it with the newest
+    /// entry of whatever page happened to be in hand, which made the UI state
+    /// "rename detection was skipped at <commit>" about a commit that may have
+    /// had nothing to do with it. A field that is sometimes a guess is worse
+    /// than a field that is sometimes absent: the guess is indistinguishable
+    /// from knowledge at the point of reading. So this is `Option`, and
+    /// nothing fills it in from context.
+    pub commit: Option<String>,
     /// git's own suggested minimum, parsed from its second warning line,
     /// when it printed one.
     pub suggested_minimum: Option<u32>,
@@ -228,12 +261,25 @@ pub struct BlameRange {
 }
 
 /// One page of blame, covering `[start_line, end_line]` of the file's
-/// *current* total line count (`total_lines`) at the requested revision.
-/// Paging blame this way — a `git blame -L start,end` per page, verified to
-/// still resolve renames correctly across the boundary it cuts — means a
-/// huge file's cost is bounded by the page size actually requested, not by
-/// the whole file (M5.33, #86; the "explicit performance limit" the issue
-/// asks for).
+/// *current* total line count (`total_lines`) at the requested revision, via
+/// `git blame -L start,end` — verified to still resolve renames correctly
+/// across the boundary it cuts.
+///
+/// # What `-L` bounds, and what it does not (M5.33, #86)
+///
+/// An earlier version of this comment said a huge file's cost is bounded by
+/// the page size rather than the whole file. That is **not true** and the
+/// measurements are in ADR 0124: git still diffs every commit between the
+/// requested revision and wherever the target lines last changed, so a page
+/// at the tip costs ~21 ms on a 3,000-commit file while one at the root
+/// costs ~450 ms. Two further costs are the server's own: it reads the whole
+/// blob once to classify the path and count lines (so an 8 MiB file is
+/// refused whatever page you ask for), and the walk above.
+///
+/// What paging *does* bound is the **parsed and returned window** — always
+/// exactly the lines requested, never the whole file — and, through
+/// `total_lines`, a client's ability to fetch the rest incrementally instead
+/// of in one response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlamePage {
     /// Echoes the request, same posture as [`FileHistoryPage::path`].
@@ -283,12 +329,13 @@ pub fn parse_suggested_minimum(line: &str) -> Option<u32> {
     }
 }
 
-/// Scan every line of a git stderr capture for the rename-limit warning pair,
-/// attaching `commit` to each hit found. Two warnings from the same commit
-/// (git only ever prints the pair once per skipped diff) never happens in
-/// practice, but the function does not assume it — it just reports what it
-/// finds, once per matching first line.
-pub fn scan_rename_limit_warnings(stderr: &str, commit: &str) -> Vec<RenameLimitNotice> {
+/// Scan every line of a git stderr capture for the rename-limit warning pair.
+///
+/// Reports what it finds, once per matching first line, and **attributes
+/// nothing**: git's warning carries no commit, so neither does the notice.
+/// See [`RenameLimitNotice::commit`] for why guessing one was worse than
+/// leaving it absent.
+pub fn scan_rename_limit_warnings(stderr: &str) -> Vec<RenameLimitNotice> {
     let lines: Vec<&str> = stderr.lines().collect();
     let mut hits = Vec::new();
     for (i, line) in lines.iter().enumerate() {
@@ -297,7 +344,9 @@ pub fn scan_rename_limit_warnings(stderr: &str, commit: &str) -> Vec<RenameLimit
                 .get(i + 1)
                 .and_then(|next| parse_suggested_minimum(next));
             hits.push(RenameLimitNotice {
-                commit: commit.to_string(),
+                // Deliberately not inferred from the caller's context — see
+                // `RenameLimitNotice::commit`.
+                commit: None,
                 suggested_minimum,
             });
         }
@@ -659,7 +708,7 @@ mod rename_limit_warning_tests {
 
     /// Verbatim text captured from a real `git -l1 log --follow -M50% ...`
     /// run against a fixture that renamed one file amid 30 unrelated
-    /// delete/add pairs (see `docs/adr/0121-*.md` for the full transcript).
+    /// delete/add pairs (see `docs/adr/0124-a-rename-is-followed-forward-by-walking-not-by-asking-follow.md` for the full transcript).
     const FIRST: &str = "warning: exhaustive rename detection was skipped due to too many files.";
     const SECOND: &str =
         "warning: you may want to set your diff.renameLimit variable to at least 31 and retry the command.";
@@ -681,13 +730,15 @@ mod rename_limit_warning_tests {
     }
 
     #[test]
-    fn scan_pairs_the_warning_with_its_advisory_line_and_the_callers_commit() {
+    fn scan_pairs_the_warning_with_its_advisory_line_and_attributes_no_commit() {
         let stderr = format!("{FIRST}\n{SECOND}\n");
-        let hits = scan_rename_limit_warnings(&stderr, "deadbeef");
+        let hits = scan_rename_limit_warnings(&stderr);
         assert_eq!(
             hits,
             vec![RenameLimitNotice {
-                commit: "deadbeef".to_string(),
+                // Not "deadbeef": git's warning names no commit, and this
+                // function no longer accepts one to attach (#86 review).
+                commit: None,
                 suggested_minimum: Some(31),
             }]
         );
@@ -696,15 +747,15 @@ mod rename_limit_warning_tests {
     #[test]
     fn a_first_line_with_no_advisory_follow_up_still_counts_as_a_hit() {
         // Git version differences: only the first line's wording is load-bearing.
-        let hits = scan_rename_limit_warnings(FIRST, "deadbeef");
+        let hits = scan_rename_limit_warnings(FIRST);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].suggested_minimum, None);
     }
 
     #[test]
     fn ordinary_stderr_with_no_warning_yields_nothing() {
-        assert!(scan_rename_limit_warnings("", "deadbeef").is_empty());
-        assert!(scan_rename_limit_warnings("Auto packing...\n", "deadbeef").is_empty());
+        assert!(scan_rename_limit_warnings("").is_empty());
+        assert!(scan_rename_limit_warnings("Auto packing...\n").is_empty());
     }
 }
 
@@ -715,7 +766,7 @@ mod follow_history_tests {
     /// Byte-for-byte the two-commit stream captured from:
     /// `git log --follow -M50% -z --name-status
     /// --format=$'%x00%H%x09%an%x09%at%x09%s' -- sub/renamed.txt`
-    /// against the fixture in `docs/adr/0121-*.md`. Newest first: a rename
+    /// against the fixture in `docs/adr/0124-a-rename-is-followed-forward-by-walking-not-by-asking-follow.md`. Newest first: a rename
     /// commit, then the root add.
     fn two_commit_stream() -> Vec<u8> {
         let mut buf = Vec::new();

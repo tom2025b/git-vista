@@ -49,6 +49,8 @@ pub fn blame_body(
     selection: RwSignal<BlameSelection>,
     shell: Shell,
     compare_anchor: RwSignal<Option<String>>,
+    blame_window: RwSignal<Option<(usize, usize)>>,
+    history_skip: RwSignal<usize>,
 ) -> View {
     let state_banner = path_state_message(&page.path_state);
 
@@ -58,7 +60,7 @@ pub fn blame_body(
                 <p class="detail-status">
                     {state_banner.unwrap_or_else(|| "Nothing to show.".to_string())}
                 </p>
-                {history_list(history, shell)}
+                {history_list(history, shell, history_skip)}
             </div>
         }
         .into_view();
@@ -67,6 +69,7 @@ pub fn blame_body(
     focus.update_untracked(|f| f.set_row_count(page.ranges.len()));
     let ranges = page.ranges.clone();
     let drag_anchor: StoredValue<Option<usize>> = store_value(None);
+    let dragged: StoredValue<bool> = store_value(false);
 
     let rename_banner = rename_limit_banner(&page.rename_limit_hits)
         .map(|b| view! { <p class="detail-status blame-rename-warning">{b}</p> }.into_view());
@@ -75,23 +78,29 @@ pub fn blame_body(
         .iter()
         .cloned()
         .enumerate()
-        .map(|(idx, range)| blame_row(idx, range, focus, selection, drag_anchor, shell))
+        .map(|(idx, range)| blame_row(idx, range, focus, selection, drag_anchor, dragged, shell))
         .collect();
 
     // The compare toolbar: visible only while a selection exists, offering
-    // whatever `offer_for` says given the current anchor and the commit that
-    // owns the FIRST line of the selected range — a range can span more than
-    // one commit, and "the commit at the top of what you selected" is the
-    // one unambiguous choice for what "compare from here" means.
+    // whatever `offer_for` says for the commit of the FIRST SELECTED ROW — a
+    // selection can span rows belonging to several commits, and "the commit
+    // at the top of what you selected" is the one unambiguous choice for what
+    // "compare from here" means.
     let ranges_for_toolbar = page.ranges.clone();
     let toolbar = move || {
         let Some(range) = selection.with(|s| s.range()) else {
             return ().into_view();
         };
-        let start = *range.start();
+        // `range` is in ROW-INDEX space — `BlameSelection` stores the index
+        // `enumerate()` handed each row, not a source line number. An earlier
+        // version searched the ranges for one whose 1-based LINE interval
+        // contained that index, which is a category error with two visible
+        // symptoms: row 0 matched nothing (no line is numbered 0, so the
+        // first row never offered a comparison at all) and later rows matched
+        // whichever earlier range happened to span that small integer,
+        // opening a comparison on the wrong commit. Index the slice.
         let Some(this) = ranges_for_toolbar
-            .iter()
-            .find(|r| r.start_line <= start && start <= r.end_line)
+            .get(*range.start())
             .map(|r| r.commit.clone())
         else {
             return ().into_view();
@@ -159,7 +168,53 @@ pub fn blame_body(
                 {rows}
             </div>
             {toolbar}
-            {history_list(history, shell)}
+            {blame_pager(page, blame_window)}
+            {history_list(history, shell, history_skip)}
+        </div>
+    }
+    .into_view()
+}
+
+/// Move the blame window (#86 review).
+///
+/// Before this the panel fetched one page and offered no way to ask for
+/// another: the endpoint took a line range, the client API could encode one,
+/// and nothing ever sent a second request — so any file longer than the
+/// server's default page was silently truncated in the only surface a user
+/// actually sees. `total_lines` is what makes the arithmetic honest; it is
+/// the file's real length, not the page's.
+fn blame_pager(page: &BlamePage, window: RwSignal<Option<(usize, usize)>>) -> View {
+    let (start, end, total) = (page.start_line, page.end_line, page.total_lines);
+    let span = end.saturating_sub(start) + 1;
+    if total == 0 || (start <= 1 && end >= total) {
+        // The whole file is on screen; a pager would be furniture.
+        return ().into_view();
+    }
+    let prev = (start > 1).then(|| {
+        let new_end = start - 1;
+        let new_start = new_end.saturating_sub(span - 1).max(1);
+        view! {
+            <button class="ctx-item" on:click=move |_| window.set(Some((new_start, new_end)))>
+                "◀ Earlier lines"
+            </button>
+        }
+        .into_view()
+    });
+    let next = (end < total).then(|| {
+        let new_start = end + 1;
+        let new_end = (new_start + span - 1).min(total);
+        view! {
+            <button class="ctx-item" on:click=move |_| window.set(Some((new_start, new_end)))>
+                "Later lines ▶"
+            </button>
+        }
+        .into_view()
+    });
+    view! {
+        <div class="blame-pager">
+            {prev}
+            <span class="blame-pager-at">{format!("lines {start}–{end} of {total}")}</span>
+            {next}
         </div>
     }
     .into_view()
@@ -171,7 +226,11 @@ pub fn blame_body(
 /// on:click>`), which is already in the tab order and already speaks its own
 /// accessible name, so a second custom focus model would only duplicate what
 /// the browser gives a `<button>` for free.
-fn history_list(history: Option<&Result<FileHistoryPage, String>>, shell: Shell) -> View {
+fn history_list(
+    history: Option<&Result<FileHistoryPage, String>>,
+    shell: Shell,
+    skip: RwSignal<usize>,
+) -> View {
     match history {
         None => view! { <p class="detail-status">"Loading history…"</p> }.into_view(),
         Some(Err(e)) => view! {
@@ -208,10 +267,37 @@ fn history_list(history: Option<&Result<FileHistoryPage, String>>, shell: Shell)
                     .into_view()
                 })
                 .collect();
+            // `cursor` is the server's own "there may be more past this"
+            // answer; it was previously fetched and ignored.
+            let has_more = page.cursor.is_some();
+            let shown = page.entries.len();
+            let pager = (has_more || skip.get() > 0).then(|| {
+                let back = (skip.get() > 0).then(|| {
+                    view! {
+                        <button
+                            class="ctx-item"
+                            on:click=move |_| skip.update(|s| *s = s.saturating_sub(shown.max(1)))
+                        >
+                            "◀ Newer"
+                        </button>
+                    }
+                    .into_view()
+                });
+                let forward = has_more.then(|| {
+                    view! {
+                        <button class="ctx-item" on:click=move |_| skip.update(|s| *s += shown)>
+                            "Older ▶"
+                        </button>
+                    }
+                    .into_view()
+                });
+                view! { <div class="blame-pager">{back}{forward}</div> }.into_view()
+            });
             view! {
                 <div class="blame-history">
                     <h3 class="detail-heading">"File history"</h3>
                     <ul class="blame-history-list">{rows}</ul>
+                    {pager}
                 </div>
             }
             .into_view()
@@ -223,12 +309,18 @@ fn history_list(history: Option<&Result<FileHistoryPage, String>>, shell: Shell)
 /// commit's detail panel — the "map blame ranges to commits" criterion) plus
 /// its own 44px select target (drag-extendable via [`BlameSelection`] — the
 /// "touch selection is accessible" criterion).
+#[allow(clippy::too_many_arguments)]
 fn blame_row(
     idx: usize,
     range: BlameRange,
     focus: RwSignal<GraphFocus>,
     selection: RwSignal<BlameSelection>,
     drag_anchor: StoredValue<Option<usize>>,
+    // Set when a drag actually moved across rows, so the click that ends it
+    // can tell itself apart from a tap. Shared with the panel, not per-row:
+    // the click lands on whichever row the pointer was released over, which
+    // is not the row the drag started on.
+    dragged: StoredValue<bool>,
     shell: Shell,
 ) -> View {
     let tabindex = move || {
@@ -298,23 +390,49 @@ fn blame_row(
         }
     };
 
+    // One gesture, one meaning (#86 review). `pointerdown` used to call
+    // `start(idx)` AND the click that inevitably follows used to toggle — so a
+    // plain tap selected the row and then immediately cleared it, leaving the
+    // control looking dead. The browser spec could not see it because it
+    // dispatched pointer events directly and never the click a real tap
+    // produces.
+    //
+    // Now `pointerdown` only ANCHORS (for a possible drag) and commits
+    // nothing; `click` is the single place a tap's selection is decided, and
+    // it fires for pointer and keyboard activation alike.
     let on_select_pointer_down = move |_: web_sys::PointerEvent| {
         drag_anchor.set_value(Some(idx));
-        selection.update(|s| s.start(idx));
     };
+    // A drag: the first row entered while the pointer is still down starts the
+    // selection at the anchor, and each subsequent one extends it. Starting
+    // here rather than on `pointerdown` is what keeps a tap (down, up, no
+    // movement) from committing anything before the click decides.
     let on_select_pointer_enter = move |ev: web_sys::PointerEvent| {
         if ev.buttons() != 1 {
             return;
         }
-        if drag_anchor.get_value().is_some() {
-            selection.update(|s| s.extend_to(idx));
-        }
+        let Some(anchor) = drag_anchor.get_value() else {
+            return;
+        };
+        dragged.set_value(true);
+        selection.update(|s| {
+            if s.is_empty() {
+                s.start(anchor);
+            }
+            s.extend_to(idx);
+        });
     };
     let on_select_pointer_up = move |_: web_sys::PointerEvent| drag_anchor.set_value(None);
     let on_select_click = move |ev: web_sys::MouseEvent| {
         ev.stop_propagation();
+        // A click that merely ends a drag must not re-decide what the drag
+        // selected. Only a click with no drag behind it is a tap.
+        if dragged.get_value() {
+            dragged.set_value(false);
+            return;
+        }
         selection.update(|s| {
-            if s.contains(idx) && s.range() == Some(idx..=idx) {
+            if s.range() == Some(idx..=idx) {
                 s.clear();
             } else {
                 s.start(idx);
