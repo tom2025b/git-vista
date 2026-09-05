@@ -2712,6 +2712,90 @@ async fn shape(
             };
             (RiskLevel::Destructive, preconditions, changes, recovery)
         }
+        // M5.34 (#87, ADR 0121). No `Precondition` on `BisectStart`: the
+        // fields are bare commit oids (git itself refuses an unknown one,
+        // the same protection `CreateBranch`'s `at` field relies on), and
+        // starting while another bisect is already in progress is refused
+        // by the executor reading `.git/BISECT_START` itself — the same
+        // "the real gate lives in the executor, checked freshly" posture
+        // `RemoveWorktree` takes (ADR 0120 §3), rather than a build-time
+        // check `enforce_fresh` would have to re-verify against state this
+        // crate cannot read (it is wasm-safe, no filesystem).
+        //
+        // `before` mirrors `CheckoutBranch`'s own computation exactly: a
+        // checked-out branch's symbolic HEAD, or a detached commit's bare
+        // oid. `after` is `Computed` because which commit `git bisect
+        // start` checks out first depends on the good/bad range's midpoint
+        // — not knowable from this operation's own fields.
+        GitOperation::BisectStart { .. } => {
+            let before = match (&head_ref, &head_oid) {
+                (Some(r), _) => Some(RefState::Symbolic(r.clone())),
+                (None, Some(o)) => Some(RefState::At(o.clone())),
+                (None, None) => None,
+            };
+            let changes = match before {
+                Some(before) => vec![RefChange {
+                    ref_name: RefName::new("HEAD").expect("literal is valid"),
+                    before,
+                    after: RefState::Computed,
+                }],
+                None => Vec::new(),
+            };
+            (
+                RiskLevel::Reversible,
+                Vec::new(),
+                changes,
+                RecoveryStrategy::BisectReset,
+            )
+        }
+        // No `Precondition` here either — same reasoning as `BisectStart`
+        // just above, and the same shape `SequenceContinue` already takes:
+        // the executor reads `.git/BISECT_START` itself and refuses with
+        // `409` if no bisect is in progress, rather than a build-time check
+        // this crate has no filesystem access to perform.
+        GitOperation::BisectMark { .. } => {
+            let changes = head_oid
+                .as_ref()
+                .map(|o| {
+                    vec![RefChange {
+                        ref_name: RefName::new("HEAD").expect("literal is valid"),
+                        before: RefState::At(o.clone()),
+                        after: RefState::Computed,
+                    }]
+                })
+                .unwrap_or_default();
+            (
+                RiskLevel::Reversible,
+                Vec::new(),
+                changes,
+                RecoveryStrategy::BisectReset,
+            )
+        }
+        // Nothing is destroyed — a bisect step only ever checks out a
+        // candidate that already exists in history — so reset's own
+        // recovery is `NotNeeded`: it returns to exactly the state
+        // `BisectStart` found the repository in, and there is nothing
+        // further back to go. The pre-bisect position itself is not
+        // `RefState::At`-able here: it lives in `.git/BISECT_START`, which
+        // this wasm-safe crate cannot read, so `after` is `Computed`.
+        GitOperation::BisectReset => {
+            let changes = head_oid
+                .as_ref()
+                .map(|o| {
+                    vec![RefChange {
+                        ref_name: RefName::new("HEAD").expect("literal is valid"),
+                        before: RefState::At(o.clone()),
+                        after: RefState::Computed,
+                    }]
+                })
+                .unwrap_or_default();
+            (
+                RiskLevel::Reversible,
+                Vec::new(),
+                changes,
+                RecoveryStrategy::NotNeeded,
+            )
+        }
         // Continue and skip both move the sequence forward and may create a
         // commit; the undo is to move HEAD back, which head_moves supplies.
         GitOperation::SequenceContinue | GitOperation::SequenceSkip => {
@@ -3878,6 +3962,11 @@ mod sequence_exec;
 /// module doc.
 mod worktree_exec;
 
+/// The bisect executors — start/mark/reset, and `discover` — git's own
+/// on-disk bisect state read fresh, never mirrored; see the module doc and
+/// ADR 0121 (M5.34, #87).
+pub(crate) mod bisect_exec;
+
 /// `POST /api/amend-commit`'s one 400 constructor — the handler's own
 /// request-shape refusals and [`commit_exec`]'s classified git outcomes both
 /// build through it — re-exported so `handlers::commit`'s
@@ -4017,7 +4106,13 @@ pub(crate) fn honours_cancellation(op: &GitOperation) -> bool {
         | GitOperation::CreateTag { .. }
         | GitOperation::DeleteLocalTag { .. }
         | GitOperation::DeleteRemoteTag { .. }
-        | GitOperation::PushTag { .. } => false,
+        | GitOperation::PushTag { .. }
+        // M5.34 (#87): a bisect step/start/reset is local and
+        // millisecond-scale — it walks and checks out commits already in
+        // the object database, no transfer to interrupt.
+        | GitOperation::BisectStart { .. }
+        | GitOperation::BisectMark { .. }
+        | GitOperation::BisectReset => false,
     }
 }
 
