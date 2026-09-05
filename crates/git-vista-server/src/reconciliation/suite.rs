@@ -412,6 +412,20 @@ async fn a_watcher_whose_channel_closed_does_not_become_a_read_storm() {
         "a feed that cannot watch must still sweep on its own cadence, not spin: \
          {reads} reads in two seconds"
     );
+
+    // And the loop itself must be idle, not merely quiet.
+    //
+    // The read count alone does not pin the retire, which is how this test came
+    // to pass under the mutation that removes it: with the closed channel still
+    // in the `select!` its arm wins every iteration, and whether that *reads*
+    // depends on what the arm goes on to do. The spin is the defect; the reads
+    // were the symptom that happened to be visible from outside.
+    let turns = feed.driver_turns();
+    assert!(
+        turns <= 200,
+        "the driver spun {turns} times in two seconds — a closed notice source \
+         must be retired, not re-polled"
+    );
 }
 
 #[tokio::test]

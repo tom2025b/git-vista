@@ -152,6 +152,12 @@ impl Feed {
     pub(crate) fn read_time(&self) -> Duration {
         Duration::from_nanos(self.reads.nanos.load(Ordering::Relaxed))
     }
+
+    /// Times this feed's driver has been round its loop. A feed doing nothing
+    /// should be round it a handful of times; a spinning one, millions.
+    pub(crate) fn driver_turns(&self) -> u64 {
+        self.reads.turns.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for Feed {
@@ -162,11 +168,22 @@ impl Drop for Feed {
     }
 }
 
-/// What one feed has spent reading the repository.
+/// What one feed has spent reading the repository, and how hard its driver has
+/// had to work to do it.
 #[derive(Default)]
 pub(crate) struct ReadMeter {
     count: AtomicU64,
     nanos: AtomicU64,
+    /// Times round the driver loop.
+    ///
+    /// A separate number from `count` because they fail separately, and the
+    /// distinction is the whole of #664's finding 1. A source that has closed
+    /// answers `recv()` instantly and forever, so leaving it in the `select!`
+    /// makes its arm win every iteration: the loop spins at the speed of the
+    /// scheduler. Whether that spin also *reads* depends on what that arm then
+    /// does — which means a test counting reads can miss the spin entirely,
+    /// and did.
+    turns: AtomicU64,
 }
 
 type Registry = StdMutex<HashMap<PathBuf, Weak<Feed>>>;
@@ -331,6 +348,7 @@ async fn drive(
     let mut pending_acks: Vec<oneshot::Sender<()>> = Vec::new();
 
     loop {
+        reads.turns.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
         if now >= next_sweep && now >= floor_until {
             let began = Instant::now();
