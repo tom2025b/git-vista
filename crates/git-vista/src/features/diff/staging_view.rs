@@ -453,13 +453,7 @@ pub fn staging_body(
     };
 
     let no_identity = repo_tokens(ctx).is_none();
-    let gate = move || {
-        staging_actions(
-            selection.with(|s| s.is_empty()),
-            busy.get(),
-            !no_identity,
-        )
-    };
+    let gate = move || staging_actions(selection.with(|s| s.is_empty()), busy.get(), !no_identity);
     // Three states, three renderings, and `PreviewState` is what tells them
     // apart (#653). The `Stale` arm is the #215 review finding: Apply was
     // always correct — it rebuilds the plan from the live selection at click
