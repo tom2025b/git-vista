@@ -556,11 +556,15 @@ fn a_desk_the_app_just_made_is_serviceable_in_the_census() {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
 
-        match crate::worktree_census::worktree_census(&repo, false, &crate::state::path_is_allowed)
+        match crate::worktree_census::worktree_census(
+            &repo,
+            crate::worktree_census::CensusPaths::from_flag(false),
+            &crate::state::path_is_allowed,
+        )
             .await
         {
             git_vista_protocol::WorktreeCensus::Observed { siblings } => siblings,
-            git_vista_protocol::WorktreeCensus::CensusFailed { reason } => {
+            git_vista_protocol::WorktreeCensus::CensusFailed { reason, .. } => {
                 panic!("the census failed: {reason}")
             }
         }
