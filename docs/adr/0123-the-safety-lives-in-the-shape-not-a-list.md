@@ -229,11 +229,40 @@ own history was measurably clean. Two lessons worth keeping:
   Diagnose it by scanning the PR's branch alone in a single-branch clone —
   that experiment is what separated "my merge broke it" from "another
   branch broke it" here, and the two have completely different fixes.
-- **The fix was prose, not an allowlist.** A `.gitleaks.toml` exemption was
-  available and deliberately not taken: it is the exact "add an exclusion"
-  move decision 2 of this very ADR argues against, and it would have
-  widened a security check's blind spot to spare one sentence. Rewording
-  costs nothing and leaves the guard at full strength. Other ADRs' run keys
+- **The fix is BOTH a reword and a fingerprint allowlist — and the first
+  instinct to reword *instead* was wrong.** This session's first plan was
+  to amend the offending commit and force-push, on the reasoning that a
+  `.gitleaks.toml` entry would be the "add an exclusion" move decision 2
+  argues against. A reviewer caught it. Two corrections, both worth keeping
+  because the mistake is an easy one to repeat:
+
+  1. **This repository had already decided this question, in writing, and
+     the author had not read it.** `.gitleaks.toml`'s header states that
+     the scan treats history as immutable input, that "a false positive
+     that reached history gets a FINGERPRINT allowlist entry: the narrowest
+     exception the tool offers," and that force-pushing a branch to silence
+     a scanner is "a cure worse than the disease." The claim that no such
+     config existed came from checking that the CI workflow passes no
+     `--config` flag — gitleaks auto-discovers the file — rather than from
+     looking for the file. A citation not opened is a citation not
+     verified, which is a standing caution in this project and was earned
+     again here.
+  2. **A fingerprint entry is not the exclusion decision 2 rejects.**
+     Decision 2 is about a *path or file* list, which fails open by
+     omission — the whole file stops being scanned. A fingerprint is
+     `commit:path:rule:line`: one finding, in one immutable commit. The
+     same path keeps being scanned in every other commit, including every
+     future one. `.gitleaks.toml`'s header records that `paths` allowlists
+     were tried, **measured** to fail open, and rejected for exactly the
+     reason decision 2 gives. The two are opposite answers to the same
+     question, and conflating them was the error.
+
+  So the working tree is reworded (new commits do not re-trip the rule) and
+  commit `6f9ef5da` carries a fingerprint entry (the full-history scan
+  still reaches it and it cannot be edited) — the identical shape as the
+  PEM placeholder that entry sits beside. Both verification legs the header
+  demands were run: the repo scans clean, and a planted finding at the same
+  path in a different commit is still reported. Other ADRs' run keys
   (`gv-582-credential-helper`, `gv-583-mask-token`, `gv-591-tween`) were
   measured and do not trip the rule, so no sweep was needed — only this
   line.
