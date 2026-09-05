@@ -65,8 +65,18 @@ fn plan(generation: &str, expects: &[&str]) -> PlanOnScreen {
     PlanOnScreen {
         generation: generation.to_string(),
         expects: expects.iter().map(|e| (*e).to_string()).collect(),
+        // One desk for every fixture here: these tests are about freshness,
+        // not about which repository a plan came from, so they must all agree
+        // on the desk or they would be testing two things at once. The desk
+        // comparison has its own tests in `preview::core`.
+        repository: DESK_REPO.to_string(),
+        worktree: DESK_WORKTREE.to_string(),
     }
 }
+
+/// The one desk every fixture in this module uses. See `plan`.
+const DESK_REPO: &str = "repo-1";
+const DESK_WORKTREE: &str = "wt-1";
 
 /// Record a run of snapshots as a **continuous** feed — seq 1, 2, 3 … — which
 /// is what a client that received every publication holds.
@@ -390,15 +400,23 @@ fn the_feed_subscription_asks_core_for_the_verdict_and_forgets_across_a_gap() {
 
 #[test]
 fn the_preview_remembers_the_plan_it_drew_and_drops_it_with_the_picture() {
+    // Re-pinned in #664 review round 5. This used to require the literal
+    // `PlanOnScreen {` here, which pinned the fact that `fetch` HAND-BUILT one
+    // — and that hand-built copy is exactly how this site came to be missing
+    // two fields the shared constructor had gained. Pinning the constructor
+    // call instead pins the property the test is named for, and cannot be
+    // satisfied by a second copy that has drifted.
     assert!(
-        PREVIEW_SIGNALS.contains("PlanOnScreen {"),
-        "the plan's generation and expected refs are what make a freshness \
-         question answerable at all"
+        PREVIEW_SIGNALS.contains("PlanOnScreen::of(&plan)"),
+        "the preview must take the plan through `PlanOnScreen::of`, not rebuild \
+         it field by field — a second copy of that constructor is how a surface \
+         silently stops carrying a field the constructor added (the desk, in \
+         round 5's case)"
     );
     assert!(
-        PREVIEW_SIGNALS.contains("expected_ref_changes"),
-        "the refs the plan names are what separate `Moved` from \
-         `MovedElsewhere`"
+        !PREVIEW_SIGNALS.contains("PlanOnScreen {"),
+        "a hand-built `PlanOnScreen` has reappeared in the preview signals — \
+         that is the drift this assertion replaced, not a style preference"
     );
     let clear = PREVIEW_SIGNALS
         .split("pub fn clear(&self)")
@@ -546,10 +564,7 @@ fn a_force_push_carries_its_own_plan_because_it_has_no_preview() {
     // that confirmation is displaying a server-built plan's explanation, its
     // risk, and the oid it will overwrite. Freshness taken only from the
     // preview saw nothing and left the button enabled.
-    let carried = PlanOnScreen {
-        generation: "100".to_string(),
-        expects: vec!["refs/heads/main".to_string()],
-    };
+    let carried = plan("100", &["refs/heads/main"]);
     let found = plan_on_screen(&force_push_op(carried.clone()), PlanSlot::Absent);
     assert_eq!(
         found,
@@ -560,14 +575,8 @@ fn a_force_push_carries_its_own_plan_because_it_has_no_preview() {
 
 #[test]
 fn a_previewed_plan_still_wins_where_there_is_one() {
-    let carried = PlanOnScreen {
-        generation: "100".to_string(),
-        expects: vec!["refs/heads/main".to_string()],
-    };
-    let previewed = PlanOnScreen {
-        generation: "200".to_string(),
-        expects: vec!["refs/heads/side".to_string()],
-    };
+    let carried = plan("100", &["refs/heads/main"]);
+    let previewed = plan("200", &["refs/heads/side"]);
     assert_eq!(
         plan_on_screen(&force_push_op(carried), PlanSlot::Ready(previewed.clone())),
         PlanSlot::Ready(previewed),
@@ -644,7 +653,8 @@ fn the_dialog_offers_the_rebuild_it_talks_about_and_asks_core_which_plan() {
          a plan we know is stale (#664 review, defect 1)"
     );
     assert!(
-        CONFIRM_DIALOG.contains("PreviewAction::Clear => rebuild_lease("),
+        CONFIRM_DIALOG.contains("PreviewAction::Clear => {")
+            && CONFIRM_DIALOG.contains("rebuild_lease(&rebuild_op, preview, shell, graph"),
         "and a NotPreviewable one — the force-with-lease push — must take its \
          own path. Routing it through `preview_action` alone resolves to \
          `Clear`, so the offered button issued no request at all (#664 review, \
@@ -669,35 +679,58 @@ fn the_dialog_offers_the_rebuild_it_talks_about_and_asks_core_which_plan() {
         .split("fn rebuild_lease(")
         .nth(1)
         .expect("the force-with-lease rebuild path exists");
+    // ── Re-pinned in #664 review round 5 ──────────────────────────────────
+    //
+    // These four assertions used to pin the SIX-site shape: a token presented
+    // at each of three failure writes, at the landed write, and at the reopen
+    // guard. That shape was the defect. Round 4 found a seventh site (issuing
+    // the second request between the awaits) and an axis no token could see at
+    // all, which is the signature of a fix that enumerates sites rather than
+    // removing them.
+    //
+    // What is pinned now is the property that made the enumeration
+    // unnecessary: ONE commit point, reached with no `.await` after it, so
+    // "check then act" cannot interleave on wasm's single-threaded executor.
     assert!(
-        lease.contains("let token = preview.note_rebuild_started()"),
+        lease.contains("let token = preview.note_rebuild_started(epoch)"),
         "the lease rebuild must enter the rebuilding state before it awaits, \
-         and must capture the token its completion has to present (#664 \
-         review round 3) — a completion that cannot name which rebuild it is \
-         finishing cannot tell a stale reply from a live one"
+         and must capture a token carrying BOTH axes — its own generation and \
+         the graph epoch that repository selection moves (#664 review rounds \
+         3 and 5)"
+    );
+    assert_eq!(
+        lease.matches("rebuild_commit(").count(),
+        1,
+        "exactly one commit point. More than one is the shape rounds 3 and 4 \
+         kept patching — a set of sites discovered one review at a time"
+    );
+    let commit_at = lease
+        .find("rebuild_commit(")
+        .expect("the commit point exists");
+    assert!(
+        !lease[commit_at..].contains(".await"),
+        "no `.await` after the commit point — that is the whole reason the \
+         decision and its effects cannot interleave, and it is a property of \
+         the block's SHAPE rather than of any guard a later edit could forget"
+    );
+    let reopen_at = lease
+        .find("shell.open_confirm(")
+        .expect("the reopen still exists");
+    assert!(
+        reopen_at > commit_at,
+        "the confirmation may only be re-opened AFTER the commit point has \
+         decided — re-opening first is round 3's defect, and re-opening on a \
+         plan built for another desk is round 5's"
     );
     assert!(
-        lease.contains("preview.note_rebuild_landed(token)"),
-        "and must leave it when the replacement arrives, or the confirmation \
-         stays withdrawn over a plan that is right there — presenting the \
-         SAME token it was issued, not a bare call, so a superseded rebuild's \
-         landing cannot overwrite a newer one's state (#664 review round 3)"
-    );
-    assert!(
-        lease.matches("preview.note_rebuild_failed(token)").count() >= 3,
-        "every way it can fail — either request, and a remote tip it cannot \
-         read — must land in the same stated state rather than silently \
-         leaving the dialog rebuilding forever, and each must present the \
-         token so a canceled or superseded rebuild's failure cannot write \
-         over what replaced it (#664 review round 3)"
-    );
-    assert!(
-        lease.contains("if preview.rebuild_is_current(token) {"),
-        "re-opening the confirmation on the replacement plan must check the \
-         SAME token before acting — the fix for #664 review round 3's actual \
-         browser-reproduced defect: a held reply, released after Cancel, \
-         unconditionally reopened a confirmation the user had already \
-         discarded"
+        lease.contains("opened_desk.same_desk(&PlanOnScreen::of(leased))"),
+        "the commit must be fenced on the REPLACEMENT PLAN'S OWN desk, taken \
+         off the plan rather than from anything this client believes about the \
+         selection. Repository selection is per session and shared across \
+         tabs, so a second tab can move this tab's requests with nothing here \
+         going stale — no counter can see that, and the wire already carries \
+         the answer (#664 review round 5; reproduced in \
+         ci/browser/tests/rebuild-lease-two-tabs.spec.mjs)"
     );
 }
 
@@ -778,10 +811,7 @@ fn a_rebuild_in_flight_outranks_the_plan_it_is_replacing() {
     // operation, so a rebuild that did not outrank it would read the plan it
     // is in the middle of replacing — and report it fresh or stale on the
     // strength of a generation the user has already asked to be rid of.
-    let carried = PlanOnScreen {
-        generation: "100".to_string(),
-        expects: vec!["refs/heads/main".to_string()],
-    };
+    let carried = plan("100", &["refs/heads/main"]);
     assert_eq!(
         plan_on_screen(&force_push_op(carried.clone()), PlanSlot::Rebuilding),
         PlanSlot::Rebuilding
@@ -806,10 +836,7 @@ fn the_lease_rebuild_is_a_different_path_because_push_has_no_preview() {
     use crate::features::dialogs::core::preview_subject;
     use crate::features::preview::core::{preview_action, PreviewAction};
 
-    let op = force_push_op(PlanOnScreen {
-        generation: "100".to_string(),
-        expects: Vec::new(),
-    });
+    let op = force_push_op(plan("100", &[]));
     assert_eq!(
         preview_action(Some(preview_subject(&op))),
         PreviewAction::Clear,
