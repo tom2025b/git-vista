@@ -60,19 +60,32 @@
 //! back, which is the redaction half of the deliverable regardless of what
 //! produced the leak.
 //!
-//! # The one thing this harness cannot pin, and why
+//! **Post-M13.01 update:** the above is still why this module never forces
+//! `credential.helper=` *off*. [`network_command_with_credential`] does the
+//! opposite — it *appends* Git-Vista's own helper, never clearing whatever
+//! the operator's config already declares — for the narrow case #582
+//! measured: the operator's own helper executes under this sandbox but
+//! cannot reach its token store, so a token Git-Vista holds itself has
+//! nowhere to go without one. See that function's doc for the design.
+//!
+//! # The one thing this harness could not pin, before #582
 //!
 //! The M1.13 finding's own reproduction of "fails fast and cleanly" pins the
 //! exact string `could not read Username for '<url>': terminal prompts
 //! disabled` — which requires `GIT_TERMINAL_PROMPT=0` in the child's
-//! environment. [`spawn::SandboxedCommand`] deliberately exposes no `env`
-//! method in production (see its module doc, C10 hazard #1): argv and
-//! environment must not be settable after `sandbox_argv` has classified the
-//! spawn, and env-setting is excluded from the production surface for
-//! exactly the same reason `arg`/`args` are. Adding one to force this single
-//! variable would reopen that hazard for a message string, not for a
-//! containment property this crate's tests can't get another way, so this
-//! module does not do it and callers should not either.
+//! environment. Before M13.01, [`spawn::SandboxedCommand`] exposed no `env`
+//! method in production at all (see its module doc, C10 hazard #1), and
+//! adding one to force this single variable was judged not worth reopening
+//! that hazard for a message string alone, so it stayed unpinned.
+//!
+//! #582 has since added exactly one such exception —
+//! [`spawn::SandboxedCommand::credential_env`], narrow by construction (see
+//! its doc for why it does not carry the hazard the exclusion was about) —
+//! but it sets [`spawn::CREDENTIAL_TOKEN_VAR`] specifically, not
+//! `GIT_TERMINAL_PROMPT`. Widening it to a second variable for a message
+//! string alone would still be a scope decision on its own, so this
+//! byte-exact string remains unpinned; the *behavioural* measurement below
+//! is what stands.
 //!
 //! Measured instead (see `network_tier_https_auth_failure_is_fast_and_never_prompts`
 //! below): with no `core.askpass`, no credential helper that succeeds, and no
@@ -82,11 +95,7 @@
 //! when that variable is unset) and fails immediately with `could not read
 //! Username for '<url>': No such device or address`. That is the same
 //! *behaviour* the pinned message promises — fast, clean, no hang, no
-//! interactive fallback — just not the same *bytes*. If the byte-exact
-//! string is required (a client-side string match, say), that needs
-//! `GIT_TERMINAL_PROMPT=0`, which needs an `env` capability on the production
-//! spawn surface — an architectural decision that belongs in its own ADR, not
-//! a unilateral widening here. Reported, not built.
+//! interactive fallback — just not the same *bytes*.
 
 use std::path::Path;
 use std::process::Output;
@@ -128,6 +137,80 @@ pub(crate) fn network_command(
     let mut full: Vec<&str> = FORCED_NETWORK_ARGS.to_vec();
     full.extend_from_slice(args);
     spawn::command_async(policy, repo, &full)
+}
+
+/// The literal appended as `-c credential.helper=<this>` when
+/// [`network_command_with_credential`] is given a token. Contains
+/// [`spawn::CREDENTIAL_TOKEN_VAR`]'s **name**, never a value — the value
+/// lives only in the child's environment, set separately via
+/// [`spawn::SandboxedCommand::credential_env`]. This is the whole of #582's
+/// "argv carries the variable's name, never its value."
+///
+/// `printf`, not `echo`: `echo`'s handling of `-n` and backslash escapes is
+/// shell-dependent, `printf`'s is not. The `[ "$1" = get ]` guard matters
+/// because git also invokes a configured helper with `store` and `erase` (to
+/// report outcome) — without the guard those calls would print a stray
+/// `password=` line to a channel nothing is reading it from, on every
+/// successful or failed auth, not just when a credential is actually wanted.
+fn credential_helper_config() -> String {
+    format!(
+        "!f() {{ [ \"$1\" = get ] && printf 'username=x-access-token\\npassword=%s\\n' \"${}\"; }}; f",
+        spawn::CREDENTIAL_TOKEN_VAR
+    )
+}
+
+/// [`network_command`], plus Git-Vista's own credential helper when `token`
+/// is `Some` (M13.01, #582) — the mechanism the module doc's final section
+/// named as "an architectural decision that belongs in its own ADR" (ADR
+/// 0122, #587) rather than a unilateral widening of [`spawn::SandboxedCommand`].
+///
+/// # The measurement this answers
+///
+/// `sandbox::clone_live::a_private_https_fetch_completes_through_the_production_clone_policy`
+/// found that the sanctioned path — an operator's own configured
+/// `credential.helper`, reached via the config parity every Network-tier
+/// spawn already has — **executes** under this sandbox but cannot read its
+/// own token store (`gh`'s config, `~/.git-credentials`, a keyring socket):
+/// none of those are under a grant this sandbox gives out, and widening one
+/// in per-helper, open-ended, and closes nothing this project has not just
+/// finished hardening. Supplying Git-Vista's own token to Git-Vista's own
+/// helper needs no such grant: the helper this function forces reads
+/// exactly one environment variable and touches no filesystem at all.
+///
+/// # Never clears, only appends
+///
+/// The forced `-c credential.helper=` is **not** the empty-value form
+/// [`FORCED_NETWORK_ARGS`] uses for `core.askpass` (which *disables* a
+/// config-level entry) — a non-empty `credential.helper` value is added to
+/// whatever chain the operator's own config already declares. Git tries
+/// configured helpers in the order they are defined, config-file entries
+/// before `-c` overrides, and moves to the next helper whenever one answers
+/// nothing for `get` — so this one runs *last*, as the fallback for exactly
+/// the case an operator's own helper cannot handle under this sandbox, and
+/// never shadows a host credential path that happens to work.
+///
+/// # `token: None` changes nothing
+///
+/// When `token` is `None` this is byte-identical to [`network_command`] —
+/// no `-c credential.helper=`, no environment variable set — so every
+/// existing Remote-tier caller (`exec_push`, and everywhere else this
+/// crate's `git_cmd::sandboxed()` routes `NetworkNeed::Remote`) is
+/// unaffected until it deliberately opts in.
+pub(crate) fn network_command_with_credential(
+    policy: &Policy,
+    repo: &Path,
+    args: &[&str],
+    token: Option<&str>,
+) -> spawn::SandboxedCommand {
+    let Some(token) = token else {
+        return network_command(policy, repo, args);
+    };
+    let helper_config = format!("credential.helper={}", credential_helper_config());
+    let mut full: Vec<&str> = FORCED_NETWORK_ARGS.to_vec();
+    full.push("-c");
+    full.push(&helper_config);
+    full.extend_from_slice(args);
+    spawn::command_async(policy, repo, &full).credential_env(token)
 }
 
 /// Strip `user[:pass]@` userinfo from every `<scheme>://…` URL substring
@@ -372,6 +455,235 @@ mod tests {
         std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
         std::fs::set_permissions(&bin, perm).unwrap();
         dir.to_string_lossy().into_owned()
+    }
+
+    // --- network_command_with_credential (M13.01, #582) -----------------
+
+    /// A `PATH` containing nothing but a fake `git` that writes its own argv
+    /// (as [`which_dumper`] does) **and then also dumps `/proc/self/cmdline`**
+    /// (NUL-joined, so a value containing spaces or the record separator
+    /// survives) and the raw value of `GIT_VISTA_CREDENTIAL_TOKEN` from its
+    /// own environment — each on its own line, in a fixed order, so a test
+    /// can assert on all three views of "what this process actually saw"
+    /// from one spawn: the argv this crate composed, the argv the *kernel*
+    /// recorded for the process (`/proc/self/cmdline` is what #582's
+    /// acceptance criterion names explicitly — the OS-level view, not this
+    /// crate's own bookkeeping of what it intended to pass), and the
+    /// environment.
+    fn credential_probe_dumper(repo: &Path) -> String {
+        let dir = repo.join("fake-bin-cred");
+        std::fs::create_dir_all(&dir).expect("mkdir fake-bin-cred");
+        let bin = dir.join("git");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\n\
+             for a in \"$@\"; do printf '%s\\037' \"$a\"; done; printf '\\n'\n\
+             tr '\\0' '\\037' < /proc/self/cmdline; printf '\\n'\n\
+             printf '%s\\n' \"$GIT_VISTA_CREDENTIAL_TOKEN\"\n",
+        )
+        .expect("write credential-probe fake git");
+        let mut perm = std::fs::metadata(&bin).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+        std::fs::set_permissions(&bin, perm).unwrap();
+        dir.to_string_lossy().into_owned()
+    }
+
+    /// **The acceptance criterion, driven end to end through a real spawn**:
+    /// "the token appears in neither `/proc/PID/cmdline` … — asserted, not
+    /// reasoned." This does not read the argv this module *composed* and
+    /// trust it — it spawns a real child, has that child read its own
+    /// `/proc/self/cmdline` from the kernel, and greps the canary out of
+    /// that.
+    ///
+    /// # What this test does NOT prove — corrected after review
+    ///
+    /// This comment used to claim the run "also proves the positive half:
+    /// the helper really does receive the token, via the environment, so a
+    /// 'withholds by never actually supplying it' non-fix cannot pass this
+    /// test either." **That was false.** `pinned_env_for_test` does
+    /// `env_clear()` and then applies its profile — which includes
+    /// `CREDENTIAL_TOKEN_VAR` — so it wipes whatever `credential_env` set
+    /// and supplies the canary itself. The env assertion below therefore
+    /// checks the test's own profile, not the production supply path.
+    ///
+    /// Measured, not argued: deleting `.credential_env(token)` from
+    /// `network_command_with_credential` left this test **green**
+    /// (`failure-atlas` mutation 332, verdict `survived`) — the exact
+    /// "structurally complete, semantically inert" shape the claim above
+    /// said could not pass. Found by grok's read-only review of #668,
+    /// 2026-09-05.
+    ///
+    /// The argv/kernel-cmdline half below is sound and is what this test is
+    /// for. The supply half is pinned separately by
+    /// [`the_composed_command_actually_carries_the_token_in_its_environment`],
+    /// which reads the composed command instead of a spawned child, because
+    /// the spawn's environment is exactly what this harness overwrites.
+    #[tokio::test]
+    async fn a_supplied_token_reaches_the_helpers_environment_and_never_the_processs_own_argv() {
+        const CANARY: &str = "gv-test-canary-token-should-never-appear-in-argv-8f2c";
+
+        let repo = fixture().await;
+        let policy = production_policy(repo.path());
+        let dumper = credential_probe_dumper(repo.path());
+
+        let cmd = network_command_with_credential(
+            &policy,
+            repo.path(),
+            &["ls-remote", "https://example.invalid/repo.git"],
+            Some(CANARY),
+        )
+        .pinned_env_for_test(&[
+            ("PATH", dumper),
+            ("HOME", std::env::var("HOME").unwrap()),
+            (spawn::CREDENTIAL_TOKEN_VAR, CANARY.to_string()),
+        ]);
+        let out = cmd.output().await.expect("fake git runs");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut lines = text.lines();
+        let composed_argv = lines.next().expect("argv line");
+        let kernel_cmdline = lines.next().expect("/proc/self/cmdline line");
+        let env_value = lines.next().expect("env value line");
+
+        assert!(
+            !composed_argv.contains(CANARY),
+            "the argv this crate composed contains the token: {composed_argv}"
+        );
+        assert!(
+            !kernel_cmdline.contains(CANARY),
+            "the KERNEL's own record of this process's argv contains the token — \
+             this is the exact acceptance criterion #582 states, and it is not \
+             satisfied by this crate's argv looking clean if the OS view \
+             disagrees: {kernel_cmdline}"
+        );
+        assert_eq!(
+            env_value, CANARY,
+            "the helper's environment does not carry the token at all — a \
+             fix that merely withholds it everywhere would pass the two \
+             assertions above without doing anything useful"
+        );
+        assert!(
+            composed_argv.contains(spawn::CREDENTIAL_TOKEN_VAR),
+            "the credential.helper config should name the variable BY NAME so \
+             the helper knows where to read it, even though the value never \
+             appears: {composed_argv}"
+        );
+    }
+
+    /// The supply half, pinned where the spawn-based test cannot pin it:
+    /// `network_command_with_credential` must actually put the token on the
+    /// command's environment via `credential_env`.
+    ///
+    /// Separate from the `/proc/self/cmdline` test on purpose. That one
+    /// spawns a real child under `pinned_env_for_test`, which `env_clear()`s
+    /// and re-supplies `CREDENTIAL_TOKEN_VAR` from its own profile — so no
+    /// assertion made on the *spawned* environment can distinguish "the
+    /// composer supplied it" from "the test profile supplied it". Deleting
+    /// `.credential_env(token)` left that test green (`failure-atlas`
+    /// mutation 332, `survived`). This test is the one that goes red for
+    /// that defect.
+    ///
+    /// The negative arm matters as much as the positive one: `None` must
+    /// leave the variable unset, so this cannot pass by the composer
+    /// setting it unconditionally.
+    #[tokio::test]
+    async fn the_composed_command_actually_carries_the_token_in_its_environment() {
+        const CANARY: &str = "gv-test-supply-canary-9d41";
+
+        let repo = fixture().await;
+        let policy = production_policy(repo.path());
+
+        let with_token = network_command_with_credential(
+            &policy,
+            repo.path(),
+            &["ls-remote", "https://example.invalid/repo.git"],
+            Some(CANARY),
+        );
+        assert_eq!(
+            with_token.credential_env_for_test().as_deref(),
+            Some(CANARY),
+            "the composed command does not carry the token in its \
+             environment — the helper would have nothing to read, and the \
+             spawn-based test cannot catch this because its own pinned \
+             profile re-supplies the variable"
+        );
+
+        let without_token = network_command_with_credential(
+            &policy,
+            repo.path(),
+            &["ls-remote", "https://example.invalid/repo.git"],
+            None,
+        );
+        assert_eq!(
+            without_token.credential_env_for_test(),
+            None,
+            "a tokenless call must leave {} unset; setting it \
+             unconditionally would make the positive assertion above \
+             vacuous",
+            spawn::CREDENTIAL_TOKEN_VAR
+        );
+    }
+
+    /// `token: None` must be byte-identical to plain [`network_command`] — no
+    /// `-c credential.helper=`, no environment variable — so every existing
+    /// Remote-tier caller that has no token to offer is provably unaffected,
+    /// not merely "probably fine because nothing broke in review."
+    #[tokio::test]
+    async fn no_token_is_byte_identical_to_plain_network_command() {
+        let repo = fixture().await;
+        let policy = production_policy(repo.path());
+        let dumper = which_dumper(repo.path());
+        let hermetic = |c: spawn::SandboxedCommand| {
+            c.pinned_env_for_test(&[
+                ("PATH", dumper.clone()),
+                ("HOME", std::env::var("HOME").unwrap()),
+            ])
+        };
+
+        let with_none = hermetic(network_command_with_credential(
+            &policy,
+            repo.path(),
+            &["ls-remote", "origin"],
+            None,
+        ))
+        .output()
+        .await
+        .expect("fake git runs (None leg)");
+        let plain = hermetic(network_command(
+            &policy,
+            repo.path(),
+            &["ls-remote", "origin"],
+        ))
+        .output()
+        .await
+        .expect("fake git runs (plain leg)");
+
+        assert_eq!(
+            with_none.stdout, plain.stdout,
+            "network_command_with_credential(.., None) must compose the exact \
+             same argv as network_command — a caller with nothing to offer \
+             must see zero behavioural difference"
+        );
+    }
+
+    /// The forced flag is the **non-empty** form. [`FORCED_NETWORK_ARGS`]'s
+    /// `-c core.askpass=` is empty on purpose, to *clear* a config-level
+    /// entry; this one must never accidentally take that shape, because an
+    /// empty `credential.helper=` value clears every helper the operator's
+    /// own config already declares — the opposite of "append a fallback".
+    #[test]
+    fn the_forced_credential_helper_value_is_never_empty() {
+        let cfg = credential_helper_config();
+        assert!(
+            !cfg.is_empty(),
+            "an empty credential.helper value clears the operator's own \
+             configured helpers instead of falling back after them"
+        );
+        assert!(
+            cfg.contains(spawn::CREDENTIAL_TOKEN_VAR),
+            "the helper must name the variable it reads, or nothing tells a \
+             reader (or a future edit) where the token is expected to come \
+             from: {cfg}"
+        );
     }
 
     // --- redact_url_userinfo, pure -------------------------------------

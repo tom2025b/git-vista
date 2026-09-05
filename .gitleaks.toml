@@ -99,3 +99,45 @@ fingerprints = [
   "8e2cec76183ced717792ee84ca324fee519c88c1:.github/actions/host-sandbox-setup/action.yml:private-key:179",
   "056bd4282542e0eddd1dd1d4d2d32fffe7267df9:.github/actions/host-sandbox-setup/action.yml:private-key:179",
 ]
+
+[[allowlists]]
+targetRules = ["generic-api-key"]
+description = """
+False positive, commit 6f9ef5da only. #586 (M13.05), ADR 0123.
+
+ADR 0123's mutation-proof section records the failure-atlas run key its two
+mutation arms were filed under. That commit wrote it as an inline
+`<the underscore spelling of "run key">:`-then-value pair, and the
+`generic-api-key` rule scores that adjacency as a secret because the value
+carries enough entropy to clear its threshold.
+
+It is not a credential. It is a label this repository's own tooling
+generates to group mutation runs — `mutation_check`'s `run_key` argument —
+and it grants access to nothing. Nothing needs rotating. Other ADRs' run
+keys (gv-582-credential-helper, gv-583-mask-token, gv-591-tween) were
+measured against this rule and do not trip it; only this one had the
+entropy to.
+
+The working tree no longer contains the tripping adjacency — the sentence
+was reworded so that new commits do not re-trip the rule, exactly as the
+PEM placeholder above was. This entry exists solely because the
+full-history scan still reaches commit 6f9ef5da, which cannot be edited.
+
+Recorded rather than rewritten deliberately: the branch had already been
+pushed, and this file's header rules that out ("force-pushing a shared
+branch to silence a scanner is a cure worse than the disease"). The
+alternative considered and rejected was a force-push dropping the commit —
+see ADR 0123's own footnote, which records the correction.
+"""
+# `commits` for the same reason as the block above: a top-level
+# [[allowlists]] needs one of commits/paths/regexes/stopwords before
+# `fingerprints` will load, and commit-scoping is the only one of the four
+# that cannot widen. NOT `paths` — a path entry would blind every future
+# commit of this ADR to real key material, which the header records as
+# measured and rejected.
+commits = [
+  "6f9ef5da0bce57709b1c075b8e9bd0112564e89d",
+]
+fingerprints = [
+  "6f9ef5da0bce57709b1c075b8e9bd0112564e89d:docs/adr/0123-the-safety-lives-in-the-shape-not-a-list.md:generic-api-key:211",
+]
