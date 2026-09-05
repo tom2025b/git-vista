@@ -181,6 +181,11 @@ pub struct FileHistoryEntry {
 /// history — see `docs/adr/0022-paged-history-and-bounded-reads.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileHistoryPage {
+    /// Echoes the request (same posture as [`crate::diff::SpecDiff::spec`]):
+    /// a client comparing this against what it currently wants can drop a
+    /// late answer to a superseded request rather than paint it.
+    pub path: String,
+    pub rev: String,
     pub entries: Vec<FileHistoryEntry>,
     /// Present when there may be more history past this page.
     pub cursor: Option<String>,
@@ -231,6 +236,9 @@ pub struct BlameRange {
 /// asks for).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlamePage {
+    /// Echoes the request, same posture as [`FileHistoryPage::path`].
+    pub path: String,
+    pub rev: String,
     pub ranges: Vec<BlameRange>,
     pub start_line: usize,
     pub end_line: usize,

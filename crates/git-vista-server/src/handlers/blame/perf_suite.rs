@@ -166,12 +166,15 @@ fn deep_line_history(repo: &std::path::Path, lines: usize) -> () {
 /// CURRENT, live name — proving the cost is `O(hops)`, not `O(history)`.
 ///
 /// Measured on this host (2026-09-05, `cargo test` debug timings — the ones
-/// a CI run actually pays): classifying the oldest name took ~1.37s (12 hops
-/// × 2 git spawns each, each spawn crossing the sandbox); classifying the
-/// live name took ~15ms (one `cat-file -e`, no chase at all) — a ~90x ratio
-/// for 12 hops, well short of the 3,000 the noise commits would imply if the
-/// cost scaled with history instead of hop count. Asserted at 3s — still
-/// over 2x this host's own worst measurement — so the bound catches a real
+/// a CI run actually pays), across several runs including the full parallel
+/// suite (1,196 other tests competing for the sandbox): classifying the
+/// oldest name ranged **1.37s–2.9s** (12 hops × 2 git spawns each, each spawn
+/// crossing the sandbox, so per-spawn sandbox overhead dominates and varies
+/// with host load); classifying the live name took 15–60ms (one
+/// `cat-file -e`, no chase at all) — a ~40-90x ratio for 12 hops, well short
+/// of the 3,000 the noise commits would imply if the cost scaled with
+/// history instead of hop count. Asserted at 8s — comfortably over this
+/// host's observed worst case under load — so the bound catches a real
 /// regression (an accidental full-history walk here costs whole seconds
 /// *per hop* at 3,000 commits, not milliseconds) without flaking on a loaded
 /// CI box.
@@ -210,8 +213,8 @@ async fn classifying_a_stale_name_costs_hops_not_history_depth() {
         "perf: classify oldest (12 hops) = {oldest_elapsed:?}, classify newest (0 hops) = {newest_elapsed:?}"
     );
     assert!(
-        oldest_elapsed.as_secs_f64() < 3.0,
-        "classifying a 12-hop-stale name took {oldest_elapsed:?}, over the 3s bound — \
+        oldest_elapsed.as_secs_f64() < 8.0,
+        "classifying a 12-hop-stale name took {oldest_elapsed:?}, over the 8s bound — \
          chase_rename_chain may have stopped being O(hops)"
     );
     // The real invariant: the stale-name cost is dominated by hop count, not

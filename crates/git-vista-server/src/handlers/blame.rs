@@ -320,6 +320,8 @@ async fn file_history_for_repo(
     // at all: a `NeverExisted` classification already answered the question.
     if matches!(path_state, PathState::NeverExisted) {
         return Ok(FileHistoryPage {
+            path: path.to_string(),
+            rev: rev.to_string(),
             entries: Vec::new(),
             cursor: None,
             path_state,
@@ -381,6 +383,8 @@ async fn file_history_for_repo(
     let rename_limit_hits = scan_rename_limit_warnings(&stderr, &newest_commit);
 
     Ok(FileHistoryPage {
+        path: path.to_string(),
+        rev: rev.to_string(),
         entries,
         cursor,
         path_state,
@@ -465,6 +469,8 @@ async fn blame_for_repo(
         // returning an empty or nonsense range list — see `PathState`'s own
         // doc for why binary specifically is a refusal, not an empty result.
         return Ok(BlamePage {
+            path: path.to_string(),
+            rev: rev.to_string(),
             ranges: Vec::new(),
             start_line: start.unwrap_or(1),
             end_line: end.unwrap_or(1),
@@ -483,6 +489,8 @@ async fn blame_for_repo(
 
     if total_lines == 0 {
         return Ok(BlamePage {
+            path: path.to_string(),
+            rev: rev.to_string(),
             ranges: Vec::new(),
             start_line,
             end_line: start_line,
@@ -530,6 +538,8 @@ async fn blame_for_repo(
         scan_rename_limit_warnings(&stderr, &newest_commit);
 
     Ok(BlamePage {
+        path: path.to_string(),
+        rev: rev.to_string(),
         ranges,
         start_line,
         end_line,
