@@ -204,9 +204,19 @@ async fn an_app_write_publishes_the_state_it_left_and_the_next_sweeps_add_nothin
     // *publications*, which is what a client actually pays for: a redundant
     // re-read that publishes nothing is invisible to every open stream.
     let repo = repository();
-    let feed = attach_with_hints(repo.path(), Hints::Suppressed);
+    // The native watcher, and the health allowed to settle to `Watching`
+    // FIRST. Both matter to what this test counts. A feed with hints
+    // suppressed publishes an honest health transition of its own when the
+    // watcher's start-up window expires — a real change, but not one this test
+    // is about, and counting it would force the assertion below to be weaker
+    // than the criterion deserves. Waiting for a settled `Watching` removes the
+    // confounder instead of tolerating it, and exercises the production shape.
+    let feed = attach(repo.path());
     let mut snapshots = feed.subscribe();
-    let first = next_snapshot(&mut snapshots, Duration::from_secs(5)).await;
+    let first = snapshot_where(&mut snapshots, Duration::from_secs(10), |s| {
+        matches!(s.health, ChangeFeedHealth::Watching { .. })
+    })
+    .await;
 
     let (status, body) = crate::planner::plan_and_execute_in(
         repo.path(),
@@ -232,6 +242,12 @@ async fn an_app_write_publishes_the_state_it_left_and_the_next_sweeps_add_nothin
 
     // Now let several sweeps run over the state the write produced. Every one
     // of them re-reads; not one of them may publish.
+    //
+    // Counted on the **publication sequence**, not on whether the generation
+    // differs (#664 review). Counting differing generations would let a
+    // redundant re-publication of the SAME state pass unseen — which is the
+    // very thing this criterion is about — so the assertion is that no
+    // publication happened at all, whatever it carried.
     let mut extra = 0;
     let watch_for = tokio::time::Instant::now() + Duration::from_secs(7);
     while tokio::time::timeout_at(watch_for, snapshots.changed())
@@ -239,13 +255,14 @@ async fn an_app_write_publishes_the_state_it_left_and_the_next_sweeps_add_nothin
         .is_ok()
     {
         let seen = snapshots.borrow_and_update().clone();
-        if seen.as_ref().map(|s| &s.generation) != Some(&after_write.generation) {
+        if seen.as_ref().map(|s| s.seq) != Some(after_write.seq) {
             extra += 1;
         }
     }
     assert_eq!(
         extra, 0,
-        "the state the write published is the state every later sweep read"
+        "the write published once; every later sweep read the same state and \
+         published nothing"
     );
 }
 
