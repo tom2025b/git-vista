@@ -883,11 +883,39 @@ pub(super) async fn exec_remove_worktree(
     let args = ["worktree", "remove", fresh_path_str.as_str()];
     let output = match crate::git_cmd::git_output_with_extra_grant(repo, &args, need, grant).await {
         Ok(o) => o,
-        Err(e) => return couldnt_run("/api/remove-worktree", &e),
+        // A spawn/sandbox error routinely names the grant or the repository
+        // path — the shared `couldnt_run` helper embeds it unconditionally,
+        // which is exactly the #656 class of leak (confirmed by grok on this
+        // PR, #665) applied to a different error source. `withheld_detail`
+        // is the fix every one of `AddWorktree`'s three failure arms already
+        // uses (`branch_exec.rs::exec_add_worktree`); this arm is this
+        // operation's equivalent of that function's spawn-error arm.
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::state::withheld_detail(
+                    "/api/remove-worktree",
+                    "Couldn't run git to remove the worktree.",
+                    &e.to_string(),
+                ),
+            )
+        }
     };
     if !output.status.success() {
-        let msg = stderr_or(&output, "git worktree remove failed.");
-        eprintln!("git-vista: /api/remove-worktree failed: {msg}");
+        // THE confirmed leak (grok, #665): git's refusal on a dirty tree is
+        // `fatal: '<abs path>' contains modified or untracked files, use
+        // --force to delete it` — the path is the one thing this operation
+        // never let the client choose or see, and `stderr_or` alone shipped
+        // it verbatim regardless of `GIT_VISTA_EXPOSE_PATHS`. The summary
+        // stays useful with the path withheld: git already refused, nothing
+        // more precise than "which desk, why" is needed to act on it.
+        let why = stderr_or(&output, "git worktree remove failed.");
+        let msg = crate::state::withheld_detail(
+            "/api/remove-worktree",
+            "git wouldn't remove the worktree — it may have uncommitted changes. \
+             This never forces past that; check its status and try again.",
+            &why,
+        );
         return (StatusCode::BAD_REQUEST, msg);
     }
 

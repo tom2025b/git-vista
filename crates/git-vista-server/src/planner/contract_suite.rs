@@ -1647,6 +1647,23 @@ async fn remove_worktree_refuses_a_dirty_sibling() {
         desk_path.exists(),
         "a refused removal must leave the directory in place"
     );
+    // grok's finding on #665: git's own refusal here is `fatal: '<abs path>'
+    // contains modified or untracked files, use --force to delete it` — the
+    // absolute path is the one thing this operation never lets a client
+    // choose or see, and a status-only assertion (the shape of this test
+    // before this line existed) let the leak through unnoticed. The
+    // desk's own path is the concrete string that would appear if the leak
+    // ever comes back — asserting its absence, not just "no leading slash",
+    // survives a rename of the fixture that a bare `!contains('/')` would not
+    // catch as precisely.
+    assert!(
+        !body.contains(&desk_path.display().to_string()),
+        "the response leaked the worktree's absolute path: {body}"
+    );
+    assert!(
+        !body.contains('/'),
+        "the response contains a path-shaped fragment: {body}"
+    );
 }
 
 /// Acceptance: the compare-and-swap. `id` still names a real, servable
@@ -1701,6 +1718,127 @@ async fn remove_worktree_refuses_when_the_id_now_resolves_elsewhere() {
         "the refused removal must not have touched the desk that actually occupies the id now"
     );
     let _ = desks_a; // kept alive for the duration of the test
+}
+
+// ---------------------------------------------------------------------------
+// The omission that carries the fence — exact-body pin, mirroring
+// `worktree_add_suite.rs`'s `exec_add_worktree` pin (#550, M11.05; #665,
+// grok's absolute-path-disclosure finding)
+// ---------------------------------------------------------------------------
+
+/// `exec_remove_worktree`'s body, with `//` comment lines dropped and
+/// whitespace collapsed — so the comparison is about what the function
+/// *does*, same technique as `worktree_add_suite::exec_body_normalised`.
+fn exec_remove_worktree_body_normalised() -> String {
+    const WORKTREE_EXEC: &str = include_str!("worktree_exec.rs");
+    let after = WORKTREE_EXEC
+        .split_once("pub(super) async fn exec_remove_worktree(")
+        .expect("worktree_exec.rs no longer defines `exec_remove_worktree`")
+        .1;
+    let end = after
+        .find("\n}\n")
+        .expect("`exec_remove_worktree` is no longer a closed block");
+    after[..end]
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .flat_map(|line| line.split_whitespace())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// **The load-bearing omission, pinned as an exact body rather than a
+/// denylist.** grok's finding on #665: the git-refusal arm returned
+/// `stderr_or`'s raw text — including git's own quoted absolute path on a
+/// dirty-tree refusal — straight to the client, and a second arm
+/// (`couldnt_run` on the spawn error) leaked the same way. Both are now
+/// routed through `crate::state::withheld_detail`, the mechanism #656/#662
+/// already established for `AddWorktree`'s three arms. This test pins the
+/// fixed body exactly, so a future edit that reintroduces a bare
+/// `stderr_or`/`couldnt_run` return lands here as a diff a human must read
+/// and update on purpose, rather than a silent regression.
+#[test]
+fn the_executor_body_is_exactly_what_it_should_be() {
+    const EXPECTED: &str = concat!(
+        "repo: &Path, need: NetworkNeed, id: &str, expected_census: &WorktreeCensus, ) -> ",
+        "(StatusCode, String) { let expected_path = match resolve_removable(expected_census, ",
+        "id) { Ok(p) => p, Err(refused) => return refused, }; let fresh_census = ",
+        "crate::worktree_census::worktree_census( repo, ",
+        "crate::worktree_census::CensusPaths::rows_for_local_use(crate::state::expose_paths()), ",
+        "&crate::state::path_is_allowed, ) .await; let fresh_path = ",
+        "match resolve_removable(&fresh_census, id) { Ok(p) => p, Err(refused) => return ",
+        "refused, }; if fresh_path != expected_path { eprintln!( \"git-vista: ",
+        "/api/remove-worktree refusing a compare-and-swap mismatch for {id}: \\ reviewed as ",
+        "{}, a fresh census now says {}\", expected_path.display(), fresh_path.display() ); ",
+        "return ( StatusCode::CONFLICT, \"This worktree changed since it was reviewed, so ",
+        "nothing was removed. \\ Reopen the worktree drawer and try again.\" .to_string(), ); } ",
+        "let Some(grant) = fresh_path.parent() else { eprintln!( \"git-vista: ",
+        "/api/remove-worktree: {} has no parent directory to grant\", fresh_path.display() ); ",
+        "return ( StatusCode::INTERNAL_SERVER_ERROR, \"Couldn't determine where that worktree ",
+        "lives, so nothing was removed.\".to_string(), ); }; let fresh_path_str = ",
+        "fresh_path.to_string_lossy().into_owned(); let args = [\"worktree\", \"remove\", ",
+        "fresh_path_str.as_str()]; let output = match ",
+        "crate::git_cmd::git_output_with_extra_grant(repo, &args, need, grant).await { Ok(o) ",
+        "=> o, Err(e) => { return ( StatusCode::INTERNAL_SERVER_ERROR, ",
+        "crate::state::withheld_detail( \"/api/remove-worktree\", \"Couldn't run git to remove ",
+        "the worktree.\", &e.to_string(), ), ) } }; if !output.status.success() { let why = ",
+        "stderr_or(&output, \"git worktree remove failed.\"); let msg = ",
+        "crate::state::withheld_detail( \"/api/remove-worktree\", \"git wouldn't remove the ",
+        "worktree — it may have uncommitted changes. \\ This never forces past that; check ",
+        "its status and try again.\", &why, ); return (StatusCode::BAD_REQUEST, msg); } let ",
+        "summary = format!(\"removed worktree at {}\", fresh_path.display()); ",
+        "println!(\"[/api/remove-worktree] {summary}\"); journal_app_event( repo, ",
+        "ActivityKind::Other, None, Obs::Absent, Obs::Absent, summary, ) .await; (StatusCode::OK, ",
+        "\"Worktree removed.\".to_string())",
+    );
+    assert_eq!(
+        exec_remove_worktree_body_normalised(),
+        EXPECTED,
+        "\n`exec_remove_worktree` changed. This is a security-critical function: it is \
+         the one place that turns git's own stderr into a client-facing response for a \
+         destructive, irrecoverable operation, and #665 (grok) found it leaking an \
+         absolute path here twice. Read the diff, confirm every failure arm that touches \
+         git/OS output still routes through `crate::state::withheld_detail`, then update \
+         this literal deliberately.\n"
+    );
+}
+
+/// The paired positive for the pin above: an exact-body assertion is only
+/// worth having if the body it pins actually withholds the path AND still
+/// says something a human can act on. This names both facts so a future edit
+/// that updates the literal without thinking still has to keep them true —
+/// in particular, it catches the over-redaction failure mode (e.g. replacing
+/// a summary with `""` or a bare "Error") that a leak-only check would miss.
+#[test]
+fn the_pinned_body_withholds_the_path_but_says_something_useful() {
+    let body = exec_remove_worktree_body_normalised();
+    assert!(
+        body.contains(
+            "crate::state::withheld_detail( \"/api/remove-worktree\", \"Couldn't run git to \
+             remove the worktree.\", &e.to_string(), )"
+        ),
+        "the spawn-error arm no longer routes through `withheld_detail` with a useful \
+         summary: {body}"
+    );
+    assert!(
+        body.contains(
+            "crate::state::withheld_detail( \"/api/remove-worktree\", \"git wouldn't remove the \
+             worktree — it may have uncommitted changes. \\ This never forces past that; check \
+             its status and try again.\", &why, )"
+        ),
+        "the git-refusal arm no longer routes through `withheld_detail` with a useful \
+         summary — either it went back to a bare `stderr_or` return (the original leak), or \
+         the summary was redacted into something unusable: {body}"
+    );
+    assert!(
+        body.contains("return (StatusCode::BAD_REQUEST, msg);"),
+        "the git-refusal arm no longer returns the withheld summary (`msg`) as the \
+         client-facing body: {body}"
+    );
+    assert!(
+        !body.contains("return (StatusCode::BAD_REQUEST, why)"),
+        "the git-refusal arm returns the raw, unwithheld `why` as the client-facing \
+         body — this is the original leak: {body}"
+    );
 }
 
 /// The race guard, in isolation: [`exec_delete_untracked_paths`] refuses a
