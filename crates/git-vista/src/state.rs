@@ -164,6 +164,10 @@ pub enum ViewerDoc {
     ///
     /// Read-only in this slice. Editing arrives in #429.
     Conflict { path: String },
+    /// Rename-aware file history and line-range blame for one path at one
+    /// revision (M5.33, #86) — opened from a file's own menu, the same way
+    /// `File` opens from the diff list.
+    Blame { path: String, rev: String },
 }
 
 /// The persisted display settings, shared into every icon-drawing view so a

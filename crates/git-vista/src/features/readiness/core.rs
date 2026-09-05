@@ -67,6 +67,12 @@ pub enum DocIdentity {
     Conflict {
         path: String,
     },
+    /// M5.33 (#86): echoes `BlamePage::path`/`BlamePage::rev`, the same
+    /// response-echoes-request posture `File` and `Spec` already use.
+    Blame {
+        path: String,
+        rev: String,
+    },
 }
 
 /// What the viewer's resource has settled on for the currently-open
@@ -120,6 +126,25 @@ mod tests {
             id: id.to_string(),
             path: path.to_string(),
         }
+    }
+
+    fn blame(path: &str, rev: &str) -> DocIdentity {
+        DocIdentity::Blame {
+            path: path.to_string(),
+            rev: rev.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_blame_response_for_a_different_path_reads_busy_like_any_other_stale_echo() {
+        assert!(is_viewer_busy(
+            &blame("a.rs", "HEAD"),
+            &FetchOutcome::Ok(blame("b.rs", "HEAD"))
+        ));
+        assert!(!is_viewer_busy(
+            &blame("a.rs", "HEAD"),
+            &FetchOutcome::Ok(blame("a.rs", "HEAD"))
+        ));
     }
 
     #[test]

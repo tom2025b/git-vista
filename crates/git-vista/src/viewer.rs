@@ -17,13 +17,16 @@ use leptos::*;
 
 use git_vista_core::diff::{CommitDiff, FileContent};
 use git_vista_core::virtualize::CumulativeHeights;
+use git_vista_protocol::blame::BlamePage;
 use git_vista_protocol::diff::{ComparisonBasis, DiffSpec, SpecDiff};
 use git_vista_protocol::{PatchPlan, PatchPreview, StageDirection, StagingDiff};
 
 use crate::api::{
-    fetch_conflict_panes, fetch_conflict_source, fetch_diff_full, fetch_file, fetch_spec_diff,
-    resolve_conflict_content_request, resolve_conflict_request, staging_diff_request,
+    fetch_blame, fetch_conflict_panes, fetch_conflict_source, fetch_diff_full, fetch_file,
+    fetch_file_history, fetch_spec_diff, resolve_conflict_content_request,
+    resolve_conflict_request, staging_diff_request,
 };
+use crate::features::blame::view::blame_body;
 // The row-height scale and overscan are the panel's constants, shared rather
 // than duplicated: two surfaces measuring the same rendered text with
 // different numbers is how a window and its scrollbar drift apart.
@@ -145,6 +148,7 @@ pub fn viewer_view(
         shell,
         status,
         graph,
+        compare_anchor,
         ..
     } = features;
     let nerd_icons = settings.nerd_icons;
@@ -179,6 +183,11 @@ pub fn viewer_view(
     let printing = create_rw_signal(false);
     install_print_signal(printing);
     let staging_selection = create_rw_signal(DiffSelection::new());
+    // M5.33 (#86): the blame panel's own roving focus and touch/keyboard
+    // range selection — created here, above the render closures, for the
+    // same reason as `hunk_focus`: a re-render must not reset the position.
+    let blame_focus = create_rw_signal(GraphFocus::new(0));
+    let blame_selection = create_rw_signal(crate::features::blame::core::BlameSelection::new());
     let staging_preview = create_rw_signal(None::<Result<PatchPreview, String>>);
     // The exact plan `staging_preview` was built from (review finding,
     // #215): without this, changing the selection after a preview leaves
@@ -216,6 +225,13 @@ pub fn viewer_view(
                 Some(ViewerDoc::Spec { spec }) => {
                     Some(DocResult::Spec(fetch_spec_diff(&spec).await))
                 }
+                Some(ViewerDoc::Blame { path, rev }) => {
+                    // A selection made against a since-replaced path/rev
+                    // would address ranges that may no longer exist —
+                    // same rule `Staging`'s arm applies to its own selection.
+                    blame_selection.update(|s| s.clear());
+                    Some(DocResult::Blame(fetch_blame(&path, &rev, None, None).await))
+                }
                 Some(ViewerDoc::Conflict { path }) => {
                     // A refusal belongs to the path it was about; carrying it
                     // onto the next file would explain the wrong conflict.
@@ -229,6 +245,23 @@ pub fn viewer_view(
                     };
                     Some(DocResult::Conflict(result))
                 }
+            }
+        },
+    );
+    // The blame panel's own file-history list — a second resource rather
+    // than folded into `doc` above: `BlamePage` and `FileHistoryPage` are two
+    // different reads of the same path/rev, and `blame_body` renders the
+    // history list underneath the ranges regardless of which one is still
+    // settling, so gating the whole panel on both landing together would
+    // make the ranges wait on a fetch they do not need.
+    let blame_history = create_local_resource(
+        move || shell.viewer_doc(),
+        |doc| async move {
+            match doc {
+                Some(ViewerDoc::Blame { path, rev }) => {
+                    Some(fetch_file_history(&path, &rev, None).await)
+                }
+                _ => None,
             }
         },
     );
@@ -250,6 +283,9 @@ pub fn viewer_view(
                 },
                 ViewerDoc::Spec { spec } => spec_title(spec),
                 ViewerDoc::Conflict { path } => format!("Conflict — {path}"),
+                ViewerDoc::Blame { path, rev } => {
+                    format!("Blame — {path} @ {}", &rev[..rev.len().min(7)])
+                }
             };
             let which_for_body = which.clone();
             // #387: the readiness signal, cloned off before `which_for_body`
@@ -270,6 +306,7 @@ pub fn viewer_view(
                 | Some(DocResult::File(Err(e)))
                 | Some(DocResult::Staging(Err(e)))
                 | Some(DocResult::Conflict(Err(e)))
+                | Some(DocResult::Blame(Err(e)))
                 | Some(DocResult::Spec(Err(e))) => view! {
                     <p class="detail-status detail-error">{format!("Couldn't load: {e}")}</p>
                 }
@@ -331,6 +368,23 @@ pub fn viewer_view(
                         status,
                         graph,
                         shell,
+                    )
+                }
+                Some(DocResult::Blame(Ok(page))) => {
+                    // Same staleness echo as every other arm.
+                    if !matches!(&which_for_body, ViewerDoc::Blame { path, rev }
+                                 if *path == page.path && *rev == page.rev)
+                    {
+                        return view! { <p class="detail-status">"Loading…"</p> }.into_view();
+                    }
+                    let history = blame_history.get().flatten();
+                    blame_body(
+                        &page,
+                        history.as_ref(),
+                        blame_focus,
+                        blame_selection,
+                        shell,
+                        compare_anchor,
                     )
                 }
                 Some(DocResult::Staging(Ok(d))) => {
@@ -424,6 +478,11 @@ enum DocResult {
     Spec(Result<SpecDiff, String>),
     /// All four panes of one conflicted path (M4.31a, #428).
     Conflict(Result<ConflictPanes, String>),
+    /// Rename-aware blame for one path/revision (M5.33, #86). Only the
+    /// default first page — `blame_body` owns paging further lines/history
+    /// itself, the same way `spec_body`/`diff_body` own their own internal
+    /// signals below this match.
+    Blame(Result<BlamePage, String>),
 }
 
 /// Reduce the currently-open document to the identity
@@ -441,6 +500,10 @@ fn viewer_doc_identity(which: &ViewerDoc) -> DocIdentity {
         ViewerDoc::Staging { .. } => DocIdentity::Staging,
         ViewerDoc::Spec { spec } => DocIdentity::Spec { spec: spec.clone() },
         ViewerDoc::Conflict { path } => DocIdentity::Conflict { path: path.clone() },
+        ViewerDoc::Blame { path, rev } => DocIdentity::Blame {
+            path: path.clone(),
+            rev: rev.clone(),
+        },
     }
 }
 
@@ -456,7 +519,8 @@ fn doc_result_outcome(result: Option<&DocResult>) -> FetchOutcome {
         | Some(DocResult::File(Err(_)))
         | Some(DocResult::Staging(Err(_)))
         | Some(DocResult::Spec(Err(_)))
-        | Some(DocResult::Conflict(Err(_))) => FetchOutcome::Err,
+        | Some(DocResult::Conflict(Err(_)))
+        | Some(DocResult::Blame(Err(_))) => FetchOutcome::Err,
         Some(DocResult::Diff(Ok(d))) => FetchOutcome::Ok(DocIdentity::Diff { id: d.id.clone() }),
         Some(DocResult::File(Ok(f))) => FetchOutcome::Ok(DocIdentity::File {
             id: f.id.clone(),
@@ -468,6 +532,10 @@ fn doc_result_outcome(result: Option<&DocResult>) -> FetchOutcome {
         }),
         Some(DocResult::Conflict(Ok(panes))) => FetchOutcome::Ok(DocIdentity::Conflict {
             path: panes.path.clone(),
+        }),
+        Some(DocResult::Blame(Ok(page))) => FetchOutcome::Ok(DocIdentity::Blame {
+            path: page.path.clone(),
+            rev: page.rev.clone(),
         }),
     }
 }
