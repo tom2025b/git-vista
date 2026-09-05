@@ -122,6 +122,14 @@ flowchart TD
     class K legend
 ```
 
+**Both counts are drawn from the same population**, and that symmetry is what
+makes comparing them mean anything: every change the watcher had an opportunity
+to announce is counted, whether it announced it or not. Counting only
+timer-triggered changes — the first implementation, and the spec's own field
+wording — samples misses and near-races while excluding every ordinary success,
+so a watcher that had worked twenty times running could be condemned by the
+next ten it missed.
+
 **A dead watcher is caught by the free experiment already running.** Because the
 sweep also runs on a timer, a timer-triggered sweep that finds a change the
 watcher never hinted at is *evidence about the watcher*. It is counted, never
@@ -370,10 +378,20 @@ as one that was already too large. The two required roots are installed first,
 so a starved budget still watches `HEAD`, `index` and `packed-refs`.
 
 **The cadence is bounded by its own measured cost**, not by a guessed interval:
-the sweep never runs sooner than **ten times** its own last measured duration.
+a read never runs sooner than **ten times** the last read's measured duration.
 The app's cost is therefore capped at 10 % of one core by construction, on a
 tiny repository and a huge one alike, with no size heuristic and no
 configuration.
+
+**That floor is a property of the driver, not of the timer, and the difference
+is the whole of it.** The first implementation applied it only to the timer
+deadline — and every watcher hint and app write then replaced that deadline
+with *now*, so the ordinary case bypassed the bound entirely. Measured in
+review of this branch: forty real tag writes at ~120 ms spacing produced 39
+full reads, **35.0 % read occupancy** on a tiny repository. A bound that holds
+only when nothing is happening is not a bound. Hints inside the window are
+coalesced rather than dropped: the read they asked for happens the moment the
+floor lifts.
 
 ```mermaid
 ---
@@ -504,7 +522,27 @@ Three things fall out, and the third is a finding rather than a result:
   string**, because `EventSource` cannot set headers. Matched *exactly* rather
   than by a wildcard, so the exception cannot widen by accident.
 - **No path crosses the wire.** A lost watch is named by a git-dir-relative
-  label (`refs/heads/team`), never a filesystem path.
+  label (`refs/heads/team`), never a filesystem path — and a path with no
+  recognisable git directory above it discloses nothing at all rather than a
+  path with its front cut off.
+- **Every snapshot carries its position in the feed's publication sequence.**
+  A `RefDelta` is a difference from the *previous publication*, and the
+  transport keeps only the latest value — so a slow reader can skip
+  publications without ever disconnecting, and a chain of deltas read across a
+  gap is not a chain. Reproduced in review: `refs/heads/main` moves, an
+  unrelated tag moves before the client polls, and a plan expecting `main` is
+  told the repository moved "but not in a way this operation depends on". The
+  button stayed correctly withdrawn and the *explanation* was false, which is
+  this milestone's own failure shape aimed at itself. A client whose previous
+  snapshot is not `seq - 1` keeps the reading and discards the claim.
+- **A write waits for its own sweep, not for a publication.** Those are
+  different facts: a sweep that correctly publishes nothing — because the
+  watcher already announced that generation — has still finished, and waiting
+  on a publication instead added a measured 5.0 s to a successful write.
+- **A retired notice source is dropped, not re-polled.** A closed channel
+  answers instantly and forever, so leaving it in the driver's `select!` makes
+  its arm win every iteration: measured at 41 reads in two seconds, and a spin
+  even once the reads were stopped.
 - **The decisions are host-testable by construction.** The policy is a pure core
   with no tokio and no clock; the client's four-state verdict and every sentence
   it prints are pure. That is ADR 0115's rule applied at the moment the decision
@@ -515,6 +553,17 @@ Three things fall out, and the third is a finding rather than a result:
   what it says and what it offers. It found a real defect the Rust suite could
   not — the feed opened on the launch repository and did not follow the
   session's selection.
+- **A stale plan offers Rebuild, and Cancel is Discard.** Rebuild fetches a new
+  plan through the same path the dialog opened with; it never executes and
+  never dismisses, so the approval boundary holds. The first slice shipped the
+  *sentence* telling the user to rebuild and no control that would — and the
+  browser tests, which asserted the wording and the disabled state, passed
+  straight over it.
+- **A confirmation can hold a plan two ways, and both are checked.** A
+  force-with-lease push has no graph preview (`preview_subject(Push)` is
+  `NotPreviewable`) while displaying a server-built plan's explanation, risk and
+  lease oid. Freshness taken only from the preview saw nothing there and left
+  the most destructive button in the app enabled after the repository moved.
 
 ## The operator's five questions
 
