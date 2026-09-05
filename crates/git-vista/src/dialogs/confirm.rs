@@ -683,7 +683,7 @@ fn rebuild_lease(op: &PendingOp, preview: Preview, shell: Shell) {
     };
     let branch = branch.clone();
     let set_upstream = *set_upstream;
-    preview.note_rebuild_started();
+    let token = preview.note_rebuild_started();
     spawn_local(async move {
         let Ok(plain) = crate::api::preview_push(
             "origin",
@@ -693,7 +693,7 @@ fn rebuild_lease(op: &PendingOp, preview: Preview, shell: Shell) {
         )
         .await
         else {
-            preview.note_rebuild_failed();
+            preview.note_rebuild_failed(token);
             return;
         };
         let RemoteTipKnowledge::Known(oid) = remote_tip_from_plan(&plain.expected_ref_changes)
@@ -702,7 +702,7 @@ fn rebuild_lease(op: &PendingOp, preview: Preview, shell: Shell) {
             // to lease against. A force-with-lease plan cannot be built at all
             // — which is a refusal, not a failed request, and it lands in the
             // same place because the user's next move is the same either way.
-            preview.note_rebuild_failed();
+            preview.note_rebuild_failed(token);
             return;
         };
         let Ok(leased) = crate::api::preview_push(
@@ -715,18 +715,26 @@ fn rebuild_lease(op: &PendingOp, preview: Preview, shell: Shell) {
         )
         .await
         else {
-            preview.note_rebuild_failed();
+            preview.note_rebuild_failed(token);
             return;
         };
-        // Re-open the confirmation on the replacement. The user approves again
-        // — the modal is still asking, and the button is live only because the
-        // new plan's generation is the live one.
-        shell.open_confirm(PendingOp::Push {
-            branch,
-            set_upstream,
-            force: Some(ForceWithLease::from_leased_plan(&leased, oid)),
-        });
-        preview.note_rebuild_landed();
+        // Re-open the confirmation on the replacement, but only if this is
+        // still the rebuild that is live — Cancel, a newer rebuild, or the
+        // dialog closing and reopening on something else has all bumped the
+        // generation `token` was issued under (#664 review round 3). Without
+        // this check a held-then-released reply reopened a confirmation the
+        // user had already discarded, unconditionally.
+        if preview.rebuild_is_current(token) {
+            // The user approves again — the modal is still asking, and the
+            // button is live only because the new plan's generation is the
+            // live one.
+            shell.open_confirm(PendingOp::Push {
+                branch,
+                set_upstream,
+                force: Some(ForceWithLease::from_leased_plan(&leased, oid)),
+            });
+        }
+        preview.note_rebuild_landed(token);
     });
 }
 

@@ -670,19 +670,34 @@ fn the_dialog_offers_the_rebuild_it_talks_about_and_asks_core_which_plan() {
         .nth(1)
         .expect("the force-with-lease rebuild path exists");
     assert!(
-        lease.contains("preview.note_rebuild_started()"),
-        "the lease rebuild must enter the rebuilding state before it awaits"
+        lease.contains("let token = preview.note_rebuild_started()"),
+        "the lease rebuild must enter the rebuilding state before it awaits, \
+         and must capture the token its completion has to present (#664 \
+         review round 3) — a completion that cannot name which rebuild it is \
+         finishing cannot tell a stale reply from a live one"
     );
     assert!(
-        lease.contains("preview.note_rebuild_landed()"),
+        lease.contains("preview.note_rebuild_landed(token)"),
         "and must leave it when the replacement arrives, or the confirmation \
-         stays withdrawn over a plan that is right there"
+         stays withdrawn over a plan that is right there — presenting the \
+         SAME token it was issued, not a bare call, so a superseded rebuild's \
+         landing cannot overwrite a newer one's state (#664 review round 3)"
     );
     assert!(
-        lease.matches("preview.note_rebuild_failed()").count() >= 3,
+        lease.matches("preview.note_rebuild_failed(token)").count() >= 3,
         "every way it can fail — either request, and a remote tip it cannot \
          read — must land in the same stated state rather than silently \
-         leaving the dialog rebuilding forever"
+         leaving the dialog rebuilding forever, and each must present the \
+         token so a canceled or superseded rebuild's failure cannot write \
+         over what replaced it (#664 review round 3)"
+    );
+    assert!(
+        lease.contains("if preview.rebuild_is_current(token) {"),
+        "re-opening the confirmation on the replacement plan must check the \
+         SAME token before acting — the fix for #664 review round 3's actual \
+         browser-reproduced defect: a held reply, released after Cancel, \
+         unconditionally reopened a confirmation the user had already \
+         discarded"
     );
 }
 

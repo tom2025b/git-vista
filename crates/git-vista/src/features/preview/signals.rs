@@ -56,6 +56,17 @@ pub enum PreviewSlot {
     Failed(String),
 }
 
+/// Proof that a rebuild-lease continuation is still the one that started it
+/// — nothing has bumped `Preview`'s generation since (#664 review round 3;
+/// see [`Preview::note_rebuild_started`]'s doc comment for the defect this
+/// closes). The only way to mint one is `note_rebuild_started`; the only
+/// ways to spend one are `note_rebuild_failed`, `note_rebuild_landed` and
+/// `rebuild_is_current` — a continuation cannot write state or act on a
+/// stale rebuild without presenting a token, and presenting a stale one is
+/// simply inert rather than a check the caller could forget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RebuildToken(u64);
+
 /// The preview panel's state, owned by `App` and handed down in `Features`.
 #[derive(Clone, Copy)]
 pub struct Preview {
@@ -195,30 +206,77 @@ impl Preview {
         self.plan.set(PlanSlot::Absent);
     }
 
-    /// Note that a rebuild this `Preview` is not itself fetching has begun.
+    /// Note that a rebuild this `Preview` is not itself fetching has begun,
+    /// and return the token its completion must present.
     ///
     /// The force-with-lease confirmation's plan does not come from here — it
     /// has no graph preview at all — but its Rebuild has the same two states,
     /// and they are held here so the dialog reads one slot rather than two.
-    pub fn note_rebuild_started(&self) {
-        self.bump();
+    ///
+    /// # Why this returns a token (#664 review round 3)
+    ///
+    /// `fetch`'s own generation guard (this module's doc comment) only
+    /// protects state `fetch` itself writes. A rebuild-lease continuation is
+    /// two round trips run entirely outside `fetch`, so nothing checked its
+    /// generation before writing `RebuildFailed`/`Absent` or before
+    /// re-opening the confirmation dialog — a held response, released after
+    /// Cancel (which bumps via [`Self::clear`]) or after a newer rebuild
+    /// (which bumps again via this method), would act as though it were
+    /// still current. `RebuildToken` makes that unrepresentable: the only
+    /// way to mint one is to call this method, and the only ways to spend
+    /// one are [`Self::note_rebuild_failed`], [`Self::note_rebuild_landed`]
+    /// and [`Self::rebuild_is_current`] — each checks it against the live
+    /// generation before doing anything, so a stale token is inert rather
+    /// than a convention a caller has to remember to honour.
+    pub fn note_rebuild_started(&self) -> RebuildToken {
+        let issued = self.bump();
         self.plan.set(PlanSlot::Rebuilding);
+        RebuildToken(issued)
     }
 
-    /// Note that such a rebuild did not produce a plan.
-    pub fn note_rebuild_failed(&self) {
-        self.plan.set(PlanSlot::RebuildFailed);
+    /// Note that such a rebuild did not produce a plan — unless `token` is no
+    /// longer current, in which case this does nothing: a newer rebuild or a
+    /// cancel already wrote whatever state now holds, and this stale reply
+    /// must not overwrite it.
+    pub fn note_rebuild_failed(&self, token: RebuildToken) {
+        if self.rebuild_is_current(token) {
+            self.plan.set(PlanSlot::RebuildFailed);
+        }
     }
 
     /// Note that such a rebuild landed, and the replacement plan is now
-    /// carried by the operation itself.
+    /// carried by the operation itself — unless `token` is no longer
+    /// current, in which case this does nothing, for the same reason
+    /// [`Self::note_rebuild_failed`] guards: a newer rebuild's own
+    /// `Rebuilding` (or a cancel's `Absent`) must not be clobbered by a
+    /// reply to the rebuild it replaced.
     ///
-    /// Required, and its absence would be a defect of exactly the shape this
-    /// whole slot exists to prevent: `Rebuilding` outranks the carried plan in
-    /// `plan_on_screen`, so a rebuild that never says it finished leaves the
-    /// confirmation disabled over a replacement that did arrive.
-    pub fn note_rebuild_landed(&self) {
-        self.plan.set(PlanSlot::Absent);
+    /// A *current* call is still required, and its absence would be a defect
+    /// of exactly the shape this whole slot exists to prevent: `Rebuilding`
+    /// outranks the carried plan in `plan_on_screen`, so a rebuild that never
+    /// says it finished leaves the confirmation disabled over a replacement
+    /// that did arrive.
+    pub fn note_rebuild_landed(&self, token: RebuildToken) {
+        if self.rebuild_is_current(token) {
+            self.plan.set(PlanSlot::Absent);
+        }
+    }
+
+    /// Whether a rebuild started with `token` is still the live one —
+    /// nothing (Cancel, a newer rebuild, the dialog closing and reopening)
+    /// has bumped the generation since. `note_rebuild_failed` and
+    /// `note_rebuild_landed` already check this before writing; call it
+    /// directly for an action this `Preview` does not itself own, such as
+    /// re-opening the confirmation dialog on the replacement plan (#664
+    /// review round 3).
+    pub fn rebuild_is_current(&self, token: RebuildToken) -> bool {
+        // The comparison itself lives in `core::rebuild_token_is_current`,
+        // host-tested — this wrapper only supplies the wasm-only signal read
+        // (#664 review round 3; see that function's own doc comment).
+        crate::features::preview::core::rebuild_token_is_current(
+            self.generation.try_get_value(),
+            token.0,
+        )
     }
 
     /// Take the next generation and return it.

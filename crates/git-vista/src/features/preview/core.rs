@@ -442,6 +442,54 @@ pub fn preview_action(subject: Option<DialogSubject<'_>>) -> PreviewAction {
     }
 }
 
+/// Whether a rebuild-lease continuation issued at generation `issued` is
+/// still the live one — `current` is `Preview`'s generation counter, read at
+/// the moment this is checked.
+///
+/// # Moved here for the same reason `preview_action` was (#664 review round 3)
+///
+/// This one comparison is the entire fix for the round's browser-reproduced
+/// defect: `dialogs/confirm.rs`'s `rebuild_lease` held a reply after Cancel,
+/// and nothing checked whether the rebuild it was completing was still
+/// current before writing state or re-opening the confirmation. The
+/// comparison itself is one line either way it is written, which is exactly
+/// why it must live where a runner can execute it rather than in
+/// `features/preview/signals.rs` (`#[cfg(target_arch = "wasm32")]`, `cargo
+/// test` never compiles it) — the same gap ADR 0115 and #612 both name, and
+/// the same fix: move the decision, not the value.
+///
+/// `None` (a disposed owner; `try_get_value` found nothing) is never
+/// current — the same conservative reading `Preview::fetch`'s own guard
+/// already gives an unreadable generation, so an unreadable one and a
+/// stale one are not distinguished here either.
+pub fn rebuild_token_is_current(current: Option<u64>, issued: u64) -> bool {
+    current == Some(issued)
+}
+
+#[cfg(test)]
+mod rebuild_token_tests {
+    use super::rebuild_token_is_current;
+
+    #[test]
+    fn a_token_matching_the_live_generation_is_current() {
+        assert!(rebuild_token_is_current(Some(3), 3));
+    }
+
+    #[test]
+    fn a_token_behind_the_live_generation_is_not_current() {
+        // Cancel, or a newer rebuild, bumped past it.
+        assert!(!rebuild_token_is_current(Some(4), 3));
+    }
+
+    #[test]
+    fn an_unreadable_generation_is_never_current() {
+        // A disposed owner — never treated as "still fine", the same
+        // conservative reading an unreadable ref gets everywhere else in
+        // this app.
+        assert!(!rebuild_token_is_current(None, 3));
+    }
+}
+
 #[cfg(test)]
 mod preview_action_tests {
     use super::*;
