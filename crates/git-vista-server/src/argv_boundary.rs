@@ -108,6 +108,18 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     "src/handlers/read/content_suite.rs",
     "src/handlers/read/graph_suite.rs",
     "src/handlers/read/status_suite.rs",
+    // M5.33 (#86): `#[cfg(test)]` fixture setup only — one `git fast-import`
+    // spawn per fixture, feeding a stream this file builds, into a fresh
+    // `tempfile::tempdir()`. It is here rather than using
+    // `git_vista_fixtures`'s helpers because the two fixtures it needs are
+    // deliberately large (a 12-hop rename chain inside ~3,000 commits, and a
+    // 3,000-commit single-line-per-commit file), and thousands of `git
+    // commit` spawns would take minutes — the same argument
+    // `git_vista_git::history::tests::deep_remote_chain` already makes for
+    // the same tool. Nothing in `handlers/blame.rs` itself constructs a
+    // `Command`: both endpoints go through `git_cmd`'s sandboxed, capped
+    // helpers, which is the seam this census exists to keep them behind.
+    "src/handlers/blame/perf_suite.rs",
     // M2.21b (#236): `#[cfg(test)]` fixture setup only. No handler in this
     // file runs a subprocess in production. `GET /api/tags` runs none at all —
     // `git_vista_git::read_tags` opens the repository with `gix` and decodes

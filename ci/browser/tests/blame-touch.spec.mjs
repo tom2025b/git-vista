@@ -57,14 +57,26 @@ async function pressedStates(page) {
  *  primary pointer is still down, release. Dispatched as real PointerEvents
  *  with `buttons: 1`, because the handler's own guard is `ev.buttons() != 1`
  *  -- a synthetic sweep without it is exactly the hover case the guard
- *  refuses, and would prove the opposite of what this test claims. */
+ *  refuses, and would prove the opposite of what this test claims.
+ *
+ *  The step is SIGNED. A first version walked `from + 1 .. to` unconditionally,
+ *  so an upward sweep dispatched no `pointerenter` at all and the upward-drag
+ *  test failed against an app that was behaving correctly -- a helper that can
+ *  only sweep one way, accusing the code of the helper's own limitation. Worth
+ *  keeping in view: the same shape with a weaker assertion would have *passed*
+ *  vacuously instead, which is the harder version of this bug to notice. */
 async function dragSelect(page, from, to) {
   await page.evaluate(
     ({ from, to }) => {
       const targets = [...document.querySelectorAll('.blame-select')]
       const opts = { bubbles: true, pointerId: 1, pointerType: 'touch', isPrimary: true }
       targets[from].dispatchEvent(new PointerEvent('pointerdown', { ...opts, buttons: 1 }))
-      for (let i = from + 1; i <= to; i += 1) {
+      const step = to > from ? 1 : -1
+      // `from === to` is a tap, not a sweep: no `pointerenter` at all, and no
+      // loop (an unguarded signed walk would step away from `to` forever and
+      // index off the end of the array).
+      for (let i = from; i !== to; ) {
+        i += step
         targets[i].dispatchEvent(new PointerEvent('pointerenter', { ...opts, buttons: 1 }))
       }
       targets[to].dispatchEvent(new PointerEvent('pointerup', { ...opts, buttons: 0 }))
