@@ -46,6 +46,24 @@ pub const SNAPSHOT_EVENT: &str = "snapshot";
 /// answer instead of waiting for a transition that already happened.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangeFeedSnapshot {
+    /// This publication's position in the feed's own sequence, counting from
+    /// one and increasing by exactly one per publication.
+    ///
+    /// # A delta is only readable against the publication it followed
+    ///
+    /// `changed` is a difference from the **previous publication**, and a
+    /// client cannot assume it received that one. The transport keeps only the
+    /// latest value, so a slow reader can skip publications without ever
+    /// disconnecting — and a chain of deltas read across a gap produces a
+    /// verdict that sounds informative and is wrong. Measured: publish a change
+    /// to `refs/heads/main`, then a change to an unrelated tag before the
+    /// reader polls, and a plan expecting `main` is told "the repository moved,
+    /// but not in a way this operation depends on."
+    ///
+    /// That is this milestone's own failure shape aimed at itself, so the
+    /// sequence is on the wire rather than inferred: a client whose previous
+    /// snapshot is not `seq - 1` knows it cannot name what moved, and says so.
+    pub seq: u64,
     /// The live repository generation, in **the planner's recipe** — the same
     /// token `Plan::generation` carries and the execution gate compares
     /// against, so a panel's verdict can never be more optimistic than the
@@ -60,7 +78,10 @@ pub struct ChangeFeedSnapshot {
     /// What the feed itself is currently able to do. Never inferable from
     /// silence, and never absent.
     pub health: ChangeFeedHealth,
-    /// What moved between the previously published snapshot and this one.
+    /// What moved between the previously published snapshot and this one —
+    /// readable **only** by a client that received that one. See [`seq`].
+    ///
+    /// [`seq`]: ChangeFeedSnapshot::seq
     pub changed: RefDelta,
     /// When this reading was taken.
     pub at: UnixSeconds,
@@ -214,6 +235,7 @@ mod tests {
     #[test]
     fn a_snapshot_round_trips_through_json() {
         let snapshot = ChangeFeedSnapshot {
+            seq: 7,
             generation: Some(token("1234")),
             health: ChangeFeedHealth::Watching {
                 watches: 12,

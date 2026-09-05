@@ -176,6 +176,10 @@ pub(crate) struct FeedPolicy {
     last_hint_at_ms: Option<u64>,
     /// Consecutive sweeps that published nothing — the backoff exponent.
     unchanged: u32,
+    /// How many snapshots this feed has published. Stamped on each one so a
+    /// client can tell whether the delta it just received is readable against
+    /// the snapshot it holds, or whether the transport dropped one in between.
+    published_count: u64,
     /// Set once, on evidence, and never cleared: a watcher that has been caught
     /// missing changes is not re-trusted by a quiet minute. It is cleared only
     /// by a restart, which is honest — nothing observed says it recovered.
@@ -192,6 +196,7 @@ impl FeedPolicy {
             pending_miss: None,
             last_hint_at_ms: None,
             unchanged: 0,
+            published_count: 0,
             untrusted: false,
             blind_since: None,
         }
@@ -308,7 +313,9 @@ impl FeedPolicy {
         }
 
         let changed = self.delta(reading.as_ref());
+        self.published_count = self.published_count.saturating_add(1);
         let snapshot = ChangeFeedSnapshot {
+            seq: self.published_count,
             generation: generation.clone(),
             health: health.clone(),
             changed,

@@ -16,8 +16,12 @@ fn watching() -> ChangeFeedHealth {
     }
 }
 
+/// Snapshots in these tests are numbered by the order `log_of` records them,
+/// so the ordinary case is a continuous chain; the gap tests below stamp their
+/// own sequence deliberately.
 fn named(generation: &str, refs: &[&str], other: bool) -> ChangeFeedSnapshot {
     ChangeFeedSnapshot {
+        seq: 0,
         generation: Some(GenerationToken::new(generation).unwrap()),
         health: watching(),
         changed: RefDelta::Named {
@@ -30,6 +34,7 @@ fn named(generation: &str, refs: &[&str], other: bool) -> ChangeFeedSnapshot {
 
 fn unknown_delta(generation: &str) -> ChangeFeedSnapshot {
     ChangeFeedSnapshot {
+        seq: 0,
         generation: Some(GenerationToken::new(generation).unwrap()),
         health: watching(),
         changed: RefDelta::Unknown,
@@ -39,6 +44,7 @@ fn unknown_delta(generation: &str) -> ChangeFeedSnapshot {
 
 fn blind() -> ChangeFeedSnapshot {
     ChangeFeedSnapshot {
+        seq: 0,
         generation: None,
         health: ChangeFeedHealth::Blind {
             reason: "git status could not be run".to_string(),
@@ -56,10 +62,15 @@ fn plan(generation: &str, expects: &[&str]) -> PlanOnScreen {
     }
 }
 
+/// Record a run of snapshots as a **continuous** feed — seq 1, 2, 3 … — which
+/// is what a client that received every publication holds.
 fn log_of(snapshots: Vec<ChangeFeedSnapshot>) -> FeedLog {
     let mut log = FeedLog::new();
-    for snapshot in snapshots {
-        log.record(snapshot);
+    for (n, snapshot) in snapshots.into_iter().enumerate() {
+        log.record(ChangeFeedSnapshot {
+            seq: n as u64 + 1,
+            ..snapshot
+        });
     }
     log
 }
@@ -253,7 +264,10 @@ fn a_plan_that_returns_to_its_own_generation_is_current_again() {
 fn the_log_is_bounded_and_drops_the_oldest_first() {
     let mut log = FeedLog::new();
     for n in 0..(LOG_DEPTH + 5) {
-        log.record(named(&n.to_string(), &[], false));
+        log.record(ChangeFeedSnapshot {
+            seq: n as u64 + 1,
+            ..named(&n.to_string(), &[], false)
+        });
     }
     assert_eq!(
         log.latest().unwrap().generation.as_ref().unwrap().as_str(),
@@ -411,5 +425,80 @@ fn the_confirm_dialog_composes_the_two_halves_rather_than_reimplementing_them() 
         notice < panel,
         "the staleness warning goes ABOVE the picture: printed under it, a \
          reader meets it after they have already believed the picture"
+    );
+}
+
+// --- #664 review, finding 3: a delta read across a gap is not a delta ------
+
+/// Record snapshots at exactly the sequence numbers given — a client that
+/// missed the ones in between.
+fn log_at(numbered: Vec<(u64, ChangeFeedSnapshot)>) -> FeedLog {
+    let mut log = FeedLog::new();
+    for (seq, snapshot) in numbered {
+        log.record(ChangeFeedSnapshot { seq, ..snapshot });
+    }
+    log
+}
+
+#[test]
+fn a_publication_this_client_never_received_cannot_produce_the_reassuring_answer() {
+    // codex's reproduction, as a test. The feed's transport keeps only the
+    // latest value, so a slow reader skips publications WITHOUT disconnecting:
+    // `refs/heads/main` moves in publication 2, an unrelated tag moves in
+    // publication 3, and this client polls once and sees only 3.
+    //
+    // Read as a chain, that says "only a tag moved" — and a plan expecting
+    // `main` is told the repository moved "but not in a way this operation
+    // depends on". The button is still withdrawn, so nothing unsafe happens;
+    // the EXPLANATION is false, which is this milestone's own failure shape
+    // pointed at itself.
+    let log = log_at(vec![
+        (1, unknown_delta("100")),
+        // publication 2 — naming refs/heads/main — never arrived
+        (3, named("102", &["refs/tags/v9"], false)),
+    ]);
+    let verdict = freshness(&plan("100", &["refs/heads/main"]), &log);
+    assert_eq!(
+        verdict,
+        PlanFreshness::Moved { refs: Vec::new() },
+        "a gap in the sequence means this client cannot name what moved"
+    );
+    assert_ne!(
+        verdict,
+        PlanFreshness::MovedElsewhere,
+        "and it certainly cannot say the change was irrelevant"
+    );
+}
+
+#[test]
+fn a_continuous_run_is_still_read_as_a_chain() {
+    // The other half: the fix must not make every delta unusable. A client that
+    // received every publication reads them exactly as before.
+    let log = log_at(vec![
+        (1, unknown_delta("100")),
+        (2, named("101", &["refs/tags/v9"], false)),
+        (3, named("102", &["refs/tags/v10"], false)),
+    ]);
+    assert_eq!(
+        freshness(&plan("100", &["refs/heads/main"]), &log),
+        PlanFreshness::MovedElsewhere,
+        "two tags moved, this plan names neither, and nothing was missed"
+    );
+}
+
+#[test]
+fn the_first_snapshot_on_a_stream_is_never_read_as_a_delta() {
+    // A client that connects to a feed already running receives the current
+    // snapshot, whose `changed` is a difference against a publication made
+    // before this client existed.
+    let log = log_at(vec![(9, named("102", &["refs/tags/v9"], false))]);
+    assert!(
+        log.moved_since("102").is_some(),
+        "the reading itself is perfectly good"
+    );
+    assert_eq!(
+        freshness(&plan("100", &["refs/heads/main"]), &log),
+        PlanFreshness::Moved { refs: Vec::new() },
+        "but its delta describes a span this client did not watch"
     );
 }

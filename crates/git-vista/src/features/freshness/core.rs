@@ -100,8 +100,39 @@ impl FeedLog {
         Self::default()
     }
 
-    /// Record one published snapshot.
+    /// Record one published snapshot, keeping only deltas this client can
+    /// actually read.
+    ///
+    /// # A delta that followed a publication we never received is not a delta
+    ///
+    /// The feed's transport keeps only the latest value, so a slow reader can
+    /// skip publications **without disconnecting**. Each `changed` is a
+    /// difference from the previous *server* publication, so a chain read
+    /// across a gap is not a chain — and the verdict it produces is not merely
+    /// vaguer, it is wrong in the reassuring direction. Measured: `main` moves,
+    /// then an unrelated tag moves before this client polls, and a plan
+    /// expecting `main` is told the repository moved "but not in a way this
+    /// operation depends on."
+    ///
+    /// So a snapshot whose `seq` does not immediately follow the last one this
+    /// client holds is recorded with its delta **replaced by
+    /// [`RefDelta::Unknown`]**. The reading itself is still perfectly good; it
+    /// is only the claim about what moved that this client is not entitled to.
+    /// The first snapshot on a stream is the same case: it may carry a delta
+    /// against a publication made before this client existed.
     pub fn record(&mut self, snapshot: ChangeFeedSnapshot) {
+        let continuous = self
+            .entries
+            .back()
+            .is_some_and(|last| snapshot.seq == last.seq.wrapping_add(1));
+        let snapshot = if continuous {
+            snapshot
+        } else {
+            ChangeFeedSnapshot {
+                changed: RefDelta::Unknown,
+                ..snapshot
+            }
+        };
         if self.entries.len() == LOG_DEPTH {
             self.entries.pop_front();
         }
