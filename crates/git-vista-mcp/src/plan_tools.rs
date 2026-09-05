@@ -1227,6 +1227,11 @@ mod tests {
         "reset_test_repo",
         "resolve_conflict",
         "resolve_conflict_content",
+        // M11.05 (#550): destructive, and its safety rests on a compare-and-
+        // swap against a fresh worktree census an agent has no tool to read
+        // — the same reasoning as the stash three, restated for a different
+        // census. See `exposure_of`'s own arm for the full wording.
+        "remove_worktree",
         "stage_selection",
         "branch_from_stash",
         "cherry_pick",
@@ -1461,6 +1466,9 @@ mod tests {
             },
             GitOperation::DeleteUntrackedPaths {
                 paths: vec![path("a.txt")],
+            },
+            GitOperation::RemoveWorktree {
+                id: git_vista_protocol::WorktreeSiblingId::new("sibling-1").unwrap(),
             },
             GitOperation::AmendCommit {
                 message: message("m"),
