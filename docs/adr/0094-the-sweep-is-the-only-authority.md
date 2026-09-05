@@ -546,19 +546,52 @@ Three things fall out, and the third is a finding rather than a result:
 - **The decisions are host-testable by construction.** The policy is a pure core
   with no tokio and no clock; the client's four-state verdict and every sentence
   it prints are pure. That is ADR 0115's rule applied at the moment the decision
-  was written, not retrofitted — and a source census binds the three wasm-only
-  callers to the core functions they must ask.
+  was written, not retrofitted — and a source census binds the wasm-only callers
+  to the core functions they must ask.
+
+  **Applied at the moment, and still missed once.** The rebuild transition was
+  first written as two lines inside `preview/signals.rs`, and the mutation that
+  collapsed them came back `survived` — not because the test was weak, but
+  because `cargo test` never compiles a `#[cfg(target_arch = "wasm32")]` module
+  and so could not fail on the defect. ADR 0115's own rule, hit inside the fix
+  for a defect that rule describes. The prescribed answer is to move the
+  decision rather than reach for the code, so `slot_when_requested` and
+  `slot_when_request_failed` are pure functions the wrapper asks.
 - **A browser leg proves the whole path runs**, because the census cannot: the
   spec makes an external change with real `git` and requires the panel to change
   what it says and what it offers. It found a real defect the Rust suite could
   not — the feed opened on the launch repository and did not follow the
   session's selection.
 - **A stale plan offers Rebuild, and Cancel is Discard.** Rebuild fetches a new
-  plan through the same path the dialog opened with; it never executes and
-  never dismisses, so the approval boundary holds. The first slice shipped the
+  plan; it never executes and never dismisses. The first slice shipped the
   *sentence* telling the user to rebuild and no control that would — and the
   browser tests, which asserted the wording and the disabled state, passed
   straight over it.
+
+  **The approval boundary is held by the states in between, not by the button
+  being there.** The first attempt at this control broke the boundary it was
+  added to protect: clearing the plan to make room for its replacement made
+  "there is no plan" true, and *that* re-enabled the confirmation — the notice
+  gone, nothing to review, and the modal's own dispatch sending a branch-only
+  request the execution gate never sees. The user reached that state by acting
+  on being told the plan was stale.
+
+  So a plan on screen is a **four-state value**, not an `Option`: `Absent`
+  (never had one — #594 leaves these offerable), `Rebuilding`, `RebuildFailed`,
+  `Ready`. Only `Absent` leaves a confirmation alone. Collapsing the middle two
+  into it is what the first attempt did.
+
+  Two ways to hold a plan means two ways to replace one, and the second did
+  nothing at all: `preview_subject(Push)` is `NotPreviewable`, so routing a
+  force-with-lease rebuild through `preview_action` resolved to `Clear` while
+  the handler served only `Start`. The button was offered, the click issued no
+  request. It now re-runs the menu's own two-step lease fetch through one
+  shared constructor, because five values have to come off the same plan.
+
+  Both defects live in a **transition**, and every test written for the first
+  attempt asserted a resting state. The browser spec waited for the final
+  picture, so it saw both ends and never the middle. The current specs hold
+  `/api/plan` open and fail it.
 - **A confirmation can hold a plan two ways, and both are checked.** A
   force-with-lease push has no graph preview (`preview_subject(Push)` is
   `NotPreviewable`) while displaying a server-built plan's explanation, risk and
