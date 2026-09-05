@@ -783,3 +783,6 @@ mod tests {
         assert!(page.ranges.is_empty());
     }
 }
+
+#[cfg(test)]
+mod perf_suite;
