@@ -962,7 +962,21 @@ struct Observed {
 fn needs_worktree_census(operation: &GitOperation) -> bool {
     matches!(
         operation,
-        GitOperation::CheckoutBranch { .. } | GitOperation::RemoveWorktree { .. }
+        // M11.02 (#547).
+        GitOperation::CheckoutBranch { .. }
+            // M11.04 (#549): carries the same precondition, so it must carry
+            // the same observation. Adding the precondition without adding it
+            // here would leave `verify_precondition` reading
+            // `no_census_taken` — a `CensusFailed` — and refusing every honest
+            // `worktree add` with "couldn't check". That failure is loud
+            // rather than silent, which is the whole reason this function
+            // exists as one place both observation paths read.
+            | GitOperation::AddWorktree { .. }
+            // M11.05 (#550): the compare-and-swap's "expected" half — see
+            // `census_for`'s own `RemoveWorktree` arm for why this one reads
+            // with `expose_paths` forced on regardless of the operator's
+            // setting.
+            | GitOperation::RemoveWorktree { .. }
     )
 }
 
@@ -984,7 +998,12 @@ fn no_census_taken() -> WorktreeCensus {
 /// the one place that supplies the process-global pair.
 async fn census_for(repo: &Path, operation: &GitOperation) -> WorktreeCensus {
     match operation {
-        GitOperation::CheckoutBranch { .. } => {
+        // M11.02 (#547) and M11.04 (#549) share this arm: both preconditions
+        // (`BranchFreeInEveryOtherWorktree`, `BranchFreeInEveryOtherWorktree`
+        // reused for the add-side check) read only the census's public,
+        // already-redaction-aware shape, so both follow the operator's own
+        // `GIT_VISTA_EXPOSE_PATHS` flag rather than forcing paths on.
+        GitOperation::CheckoutBranch { .. } | GitOperation::AddWorktree { .. } => {
             crate::worktree_census::worktree_census(
                 repo,
                 crate::worktree_census::CensusPaths::from_flag(crate::state::expose_paths()),
@@ -2402,6 +2421,44 @@ async fn shape(
             Vec::new(),
             RecoveryStrategy::NotNeeded,
         ),
+        // M11.04 (#549), ADR 0118. Safe and NotNeeded: it creates a directory
+        // and a metadata file, moves no ref, and destroys nothing. No
+        // `RefChange` either — a new worktree points HEAD *inside itself* at a
+        // branch that already exists; no ref in this repository moves, and the
+        // plan's ref-change list is the reviewer-facing "what will move".
+        //
+        // # The precondition pair, and why one of them is not enough
+        //
+        // git refuses `worktree add` on a branch that is checked out
+        // ANYWHERE — including right here. M11.02's
+        // `BranchFreeInEveryOtherWorktree` covers every *other* worktree and,
+        // by its own definition, deliberately does not cover this one. Alone
+        // it would be a half-check that reads as complete: the most common
+        // mistake a user makes is asking for a second desk on the branch they
+        // are looking at, and that is exactly the case it does not catch.
+        //
+        // `BranchNotCheckedOut` is the other half, and it already exists.
+        // Together the two state git's actual rule, in the existing closed
+        // vocabulary, with no new variant — which is the test of whether this
+        // operation belongs in this design at all.
+        GitOperation::AddWorktree { branch, .. } => {
+            let mut preconditions = vec![Precondition::BranchNotCheckedOut {
+                branch: branch.clone(),
+            }];
+            preconditions.push(Precondition::BranchFreeInEveryOtherWorktree {
+                branch: branch.clone(),
+            });
+            // The branch must exist: this opens a desk on work that is already
+            // there. Creating a branch is `CreateBranch`, a different
+            // operation with a different risk level.
+            preconditions.extend(heads(branch).map(|ref_name| Precondition::RefExists { ref_name }));
+            (
+                RiskLevel::Safe,
+                preconditions,
+                Vec::new(),
+                RecoveryStrategy::NotNeeded,
+            )
+        }
         GitOperation::CheckoutBranch { branch } => {
             let target = heads(branch);
             let mut preconditions: Vec<Precondition> = target
@@ -3062,6 +3119,13 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
         GitOperation::UnstageAll => staging_exec::exec_unstage_all(repo, need).await,
         GitOperation::CheckoutBranch { branch } => {
             branch_exec::exec_checkout(repo, need, &branch, &observed).await
+        }
+        // M11.04 (#549). `need` is deliberately not passed: this executor
+        // reaches git through the one helper that carries an extra write
+        // grant, and that helper declares `Local` itself and refuses to
+        // combine a grant with a socket. See `git_cmd::sandboxed_with_grant`.
+        GitOperation::AddWorktree { name, branch } => {
+            branch_exec::exec_add_worktree(repo, &name, &branch).await
         }
         GitOperation::MergeBranch { branch } => {
             branch_exec::exec_merge(
@@ -3926,6 +3990,10 @@ pub(crate) fn honours_cancellation(op: &GitOperation) -> bool {
         | GitOperation::UnstageAll
         | GitOperation::StageSelection { .. }
         | GitOperation::CheckoutBranch { .. }
+        // M11.04 (#549): one `git worktree add`, local and millisecond-scale
+        // — it copies a working tree from objects already on disk. Nothing
+        // transfers, so there is no window a cancel could land in.
+        | GitOperation::AddWorktree { .. }
         | GitOperation::MergeBranch { .. }
         | GitOperation::DeleteBranch { .. }
         | GitOperation::ForceDeleteBranch { .. }
@@ -4032,6 +4100,13 @@ mod remote_operation_shape_suite;
 // the three census outcomes become English.
 #[cfg(test)]
 mod worktree_collision_suite;
+
+// M11.04 (#549), ADR 0118: where a new desk is allowed to go, and who decides
+// — the wire boundary that refuses a path, the precondition pair that states
+// git's actual rule, and the exact-body pin on the omission that carries the
+// fence.
+#[cfg(test)]
+mod worktree_add_suite;
 
 // M10 (#590): the plan export's one seam into this crate — proof that every
 // printable operation's argv is built by the shared builder the export reads,

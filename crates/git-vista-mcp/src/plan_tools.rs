@@ -135,6 +135,22 @@ pub(crate) fn exposure_of(op: &GitOperation) -> Exposure {
              authoring bytes from a tool description — excluded more strongly than \
              whole-side resolution above, which this inherits from and extends",
         ),
+        // M11.04 (#549). Excluded for now, and the reason is the sibling of
+        // the stash exclusion above: there is no worktree-listing tool on this
+        // surface yet, so an agent cannot see what desks already exist or what
+        // branch each holds. It would be choosing a name blind, and git
+        // refuses a branch already checked out elsewhere — so the most likely
+        // outcome of an unseen guess is a refusal the agent cannot diagnose.
+        //
+        // Not a refusal of the operation: it is `RiskLevel::Safe`, creates a
+        // directory and destroys nothing, and is defensible to expose. It
+        // lands with the read tool, in its own slice, exactly as the stash
+        // tools do.
+        GitOperation::AddWorktree { .. } => Excluded(
+            "an agent cannot choose where to open a second desk without seeing which \
+             desks exist and which branch each one holds, and this surface has no \
+             worktree-listing tool yet — the exposure is pending, not refused",
+        ),
         GitOperation::CreateBranch { .. } => Tool("plan_create_branch"),
         GitOperation::CommitOnHead { .. } => Tool("plan_commit_on_head"),
         GitOperation::EmptyCommitOnBranch { .. } => Tool("plan_empty_commit_on_branch"),
@@ -1243,6 +1259,12 @@ mod tests {
         "push_stash",
         "apply_stash",
         "drop_stash",
+        // M11.04 (#549). Excluded for the same reason the three stash tags
+        // above are: this surface has no worktree-listing tool yet, so an
+        // agent cannot see which desks exist or which branch each holds, and
+        // would be choosing blind against a rule git enforces by refusal.
+        // Pending, not refused — see `exposure_of`'s arm.
+        "add_worktree",
     ];
 
     fn catalog_names() -> Vec<String> {
@@ -1348,6 +1370,14 @@ mod tests {
         let tag = |s: &str| TagName::new(s).unwrap();
         let path = |s: &str| WorktreePath::new(s).unwrap();
         vec![
+            // M11.04 (#549). Excluded from the tool surface, and present here
+            // for exactly the reason the stash samples below are: the census
+            // proves every protocol variant has a *considered* exposure, and
+            // an excluded one it never sees is an exposure nobody considered.
+            GitOperation::AddWorktree {
+                name: git_vista_protocol::WorktreeName::new("review-549").unwrap(),
+                branch: branch("feature/idea"),
+            },
             // M3.24 (#77). DropStash is Excluded from the tool surface but
             // must still appear here: the census proves every protocol variant
             // has a considered exposure, and "deliberately excluded" is an

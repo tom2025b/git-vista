@@ -938,6 +938,30 @@ pub struct SelectWorktreeRequest {
     pub mode: RepoMode,
 }
 
+/// Body of `POST /api/add-worktree` (M11.04, #549, ADR 0118): open a second
+/// working tree on an existing branch.
+///
+/// # `name`, not a path — and that is the containment argument
+///
+/// The design spec sketched a `path` field. It does not ship. ADR 0118 puts
+/// new worktrees under a root this application owns, so the server computes
+/// `worktrees_root().join(name)` itself and the client never names a location
+/// — the same posture every other request body here already takes (see
+/// [`SelectRequest`], which addresses a repository by opaque id rather than by
+/// where it sits on disk).
+///
+/// `name` deserializes into a [`WorktreeName`](crate::WorktreeName), a single
+/// path segment that cannot hold a separator, a `..`, a leading dot or an
+/// absolute path. A malformed value is a **wire-boundary 400** — before any
+/// handler runs and before any path exists, rather than a check some call site
+/// performs later and a future one forgets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AddWorktreeRequest {
+    pub name: crate::plan::WorktreeName,
+    pub branch: crate::plan::BranchName,
+}
+
 /// Body of `POST /api/delete-clone` (ADR 0008): delete the *clone* addressed by
 /// the opaque `worktree` id — its catalog entry and its directory. The server
 /// refuses any id whose path does not canonicalize inside the clones root, so

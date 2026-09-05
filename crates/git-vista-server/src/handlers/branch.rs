@@ -12,8 +12,8 @@ use axum::http::StatusCode;
 use axum::Json;
 
 use git_vista_protocol::{
-    BranchName, BranchRequest, CreateBranchRequest, ForcePublish, GitOperation, PushRequest,
-    RemoteName,
+    AddWorktreeRequest, BranchName, BranchRequest, CreateBranchRequest, ForcePublish, GitOperation,
+    PushRequest, RemoteName,
 };
 
 use crate::planner;
@@ -71,6 +71,38 @@ pub(crate) async fn create_branch(Json(req): Json<CreateBranchRequest>) -> (Stat
 /// the executor answers ("Already on …") without journalling a phantom event.
 pub(crate) async fn checkout_branch(Json(req): Json<BranchRequest>) -> (StatusCode, String) {
     branch_op(req, |branch| GitOperation::CheckoutBranch { branch }).await
+}
+
+/// Open a second working tree on an existing branch (M11.04, #549, ADR 0118):
+/// `git worktree add <worktrees_root>/<name> <branch>` via
+/// [`GitOperation::AddWorktree`].
+///
+/// # Its own route rather than the generic plan seam
+///
+/// ADR 0100: a capability with no door is indistinguishable from one that does
+/// not exist. Reached through `POST /api/plan` + `/api/execute-plan` instead,
+/// this write would carry no idempotency key, pass neither `api.rs` guard,
+/// never enter the operations registry, and be invisible to the authz census —
+/// which is the shape that ADR found shipped once already.
+///
+/// # The request names a desk; the server chooses where it goes
+///
+/// [`AddWorktreeRequest::name`] is a
+/// [`WorktreeName`](git_vista_protocol::WorktreeName), validated at the wire
+/// boundary into a single path segment. A value carrying a separator, a `..`,
+/// a leading dot or an absolute path is a **400 from serde**, before this
+/// function runs and before any path is computed. That is the refusal the
+/// fence rests on, and it is the server's — a picker declining to offer a bad
+/// name is a courtesy on top, never the enforcement.
+pub(crate) async fn add_worktree(Json(req): Json<AddWorktreeRequest>) -> (StatusCode, String) {
+    if let Some(refused) = crate::state::reject_if_read_only() {
+        return refused;
+    }
+    planner::plan_and_execute(GitOperation::AddWorktree {
+        name: req.name,
+        branch: req.branch,
+    })
+    .await
 }
 
 /// Merge a branch into the currently checked-out branch (Issue #33 follow-up):

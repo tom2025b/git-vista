@@ -76,6 +76,16 @@ use WorktreeEffect as W;
 /// Written from what the git verb does, not read off the match arms. Where
 /// the two disagree, that disagreement is the finding.
 const EFFECTS: &[(&str, WorktreeEffect, ExpectedIndex, NetworkNeed)] = &[
+    // M11.04 (#549), ADR 0118. Written from the operation's *description*, not
+    // from reading `effects.rs` — which is the only thing that makes this
+    // table worth having. `git worktree add` writes a whole working tree and
+    // an index, and both are in a directory that did not exist a moment ago;
+    // this repository's tree and index are neither read nor changed. The
+    // plausible wrong answers are `FilesRewritten` and `Rebuilt`, from asking
+    // "does this write files anywhere" instead of the question these fields
+    // ask — which is why an independent row is a real check here rather than a
+    // transcription.
+    ("add_worktree", W::Untouched, Always(I::Untouched), N::Local),
     // Ref-only work: a pointer moves, no file is opened, nothing is staged.
     (
         "create_branch",

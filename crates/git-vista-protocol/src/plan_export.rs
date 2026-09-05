@@ -645,12 +645,15 @@ pub enum Export {
     ///
     ///  1. **The operation's input is not arguments** — bytes on stdin, or a
     ///     file's contents. No amount of quoting expresses it.
-    ///  2. **An argument is a location this application resolves, not one
-    ///     the caller supplied** (M11.05, #550: `RemoveWorktree` carries only
-    ///     an opaque id — this crate is wasm-safe and cannot resolve it to a
-    ///     path). The command shape is ordinary; the literal path depends on
-    ///     a live census of that machine's repository, and printing a guess
-    ///     would print a command that could act on the wrong desk.
+    ///  2. **An argument is a location this application resolves or chooses**,
+    ///     never one the caller supplied. `AddWorktree` (M11.04, #549, ADR
+    ///     0118) chooses where a new desk goes, under its own managed root;
+    ///     `RemoveWorktree` (M11.05, #550, ADR 0120) carries only an opaque
+    ///     id and resolves it to a path via a live census immediately before
+    ///     acting. Either way the command shape is ordinary and the literal
+    ///     path is not knowable here: this crate is wasm-safe and cannot
+    ///     resolve it, and printing a guess would print a *working* command
+    ///     that acts on the wrong desk — worse than printing none.
     ///
     /// Both reasons share the consequence this variant exists for: there is
     /// no line a reader can copy that is the line the app runs.
@@ -1066,6 +1069,36 @@ pub fn export_operation(operation: &GitOperation) -> Export {
                  in the editor. Those bytes are the operation; git is only asked to \
                  stage the result afterwards. No argument list can carry a file's \
                  contents."
+            ),
+        },
+
+        // M11.04 (#549), ADR 0118. This one is different from the three
+        // `NotACommandLine` cases below it, and the difference is worth
+        // stating rather than letting the shared variant blur it: those
+        // operations cannot be expressed as arguments at all. This one can —
+        // `git worktree add <path> <branch>` is an ordinary command line. What
+        // is missing is the **path**, and it is missing on purpose.
+        //
+        // ADR 0118 puts new worktrees under a root this application owns and
+        // computes, so the location is not part of what the user asked for and
+        // is not carried by the operation. This crate is wasm-safe and reads
+        // no environment, so it cannot resolve that root — and a printed
+        // command carrying a *guessed* path would not be an approximation of
+        // what the app does. It would be a working command that creates a
+        // worktree somewhere else, which is precisely the failure this
+        // module's "no wildcard, ever" rule exists to prevent.
+        //
+        // So it refuses to print one, and tells the reader the command shape
+        // they would use to do it themselves, where the path is genuinely
+        // theirs to choose.
+        GitOperation::AddWorktree { branch, .. } => Export::NotACommandLine {
+            why: format!(
+                "This opens a second working tree on ‘{branch}’ inside a folder git-vista \
+                 owns and names itself, so the path is not something you chose and is not \
+                 part of this operation. Printing a command with a guessed path would \
+                 create a worktree somewhere else rather than the one described here. To \
+                 do it by hand in a folder of your own choosing, the command is \
+                 `git worktree add <path> {branch}`."
             ),
         },
 
@@ -1497,6 +1530,7 @@ pub fn operation_name(operation: &GitOperation) -> &'static str {
         GitOperation::StageAll => "stage everything",
         GitOperation::UnstageAll => "unstage everything",
         GitOperation::CheckoutBranch { .. } => "switch branch",
+        GitOperation::AddWorktree { .. } => "open a second desk (add a worktree)",
         GitOperation::MergeBranch { .. } => "merge a branch",
         GitOperation::PushBranch { .. } => "push a branch",
         GitOperation::ResolveConflict { .. } => "resolve a conflict by taking a side",

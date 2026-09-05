@@ -22,9 +22,12 @@ rule in one sentence:
 That sentence assumes a client submits a path to compare against. Nothing in
 this codebase's wire contract may — `git-vista-protocol` is wasm-safe and
 carries no filesystem type at all, the same constraint that had already cut
-`AddWorktree`'s own `path` field (#656, unmerged as of this issue's base
-commit; read as reference, depended on as nothing). So the sentence has to be
-implemented without ever putting a path on the wire, and the "submitted path"
+`AddWorktree`'s own `path` field (#549, ADR 0118). This issue's base commit
+predated #549's merge (its PR, #656, was read as reference only and depended
+on as nothing while it was still open); #549 landed on `main` mid-session and
+this branch was rebased onto it, which is also where the sandbox grant helper
+below got its expected deduplication. So the sentence has to be implemented
+without ever putting a path on the wire, and the "submitted path"
 it describes has to come from somewhere else.
 
 ```mermaid
@@ -141,11 +144,15 @@ precondition by adding one that cannot carry what it would need to.
 `git worktree remove <path>` writes outside the served repository — into the
 sibling's own directory — and `sandbox::policy_for` never grants that: it
 grants the served repository (and its commondir, for a linked worktree) and
-the fixed system trees, nothing else. `sandboxed_with_extra_grant` /
-`git_output_with_extra_grant` (new, `git_cmd.rs`) compose one extra RW grant on
-top of the ordinary policy — same shape as `AddWorktree`'s unmerged
-`sandboxed_with_grant`, kept as a separate name deliberately (a future merge
-of #656 should deduplicate the two, not assume either is gone).
+the fixed system trees, nothing else. `AddWorktree` (#549) already needed the
+identical mechanism for its own destination, so the two share one inner
+function, `sandboxed_with_grant` (`git_cmd.rs`) — generalised, when this
+issue's branch rebased onto #549's merge, to document both callers rather
+than kept as two near-identical twins. Each keeps its own thin wrapper
+(`git_output_in_managed_root` for add, hardcoding `NetworkNeed::Local`;
+`git_output_with_extra_grant` for remove, taking the declared need) so
+neither caller's call site changed shape, but the policy-composition logic —
+and the "never request-derived" argument for `grant` — is stated once.
 
 **The grant target was wrong on the first attempt, and the fix was found by
 this feature's own pipeline test, not reasoned out in advance.** Granting
@@ -202,10 +209,12 @@ servable, non-current row answers yes to both "can I switch to this?" and
   a precondition is discarded before `execute` runs, so this shape cannot hand
   the executor the path it needs without a larger, riskier change to shared
   pipeline plumbing that no other operation needs.
-- **Reuse `#656`'s `sandboxed_with_grant` verbatim.** Not possible: #656 is
-  unmerged, and depending on unmerged code would make this issue's own
-  landing conditional on another lane's. A near-identical function was written
-  under a different name, with a note to deduplicate at merge time.
+- **Reuse `#656`'s `sandboxed_with_grant` verbatim, before it merged.** Not
+  possible while #656 was still open: depending on unmerged code would have
+  made this issue's own landing conditional on another lane's. A
+  near-identical function was written under a different name, with a note to
+  deduplicate at merge time — done once #549 landed and this branch rebased
+  onto it (decision 4).
 - **Grant `fresh_path` (not its parent).** Tried first; refuted by the
   pipeline test itself (decision 4) rather than reasoned out before writing
   code.
@@ -215,9 +224,9 @@ servable, non-current row answers yes to both "can I switch to this?" and
 - One new POST route (`/api/remove-worktree`), classified in `ROUTE_AUTHZ`
   (`SessionAndCsrf`) and in the planner's write-route census as a genuine git
   write, with its own funnel row.
-- A new crate-internal sandbox primitive (`sandboxed_with_extra_grant`) that
-  the eventual `AddWorktree` merge should fold together with its own
-  `sandboxed_with_grant` rather than carry both.
+- `sandboxed_with_grant` (`git_cmd.rs`) is now shared by `AddWorktree` (#549)
+  and `RemoveWorktree`, generalised at rebase time rather than left as two
+  near-identical functions — see decision 4.
 - `features::operations::{core,signals}.rs`'s exhaustive `OperationKind`
   census (`write_route`, `every_operation_kind`, `sends_dispatch_matches_the_route_table`)
   now has a fourteenth entry — every one of those censuses is compile- or

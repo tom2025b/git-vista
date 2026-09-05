@@ -18,7 +18,7 @@ use git_vista_protocol::{
     MergeStrategy, OperationHash, Plan, Precondition, RecoveryStrategy, RefChange, RefName,
     RefState, RemoteName, RepositoryToken, RiskLevel, SignatureStatus, StageDirection,
     StashMessage, StashSelector, TagAnnotation, TagDetail, TagKind, TagMessage, TagName,
-    UnixSeconds, WorktreePath, WorktreeSiblingId, WorktreeToken,
+    UnixSeconds, WorktreeName, WorktreePath, WorktreeSiblingId, WorktreeToken,
 };
 
 const FIXTURE: &str = include_str!("fixtures/plan_v1.json");
@@ -267,6 +267,31 @@ fn golden_plans() -> Vec<Plan> {
             GitOperation::UnstageAll,
             RiskLevel::Safe,
             vec![],
+            vec![],
+            RecoveryStrategy::NotNeeded,
+        ),
+        // M11.04 (#549), ADR 0118. The wire shape worth pinning here is the
+        // one the spec's sketch got wrong: `name`, not `path`. A golden
+        // fixture carrying `"path"` would be the first request body in this
+        // protocol able to name a location on disk.
+        plan(
+            'f',
+            GitOperation::AddWorktree {
+                name: WorktreeName::new("review-549").unwrap(),
+                branch: branch("feature/idea"),
+            },
+            RiskLevel::Safe,
+            vec![
+                Precondition::BranchNotCheckedOut {
+                    branch: branch("feature/idea"),
+                },
+                Precondition::BranchFreeInEveryOtherWorktree {
+                    branch: branch("feature/idea"),
+                },
+                Precondition::RefExists {
+                    ref_name: rname("refs/heads/feature/idea"),
+                },
+            ],
             vec![],
             RecoveryStrategy::NotNeeded,
         ),

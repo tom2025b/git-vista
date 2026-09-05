@@ -298,6 +298,7 @@ fn variant_name(op: &GitOperation) -> &'static str {
         GitOperation::StageAll => "StageAll",
         GitOperation::UnstageAll => "UnstageAll",
         GitOperation::CheckoutBranch { .. } => "CheckoutBranch",
+        GitOperation::AddWorktree { .. } => "AddWorktree",
         GitOperation::MergeBranch { .. } => "MergeBranch",
         GitOperation::PushBranch { .. } => "PushBranch",
         GitOperation::DeleteBranch { .. } => "DeleteBranch",
@@ -440,6 +441,17 @@ fn every_operation() -> Vec<GitOperation> {
         GitOperation::CheckoutBranch {
             branch: branch("feature"),
         },
+        // M11.04 (#549). Local: it writes a directory and a metadata file from
+        // objects already on disk, and opens no socket. Its coverage here
+        // matters more than most — it is the one operation whose spawn carries
+        // an extra write grant (`git_cmd::sandboxed_with_grant`), and that
+        // helper refuses to combine a grant with the Network tier, so a
+        // reclassification to Remote would break it loudly rather than
+        // quietly widening what a granted spawn can reach.
+        GitOperation::AddWorktree {
+            name: git_vista_protocol::WorktreeName::new("review-549").expect("valid name"),
+            branch: branch("feature"),
+        },
         GitOperation::MergeBranch {
             branch: branch("feature"),
         },
@@ -580,6 +592,7 @@ fn every_operation_declares_every_variant() {
         "StageAll",
         "UnstageAll",
         "CheckoutBranch",
+        "AddWorktree",
         "MergeBranch",
         "PushBranch",
         "DeleteBranch",
@@ -751,8 +764,8 @@ fn exactly_the_five_remote_operations_declare_a_network_need() {
     let ops = every_operation();
     assert_eq!(
         ops.len(),
-        38,
-        "every_operation() must list every GitOperation variant; the enum has 38 \
+        39,
+        "every_operation() must list every GitOperation variant; the enum has 39 \
          (this literal is a tripwire, not the enforcement — \
          every_operation_covers_every_variant_the_enum_declares is what checks \
          the census against the enum itself and cannot be left stale with it)"
@@ -780,8 +793,8 @@ fn exactly_the_five_remote_operations_declare_a_network_need() {
     );
     assert_eq!(
         local.len(),
-        33,
-        "the other thirty-three operations must stay Local; declared Local: {local:?}"
+        34,
+        "the other thirty-four operations must stay Local; declared Local: {local:?}"
     );
 }
 

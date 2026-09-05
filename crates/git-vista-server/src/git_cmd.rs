@@ -237,42 +237,51 @@ fn sandboxed(
     })
 }
 
-/// [`sandboxed`] plus **one** extra read-write grant (M11.05, #550).
+/// [`sandboxed`] plus **one** extra read-write grant.
 ///
-/// # One caller, and why it needs this at all
+/// # Two callers, and why each needs this
 ///
-/// `git worktree remove <path>` is the rare spawn whose target is outside the
-/// repository it runs in: `<path>` names a **sibling** working tree, which
-/// `policy_for` never grants — it grants the served repository (and its
+/// `git worktree add` (M11.04, #549, ADR 0118) and `git worktree remove`
+/// (M11.05, #550, ADR 0120) are the two spawns whose target is outside the
+/// repository they run in — a new desk's directory, or a sibling's — which
+/// `policy_for` never grants: it grants the served repository (and its
 /// commondir, for a linked worktree) and the fixed system trees, nothing
-/// else. Without the extra grant, the sandboxed spawn cannot delete the
-/// sibling's directory even after every other check has passed.
+/// else. Without the extra grant, neither spawn could write where it needs
+/// to even after every other check has passed.
 ///
-/// # It composes `policy_for` rather than replacing it
+/// # It composes `policy_for` rather than replacing it — the inverse of clone
 ///
-/// The removal must run under **exactly** the served repository's own tier,
-/// trust state and secret excludes — anything else would mean a destructive
-/// operation ran under a policy that repository never earned. So this takes
-/// the policy the operation would otherwise have had and adds one grant to
-/// it, changing nothing else.
+/// `policy_for_clone` is an *independent* constructor precisely because clone
+/// has no repository to look a trust flag up for, and must never be able to
+/// reach `Tier::Unsandboxed`. Both worktree-add and worktree-remove are the
+/// opposite case: each has a repository, and each must inherit **exactly**
+/// that repository's tier, trust state, hook mode and secret excludes —
+/// anything else would mean an operation on a repository ran under a policy
+/// that repository never earned. So this takes the policy the operation
+/// would otherwise have had and adds one grant to it, changing nothing else.
 ///
-/// # `grant` is a resolved sibling, never a raw client string
+/// # `grant` is never request-derived, for either caller
 ///
-/// The sole caller (`planner::worktree_exec::exec_remove_worktree`) passes
-/// the canonical path a **fresh worktree census** just resolved for a
-/// client-submitted opaque id — a path proven, at the moment this runs, to be
-/// `Serviceable::Yes`: inside this application's own allowed roots, exactly
-/// like every path this server already admits into the catalog. A client
-/// never supplies a path directly; it is always this function's caller that
-/// derives one, and only from a census read that already fenced it.
+/// `AddWorktree`'s grant is always `state::worktrees_root()` — a constant of
+/// the installation, resolved from the environment at startup, never
+/// assembled from anything a client sent; the client supplies a
+/// [`WorktreeName`](git_vista_protocol::WorktreeName), which cannot hold a
+/// separator, a `..`, a leading dot or an absolute path, and the server joins
+/// it to that root itself. `RemoveWorktree`'s grant is the canonical path a
+/// **fresh worktree census** just resolved for a client-submitted opaque id
+/// — proven, at the moment this runs, to be `Serviceable::Yes` and therefore
+/// already inside this application's own allowed roots, exactly like every
+/// path this server already admits into the catalog. Neither caller ever
+/// lets a request choose `grant` directly; if either did, this function would
+/// be a way to hand any directory on the filesystem to a git spawn — so each
+/// call site is its own whole safety argument, pinned as such rather than
+/// left to inspection.
 ///
 /// # Refuses to combine a grant with the network tier
 ///
 /// A grant plus an open socket is a strictly larger surface than either
-/// alone, and no caller needs both — mirrors the same refusal
-/// `git-vista-server`'s worktree-creation grant helper takes for the same
-/// reason, should the two ever land in the same tree together.
-fn sandboxed_with_extra_grant(
+/// alone, and no caller needs both.
+fn sandboxed_with_grant(
     repo: &Path,
     args: &[&str],
     declared: crate::sandbox::NetworkNeed,
@@ -292,17 +301,30 @@ fn sandboxed_with_extra_grant(
     Ok(crate::sandbox::spawn::command_async(&policy, repo, args))
 }
 
-/// [`git_output`] for a spawn that needs write access to a path outside the
-/// repository it runs in (M11.05, #550): today, only `git worktree remove`
-/// against a resolved sibling. See [`sandboxed_with_extra_grant`] for why the
-/// grant is safe and why it is not a general-purpose escape hatch.
+/// [`git_output`] for `git worktree add` (M11.04, #549), whose destination is
+/// always the managed worktrees root. See [`sandboxed_with_grant`] for why
+/// the grant is safe and why it is not a general-purpose escape hatch.
+pub(crate) async fn git_output_in_managed_root(
+    repo: &Path,
+    args: &[&str],
+    grant: &Path,
+) -> std::io::Result<Output> {
+    sandboxed_with_grant(repo, args, crate::sandbox::NetworkNeed::Local, grant)
+        .map_err(std::io::Error::other)?
+        .output()
+        .await
+}
+
+/// [`git_output`] for `git worktree remove` (M11.05, #550) against a resolved
+/// sibling. See [`sandboxed_with_grant`] for why the grant is safe and why it
+/// is not a general-purpose escape hatch.
 pub(crate) async fn git_output_with_extra_grant(
     repo: &Path,
     args: &[&str],
     declared: crate::sandbox::NetworkNeed,
     grant: &Path,
 ) -> std::io::Result<Output> {
-    sandboxed_with_extra_grant(repo, args, declared, grant)
+    sandboxed_with_grant(repo, args, declared, grant)
         .map_err(std::io::Error::other)?
         .output()
         .await
