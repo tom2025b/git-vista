@@ -119,11 +119,18 @@ pub(crate) enum WatcherState {
 }
 
 /// The evidence that the watcher is not seeing what the sweep sees (spec D1).
+///
+/// Both counts are over **the same population**: changes this feed observed
+/// that the watcher had an opportunity to announce. That symmetry is the whole
+/// point of comparing them, and it is what the first implementation did not
+/// have — it counted only timer sweeps, so every ordinary success was invisible
+/// and the ratio described near-races rather than reliability.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct WatcherMisses {
-    /// Timer sweeps that found a change with no hint inside the grace window.
+    /// Changes found with no hint inside the grace window.
     pub(crate) missed: u32,
-    /// Timer sweeps that found a change the watcher had already hinted at.
+    /// Changes the watcher announced — a hint-triggered sweep that found one,
+    /// or a timer sweep a hint caught up with inside the grace window.
     pub(crate) hinted: u32,
     pub(crate) last_missed_at_ms: Option<u64>,
 }
@@ -275,8 +282,24 @@ impl FeedPolicy {
             .as_ref()
             .is_none_or(|last| last.health != health);
 
-        if generation_moved && matches!(trigger, SweepTrigger::Timer) && self.published.is_some() {
-            self.note_timer_found_a_change(now_ms);
+        if generation_moved && self.published.is_some() {
+            match trigger {
+                SweepTrigger::Timer => self.note_timer_found_a_change(now_ms),
+                // An ordinary hint that led to a real change is the watcher
+                // doing its job, and it must be counted (#664 review, finding
+                // 5). Counting only timer sweeps sampled misses and near-races
+                // while excluding every success, so twenty hinted changes left
+                // `hinted` at zero and ten later unhinted ones could latch
+                // `Unreliable { missed: 10, hinted: 0 }` on a watcher that had
+                // been working the whole time.
+                SweepTrigger::Hint => {
+                    self.misses.hinted = self.misses.hinted.saturating_add(1);
+                }
+                // A stream opening and this process's own write are not
+                // evidence in either direction: neither is a change the watcher
+                // had any opportunity to announce first.
+                SweepTrigger::StreamOpen | SweepTrigger::AppWrite => {}
+            }
         }
 
         if !generation_moved && !health_moved {
@@ -299,6 +322,28 @@ impl FeedPolicy {
             reading,
         });
         Some(snapshot)
+    }
+
+    /// Whether the watcher has already told us it is gone, and why.
+    ///
+    /// Read by the driver when the notice channel closes: a watcher that
+    /// reported `WatchLost` and then exited *did* report, and overwriting that
+    /// with "stopped without reporting" throws away the only useful word in it.
+    pub(crate) fn watcher_is_lost(&self) -> bool {
+        matches!(self.watcher, WatcherState::Lost { .. })
+    }
+
+    /// The earliest a read may follow one that cost `last` — the duty floor.
+    ///
+    /// Separate from [`next_sweep_delay`](Self::next_sweep_delay) because they
+    /// bound different things and only one of them is about the timer. The
+    /// backoff decides how long a *quiet* feed waits; this decides how soon
+    /// **any** read may follow another, whoever asked for it. A hint that
+    /// schedules a read for `now` is respecting the first and bypassing the
+    /// second, which is exactly how a bound written into a spec came to be
+    /// measured at 35 % read occupancy under an ordinary burst of tag writes.
+    pub(crate) fn duty_floor(&self, last: Duration) -> Duration {
+        last.saturating_mul(DUTY_FACTOR)
     }
 
     /// How long to wait before the next timer sweep, given how long the last

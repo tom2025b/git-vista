@@ -358,6 +358,161 @@ async fn what_the_bound_gives_up_is_latency_and_the_sweep_still_covers_it() {
     );
 }
 
+// --- the resource bounds, measured rather than reasoned about --------------
+//
+// Every test in this section asserts a RATE. None of them can be satisfied by a
+// published value, which is why the defects they pin survived a green suite,
+// two reviewers reading the code, and a spec that states both bounds: the feed
+// was doing exactly the right thing far too often.
+
+/// A repository whose `refs` is a symlink — the geometry `WatchRoots` rejects,
+/// so the native watcher reports a loss and its driver exits. Codex's fixture.
+fn repository_the_watcher_refuses() -> tempfile::TempDir {
+    let temp = repository();
+    let refs = temp.path().join(".git/refs");
+    let elsewhere = temp.path().join("refs-moved-aside");
+    std::fs::rename(&refs, &elsewhere).expect("move the refs tree aside");
+    std::os::unix::fs::symlink(&elsewhere, &refs).expect("put a symlink in its place");
+    temp
+}
+
+#[tokio::test]
+async fn a_watcher_whose_channel_closed_does_not_become_a_read_storm() {
+    // #664 review, finding 1, measured at **41 production reads in two
+    // seconds**. `recv()` on a closed channel returns `None` immediately and
+    // forever, so leaving the retired watcher in the `select!` made that arm
+    // win every iteration and schedule a read every time. Degrading to
+    // sweep-only is supposed to cost promptness; it was costing the machine.
+    let repo = repository_the_watcher_refuses();
+    let feed = attach(repo.path());
+    let mut snapshots = feed.subscribe();
+    next_snapshot(&mut snapshots, Duration::from_secs(10)).await;
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let reads = feed.reads();
+    assert!(
+        reads <= 6,
+        "a feed that cannot watch must still sweep on its own cadence, not spin: \
+         {reads} reads in two seconds"
+    );
+}
+
+#[tokio::test]
+async fn a_watcher_that_named_its_loss_keeps_that_reason_when_its_channel_closes() {
+    // The other half of finding 1. The driver reports a real loss and *then*
+    // exits, so the closed channel arrives after a reason that was already
+    // given. Overwriting it with "the watcher stopped without reporting" is
+    // false — it did report — and it throws away the only useful word.
+    let repo = repository_the_watcher_refuses();
+    let feed = attach(repo.path());
+    let mut snapshots = feed.subscribe();
+    // Wait for the watcher's OWN reason, not for the start-up placeholder that
+    // also reports `SweepOnly` while nothing has been heard yet. Matching any
+    // `SweepOnly` here would catch "the watcher has not reported yet" and prove
+    // nothing about what happens when it does.
+    let degraded = snapshot_where(&mut snapshots, Duration::from_secs(10), |s| {
+        matches!(
+            &s.health,
+            ChangeFeedHealth::SweepOnly {
+                reason: WatcherLoss::WatchLost { .. }
+            }
+        )
+    })
+    .await;
+    let ChangeFeedHealth::SweepOnly { reason } = &degraded.health else {
+        unreachable!("selected on this arm one line above")
+    };
+    assert!(
+        !format!("{reason:?}").contains("stopped without reporting"),
+        "the reason the watcher gave must survive its exit: {reason:?}"
+    );
+    assert_eq!(
+        *reason,
+        WatcherLoss::WatchLost {
+            location: "refs".to_string()
+        },
+        "and it names WHERE, as a git-dir-relative label rather than a path"
+    );
+
+    // And it must still say so after the channel has been closed for a while,
+    // rather than being overwritten a beat later.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let now = snapshots.borrow_and_update().clone().expect("a reading");
+    assert_eq!(
+        now.health, degraded.health,
+        "the named loss is the standing reason, not a value that decayed"
+    );
+}
+
+#[tokio::test]
+async fn a_burst_of_hints_cannot_outrun_the_duty_floor() {
+    // #664 review, finding 2, measured at **35.0 % read occupancy** — forty
+    // real tag writes at ~120 ms spacing produced 39 full reads. The floor was
+    // applied to the timer deadline only, and every hint replaced that deadline
+    // with `now`, so the bound this milestone states in its own ADR was
+    // bypassed by the ordinary case.
+    //
+    // The assertion is on **occupancy**, not on a read count, and that
+    // distinction is the point: the bound is a share of wall-clock time. A
+    // cheap read may legitimately happen far more often than an expensive one.
+    // Counting reads would pass or fail on how fast this box happens to be.
+    let repo = repository();
+    let feed = attach(repo.path());
+    let mut snapshots = feed.subscribe();
+    next_snapshot(&mut snapshots, Duration::from_secs(10)).await;
+
+    let began = Instant::now();
+    let before = feed.read_time();
+    for tag in 0..40 {
+        git(repo.path(), &["tag", &format!("burst-{tag}")]);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+    let elapsed = began.elapsed();
+    let spent = feed.read_time() - before;
+    let occupancy = spent.as_secs_f64() / elapsed.as_secs_f64();
+    assert!(
+        occupancy < 0.25,
+        "the duty floor must survive hints: {:.1} % of {:.3} s spent reading \
+         ({:.3} s over {} reads)",
+        occupancy * 100.0,
+        elapsed.as_secs_f64(),
+        spent.as_secs_f64(),
+        feed.reads()
+    );
+}
+
+#[tokio::test]
+async fn a_write_whose_sweep_publishes_nothing_still_answers_promptly() {
+    // #664 review, finding 4, measured at **5.0009 s added** to a successful
+    // write. `publish_after_write` waited for a *publication*, but the sweep it
+    // asked for correctly publishes nothing when the native watcher has already
+    // announced that generation — so the write's own response sat out the whole
+    // timeout. The acknowledgement has to be the sweep's, not a snapshot's.
+    //
+    // Forced deterministically rather than raced: the write happens, the feed
+    // is allowed to publish it, and only *then* is the wrapper's publish asked
+    // for. That is the state the race produces, without depending on winning it.
+    let repo = repository();
+    let feed = attach(repo.path());
+    let mut snapshots = feed.subscribe();
+    let first = next_snapshot(&mut snapshots, Duration::from_secs(10)).await;
+
+    git(repo.path(), &["branch", "already-announced"]);
+    snapshot_where(&mut snapshots, Duration::from_secs(15), |s| {
+        s.generation != first.generation
+    })
+    .await;
+
+    let began = Instant::now();
+    publish_after_write(repo.path()).await;
+    let waited = began.elapsed();
+    assert!(
+        waited < Duration::from_secs(3),
+        "a sweep that publishes nothing has still finished, and the write must \
+         not wait out the timeout for it: waited {waited:?}"
+    );
+}
+
 // --- the feed's own lifetime -----------------------------------------------
 
 #[tokio::test]
@@ -470,4 +625,43 @@ async fn measure_one_sweep_and_the_watch_set() {
         .expect("the watcher reported")
         .expect("the watcher's stream stayed open");
     println!("watcher           {health:?}");
+}
+
+// --- no path crosses the wire, whatever the geometry -----------------------
+
+#[test]
+fn a_watch_label_is_relative_to_a_git_directory_or_it_says_nothing() {
+    // Transport never learns filesystem paths, and a watcher's diagnostic is
+    // not a reason to make an exception. The label is built only from the
+    // segments BELOW a recognised git directory.
+    assert_eq!(
+        watch_label(Path::new(
+            "/home/someone/secret-project/.git/refs/heads/team"
+        )),
+        "refs/heads/team"
+    );
+    assert_eq!(
+        watch_label(Path::new("/srv/mirror/project.git/refs/heads")),
+        "refs/heads"
+    );
+    // The git directory itself has nothing below it to name.
+    assert_eq!(
+        watch_label(Path::new("/home/someone/secret-project/.git")),
+        "a watched directory"
+    );
+    // A linked worktree's private directory keeps the desk's own name, and that
+    // is deliberate: without it, a loss at one desk is indistinguishable from a
+    // loss at another. A worktree name is a name the drawer already shows
+    // (#548), not a filesystem path.
+    assert_eq!(
+        watch_label(Path::new("/home/someone/p/.git/worktrees/desk-two/refs")),
+        "desk-two/refs"
+    );
+    // And a `GIT_DIR` pointing somewhere with no recognisable boundary
+    // discloses nothing at all, rather than a path with its front cut off.
+    assert_eq!(
+        watch_label(Path::new("/var/lib/someone/private/refs/heads")),
+        "a watched directory"
+    );
+    assert_eq!(watch_label(Path::new("/")), "a watched directory");
 }

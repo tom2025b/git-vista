@@ -65,12 +65,13 @@
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use git_vista_protocol::change_feed::{ChangeFeedSnapshot, WatchBudget, WatcherLoss};
 use git_vista_protocol::UnixSeconds;
-use tokio::sync::{watch, Notify};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::watcher::{RepositoryWatcher, WatcherHealth, WatcherNotice};
 
@@ -88,6 +89,14 @@ use policy::{FeedPolicy, SweepOutcome, SweepReading, SweepTrigger, WatcherState}
 /// is the failure this milestone exists to prevent, aimed at itself.
 const WATCHER_START_WINDOW: Duration = Duration::from_secs(2);
 
+/// How long a write will wait for the feed to catch up before answering anyway.
+///
+/// The wait exists so a client that has seen a write's response is not then
+/// told about that write as though it were news. It is bounded because the
+/// alternative — a wedged driver holding every write's response open — is worse
+/// than a feed that is briefly behind.
+const WRITE_SWEEP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// One repository's live change feed.
 ///
 /// Held by every open stream. When the last one drops, [`Drop`] stops the
@@ -95,10 +104,31 @@ const WATCHER_START_WINDOW: Duration = Duration::from_secs(2);
 pub(crate) struct Feed {
     repo: PathBuf,
     snapshots: watch::Sender<Option<ChangeFeedSnapshot>>,
-    /// Asks the driver to sweep now, without saying anything about the
-    /// repository. Used by this process's own writes (#554) — a nudge, exactly
-    /// like a watcher hint, because a write is not evidence either.
-    wake: Arc<Notify>,
+    /// Asks the driver to sweep now and **say when it has**, without saying
+    /// anything about the repository. Used by this process's own writes (#554)
+    /// — a nudge, exactly like a watcher hint, because a write is not evidence
+    /// either.
+    ///
+    /// It carries a one-shot rather than being a bare notify because "the sweep
+    /// you asked for has finished" and "something was published" are different
+    /// facts, and the caller needs the first (#664 review, finding 4). A sweep
+    /// that correctly publishes nothing — because the watcher already announced
+    /// this write's generation — must still complete the write's response.
+    wake: mpsc::UnboundedSender<oneshot::Sender<()>>,
+    /// Every read this feed's driver has made, and how long they took in total.
+    ///
+    /// Two of this milestone's properties are about how often the repository is
+    /// read, and neither is visible in any published value: a retired watcher
+    /// must not become a read storm, and a burst of hints must not outrun the
+    /// duty floor. Both were reproduced by measuring reads, so both are pinned
+    /// by measuring reads.
+    ///
+    /// The *count* is the right instrument for the first and the wrong one for
+    /// the second. The duty bound is a share of wall-clock time, not a number
+    /// of reads — a cheap read may happen far more often than an expensive one
+    /// and still be within budget, which is the whole point of a
+    /// self-calibrating floor. So the second is asserted on occupancy.
+    reads: Arc<ReadMeter>,
     driver: StdMutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
@@ -112,6 +142,16 @@ impl Feed {
     pub(crate) fn repo(&self) -> &Path {
         &self.repo
     }
+
+    /// How many times this feed has read the repository.
+    pub(crate) fn reads(&self) -> u64 {
+        self.reads.count.load(Ordering::Relaxed)
+    }
+
+    /// How long those reads took in total — the numerator of the duty cycle.
+    pub(crate) fn read_time(&self) -> Duration {
+        Duration::from_nanos(self.reads.nanos.load(Ordering::Relaxed))
+    }
 }
 
 impl Drop for Feed {
@@ -120,6 +160,13 @@ impl Drop for Feed {
             driver.abort();
         }
     }
+}
+
+/// What one feed has spent reading the repository.
+#[derive(Default)]
+pub(crate) struct ReadMeter {
+    count: AtomicU64,
+    nanos: AtomicU64,
 }
 
 type Registry = StdMutex<HashMap<PathBuf, Weak<Feed>>>;
@@ -161,11 +208,13 @@ pub(crate) fn attach_with_hints(repo: &Path, hints: Hints) -> Arc<Feed> {
         return existing;
     }
     let (snapshots, _) = watch::channel(None);
-    let wake = Arc::new(Notify::new());
+    let (wake, wake_rx) = mpsc::unbounded_channel();
+    let reads = Arc::new(ReadMeter::default());
     let feed = Arc::new(Feed {
         repo: repo.to_path_buf(),
         snapshots: snapshots.clone(),
-        wake: Arc::clone(&wake),
+        wake,
+        reads: Arc::clone(&reads),
         driver: StdMutex::new(None),
     });
     // The driver holds no `Arc<Feed>` — only the sender and the notify — so the
@@ -173,7 +222,8 @@ pub(crate) fn attach_with_hints(repo: &Path, hints: Hints) -> Arc<Feed> {
     let driver = tokio::spawn(crate::state::inherit_selection(drive(
         repo.to_path_buf(),
         snapshots,
-        wake,
+        wake_rx,
+        reads,
         hints,
     )));
     *feed.driver.lock().expect("feed driver slot") = Some(driver);
@@ -224,21 +274,33 @@ pub(crate) async fn publish_after_write(repo: &Path) {
     let Some(feed) = existing(repo) else {
         return;
     };
-    let mut settled = feed.subscribe();
-    settled.mark_unchanged();
-    feed.wake.notify_one();
-    // Wait for the driver to finish the sweep this nudge asked for, so a write
-    // whose response the client has already seen cannot be followed by a feed
-    // that has not caught up yet. Bounded: a driver that is wedged must not
-    // hold a write's response open.
-    let _ = tokio::time::timeout(Duration::from_secs(5), settled.changed()).await;
+    let (done, wait) = oneshot::channel();
+    if feed.wake.send(done).is_err() {
+        // The driver is gone; there is nothing left to wait for.
+        return;
+    }
+    // Wait for the sweep this nudge asked for to **complete**, so a write whose
+    // response the client has already seen cannot be followed by a feed that
+    // has not caught up yet.
+    //
+    // The acknowledgement is the sweep's own, not "a snapshot was published"
+    // (#664 review, finding 4). Those are different facts and the difference is
+    // measurable: if the native watcher already announced this write's
+    // generation, the requested sweep correctly publishes nothing — and waiting
+    // on a publication then held a successful write's response for the whole
+    // five-second timeout. It also cut the other way, since an unrelated
+    // publication could satisfy a wait it never answered.
+    //
+    // Still bounded: a driver that is wedged must not hold a write open.
+    let _ = tokio::time::timeout(WRITE_SWEEP_TIMEOUT, wait).await;
 }
 
 /// The driver: one task per live feed.
 async fn drive(
     repo: PathBuf,
     snapshots: watch::Sender<Option<ChangeFeedSnapshot>>,
-    wake: Arc<Notify>,
+    mut wake: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
+    reads: Arc<ReadMeter>,
     hints: Hints,
 ) {
     let origin = Instant::now();
@@ -253,13 +315,31 @@ async fn drive(
     // an answer rather than waiting for a transition that already happened.
     let mut next_sweep = origin;
     let mut trigger = SweepTrigger::StreamOpen;
+    // The earliest instant a read is permitted, whatever asks for it.
+    //
+    // This is the duty floor, and it lives here rather than only in the timer
+    // deadline because the timer is not the only thing that can ask (#664
+    // review, finding 2). Every watcher hint and every app write used to
+    // schedule a read for *now*, so an ordinary burst of events bypassed the
+    // "never sooner than ten times the previous read's cost" bound this
+    // milestone claims — measured at 35 % read occupancy under forty tag writes
+    // on a tiny repository. Hints inside the window are not dropped: they are
+    // coalesced, and the read they asked for happens the moment the floor lifts.
+    let mut floor_until = origin;
+    // Writers waiting to be told their sweep finished. A `Vec` because two
+    // writes can land inside one floor window and one read answers both.
+    let mut pending_acks: Vec<oneshot::Sender<()>> = Vec::new();
 
     loop {
         let now = Instant::now();
-        if now >= next_sweep {
+        if now >= next_sweep && now >= floor_until {
             let began = Instant::now();
             let outcome = read(&repo).await;
             let cost = began.elapsed();
+            reads.count.fetch_add(1, Ordering::Relaxed);
+            reads
+                .nanos
+                .fetch_add(cost.as_nanos() as u64, Ordering::Relaxed);
             if let Some(snapshot) = policy.observe(
                 millis(origin),
                 UnixSeconds(crate::activity::now_secs()),
@@ -271,8 +351,16 @@ async fn drive(
                     return;
                 }
             }
-            next_sweep = Instant::now() + policy.next_sweep_delay(cost);
+            let finished = Instant::now();
+            floor_until = finished + policy.duty_floor(cost);
+            next_sweep = finished + policy.next_sweep_delay(cost);
             trigger = SweepTrigger::Timer;
+            // The sweep is complete, so every writer waiting on it is answered
+            // — whether or not it published anything. That distinction is the
+            // whole of finding 4.
+            for ack in pending_acks.drain(..) {
+                let _ = ack.send(());
+            }
             continue;
         }
 
@@ -290,7 +378,9 @@ async fn drive(
             continue;
         }
 
-        let until_sweep = next_sweep.saturating_duration_since(Instant::now());
+        let until_sweep = next_sweep
+            .max(floor_until)
+            .saturating_duration_since(Instant::now());
         let until_watcher_deadline = if watcher_reported {
             Duration::MAX
         } else {
@@ -315,22 +405,39 @@ async fn drive(
                     next_sweep = Instant::now();
                 }
                 None => {
-                    // The watcher's notice stream closed without a loss notice.
-                    // Say so; the sweep carries on unchanged.
-                    watcher_reported = true;
-                    policy.note_watcher(WatcherState::Lost {
-                        reason: WatcherLoss::Backend {
-                            detail: "the watcher stopped without reporting".to_string(),
-                        },
-                        budget: WatchBudget::Undetermined { watches: 0 },
-                    });
-                    next_sweep = Instant::now();
+                    // The notice stream closed. **Retire it** (#664 review,
+                    // finding 1): `recv()` on a closed channel returns `None`
+                    // immediately and forever, so leaving it in the `select!`
+                    // makes this arm win every iteration and schedule a read
+                    // every time — measured at 41 production reads in two
+                    // seconds, turning a degraded feed into a read storm.
+                    watcher = None;
+                    // And do not overwrite a reason the watcher already gave.
+                    // A driver that reported `WatchLost` or `LimitReached` and
+                    // then exited *did* report; replacing that with "stopped
+                    // without reporting" loses the only useful word in it.
+                    if !policy.watcher_is_lost() {
+                        watcher_reported = true;
+                        policy.note_watcher(WatcherState::Lost {
+                            reason: WatcherLoss::Backend {
+                                detail: "the watcher stopped without reporting".to_string(),
+                            },
+                            budget: WatchBudget::Undetermined { watches: 0 },
+                        });
+                        next_sweep = Instant::now();
+                    }
                 }
             },
-            () = wake.notified() => {
-                next_sweep = Instant::now();
-                trigger = SweepTrigger::AppWrite;
-            }
+            requested = wake.recv() => match requested {
+                Some(ack) => {
+                    pending_acks.push(ack);
+                    next_sweep = Instant::now();
+                    trigger = SweepTrigger::AppWrite;
+                }
+                // Every `Feed` holding the sender is gone, so no write can ask
+                // again. The feed itself is about to be dropped with it.
+                None => return,
+            },
             () = tokio::time::sleep(wait) => {
                 policy.settle_due(millis(origin));
             }
@@ -414,10 +521,11 @@ fn wire_loss(loss: crate::watcher::WatcherLoss) -> WatcherLoss {
 /// recognisable git segment collapses to a shape that names nothing.
 pub(crate) fn watch_label(path: &Path) -> String {
     let mut parts: Vec<String> = Vec::new();
+    let mut found_the_boundary = false;
     for part in path.iter().rev() {
         let part = part.to_string_lossy().to_string();
-        let stop = part == ".git" || part.starts_with("worktrees") || part.ends_with(".git");
-        if stop {
+        if part == ".git" || part == "worktrees" || part.ends_with(".git") {
+            found_the_boundary = true;
             break;
         }
         parts.push(part);
@@ -425,10 +533,15 @@ pub(crate) fn watch_label(path: &Path) -> String {
             break;
         }
     }
-    parts.reverse();
-    if parts.is_empty() || parts.len() > 4 {
+    // No recognisable git directory above it, so nothing here is known to be
+    // *inside* a repository — and a "relative" label built from segments of an
+    // unknown path is just a path with the front cut off. `GIT_DIR` can point
+    // anywhere, so this arm is reachable, and it says nothing rather than
+    // guessing how much of a filesystem path is safe to disclose.
+    if !found_the_boundary || parts.is_empty() || parts.len() > 4 {
         return "a watched directory".to_string();
     }
+    parts.reverse();
     parts.join("/")
 }
 

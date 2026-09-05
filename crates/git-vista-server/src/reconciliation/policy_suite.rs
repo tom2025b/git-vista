@@ -559,3 +559,119 @@ fn a_watcher_that_has_not_reported_is_not_reported_as_watching() {
         other => panic!("a watcher that has said nothing cannot be Watching: {other:?}"),
     }
 }
+
+// --- #664 review, finding 5: the two counts must be over one population ----
+
+#[test]
+fn an_ordinary_successful_hint_is_credited_to_the_watcher() {
+    // The counts only mean something if they are drawn from the same
+    // population: changes the watcher had an opportunity to announce. Counting
+    // only timer sweeps sampled misses and near-races and excluded every
+    // ordinary success — so twenty hint-driven changes left `hinted` at zero,
+    // and ten later unhinted changes could latch `Unreliable` on a watcher that
+    // had been working the whole time.
+    let mut policy = settled();
+    for round in 1..=20u32 {
+        policy.note_hint(u64::from(round) * 1_000);
+        let published = policy.observe(
+            u64::from(round) * 1_000 + 10,
+            UnixSeconds(200 + i64::from(round)),
+            SweepTrigger::Hint,
+            reading(
+                &(round + 1).to_string(),
+                &[("refs/heads/main", &format!("oid{round}"))],
+                "clean",
+            ),
+        );
+        assert!(published.is_some(), "each round moved the generation");
+    }
+    assert_eq!(
+        policy.misses().hinted,
+        20,
+        "twenty changes the watcher announced are twenty successes"
+    );
+    assert_eq!(policy.misses().missed, 0);
+}
+
+#[test]
+fn a_watcher_with_a_working_record_is_not_condemned_by_a_later_run_of_misses() {
+    // The consequence of the fix, stated as the property that matters. Twenty
+    // successes then ten misses is a watcher that mostly works; before the fix
+    // this latched `Unreliable { missed: 10, hinted: 0 }` — permanently, since
+    // `untrusted` is never cleared.
+    let mut policy = settled();
+    let mut generation = 1u32;
+    for round in 1..=20u32 {
+        generation += 1;
+        policy.note_hint(u64::from(round) * 1_000);
+        policy.observe(
+            u64::from(round) * 1_000 + 10,
+            UnixSeconds(200 + i64::from(round)),
+            SweepTrigger::Hint,
+            reading(
+                &generation.to_string(),
+                &[("refs/heads/main", &format!("oid{generation}"))],
+                "clean",
+            ),
+        );
+    }
+    for round in 1..=10u32 {
+        generation += 1;
+        let now = 100_000 + u64::from(round) * 3_000;
+        policy.observe(
+            now,
+            UnixSeconds(400 + i64::from(round)),
+            SweepTrigger::Timer,
+            reading(
+                &generation.to_string(),
+                &[("refs/heads/main", &format!("oid{generation}"))],
+                "clean",
+            ),
+        );
+        policy.settle_due(now + MISS_GRACE.as_millis() as u64 + 1);
+    }
+    assert_eq!(policy.misses().missed, 10);
+    assert_eq!(policy.misses().hinted, 20);
+
+    generation += 1;
+    let verdict = policy
+        .observe(
+            200_000,
+            UnixSeconds(500),
+            SweepTrigger::Timer,
+            reading(
+                &generation.to_string(),
+                &[("refs/heads/main", "final")],
+                "clean",
+            ),
+        )
+        .expect("the generation moved");
+    assert!(
+        matches!(verdict.health, ChangeFeedHealth::Watching { .. }),
+        "ten misses against twenty successes is not evidence of an unreliable \
+         watcher: {:?}",
+        verdict.health
+    );
+}
+
+#[test]
+fn the_duty_floor_is_ten_times_the_last_read_whoever_asks() {
+    // The floor is a separate bound from the backoff, and separate for a
+    // reason: the backoff decides how long a quiet feed waits, while this
+    // decides how soon ANY read may follow another. A hint that schedules a
+    // read for `now` respects the first and bypasses the second.
+    let policy = settled();
+    assert_eq!(
+        policy.duty_floor(Duration::from_millis(44)),
+        Duration::from_millis(440)
+    );
+    assert_eq!(
+        policy.duty_floor(Duration::from_secs(2)),
+        Duration::from_secs(20)
+    );
+    assert!(
+        policy.duty_floor(Duration::from_millis(3)) < SWEEP_BASE,
+        "on a cheap repository the base interval is what binds, and the floor \
+         must not inflate it"
+    );
+}
