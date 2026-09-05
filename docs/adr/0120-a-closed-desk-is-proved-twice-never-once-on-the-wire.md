@@ -1,6 +1,6 @@
 # ADR 0120 — A closed desk is proved twice, and never once on the wire
 
-- **Status:** Accepted — implemented, mutation-proved two ways, both caught
+- **Status:** Accepted — implemented, mutation-proved (three arms run; two overlapped, a third found the genuinely disjoint second way), all caught
 - **Date:** 2026-09-05
 - **Issue:** #550 (M11.05)
 - **Extends:** [ADR 0117](0117-a-discovered-desk-needs-a-door-and-the-door-does-not-move-the-fence.md) (the census and the fence this reads) · [ADR 0119](0119-a-guarantee-that-holds-only-on-the-success-arm-is-not-a-guarantee.md) (`CensusPaths`, which this is the second caller of)
@@ -234,22 +234,28 @@ servable, non-current row answers yes to both "can I switch to this?" and
 
 ## Mutation proof
 
-Two arms against `crates/git-vista-server/src/planner/worktree_exec.rs`,
+Three arms against `crates/git-vista-server/src/planner/worktree_exec.rs`,
 proved via `failure-atlas`'s `mutation_check` (a fresh clone at HEAD, run
-unmutated then mutated, never touching this working tree), both **caught** by
-the same test — `remove_worktree_refuses_when_the_id_now_resolves_elsewhere`
-— which drives the exact scenario the spec names: the reviewed desk is closed
-and a different one reoccupies the same admin-dir slot, so `id` is unchanged
-but the real path is not.
+unmutated then mutated, never touching this working tree), all **caught** by
+`remove_worktree_refuses_when_the_id_now_resolves_elsewhere` — the test that
+drives the exact scenario the spec names: the reviewed desk is closed and a
+different one reoccupies the same admin-dir slot, so `id` is unchanged but
+the real path is not.
 
-| arm | mutation | baseline | mutated |
-|---|---|---|---|
-| remove the compare-and-swap | delete the `if fresh_path != expected_path { … }` block entirely (`let _ = &expected_path;`) | green | **red** — the operation actually ran: `200 Worktree removed.` where `409` was expected. Without the guard, the stale plan's authority (`id`) silently redirected onto whatever now occupies it |
-| invert the comparison | `!=` → `==` (refuse on a match, proceed on a mismatch — backwards) | green | **red** — same observable failure, `200` instead of `409`; the guard now actively waves through the exact case it exists to catch |
+| arm | mutation | mutated result |
+|---|---|---|
+| remove the check | delete `if fresh_path != expected_path { … }` (`let _ = &expected_path;`); both census reads still run, the fresh resolution is just never compared | **200 Worktree removed** where `409` was expected — the operation actually ran, silently redirected onto whatever now occupies `id` |
+| invert the comparison | `!=` → `==` (refuse on a match, proceed on a mismatch — backwards) | **200 Worktree removed** — same symptom as the first arm |
+| weaken to id-existence-only | keep the fresh census read but drop both the `Serviceable`/path resolution AND the equality check: only confirm *some* sibling with this `id` still appears in the fresh census (`siblings.iter().any(\|s\| s.id == id)`), then act on the **stale, build-time** path rather than re-deriving it | **400 Bad Request** — `fatal: '<stale path>' is not a working tree`, because the reviewed desk had genuinely been removed and the weakened check never re-derived where `id` lives now |
 
-Both mutations are real, disjoint code changes (one deletes the mechanism,
-the other inverts its logic) and both were caught by the same assertion,
-which is the correct shape here: the test's whole claim is "a stale plan
-whose id now resolves elsewhere is refused," and both ways of breaking that
-guarantee should — and did — trip it. Neither survived. Run ids: 280
-(deletion), 281 (inversion); `run_key: gv-550-remove-worktree-cas`.
+The first two initially looked like one proof run twice — both go red on the
+identical `200` vs. `409` symptom, because both leave the *fresh* path
+resolution intact and only break the *comparison* against it. The third arm
+is the one that actually earns "two ways": it breaks a different half of the
+mechanism (the re-derivation itself, not the comparison) and is caught by a
+**different** failure mode — git's own error surfacing as `400`, rather than
+the application silently succeeding as `200`. That the first two overlap is
+recorded here rather than quietly dropped; the third is what makes the proof
+honest. All three: caught, none survived. Run ids: 280 (delete the check),
+281 (invert the comparison, redundant with 280 — see above), 282 (weaken to
+id-existence-only); `run_key: gv-550-remove-worktree-cas`.
