@@ -58,13 +58,19 @@ fn admin_dir(repo: &Path, name: &str) -> PathBuf {
 fn observed(census: WorktreeCensus) -> Vec<WorktreeSibling> {
     match census {
         WorktreeCensus::Observed { siblings } => siblings,
-        WorktreeCensus::CensusFailed { reason } => {
+        WorktreeCensus::CensusFailed { reason, .. } => {
             panic!("expected Observed, got CensusFailed({reason})")
         }
     }
 }
 
+/// The client-safe half of a failed census — what every route serializes.
 fn failed(census: WorktreeCensus) -> String {
+    failed_pair(census).0
+}
+
+/// Both halves, for the tests that are about the split itself (#657).
+fn failed_pair(census: WorktreeCensus) -> (String, Option<String>) {
     match census {
         WorktreeCensus::Observed { siblings } => {
             panic!(
@@ -72,7 +78,7 @@ fn failed(census: WorktreeCensus) -> String {
                 siblings.len()
             )
         }
-        WorktreeCensus::CensusFailed { reason } => reason,
+        WorktreeCensus::CensusFailed { reason, detail } => (reason, detail),
     }
 }
 
@@ -85,7 +91,8 @@ async fn a_repo_with_no_linked_worktrees_reports_itself_as_the_only_sibling() {
     let (_dir, repo) = seeded();
     let tip = head_tip(&repo);
 
-    let siblings = observed(worktree_census(&repo, false, &allow_all).await);
+    let siblings =
+        observed(worktree_census(&repo, CensusPaths::from_flag(false), &allow_all).await);
 
     assert_eq!(siblings.len(), 1);
     let s = &siblings[0];
@@ -111,7 +118,8 @@ async fn a_linked_worktree_gets_its_own_id_but_shares_the_repository_id() {
         &["worktree", "add", linked.to_str().unwrap(), "feature"],
     );
 
-    let siblings = observed(worktree_census(&repo, false, &allow_all).await);
+    let siblings =
+        observed(worktree_census(&repo, CensusPaths::from_flag(false), &allow_all).await);
 
     assert_eq!(siblings.len(), 2);
     assert_eq!(current_of(&siblings).len(), 1);
@@ -156,7 +164,8 @@ async fn locked_reads_true_from_gits_own_flag_and_leaves_serviceable_alone() {
         ],
     );
 
-    let siblings = observed(worktree_census(&repo, false, &allow_all).await);
+    let siblings =
+        observed(worktree_census(&repo, CensusPaths::from_flag(false), &allow_all).await);
     let side_sibling = siblings.iter().find(|s| !s.is_current).unwrap();
 
     assert!(side_sibling.locked, "git's own lock flag must read true");
@@ -197,7 +206,7 @@ async fn outside_allowed_roots_sibling_is_listed_and_refused_never_dropped() {
     let allowed_root = std::fs::canonicalize(&repo).unwrap();
     let fence = move |candidate: &Path| candidate.starts_with(&allowed_root);
 
-    let siblings = observed(worktree_census(&repo, false, &fence).await);
+    let siblings = observed(worktree_census(&repo, CensusPaths::from_flag(false), &fence).await);
 
     assert_eq!(
         siblings.len(),
@@ -230,7 +239,8 @@ async fn prunable_with_a_gone_directory_reads_missing_and_keeps_a_stable_id() {
     );
     std::fs::remove_dir_all(&linked).unwrap();
 
-    let siblings = observed(worktree_census(&repo, false, &allow_all).await);
+    let siblings =
+        observed(worktree_census(&repo, CensusPaths::from_flag(false), &allow_all).await);
     assert_eq!(siblings.len(), 2, "a gone worktree must still be listed");
 
     let missing = siblings.iter().find(|s| !s.is_current).unwrap();
@@ -246,7 +256,8 @@ async fn prunable_with_a_gone_directory_reads_missing_and_keeps_a_stable_id() {
     );
 
     // The id is derived, not fabricated, and stable across a second read.
-    let siblings_again = observed(worktree_census(&repo, false, &allow_all).await);
+    let siblings_again =
+        observed(worktree_census(&repo, CensusPaths::from_flag(false), &allow_all).await);
     let missing_again = siblings_again.iter().find(|s| !s.is_current).unwrap();
     assert_eq!(
         missing.id, missing_again.id,
@@ -292,7 +303,8 @@ async fn a_missing_siblings_id_survives_its_own_deletion() {
 
     std::fs::remove_dir_all(&linked).unwrap();
 
-    let siblings = observed(worktree_census(&repo, false, &allow_all).await);
+    let siblings =
+        observed(worktree_census(&repo, CensusPaths::from_flag(false), &allow_all).await);
     let missing = siblings.iter().find(|s| !s.is_current).unwrap();
     assert_eq!(missing.serviceable, Serviceable::Missing);
     assert_eq!(
@@ -333,7 +345,8 @@ async fn a_missing_rows_id_comes_from_its_own_gitdir_not_a_surviving_siblings() 
 
     std::fs::remove_dir_all(&gone).unwrap();
 
-    let siblings = observed(worktree_census(&repo, false, &allow_all).await);
+    let siblings =
+        observed(worktree_census(&repo, CensusPaths::from_flag(false), &allow_all).await);
     assert_eq!(siblings.len(), 3, "main, the survivor, and the gone one");
 
     let missing: Vec<&WorktreeSibling> = siblings
@@ -385,7 +398,8 @@ async fn two_missing_rows_each_keep_their_own_admin_entrys_id() {
     std::fs::remove_dir_all(&alpha).unwrap();
     std::fs::remove_dir_all(&beta).unwrap();
 
-    let siblings = observed(worktree_census(&repo, false, &allow_all).await);
+    let siblings =
+        observed(worktree_census(&repo, CensusPaths::from_flag(false), &allow_all).await);
     let missing: Vec<&WorktreeSibling> = siblings
         .iter()
         .filter(|s| s.serviceable == Serviceable::Missing)
@@ -424,7 +438,8 @@ async fn two_missing_rows_each_keep_their_own_admin_entrys_id() {
 async fn an_unborn_branch_reports_no_head_not_the_null_oid() {
     let (_dir, repo) = empty();
 
-    let siblings = observed(worktree_census(&repo, false, &allow_all).await);
+    let siblings =
+        observed(worktree_census(&repo, CensusPaths::from_flag(false), &allow_all).await);
 
     assert_eq!(siblings.len(), 1);
     let s = &siblings[0];
@@ -458,7 +473,8 @@ async fn a_bare_hub_admin_entry_is_reported_as_bare_with_no_branch_or_head() {
     let linked = side.path().join("linked");
     fx::run(&hub, &["worktree", "add", linked.to_str().unwrap(), "main"]);
 
-    let siblings = observed(worktree_census(&linked, false, &allow_all).await);
+    let siblings =
+        observed(worktree_census(&linked, CensusPaths::from_flag(false), &allow_all).await);
 
     assert_eq!(siblings.len(), 2);
     let bare_row = siblings.iter().find(|s| s.bare).expect("a bare row");
@@ -489,13 +505,16 @@ async fn a_bare_hub_admin_entry_is_reported_as_bare_with_no_branch_or_head() {
 async fn a_truncated_worktree_list_is_refused_not_parsed_into_a_short_census() {
     let (_dir, repo) = seeded();
 
-    let reason = failed(worktree_census_capped(&repo, false, &allow_all, 1).await);
+    let reason =
+        failed(worktree_census_capped(&repo, CensusPaths::from_flag(false), &allow_all, 1).await);
     assert!(
         reason.contains("truncated"),
         "a cap hit must say so, not masquerade as some other failure: {reason}"
     );
 
-    let siblings = observed(worktree_census_capped(&repo, false, &allow_all, 8 * 1024).await);
+    let siblings = observed(
+        worktree_census_capped(&repo, CensusPaths::from_flag(false), &allow_all, 8 * 1024).await,
+    );
     assert_eq!(
         siblings.len(),
         1,
@@ -572,7 +591,7 @@ async fn the_production_census_refuses_a_stream_larger_than_its_own_ceiling() {
     );
     std::fs::write(&lock_file, "x".repeat(over)).unwrap();
 
-    let reason = failed(worktree_census(&repo, false, &allow_all).await);
+    let reason = failed(worktree_census(&repo, CensusPaths::from_flag(false), &allow_all).await);
     assert!(
         reason.contains("truncated"),
         "the production ceiling must refuse an oversized stream, and say why: {reason}"
@@ -580,7 +599,8 @@ async fn the_production_census_refuses_a_stream_larger_than_its_own_ceiling() {
 
     // The paired positive: same repository, reason gone, healthy census.
     std::fs::remove_file(&lock_file).unwrap();
-    let siblings = observed(worktree_census(&repo, false, &allow_all).await);
+    let siblings =
+        observed(worktree_census(&repo, CensusPaths::from_flag(false), &allow_all).await);
     assert_eq!(
         siblings.len(),
         2,
@@ -615,7 +635,7 @@ async fn two_rows_resolving_to_the_served_worktree_is_refused_not_reported() {
 
     // Control: censused from beta, this repository is healthy and has exactly
     // one current row.
-    let healthy = observed(worktree_census(&beta, false, &allow_all).await);
+    let healthy = observed(worktree_census(&beta, CensusPaths::from_flag(false), &allow_all).await);
     assert_eq!(healthy.len(), 3);
     assert_eq!(current_of(&healthy).len(), 1);
 
@@ -628,7 +648,7 @@ async fn two_rows_resolving_to_the_served_worktree_is_refused_not_reported() {
     )
     .unwrap();
 
-    let reason = failed(worktree_census(&beta, false, &allow_all).await);
+    let reason = failed(worktree_census(&beta, CensusPaths::from_flag(false), &allow_all).await);
     assert!(
         reason.contains("resolved 2 entries"),
         "the guard must name how many rows claimed to be current: {reason}"
@@ -642,7 +662,8 @@ async fn two_rows_resolving_to_the_served_worktree_is_refused_not_reported() {
 #[tokio::test]
 async fn a_path_that_is_not_a_git_repository_fails_the_census() {
     let dir = tempfile::tempdir().unwrap();
-    let reason = failed(worktree_census(dir.path(), false, &allow_all).await);
+    let reason =
+        failed(worktree_census(dir.path(), CensusPaths::from_flag(false), &allow_all).await);
     assert!(
         reason.contains("identity"),
         "expected a message about the repo's own identity, got: {reason}"
@@ -653,11 +674,195 @@ async fn a_path_that_is_not_a_git_repository_fails_the_census() {
 async fn expose_paths_gates_the_path_field() {
     let (_dir, repo) = seeded();
 
-    let hidden = observed(worktree_census(&repo, false, &allow_all).await);
+    let hidden = observed(worktree_census(&repo, CensusPaths::from_flag(false), &allow_all).await);
     assert_eq!(hidden[0].path, None);
 
-    let shown = observed(worktree_census(&repo, true, &allow_all).await);
+    let shown = observed(worktree_census(&repo, CensusPaths::from_flag(true), &allow_all).await);
     assert!(shown[0].path.is_some());
+}
+
+// ---------------------------------------------------------------------------
+// #657: the flag holds on the FAILURE arm too
+//
+// Every test below drives a real failure inside a `tempfile::tempdir`, whose
+// path is absolute and unpredictable — so "does this string name a path" is
+// asserted against the actual directory this run used, not against a pattern
+// that could match by accident.
+// ---------------------------------------------------------------------------
+
+/// The census's own identity read fails (a directory that is not a git
+/// repository), and `gix`'s error names the directory.
+///
+/// This is the shape the whole issue is about: with the flag off, the string
+/// a client receives must not contain the path — and the operator who opts in
+/// must still be able to see it, or redaction has cost the diagnosability
+/// `CensusFailed` exists to provide.
+#[tokio::test]
+async fn a_failure_reason_withholds_the_path_and_the_flag_restores_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let here = dir.path().to_string_lossy().into_owned();
+
+    let (reason, detail) =
+        failed_pair(worktree_census(dir.path(), CensusPaths::from_flag(false), &allow_all).await);
+    assert!(
+        !reason.contains(&here),
+        "the client-safe half named the absolute path `{here}`: {reason}"
+    );
+    assert!(
+        reason.contains("identity"),
+        "and it must still say what failed: {reason}"
+    );
+    assert_eq!(
+        detail, None,
+        "the path-bearing half must be withheld entirely when the operator did \
+         not opt in, not merely scrubbed"
+    );
+
+    let (opted_reason, opted_detail) =
+        failed_pair(worktree_census(dir.path(), CensusPaths::from_flag(true), &allow_all).await);
+    assert_eq!(
+        opted_reason, reason,
+        "the flag adds `detail`; it must never rewrite `reason`"
+    );
+    let opted_detail = opted_detail.expect("an opted-in operator gets the detail");
+    assert!(
+        opted_detail.contains(&here),
+        "the detail is the whole point of opting in, and must carry the path: \
+         {opted_detail}"
+    );
+}
+
+/// The route that takes its census with row paths on for its own local use
+/// (`handlers::select`, via [`CensusPaths::rows_for_local_use`]) must **not**
+/// thereby publish the failure detail: that decision belongs to the operator's
+/// flag alone.
+///
+/// This is the exact conflation #657 found — one boolean answering two
+/// questions — so it gets its own test rather than being implied by the
+/// constructor's name.
+#[tokio::test]
+async fn a_local_use_census_still_withholds_the_failure_detail() {
+    let dir = tempfile::tempdir().unwrap();
+    let here = dir.path().to_string_lossy().into_owned();
+
+    let (reason, detail) = failed_pair(
+        worktree_census(
+            dir.path(),
+            CensusPaths::rows_for_local_use(false),
+            &allow_all,
+        )
+        .await,
+    );
+    assert_eq!(
+        detail, None,
+        "rows-for-local-use must not carry the failure detail to a client"
+    );
+    assert!(!reason.contains(&here), "{reason}");
+
+    // Paired positive, so this cannot pass by the census having become unable
+    // to produce a detail at all: the same constructor, operator opted in.
+    let (_, detail) = failed_pair(
+        worktree_census(
+            dir.path(),
+            CensusPaths::rows_for_local_use(true),
+            &allow_all,
+        )
+        .await,
+    );
+    assert!(
+        detail.is_some_and(|d| d.contains(&here)),
+        "with the flag on, the same call must still produce the detail"
+    );
+}
+
+/// The `current_count != 1` guard, whose reason used to end with
+/// `(repository root: /abs/path)`. Its arithmetic stays client-safe; its path
+/// moves.
+///
+/// The fixture is `two_rows_resolving_to_the_served_worktree_is_refused_not_reported`'s
+/// — alpha's admin `gitdir` repointed at beta, so git prints beta twice.
+#[tokio::test]
+async fn the_exactly_one_current_guard_keeps_its_count_and_moves_its_path() {
+    let (_dir, repo) = seeded();
+    let side = tempfile::tempdir().unwrap();
+    let (_alpha, _alpha_id) = add_linked(&repo, side.path(), "alpha");
+    let (beta, _beta_id) = add_linked(&repo, side.path(), "beta");
+    std::fs::write(
+        admin_dir(&repo, "alpha").join("gitdir"),
+        format!("{}/.git\n", beta.display()),
+    )
+    .unwrap();
+    let beta_path = beta.to_string_lossy().into_owned();
+
+    let (reason, detail) =
+        failed_pair(worktree_census(&beta, CensusPaths::from_flag(false), &allow_all).await);
+    assert!(
+        reason.contains("resolved 2 entries") && reason.contains("exactly one is required"),
+        "the count is this module's own arithmetic and stays: {reason}"
+    );
+    assert!(
+        !reason.contains(&beta_path),
+        "the repository root must not ride along in the client-safe half: {reason}"
+    );
+    assert_eq!(detail, None);
+
+    let (_, detail) =
+        failed_pair(worktree_census(&beta, CensusPaths::from_flag(true), &allow_all).await);
+    assert!(
+        detail.is_some_and(|d| d.contains("repository root:")),
+        "the opted-in operator still gets the root that made the guard fire"
+    );
+}
+
+/// A live sibling git lists but nothing can open: the row's failure names the
+/// worktree by the same base name the success arm would have put in
+/// `WorktreeSibling::name`, and its absolute path only in the detail.
+///
+/// Built by corrupting a linked worktree's `.git` pointer file rather than by
+/// deleting the directory: git decides `prunable` by whether the path its
+/// admin `gitdir` names still **exists**, so a `.git` file that is present but
+/// unreadable keeps the row non-`prunable` (verified — deleting the directory
+/// instead lands on the `prunable` arm and censuses fine as
+/// `Serviceable::Missing`) while `read_repo_facts` fails on it. That is the
+/// live-but-unreadable arm, and nothing else reaches it.
+#[tokio::test]
+async fn a_live_but_unreadable_sibling_is_named_by_base_name_not_by_path() {
+    let (_dir, repo) = seeded();
+    let side = tempfile::tempdir().unwrap();
+    let (linked, _id) = add_linked(&repo, side.path(), "desk-two");
+
+    std::fs::write(linked.join(".git"), "gitdir: /nonexistent/not/a/git/dir\n").unwrap();
+    let linked_path = linked.to_string_lossy().into_owned();
+
+    let (reason, detail) =
+        failed_pair(worktree_census(&repo, CensusPaths::from_flag(false), &allow_all).await);
+    assert!(
+        reason.contains("desk-two"),
+        "the base name is the non-path label the success arm already exposes, \
+         and dropping it would make the refusal useless: {reason}"
+    );
+    assert!(
+        !reason.contains(&linked_path),
+        "but the absolute path must not be there: {reason}"
+    );
+    assert_eq!(detail, None);
+
+    let (_, detail) =
+        failed_pair(worktree_census(&repo, CensusPaths::from_flag(true), &allow_all).await);
+    assert!(
+        detail.is_some_and(|d| d.contains(&linked_path)),
+        "the opted-in operator gets the path that could not be read"
+    );
+}
+
+/// `safe_label` never degrades into the path itself — [`display_name`]'s
+/// fallback for a path with no final component *is* the whole path, which is
+/// precisely what must not reach a `reason`.
+#[test]
+fn safe_label_falls_back_to_a_placeholder_not_to_the_path() {
+    assert_eq!(safe_label(Path::new("/home/someone/desk-two")), "desk-two");
+    assert_eq!(safe_label(Path::new("/")), "an unnamed worktree");
+    assert_eq!(display_name(Path::new("/")), "/");
 }
 
 // ---------------------------------------------------------------------------
@@ -691,4 +896,145 @@ fn is_null_oid_matches_exactly_40_or_64_zeros() {
     assert!(!is_null_oid(&"0".repeat(39)));
     assert!(!is_null_oid(&format!("{}1", "0".repeat(39))));
     assert!(!is_null_oid(&"a".repeat(40)));
+}
+
+// ---------------------------------------------------------------------------
+// #658 follow-up (grok): route 4 driven live, and the JSON body a client
+// actually receives
+// ---------------------------------------------------------------------------
+
+/// **Route 4, driven rather than commented.** `parse_worktree_porcelain`'s own
+/// errors quote the record's path, and a `worktree` line *is* an absolute
+/// path — that was the fourth path-bearing source #657 found, and until this
+/// test it was handled in code and asserted nowhere.
+///
+/// # How a real `git worktree list --porcelain` is made to fail
+///
+/// No porcelain is fabricated. The format at this repository's git floor is
+/// newline-framed with no `-z`, so a worktree whose directory name *contains a
+/// newline* splits its own record — the module doc already names this as git's
+/// limitation at that floor. Naming a directory `desk\nHEAD 000…0` makes git
+/// print a second `HEAD` line inside one record (verified by hand against git
+/// 2.53), and the parser answers ``` `<abs path>` has more than one `HEAD`
+/// line ``` — a genuine absolute path, in a genuine parser error, from a
+/// genuine repository.
+///
+/// The name is hostile-looking and that is the point: it is exactly the input
+/// that turns the parser's own diagnostic into a disclosure, and it is
+/// reachable by anyone who can `git worktree add` in the served repository.
+#[tokio::test]
+async fn a_real_porcelain_parse_failure_withholds_the_path_it_quotes() {
+    let (_dir, repo) = seeded();
+    let side = tempfile::tempdir().unwrap();
+    let crafted = side.path().join(format!("desk\nHEAD {}", "0".repeat(40)));
+    fx::run(&repo, &["branch", "crafted"]);
+    fx::run(
+        &repo,
+        &["worktree", "add", crafted.to_str().unwrap(), "crafted"],
+    );
+    // The first line of the crafted name is what the parser quotes: everything
+    // up to the newline, which is an absolute path.
+    let quoted = crafted
+        .to_string_lossy()
+        .split('\n')
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(quoted.starts_with('/'), "the fixture must be absolute");
+
+    let (reason, detail) =
+        failed_pair(worktree_census(&repo, CensusPaths::from_flag(false), &allow_all).await);
+    assert!(
+        reason.contains("could not parse"),
+        "the client-safe half must still say what failed: {reason}"
+    );
+    assert!(
+        !reason.contains(&quoted),
+        "the parser's quoted path reached the client-safe half: {reason}"
+    );
+    assert_eq!(detail, None);
+
+    let (opted_reason, opted_detail) =
+        failed_pair(worktree_census(&repo, CensusPaths::from_flag(true), &allow_all).await);
+    assert_eq!(opted_reason, reason, "the flag never rewrites `reason`");
+    let opted_detail = opted_detail.expect("an opted-in operator gets the parser's own words");
+    assert!(
+        opted_detail.contains(&quoted),
+        "and those words are the ones that name the path: {opted_detail}"
+    );
+}
+
+/// **Route 1, as a response body rather than as a value.** `GET /api/worktrees`
+/// answers `Json(census)` and adds nothing of its own, so the bytes a client
+/// receives are exactly this serialization — and grok's finding was that
+/// nothing asserted on them.
+///
+/// Serializing a census built from a *real* failure and searching the actual
+/// JSON text for this run's own temporary directory is the assertion the
+/// value-level tests above cannot make: it would catch a `reason` that stayed
+/// clean while some other serialized field carried the path.
+#[tokio::test]
+async fn the_worktrees_response_body_carries_no_path_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let here = dir.path().to_string_lossy().into_owned();
+
+    let census = worktree_census(dir.path(), CensusPaths::from_flag(false), &allow_all).await;
+    let body = serde_json::to_string(&census).expect("the census serializes");
+    assert!(
+        body.contains("census_failed"),
+        "the fixture must actually be a failure: {body}"
+    );
+    assert!(
+        !body.contains(&here),
+        "GET /api/worktrees' body named `{here}`: {body}"
+    );
+    assert!(
+        !body.contains("\"detail\""),
+        "and the withheld half must be absent from the wire, not empty: {body}"
+    );
+
+    let census = worktree_census(dir.path(), CensusPaths::from_flag(true), &allow_all).await;
+    let body = serde_json::to_string(&census).expect("the census serializes");
+    assert!(
+        body.contains(&here),
+        "the paired positive: an opted-in operator's body does carry it: {body}"
+    );
+}
+
+/// The handler is what decides which [`CensusPaths`] the body above is built
+/// with, and that decision has no runtime signature — a route switched to
+/// `rows_for_local_use` would serialize the detail with the flag off and every
+/// test in this file would stay green, because none of them call the handler.
+///
+/// So it is pinned by reading the source, the same technique
+/// `worktree_add_suite`'s exact-body pin uses and for the same reason: the
+/// mistake makes the app disclose *more*, and nothing goes red.
+#[test]
+fn the_worktrees_route_builds_its_census_from_the_operator_flag_alone() {
+    const READ_RS: &str = include_str!("../handlers/read.rs");
+    let after = READ_RS
+        .split_once("pub(crate) async fn worktree_list(")
+        .expect("handlers/read.rs no longer defines `worktree_list`")
+        .1;
+    let end = after
+        .find("\n}\n")
+        .expect("`worktree_list` is no longer a closed block");
+    let body: String = after[..end]
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .flat_map(|l| l.split_whitespace())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    assert!(
+        body.contains(
+            "crate::worktree_census::CensusPaths::from_flag(crate::state::expose_paths())"
+        ),
+        "`worktree_list` must build its census from the operator's flag alone: {body}"
+    );
+    assert!(
+        !body.contains("rows_for_local_use"),
+        "this route serializes its census, so it may never take the \
+         local-use constructor: {body}"
+    );
 }

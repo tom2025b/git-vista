@@ -82,7 +82,17 @@ struct WorktreeCensusGoldenSet {
     bare: WorktreeSibling,
     /// The two `WorktreeCensus` shapes.
     observed: WorktreeCensus,
+    /// A failed census with its path-bearing `detail` **withheld** — the
+    /// default, and the shape a client sees unless the operator set
+    /// `GIT_VISTA_EXPOSE_PATHS` (#657).
     census_failed: WorktreeCensus,
+    /// The same failure with `detail` **present**. Both are goldened for the
+    /// same reason `path` is goldened present and absent: `detail` is
+    /// `skip_serializing_if = "Option::is_none"`, so an optional field
+    /// silently becoming always-present (or the reverse) round-trips fine
+    /// through Rust and is still a real wire change to a client's
+    /// `"detail" in obj`.
+    census_failed_with_detail: WorktreeCensus,
 }
 
 fn golden_set() -> WorktreeCensusGoldenSet {
@@ -174,8 +184,21 @@ fn golden_set() -> WorktreeCensusGoldenSet {
             bare.clone(),
         ],
     };
+    // Note what the two reasons have in common: they are the **same string**.
+    // The flag adds `detail`; it never rewrites `reason` (#657, ADR 0119), and
+    // pinning both here is what makes that invariant a wire fact rather than a
+    // claim in a doc comment.
     let census_failed = WorktreeCensus::CensusFailed {
-        reason: "`git worktree list --porcelain` failed: fatal: not a git repository".to_string(),
+        reason: "`git worktree list --porcelain` failed".to_string(),
+        detail: None,
+    };
+    let census_failed_with_detail = WorktreeCensus::CensusFailed {
+        reason: "`git worktree list --porcelain` failed".to_string(),
+        detail: Some(
+            "`git worktree list --porcelain` failed: fatal: not a git repository: \
+             '/home/someone/private/repo/.git'"
+                .to_string(),
+        ),
     };
     WorktreeCensusGoldenSet {
         current,
@@ -186,6 +209,7 @@ fn golden_set() -> WorktreeCensusGoldenSet {
         bare,
         observed,
         census_failed,
+        census_failed_with_detail,
     }
 }
 
@@ -255,6 +279,28 @@ fn the_fixture_file_carries_the_literal_wire_tags_a_client_matches_on() {
     assert!(
         raw["census_failed"]["reason"].is_string(),
         "CensusFailed must carry a human-readable reason on the wire"
+    );
+    // #657: the flag adds a field, it does not rewrite one. Read off the
+    // committed file rather than off a freshly-serialized value, for the same
+    // reason the tags above are.
+    assert!(
+        raw["census_failed"].get("detail").is_none(),
+        "detail must be absent from the wire when withheld, not null: {}",
+        raw["census_failed"]
+    );
+    assert_eq!(
+        raw["census_failed_with_detail"]["reason"], raw["census_failed"]["reason"],
+        "the operator's opt-in must add `detail`, never rewrite `reason` — a \
+         client that matched on the reason string would otherwise see a \
+         different message purely because of a server-side env var"
+    );
+    assert!(
+        raw["census_failed_with_detail"]["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains('/')),
+        "the goldened opted-in detail must actually carry the absolute path \
+         the flag exists to gate: {}",
+        raw["census_failed_with_detail"]
     );
     assert!(
         raw["observed"]["siblings"].is_array(),

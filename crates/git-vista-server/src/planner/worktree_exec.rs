@@ -737,7 +737,10 @@ pub(super) async fn exec_delete_untracked_paths(
 /// this function, not in the caller.
 fn resolve_removable(census: &WorktreeCensus, id: &str) -> Result<PathBuf, (StatusCode, String)> {
     let siblings = match census {
-        WorktreeCensus::CensusFailed { reason } => {
+        // `reason` is always client-safe (`Failure::detailed`'s first half,
+        // #657); `detail` is the operator-gated half this function never
+        // needs, since `reason` alone is enough to explain the refusal.
+        WorktreeCensus::CensusFailed { reason, .. } => {
             return Err((
                 StatusCode::CONFLICT,
                 format!(
@@ -819,12 +822,15 @@ pub(super) async fn exec_remove_worktree(
     };
 
     // The fresh half of the compare-and-swap — see the doc comment above.
-    // `expose_paths: true` regardless of the operator's own setting: this
-    // path is used only for the comparison and the git spawn below, never
-    // returned to a client, matching `planner::census_for`'s own reasoning
-    // for its build-time read of this same operation.
-    let fresh_census =
-        crate::worktree_census::worktree_census(repo, true, &crate::state::path_is_allowed).await;
+    // `rows_for_local_use`, matching `planner::census_for`'s own reasoning for
+    // its build-time read of this same operation: this path is used only for
+    // the comparison and the git spawn below, never returned to a client.
+    let fresh_census = crate::worktree_census::worktree_census(
+        repo,
+        crate::worktree_census::CensusPaths::rows_for_local_use(crate::state::expose_paths()),
+        &crate::state::path_is_allowed,
+    )
+    .await;
     let fresh_path = match resolve_removable(&fresh_census, id) {
         Ok(p) => p,
         Err(refused) => return refused,

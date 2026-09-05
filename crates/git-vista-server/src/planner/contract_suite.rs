@@ -1558,8 +1558,12 @@ fn repo_with_a_removable_sibling(
 /// [`git_vista_core::identity::WorktreeId`] is derived from the admin
 /// directory rather than from anything a test could construct by hand.
 async fn sibling_id(repo: &Path) -> String {
-    let census =
-        crate::worktree_census::worktree_census(repo, true, &crate::state::path_is_allowed).await;
+    let census = crate::worktree_census::worktree_census(
+        repo,
+        crate::worktree_census::CensusPaths::rows_for_local_use(true),
+        &crate::state::path_is_allowed,
+    )
+    .await;
     let WorktreeCensus::Observed { siblings } = census else {
         panic!("expected an observed census");
     };

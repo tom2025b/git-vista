@@ -971,6 +971,7 @@ fn needs_worktree_census(operation: &GitOperation) -> bool {
 fn no_census_taken() -> WorktreeCensus {
     WorktreeCensus::CensusFailed {
         reason: "no worktree census was taken for this operation".to_string(),
+        detail: None,
     }
 }
 
@@ -986,24 +987,33 @@ async fn census_for(repo: &Path, operation: &GitOperation) -> WorktreeCensus {
         GitOperation::CheckoutBranch { .. } => {
             crate::worktree_census::worktree_census(
                 repo,
-                crate::state::expose_paths(),
+                crate::worktree_census::CensusPaths::from_flag(crate::state::expose_paths()),
                 &crate::state::path_is_allowed,
             )
             .await
         }
-        // M11.05 (#550): `expose_paths` is always `true` here, regardless of
-        // the operator's own `GIT_VISTA_EXPOSE_PATHS` setting. This census's
-        // path is never handed to a client — it exists purely so
+        // M11.05 (#550): `rows` is always `true` here, regardless of the
+        // operator's own `GIT_VISTA_EXPOSE_PATHS` setting — `rows_for_local_use`
+        // is exactly the constructor `handlers::select::select_discovered_worktree`
+        // already uses for the same reason (see its own doc comment): a path
+        // consumed only for this server's own internal use, never serialized
+        // to a client. This census's rows exist purely so
         // `worktree_exec::exec_remove_worktree` can compare-and-swap a
         // sibling's resolved path against a second, fresher read taken
         // immediately before the spawn (both stay entirely server-side).
         // Withholding the path here would defeat that check for the common
-        // case (path exposure off by default), the exact same reasoning
-        // `handlers::select::select_discovered_worktree` already uses for its
-        // own internal-only census read.
+        // case (path exposure off by default). `failure_detail` still follows
+        // the operator's flag — this arm never reads `CensusFailed::detail`,
+        // only `reason`, so its value is moot here but correct in spirit.
         GitOperation::RemoveWorktree { .. } => {
-            crate::worktree_census::worktree_census(repo, true, &crate::state::path_is_allowed)
-                .await
+            crate::worktree_census::worktree_census(
+                repo,
+                crate::worktree_census::CensusPaths::rows_for_local_use(
+                    crate::state::expose_paths(),
+                ),
+                &crate::state::path_is_allowed,
+            )
+            .await
         }
         _ if needs_worktree_census(operation) => {
             unreachable!(

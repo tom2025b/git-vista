@@ -908,6 +908,7 @@ mod head_branch_tests {
     fn a_census_failed_response_never_becomes_free() {
         let answer = CheckoutElsewhere::classify(
             Ok(WorktreeCensus::CensusFailed {
+                detail: None,
                 reason: "git worktree list exited 128".to_string(),
             }),
             "feature/x",

@@ -12,7 +12,7 @@ use crate::features::core_traits::{Applied, Invalidate, InvalidateScope};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use git_vista_core::model::{Edge, FrameStub, GitRef, GraphRow, Oid};
+use git_vista_core::model::{Edge, FrameStub, GitRef, GraphRow, Oid, RefKind};
 use git_vista_protocol::plan::Advisory;
 use git_vista_protocol::{
     CommitOid, GenerationToken, HistoryFrame, HistoryPage, RefChange, RefState, RepoMode, RiskLevel,
@@ -1012,6 +1012,366 @@ fn advisory_lines(advisories: &[Advisory]) -> String {
 pub(crate) fn short_oid(oid: &str) -> &str {
     &oid[..oid.len().min(7)]
 }
+
+// ── Label links, glyphs and badge colours (#653) ─────────────────────────────
+//
+// `render/labels.rs` (the interactive label tier) and `print.rs` (the static
+// print sheet) draw the same badges over the same refs, and both are
+// `#[cfg(target_arch = "wasm32")]` — so every rule below used to live where
+// `cargo test --workspace` compiles none of it. Two of them were literally
+// duplicated across the pair, each copy carrying a comment promising it
+// matched the other; `print.rs` even kept a `#[cfg(test)] mod tests` for its
+// link rule that has never run a single time on this box. Per ADR 0115 the
+// decision moves here, where a host test executes it, and the two wasm-only
+// files are left with markup to arrange.
+
+/// Whether a badge or commit label has a GitHub page to point at, and — when
+/// it does not — whether that is because the repository has no GitHub remote
+/// at all or because this particular ref/commit simply is not pushed yet.
+///
+/// The distinction is the whole reason this is an enum rather than an
+/// `Option<String>`. `render/labels.rs` styles the three cases differently
+/// (linked / dimmed-and-unlinked / plain), and it used to derive the middle
+/// one at each call site as `repo_url.is_some() && url.is_none()` — the same
+/// expression written out three times next to three separate URL
+/// computations. Any one of them drifting from its URL rule shows a `.unpushed`
+/// commit as ordinary, or dims one that links fine; neither is visible to a
+/// test that only checks the URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefLink {
+    /// A page that resolves: draw it as a real link.
+    To(String),
+    /// This repository has a GitHub base, but this target has no page on it —
+    /// it is not pushed. Draw it dimmed and unlinked; a link here would 404.
+    Unpushed,
+    /// No GitHub base at all. Nothing to link, and nothing to dim either —
+    /// an unlinked label in a repo with no remote is not a deficiency.
+    NoRemote,
+}
+
+impl RefLink {
+    /// Consume into the owned URL, if any — the only accessor the views need,
+    /// since both move the string straight into a `href=` attribute. A
+    /// borrowing `url(&self)` twin was written first and deleted: nothing but
+    /// a test ever called it, and `reachability_census` said so.
+    pub fn into_url(self) -> Option<String> {
+        match self {
+            Self::To(url) => Some(url),
+            Self::Unpushed | Self::NoRemote => None,
+        }
+    }
+
+    /// `class:clickable` — true exactly when there is a URL.
+    pub const fn clickable(&self) -> bool {
+        matches!(self, Self::To(_))
+    }
+
+    /// `class:unpushed` — the dimmed "GitHub repo, but not on it yet" state.
+    /// Never true when [`Self::clickable`] is, and never true for a repository
+    /// with no GitHub base: those two facts are what the call sites kept
+    /// re-deriving.
+    pub const fn unpushed(&self) -> bool {
+        matches!(self, Self::Unpushed)
+    }
+}
+
+/// The settled commit-link rule shared by the print sheet and the interactive
+/// labels: only a GitHub-backed commit known to be on the remote has a
+/// reachable page (#12). Moved here from `print.rs`, which is wasm-only and
+/// whose three tests for this rule therefore never compiled.
+pub fn commit_link(repo_url: Option<&str>, on_remote: bool, commit_id: &str) -> RefLink {
+    match repo_url {
+        None => RefLink::NoRemote,
+        Some(base) if on_remote => RefLink::To(format!("{base}/commit/{commit_id}")),
+        Some(_) => RefLink::Unpushed,
+    }
+}
+
+/// Where one ref badge links on GitHub (#12), by kind:
+///
+///  * **HEAD / tag** → the commit they sit on, when that commit is pushed. A
+///    tag's own page cannot be verified offline, so the commit it points at is
+///    linked instead — that resolves whenever the commit is pushed.
+///  * **local branch** → its tree page, but *only* when a remote branch of the
+///    same name exists. Without that check a local-only branch badge would
+///    link to a tree page that 404s.
+///  * **remote branch** → its tree page unconditionally; it is on the remote by
+///    definition. Its leading `<remote>/` is stripped, since GitHub's tree
+///    URLs name the branch, not the remote.
+///
+/// `remote_branch_named` answers "does a remote branch with this exact name
+/// exist?" — the caller's `RenderCtx::remote_branches` lookup, passed in as a
+/// fact so this rule needs no collection type and no lifetime.
+pub fn ref_badge_link(
+    kind: &RefKind,
+    ref_name: &str,
+    repo_url: Option<&str>,
+    commit_on_remote: bool,
+    commit_id: &str,
+    remote_branch_named: bool,
+) -> RefLink {
+    let Some(base) = repo_url else {
+        return RefLink::NoRemote;
+    };
+    match kind {
+        RefKind::Head | RefKind::Tag => commit_link(Some(base), commit_on_remote, commit_id),
+        RefKind::Branch => {
+            if remote_branch_named {
+                RefLink::To(format!("{base}/tree/{ref_name}"))
+            } else {
+                RefLink::Unpushed
+            }
+        }
+        RefKind::RemoteBranch => {
+            let branch = ref_name.split_once('/').map_or(ref_name, |(_, b)| b);
+            RefLink::To(format!("{base}/tree/{branch}"))
+        }
+    }
+}
+
+/// The badge glyph for a ref kind. Local branches get the branch icon, remote
+/// branches the alternate one — so local and remote pills differ at a glance
+/// before the name is read — tags the tag icon, and HEAD the commit icon (it
+/// marks the commit you are on). The glyph counts into the pill's width like
+/// any other monospace character.
+///
+/// One mapping, not two: `render/labels.rs` and `print.rs` each held a copy,
+/// each labelled "same mapping as" the other.
+pub fn ref_glyph(ic: &crate::icons::GitIcons, kind: &RefKind) -> &'static str {
+    match kind {
+        RefKind::Head => ic.commit,
+        RefKind::Tag => ic.tag,
+        RefKind::Branch => ic.branch,
+        RefKind::RemoteBranch => ic.branch_alt,
+    }
+}
+
+/// Which surface a badge is being drawn on. The two differ in exactly one
+/// place and it is not cosmetic drift: [`RefKind::Head`]'s near-white fill is
+/// invisible on paper without a grey outline, and that outline would be wrong
+/// on the dark canvas. Naming the surface makes the one intended divergence
+/// explicit and keeps the other three kinds structurally identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BadgeSurface {
+    /// The interactive canvas: dark background, HEAD outlined in its own fill.
+    Screen,
+    /// The print sheet: white paper, HEAD outlined in grey so the pill exists.
+    Paper,
+}
+
+/// A badge pill's three colours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BadgeColors {
+    pub fill: &'static str,
+    pub stroke: &'static str,
+    pub text: &'static str,
+}
+
+/// HEAD's outline on paper. Its `HEAD_BADGE` fill is near-white, so on a white
+/// sheet a HEAD pill with a `HEAD_BADGE` stroke has no edge at all.
+const HEAD_PAPER_STROKE: &str = "#57606a";
+
+/// The pill colours for one ref kind on one surface. `branch` is the row's
+/// already-resolved branch colour (`branch_color(slot)`), which local and
+/// remote branch badges take — filled for local, outlined for remote — while
+/// HEAD and tags carry fixed colours.
+pub fn badge_colors(kind: &RefKind, branch: &'static str, surface: BadgeSurface) -> BadgeColors {
+    use git_vista_core::color::{BADGE_DARK, HEAD_BADGE, TAG_BADGE};
+    match kind {
+        RefKind::Head => BadgeColors {
+            fill: HEAD_BADGE,
+            stroke: match surface {
+                BadgeSurface::Screen => HEAD_BADGE,
+                BadgeSurface::Paper => HEAD_PAPER_STROKE,
+            },
+            text: BADGE_DARK,
+        },
+        RefKind::Tag => BadgeColors {
+            fill: TAG_BADGE,
+            stroke: TAG_BADGE,
+            text: BADGE_DARK,
+        },
+        RefKind::Branch => BadgeColors {
+            fill: branch,
+            stroke: branch,
+            text: BADGE_DARK,
+        },
+        RefKind::RemoteBranch => BadgeColors {
+            fill: "none",
+            stroke: branch,
+            text: branch,
+        },
+    }
+}
+
+// ── Keyboard policy (#653) ───────────────────────────────────────────────────
+//
+// `gestures.rs` is `#[cfg(target_arch = "wasm32")]`, so every one of the
+// shortcuts below — the whole of what the keyboard can do to this canvas —
+// used to be decided where `cargo test --workspace` compiles nothing. Per ADR
+// 0115 the mapping moves here; the wasm file keeps the listener registration,
+// the `web_sys` reads and the camera writes, which are the parts that
+// genuinely need a browser.
+
+/// What the window-level keydown listener does with one key press.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanvasKey {
+    /// Back out of whatever overlay is topmost. A desktop convenience only:
+    /// every overlay also closes by its own control, since some iPad Magic
+    /// Keyboards have no physical Esc key.
+    DismissTopOverlay,
+    ZoomIn,
+    ZoomOut,
+    /// Back to the graph's home view — not the raw identity, since a repo
+    /// whose stub cascades overshoot the top edge must reset to a view that
+    /// actually shows them.
+    ResetView,
+    /// Down the history by most of a screenful.
+    PageDown,
+    /// Back up the history by the same.
+    PageUp,
+    /// Re-read the repository, same as the Refresh button.
+    Reload,
+}
+
+/// One decided key press: what to do, and whether the browser's own default
+/// for that key must be suppressed.
+///
+/// The two travel together because they do **not** line up by action.
+/// `Home` and `0` both reset the view, but only `Home` needs its default
+/// stopped (some browsers scroll the document on it); `PageDown` and `Space`
+/// scroll by default and must be stopped, while `+`/`-`/`r` have no default
+/// worth taking. Returning the action alone and letting the caller decide the
+/// suppression is how those pairings quietly diverge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanvasKeyAction {
+    pub action: CanvasKey,
+    pub prevent_default: bool,
+}
+
+/// Which modifier keys were held. `shift` is deliberately separate from the
+/// other three: it is a *selector* here (Shift-Space pages back), not a
+/// reason to bail out, which is the asymmetry [`canvas_key_action`] exists to
+/// keep honest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KeyMods {
+    pub shift: bool,
+    pub ctrl: bool,
+    pub meta: bool,
+    pub alt: bool,
+}
+
+impl KeyMods {
+    /// Ctrl / Cmd / Alt — the modifiers that mean "this key press belongs to
+    /// the browser or the OS, not to the canvas". Shift is not among them.
+    pub const fn bails_out(self) -> bool {
+        self.ctrl || self.meta || self.alt
+    }
+}
+
+/// The whole canvas keyboard map, as one decision (M1.11 #64, plus the
+/// desktop paging keys).
+///
+/// `typing` is "focus is in a text field" — the commit box, the URL box —
+/// and `default_prevented` is whether a handler closer to the event already
+/// consumed this press.
+///
+/// # The three rules that are easy to lose
+///
+/// 1. **Escape is decided before the typing/modifier bail-out.** Backing out
+///    of an overlay has to work while the cursor is in that overlay's own
+///    text field; moving Escape below the guard would make the commit dialog
+///    un-escapable.
+/// 2. **Escape yields to a handler that already consumed it.** The diff's
+///    hunk navigation calls `prevent_default` when Escape disengages it, and
+///    that press must not *also* dismiss the overlay the reader is still
+///    inside. `stop_propagation` cannot protect it: this listener and
+///    Leptos's delegated handlers share the window target, and same-target
+///    listeners all run regardless.
+/// 3. **Shift is not part of the bail-out.** Shift-Space pages back, matching
+///    every browser and reader — Space alone is "more", Shift-Space is
+///    "back". Folding Shift in with Ctrl/Cmd/Alt silently deletes that key,
+///    and nothing about the remaining Space binding would look wrong.
+pub fn canvas_key_action(
+    key: &str,
+    mods: KeyMods,
+    typing: bool,
+    default_prevented: bool,
+) -> Option<CanvasKeyAction> {
+    // Rules 1 and 2, in that order and above the guard on purpose.
+    if key == "Escape" {
+        return (!default_prevented).then_some(CanvasKeyAction {
+            action: CanvasKey::DismissTopOverlay,
+            prevent_default: false,
+        });
+    }
+    if typing || mods.bails_out() {
+        return None;
+    }
+    let (action, prevent_default) = match key {
+        "+" | "=" => (CanvasKey::ZoomIn, false),
+        "-" | "_" => (CanvasKey::ZoomOut, false),
+        "0" => (CanvasKey::ResetView, false),
+        // Rule 3: Shift-Space pages back, so this arm must come first.
+        " " if mods.shift => (CanvasKey::PageUp, true),
+        "PageDown" | " " => (CanvasKey::PageDown, true),
+        "PageUp" => (CanvasKey::PageUp, true),
+        "Home" => (CanvasKey::ResetView, true),
+        "r" | "R" => (CanvasKey::Reload, false),
+        _ => return None,
+    };
+    Some(CanvasKeyAction {
+        action,
+        prevent_default,
+    })
+}
+
+/// What a key press means to one roving-tabindex row — a commit row's hit
+/// circle in the canvas (`gestures::on_node_keydown`), or a hunk header in
+/// the staging view (`features::diff::staging_view`).
+///
+/// Both surfaces drive the same [`GraphFocus`](crate::features::a11y::focus::GraphFocus)
+/// state machine with the same keys, and each held its own copy of this
+/// `match` inside a wasm-only file. What they do with the answer still
+/// differs — [`Self::Activate`] opens a commit's context menu on one surface
+/// and toggles a hunk's selection checkbox on the other — and that is why
+/// this returns an intent rather than performing anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowKey {
+    /// Move the roving focus.
+    Move(crate::features::a11y::focus::FocusMove),
+    /// Enter / Space: do to this row what a tap on it would.
+    Activate,
+    /// Escape: leave the roving set — update the model *and* blur the
+    /// element, or the focus ring stays painted on a row the model no longer
+    /// considers focused.
+    Dismiss,
+}
+
+/// The roving-row key map. Pure key → intent: neither caller's modifier guard
+/// lives here, because the two guards genuinely differ and folding them in
+/// would change behaviour rather than describe it. The staging view ignores a
+/// press with **any** modifier held including Shift; the canvas node handler
+/// checks none at all. That asymmetry is recorded, not resolved, by #653 —
+/// resolving it is a behaviour change and wants its own issue.
+pub fn roving_row_key(key: &str) -> Option<RowKey> {
+    use crate::features::a11y::focus::FocusMove;
+    match key {
+        "ArrowDown" => Some(RowKey::Move(FocusMove::Next)),
+        "ArrowUp" => Some(RowKey::Move(FocusMove::Prev)),
+        "Home" => Some(RowKey::Move(FocusMove::First)),
+        "End" => Some(RowKey::Move(FocusMove::Last)),
+        "Enter" | " " => Some(RowKey::Activate),
+        "Escape" => Some(RowKey::Dismiss),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod keyboard_suite;
+
+#[cfg(test)]
+mod label_link_suite;
 
 #[cfg(test)]
 mod compare_offer_suite;

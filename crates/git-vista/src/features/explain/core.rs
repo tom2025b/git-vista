@@ -954,4 +954,71 @@ mod tests {
             );
         }
     }
+
+    /// M11.05 (#550): Explain Mode has its sentences for `RemoveWorktree` —
+    /// and, like `AddWorktree` before it, without a single new arm, which is
+    /// the claim this test exists to check rather than assert.
+    ///
+    /// The operation introduces no new fact kind: it carries no
+    /// preconditions, its effects are `Untouched`/`Untouched`/`Local` (all
+    /// already covered), and its recovery is `RecoveryStrategy::Irrecoverable`
+    /// — a strategy several other operations already share, so "no undo
+    /// exists" is already a sentence this module knows how to say. "Explain
+    /// Mode is covered" is therefore a statement about composition, checked
+    /// the only way a composition can be: by building the real thing and
+    /// reading every line of it.
+    #[test]
+    fn a_remove_worktree_plan_explains_itself_with_no_new_sentence() {
+        let plan = git_vista_protocol::Plan {
+            repository: git_vista_protocol::RepositoryToken::new("r").unwrap(),
+            worktree: git_vista_protocol::WorktreeToken::new("w").unwrap(),
+            generation: git_vista_protocol::GenerationToken::new("g").unwrap(),
+            operation: git_vista_protocol::GitOperation::RemoveWorktree {
+                id: git_vista_protocol::WorktreeSiblingId::new("sibling-1").unwrap(),
+            },
+            operation_hash: git_vista_protocol::OperationHash::new("0".repeat(64)).unwrap(),
+            issued_at: git_vista_protocol::UnixSeconds(0),
+            expires_at: git_vista_protocol::UnixSeconds(1),
+            risk: RiskLevel::Destructive,
+            preconditions: Vec::new(),
+            expected_ref_changes: Vec::new(),
+            recovery: RecoveryStrategy::Irrecoverable,
+            advisories: Vec::new(),
+        };
+
+        let sections = render(&git_vista_protocol::explain(&plan));
+        assert!(!sections.is_empty(), "the explanation rendered no sections");
+
+        for section in &sections {
+            for line in &section.lines {
+                let text = line.text.trim();
+                assert!(
+                    !text.is_empty(),
+                    "{:?} rendered an empty line",
+                    section.topic
+                );
+                assert!(
+                    text.len() > 12 && text.ends_with('.'),
+                    "{:?} rendered {text:?} — not a finished sentence",
+                    section.topic
+                );
+            }
+            assert!(
+                !section.when_empty.trim().is_empty(),
+                "{:?} has no words for the empty case",
+                section.topic
+            );
+        }
+
+        // The one thing this operation must say plainly: there is no undo.
+        let all: String = sections
+            .iter()
+            .flat_map(|s| s.lines.iter().map(|l| l.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all.to_lowercase().contains("no undo"),
+            "the panel does not say this cannot be undone:\n{all}"
+        );
+    }
 }

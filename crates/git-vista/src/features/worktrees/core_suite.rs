@@ -22,7 +22,7 @@ fn sibling(name: &str, branch: Option<&str>, serviceable: Serviceable) -> Worktr
 fn rows(view: DrawerView) -> Vec<WorktreeRow> {
     match view {
         DrawerView::Rows(rows) => rows,
-        DrawerView::Unreadable { reason } => {
+        DrawerView::Unreadable { reason, .. } => {
             panic!("expected rows, got an unreadable census: {reason}")
         }
     }
@@ -305,10 +305,11 @@ fn neither_way_of_learning_nothing_becomes_an_empty_drawer() {
         Err("network error".to_string()),
         Ok(WorktreeCensus::CensusFailed {
             reason: "git worktree list exited 128".to_string(),
+            detail: None,
         }),
     ] {
         match drawer_view(fetched.clone()) {
-            DrawerView::Unreadable { reason } => assert!(!reason.is_empty(), "{fetched:?}"),
+            DrawerView::Unreadable { reason, .. } => assert!(!reason.is_empty(), "{fetched:?}"),
             DrawerView::Rows(rows) => {
                 panic!(
                     "{fetched:?} became {} rows rather than a stated failure",
@@ -484,4 +485,65 @@ fn opening_a_worktree_never_escalates_the_session_mode() {
         0,
         "the drawer names Active mode somewhere; switching desks must not grant it"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #658 follow-up (grok, finding 5): the drawer's disclosure decision is
+// host-testable
+//
+// `view.rs` is wasm-only, so `cargo test` never compiles it. A `detail.map(…)`
+// living there decides whether a path-bearing string is drawn and no runner can
+// reach that decision — the same class ADR 0115 records and #612 is
+// systematically moving out of the view layer. `unreadable_paragraphs` is where
+// it lives now, and these are the tests that could not have existed before.
+// ---------------------------------------------------------------------------
+
+/// The default: the server withheld the detail, so there is exactly one
+/// paragraph and it is the sentence.
+#[test]
+fn an_unreadable_drawer_without_a_detail_draws_one_paragraph() {
+    let view = drawer_view(Ok(WorktreeCensus::CensusFailed {
+        reason: "the worktree list could not be read".to_string(),
+        detail: None,
+    }));
+    let lines = view.unreadable_paragraphs();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains("the worktree list could not be read"),
+        "the server's reason must survive to the screen: {lines:?}"
+    );
+}
+
+/// The opt-in: the server sent a detail, so it is drawn as a second paragraph.
+/// Without this the flag buys the operator nothing where they actually look,
+/// which is the whole reason `DrawerView::Unreadable` carries it at all.
+#[test]
+fn a_detail_the_server_chose_to_send_is_drawn_as_a_second_paragraph() {
+    let view = drawer_view(Ok(WorktreeCensus::CensusFailed {
+        reason: "the worktree list could not be read".to_string(),
+        detail: Some("/home/someone/private/repo".to_string()),
+    }));
+    let lines = view.unreadable_paragraphs();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(lines[1], "/home/someone/private/repo");
+}
+
+/// A transport failure has no second half — there is no server response to
+/// have carried one — so it must not grow a paragraph either.
+#[test]
+fn a_transport_failure_draws_one_paragraph_too() {
+    let view = drawer_view(Err("network error".to_string()));
+    assert_eq!(view.unreadable_paragraphs().len(), 1);
+}
+
+/// A healthy census renders rows, not paragraphs. Asking the wrong variant for
+/// a message returns nothing to draw rather than a fabricated sentence — the
+/// same fail-closed posture as everywhere else in this module.
+#[test]
+fn a_readable_drawer_has_no_paragraphs_to_draw() {
+    let mut here = sibling("here", Some("main"), Serviceable::Yes);
+    here.is_current = true;
+    assert!(drawer_view(observed(vec![here]))
+        .unreadable_paragraphs()
+        .is_empty());
 }
