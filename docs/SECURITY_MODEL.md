@@ -239,7 +239,11 @@ it did not itself register.
   accepts a path; ids resolve only against the registered set.)*
 - Report capabilities without exposing absolute paths by default. *(Descriptors
   and the graph label carry only a base name unless `GIT_VISTA_EXPOSE_PATHS` is
-  set.)*
+  set. The guarantee holds on failure paths too, not only on success ones: a
+  `WorktreeCensus::CensusFailed` carries a client-safe `reason` and a separate,
+  flag-gated `detail`, and the full text is always written to the server's own
+  log regardless — the flag withholds from a client, it never destroys.
+  #657, ADR 0119.)*
 - Scope operation stores and recovery refs to the canonical repository identity.
   *(Deferred to M1.09.)*
 - Treat submodules as separate repositories with explicit opt-in traversal.

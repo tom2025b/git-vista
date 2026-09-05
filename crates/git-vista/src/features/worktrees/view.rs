@@ -85,10 +85,15 @@ pub fn worktree_section_view(features: Features) -> impl IntoView {
     let rows_view = move || match census.get().flatten() {
         None => view! { <p class="detail-status">{LOADING}</p> }.into_view(),
         Some(fetched) => match drawer_view(fetched) {
-            DrawerView::Unreadable { reason } => view! {
+            DrawerView::Unreadable { reason, detail } => view! {
                 <p class="detail-status detail-error">
                     {format!("Couldn't read this repository's worktrees: {reason}")}
                 </p>
+                // Present only when the operator opted into path exposure;
+                // the server withheld it otherwise (#657).
+                {detail.map(|detail| view! {
+                    <p class="detail-status detail-error">{detail}</p>
+                })}
             }
             .into_view(),
             DrawerView::Rows(rows) => rows

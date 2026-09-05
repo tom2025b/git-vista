@@ -142,7 +142,17 @@ pub enum DrawerView {
     /// The census could not be read. Lists nothing and claims nothing — an
     /// empty row list here would say "this repository has no other worktrees",
     /// which is precisely the fail-open `WorktreeCensus` exists to prevent.
-    Unreadable { reason: String },
+    Unreadable {
+        /// The client-safe half of `CensusFailed`, or the transport error.
+        /// Never names an absolute path (#657).
+        reason: String,
+        /// `CensusFailed`'s path-bearing half, present only when the operator
+        /// set `GIT_VISTA_EXPOSE_PATHS` — the server decides that, not this
+        /// view. Carried rather than dropped so the flag actually buys the
+        /// operator the diagnosability it promises; a transport failure has
+        /// no such half.
+        detail: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -157,8 +167,13 @@ pub enum DrawerView {
 /// empty row list.
 pub fn drawer_view(fetched: Result<WorktreeCensus, String>) -> DrawerView {
     match fetched {
-        Err(reason) => DrawerView::Unreadable { reason },
-        Ok(WorktreeCensus::CensusFailed { reason }) => DrawerView::Unreadable { reason },
+        Err(reason) => DrawerView::Unreadable {
+            reason,
+            detail: None,
+        },
+        Ok(WorktreeCensus::CensusFailed { reason, detail }) => {
+            DrawerView::Unreadable { reason, detail }
+        }
         Ok(WorktreeCensus::Observed { siblings }) => {
             DrawerView::Rows(siblings.iter().map(row).collect())
         }

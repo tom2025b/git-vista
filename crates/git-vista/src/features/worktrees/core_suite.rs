@@ -22,7 +22,7 @@ fn sibling(name: &str, branch: Option<&str>, serviceable: Serviceable) -> Worktr
 fn rows(view: DrawerView) -> Vec<WorktreeRow> {
     match view {
         DrawerView::Rows(rows) => rows,
-        DrawerView::Unreadable { reason } => {
+        DrawerView::Unreadable { reason, .. } => {
             panic!("expected rows, got an unreadable census: {reason}")
         }
     }
@@ -251,10 +251,11 @@ fn neither_way_of_learning_nothing_becomes_an_empty_drawer() {
         Err("network error".to_string()),
         Ok(WorktreeCensus::CensusFailed {
             reason: "git worktree list exited 128".to_string(),
+            detail: None,
         }),
     ] {
         match drawer_view(fetched.clone()) {
-            DrawerView::Unreadable { reason } => assert!(!reason.is_empty(), "{fetched:?}"),
+            DrawerView::Unreadable { reason, .. } => assert!(!reason.is_empty(), "{fetched:?}"),
             DrawerView::Rows(rows) => {
                 panic!(
                     "{fetched:?} became {} rows rather than a stated failure",

@@ -75,26 +75,27 @@ pub(crate) async fn select_repo(Json(req): Json<SelectRequest>) -> (StatusCode, 
 /// path comes from `git worktree list --porcelain` run inside the repository
 /// the session already has selected.
 ///
-/// # `expose_paths: true` on the internal census — precisely
+/// # `CensusPaths::rows_for_local_use` on the internal census — precisely
 ///
-/// The census is taken with paths on because registration takes a path. What
-/// that discloses differs by arm, and the honest statement has to say so:
+/// The census is taken with **row** paths on because registration takes a
+/// path. What that discloses differs by arm, and the honest statement has to
+/// say so:
 ///
 /// * **`Observed`** — the sibling rows are read locally and never serialized.
 ///   This handler answers with a status and a sentence it composes itself, so
 ///   nothing the operator's `GIT_VISTA_EXPOSE_PATHS` opt-in would have
 ///   withheld reaches the client.
-/// * **`CensusFailed`** — the `reason` **is** returned to the client, and
-///   `worktree_census` builds those reasons from porcelain output and
-///   `common_dir.display()`. Absolute paths do reach a response body on this
-///   arm, and they do so regardless of the flag.
+/// * **`CensusFailed`** — the `reason` **is** returned to the client. It is
+///   now the client-safe half by construction, and the path-bearing `detail`
+///   follows the operator's flag rather than this route's local need, which
+///   is why the two are separate arguments to `CensusPaths` at all.
 ///
-/// The second bullet is not introduced here: `GET /api/worktrees` (M11.01,
-/// #546) already answers `CensusFailed.reason` verbatim with `expose_paths`
-/// off. It is recorded because ADR 0117 originally claimed the first bullet
-/// covered both, which was wrong (Grok, round 6, finding 4) — see that ADR's
-/// §2a for why redacting it is a separate decision with a real cost, and not
-/// one this route should make on its own.
+/// The second bullet used to read the other way, and that was the defect:
+/// `GET /api/worktrees` (M11.01, #546) answered `CensusFailed.reason`
+/// verbatim with `expose_paths` off, so a control whose stated guarantee is
+/// "absolute paths do not leave the process unless the operator opts in" held
+/// on the success arm and not the failure one (Grok, round 6, finding 4;
+/// #657; ADR 0119). ADR 0117 §2a records the state before the fix.
 pub(crate) async fn select_discovered_worktree(
     Json(req): Json<SelectWorktreeRequest>,
 ) -> (StatusCode, String) {
@@ -109,12 +110,20 @@ pub(crate) async fn select_discovered_worktree(
 
     // 2. A fresh census of the repository this session has selected.
     let (repo, read_only) = crate::state::current();
-    let census =
-        crate::worktree_census::worktree_census(&repo, true, &crate::state::path_is_allowed).await;
+    let census = crate::worktree_census::worktree_census(
+        &repo,
+        crate::worktree_census::CensusPaths::rows_for_local_use(crate::state::expose_paths()),
+        &crate::state::path_is_allowed,
+    )
+    .await;
     let siblings = match census {
         WorktreeCensus::Observed { siblings } => siblings,
-        WorktreeCensus::CensusFailed { reason } => {
-            eprintln!("git-vista: /api/select-worktree could not read the census: {reason}");
+        // `reason` alone: the census has already logged the full detail, and
+        // `detail` reaches a client only when the operator opted in — which
+        // this route answers as plain text, so appending it here would be the
+        // one place the flag could be bypassed by accident. An operator who
+        // wants the path has the log and `GET /api/worktrees`.
+        WorktreeCensus::CensusFailed { reason, .. } => {
             return (
                 StatusCode::CONFLICT,
                 format!(

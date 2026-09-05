@@ -312,6 +312,7 @@ fn a_missing_holder_blocks_and_says_how_to_release_the_branch() {
 fn an_unread_census_refuses_without_inventing_a_worktree() {
     let census = WorktreeCensus::CensusFailed {
         reason: "`git worktree list --porcelain` failed: no such file".to_string(),
+        detail: None,
     };
     let (status, body) = collision_refusal(
         &BranchName::new("feature/x").unwrap(),
