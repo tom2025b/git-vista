@@ -24,10 +24,15 @@ use leptos::*;
 
 use crate::features::preview::core::{reassurance, PreviewView};
 use crate::features::preview::scene::{
-    scene_of, HalfScene, LegendEntry, PreviewScene, SceneNode, MARK_ADDED,
+    scene_of, tag_width, HalfScene, LegendEntry, PreviewScene, SceneNode, MARK_ADDED, MARK_REF,
+    TAG_H, TAG_R,
 };
-use crate::features::preview::signals::{Preview, PreviewSlot};
+use crate::features::preview::signals::{prefers_reduced_motion, Playback, Preview, PreviewSlot};
+use crate::features::preview::tween::{
+    sample, tween_of, FrameBadge, FrameEdge, FrameNode, TweenScene,
+};
 use crate::listener_policy::{preview_failure_message, preview_pending_message};
+use git_vista_core::color::BADGE_DARK;
 
 /// Panel chrome, matching `explanation_panel_view`'s box in `confirm.rs` so
 /// the two read as siblings under one confirmation.
@@ -82,7 +87,7 @@ fn ready_view(view: PreviewView) -> View {
     let (head, body) = match view {
         PreviewView::Picture(ref picture) => (
             "What this would do",
-            picture_body(scene_of(picture)).into_view(),
+            picture_body(scene_of(picture), tween_of(picture)).into_view(),
         ),
         // A conflict is a live established fact — real git ran the real
         // three-way merge and it does not apply. Named paths, not a spinner
@@ -154,17 +159,28 @@ fn ready_view(view: PreviewView) -> View {
     .into_view()
 }
 
-/// The two halves, the sentence, and the legend.
-fn picture_body(scene: PreviewScene) -> impl IntoView {
+/// The animated transition, the two static halves, the sentence, and the
+/// legend.
+///
+/// The animation is additive (#591): a fresh [`Playback`] starts the moment
+/// this body is built (once per preview becoming [`PreviewSlot::Ready`]), but
+/// the two static halves below it are ordinary markup with no dependency on
+/// it whatsoever — a host with `prefers-reduced-motion: reduce`, a screen
+/// reader, or simply a slow frame never has less to look at than this panel
+/// already offered before #591 existed.
+fn picture_body(scene: PreviewScene, tween: TweenScene) -> impl IntoView {
     let PreviewScene {
         before,
         after,
         summary,
         legend,
     } = scene;
+    let playback = Playback::new();
+    playback.start(prefers_reduced_motion());
     view! {
         <div>
             <div style="margin-bottom:8px;">{summary}</div>
+            {animated_scene_view(tween, playback)}
             <div style="display:flex; gap:14px; flex-wrap:wrap; align-items:flex-start; \
                         max-height:44vh; overflow:auto;">
                 {half_view(before)}
@@ -176,6 +192,146 @@ fn picture_body(scene: PreviewScene) -> impl IntoView {
                 </div>
             })}
         </div>
+    }
+}
+
+/// The single animated scene: a "Watch it happen" caption, a Replay button,
+/// and the SVG that plays the transition once and settles.
+///
+/// The scene's geometry ([`TweenScene`]) is built exactly once, when the
+/// picture becomes ready — it does not change while the animation plays, so
+/// it is stored rather than recomputed on every tick. Only [`sample`]'s
+/// output (a [`Frame`]) is recomputed per frame, from [`playback`]'s
+/// progress signal.
+fn animated_scene_view(tween: TweenScene, playback: Playback) -> impl IntoView {
+    let width = tween.width;
+    let height = tween.height;
+    let scene = store_value(tween);
+    let frame = create_memo(move |_| scene.with_value(|s| sample(s, playback.progress())));
+    view! {
+        <div style="margin-bottom:10px;">
+            <div style="display:flex; align-items:center; justify-content:space-between; \
+                        margin-bottom:4px;">
+                <div style="color:var(--muted); font-size:11px; letter-spacing:0.04em; \
+                            text-transform:uppercase;">
+                    "Watch it happen"
+                </div>
+                <button
+                    type="button"
+                    on:click=move |_| playback.start(prefers_reduced_motion())
+                    style="font-size:11px; padding:2px 8px; border-radius:4px; \
+                           border:1px solid #30363d; background:#161b22; \
+                           color:var(--muted); cursor:pointer;"
+                >
+                    "Replay"
+                </button>
+            </div>
+            <svg
+                width=width
+                height=height
+                viewBox=format!("0 0 {width} {height}")
+                role="img"
+                aria-label="An animation from the repository as it is now to the \
+                             state this operation would produce"
+                style="display:block; max-width:100%; height:auto; \
+                       background:#0d1117; border-radius:6px;"
+            >
+                {move || frame.get().edges.into_iter().map(tween_edge_view).collect_view()}
+                {move || frame.get().nodes.into_iter().map(tween_node_view).collect_view()}
+                {move || frame.get().badges.into_iter().map(tween_badge_view).collect_view()}
+            </svg>
+        </div>
+    }
+}
+
+/// One edge at the current instant.
+fn tween_edge_view(edge: FrameEdge) -> impl IntoView {
+    view! {
+        <path
+            d=edge.d
+            fill="none"
+            stroke=edge.color
+            stroke-width="2"
+            stroke-linecap="round"
+            opacity=edge.opacity.to_string()
+        />
+    }
+}
+
+/// One commit dot at the current instant. Same shape as [`node_view`], with
+/// `cx`/`cy`/tag-`y`/label-`y` carrying fractional pixels mid-flight instead
+/// of the static picture's integers.
+fn tween_node_view(node: FrameNode) -> impl IntoView {
+    let FrameNode {
+        cx,
+        cy,
+        opacity,
+        color,
+        hollow,
+        r,
+        halo,
+        tags,
+        label,
+        label_x,
+        label_y,
+        alt,
+        ..
+    } = node;
+    view! {
+        <g opacity=opacity.to_string()>
+            <title>{alt}</title>
+            {halo.map(|hr| view! {
+                <circle cx=cx cy=cy r=hr fill="none" stroke=MARK_ADDED stroke-width="1.5"
+                        stroke-dasharray="3 2" />
+            })}
+            <circle
+                cx=cx
+                cy=cy
+                r=r
+                fill=if hollow { "#0d1117" } else { color }
+                stroke=color
+                stroke-width="2"
+            />
+            {tags
+                .into_iter()
+                .map(|t| view! {
+                    <rect x=t.x y=t.y width=t.w height=t.h rx="3" ry="3"
+                          fill=t.fill stroke=t.stroke stroke-width="1" />
+                    <text x=t.x + 4 y=t.y + 10.0 font-family="monospace" font-size="10"
+                          fill=t.fg>
+                        {t.text}
+                    </text>
+                })
+                .collect_view()}
+            <text x=label_x y=label_y font-family="monospace" font-size="11"
+                  fill="#c9d1d9">
+                {label}
+            </text>
+        </g>
+    }
+}
+
+/// One ref badge in flight, drawn as a small pill centred on its current
+/// point rather than anchored to a row's label column — it is not attached
+/// to either commit's tag stack, it is travelling between them.
+fn tween_badge_view(badge: FrameBadge) -> impl IntoView {
+    let FrameBadge {
+        text,
+        cx,
+        cy,
+        opacity,
+    } = badge;
+    let w = tag_width(&text);
+    let x = cx - (w as f64) / 2.0;
+    let y = cy - (TAG_H as f64) / 2.0;
+    view! {
+        <g opacity=opacity.to_string()>
+            <rect x=x y=y width=w height=TAG_H rx=TAG_R ry=TAG_R
+                  fill=MARK_REF stroke=MARK_REF stroke-width="1" />
+            <text x=x + 4.0 y=y + 10.0 font-family="monospace" font-size="10" fill=BADGE_DARK>
+                {text}
+            </text>
+        </g>
     }
 }
 
@@ -282,6 +438,8 @@ fn node_view(node: SceneNode) -> impl IntoView {
         label,
         marked,
         alt,
+        // Only `tween` reads a node's identity across the two halves.
+        commit_id: _,
     } = node;
     // Unmarked rows are dimmed so the eye lands on what changed. Dimmed, not
     // hidden: they are the context that makes the change legible.

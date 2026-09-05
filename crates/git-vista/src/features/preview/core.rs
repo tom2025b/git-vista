@@ -76,6 +76,23 @@ impl RowMark {
     }
 }
 
+/// One ref's journey from its current commit to where the operation lands it.
+///
+/// [`RowMark::refs_landed`] keeps only the destination — enough for the static
+/// picture, which marks the after row and says nothing about the before row.
+/// The animation (#591) needs the other end too: a ref can only be drawn
+/// *sliding* between two commits it actually points at, one before the
+/// operation and one after, and [`PreviewChange::RefMoved`] is the only place
+/// that origin survives. Kept as a plain struct of ids rather than re-deriving
+/// `from` by name-searching `before` — the server already computed it once,
+/// and a second computation could only ever disagree with the first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefMove {
+    pub ref_name: String,
+    pub from: String,
+    pub to: String,
+}
+
 /// A before/after picture, with the after half marked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Picture {
@@ -83,6 +100,8 @@ pub struct Picture {
     pub after: Half,
     /// Commit id -> what to mark it with. Only marked rows appear.
     pub marks: HashMap<String, RowMark>,
+    /// Every ref the operation moves, with both endpoints. See [`RefMove`].
+    pub ref_moves: Vec<RefMove>,
     /// One plain sentence describing the change, for readers who will not read
     /// a graph — and for a screen reader, which cannot.
     pub summary: String,
@@ -138,11 +157,13 @@ pub fn view_of(response: PreviewResponse) -> PreviewView {
             changes,
         } => {
             let marks = marks_from(&changes);
+            let ref_moves = ref_moves_from(&changes);
             let summary = summarize(&changes);
             PreviewView::Picture(Picture {
                 before,
                 after,
                 marks,
+                ref_moves,
                 summary,
             })
         }
@@ -220,6 +241,26 @@ fn marks_from(changes: &[PreviewChange]) -> HashMap<String, RowMark> {
         }
     }
     marks
+}
+
+/// Pull every ref move out of the change list, both endpoints intact.
+///
+/// A `LaneShifted`/`Added` change carries no ref, so only `RefMoved` produces
+/// an entry — an operation with none (a fast-forward merge that lands no new
+/// ref, or a preview with only a lane shuffle) simply returns an empty list,
+/// and the animation draws no floating badge, which is the honest answer.
+fn ref_moves_from(changes: &[PreviewChange]) -> Vec<RefMove> {
+    changes
+        .iter()
+        .filter_map(|c| match c {
+            PreviewChange::RefMoved { ref_name, from, to } => Some(RefMove {
+                ref_name: ref_name.clone(),
+                from: from.0.clone(),
+                to: to.0.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 /// One plain sentence for the change list.
