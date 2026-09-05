@@ -275,8 +275,26 @@ mod tests {
 
     // -- env tier: blank values are absent, not "found but empty" --
 
+    /// Every test in this file that mutates `GIT_VISTA_GITHUB_TOKEN` or
+    /// `GH_TOKEN` must hold this for its whole body. `std::env` is process-
+    /// wide, `cargo test` runs on multiple threads by default, and these
+    /// tests genuinely race each other without it — caught the hard way:
+    /// `mutation_check`'s baseline leg (no `--test-threads=1`, same as a
+    /// real CI run) went red on unrelated env-tier tests with no mutation
+    /// applied at all. `git-vista-session::auth`'s equivalent test dodges
+    /// this by folding two cases into one `#[test]`; a lock is used here
+    /// instead so each case keeps its own name and failure message.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn env_token_treats_a_blank_value_as_absent() {
+        let _lock = lock_env();
         let guard = EnvGuard::set(GIT_VISTA_ENV, "   ");
         assert_eq!(env_token(GIT_VISTA_ENV), None);
         drop(guard);
@@ -284,6 +302,7 @@ mod tests {
 
     #[test]
     fn env_token_trims_surrounding_whitespace_from_a_real_value() {
+        let _lock = lock_env();
         let guard = EnvGuard::set(GIT_VISTA_ENV, "  a-real-token  ");
         assert_eq!(env_token(GIT_VISTA_ENV), Some("a-real-token".to_string()));
         drop(guard);
@@ -291,6 +310,7 @@ mod tests {
 
     #[test]
     fn env_token_is_none_when_the_variable_is_unset() {
+        let _lock = lock_env();
         let guard = EnvGuard::unset(GH_ENV);
         assert_eq!(env_token(GH_ENV), None);
         drop(guard);
@@ -299,6 +319,9 @@ mod tests {
     /// Restores whatever an env var held before the test, on every exit path
     /// — the pattern `git-vista-session::auth`'s own env-var test uses, so a
     /// later env-reading test can't inherit a fake value by thread schedule.
+    /// Callers must hold [`lock_env`] for the guard's whole lifetime — this
+    /// type has no lock of its own (two guards in one test would deadlock a
+    /// non-reentrant `Mutex` against itself).
     struct EnvGuard {
         name: &'static str,
         original: Option<std::ffi::OsString>,
@@ -358,6 +381,7 @@ mod tests {
 
     #[test]
     fn provenance_line_never_contains_the_resolved_token() {
+        let _lock = lock_env();
         let guard = EnvGuard::set(GIT_VISTA_ENV, "super-secret-canary-value");
         let line = provenance_line();
         assert!(!line.contains("super-secret-canary-value"));
@@ -367,6 +391,7 @@ mod tests {
 
     #[test]
     fn provenance_line_names_the_source_that_answered() {
+        let _lock = lock_env();
         let guard = EnvGuard::set(GIT_VISTA_ENV, "some-token-value");
         assert!(provenance_line().contains(TokenSource::EnvGitVista.label()));
         drop(guard);
@@ -374,6 +399,7 @@ mod tests {
 
     #[test]
     fn provenance_line_is_a_normal_sentence_when_nothing_is_configured() {
+        let _lock = lock_env();
         // Best-effort: clears both env tiers so the assertion holds even when a
         // real keyring entry or tier-3 file happens to exist on the machine
         // running this test — a false failure here would be exactly the "absent
