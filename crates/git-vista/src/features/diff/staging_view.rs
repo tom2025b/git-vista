@@ -33,7 +33,9 @@ use git_vista_protocol::{
 use crate::api::{staging_apply_request, staging_preview_request};
 use crate::detail::diff_line_class;
 use crate::features::a11y::focus::GraphFocus;
-use crate::features::diff::core::selectable_hunks;
+use crate::features::diff::core::{
+    preview_state, selectable_hunks, stage_direction_copy, staging_actions, PreviewState,
+};
 use crate::features::diff::selection::{drag_range, DiffSelection};
 use crate::features::graph::core::{roving_row_key, RenderCtx, RowKey};
 use crate::features::shell::signals::Shell;
@@ -354,10 +356,10 @@ pub fn staging_body(
     status: StatusResource,
     shell: Shell,
 ) -> View {
-    let action_word = match direction {
-        StageDirection::Stage => "Stage",
-        StageDirection::Unstage => "Unstage",
-    };
+    // The verb and the flow arrows come from core (#653): which of the two
+    // diffs the coordinates address is a fact about the direction, and this
+    // file is wasm-only, so a copy kept here is unreachable from every test.
+    let (action_word, flow) = stage_direction_copy(direction);
     let generation = d.generation.clone();
     let patch = staging_patch_view(&d.patch, hunk_focus, selection);
     let truncated_note = d.truncated.then(|| {
@@ -413,11 +415,13 @@ pub fn staging_body(
     // what that would be. `preview_view` hides stale content instead of
     // rendering it, forcing a fresh Preview before the patch text is trusted
     // again.
-    let preview_stale = {
+    let preview_showable = {
         let generation = generation.clone();
-        move || match previewed_plan.get() {
-            None => false,
-            Some(p) => build_plan(ctx, selection, &generation, direction).as_ref() != Some(&p),
+        move || {
+            preview_state(
+                previewed_plan.get().as_ref(),
+                build_plan(ctx, selection, &generation, direction).as_ref(),
+            )
         }
     };
 
@@ -449,19 +453,32 @@ pub fn staging_body(
     };
 
     let no_identity = repo_tokens(ctx).is_none();
-    let preview_view = move || {
-        if preview_stale() {
-            return Some(
-                view! {
-                    <p class="detail-status">
-                        "Selection changed since this preview — press Preview \
-                         again to see the current patch."
-                    </p>
-                }
-                .into_view(),
-            );
-        }
-        preview.get().map(|r| match r {
+    let gate = move || {
+        staging_actions(
+            selection.with(|s| s.is_empty()),
+            busy.get(),
+            !no_identity,
+        )
+    };
+    // Three states, three renderings, and `PreviewState` is what tells them
+    // apart (#653). The `Stale` arm is the #215 review finding: Apply was
+    // always correct — it rebuilds the plan from the live selection at click
+    // time — but the panel was lying about what that would be, leaving the
+    // previous patch text on screen after a hunk was toggled. Showing the
+    // notice on `NotRequested` too would put "selection changed" on a view
+    // nobody has previewed yet.
+    let preview_view = move || match preview_showable() {
+        PreviewState::NotRequested => None,
+        PreviewState::Stale => Some(
+            view! {
+                <p class="detail-status">
+                    "Selection changed since this preview — press Preview \
+                     again to see the current patch."
+                </p>
+            }
+            .into_view(),
+        ),
+        PreviewState::Fresh => preview.get().map(|r| match r {
             Ok(p) => {
                 let files_note = if p.whole_files.is_empty() {
                     view! {}.into_view()
@@ -485,18 +502,12 @@ pub fn staging_body(
                 <p class="detail-status detail-error">{format!("Preview failed: {e}")}</p>
             }
             .into_view(),
-        })
+        }),
     };
 
     view! {
         <div class="viewer-doc-head">
-            {format!(
-                "{action_word} selected changes — {}",
-                match direction {
-                    StageDirection::Stage => "worktree → index",
-                    StageDirection::Unstage => "index → HEAD",
-                },
-            )}
+            {format!("{action_word} selected changes — {flow}")}
         </div>
         {no_identity.then(|| view! {
             <p class="detail-status detail-error">
@@ -505,23 +516,29 @@ pub fn staging_body(
             </p>
         })}
         <div class="stage-actions">
+            // Which buttons are live is `staging_actions`' to say (#653). The
+            // asymmetry it holds is the point: Clear needs only a selection,
+            // because clearing is local — a request in flight is no reason to
+            // trap the user with a selection they have decided against, and a
+            // repository with no identity is exactly the state where clearing
+            // is the only useful thing left.
             <button
                 class="viewer-btn"
-                prop:disabled=move || selection.with(|s| s.is_empty()) || busy.get() || no_identity
+                prop:disabled=move || !gate().preview
                 on:click=on_preview
             >
                 "Preview"
             </button>
             <button
                 class="viewer-btn"
-                prop:disabled=move || selection.with(|s| s.is_empty()) || busy.get() || no_identity
+                prop:disabled=move || !gate().apply
                 on:click=on_apply
             >
                 {format!("{action_word} Selected")}
             </button>
             <button
                 class="viewer-btn"
-                prop:disabled=move || selection.with(|s| s.is_empty())
+                prop:disabled=move || !gate().clear
                 on:click=move |_| selection.update(|s| s.clear())
             >
                 "Clear selection"
