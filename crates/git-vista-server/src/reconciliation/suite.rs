@@ -107,6 +107,32 @@ async fn a_change_no_watcher_reported_is_caught_by_the_sweep_alone() {
         ),
         RefDelta::Unknown => panic!("there was a previous reading to difference against"),
     }
+
+    // A SECOND change, and this one is the assertion that means something.
+    //
+    // The first is catchable by a one-off: the driver sweeps once when its
+    // watcher start-up window expires, and with hints suppressed that expiry
+    // lands a couple of seconds in — so a change made immediately after the
+    // stream opened is caught by a sweep that never repeats. Disarming the
+    // periodic timer entirely left this test green, which is how that was
+    // found: a mutation proof reporting `survived` against a test whose name
+    // claims the sweep is periodic.
+    //
+    // By the time this second branch is made, that one-off is spent. Only a
+    // sweep that keeps running can announce it.
+    git(repo.path(), &["branch", "and-again-much-later"]);
+    let later = snapshot_where(&mut snapshots, Duration::from_secs(20), |s| {
+        s.generation != after.generation
+    })
+    .await;
+    match later.changed {
+        RefDelta::Named { refs, .. } => assert!(
+            refs.iter()
+                .any(|r| r.as_str() == "refs/heads/and-again-much-later"),
+            "a repeating sweep names the second change too: {refs:?}"
+        ),
+        RefDelta::Unknown => panic!("there was a previous reading to difference against"),
+    }
 }
 
 #[tokio::test]
@@ -303,40 +329,11 @@ async fn a_panicking_write_leaves_the_feed_free_to_publish() {
     }
 }
 
-// --- #556: the bound, and what it degrades to ------------------------------
-
-#[tokio::test]
-async fn a_budget_smaller_than_the_watch_set_reports_bounded_rather_than_watching() {
-    // #556 acceptance 2 and 5: the bound is enforced in code, and hitting it is
-    // an observable state. A watcher that quietly covered less while still
-    // reporting `Watching` is the failure this milestone exists to prevent,
-    // aimed at itself.
-    let repo = repository();
-    git(repo.path(), &["branch", "one"]);
-    git(repo.path(), &["branch", "team/two"]);
-    git(repo.path(), &["branch", "team/sub/three"]);
-
-    let mut watcher = crate::watcher::RepositoryWatcher::start_with_budget(
-        repo.path(),
-        WatchBudget::Undetermined { watches: 2 },
-    );
-    let health = tokio::time::timeout(Duration::from_secs(5), watcher.recv())
-        .await
-        .expect("the watcher reported within five seconds")
-        .expect("the watcher's notice stream stayed open");
-    match health {
-        WatcherNotice::Health(WatcherHealth::Watching {
-            installed, wanted, ..
-        }) => {
-            assert_eq!(installed, 2, "the budget bound the installs");
-            assert!(
-                wanted > installed,
-                "and the watcher says how much it wanted: {wanted} > {installed}"
-            );
-        }
-        other => panic!("expected a bounded watching report, got {other:?}"),
-    }
-}
+// --- #556: what the bound degrades to --------------------------------------
+//
+// The bound's own enforcement is proven in `watcher::suite`, beside the code
+// that enforces it — a mutation proof filtered to `watcher` must be able to see
+// it fail.
 
 #[tokio::test]
 async fn what_the_bound_gives_up_is_latency_and_the_sweep_still_covers_it() {
