@@ -12,7 +12,7 @@ use crate::features::core_traits::{Applied, Invalidate, InvalidateScope};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use git_vista_core::model::{Edge, FrameStub, GitRef, GraphRow, Oid};
+use git_vista_core::model::{Edge, FrameStub, GitRef, GraphRow, Oid, RefKind};
 use git_vista_protocol::plan::Advisory;
 use git_vista_protocol::{
     CommitOid, GenerationToken, HistoryFrame, HistoryPage, RefChange, RefState, RepoMode, RiskLevel,
@@ -1012,6 +1012,200 @@ fn advisory_lines(advisories: &[Advisory]) -> String {
 pub(crate) fn short_oid(oid: &str) -> &str {
     &oid[..oid.len().min(7)]
 }
+
+// ── Label links, glyphs and badge colours (#653) ─────────────────────────────
+//
+// `render/labels.rs` (the interactive label tier) and `print.rs` (the static
+// print sheet) draw the same badges over the same refs, and both are
+// `#[cfg(target_arch = "wasm32")]` — so every rule below used to live where
+// `cargo test --workspace` compiles none of it. Two of them were literally
+// duplicated across the pair, each copy carrying a comment promising it
+// matched the other; `print.rs` even kept a `#[cfg(test)] mod tests` for its
+// link rule that has never run a single time on this box. Per ADR 0115 the
+// decision moves here, where a host test executes it, and the two wasm-only
+// files are left with markup to arrange.
+
+/// Whether a badge or commit label has a GitHub page to point at, and — when
+/// it does not — whether that is because the repository has no GitHub remote
+/// at all or because this particular ref/commit simply is not pushed yet.
+///
+/// The distinction is the whole reason this is an enum rather than an
+/// `Option<String>`. `render/labels.rs` styles the three cases differently
+/// (linked / dimmed-and-unlinked / plain), and it used to derive the middle
+/// one at each call site as `repo_url.is_some() && url.is_none()` — the same
+/// expression written out three times next to three separate URL
+/// computations. Any one of them drifting from its URL rule shows a `.unpushed`
+/// commit as ordinary, or dims one that links fine; neither is visible to a
+/// test that only checks the URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefLink {
+    /// A page that resolves: draw it as a real link.
+    To(String),
+    /// This repository has a GitHub base, but this target has no page on it —
+    /// it is not pushed. Draw it dimmed and unlinked; a link here would 404.
+    Unpushed,
+    /// No GitHub base at all. Nothing to link, and nothing to dim either —
+    /// an unlinked label in a repo with no remote is not a deficiency.
+    NoRemote,
+}
+
+impl RefLink {
+    /// Consume into the owned URL, if any — the only accessor the views need,
+    /// since both move the string straight into a `href=` attribute. A
+    /// borrowing `url(&self)` twin was written first and deleted: nothing but
+    /// a test ever called it, and `reachability_census` said so.
+    pub fn into_url(self) -> Option<String> {
+        match self {
+            Self::To(url) => Some(url),
+            Self::Unpushed | Self::NoRemote => None,
+        }
+    }
+
+    /// `class:clickable` — true exactly when there is a URL.
+    pub const fn clickable(&self) -> bool {
+        matches!(self, Self::To(_))
+    }
+
+    /// `class:unpushed` — the dimmed "GitHub repo, but not on it yet" state.
+    /// Never true when [`Self::clickable`] is, and never true for a repository
+    /// with no GitHub base: those two facts are what the call sites kept
+    /// re-deriving.
+    pub const fn unpushed(&self) -> bool {
+        matches!(self, Self::Unpushed)
+    }
+}
+
+/// The settled commit-link rule shared by the print sheet and the interactive
+/// labels: only a GitHub-backed commit known to be on the remote has a
+/// reachable page (#12). Moved here from `print.rs`, which is wasm-only and
+/// whose three tests for this rule therefore never compiled.
+pub fn commit_link(repo_url: Option<&str>, on_remote: bool, commit_id: &str) -> RefLink {
+    match repo_url {
+        None => RefLink::NoRemote,
+        Some(base) if on_remote => RefLink::To(format!("{base}/commit/{commit_id}")),
+        Some(_) => RefLink::Unpushed,
+    }
+}
+
+/// Where one ref badge links on GitHub (#12), by kind:
+///
+///  * **HEAD / tag** → the commit they sit on, when that commit is pushed. A
+///    tag's own page cannot be verified offline, so the commit it points at is
+///    linked instead — that resolves whenever the commit is pushed.
+///  * **local branch** → its tree page, but *only* when a remote branch of the
+///    same name exists. Without that check a local-only branch badge would
+///    link to a tree page that 404s.
+///  * **remote branch** → its tree page unconditionally; it is on the remote by
+///    definition. Its leading `<remote>/` is stripped, since GitHub's tree
+///    URLs name the branch, not the remote.
+///
+/// `remote_branch_named` answers "does a remote branch with this exact name
+/// exist?" — the caller's `RenderCtx::remote_branches` lookup, passed in as a
+/// fact so this rule needs no collection type and no lifetime.
+pub fn ref_badge_link(
+    kind: &RefKind,
+    ref_name: &str,
+    repo_url: Option<&str>,
+    commit_on_remote: bool,
+    commit_id: &str,
+    remote_branch_named: bool,
+) -> RefLink {
+    let Some(base) = repo_url else {
+        return RefLink::NoRemote;
+    };
+    match kind {
+        RefKind::Head | RefKind::Tag => commit_link(Some(base), commit_on_remote, commit_id),
+        RefKind::Branch => {
+            if remote_branch_named {
+                RefLink::To(format!("{base}/tree/{ref_name}"))
+            } else {
+                RefLink::Unpushed
+            }
+        }
+        RefKind::RemoteBranch => {
+            let branch = ref_name.split_once('/').map_or(ref_name, |(_, b)| b);
+            RefLink::To(format!("{base}/tree/{branch}"))
+        }
+    }
+}
+
+/// The badge glyph for a ref kind. Local branches get the branch icon, remote
+/// branches the alternate one — so local and remote pills differ at a glance
+/// before the name is read — tags the tag icon, and HEAD the commit icon (it
+/// marks the commit you are on). The glyph counts into the pill's width like
+/// any other monospace character.
+///
+/// One mapping, not two: `render/labels.rs` and `print.rs` each held a copy,
+/// each labelled "same mapping as" the other.
+pub fn ref_glyph(ic: &crate::icons::GitIcons, kind: &RefKind) -> &'static str {
+    match kind {
+        RefKind::Head => ic.commit,
+        RefKind::Tag => ic.tag,
+        RefKind::Branch => ic.branch,
+        RefKind::RemoteBranch => ic.branch_alt,
+    }
+}
+
+/// Which surface a badge is being drawn on. The two differ in exactly one
+/// place and it is not cosmetic drift: [`RefKind::Head`]'s near-white fill is
+/// invisible on paper without a grey outline, and that outline would be wrong
+/// on the dark canvas. Naming the surface makes the one intended divergence
+/// explicit and keeps the other three kinds structurally identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BadgeSurface {
+    /// The interactive canvas: dark background, HEAD outlined in its own fill.
+    Screen,
+    /// The print sheet: white paper, HEAD outlined in grey so the pill exists.
+    Paper,
+}
+
+/// A badge pill's three colours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BadgeColors {
+    pub fill: &'static str,
+    pub stroke: &'static str,
+    pub text: &'static str,
+}
+
+/// HEAD's outline on paper. Its `HEAD_BADGE` fill is near-white, so on a white
+/// sheet a HEAD pill with a `HEAD_BADGE` stroke has no edge at all.
+const HEAD_PAPER_STROKE: &str = "#57606a";
+
+/// The pill colours for one ref kind on one surface. `branch` is the row's
+/// already-resolved branch colour (`branch_color(slot)`), which local and
+/// remote branch badges take — filled for local, outlined for remote — while
+/// HEAD and tags carry fixed colours.
+pub fn badge_colors(kind: &RefKind, branch: &'static str, surface: BadgeSurface) -> BadgeColors {
+    use git_vista_core::color::{BADGE_DARK, HEAD_BADGE, TAG_BADGE};
+    match kind {
+        RefKind::Head => BadgeColors {
+            fill: HEAD_BADGE,
+            stroke: match surface {
+                BadgeSurface::Screen => HEAD_BADGE,
+                BadgeSurface::Paper => HEAD_PAPER_STROKE,
+            },
+            text: BADGE_DARK,
+        },
+        RefKind::Tag => BadgeColors {
+            fill: TAG_BADGE,
+            stroke: TAG_BADGE,
+            text: BADGE_DARK,
+        },
+        RefKind::Branch => BadgeColors {
+            fill: branch,
+            stroke: branch,
+            text: BADGE_DARK,
+        },
+        RefKind::RemoteBranch => BadgeColors {
+            fill: "none",
+            stroke: branch,
+            text: branch,
+        },
+    }
+}
+
+#[cfg(test)]
+mod label_link_suite;
 
 #[cfg(test)]
 mod compare_offer_suite;

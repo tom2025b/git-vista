@@ -331,11 +331,10 @@ const THRESHOLD_LINES: usize = 150;
 ///
 /// These are not all the same kind of gap, and the reasons say so plainly.
 /// Several are real, unpinned debt named here for the first time by this
-/// census (`gestures.rs`, `print.rs`, `render/labels.rs`,
-/// `features/diff/staging_view.rs`, `dialogs/open_url.rs`) — landing this
-/// module does not close those gaps, it is what makes them visible instead
-/// of requiring another by-hand read of the tree to rediscover; #653 tracks
-/// the five that remain.
+/// census (`gestures.rs`, `features/diff/staging_view.rs`,
+/// `dialogs/open_url.rs`) — landing this module does not close those gaps,
+/// it is what makes them visible instead of requiring another by-hand read
+/// of the tree to rediscover; #653 tracks the ones that remain.
 ///
 /// `dialogs/open_url.rs` is on that list because *this table* says it is.
 /// #649's PR body filed it under "argued thin" while the entry it landed
@@ -345,12 +344,15 @@ const THRESHOLD_LINES: usize = 150;
 /// [`exempt_entries_still_need_exempting`] is written against. A prose
 /// summary elsewhere that drifts from it is the summary that is wrong.
 ///
-/// Two have already left. `app/canvas.rs` went when its 409 handler moved to
+/// Four have already left. `app/canvas.rs` went when its 409 handler moved to
 /// `features::history::core::drift_reload`; `features/shell/signals.rs` went
-/// when its overlay payload map moved to `features::shell::core`. Neither
-/// entry was removed as a courtesy someone remembered —
-/// [`exempt_entries_still_need_exempting`] demanded it the moment a host test
-/// started reading the file, which is this table working as intended.
+/// when its overlay payload map moved to `features::shell::core`; `print.rs`
+/// and `render/labels.rs` went together when the GitHub link rule, the ref
+/// glyph mapping and the badge palette they each held a copy of moved to
+/// `features::graph::core` (#653). None of those entries was removed as a
+/// courtesy someone remembered — [`exempt_entries_still_need_exempting`]
+/// demanded it the moment a host test started reading the file, which is
+/// this table working as intended.
 ///
 /// Others are argued thin on inspection
 /// (`state.rs`, `session.rs`, `prefs.rs`, `features/stash/signals.rs`,
@@ -366,24 +368,9 @@ const EXEMPT: &[(&str, &str)] = &[
          no host test reading it. Real debt, not fixed here.",
     ),
     (
-        "print.rs",
-        "480 lines, 13 fns / 11 `view!` blocks building the static print SVG \
-         and the page-size picker's layout math. No host test reads it. Real \
-         debt, not fixed here.",
-    ),
-    (
         "features/diff/staging_view.rs",
         "533 lines: the finger/keyboard hunk-selection view wired to \
          /api/staging. No host test reads it. Real debt, not fixed here.",
-    ),
-    (
-        "render/labels.rs",
-        "298 lines. Sibling of `render/nodes.rs` and `render/stubs.rs`, both \
-         already pinned by `features/a11y/audit.rs` — left out of that \
-         census by omission, the exact API_SRC-omission shape #77 fixed for \
-         `api/conflicts.rs`. Extending a11y's own accessibility assertions to \
-         a new file is a11y's judgment call, not this census's; real gap, not \
-         fixed here.",
     ),
     (
         "dialogs/open_url.rs",
