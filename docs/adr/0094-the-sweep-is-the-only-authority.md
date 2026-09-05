@@ -6,6 +6,10 @@
 - **Reserved by:** [ADR 0095](0095-the-viewer-says-when-it-is-ready.md), which allocated 0094 for "watcher authority" before this file existed
 - **Extends:** [ADR 0001](0001-repository-generation-token.md) (the generation this feed carries) · [ADR 0055](0055-an-undated-reading-gets-no-benefit-of-the-doubt.md) · [ADR 0005](0005-two-listeners-two-route-tables.md) · [ADR 0115](0115-a-mutation-proof-cannot-see-what-it-does-not-run.md)
 - **Supersedes / superseded by:** —
+- **Amended:** 2026-09-05 by #664 review round 5 — the round-3 currency
+  paragraph's two strongest claims are narrowed in place (search "Narrowed by
+  review round 5"). The originals are left standing: what they got wrong is
+  the useful part of the record.
 
 ## Context
 
@@ -625,6 +629,52 @@ Three things fall out, and the third is a finding rather than a result:
   mutation proof cannot reach. The type makes the omission impossible; the
   comparison makes the staleness detectable. Neither alone would have been
   the whole fix.
+
+  **Narrowed by review round 5 (2026-09-05, #664).** Two claims in the
+  paragraph above were true of the sites the round could see and are not
+  true in general; they are left standing rather than rewritten, because
+  what they got wrong is the useful part of the record.
+
+  *"There is no argument-less overload left to call."* There is now, on
+  purpose. Requiring a token at every site made the **number of sites** the
+  variable — and rounds 3 and 4 were each "one more site" (round 4 found a
+  seventh: issuing the second request between the awaits, with no check
+  between a successful first reply and it). A guard-per-site fix cannot
+  converge, because it enumerates, and the enumeration was already incomplete
+  twice. The shape changed instead: `rebuild_lease` now computes a pure
+  outcome across both awaits and asks `preview::core::rebuild_commit` **once**,
+  in a block containing no `.await` — atomic by construction on wasm's
+  single-threaded executor. `note_rebuild_failed`/`note_rebuild_landed` take
+  no token because there is one caller and one decision above them.
+
+  *"The type makes the omission impossible."* It made a **missing check**
+  impossible. It could not make a **wrong fence** impossible, and that is the
+  round's real finding: `RebuildToken` compared `Preview`'s private counter,
+  which is bumped only by `fetch`/`clear`/`note_rebuild_started` and is blind
+  to repository selection — selection bumps `GraphCore::epoch` and has never
+  bumped `Preview`. Worse, one reachable case is invisible to *any*
+  client-side counter. Repository selection is per session and shared by
+  every tab on the cookie, and `/api/plan` carries no repository selector, so
+  a second tab selecting another repository moves this tab's in-flight
+  requests to it with nothing here going stale. Reproduced in a real browser
+  (`ci/browser/tests/rebuild-lease-two-tabs.spec.mjs`): two plans carrying the
+  other desk, that desk's own object id rendered into the live confirmation,
+  and both server gates passing it because plan and live selection agree.
+  The fence is therefore two things the token could not supply — the shared
+  graph epoch, and the **plan's own `repository`/`worktree`**, which arrive on
+  every plan and were being discarded at `PlanOnScreen::of`. That last is
+  ADR 0119's finding one milestone over: a guarantee the wire already carries,
+  dropped by the client that needed it.
+
+  **The rule, stated so the next author finds it:** *a continuation that
+  writes shared state has one commit point, and it asks the shared fence, not
+  a private one.* `Preview::fetch` had the first half right from the start —
+  it computes `(outcome, plan)` across both awaits and commits once behind one
+  comparison — which is why it was never the function that kept needing
+  rounds. It still had the second half wrong, and `RequestKey { epoch,
+  generation }` / `is_current` (`features/core_traits.rs`, host-tested, live on
+  every history page reply since #555) was the shared fence sitting one module
+  over the whole time.
 - **A confirmation can hold a plan two ways, and both are checked.** A
   force-with-lease push has no graph preview (`preview_subject(Push)` is
   `NotPreviewable`) while displaying a server-built plan's explanation, risk and

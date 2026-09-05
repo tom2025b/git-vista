@@ -507,6 +507,209 @@ pub fn rebuild_token_is_current(current: Option<u64>, issued: u64) -> bool {
     current == Some(issued)
 }
 
+/// The same question on **both** axes (#664 review round 5): `Preview`'s own
+/// generation, and the shared graph epoch that repository selection moves.
+///
+/// # Why one axis was not enough
+///
+/// `Preview::generation` is bumped only by `fetch`, `clear` and
+/// `note_rebuild_started`. Repository selection bumps `GraphCore::epoch`
+/// (`force_bump`) and has never bumped `Preview` — so the private counter is
+/// blind to the one event that makes a held continuation dangerous. The app
+/// already had the right shape for this and `Preview` never adopted it:
+/// `RequestKey { epoch, generation }` / `is_current`, which refuses on the
+/// epoch first and has guarded every history page reply since #555.
+///
+/// The epoch is checked first for the same reason `RequestKey` checks it
+/// first: it is the coarser fact, and a moved selection invalidates a rebuild
+/// regardless of what the finer counter says.
+pub fn rebuild_key_is_current(
+    live_epoch: Option<u64>,
+    live_generation: Option<u64>,
+    issued_epoch: u64,
+    issued_generation: u64,
+) -> bool {
+    live_epoch == Some(issued_epoch) && rebuild_token_is_current(live_generation, issued_generation)
+}
+
+#[cfg(test)]
+mod rebuild_key_tests {
+    use super::rebuild_key_is_current;
+
+    #[test]
+    fn both_axes_matching_is_current() {
+        assert!(rebuild_key_is_current(Some(7), Some(3), 7, 3));
+    }
+
+    /// The axis the private counter could not see: selection moved the graph
+    /// epoch while the generation stayed put.
+    #[test]
+    fn a_moved_epoch_is_not_current_even_when_the_generation_agrees() {
+        assert!(!rebuild_key_is_current(Some(8), Some(3), 7, 3));
+    }
+
+    #[test]
+    fn a_moved_generation_is_not_current_even_when_the_epoch_agrees() {
+        assert!(!rebuild_key_is_current(Some(7), Some(4), 7, 3));
+    }
+
+    /// A disposed owner reads as not current, the same conservative reading
+    /// `rebuild_token_is_current` already gives — on either axis.
+    #[test]
+    fn an_unreadable_axis_is_never_current() {
+        assert!(!rebuild_key_is_current(None, Some(3), 7, 3));
+        assert!(!rebuild_key_is_current(Some(7), None, 7, 3));
+    }
+}
+
+/// What a rebuild-lease continuation came back with (#664 review round 5).
+///
+/// A pure value computed across both awaits, so the continuation writes
+/// nothing while it is still in flight — see [`rebuild_commit`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RebuildOutcome {
+    /// Both requests answered and a leased plan was built.
+    Landed,
+    /// Any refusal: either request failed, or the remote tip was unknown so
+    /// no lease could be computed at all. They land in the same place because
+    /// the user's next move is the same either way.
+    Failed,
+}
+
+/// What the one commit point is allowed to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RebuildEffect {
+    /// Re-open the confirmation on the replacement and mark the rebuild
+    /// landed — one effect, never two half-applied ones.
+    Reopen,
+    /// Record that the rebuild produced nothing.
+    MarkFailed,
+    /// Stale, or built for the wrong desk: touch nothing at all.
+    Drop,
+}
+
+/// The single decision a rebuild-lease continuation makes before it touches
+/// any shared state (#664 review round 5).
+///
+/// # Why this function exists rather than five guards
+///
+/// `rebuild_lease` used to interleave six writes with its two awaits — three
+/// failure writes, one request issuance, one dialog re-open and one "landed"
+/// write — each of which was a site somebody had to remember to guard. Rounds
+/// 3 and 4 of the review were each "one more site", which is the signature of
+/// a fix that enumerates rather than converges: the enumeration was already
+/// incomplete twice. ADR 0119 states the same principle for a different
+/// surface — "a list of known message sites is not a fix, because that list
+/// was already incomplete twice".
+///
+/// So the shape changed instead of the guard count. The continuation computes
+/// a pure [`RebuildOutcome`] across both awaits and asks this function once.
+/// On wasm's single-threaded executor a block containing no `.await` cannot
+/// interleave, so "decide, then act" is atomic by construction rather than by
+/// a convention each new site has to honour.
+///
+/// # The two fences, and why one of them cannot be a counter
+///
+/// * `current` — the shared-fence answer: is this still the live rebuild, on
+///   both `Preview`'s own generation and the graph epoch that repository
+///   selection moves? (`RequestKey::is_current`'s two-axis shape, which
+///   history paging has used since #555 and `Preview` never adopted.)
+/// * `same_desk` — was the replacement built for the repository and worktree
+///   the confirmation was opened against?
+///
+/// The second is not redundant, and this is the part the review took four
+/// rounds to reach. Repository selection is per session and shared across
+/// tabs, so another tab can move this tab's requests to another repository
+/// with nothing here going stale: `current` is honestly `true`, every
+/// client-side counter agrees, and the plan that comes back is for the wrong
+/// desk. Reproduced in `ci/browser/tests/rebuild-lease-two-tabs.spec.mjs`.
+/// Only the plan's own tokens can answer it, which is why `same_desk` is
+/// computed from the value rather than from anything this client believes.
+pub fn rebuild_commit(outcome: RebuildOutcome, current: bool, same_desk: bool) -> RebuildEffect {
+    if !current {
+        // A newer rebuild, a cancel, or a selection change owns the state now.
+        return RebuildEffect::Drop;
+    }
+    match outcome {
+        RebuildOutcome::Failed => RebuildEffect::MarkFailed,
+        // A plan for another desk is dropped rather than marked failed: the
+        // rebuild did not fail, it answered a question about a different
+        // repository, and `RebuildFailed` would tell the user their own
+        // repository refused when it never spoke.
+        RebuildOutcome::Landed if !same_desk => RebuildEffect::Drop,
+        RebuildOutcome::Landed => RebuildEffect::Reopen,
+    }
+}
+
+#[cfg(test)]
+mod rebuild_commit_tests {
+    use super::{rebuild_commit, RebuildEffect, RebuildOutcome};
+
+    #[test]
+    fn a_current_landed_rebuild_on_the_same_desk_reopens() {
+        assert_eq!(
+            rebuild_commit(RebuildOutcome::Landed, true, true),
+            RebuildEffect::Reopen
+        );
+    }
+
+    #[test]
+    fn a_current_failure_marks_failed() {
+        assert_eq!(
+            rebuild_commit(RebuildOutcome::Failed, true, true),
+            RebuildEffect::MarkFailed
+        );
+    }
+
+    /// The round-3 defect: a reply released after Cancel must not write
+    /// anything, success or failure.
+    #[test]
+    fn a_stale_rebuild_touches_nothing_whichever_way_it_ended() {
+        assert_eq!(
+            rebuild_commit(RebuildOutcome::Landed, false, true),
+            RebuildEffect::Drop
+        );
+        assert_eq!(
+            rebuild_commit(RebuildOutcome::Failed, false, true),
+            RebuildEffect::Drop
+        );
+    }
+
+    /// The round-5 defect, and the one no counter can reach: the rebuild is
+    /// genuinely current — nothing in this tab is stale — but the plan came
+    /// back built for another repository because a second tab moved the
+    /// shared session selection.
+    #[test]
+    fn a_current_rebuild_for_another_desk_is_dropped_not_reopened() {
+        assert_eq!(
+            rebuild_commit(RebuildOutcome::Landed, true, false),
+            RebuildEffect::Drop,
+        );
+    }
+
+    /// …and specifically NOT reported as a failure. The user's own repository
+    /// never refused anything; saying it did would be a false statement about
+    /// a repository that was never asked.
+    #[test]
+    fn a_wrong_desk_plan_is_not_reported_as_a_failure() {
+        assert_ne!(
+            rebuild_commit(RebuildOutcome::Landed, true, false),
+            RebuildEffect::MarkFailed,
+        );
+    }
+
+    /// A failure is a failure regardless of desk: there is no plan to have
+    /// been built for the wrong one, so `same_desk` must not change the
+    /// answer here.
+    #[test]
+    fn the_desk_does_not_change_what_a_failure_means() {
+        assert_eq!(
+            rebuild_commit(RebuildOutcome::Failed, true, false),
+            RebuildEffect::MarkFailed
+        );
+    }
+}
+
 #[cfg(test)]
 mod rebuild_token_tests {
     use super::rebuild_token_is_current;

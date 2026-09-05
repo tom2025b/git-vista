@@ -50,6 +50,11 @@ pub struct PlanOnScreen {
     /// The refs the plan expects to move — `Plan::expected_ref_changes`, by
     /// full ref name.
     pub expects: Vec<String>,
+    /// The repository the plan was built for — `Plan::repository` (#664
+    /// review round 5).
+    pub repository: String,
+    /// The worktree the plan was built for — `Plan::worktree`.
+    pub worktree: String,
 }
 
 impl PlanOnScreen {
@@ -60,6 +65,24 @@ impl PlanOnScreen {
     /// two things off the same object. The alternative — each caller reaching
     /// into `Plan` itself — is how the force-with-lease confirmation came to
     /// display a server-built plan and check the freshness of nothing.
+    ///
+    /// # Why the desk is taken too (#664 review round 5)
+    ///
+    /// Repository selection is per *session*, shared by every tab on the
+    /// cookie, and `/api/plan` carries no repository selector — it resolves
+    /// against whatever the session has selected when the request lands. So a
+    /// second tab selecting another repository moves this tab's in-flight
+    /// requests to it with **no epoch bump here**, and a rebuilt plan can come
+    /// back built for a repository the user is not looking at. Reproduced in
+    /// `ci/browser/tests/rebuild-lease-two-tabs.spec.mjs`: two plans carrying
+    /// the other desk, and that desk's own object id rendered into the live
+    /// confirmation.
+    ///
+    /// No client-side counter can catch that — nothing here is stale, so every
+    /// currency token is honestly current. The identity that *can* is on the
+    /// value itself, and this constructor used to drop it on the floor. That is
+    /// ADR 0119's finding one milestone over: a guarantee the wire already
+    /// carries, discarded by the client that needed it.
     pub fn of(plan: &git_vista_protocol::Plan) -> Self {
         Self {
             generation: plan.generation.as_str().to_string(),
@@ -68,7 +91,18 @@ impl PlanOnScreen {
                 .iter()
                 .map(|change| change.ref_name.as_str().to_string())
                 .collect(),
+            repository: plan.repository.as_str().to_string(),
+            worktree: plan.worktree.as_str().to_string(),
         }
+    }
+
+    /// Whether `other` was built for the same desk as this one.
+    ///
+    /// Both halves, never just the repository: one repository can be open at
+    /// several worktrees, and a plan built at the wrong desk of the right
+    /// repository still force-pushes from a tree the reviewer never looked at.
+    pub fn same_desk(&self, other: &PlanOnScreen) -> bool {
+        self.repository == other.repository && self.worktree == other.worktree
     }
 }
 
