@@ -139,7 +139,7 @@ fn deep_rename_chain(repo: &std::path::Path, hops: u32, noise_per_hop: u32) -> V
 /// append primitive; each commit's blob is the whole file to that point,
 /// which is exactly what a real file grown one line at a time looks like on
 /// disk).
-fn deep_line_history(repo: &std::path::Path, lines: usize) -> () {
+fn deep_line_history(repo: &std::path::Path, lines: usize) {
     let mut stream = String::new();
     let mut content = String::new();
     for n in 1..=lines {
