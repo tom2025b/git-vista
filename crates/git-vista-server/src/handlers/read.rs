@@ -903,7 +903,7 @@ pub(crate) async fn worktree_list(
     let repo = resolve_repo(q.repo.as_deref())?.0;
     let census = crate::worktree_census::worktree_census(
         &repo,
-        crate::state::expose_paths(),
+        crate::worktree_census::CensusPaths::from_flag(crate::state::expose_paths()),
         &crate::state::path_is_allowed,
     )
     .await;

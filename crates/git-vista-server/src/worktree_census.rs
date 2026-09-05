@@ -53,7 +53,7 @@
 //!
 //! # Why the allowed-roots check and the path-exposure flag are parameters
 //!
-//! [`worktree_census`] takes `expose_paths`/`path_is_allowed` rather than
+//! [`worktree_census`] takes [`CensusPaths`]/`path_is_allowed` rather than
 //! calling `crate::state::expose_paths()`/`crate::state::path_is_allowed`
 //! itself — the same hoist `Catalog::descriptor`/`descriptor_with_policy`
 //! already make for exactly this reason (see that function's own doc
@@ -61,10 +61,27 @@
 //! in this binary, so a function that reaches into it directly cannot be unit
 //! tested without either polluting or depending on what other tests already
 //! registered. A production call site supplies
-//! `crate::state::expose_paths()`/`&crate::state::path_is_allowed` once this
-//! is wired to a handler; every test here supplies its own, so an
-//! "outside the allowed roots" test needs no dependency on what any other
-//! test happened to register first.
+//! `crate::state::expose_paths()`/`&crate::state::path_is_allowed`; every test
+//! here supplies its own, so an "outside the allowed roots" test needs no
+//! dependency on what any other test happened to register first.
+//!
+//! # Both arms of the census obey the path flag (#657)
+//!
+//! [`CensusPaths`] is two answers, not one, because the question is two
+//! questions: whether the *rows* carry paths (a caller may need one locally
+//! and never serialize it) and whether a *failure* carries the path-bearing
+//! half of its diagnostic to the client. A single `bool` conflated them, and
+//! `GIT_VISTA_EXPOSE_PATHS` — whose stated guarantee is that absolute paths
+//! do not leave the process unless the operator opts in — held on the arm
+//! everyone tests and not on the arm nobody does.
+//!
+//! [`Failure`] is the fix's shape: every failure in this module is raised as
+//! a client-safe `reason` plus an optional path-bearing `detail`, and
+//! [`Failure::into_census`] is the single place that consults the flag and
+//! writes the log. Because the safety lives in the *value*, every route that
+//! relays a census gets it — including the planner's collision refusal, which
+//! the original finding did not enumerate. ADR 0119 records the decision and
+//! what redacting the whole string would have cost instead.
 //!
 //! # The pure parse lives in `git-vista-protocol`, not here
 //!
@@ -105,10 +122,53 @@ const WORKTREE_LIST_ENDPOINT: &str = "worktree census";
 /// hit is a `CensusFailed`, never a best-effort parse; see the call site.
 const WORKTREE_LIST_STDOUT_CAP: usize = 8 * 1024 * 1024;
 
+/// Which absolute paths one census may carry — the two questions #657 found
+/// sharing a single `bool`, kept apart here because their right answers
+/// differ.
+///
+/// * [`rows`](Self::rows) fills [`WorktreeSibling::path`]. A caller that
+///   needs a path for its **own local use** and never serializes the rows
+///   (`handlers::select`, which must hand a path to `Catalog::register`) sets
+///   this regardless of the operator's flag; ADR 0117 §2a argues why that
+///   discloses nothing.
+/// * [`failure_detail`](Self::failure_detail) fills
+///   [`WorktreeCensus::CensusFailed`]'s `detail`, which **is** serialized on
+///   every route that touches it. That is the operator's
+///   `GIT_VISTA_EXPOSE_PATHS` and nothing else.
+///
+/// Two adjacent `bool` parameters would swap silently; two named
+/// constructors cannot.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CensusPaths {
+    rows: bool,
+    failure_detail: bool,
+}
+
+impl CensusPaths {
+    /// Both halves follow the operator's `GIT_VISTA_EXPOSE_PATHS`. The
+    /// ordinary case: every caller whose census reaches a client.
+    pub(crate) fn from_flag(expose_paths: bool) -> Self {
+        Self {
+            rows: expose_paths,
+            failure_detail: expose_paths,
+        }
+    }
+
+    /// Rows carry paths because this caller consumes them locally and never
+    /// serializes them; the failure arm still follows the flag, because that
+    /// arm *is* serialized. `handlers::select` is the only caller.
+    pub(crate) fn rows_for_local_use(expose_paths: bool) -> Self {
+        Self {
+            rows: true,
+            failure_detail: expose_paths,
+        }
+    }
+}
+
 /// Read and resolve the worktree census for the repository at `repo` (the
 /// worktree currently being served).
 ///
-/// `expose_paths`/`path_is_allowed` are the production call site's
+/// `paths`/`path_is_allowed` are built at the production call site from
 /// `crate::state::expose_paths()`/`&crate::state::path_is_allowed` — see the
 /// module doc for why they arrive as parameters rather than being read here.
 ///
@@ -118,16 +178,10 @@ const WORKTREE_LIST_STDOUT_CAP: usize = 8 * 1024 * 1024;
 /// surfaces at the spawn rather than here.
 pub(crate) async fn worktree_census(
     repo: &Path,
-    expose_paths: bool,
+    paths: CensusPaths,
     path_is_allowed: &(dyn Fn(&Path) -> bool + Sync),
 ) -> WorktreeCensus {
-    worktree_census_capped(
-        repo,
-        expose_paths,
-        path_is_allowed,
-        WORKTREE_LIST_STDOUT_CAP,
-    )
-    .await
+    worktree_census_capped(repo, paths, path_is_allowed, WORKTREE_LIST_STDOUT_CAP).await
 }
 
 /// [`worktree_census`] with the stdout ceiling passed in rather than baked in
@@ -139,13 +193,35 @@ pub(crate) async fn worktree_census(
 /// linked worktrees) to exercise it is not a test anyone would run.
 async fn worktree_census_capped(
     repo: &Path,
-    expose_paths: bool,
+    paths: CensusPaths,
     path_is_allowed: &(dyn Fn(&Path) -> bool + Sync),
     stdout_cap: usize,
 ) -> WorktreeCensus {
+    match census_or_failure(repo, paths, path_is_allowed, stdout_cap).await {
+        Ok(siblings) => WorktreeCensus::Observed { siblings },
+        Err(failure) => failure.into_census(paths),
+    }
+}
+
+/// The census proper, with every failure raised as a [`Failure`] rather than
+/// built into a `WorktreeCensus` on the spot — so the one place that turns a
+/// failure into a wire value ([`Failure::into_census`]) is also the one place
+/// that consults the flag and writes the log.
+async fn census_or_failure(
+    repo: &Path,
+    paths: CensusPaths,
+    path_is_allowed: &(dyn Fn(&Path) -> bool + Sync),
+    stdout_cap: usize,
+) -> Result<Vec<WorktreeSibling>, Failure> {
     let current = match read_repo_facts(repo) {
         Ok(facts) => facts,
-        Err(e) => return fail(format!("couldn't read this repository's own identity: {e}")),
+        // `e` is `gix`'s, and can name the path it failed to open.
+        Err(e) => {
+            return Err(Failure::detailed(
+                "couldn't read this repository's own identity",
+                format!("couldn't read this repository's own identity: {e}"),
+            ))
+        }
     };
 
     let args = [
@@ -162,8 +238,13 @@ async fn worktree_census_capped(
     let (stdout, truncated) =
         match git_stdout_capped(repo, &args, WORKTREE_LIST_ENDPOINT, stdout_cap).await {
             Ok(pair) => pair,
+            // `message` is git's own stderr (or a spawn error), which names
+            // paths routinely — `fatal: not a git repository: '/…'`.
             Err((_status, message)) => {
-                return fail(format!("`git worktree list --porcelain` failed: {message}"))
+                return Err(Failure::detailed(
+                    "`git worktree list --porcelain` failed",
+                    format!("`git worktree list --porcelain` failed: {message}"),
+                ))
             }
         };
     if truncated {
@@ -175,28 +256,42 @@ async fn worktree_census_capped(
         // precisely the silent omission `CensusFailed` exists to prevent (spec
         // §1, "the enumeration ITSELF is fallible"). A `CensusFailed` says
         // "nothing was established"; a short `Observed` would lie.
-        return fail(format!(
+        // A byte ceiling is a constant of this program's own, not a path.
+        return Err(Failure::safe(format!(
             "`git worktree list --porcelain` printed more than {stdout_cap} bytes; \
              a truncated stream is refused, never parsed"
-        ));
+        )));
     }
     let text = match std::str::from_utf8(&stdout) {
         Ok(s) => s,
         Err(_) => {
-            return fail("`git worktree list --porcelain` did not print valid UTF-8".to_string())
+            return Err(Failure::safe(
+                "`git worktree list --porcelain` did not print valid UTF-8",
+            ))
         }
     };
 
     let raw_records = match parse_worktree_porcelain(text) {
         Ok(r) => r,
-        Err(reason) => return fail(reason),
+        // The parser quotes the porcelain line (or the record's path) it
+        // choked on, and a `worktree` line *is* an absolute path — so its
+        // whole reason is detail, and the client-safe half says only that
+        // parsing failed. This is the fourth route #657's finding did not
+        // enumerate, and the reason the rule is "anything from outside this
+        // module is detail" rather than a list of known-bad sites.
+        Err(reason) => {
+            return Err(Failure::detailed(
+                "`git worktree list --porcelain` printed something this app \
+                 could not parse",
+                format!("couldn't parse `git worktree list --porcelain`: {reason}"),
+            ))
+        }
     };
     if raw_records.is_empty() {
-        return fail(
+        return Err(Failure::safe(
             "`git worktree list --porcelain` reported no worktrees at all — \
-             every repository has at least its own"
-                .to_string(),
-        );
+             every repository has at least its own",
+        ));
     }
 
     let mut common_dir_cache: Option<PathBuf> = None;
@@ -204,19 +299,15 @@ async fn worktree_census_capped(
     let mut current_count = 0usize;
 
     for raw in &raw_records {
-        let sibling = match resolve_sibling(
+        let sibling = resolve_sibling(
             repo,
             raw,
             &current,
-            expose_paths,
+            paths.rows,
             path_is_allowed,
             &mut common_dir_cache,
         )
-        .await
-        {
-            Ok(s) => s,
-            Err(reason) => return fail(reason),
-        };
+        .await?;
         if sibling.is_current {
             current_count += 1;
         }
@@ -224,18 +315,80 @@ async fn worktree_census_capped(
     }
 
     if current_count != 1 {
-        return fail(format!(
-            "the census resolved {current_count} entries as the currently served \
-             worktree; exactly one is required (repository root: {})",
-            current.root.display()
+        // The count is this module's own arithmetic; the repository root is a
+        // path, so it moves to the detail half.
+        return Err(Failure::detailed(
+            format!(
+                "the census resolved {current_count} entries as the currently served \
+                 worktree; exactly one is required"
+            ),
+            format!(
+                "the census resolved {current_count} entries as the currently served \
+                 worktree; exactly one is required (repository root: {})",
+                current.root.display()
+            ),
         ));
     }
 
-    WorktreeCensus::Observed { siblings }
+    Ok(siblings)
 }
 
-fn fail(reason: String) -> WorktreeCensus {
-    WorktreeCensus::CensusFailed { reason }
+/// One census failure, split into the half that is always safe to serialize
+/// and the half that may name absolute paths (#657, ADR 0119).
+///
+/// The composition rule, applied at every construction site in this module:
+/// **`reason` is built only from literals written here plus values from a
+/// closed set proven path-free** — counts, byte ceilings, base names (the
+/// same non-path label [`WorktreeSibling::name`] already carries), and ref
+/// names. Any string that arrived from git, from `gix`, or from
+/// [`parse_worktree_porcelain`] is `detail`, without exception and without
+/// inspecting it first: whether *this* error names a path is not a property
+/// this module can check, and guessing is how the arm nobody tests goes
+/// wrong.
+///
+/// The one admitted exception, stated so it is not mistaken for an oversight:
+/// validation errors from `git-vista-protocol` (`BranchName::new`,
+/// `CommitOid::new`) are safe, because that crate is wasm-safe and has no
+/// filesystem access at all — it cannot have learned a path to name.
+struct Failure {
+    reason: String,
+    /// `None` when the reason already says everything there is to say, so
+    /// nothing is withheld from an operator who did not opt in.
+    detail: Option<String>,
+}
+
+impl Failure {
+    /// A failure whose whole text is client-safe.
+    fn safe(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            detail: None,
+        }
+    }
+
+    /// A failure whose full text may name absolute paths. `reason` is the
+    /// client-safe summary; `detail` is the whole story.
+    fn detailed(reason: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            detail: Some(detail.into()),
+        }
+    }
+
+    /// The one place a failure becomes a wire value — so the flag is
+    /// consulted once, and the log is written once, whatever failed.
+    ///
+    /// The log is unconditional: `GIT_VISTA_EXPOSE_PATHS` decides what leaves
+    /// the process for a *client*, and the operator's own terminal is not a
+    /// client. So the flag withholds, it never destroys.
+    fn into_census(self, paths: CensusPaths) -> WorktreeCensus {
+        let logged = self.detail.as_deref().unwrap_or(&self.reason);
+        eprintln!("git-vista: {WORKTREE_LIST_ENDPOINT} failed: {logged}");
+        WorktreeCensus::CensusFailed {
+            reason: self.reason,
+            detail: paths.failure_detail.then_some(self.detail).flatten(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -247,14 +400,19 @@ async fn resolve_sibling(
     repo: &Path,
     raw: &WorktreeListRecord,
     current: &RepoFacts,
-    expose_paths: bool,
+    row_paths: bool,
     path_is_allowed: &(dyn Fn(&Path) -> bool + Sync),
     common_dir_cache: &mut Option<PathBuf>,
-) -> Result<WorktreeSibling, String> {
+) -> Result<WorktreeSibling, Failure> {
     // `raw.path` is the string git printed; the parser (now in
     // `git-vista-protocol`, which touches no filesystem) deliberately leaves it
     // a `String`. This is the one place it becomes a path.
     let raw_path = Path::new(raw.path.as_str());
+    // Every failure below names the worktree by this base name in its
+    // client-safe half and by `raw.path` in its detail — the same split
+    // `WorktreeSibling::name`/`WorktreeSibling::path` already makes on the
+    // success arm, which is the symmetry #657 is about.
+    let label = safe_label(raw_path);
 
     let (worktree_id, repository_id, root_for_fence) = if raw.prunable {
         // `prunable` is git's own flag; whether it means "the directory is
@@ -272,11 +430,17 @@ async fn resolve_sibling(
                 let common_dir = get_common_dir(repo, common_dir_cache).await?;
                 let admin_dir =
                     correlate_missing_admin_dir(&common_dir, raw_path).ok_or_else(|| {
-                        format!(
-                            "`{}` is reported prunable but no admin worktree entry under \
-                             `{}` names it — can't derive a stable identity for it",
-                            raw.path,
-                            common_dir.display()
+                        Failure::detailed(
+                            format!(
+                                "‘{label}’ is reported prunable but no admin worktree entry \
+                                 names it — can't derive a stable identity for it"
+                            ),
+                            format!(
+                                "`{}` is reported prunable but no admin worktree entry under \
+                                 `{}` names it — can't derive a stable identity for it",
+                                raw.path,
+                                common_dir.display()
+                            ),
                         )
                     })?;
                 let id = WorktreeId::from_git_dir(&canonicalize_lossy(&admin_dir));
@@ -291,9 +455,15 @@ async fn resolve_sibling(
                 Some(facts.root),
             ),
             Err(e) => {
-                return Err(format!(
-                    "`git worktree list` reports `{}` as live, but it couldn't be read: {e}",
-                    raw.path
+                return Err(Failure::detailed(
+                    format!(
+                        "`git worktree list` reports ‘{label}’ as live, but it couldn't \
+                         be read"
+                    ),
+                    format!(
+                        "`git worktree list` reports `{}` as live, but it couldn't be read: {e}",
+                        raw.path
+                    ),
                 ))
             }
         }
@@ -319,17 +489,27 @@ async fn resolve_sibling(
 
     let branch = match (&raw.branch_ref, raw.detached, raw.bare) {
         (Some(r), false, false) => {
+            // A ref name, not a path: `r`/`short` stay in the safe half.
             let short = r.strip_prefix("refs/heads/").ok_or_else(|| {
-                format!(
-                    "`{}`'s `branch` line names `{r}`, not a `refs/heads/` ref",
-                    raw.path
+                Failure::detailed(
+                    format!("‘{label}’'s `branch` line names `{r}`, not a `refs/heads/` ref"),
+                    format!(
+                        "`{}`'s `branch` line names `{r}`, not a `refs/heads/` ref",
+                        raw.path
+                    ),
                 )
             })?;
             let name = BranchName::new(short).map_err(|e| {
-                format!(
-                    "`{}`'s checked-out branch `{short}` doesn't fit this app's \
-                     branch-name contract: {e}",
-                    raw.path
+                Failure::detailed(
+                    format!(
+                        "‘{label}’'s checked-out branch `{short}` doesn't fit this app's \
+                         branch-name contract: {e}"
+                    ),
+                    format!(
+                        "`{}`'s checked-out branch `{short}` doesn't fit this app's \
+                         branch-name contract: {e}",
+                        raw.path
+                    ),
                 )
             })?;
             Some(name)
@@ -341,9 +521,9 @@ async fn resolve_sibling(
             // named error rather
             // than `unreachable!()` so a future change to that check fails
             // loudly here instead of panicking.
-            return Err(format!(
-                "`{}` names both a branch and detached/bare",
-                raw.path
+            return Err(Failure::detailed(
+                format!("‘{label}’ names both a branch and detached/bare"),
+                format!("`{}` names both a branch and detached/bare", raw.path),
             ));
         }
     };
@@ -352,9 +532,14 @@ async fn resolve_sibling(
         None => None,
         Some(hex) if is_null_oid(hex) => None,
         Some(hex) => Some(CommitOid::new(hex.clone()).map_err(|e| {
-            format!(
-                "`{}`'s `HEAD` line (`{hex}`) isn't a commit id this app accepts: {e}",
-                raw.path
+            Failure::detailed(
+                format!(
+                    "‘{label}’'s `HEAD` line (`{hex}`) isn't a commit id this app accepts: {e}"
+                ),
+                format!(
+                    "`{}`'s `HEAD` line (`{hex}`) isn't a commit id this app accepts: {e}",
+                    raw.path
+                ),
             )
         })?),
     };
@@ -363,7 +548,7 @@ async fn resolve_sibling(
         repository: repository_id.to_string(),
         id: worktree_id.to_string(),
         name,
-        path: expose_paths.then(|| raw.path.clone()),
+        path: row_paths.then(|| raw.path.clone()),
         branch,
         head,
         is_current,
@@ -389,6 +574,20 @@ fn display_name(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+/// The client-safe label for a raw porcelain path: its base name, which is
+/// the same non-path string [`WorktreeSibling::name`] already carries on the
+/// success arm.
+///
+/// Deliberately **not** [`display_name`], whose fallback for a path with no
+/// final component is the whole path — the one thing that must never reach a
+/// `reason`. A failure arm that degrades into leaking is the shape #657 is
+/// about, so this one degrades into saying less instead.
+fn safe_label(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "an unnamed worktree".to_string())
 }
 
 /// Canonicalise, falling back to the original path on failure — the same
@@ -419,7 +618,7 @@ fn canonicalize_lossy(path: &Path) -> String {
 /// by a second `prunable` row in the same call. Caching it anyway would be
 /// dead machinery for a path that cannot execute; simpler to just re-run
 /// `common_dir` on the (census-ending) failure case; it happens at most once.
-async fn get_common_dir(repo: &Path, cache: &mut Option<PathBuf>) -> Result<PathBuf, String> {
+async fn get_common_dir(repo: &Path, cache: &mut Option<PathBuf>) -> Result<PathBuf, Failure> {
     if let Some(dir) = cache {
         return Ok(dir.clone());
     }
@@ -428,19 +627,29 @@ async fn get_common_dir(repo: &Path, cache: &mut Option<PathBuf>) -> Result<Path
     Ok(dir)
 }
 
-async fn common_dir(repo: &Path) -> Result<PathBuf, String> {
+async fn common_dir(repo: &Path) -> Result<PathBuf, Failure> {
     let output = git_output(repo, &["rev-parse", "--git-common-dir"])
         .await
-        .map_err(|e| format!("couldn't run `git rev-parse --git-common-dir`: {e}"))?;
+        .map_err(|e| {
+            Failure::detailed(
+                "couldn't run `git rev-parse --git-common-dir`",
+                format!("couldn't run `git rev-parse --git-common-dir`: {e}"),
+            )
+        })?;
     if !output.status.success() {
-        return Err(format!(
-            "`git rev-parse --git-common-dir` failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+        return Err(Failure::detailed(
+            "`git rev-parse --git-common-dir` failed",
+            format!(
+                "`git rev-parse --git-common-dir` failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
         ));
     }
     let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if raw.is_empty() {
-        return Err("`git rev-parse --git-common-dir` printed nothing".to_string());
+        return Err(Failure::safe(
+            "`git rev-parse --git-common-dir` printed nothing",
+        ));
     }
     let joined = repo.join(raw);
     Ok(std::fs::canonicalize(&joined).unwrap_or(joined))

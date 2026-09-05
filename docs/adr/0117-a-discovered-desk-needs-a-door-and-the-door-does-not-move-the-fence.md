@@ -150,6 +150,15 @@ summary plus a server-only detail — are a change to M11.01's wire contract, no
 to this route. Recorded here so the next reader inherits the accurate sentence
 and the open question together.
 
+> **Superseded on the failure arm by [ADR 0119](0119-a-guarantee-that-holds-only-on-the-success-arm-is-not-a-guarantee.md) (#657).**
+> The second shape won: `CensusFailed` now carries a client-safe `reason` and a
+> separate, flag-gated `detail`, and `CensusPaths` splits "may the rows carry
+> paths for this caller's local use" from "may a failure carry its path-bearing
+> half to a client" — which is the conflation this section describes. The
+> paragraphs above are left as written: they are the accurate record of what
+> the code did between #548 and #657, and 0119's own argument only makes sense
+> against them.
+
 ### 3. Three facts on a row, and they stay three
 
 `locked`/`prunable`/`bare` are **git's**. `Serviceable` is **this

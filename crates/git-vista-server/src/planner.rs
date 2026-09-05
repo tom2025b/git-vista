@@ -968,6 +968,7 @@ fn needs_worktree_census(operation: &GitOperation) -> bool {
 fn no_census_taken() -> WorktreeCensus {
     WorktreeCensus::CensusFailed {
         reason: "no worktree census was taken for this operation".to_string(),
+        detail: None,
     }
 }
 
@@ -982,7 +983,7 @@ async fn census_for(repo: &Path, operation: &GitOperation) -> WorktreeCensus {
     if needs_worktree_census(operation) {
         crate::worktree_census::worktree_census(
             repo,
-            crate::state::expose_paths(),
+            crate::worktree_census::CensusPaths::from_flag(crate::state::expose_paths()),
             &crate::state::path_is_allowed,
         )
         .await
