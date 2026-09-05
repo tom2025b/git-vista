@@ -28,7 +28,9 @@ use leptos::*;
 use git_vista_protocol::GitOperation;
 
 use crate::api;
-use crate::features::freshness::core::{PlanOnScreen, PlanSlot};
+use crate::features::freshness::core::{
+    slot_when_request_failed, slot_when_requested, PlanOnScreen, PlanSlot,
+};
 use crate::features::preview::core::{view_of, PreviewView};
 
 /// What the panel is showing right now.
@@ -133,11 +135,7 @@ impl Preview {
     fn fetch(&self, op: GitOperation, rebuilding: bool) {
         let issued = self.bump();
         self.slot.set(PreviewSlot::Pending);
-        self.plan.set(if rebuilding {
-            PlanSlot::Rebuilding
-        } else {
-            PlanSlot::Absent
-        });
+        self.plan.set(slot_when_requested(rebuilding));
         let slot = self.slot;
         let on_screen = self.plan;
         let generation = self.generation;
@@ -169,11 +167,7 @@ impl Preview {
                 }
                 Err(why) => (
                     PreviewSlot::Failed(why),
-                    if rebuilding {
-                        PlanSlot::RebuildFailed
-                    } else {
-                        PlanSlot::Absent
-                    },
+                    slot_when_request_failed(rebuilding),
                 ),
             };
             // The stale-response guard. `try_get_value` rather than

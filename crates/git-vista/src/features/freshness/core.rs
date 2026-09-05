@@ -108,6 +108,43 @@ pub enum PlanSlot {
     Ready(PlanOnScreen),
 }
 
+/// What the slot becomes when a request for a plan is **issued**.
+///
+/// # Why this is a function and not two lines in the reactive wrapper
+///
+/// It was two lines in the wrapper, and a mutation collapsing them reported
+/// `survived`: `features/preview/signals.rs` is `#[cfg(target_arch =
+/// "wasm32")]`, so `cargo test` never compiles it and no host test could fail
+/// on the defect. That is ADR 0115's rule — a mutation proof cannot see what it
+/// does not run — and the answer it prescribes is to move the decision, not to
+/// reach for the code. The browser leg still proves the wiring; this makes the
+/// *decision* provable too.
+///
+/// The distinction it encodes is the one defect 1 of #664's review turned on:
+/// a rebuild has a known-stale plan behind it, and until the replacement
+/// arrives there is nothing to approve. A first fetch has no such history.
+pub fn slot_when_requested(rebuilding: bool) -> PlanSlot {
+    if rebuilding {
+        PlanSlot::Rebuilding
+    } else {
+        PlanSlot::Absent
+    }
+}
+
+/// What the slot becomes when that request **fails**.
+///
+/// The same distinction, at the other end, and it is the half the review said
+/// "persists": a first fetch that fails leaves a confirmation that never had a
+/// plan, which #594 leaves offerable. A *rebuild* that fails leaves a
+/// confirmation whose plan we know was stale and whose replacement never came.
+pub fn slot_when_request_failed(rebuilding: bool) -> PlanSlot {
+    if rebuilding {
+        PlanSlot::RebuildFailed
+    } else {
+        PlanSlot::Absent
+    }
+}
+
 /// Why the feed cannot currently say whether the plan is current.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeedUnavailable {

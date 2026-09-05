@@ -810,3 +810,51 @@ fn the_lease_rebuild_is_a_different_path_because_push_has_no_preview() {
          Rebuild — so the arm above is reachable, not theoretical"
     );
 }
+
+#[test]
+fn a_request_issued_for_a_rebuild_enters_a_different_state_from_a_first_one() {
+    // The transition itself, moved here so a mutation proof can reach it.
+    // Collapsing these two answers is defect 1 of #664's review, and while the
+    // decision lived in the wasm-only reactive wrapper the proof came back
+    // `survived` — not because the test was weak, but because `cargo test`
+    // never compiled the code it mutated (ADR 0115).
+    assert_eq!(slot_when_requested(true), PlanSlot::Rebuilding);
+    assert_eq!(slot_when_requested(false), PlanSlot::Absent);
+
+    // A first fetch that fails leaves a confirmation that never had a plan;
+    // #594 leaves that offerable. A rebuild that fails leaves one whose plan
+    // we know was stale and whose replacement never came.
+    assert_eq!(slot_when_request_failed(true), PlanSlot::RebuildFailed);
+    assert_eq!(slot_when_request_failed(false), PlanSlot::Absent);
+
+    // And the consequence, so the pair above is not merely two mappings:
+    let log = FeedLog::new();
+    assert!(!confirm_enabled(
+        true,
+        &verdict(&slot_when_requested(true), &log)
+    ));
+    assert!(!confirm_enabled(
+        true,
+        &verdict(&slot_when_request_failed(true), &log)
+    ));
+    assert!(
+        confirm_enabled(true, &verdict(&slot_when_requested(false), &log)),
+        "a first fetch must not disable a dialog #594 decided stays offerable"
+    );
+}
+
+#[test]
+fn the_preview_wrapper_asks_core_for_both_transitions() {
+    // The seam. `cargo test` compiles none of `preview/signals.rs`, so this is
+    // the only host-side check that the wrapper asks the questions the two
+    // tests above answer rather than re-deriving them where nothing runs.
+    assert!(
+        PREVIEW_SIGNALS.contains("slot_when_requested(rebuilding)"),
+        "the wrapper must ask core what state a request enters"
+    );
+    assert!(
+        PREVIEW_SIGNALS.contains("slot_when_request_failed(rebuilding)"),
+        "and what state a failed one enters — the half the review found \
+         persisting"
+    );
+}
