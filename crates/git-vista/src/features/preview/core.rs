@@ -652,12 +652,35 @@ mod preview_action_tests {
              composition #594's mutation proof could not see, back in a wasm-only \
              file. Effect body was:\n{body}"
         );
+        // Two callers since M12.05 (#555): the effect that opens the dialog,
+        // and the Rebuild control a stale plan offers (#664 review, finding 6).
+        //
+        // The rule this census protects was never "exactly one call site" — it
+        // is that **every** request for a picture is routed through
+        // `preview_action(preview_subject(op))`, so a dialog can never ask for
+        // a picture of an operation the core says has none. Counting call sites
+        // was a cheap proxy for that while there was one. Now the property is
+        // checked directly, for each of them.
+        let starts: Vec<_> = CONFIRM.match_indices("preview.start(").collect();
         assert_eq!(
-            CONFIRM.matches("preview.start(").count(),
-            1,
-            "`preview.start` is reachable from more than one place in confirm.rs; \
-             only the `PreviewAction::Start` arm may ask for a picture"
+            starts.len(),
+            2,
+            "a new `preview.start` appeared in confirm.rs. That is allowed, but \
+             it must be routed through `preview_action` like the two below — add \
+             it here deliberately rather than raising the number"
         );
+        for (at, _) in starts {
+            let before = &CONFIRM[..at];
+            let routed = before
+                .rfind("preview_action(")
+                .is_some_and(|routed| before[routed..].matches("fn ").count() == 0);
+            assert!(
+                routed,
+                "a `preview.start` at byte {at} is not preceded by a \
+                 `preview_action` in the same function — that is the \
+                 composition #594's mutation proof could not see"
+            );
+        }
         assert_eq!(
             CONFIRM.matches("preview.clear(").count(),
             1,

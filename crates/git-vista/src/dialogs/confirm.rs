@@ -31,7 +31,9 @@ use crate::features::dialogs::core::{
 };
 use crate::features::preview::core::{preview_action, PreviewAction};
 
-use crate::features::freshness::core::{blocked_by_staleness, confirm_enabled};
+use crate::features::freshness::core::{
+    blocked_by_staleness, confirm_enabled, plan_on_screen, rebuild_is_offered,
+};
 use crate::features::preview::signals::PreviewSlot;
 
 use super::{freshness_notice_view, preview_panel_view};
@@ -437,8 +439,31 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
             // with a different answer: not "what does the picture show" but
             // "does the picture still describe the repository". A picture the
             // repository has moved past is not advice, it is a receipt.
-            let plan_freshness = preview.plan().map(|plan| freshness.of(&plan));
+            // #664 review, finding 7: the plan on screen, whichever way it got
+            // there. A force-with-lease confirmation displays a server-built
+            // plan and has no graph preview, so freshness taken only from
+            // `preview.plan()` saw `None` on the most destructive confirmation
+            // in the app and left its button enabled.
+            let plan_freshness = plan_on_screen(&op, preview.plan())
+                .map(|plan| freshness.of(&plan));
             let enabled = confirm_enabled(enabled, plan_freshness.as_ref());
+            // Rebuild is offered exactly when there is a plan on screen and it
+            // is no longer current — the same condition the notice renders on,
+            // read from the same verdict so the button and the sentence cannot
+            // disagree.
+            let rebuild_offered = rebuild_is_offered(plan_freshness.as_ref());
+            let rebuild_op = op.clone();
+            let rebuild = move || {
+                // The same call the dialog makes when it opens: fetch a fresh
+                // plan and draw its picture. `Preview::start` bumps its own
+                // generation tag, so a reply from the plan this replaces cannot
+                // paint over the new one.
+                if let PreviewAction::Start(operation) =
+                    preview_action(Some(preview_subject(&rebuild_op)))
+                {
+                    preview.start(operation);
+                }
+            };
             let blocked_reason = blocked_by_staleness(plan_freshness.as_ref()).or(blocked_reason);
             // The confirm button is muted when disabled, red for a destructive
             // delete, green otherwise.
@@ -549,8 +574,31 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                                                border:1px solid #30363d;")
                                 on:click=move |_| shell.close_confirm()
                             >
+                                // Spec D4's **Discard**, under the name this
+                                // modal has always used for it. Closing without
+                                // running is exactly what discarding a stale
+                                // plan means, and a second button that did the
+                                // same thing under a second name would be two
+                                // ways to say one thing.
                                 "Cancel"
                             </button>
+                            // Spec D4's **Rebuild** (#664 review, finding 6).
+                            // Offered only while the plan on screen is stale,
+                            // because on a current plan there is nothing to
+                            // rebuild — and it produces a NEW plan the user must
+                            // approve again, which is the whole approval
+                            // boundary this milestone exists to keep. It never
+                            // executes anything.
+                            {rebuild_offered.then(|| view! {
+                                <button
+                                    style=format!("{BUTTON_BASE}{TOUCH_TARGET_STYLE}\
+                                                   color:var(--fg); background:#21262d; \
+                                                   border:1px solid #9e6a03;")
+                                    on:click=move |_| rebuild()
+                                >
+                                    "Rebuild"
+                                </button>
+                            })}
                             // Two ways to be inert, and which one applies turns
                             // on whether this button carries its own reason.
                             //

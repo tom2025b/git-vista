@@ -65,7 +65,14 @@ function git(args) {
  * in exactly the state this spec is about.
  */
 function confirmButton(page) {
-  return page.getByRole('button', { name: 'Cancel' }).locator('xpath=following-sibling::button')
+  // The LAST button in the action row. Cancel is first, Rebuild appears
+  // between them when the plan is stale, and the confirmation is always last —
+  // so `.last()` rather than "the sibling after Cancel", which stopped being
+  // unambiguous the moment Rebuild existed.
+  return page
+    .getByRole('button', { name: 'Cancel' })
+    .locator('xpath=following-sibling::button')
+    .last()
 }
 
 /**
@@ -149,6 +156,43 @@ test.describe('#555 a plan the repository moved past', () => {
       await expect(confirmButton(page)).toHaveAttribute('aria-disabled', 'true')
     } finally {
       git(['tag', '-d', 'landed-from-outside'])
+      await page.keyboard.press('Escape')
+    }
+  })
+
+  test('the Rebuild it offers actually exists and produces a plan to approve again', async ({
+    page,
+  }) => {
+    // #664 review, finding 6. Spec D4 requires Rebuild and Discard on a stale
+    // plan; the first slice shipped only the SENTENCE telling the user to
+    // rebuild. The tests above assert the wording and the disabled button, and
+    // passed straight over the missing action — which is why this one asserts
+    // the control, and asserts that using it gets the user somewhere.
+    await openMergeConfirmation(page)
+    const rebuild = page.getByRole('button', { name: 'Rebuild' })
+    await expect(rebuild).toHaveCount(0, { timeout: 5_000 })
+
+    git(['tag', 'stale-me'])
+    try {
+      await expect(page.locator(STALE)).toBeVisible({ timeout: 20_000 })
+      await expect(rebuild).toBeVisible()
+      await expect(confirmButton(page)).toHaveAttribute('aria-disabled', 'true')
+
+      // Rebuilding replaces the plan with one built against the repository as
+      // it is now — so the notice clears and the operation becomes offerable
+      // again. It never runs anything: the user still has to confirm.
+      await rebuild.click()
+      await expect(page.getByRole('img', { name: /^After:/ })).toBeVisible({ timeout: 30_000 })
+      await expect(page.locator(STALE)).toHaveCount(0, { timeout: 20_000 })
+      await expect(confirmButton(page)).toHaveAttribute('aria-disabled', 'false')
+      // And the dialog is still open, still asking. A rebuild that executed,
+      // or that dismissed itself, would have destroyed the approval boundary
+      // it exists to keep.
+      await expect(
+        page.getByText(`Merge ‘${PREVIEW_BRANCH}’ into ‘${PREVIEW_INTO}’?`),
+      ).toBeVisible()
+    } finally {
+      git(['tag', '-d', 'stale-me'])
       await page.keyboard.press('Escape')
     }
   })

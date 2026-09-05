@@ -502,3 +502,136 @@ fn the_first_snapshot_on_a_stream_is_never_read_as_a_delta() {
         "but its delta describes a span this client did not watch"
     );
 }
+
+// --- #664 review, findings 6 and 7 -----------------------------------------
+
+use crate::features::operations::kind::{CheckoutElsewhere, ForceWithLease, OperationKind};
+use git_vista_protocol::plan::{Advisory, RiskLevel};
+use git_vista_protocol::{CommitOid, Explanation};
+
+fn force_push_op(plan: PlanOnScreen) -> OperationKind {
+    OperationKind::Push {
+        branch: "main".to_string(),
+        set_upstream: false,
+        force: Some(ForceWithLease {
+            expected_remote_tip: CommitOid::new("0123456789abcdef0123456789abcdef01234567")
+                .unwrap(),
+            risk: RiskLevel::Destructive,
+            advisories: Vec::<Advisory>::new(),
+            explanation: Explanation {
+                sections: Vec::new(),
+            },
+            plan,
+        }),
+    }
+}
+
+#[test]
+fn a_force_push_carries_its_own_plan_because_it_has_no_preview() {
+    // Finding 7. `preview_subject(Push)` is `NotPreviewable`, so `preview.plan()`
+    // is `None` on the single most destructive confirmation in the app — while
+    // that confirmation is displaying a server-built plan's explanation, its
+    // risk, and the oid it will overwrite. Freshness taken only from the
+    // preview saw nothing and left the button enabled.
+    let carried = PlanOnScreen {
+        generation: "100".to_string(),
+        expects: vec!["refs/heads/main".to_string()],
+    };
+    let found = plan_on_screen(&force_push_op(carried.clone()), None)
+        .expect("a force-with-lease confirmation always has a plan on screen");
+    assert_eq!(found, carried);
+}
+
+#[test]
+fn a_previewed_plan_still_wins_where_there_is_one() {
+    let carried = PlanOnScreen {
+        generation: "100".to_string(),
+        expects: vec!["refs/heads/main".to_string()],
+    };
+    let previewed = PlanOnScreen {
+        generation: "200".to_string(),
+        expects: vec!["refs/heads/side".to_string()],
+    };
+    assert_eq!(
+        plan_on_screen(&force_push_op(carried), Some(previewed.clone())),
+        Some(previewed),
+        "the preview's plan is the one whose picture is on screen"
+    );
+}
+
+#[test]
+fn a_confirmation_with_neither_kind_of_plan_makes_no_claim() {
+    let op = OperationKind::Checkout {
+        branch: "main".to_string(),
+        current: Some("other".to_string()),
+        elsewhere: CheckoutElsewhere::Free,
+    };
+    assert_eq!(plan_on_screen(&op, None), None);
+}
+
+#[test]
+fn rebuild_is_offered_on_every_stale_arm_and_none_of_the_current_ones() {
+    // Finding 6: spec D4 requires Rebuild and Discard, and the first slice
+    // shipped the sentence telling the user to rebuild with no way to do it.
+    for stale in [
+        PlanFreshness::Moved {
+            refs: vec!["refs/heads/main".to_string()],
+        },
+        PlanFreshness::Moved { refs: Vec::new() },
+        PlanFreshness::MovedElsewhere,
+        PlanFreshness::Unknown {
+            reason: FeedUnavailable::NotConnected,
+        },
+    ] {
+        assert!(
+            rebuild_is_offered(Some(&stale)),
+            "{stale:?} tells the user to rebuild, so it must let them"
+        );
+        assert!(
+            rebuild_framing(&stale).is_some(),
+            "and the offer is explained"
+        );
+    }
+    assert!(!rebuild_is_offered(Some(&PlanFreshness::Current)));
+    assert!(
+        !rebuild_is_offered(None),
+        "a confirmation with no plan on screen has nothing to rebuild"
+    );
+}
+
+#[test]
+fn the_dialog_offers_the_rebuild_it_talks_about_and_asks_core_which_plan() {
+    // The seam census for both findings. Neither is visible to `cargo test`:
+    // `dialogs/confirm.rs` is wasm-only, and every test above would pass with
+    // the button absent and the force-push plan never consulted — which is
+    // exactly how both shipped.
+    assert!(
+        CONFIRM_DIALOG.contains("plan_on_screen(&op, preview.plan())"),
+        "the dialog must ask which plan is on screen, not assume the preview's"
+    );
+    assert!(
+        CONFIRM_DIALOG.contains("rebuild_is_offered(plan_freshness.as_ref())"),
+        "and must ask core whether to offer Rebuild, from the same verdict the \
+         notice is rendered from"
+    );
+    assert!(
+        CONFIRM_DIALOG.contains("\"Rebuild\""),
+        "a notice telling the user to rebuild, with no control that does, is \
+         the defect this pins"
+    );
+    assert!(
+        CONFIRM_DIALOG.contains("preview.start(operation)"),
+        "Rebuild fetches a NEW plan through the same path the dialog opened \
+         with — it never re-derives one in place"
+    );
+    let rebuild = CONFIRM_DIALOG
+        .split("let rebuild = move || {")
+        .nth(1)
+        .expect("the rebuild handler exists");
+    let body = &rebuild[..rebuild.find("};").expect("a closed block")];
+    assert!(
+        !body.contains("run_confirmed") && !body.contains("close_confirm"),
+        "Rebuild never executes and never silently dismisses: it replaces the \
+         plan and leaves the user to approve it again"
+    );
+}

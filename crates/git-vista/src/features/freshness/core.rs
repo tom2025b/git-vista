@@ -32,6 +32,8 @@ use std::collections::VecDeque;
 
 use git_vista_protocol::change_feed::{ChangeFeedHealth, ChangeFeedSnapshot, RefDelta};
 
+use crate::features::operations::kind::OperationKind;
+
 /// How many snapshots the client keeps so it can difference a plan's generation
 /// against the present.
 ///
@@ -48,6 +50,26 @@ pub struct PlanOnScreen {
     /// The refs the plan expects to move — `Plan::expected_ref_changes`, by
     /// full ref name.
     pub expects: Vec<String>,
+}
+
+impl PlanOnScreen {
+    /// Everything a freshness check needs, taken off the plan the user is being
+    /// shown.
+    ///
+    /// One constructor, so every surface that displays a plan takes the same
+    /// two things off the same object. The alternative — each caller reaching
+    /// into `Plan` itself — is how the force-with-lease confirmation came to
+    /// display a server-built plan and check the freshness of nothing.
+    pub fn of(plan: &git_vista_protocol::Plan) -> Self {
+        Self {
+            generation: plan.generation.as_str().to_string(),
+            expects: plan
+                .expected_ref_changes
+                .iter()
+                .map(|change| change.ref_name.as_str().to_string())
+                .collect(),
+        }
+    }
 }
 
 /// Why the feed cannot currently say whether the plan is current.
@@ -234,6 +256,30 @@ pub fn freshness(plan: &PlanOnScreen, log: &FeedLog) -> PlanFreshness {
     PlanFreshness::MovedElsewhere
 }
 
+/// The plan this confirmation is showing, whichever way it got there.
+///
+/// A dialog can hold a plan two ways and only one of them was being checked
+/// (#664 review, finding 7). The graph preview fetches one and keeps it — but
+/// `preview_subject(Push)` is `NotPreviewable`, so a **force-with-lease**
+/// confirmation has no preview at all while displaying a server-built plan's
+/// explanation, its risk and the oid it will overwrite. Freshness taken only
+/// from the preview therefore saw `None` on the single most destructive
+/// confirmation in the app, and left its button enabled.
+///
+/// So the question is asked once, here, of the operation itself: *is there a
+/// plan on this screen?*
+pub fn plan_on_screen(op: &OperationKind, previewed: Option<PlanOnScreen>) -> Option<PlanOnScreen> {
+    if let Some(previewed) = previewed {
+        return Some(previewed);
+    }
+    match op {
+        OperationKind::Push {
+            force: Some(force), ..
+        } => Some(force.plan.clone()),
+        _ => None,
+    }
+}
+
 /// Whether a confirmation may run, given the dialog's own verdict and the
 /// freshness of the plan on screen.
 ///
@@ -246,6 +292,28 @@ pub fn freshness(plan: &PlanOnScreen, log: &FeedLog) -> PlanFreshness {
 /// disable half the app's confirmations on a feed that had not connected yet.
 pub fn confirm_enabled(prompt_enabled: bool, plan: Option<&PlanFreshness>) -> bool {
     prompt_enabled && plan.is_none_or(|freshness| freshness.execute_offered())
+}
+
+/// Whether to offer a Rebuild control.
+///
+/// Spec D4 requires Rebuild and Discard on a stale plan, and the first slice
+/// shipped the *sentence* telling the user to rebuild with no way to do it —
+/// the browser tests asserted the wording and the disabled state, so they
+/// passed straight over the missing action (#664 review, finding 6).
+///
+/// Offered on every stale arm and on none of the current ones: there is nothing
+/// to rebuild about a plan that still describes the repository, and `Unknown`
+/// is included deliberately — "couldn't tell" is exactly when a user most wants
+/// a fresh answer.
+pub fn rebuild_is_offered(plan: Option<&PlanFreshness>) -> bool {
+    matches!(
+        plan,
+        Some(
+            PlanFreshness::Moved { .. }
+                | PlanFreshness::MovedElsewhere
+                | PlanFreshness::Unknown { .. }
+        )
+    )
 }
 
 /// Why the confirm control is inert, when it is staleness that withdrew it.
