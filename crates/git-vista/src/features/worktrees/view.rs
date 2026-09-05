@@ -47,12 +47,12 @@ use leptos::*;
 use git_vista_protocol::RepoMode;
 
 use crate::api::{fetch_worktree_census, select_worktree_request};
-use crate::features::dialogs::core::ErrorNotice;
+use crate::features::dialogs::core::{Dialog, ErrorNotice};
 use crate::features::session::signals as session_state;
 use crate::features::worktrees::core::{
-    drawer_view, DrawerView, FactSource, RowFact, RowOffer, WorktreeRow,
+    drawer_view, DrawerView, FactSource, RemoveOffer, RowFact, RowOffer, WorktreeRow,
 };
-use crate::state::Features;
+use crate::state::{Features, PendingOp};
 
 /// The drawer's landmark label. A named region, not a bare div — beyond the
 /// ordinary accessibility argument, it is what lets the browser spec assert
@@ -128,6 +128,7 @@ fn worktree_row_view(row: WorktreeRow, features: Features) -> View {
         git_facts,
         app_fact,
         offer,
+        remove_offer,
     } = row;
 
     let branch_label = branch.label();
@@ -149,6 +150,13 @@ fn worktree_row_view(row: WorktreeRow, features: Features) -> View {
         }
         RowOffer::Open { id } => open_button(id, name.clone(), features).into_view(),
     };
+    // Independent of `action` above — a servable, non-current row carries
+    // both at once (M11.05, #550; see `RemoveOffer`'s own doc comment for
+    // why the two are separate questions).
+    let remove_action = match remove_offer {
+        RemoveOffer::NotOffered => View::default(),
+        RemoveOffer::Offer { id } => remove_button(id, name.clone(), features).into_view(),
+    };
 
     view! {
         <div class="act-file">
@@ -161,6 +169,7 @@ fn worktree_row_view(row: WorktreeRow, features: Features) -> View {
             <div>{git_pills}{app_pill}</div>
             {path_cell}
             {action}
+            {remove_action}
         </div>
     }
     .into_view()
@@ -187,6 +196,29 @@ fn open_button(id: String, name: String, features: Features) -> impl IntoView {
                     body: format!("‘{name}’ could not be opened: {e}"),
                 }),
             }
+        });
+    };
+    view! {
+        <button class="act-undo" on:click=on>{label}</button>
+    }
+}
+
+/// The second control in this drawer (M11.05, #550): close a linked sibling
+/// desk. Unlike [`open_button`], this never dispatches on its own tap — it
+/// only raises the two-tap confirmation modal, exactly the way every other
+/// destructive write in this app is reached (`menu/worktree_items.rs`'s
+/// `discard`/`delete-untracked` items are the pattern this copies). The
+/// actual `POST /api/remove-worktree` call, and the ceremony's wording, live
+/// in `dialogs/confirm.rs` and `features::dialogs::core::remove_worktree_confirm`
+/// — never here.
+fn remove_button(id: String, name: String, features: Features) -> impl IntoView {
+    let Features { dialogs, shell, .. } = features;
+    let label = format!("Close ‘{name}’");
+    let on = move |_| {
+        dialogs.open(Dialog::Confirm);
+        shell.open_confirm(PendingOp::RemoveWorktree {
+            id: id.clone(),
+            name: name.clone(),
         });
     };
     view! {

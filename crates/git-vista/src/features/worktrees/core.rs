@@ -77,6 +77,29 @@ pub enum RowOffer {
     Refused { reason: &'static str },
 }
 
+/// Whether the drawer offers to close a row's desk (M11.05, #550) — kept as
+/// its own field on [`WorktreeRow`] rather than folded into [`RowOffer`],
+/// because the two are independent questions about a serviceable,
+/// non-current row: [`RowOffer::Open`] answers "can this be switched to?" and
+/// this answers "can this be closed?". A row can (and typically will) answer
+/// yes to both at once, which one `RowOffer` variant per row cannot express.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoveOffer {
+    /// Not offered. Three cases collapse here, deliberately: the current
+    /// worktree (it cannot close itself), a `Missing` sibling (its directory
+    /// is already gone — releasing the branch it still holds is `git
+    /// worktree prune`, a different operation this design omits), and one
+    /// `OutsideAllowedRoots` (visible for collision detection only; that
+    /// visibility must never widen into a mutation the app cannot verify).
+    NotOffered,
+    /// `git worktree remove` may be attempted. `id` is the opaque worktree
+    /// id to send to `POST /api/remove-worktree` — the server resolves it to
+    /// a real path itself, via a fresh census, immediately before acting
+    /// (see `GitOperation::RemoveWorktree`'s doc comment). The drawer never
+    /// learns or sends a path.
+    Offer { id: String },
+}
+
 /// One row of the drawer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeRow {
@@ -102,6 +125,10 @@ pub struct WorktreeRow {
     /// that its absence means nothing was checked.
     pub app_fact: RowFact,
     pub offer: RowOffer,
+    /// Whether this row's desk may be closed (M11.05, #550) — see
+    /// [`RemoveOffer`] for why it is a field of its own rather than a
+    /// third case folded into `offer`.
+    pub remove_offer: RemoveOffer,
 }
 
 /// What a row has checked out. Three answers, not an `Option<String>` plus a
@@ -176,6 +203,7 @@ fn row(sibling: &WorktreeSibling) -> WorktreeRow {
         git_facts: git_facts(sibling),
         app_fact: app_fact(&sibling.serviceable),
         offer: offer(sibling),
+        remove_offer: remove_offer(sibling),
     }
 }
 
@@ -242,6 +270,28 @@ fn offer(sibling: &WorktreeSibling) -> RowOffer {
         None => RowOffer::Open {
             id: sibling.id.clone(),
         },
+    }
+}
+
+/// Whether the row offers to close its desk (M11.05, #550).
+///
+/// Same shape as [`offer`] — current is checked first, then the fence — but a
+/// **separate** function rather than a fold into it: `Serviceable::Yes` and
+/// non-current is exactly the condition both `offer` and `remove_offer` agree
+/// is servable, so this row can (and does) get both an [`RowOffer::Open`] and
+/// a [`RemoveOffer::Offer`] at once. The `Missing`/`OutsideAllowedRoots`
+/// refusals it shares with `offer` are spelled out on `RemoveOffer::NotOffered`
+/// itself rather than repeated here — see that variant's doc comment for
+/// the reasons, which differ from `offer`'s (a `Missing` row is offered
+/// *nothing* to switch to either, but for `RemoveOffer` the distinction from
+/// "refused" matters: closing a desk that is merely fenced off would still be
+/// removing something this application never proved existed at all).
+fn remove_offer(sibling: &WorktreeSibling) -> RemoveOffer {
+    if sibling.is_current || !matches!(sibling.serviceable, Serviceable::Yes) {
+        return RemoveOffer::NotOffered;
+    }
+    RemoveOffer::Offer {
+        id: sibling.id.clone(),
     }
 }
 
