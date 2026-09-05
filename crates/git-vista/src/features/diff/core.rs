@@ -313,6 +313,109 @@ fn parse_range(s: &str) -> Option<(u32, u32)> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The staging view's own decisions (#215 → #653)
+// ---------------------------------------------------------------------------
+//
+// `features/diff/staging_view.rs` is `#[cfg(target_arch = "wasm32")]`, so
+// everything below used to be decided where `cargo test --workspace` compiles
+// nothing (ADR 0115) — including a rule that only exists because a reviewer
+// caught it during #215 and which no test has ever been able to reach since.
+
+/// Whether the preview panel may show what it is holding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewState {
+    /// Nothing has been previewed yet — there is no panel to judge.
+    NotRequested,
+    /// The shown preview still answers the selection on screen.
+    Fresh,
+    /// The selection has moved since this preview was requested. The patch
+    /// text on screen is no longer what Apply would send.
+    Stale,
+}
+
+/// Compare the plan a shown preview answered against the plan the current
+/// selection would build.
+///
+/// # Why staleness is a state and not a rendering detail
+///
+/// Apply was always correct: it rebuilds the plan from the live selection at
+/// click time. The *panel* was the liar (#215 review finding) — toggling a
+/// hunk after Preview left the previous patch text on screen with nothing
+/// saying Apply would no longer match it. Someone reading that panel is
+/// reading a promise about what is about to happen to their index.
+///
+/// `current` is `None` when no plan can be built at all — an empty selection,
+/// or a repository the server has assigned no identity to. That still counts
+/// as [`Stale`](PreviewState::Stale) whenever something *was* previewed: the
+/// shown patch cannot be what a now-unbuildable plan would send either, and
+/// showing it would be the same lie in a quieter form.
+pub fn preview_state(
+    previewed: Option<&git_vista_protocol::PatchPlan>,
+    current: Option<&git_vista_protocol::PatchPlan>,
+) -> PreviewState {
+    match previewed {
+        None => PreviewState::NotRequested,
+        Some(shown) => {
+            if current == Some(shown) {
+                PreviewState::Fresh
+            } else {
+                PreviewState::Stale
+            }
+        }
+    }
+}
+
+/// Which of the staging view's three buttons are enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StagingActions {
+    pub preview: bool,
+    pub apply: bool,
+    pub clear: bool,
+}
+
+/// Gate the Preview / Apply / Clear buttons.
+///
+/// Preview and Apply both reach the server, so both need a non-empty
+/// selection, an idle view, and a repository the server has given an identity
+/// to. **Clear needs only a selection**, and that difference is deliberate:
+/// clearing is local, so a request in flight is no reason to trap the user
+/// with a selection they have decided against, and a repository with no
+/// identity is exactly the case where the only useful thing left to do is
+/// clear. Deriving all three from one "can act" boolean is the tempting
+/// simplification, and it would take Clear away in both of those states.
+pub const fn staging_actions(
+    selection_empty: bool,
+    busy: bool,
+    has_identity: bool,
+) -> StagingActions {
+    let reaches_the_server = !selection_empty && !busy && has_identity;
+    StagingActions {
+        preview: reaches_the_server,
+        apply: reaches_the_server,
+        clear: !selection_empty,
+    }
+}
+
+/// The verb and the flow description for one stage direction — "Stage" moves
+/// worktree → index, "Unstage" moves index → HEAD.
+///
+/// The arrows are not decoration: they are the only thing on the panel that
+/// says which of the two diffs the selection's coordinates address, and
+/// swapping them tells the reader their staged changes are about to be
+/// discarded when the opposite is true.
+pub const fn stage_direction_copy(
+    direction: git_vista_protocol::StageDirection,
+) -> (&'static str, &'static str) {
+    match direction {
+        git_vista_protocol::StageDirection::Stage => ("Stage", "worktree → index"),
+        git_vista_protocol::StageDirection::Unstage => ("Unstage", "index → HEAD"),
+    }
+}
+
+#[cfg(test)]
+mod staging_actions_suite;
+
 #[cfg(test)]
 mod tests {
     use super::*;
