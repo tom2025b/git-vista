@@ -290,3 +290,121 @@ impl Preview {
         next
     }
 }
+
+// ---------------------------------------------------------------------------
+// The animation clock (#591).
+// ---------------------------------------------------------------------------
+
+/// Whether the platform has asked for less motion.
+///
+/// A one-time read at the moment a picture becomes ready, not a live
+/// subscription — the animation only ever runs once per fresh preview (see
+/// [`Playback::start`]), so there is no ongoing animation for a later
+/// preference change to interrupt. `false` on any host that cannot answer
+/// (no `window`, `matchMedia` unsupported): every one of those is safer to
+/// treat as "no preference stated" than as "reduce", since the honest
+/// fallback either way is the same static after-picture this panel already
+/// draws — the animation is purely additive.
+pub fn prefers_reduced_motion() -> bool {
+    web_sys::window()
+        .and_then(|w| w.match_media("(prefers-reduced-motion: reduce)").ok())
+        .flatten()
+        .is_some_and(|m| m.matches())
+}
+
+/// Drives the before→after animation's progress clock.
+///
+/// Every *decision* about what progress means — how it maps to a pixel, an
+/// opacity, whether a label may show — lives in
+/// [`crate::features::preview::tween`], host-tested. What this holds is the
+/// one thing a pure function cannot: a running clock, ticked by
+/// `request_animation_frame` and read by [`Playback::progress`], which the
+/// wasm-only [`crate::dialogs::preview_panel`] view samples every frame.
+#[derive(Clone, Copy)]
+pub struct Playback {
+    /// `tween::progress_at(elapsed)`, recomputed every tick.
+    progress: RwSignal<f64>,
+    /// Bumped by every [`Playback::start`], so a `request_animation_frame`
+    /// callback scheduled under a superseded run stops rescheduling itself
+    /// rather than fighting a newer run for the same signal — the same
+    /// stale-reply guard [`Preview::generation`] uses, for the same reason.
+    generation: StoredValue<u64>,
+}
+
+impl Default for Playback {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Playback {
+    pub fn new() -> Self {
+        Self {
+            progress: create_rw_signal(0.0),
+            generation: store_value(0),
+        }
+    }
+
+    /// A tracked read — the animated view re-renders from it every tick.
+    pub fn progress(&self) -> f64 {
+        self.progress.get()
+    }
+
+    /// Start (or restart) the transition from its beginning.
+    ///
+    /// `reduced_motion` jumps straight to the resting frame and schedules no
+    /// frame at all — the rule #591 states explicitly: the animation must
+    /// degrade to the end state rather than ever being the only way to see
+    /// the result, and the cheapest way to guarantee that is to never enter
+    /// the loop that could show anything else.
+    pub fn start(&self, reduced_motion: bool) {
+        let mine = self.bump();
+        if reduced_motion {
+            self.progress.set(1.0);
+            return;
+        }
+        self.progress.set(0.0);
+        self.schedule(mine, now_ms());
+    }
+
+    fn bump(&self) -> u64 {
+        let next = self
+            .generation
+            .try_get_value()
+            .unwrap_or_default()
+            .wrapping_add(1);
+        self.generation.set_value(next);
+        next
+    }
+
+    /// Schedule the next frame, and every frame after it until progress
+    /// reaches `1.0` or a later [`Playback::start`] supersedes `mine`.
+    fn schedule(&self, mine: u64, started_at: f64) {
+        let this = *self;
+        request_animation_frame(move || {
+            // Superseded (a Replay, or a new preview loaded) — stop, and
+            // leave whatever the newer run already set alone. `try_get_value`
+            // rather than `get_value`: this callback outlives nothing today,
+            // but a disposed owner must drop the tick, never panic.
+            if this.generation.try_get_value() != Some(mine) {
+                return;
+            }
+            let elapsed = now_ms() - started_at;
+            let t = crate::features::preview::tween::progress_at(elapsed);
+            this.progress.set(t);
+            if t < 1.0 {
+                this.schedule(mine, started_at);
+            }
+        });
+    }
+}
+
+/// Wall-clock milliseconds, for measuring elapsed animation time. Not
+/// monotonic (a system clock adjustment could move it), but the same
+/// primitive this codebase already uses for elapsed-time arithmetic
+/// (`api.rs`'s request-id noise, `datetime.rs`'s relative-time math) rather
+/// than reaching for `Performance`, which would cost this crate a new
+/// web-sys feature for no practical gain at animation-frame granularity.
+fn now_ms() -> f64 {
+    js_sys::Date::now()
+}
