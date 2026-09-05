@@ -268,3 +268,41 @@ recorded here rather than quietly dropped; the third is what makes the proof
 honest. All three: caught, none survived. Run ids: 280 (delete the check),
 281 (invert the comparison, redundant with 280 — see above), 282 (weaken to
 id-existence-only); `run_key: gv-550-remove-worktree-cas`.
+
+### A fourth arm, added post-review: the path-disclosure fix (#665)
+
+grok's review of the opened PR found that the compare-and-swap above was
+sound but the executor's own failure arms were not: the git-refusal arm
+returned `stderr_or`'s raw text straight to the client, and on a dirty-tree
+refusal that text is git's own `fatal: '<absolute path>' contains modified
+or untracked files, use --force to delete it` — the one thing this
+operation never lets a client choose or see, shipped verbatim. Auditing the
+rest of the function per the reviewer's instruction found a second,
+identical leak on the spawn-error arm via the shared `couldnt_run` helper.
+Same defect class as #656 claim 2 (fixed in #662); same fix: both arms now
+route through `crate::state::withheld_detail`, exactly as `AddWorktree`'s
+three failure arms already do.
+
+Two further mutation arms, proving the withholding itself rather than the
+compare-and-swap, picked to fail **differently** rather than repeat the
+same red twice:
+
+| arm | mutation | mutated result |
+|---|---|---|
+| reproduce the leak | revert the git-refusal arm to a bare `stderr_or` return, dropping `withheld_detail` entirely | all three targets red, including the content assertion — the panic message is the leaked path itself: `` fatal: '/tmp/.../desk' contains modified or untracked files, use --force to delete it `` |
+| over-redact | keep `withheld_detail`, but replace the useful summary with `"Error."` | the leak test (`remove_worktree_refuses_a_dirty_sibling`) stays **green** — no path leaked — while the exact-body pin and the paired positive go red on uselessness, not on disclosure |
+
+The two arms are the required "two ways, failing differently": the first
+fails on *content* (a path is present that must not be), the second fails
+on *shape* (the body still discloses nothing, but the pin and the paired
+positive catch that "say nothing" is not the same as "say something safe
+and useful"). Both caught, neither survived. Run ids: 285 (reproduce the
+leak), 286 (over-redact); `run_key: gv-665-remove-worktree-path-disclosure`.
+
+New tests from this fix: an absolute-path assertion added to
+`remove_worktree_refuses_a_dirty_sibling` (a status-only assertion is
+exactly what let this class through twice), plus
+`the_executor_body_is_exactly_what_it_should_be` and
+`the_pinned_body_withholds_the_path_but_says_something_useful` in
+`contract_suite.rs`, mirroring `worktree_add_suite.rs`'s exact-body pin for
+`exec_add_worktree`.
