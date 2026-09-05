@@ -112,10 +112,7 @@ pub enum RefDelta {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ChangeFeedHealth {
     /// Hints and sweeps both running; the whole watch set is installed.
-    Watching {
-        watches: usize,
-        budget: WatchBudget,
-    },
+    Watching { watches: usize, budget: WatchBudget },
     /// Part of the ref tree is not watched because the budget bound it. The
     /// sweep still covers those refs, so nothing that was true stops being
     /// true — it arrives at the sweep cadence rather than promptly.
@@ -249,7 +246,10 @@ mod tests {
         })
         .unwrap();
         assert_ne!(unknown, empty);
-        assert!(unknown.contains("unknown"), "unknown delta tags itself: {unknown}");
+        assert!(
+            unknown.contains("unknown"),
+            "unknown delta tags itself: {unknown}"
+        );
     }
 
     #[test]

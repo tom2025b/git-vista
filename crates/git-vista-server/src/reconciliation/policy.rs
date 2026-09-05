@@ -194,10 +194,6 @@ impl FeedPolicy {
         self.misses
     }
 
-    pub(crate) fn watcher_state(&self) -> &WatcherState {
-        &self.watcher
-    }
-
     /// Record what the watcher said about itself. Never publishes on its own —
     /// the next sweep does, because a health value published beside a
     /// generation nobody just read is a snapshot no reading ever produced.

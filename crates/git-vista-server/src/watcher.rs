@@ -59,14 +59,23 @@ pub(crate) enum WatcherHealth {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WatcherLoss {
-    UnsupportedGeometry { reason: String },
-    Backend { reason: String },
-    WatchLost { path: PathBuf, reason: String },
+    UnsupportedGeometry {
+        reason: String,
+    },
+    Backend {
+        reason: String,
+    },
+    WatchLost {
+        path: PathBuf,
+        reason: String,
+    },
     /// inotify itself refused a watch: the shared per-user limit is exhausted.
     /// A **fact reported by the kernel**, never inferred from this process's own
     /// budget — the budget bounds politely and reports `Bounded`; only a real
     /// refusal is this.
-    LimitReached { at: usize },
+    LimitReached {
+        at: usize,
+    },
 }
 
 /// A running native watcher and its single-consumer notice stream.

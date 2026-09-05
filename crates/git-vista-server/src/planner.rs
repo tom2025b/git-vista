@@ -492,6 +492,28 @@ pub(crate) async fn plan_and_execute_in(
     op: GitOperation,
     proof: DropProof,
 ) -> (StatusCode, String) {
+    // M12.04 (#554): publish what this write left behind — and publish it
+    // *after* the write, through a wrapper the write cannot skip. Nothing here
+    // records "what I wrote"; the wrapper asks the feed to read the world and
+    // publish whatever it finds, so an external change that landed alongside
+    // this one is announced rather than swallowed. A write that panics never
+    // reaches the wrapper's publish and therefore records nothing, which leaves
+    // the next ordinary sweep free to announce it. See `reconciliation`'s
+    // module doc for why that is the whole mechanism.
+    crate::reconciliation::with_publish(
+        repo,
+        plan_and_execute_within(repo, repo_id, tokens, op, proof),
+    )
+    .await
+}
+
+async fn plan_and_execute_within(
+    repo: &Path,
+    repo_id: Option<RepositoryId>,
+    tokens: (RepositoryToken, WorktreeToken),
+    op: GitOperation,
+    proof: DropProof,
+) -> (StatusCode, String) {
     // The stage reports are no-ops unless this pipeline is running under a
     // tracked operation (M1.08), so the seam the test suites drive is
     // unchanged. `Waiting` is reported *before* the guard on purpose: it is the
@@ -651,6 +673,17 @@ pub(crate) async fn build_plan_only(
 ///   proves the re-derivation itself is load-bearing (emptying it passed the
 ///   whole suite before that test existed).
 pub(crate) async fn submit_plan(
+    repo: &Path,
+    repo_id: Option<RepositoryId>,
+    tokens: (RepositoryToken, WorktreeToken),
+    plan: Plan,
+) -> (StatusCode, String) {
+    // M12.04 (#554), same wrapper and same reason as `plan_and_execute_in`:
+    // the *other* path a write can take out of this module.
+    crate::reconciliation::with_publish(repo, submit_plan_within(repo, repo_id, tokens, plan)).await
+}
+
+async fn submit_plan_within(
     repo: &Path,
     repo_id: Option<RepositoryId>,
     tokens: (RepositoryToken, WorktreeToken),

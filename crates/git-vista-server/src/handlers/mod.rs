@@ -67,7 +67,9 @@ pub(crate) mod plan;
 pub(crate) mod preview;
 pub(crate) mod protocol;
 pub(crate) mod read;
+// M12.05 (#555): the repository change feed's SSE stream.
 pub(crate) mod rebase;
+pub(crate) mod repository_events;
 pub(crate) mod reset;
 pub(crate) mod select;
 pub(crate) mod staging;
