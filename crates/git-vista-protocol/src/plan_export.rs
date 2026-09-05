@@ -94,8 +94,8 @@
 
 use crate::conflict::Resolution;
 use crate::plan::{
-    BranchName, CommitMessage, CommitOid, ForcePublish, GitOperation, MergeStrategy, Plan, RefName,
-    RemoteName, StashMessage, StashSelector, TagAnnotation, TagName, WorktreePath,
+    BisectVerdict, BranchName, CommitMessage, CommitOid, ForcePublish, GitOperation, MergeStrategy,
+    Plan, RefName, RemoteName, StashMessage, StashSelector, TagAnnotation, TagName, WorktreePath,
 };
 
 // ---------------------------------------------------------------------------
@@ -510,6 +510,36 @@ impl SequenceVerb {
 /// `git cherry-pick|revert --continue|--skip|--abort`.
 pub fn sequence_argv(kind: SequenceKind, verb: SequenceVerb) -> Vec<String> {
     vec![kind.subcommand().to_string(), verb.flag().to_string()]
+}
+
+/// `git bisect start <bad> <good...>` (M5.34, #87, ADR 0121).
+pub fn bisect_start_argv(bad: &CommitOid, good: &[CommitOid]) -> Vec<String> {
+    let mut argv = vec![
+        "bisect".to_string(),
+        "start".to_string(),
+        bad.as_str().to_string(),
+    ];
+    argv.extend(good.iter().map(|oid| oid.as_str().to_string()));
+    argv
+}
+
+/// `git bisect good|bad|skip` — no commit argument, always the current
+/// candidate (see [`crate::plan::GitOperation::BisectMark`]'s doc comment).
+pub fn bisect_mark_argv(verdict: BisectVerdict) -> Vec<String> {
+    vec![
+        "bisect".to_string(),
+        match verdict {
+            BisectVerdict::Good => "good",
+            BisectVerdict::Bad => "bad",
+            BisectVerdict::Skip => "skip",
+        }
+        .to_string(),
+    ]
+}
+
+/// `git bisect reset`.
+pub fn bisect_reset_argv() -> Vec<String> {
+    vec!["bisect".to_string(), "reset".to_string()]
 }
 
 /// `git checkout --ours|--theirs -- <path>`, or `git rm -f -- <path>`.
@@ -1129,6 +1159,36 @@ pub fn export_operation(operation: &GitOperation) -> Export {
                   will refuse if the working tree is not clean."
                 .to_string(),
         },
+
+        // M5.34 (#87, ADR 0121). Unlike the sequencer's continue/skip/abort,
+        // a bisect step's command is never ambiguous: `start` carries its
+        // own bad/good oids, and `good`/`bad`/`skip` take no argument at
+        // all — the current candidate is whatever HEAD already is, on the
+        // command line exactly as much as in the executor. Nothing here is
+        // `ChosenAtRunTime` or `NotACommandLine`.
+        GitOperation::BisectStart { bad, good } => Export::Commands(vec![Step::new(
+            bisect_start_argv(bad, good),
+            format!(
+                "Start a bisect: bad at {}, good at {}.",
+                short(bad),
+                good.iter().map(short).collect::<Vec<_>>().join(", ")
+            ),
+        )]),
+        GitOperation::BisectMark { verdict } => Export::Commands(vec![Step::new(
+            bisect_mark_argv(*verdict),
+            format!(
+                "Mark the current candidate as {}.",
+                match verdict {
+                    BisectVerdict::Good => "good",
+                    BisectVerdict::Bad => "bad",
+                    BisectVerdict::Skip => "skip (untestable)",
+                }
+            ),
+        )]),
+        GitOperation::BisectReset => Export::Commands(vec![Step::new(
+            bisect_reset_argv(),
+            "End the bisect and return to where it started.".to_string(),
+        )]),
     }
 }
 
@@ -1552,6 +1612,9 @@ pub fn operation_name(operation: &GitOperation) -> &'static str {
         GitOperation::DiscardTrackedPaths { .. } => "discard changes to tracked files",
         GitOperation::DeleteUntrackedPaths { .. } => "delete untracked files",
         GitOperation::RemoveWorktree { .. } => "remove a linked worktree",
+        GitOperation::BisectStart { .. } => "start a bisect",
+        GitOperation::BisectMark { .. } => "mark the bisect candidate",
+        GitOperation::BisectReset => "end the bisect",
         GitOperation::AmendCommit { .. } => "amend the last commit",
         GitOperation::FetchRemote { .. } => "fetch from a remote",
         GitOperation::PullBranch { .. } => "pull",
@@ -1693,6 +1756,12 @@ fn describe_recovery(recovery: &crate::plan::RecoveryStrategy) -> String {
         RecoveryStrategy::Irrecoverable => {
             "Nothing can undo this. The effect leaves this machine, or it destroys the \
              only copy. Be sure before you run it."
+                .to_string()
+        }
+        RecoveryStrategy::BisectReset => {
+            "The way back is `git bisect reset`, which returns to where the bisect \
+             started and clears its state — a plain ref move cannot do either, since \
+             the bisect may need to reattach a branch."
                 .to_string()
         }
     }

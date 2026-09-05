@@ -531,6 +531,25 @@ pub enum ForcePublish {
     },
 }
 
+/// The verdict of a [`GitOperation::BisectMark`] step (M5.34, #87, ADR 0121)
+/// — `git bisect good|bad|skip` on the current candidate.
+///
+/// Named `Verdict` rather than reusing a bool: `Skip` is a real third answer
+/// (the candidate can't be tested at all — it doesn't build, say), not a
+/// missing good/bad, and a closed three-way enum is what keeps a future
+/// caller from having to invent a fourth meaning for `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BisectVerdict {
+    /// `git bisect good` — the candidate does not have the problem.
+    Good,
+    /// `git bisect bad` — the candidate has the problem.
+    Bad,
+    /// `git bisect skip` — the candidate cannot be tested; git widens its
+    /// search rather than treating it as either answer.
+    Skip,
+}
+
 /// The annotation of a [`GitOperation::CreateTag`] — present ⇒ an annotated
 /// tag (a real tag *object* with message, tagger and date), absent ⇒ a
 /// lightweight tag (a bare ref, no object) (M2.21a, #235, ADR 0041).
@@ -1361,6 +1380,62 @@ pub enum GitOperation {
         name: WorktreeName,
         branch: BranchName,
     },
+    /// `git bisect start <bad> <good...>` — open a bisect session, checking
+    /// out the first candidate (M5.34, #87, ADR 0121).
+    ///
+    /// # No session id, and that is deliberate
+    ///
+    /// A bisect session is not this app's to name: git already gives it
+    /// identity via `.git/BISECT_START` and `refs/bisect/*`, and there is
+    /// exactly one bisect a repository can have in progress at a time (the
+    /// same "one sequence at a time" fact [`GitOperation::SequenceContinue`]
+    /// already relies on). Discovering a session is reading that state, not
+    /// resolving an id this operation would have to mint and track.
+    ///
+    /// # `good` is a `Vec` — every known-good commit at start time
+    ///
+    /// `git bisect start <bad> <good1> <good2> …` accepts more than one good
+    /// commit when the caller already knows several — narrowing the first
+    /// step's candidate range without an extra round trip. An empty `good`
+    /// is refused by the executor before it reaches git: a bisect with no
+    /// known-good commit cannot compute a candidate range at all, and git's
+    /// own refusal for that case is exactly the kind of prose ADR 0037 says
+    /// not to relay.
+    BisectStart {
+        bad: CommitOid,
+        good: Vec<CommitOid>,
+    },
+    /// `git bisect good|bad|skip` on the current candidate — advance an
+    /// in-progress bisect by one step (M5.34, #87, ADR 0121).
+    ///
+    /// # No commit field — see `SequenceContinue`'s doc comment
+    ///
+    /// The candidate under test is whatever `HEAD` already is; the
+    /// repository already knows, and a client-supplied commit could go
+    /// stale between the moment it was shown and the moment this executes,
+    /// silently marking the wrong commit. The executor reads `HEAD` itself,
+    /// inside the same coordinator guard every other mutation already runs
+    /// under, and refuses with `409` if `.git/BISECT_START` does not exist.
+    ///
+    /// # Recovery is [`RecoveryStrategy::BisectReset`], not a bare ref move
+    ///
+    /// See that variant's own doc comment: the undo for a bisect step is a
+    /// full `git bisect reset`, which may reattach a branch and always
+    /// clears `refs/bisect/*` — a `ResetRef` computed at shape time cannot
+    /// express either half of that.
+    BisectMark { verdict: BisectVerdict },
+    /// `git bisect reset` — return to the pre-bisect position and clear all
+    /// bisect state (M5.34, #87, ADR 0121).
+    ///
+    /// # Always safe to offer, never safe to skip
+    ///
+    /// Unlike `SequenceAbort`, nothing here is destroyed: a bisect step only
+    /// ever checks out a candidate that already exists in history, so
+    /// reset's [`RiskLevel`] is [`RiskLevel::Reversible`] and its own
+    /// recovery is [`RecoveryStrategy::NotNeeded`] — it returns to the
+    /// state `BisectStart` found the repository in, and there is nothing
+    /// further to undo from there.
+    BisectReset,
     // `PopStash` is deliberately ABSENT (M3.24, decided 2026-08-18; the
     // variant that contradicted this comment was removed 2026-08-25, #493,
     // ADR 0078).
@@ -1641,6 +1716,29 @@ pub enum RecoveryStrategy {
     /// aborted, this stops being true.** A caller offering the undo must check
     /// the operation is still in progress rather than assuming the tag alone.
     ConflictRecreatableWhileInProgress,
+    /// The undo for a [`GitOperation::BisectStart`] or
+    /// [`GitOperation::BisectMark`] step is [`GitOperation::BisectReset`] —
+    /// a full `git bisect reset` — not a bare ref move (M5.34, #87, ADR
+    /// 0121).
+    ///
+    /// # Why not [`Self::ResetRef`]
+    ///
+    /// `ResetRef` is computed at shape time from a **checked-out branch**'s
+    /// tip (`head_moves`'s own definition). A bisect step runs on a
+    /// **detached** `HEAD` by design — there is no branch tip to pin — and
+    /// `git bisect reset` may need to **reattach** whatever branch
+    /// `.git/BISECT_START` recorded, plus clear `refs/bisect/*`, neither of
+    /// which a plain `git reset --hard <oid>` would do. Stating `ResetRef`
+    /// here would claim a mechanical undo this app does not perform.
+    ///
+    /// # Why not [`Self::NotNeeded`]
+    ///
+    /// `HEAD` does move — `NotNeeded` would understate that, the same
+    /// reason `RemoveWorktree`'s neighbouring effects arms exist to keep a
+    /// "which tree" question from being answered by the wrong field. The
+    /// honest tag names the operation that undoes this, not a claim that
+    /// nothing needs undoing.
+    BisectReset,
     /// No recovery exists inside git-vista, and none is possible regardless:
     /// the effect left the machine (push — the remote is ahead and we never
     /// force-push), the discarded state was never journaled (test-repo reset

@@ -164,6 +164,13 @@ impl GitOperation {
             // versions. It refuses rather than conflicting, so this is not
             // `MayConflict`.
             GitOperation::CheckoutBranch { .. } => WorktreeEffect::FilesRewritten,
+            // A bisect step (start/mark) IS a checkout — git drives it
+            // internally, but tracked files are rewritten exactly the same
+            // way (M5.34, #87, ADR 0121). Reset returns to the pre-bisect
+            // position, which is itself a checkout.
+            GitOperation::BisectStart { .. } => WorktreeEffect::FilesRewritten,
+            GitOperation::BisectMark { .. } => WorktreeEffect::FilesRewritten,
+            GitOperation::BisectReset => WorktreeEffect::FilesRewritten,
             // `git checkout --ours|--theirs` / `git rm` / `git add` against
             // named conflicted paths: the chosen side is written to disk.
             GitOperation::ResolveConflict { .. } => WorktreeEffect::FilesRewritten,
@@ -289,6 +296,11 @@ impl GitOperation {
 
             // Everything that sets the index from a result tree.
             GitOperation::CheckoutBranch { .. } => IndexEffect::Rebuilt,
+            // A bisect step/reset sets the index from whichever commit git
+            // checks out — same shape as CheckoutBranch (M5.34, #87).
+            GitOperation::BisectStart { .. } => IndexEffect::Rebuilt,
+            GitOperation::BisectMark { .. } => IndexEffect::Rebuilt,
+            GitOperation::BisectReset => IndexEffect::Rebuilt,
             GitOperation::MergeBranch { .. } => IndexEffect::Rebuilt,
             GitOperation::PullBranch { .. } => IndexEffect::Rebuilt,
             GitOperation::RebaseOntoBase { .. } => IndexEffect::Rebuilt,
@@ -448,6 +460,12 @@ pub fn network_need_for_operation(op: &GitOperation) -> NetworkNeed {
         GitOperation::StageAll => NetworkNeed::Local,
         GitOperation::UnstageAll => NetworkNeed::Local,
         GitOperation::CheckoutBranch { .. } => NetworkNeed::Local,
+        // A bisect step/start/reset never opens a socket — it walks and
+        // checks out commits already in the local object database (M5.34,
+        // #87).
+        GitOperation::BisectStart { .. } => NetworkNeed::Local,
+        GitOperation::BisectMark { .. } => NetworkNeed::Local,
+        GitOperation::BisectReset => NetworkNeed::Local,
         GitOperation::MergeBranch { .. } => NetworkNeed::Local,
         GitOperation::DeleteBranch { .. } => NetworkNeed::Local,
         GitOperation::ForceDeleteBranch { .. } => NetworkNeed::Local,
