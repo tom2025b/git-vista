@@ -126,6 +126,91 @@ pub(crate) fn repo_label(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// A client-facing sentence built from a client-safe `summary` plus a
+/// `detail` that may name absolute paths — git's stderr, an `io::Error`, a
+/// `gix` message. The detail is appended **only** when the operator opted in
+/// ([`expose_paths`]), and is written to the server's own log either way.
+///
+/// # Why the log is unconditional
+///
+/// `GIT_VISTA_EXPOSE_PATHS` governs what leaves the process for a **client**;
+/// the operator's own terminal is not a client. So the flag withholds, it
+/// never destroys — an operator who never sets it still has every byte of
+/// every failure, in the place they were already looking. That is what keeps
+/// the honest cost of redaction (a less useful message) from becoming a real
+/// one (a lost diagnostic).
+///
+/// # Why this exists rather than each site deciding
+///
+/// The same control was found holding on a route's success arm and absent
+/// from its failure arm twice in one milestone — #657 on the worktree census,
+/// and `exec_add_worktree` relaying `fatal: 'main' is already used by worktree
+/// at '/…'` straight into an HTTP body (#656, confirmed independently by codex
+/// and grok). The rule that follows is the one ADR 0119 states: **a string
+/// that arrived from git, from the OS, or from `gix` is detail** — not
+/// inspected first, because whether a particular error names a path is not a
+/// property the call site can check.
+///
+/// `context` names the route for the log line only; it never reaches a client.
+pub(crate) fn withheld_detail(context: &str, summary: &str, detail: &str) -> String {
+    withheld_detail_when(expose_paths(), context, summary, detail)
+}
+
+/// [`withheld_detail`] with the flag passed in rather than read — the same
+/// hoist `worktree_census` makes for exactly this reason: an environment
+/// variable is process-global and shared by every test in this binary, so a
+/// function that reads it directly cannot be unit tested without a global
+/// lock, and a test that sets it races every other test that does not.
+fn withheld_detail_when(expose: bool, context: &str, summary: &str, detail: &str) -> String {
+    let detail = detail.trim();
+    if detail.is_empty() {
+        return summary.to_string();
+    }
+    eprintln!("git-vista: {context}: {summary} — {detail}");
+    if expose {
+        format!("{summary} {detail}")
+    } else {
+        summary.to_string()
+    }
+}
+
+#[cfg(test)]
+mod withheld_detail_tests {
+    use super::withheld_detail_when;
+
+    /// git's actual refusal for the confirmed #656 leak, verbatim.
+    const GIT_REFUSAL: &str =
+        "fatal: 'main' is already used by worktree at '/home/someone/.local/share/git-vista/worktrees/desk'";
+
+    #[test]
+    fn the_detail_is_withheld_by_default_and_appended_on_opt_in() {
+        let summary = "git wouldn't open a desk.";
+
+        let withheld = withheld_detail_when(false, "/api/test", summary, GIT_REFUSAL);
+        assert_eq!(withheld, summary, "the default must be the summary alone");
+        assert!(!withheld.contains('/'), "no path survives: {withheld}");
+
+        let shown = withheld_detail_when(true, "/api/test", summary, GIT_REFUSAL);
+        assert!(shown.starts_with(summary), "the summary is never rewritten");
+        assert!(
+            shown.contains("/home/someone/.local/share/git-vista/worktrees/desk"),
+            "an opted-in operator gets git's own words: {shown}"
+        );
+    }
+
+    /// An empty detail adds nothing and logs nothing — a summary with a
+    /// dangling em dash after it would be worse than saying less.
+    #[test]
+    fn an_empty_detail_is_not_appended_in_either_direction() {
+        for expose in [false, true] {
+            assert_eq!(
+                withheld_detail_when(expose, "/api/test", "Summary.", "   \n "),
+                "Summary."
+            );
+        }
+    }
+}
+
 /// The process-wide catalog of servable repositories (M1.03). Every path→id
 /// mapping and every allowed root lives here; it is the only thing that turns an
 /// opaque request id back into a filesystem path, and it fails closed on anything
@@ -242,6 +327,48 @@ pub(crate) fn scan_clones_root() -> (usize, usize) {
         .write()
         .expect("catalog lock")
         .scan_direct_children(&root, true)
+}
+
+/// Scan the managed **worktrees** root ([`worktrees_root`], ADR 0118) into the
+/// catalog. Called at startup and by `POST /api/rescan`, beside
+/// [`scan_clones_root`] and for the same reasons.
+///
+/// # This is what makes the managed root a fence, rather than a claim
+///
+/// ADR 0118's containment argument is that a new desk is *inside the fence by
+/// construction*: the root is admitted to the allowed roots once, and every
+/// child of it is then servable with no per-path check. Nothing performed that
+/// admission — the root was resolved and written to, and never scanned — so a
+/// desk `exec_add_worktree` had just created could not be selected, and the
+/// ADR's "by construction" was a sentence rather than a mechanism (grok, on
+/// PR #656).
+///
+/// `allow_root` happens inside `scan_direct_children`, which is why this is a
+/// scan and not a bare `allow_root` call: admitting the root and registering
+/// what is already under it are the same job, exactly as they are for clones.
+///
+/// # `read_only: false`, and `create_dir_all` first
+///
+/// * **`false`, not `true`.** `read_only` is the descriptor flag the picker
+///   keys **Delete** on and marks an entry as a URL clone (ADR 0008). A linked
+///   worktree is neither: it is an ordinary working tree of a repository the
+///   operator already has, and marking it a clone would offer to delete it
+///   through a route whose guard is "canonicalizes inside the clones root" —
+///   which this root deliberately does not.
+/// * **`create_dir_all` first, and it is required rather than tidy.**
+///   `scan_direct_children` returns early — *before* `allow_root` — when
+///   `read_dir` fails. On a fresh install with no desk yet, the root does not
+///   exist, so without this the root is never admitted and the first
+///   `AddWorktree` produces a directory nothing can serve. The clones scan
+///   creates its root for a cosmetic reason (a misworded warning); here it is
+///   load-bearing.
+pub(crate) fn scan_worktrees_root() -> (usize, usize) {
+    let root = worktrees_root();
+    let _ = std::fs::create_dir_all(&root);
+    catalog()
+        .write()
+        .expect("catalog lock")
+        .scan_direct_children(&root, false)
 }
 
 /// The capability view of the catalog for `GET /api/catalog`: the servable

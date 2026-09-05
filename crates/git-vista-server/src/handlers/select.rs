@@ -16,7 +16,9 @@ use axum::Json;
 use git_vista_core::identity::WorktreeId;
 use git_vista_protocol::{SelectRequest, SelectWorktreeRequest, WorktreeCensus};
 
-use crate::state::{register_repo_list, scan_clones_root, scan_repo_root, select_registered};
+use crate::state::{
+    register_repo_list, scan_clones_root, scan_repo_root, scan_worktrees_root, select_registered,
+};
 
 /// Make the repository addressed by `worktree` the current selection, in the
 /// requested mode. Unknown/forged id → 404, the same fail-closed contract as
@@ -168,7 +170,8 @@ pub(crate) async fn select_discovered_worktree(
     }
 }
 
-/// Re-scan the configured repo root and the clones root (ADR 0009/0008).
+/// Re-scan the configured repo root, the clones root and the managed
+/// worktrees root (ADR 0009/0008/0118).
 /// Bodyless POST, like `rebase`. Registered entries and the current selection
 /// are untouched; this only adds/refreshes entries.
 pub(crate) async fn rescan() -> (StatusCode, String) {
@@ -181,6 +184,11 @@ pub(crate) async fn rescan() -> (StatusCode, String) {
     // same final flags a fresh boot would give it.
     let (listed, listed_skipped) = register_repo_list();
     let (clones_registered, _) = scan_clones_root();
+    // ADR 0118: same position as startup. A rescan that skipped this would
+    // leave the managed root un-admitted for the rest of the process whenever
+    // the root did not exist at boot — which is precisely the fresh-install
+    // case the fix is about.
+    let (desks_registered, _) = scan_worktrees_root();
     let listed_note = if listed > 0 || listed_skipped > 0 {
         format!(" {listed} listed repo(s) registered, {listed_skipped} skipped;")
     } else {
@@ -189,11 +197,13 @@ pub(crate) async fn rescan() -> (StatusCode, String) {
     let summary = match repo_result {
         Some((registered, skipped)) => format!(
             "Rescanned: {registered} repos registered, {skipped} skipped;\
-            {listed_note} {clones_registered} clone(s) re-registered."
+            {listed_note} {clones_registered} clone(s) re-registered; \
+            {desks_registered} linked worktree(s) re-registered."
         ),
         None => format!(
             "No repo root configured;{listed_note} \
-             {clones_registered} clone(s) re-registered."
+             {clones_registered} clone(s) re-registered; \
+             {desks_registered} linked worktree(s) re-registered."
         ),
     };
     (StatusCode::OK, summary)

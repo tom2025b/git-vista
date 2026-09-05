@@ -239,35 +239,34 @@ fn exec_body_normalised() -> String {
 /// This test failing is not necessarily a bug. It means this security-critical
 /// function changed, and the change wants a human to look at it and update the
 /// literal deliberately. That is the intended cost.
+///
+/// It has been paid once already: #656's fix routed all three failure arms
+/// through `crate::state::withheld_detail`, so the literal below was reread and
+/// updated on purpose. The check that mattered while doing so is the one the
+/// paired positive below automates — no `allow_root`/`allow_repo_root` appeared,
+/// and the destination is still computed from `worktrees_root()` joined to a
+/// validated single segment.
 #[test]
 fn the_executor_body_is_exactly_what_it_should_be() {
     const EXPECTED: &str = concat!(
-        "repo: &Path, name: &WorktreeName, branch: &BranchName, ",
-        ") -> (StatusCode, String) { ",
-        "let root = crate::state::worktrees_root(); ",
-        "if let Err(e) = std::fs::create_dir_all(&root) { ",
-        "eprintln!( \"git-vista: /api/add-worktree couldn't create {}: {e}\", root.display() ); ",
-        "return ( StatusCode::INTERNAL_SERVER_ERROR, ",
-        "format!(\"Couldn't prepare the worktrees folder: {e}\"), ); } ",
-        "let dest = root.join(name.as_str()); ",
-        "if dest.exists() { return ( StatusCode::CONFLICT, format!( ",
-        "\"There is already a desk called ‘{name}’. Pick another name, or open \\ ",
-        "the existing one from the worktree list.\" ), ); } ",
-        "let Some(dest_str) = dest.to_str() else { return ( ",
-        "StatusCode::INTERNAL_SERVER_ERROR, ",
-        "\"The worktrees folder's path is not valid UTF-8.\".to_string(), ); }; ",
-        "let args = [\"worktree\", \"add\", dest_str, branch.as_str()]; ",
-        "let output = match crate::git_cmd::git_output_in_managed_root(repo, &args, &root).await { ",
-        "Ok(output) => output, ",
-        "Err(e) => return crate::planner::couldnt_run(\"/api/add-worktree\", &e), ",
-        "}; if !output.status.success() { ",
-        "let why = String::from_utf8_lossy(&output.stderr).trim().to_string(); ",
-        "let why = if why.is_empty() { \"git worktree add failed.\".to_string() ",
-        "} else { why }; ",
-        "eprintln!(\"git-vista: /api/add-worktree failed: {why}\"); ",
-        "return (StatusCode::CONFLICT, why); } ",
-        "( StatusCode::OK, ",
-        "format!(\"Opened a second desk called ‘{name}’ on ‘{branch}’.\"), )",
+        "repo: &Path, name: &WorktreeName, branch: &BranchName, ) -> (StatusCode, String) { let ",
+        "root = crate::state::worktrees_root(); if let Err(e) = std::fs::create_dir_all(&root) { ",
+        "return ( StatusCode::INTERNAL_SERVER_ERROR, crate::state::withheld_detail( ",
+        "\"/api/add-worktree\", \"Couldn't prepare the worktrees folder.\", &format!(\"{}: {e}\", ",
+        "root.display()), ), ); } let dest = root.join(name.as_str()); if dest.exists() { return ",
+        "( StatusCode::CONFLICT, format!( \"There is already a desk called ‘{name}’. Pick another ",
+        "name, or open \\ the existing one from the worktree list.\" ), ); } let Some(dest_str) = ",
+        "dest.to_str() else { return ( StatusCode::INTERNAL_SERVER_ERROR, \"The worktrees folder's ",
+        "path is not valid UTF-8.\".to_string(), ); }; let args = [\"worktree\", \"add\", dest_str, ",
+        "branch.as_str()]; let output = match crate::git_cmd::git_output_in_managed_root(repo, ",
+        "&args, &root).await { Ok(output) => output, Err(e) => { return ( ",
+        "StatusCode::INTERNAL_SERVER_ERROR, crate::state::withheld_detail( \"/api/add-worktree\", ",
+        "\"Couldn't run git to open the desk.\", &e.to_string(), ), ) } }; if ",
+        "!output.status.success() { let why = String::from_utf8_lossy(&output.stderr); return ( ",
+        "StatusCode::CONFLICT, crate::state::withheld_detail( \"/api/add-worktree\", &format!( \"git ",
+        "wouldn't open a desk called ‘{name}’ on ‘{branch}’. A branch \\ can only be checked out ",
+        "at one desk at a time — the worktree list \\ says which one has it.\" ), &why, ), ); } ( ",
+        "StatusCode::OK, format!(\"Opened a second desk called ‘{name}’ on ‘{branch}’.\"), )",
     );
     assert_eq!(
         exec_body_normalised(),
@@ -410,6 +409,20 @@ fn add_worktree_opens_a_second_desk_under_the_managed_root() {
 /// branch that is already checked out here is refused rather than attempted.
 /// Without this, the test above would pass on an executor that ignored every
 /// precondition.
+///
+/// # The third assertion, and why the first two were not enough
+///
+/// As shipped in #654 this test asserted only `status != OK` and that the
+/// destination is absent — and it stayed green while the refusal body carried
+/// an absolute path, because this request skips a failed precondition, reaches
+/// git, and git answers `fatal: 'main' is already used by worktree at
+/// '<abs path>'`, which was relayed with only `.trim()` applied (found by
+/// codex and grok independently, on PR #656).
+///
+/// So the body is now read. It is asserted against **this run's actual
+/// temporary directories**, not against a pattern that could match by
+/// accident: `managed.path()` is where the desk would have gone and `repo` is
+/// where git would have named the collision, and neither may appear.
 #[test]
 fn a_desk_on_the_branch_you_are_standing_on_is_refused() {
     let (_dir, repo) = seeded_repo();
@@ -434,5 +447,132 @@ fn a_desk_on_the_branch_you_are_standing_on_is_refused() {
     assert!(
         !managed.path().join("review-549").exists(),
         "the desk was created despite the refusal"
+    );
+
+    for leaked in [managed.path(), repo.as_path()] {
+        let leaked = leaked.to_string_lossy();
+        assert!(
+            !body.contains(leaked.as_ref()),
+            "the refusal carried the absolute path `{leaked}` with \
+             GIT_VISTA_EXPOSE_PATHS unset: {body}"
+        );
+    }
+    // The paired positive for the redaction: withholding the path must not
+    // have cost the user the reason. The name and the branch are their own
+    // words, so both survive.
+    assert!(
+        body.contains("review-549") && body.contains("main"),
+        "a refusal the user cannot act on is not an improvement: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The managed root is ADMITTED, not merely written to (#656 fix 1)
+//
+// ADR 0118's containment argument — "a new desk is inside the fence by
+// construction, because the root is admitted once at startup" — was a sentence
+// with nothing performing it. `worktrees_root()` resolved and
+// `exec_add_worktree` wrote there, but nothing ever scanned the root, so it was
+// never in the allowed roots and a desk the app had just created was not
+// servable (grok, on PR #656).
+//
+// These two tests are what turn the sentence into a mechanism. They use the
+// process-global catalog deliberately: the allowed roots ARE the global
+// catalog, and a test that supplied its own fence would prove nothing about the
+// one the server actually consults. Each admits only its own unique temporary
+// directory, so nothing another test can see is widened.
+// ---------------------------------------------------------------------------
+
+/// The fresh-install case, which is the one that was broken: the managed root
+/// does not exist yet, `scan_worktrees_root` creates **and admits** it, and the
+/// desk `AddWorktree` then makes is inside the fence.
+///
+/// The `create_dir_all` is load-bearing rather than tidy, and this test is
+/// where that shows: `scan_direct_children` returns early — before
+/// `allow_root` — when `read_dir` fails, so on a missing root the admission
+/// never happens at all.
+#[test]
+fn a_missing_managed_root_is_created_admitted_and_its_desks_are_servable() {
+    let (_dir, repo) = seeded_repo();
+    git_out(&repo, &["branch", "feature/desk"]);
+    let parent = tempfile::tempdir().unwrap();
+    // Deliberately does NOT exist: a fresh install has never made a desk.
+    let managed = parent.path().join("never-created");
+    assert!(!managed.exists(), "the fixture must start with no root");
+
+    let dest = with_worktrees_root(&managed, || async {
+        let dest = managed.join("review-656");
+        assert!(
+            !crate::state::path_is_allowed(&dest),
+            "the fixture must start outside the fence, or this proves nothing"
+        );
+
+        crate::state::scan_worktrees_root();
+        assert!(managed.is_dir(), "the scan must create the root it admits");
+
+        let (status, body) = plan_and_execute_in(
+            &repo,
+            None,
+            tokens(),
+            add("review-656", "feature/desk"),
+            crate::planner::DropProof::Nothing,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        dest
+    });
+
+    let canonical = std::fs::canonicalize(&dest).expect("the desk exists");
+    assert!(
+        crate::state::path_is_allowed(&canonical),
+        "the desk the app just created is outside its own fence: {}",
+        canonical.display()
+    );
+}
+
+/// The user-visible half of the same claim, and the one grok's finding was
+/// actually about: the drawer offers to open a desk only when the census marks
+/// it `Serviceable::Yes`, and that verdict is computed from the very allowed
+/// roots the scan populates. Without the scan the row comes back
+/// `OutsideAllowedRoots` and the desk the app just made cannot be opened.
+///
+/// Asserting on `Serviceable` rather than on `path_is_allowed` alone is what
+/// makes this a test of the outcome rather than of the mechanism.
+#[test]
+fn a_desk_the_app_just_made_is_serviceable_in_the_census() {
+    let (_dir, repo) = seeded_repo();
+    git_out(&repo, &["branch", "feature/desk"]);
+    let managed = tempfile::tempdir().unwrap();
+
+    let siblings = with_worktrees_root(managed.path(), || async {
+        crate::state::scan_worktrees_root();
+        let (status, body) = plan_and_execute_in(
+            &repo,
+            None,
+            tokens(),
+            add("review-656b", "feature/desk"),
+            crate::planner::DropProof::Nothing,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        match crate::worktree_census::worktree_census(&repo, false, &crate::state::path_is_allowed)
+            .await
+        {
+            git_vista_protocol::WorktreeCensus::Observed { siblings } => siblings,
+            git_vista_protocol::WorktreeCensus::CensusFailed { reason } => {
+                panic!("the census failed: {reason}")
+            }
+        }
+    });
+
+    let desk = siblings
+        .iter()
+        .find(|s| s.name == "review-656b")
+        .expect("the census must list the desk that was just created");
+    assert_eq!(
+        desk.serviceable,
+        git_vista_protocol::Serviceable::Yes,
+        "a desk under the managed root must be openable, not fenced off"
     );
 }

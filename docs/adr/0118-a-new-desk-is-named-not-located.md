@@ -1,6 +1,6 @@
 # ADR 0118 — A new desk is named, not located, and it is built in a root the app owns
 
-- **Status:** Accepted — path policy decided; implementation follows in #549
+- **Status:** Accepted — path policy decided; implemented in #549, amended by review (see §3a, §4)
 - **Date:** 2026-09-04
 - **Issue:** #549 (M11.04), answering `docs/superpowers/specs/m3.23-worktrees.md` **open question 2**
 - **Extends:** ADR 0117 (*"A discovered desk needs a door…"* — lands with #548 / PR #654, still open at the time of writing, so the link is deliberately omitted rather than left to 404) · [ADR 0008](0008-persistent-clones-xdg.md) (the managed root this mirrors)
@@ -114,6 +114,137 @@ are not:
 | `clones_root()` | once, at startup (and on first clone) | the installation's configuration |
 | a created worktree's directory | **never** | would be a request |
 | a discovered worktree's directory | **never** (ADR 0117) | would be a census |
+
+### 3a. "Allowed once, at startup" was a sentence with nothing performing it
+
+The row above says `worktrees_root()` is allowed *once, at startup*. As first
+implemented, **nothing did that.** The root was resolved (`worktrees_root()`)
+and written to (`create_dir_all` in the executor), and no code path ever
+admitted it: there was a `scan_clones_root()` at startup and on rescan, and no
+worktrees equivalent. So the containment argument this whole ADR rests on —
+*a new desk is inside the fence by construction* — held only as prose, and a
+desk the app had just created could not be selected (grok, reviewing PR #656).
+
+The correction is `state::scan_worktrees_root()`, called at startup beside
+`scan_clones_root()` and again on `POST /api/rescan`. It is a **scan**, not a
+bare `allow_root`, because admitting the root and registering the desks already
+under it are the same job — exactly as they are for clones, and reusing that
+shape means one mechanism rather than two that can drift.
+
+Two details are load-bearing rather than incidental:
+
+- **`read_only: false`.** That flag marks an entry a URL clone (ADR 0008) and is
+  what the picker keys **Delete** on. A linked worktree is an ordinary working
+  tree of a repository the operator already has; marking it a clone would offer
+  to delete it through a route whose guard is *"canonicalizes inside the clones
+  root"*, which this root deliberately does not.
+- **`create_dir_all` before the scan.** `Catalog::scan_direct_children` returns
+  early — *before* `allow_root` — when `read_dir` fails. On a fresh install the
+  root does not exist, so without this the admission never happens at all and
+  the first `AddWorktree` produces a directory nothing can serve. The clones
+  scan creates its root for a cosmetic reason (a misworded warning); here it is
+  the mechanism.
+
+**The general lesson, and it is the one worth carrying:** a security argument
+of the form *"X is admitted once, so every child is safe"* has two halves, and
+the omission half (§3 — never widen per-path) is the one that gets pinned,
+because a widening is what reviewers look for. The *admission* half is the one
+nobody tests, because forgetting it makes the app serve **less**, and a feature
+that quietly does not work reads as a bug rather than as a fence failure. Both
+halves now have tests: the exact-body pin for the omission, and
+`a_missing_managed_root_is_created_admitted_and_its_desks_are_servable` plus
+`a_desk_the_app_just_made_is_serviceable_in_the_census` for the admission — the
+second asserting the user-visible outcome (`Serviceable::Yes` in the census)
+rather than the mechanism.
+
+```mermaid
+flowchart TD
+    C["<b>'Admitted once, so every<br/>child is safe'</b><br/>the containment argument"]
+    A["<b>Half 1: ADMIT the root</b><br/>forgetting it makes the app<br/>serve LESS"]
+    O["<b>Half 2: never widen<br/>per path</b><br/>doing it makes the app<br/>serve MORE"]
+    AB["<b>Reads as a bug</b><br/>'the new desk won't open'<br/>— so nobody tested it"]
+    OB["Reads as a security hole<br/>— so it got an exact-body pin"]
+    F["<b>Both halves now tested</b><br/>admission: Serviceable::Yes in the census<br/>omission: the exact-body pin"]
+
+    C --> A --> AB --> F
+    C --> O --> OB --> F
+
+    classDef entry fill:#1f2d3d,color:#ffffff,stroke:#0d1620,stroke-width:2px
+    classDef gate fill:#fdf3e2,color:#5c3a05,stroke:#a86b12,stroke-width:3px
+    classDef bad fill:#fbe9e9,color:#6d1111,stroke:#a11d1d,stroke-width:3px
+    classDef good fill:#e9f6ec,color:#0f4a1f,stroke:#1d7a34,stroke-width:3px
+    class C entry
+    class A,O gate
+    class AB bad
+    class OB,F good
+```
+
+### 4. Every failure of this operation withholds the path by default
+
+The destination is the one thing the user did not choose and cannot see — §2 is
+built on that. Three of `exec_add_worktree`'s failure arms handed it to them
+anyway, the worst being git's own refusal relayed with only `.trim()` applied:
+
+```
+fatal: 'main' is already used by worktree at '/home/…/.local/share/git-vista/worktrees/desk'
+```
+
+That shipped in the HTTP body regardless of `GIT_VISTA_EXPOSE_PATHS`
+(reproduced independently by codex and grok on PR #656). It is the same shape
+as #657 on the worktree census, one milestone over: **a path-exposure control
+that holds on the success arm and not on the failure arm.** Twice in one
+milestone is a pattern, not a coincidence — the success arm is what everyone
+tests.
+
+All three arms now go through `state::withheld_detail`: this function writes the
+client-safe sentence itself, git's own words are appended **only** when the
+operator opted in, and the full text is written to the server's log either way.
+The rule is ADR 0119's — *"A guarantee that holds only on the success arm is
+not a guarantee"*, which lands with #657 / PR #658, still open at the time of
+writing, so the link is deliberately omitted rather than left to 404 (the same
+habit this ADR's own header follows for 0117). It is applied without exception
+here: a string that arrived from git or from the OS is *detail*, and it is not
+inspected first to decide.
+
+The refusal stays actionable because the two things the user actually chose —
+the desk name and the branch — are their own words, so the composed sentence
+still names both and says what the rule is. What is withheld is only where on
+disk the collision lives.
+
+**The test that would have stayed green is fixed in the same change.**
+`a_desk_on_the_branch_you_are_standing_on_is_refused` asserted `status != OK`
+and that the destination was absent, and both were true throughout the leak. It
+now reads the body and asserts it against *this run's actual temporary
+directories*, with a paired positive that the name and branch survived — so
+redaction cannot pass by making the message useless.
+
+```mermaid
+flowchart TD
+    E["<b>exec_add_worktree</b><br/>three failure arms"]
+    A1["create_dir_all<br/>io::Error"]
+    A2["spawn / sandbox<br/>error"]
+    A3["<b>git's stderr</b><br/>fatal: 'main' is already<br/>used by worktree at '/…'"]
+    W["<b>state::withheld_detail</b>"]
+    L["<b>server log</b><br/>full text, ALWAYS"]
+    ON["flag on:<br/>summary + git's words"]
+    OFF["<b>flag off (default)</b><br/>summary alone<br/>— name and branch survive"]
+
+    E --> A1 --> W
+    E --> A2 --> W
+    E --> A3 --> W
+    W --> L
+    W --> ON
+    W --> OFF
+
+    classDef entry fill:#1f2d3d,color:#ffffff,stroke:#0d1620,stroke-width:2px
+    classDef bad fill:#fbe9e9,color:#6d1111,stroke:#a11d1d,stroke-width:3px
+    classDef gate fill:#fdf3e2,color:#5c3a05,stroke:#a86b12,stroke-width:3px
+    classDef good fill:#e9f6ec,color:#0f4a1f,stroke:#1d7a34,stroke-width:3px
+    class E entry
+    class A1,A2,A3 bad
+    class W gate
+    class L,ON,OFF good
+```
 
 ## Alternatives considered
 

@@ -473,6 +473,21 @@ pub(super) async fn exec_reset_branch(
 /// this is the second place the same omission carries the fence, and it is
 /// pinned by reading this function's body rather than by running it, because a
 /// widening makes the app serve *more* and no behavioural test goes red.
+///
+/// # Every failure here is withheld-by-default, including git's own refusal
+///
+/// The destination path is the one thing the user did not choose and cannot
+/// see, and three of this function's failure arms used to hand it to them
+/// anyway: `create_dir_all`'s `io::Error`, the spawn error, and — the one
+/// codex and grok both reproduced — git's stderr, relayed with only `.trim()`
+/// applied, so `fatal: 'main' is already used by worktree at '/tmp/…'` shipped
+/// in the HTTP body regardless of `GIT_VISTA_EXPOSE_PATHS`.
+///
+/// All three now go through [`crate::state::withheld_detail`]: this function
+/// writes the client-safe sentence itself, git's own words are appended only
+/// when the operator opted in, and the full text is logged either way. Same
+/// control, same convention, and the same rule as ADR 0119 — a string that
+/// arrived from git or from the OS is *detail*, not inspected first.
 pub(super) async fn exec_add_worktree(
     repo: &Path,
     name: &WorktreeName,
@@ -480,13 +495,15 @@ pub(super) async fn exec_add_worktree(
 ) -> (StatusCode, String) {
     let root = crate::state::worktrees_root();
     if let Err(e) = std::fs::create_dir_all(&root) {
-        eprintln!(
-            "git-vista: /api/add-worktree couldn't create {}: {e}",
-            root.display()
-        );
+        // `io::Error`'s own text carries no path here, but the rule is not
+        // "inspect it and decide" — see this function's doc.
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Couldn't prepare the worktrees folder: {e}"),
+            crate::state::withheld_detail(
+                "/api/add-worktree",
+                "Couldn't prepare the worktrees folder.",
+                &format!("{}: {e}", root.display()),
+            ),
         );
     }
     let dest = root.join(name.as_str());
@@ -515,17 +532,37 @@ pub(super) async fn exec_add_worktree(
     // request-derived. See `git_cmd::sandboxed_with_grant`.
     let output = match crate::git_cmd::git_output_in_managed_root(repo, &args, &root).await {
         Ok(output) => output,
-        Err(e) => return crate::planner::couldnt_run("/api/add-worktree", &e),
+        // `e` is a spawn/sandbox error and routinely names the destination.
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::state::withheld_detail(
+                    "/api/add-worktree",
+                    "Couldn't run git to open the desk.",
+                    &e.to_string(),
+                ),
+            )
+        }
     };
     if !output.status.success() {
-        let why = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let why = if why.is_empty() {
-            "git worktree add failed.".to_string()
-        } else {
-            why
-        };
-        eprintln!("git-vista: /api/add-worktree failed: {why}");
-        return (StatusCode::CONFLICT, why);
+        // The confirmed leak. git's refusal for a branch already checked out
+        // somewhere is `fatal: '<branch>' is already used by worktree at
+        // '<abs path>'` — informative, and half of it is the server's layout.
+        // The name and the branch are the client's own words, so the sentence
+        // this composes stays useful with the path withheld.
+        let why = String::from_utf8_lossy(&output.stderr);
+        return (
+            StatusCode::CONFLICT,
+            crate::state::withheld_detail(
+                "/api/add-worktree",
+                &format!(
+                    "git wouldn't open a desk called ‘{name}’ on ‘{branch}’. A branch \
+                     can only be checked out at one desk at a time — the worktree list \
+                     says which one has it."
+                ),
+                &why,
+            ),
+        );
     }
     (
         StatusCode::OK,

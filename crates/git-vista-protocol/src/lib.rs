@@ -104,7 +104,16 @@ pub use diff::{
     FileDiff, Hunk, LineKind, ParsedPatch,
 };
 pub use dto::{
-    validate_clone_url, AddWorktreeRequest, AmendCommitError, AmendCommitRequest, AmendCommitSuccess, AmendFailureKind, BranchFromStashRequest, BranchRequest, CherryPickRequest, CloneRequest, CommitError, CommitFailureKind, CreateBranchRequest, CreateCommitRequest, CreateTagRequest, DeleteCloneRequest, DeleteRemoteTagRequest, DeleteTagRequest, DropContext, DropStashRequest, FetchError, FetchFailureKind, FetchRequest, FetchSuccess, HookPolicy, PullError, PullFailureKind, PullRequest, PullSuccess, PushRequest, PushStashRequest, PushTagRequest, RebaseStatus, RemoteRefUpdate, RepoMode, RepositoryDescriptor, RepositoryKind, ResolveConflictContentRequest, ResolveConflictRequest, SelectRequest, SelectWorktreeRequest, SessionInfo, SessionRequest, SignTagError, SignTagFailureKind, SignatureStatus, StashEntry, StashTarget, TagDetail, TagKind, WorktreePathsRequest, CLONE_IN_PROGRESS_SENTINEL,
+    validate_clone_url, AddWorktreeRequest, AmendCommitError, AmendCommitRequest,
+    AmendCommitSuccess, AmendFailureKind, BranchFromStashRequest, BranchRequest, CherryPickRequest,
+    CloneRequest, CommitError, CommitFailureKind, CreateBranchRequest, CreateCommitRequest,
+    CreateTagRequest, DeleteCloneRequest, DeleteRemoteTagRequest, DeleteTagRequest, DropContext,
+    DropStashRequest, FetchError, FetchFailureKind, FetchRequest, FetchSuccess, HookPolicy,
+    PullError, PullFailureKind, PullRequest, PullSuccess, PushRequest, PushStashRequest,
+    PushTagRequest, RebaseStatus, RemoteRefUpdate, RepoMode, RepositoryDescriptor, RepositoryKind,
+    ResolveConflictContentRequest, ResolveConflictRequest, SelectRequest, SelectWorktreeRequest,
+    SessionInfo, SessionRequest, SignTagError, SignTagFailureKind, SignatureStatus, StashEntry,
+    StashTarget, TagDetail, TagKind, WorktreePathsRequest, CLONE_IN_PROGRESS_SENTINEL,
 };
 pub use effects::{network_need_for_operation, IndexEffect, NetworkNeed, WorktreeEffect};
 pub use error::{ApiError, ApiErrorBody, ErrorCode, RequestId};

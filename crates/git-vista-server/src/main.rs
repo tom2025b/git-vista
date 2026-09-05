@@ -267,6 +267,16 @@ async fn main() {
         println!("git-vista: {clones_registered} persistent clone(s) re-registered");
     }
 
+    // ADR 0118 (M11.04, #549): the managed worktrees root is admitted to the
+    // allowed roots HERE, by being scanned — that admission is what makes
+    // "inside the fence by construction" true of every desk created under it.
+    // Runs even when the root is empty, and even when it does not yet exist:
+    // the scan creates it, and the point is the `allow_root`, not the count.
+    let (desks_registered, _) = state::scan_worktrees_root();
+    if desks_registered > 0 {
+        println!("git-vista: {desks_registered} linked worktree(s) re-registered");
+    }
+
     // M1.09 (#62): reload the durable operation journal. Anything left
     // non-terminal by a prior process is closed out as interrupted here (see
     // `durable`'s module docs for why that's the correct answer) before the
