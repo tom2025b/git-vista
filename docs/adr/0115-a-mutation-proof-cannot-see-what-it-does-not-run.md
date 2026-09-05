@@ -258,3 +258,57 @@ understands the specific decision, every time.
   the one variant this ADR's move did not fully close, and a future slice
   should either move it or record why it is exempt, the way #515/#518's
   `signals.rs` docstring records what still lives there and why.
+
+## Since this ADR was written
+
+The two bullets above that describe unfinished work are now history, not
+status. They are left as written — the record of what was true when the
+decision was made — and superseded here.
+
+**The inventory test is built.** #649 landed it as
+`crates/git-vista/src/wasm_module_census.rs`, scoped exactly as this ADR
+argued: it enumerates the `#[cfg(target_arch = "wasm32")]` module set by
+scanning `main.rs` and each `features/*/mod.rs`, collects every
+`include_str!` target, and names any wasm-only file at or above 150 lines
+that no host test reads and no argued `EXEMPT` entry covers. It enforces
+**visibility**, never correctness — its own module doc says so at length,
+and lists five separate things it does not prove.
+
+**The six gaps it named are closed.** In the order they went:
+
+| File | Closed by | What moved |
+|---|---|---|
+| `app/canvas.rs` | #650 | the 409 drift response, and the ordering rule that ties the announcement to the epoch the bump produced |
+| `features/shell/signals.rs` | #652 | the overlay payload map and `Overlay::ALL`'s completeness invariant |
+| `print.rs`, `render/labels.rs` | #653 | the GitHub link rules, the ref glyph mapping, the badge palette — one copy each, in two files |
+| `gestures.rs`, `features/diff/staging_view.rs` | #653 | the canvas shortcut map with its three ordering rules, and the roving-row key map both files held a copy of |
+
+Two things that only became visible once the census existed, and that the
+"what actually enforces this" section above did not anticipate:
+
+- **A duplicated decision is one gap counted twice, and the census counts
+  it once per file.** `print.rs` and `render/labels.rs` each held their own
+  copy of the badge glyph mapping and the badge palette, each carrying a
+  comment promising it matched the other. Neither file's `EXEMPT` entry
+  mentioned the other. The census cannot see duplication — it asks only
+  whether *someone* reads a file — so the pairing had to be noticed by a
+  reader. Where a move finds a duplicate, the destination should name the
+  one intended divergence explicitly rather than leaving two copies that
+  happen to agree: `BadgeSurface::Screen` / `Paper` exists for exactly
+  that, and a test asserts HEAD is the *only* kind that differs.
+- **A wasm-only file can contain a `#[cfg(test)] mod tests` that has never
+  run.** `print.rs` carried three assertions about its commit-link rule.
+  The module around them is `#[cfg(target_arch = "wasm32")]`, so the host
+  build compiled none of it: no failure, no pass, silence — the exact
+  shape this ADR is about, sitting inside a file that looked tested. The
+  census could not see it either, since the file was `EXEMPT` for
+  unrelated reasons. #653's suite now asserts `print.rs` contains no
+  `mod tests` at all, with the reason in the message. **Any wasm-only
+  module is worth grepping for `mod tests` before its coverage is
+  believed.**
+
+**One `EXEMPT` entry remains that names real debt**: `dialogs/open_url.rs`.
+The rest of the table is argued-thin files whose decisions already live in
+a host-tested `core`.
+
+**Signed:** max · 2026-09-05
