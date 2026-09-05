@@ -54,11 +54,32 @@ function git(args) {
   }).trim()
 }
 
-/** The confirm modal's own confirm button. */
+/**
+ * The confirm modal's own confirm button, located by position rather than by
+ * name.
+ *
+ * Deliberately not `getByRole('button', { name: 'Merge' })`: a withdrawn
+ * confirmation folds its reason into `aria-label`, so the accessible name is
+ * the *reason* rather than the label — which is the behaviour #65 asked for,
+ * and which would make a name-based locator silently stop finding the button
+ * in exactly the state this spec is about.
+ */
 function confirmButton(page) {
-  return page.getByRole('button', { name: /^Merge$/ })
+  return page.getByRole('button', { name: 'Cancel' }).locator('xpath=following-sibling::button')
 }
 
+/**
+ * Open the merge confirmation with the change feed settled on **this**
+ * repository.
+ *
+ * The wait is the part that matters, and it is not decoration. The app opens
+ * its feed at start-up, against the launch selection; opening a different
+ * repository makes the server close that stream and the client reconnect onto
+ * the new one. Until that second stream has published, the client has no
+ * snapshot at the plan's generation to difference against — and every verdict
+ * correctly falls to the arm that claims least. Racing it would make this spec
+ * assert the fallback and call it the feature.
+ */
 async function openMergeConfirmation(page) {
   await openMergePreviewRepo(page)
   const item = await openBranchMenu(page, PREVIEW_BRANCH)
@@ -66,18 +87,47 @@ async function openMergeConfirmation(page) {
   await expect(
     page.getByText(`Merge ‘${PREVIEW_BRANCH}’ into ‘${PREVIEW_INTO}’?`),
   ).toBeVisible()
-  // Wait for the plan to land: until it does there is no generation on screen
-  // and the feature correctly says nothing at all.
+  // The plan has landed *and* its picture is drawn — a positive signal, so the
+  // absence asserted next cannot be the absence of a dialog.
   await expect(page.getByText(PREVIEW_HEADING)).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByRole('img', { name: /^After:/ })).toBeVisible({ timeout: 30_000 })
+
+  // Now wait for the notice to be **absent**, and that wait is the whole
+  // synchronisation this spec needs.
+  //
+  // Absence is a positive signal here rather than a hopeful one, and that is
+  // worth stating because a spec that waits on an absence is usually wrong.
+  // Every unsettled state this feature can be in renders a notice: no feed yet
+  // says "couldn't tell", and a feed that has not published a reading at this
+  // plan's generation — which is what the app's start-up stream on the *launch*
+  // repository looks like until it reconnects onto this one — says "the
+  // repository changed". Only a client holding a reading at the plan's own
+  // generation renders nothing at all.
+  await expect(page.locator(STALE)).toHaveCount(0, { timeout: 20_000 })
+  await expect(confirmButton(page)).toHaveAttribute('aria-disabled', 'false')
 }
 
 test.describe('#555 a plan the repository moved past', () => {
-  test('says nothing at all while the plan is still current', async ({ page }) => {
+  test('says nothing while the plan is current, and stops saying it when the change is undone', async ({
+    page,
+  }) => {
+    // The quiet case is half the feature — and asserting it FIRST would be
+    // vacuous, because "the notice has not appeared yet" and "the notice will
+    // never appear" look identical to a fresh page. So the quiet state is
+    // proven by *returning* to it: make the repository move, wait for the
+    // notice, put it back, and require the notice to go away again.
     await openMergeConfirmation(page)
-    // The quiet case is half the feature. A notice that appears on an
-    // untouched repository is a notice nobody reads — and it would also be
-    // this feature failing open in the direction that costs nothing to detect.
-    await expect(page.locator(STALE)).toHaveCount(0)
+    const notice = page.locator(STALE)
+
+    git(['tag', 'briefly-there'])
+    await expect(notice).toBeVisible({ timeout: 20_000 })
+    await expect(confirmButton(page)).toHaveAttribute('aria-disabled', 'true')
+
+    // Back to exactly the generation the plan was built against. This is a
+    // repository that moved and moved back, and `enforce_fresh` would admit
+    // the plan — so the panel must not be more pessimistic than the gate.
+    git(['tag', '-d', 'briefly-there'])
+    await expect(notice).toHaveCount(0, { timeout: 20_000 })
     await expect(confirmButton(page)).toHaveAttribute('aria-disabled', 'false')
     await page.keyboard.press('Escape')
   })

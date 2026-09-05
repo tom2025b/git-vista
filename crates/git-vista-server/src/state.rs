@@ -507,6 +507,42 @@ pub(crate) fn current_path_if_set() -> Option<PathBuf> {
     current_snapshot().map(|current| current.path)
 }
 
+/// A handle on "which repository is this session serving **now**".
+///
+/// Captured inside a request's selection scope and read later from somewhere
+/// that has none — which is exactly what a long-lived SSE stream is: its body
+/// is polled by the response writer, outside the task-local scope the handler
+/// ran in (the same capture-synchronously reasoning [`inherit_selection`]
+/// spells out).
+///
+/// It exists for the change feed (M12.05, #555). A stream opens against one
+/// repository and the session can select a different one at any moment; a feed
+/// that kept publishing the old repository's generation would be answering a
+/// freshness question about a repository nobody is looking at — and answering
+/// it *confidently*, which is worse than not answering.
+#[derive(Clone)]
+pub(crate) struct SelectionReader(Option<SelectionCell>);
+
+impl SelectionReader {
+    /// Capture the calling request's selection cell. Synchronously, and in the
+    /// handler — a capture attempted from inside the stream body would find no
+    /// scope and silently pin the launch selection.
+    pub(crate) fn capture() -> Self {
+        Self(SELECTION.try_with(Arc::clone).ok())
+    }
+
+    /// The path this session is serving right now, resolving an unchosen cell
+    /// to the launch selection exactly as [`current`] does.
+    pub(crate) fn path(&self) -> Option<PathBuf> {
+        if let Some(cell) = &self.0 {
+            if let Some(chosen) = cell.read().expect("selection lock not poisoned").as_ref() {
+                return Some(chosen.path.clone());
+            }
+        }
+        current_path_if_set()
+    }
+}
+
 /// The mode the current selection is open in (ADR 0006/0007).
 pub(crate) fn current_mode() -> RepoMode {
     current_snapshot().expect("CURRENT is set at startup").mode

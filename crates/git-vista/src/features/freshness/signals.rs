@@ -36,7 +36,13 @@ use super::core::{freshness, FeedLog, PlanFreshness, PlanOnScreen};
 /// settle and a menu to unblock (#232's lockout), while this one has no state to
 /// release — a client with no feed simply says "couldn't tell" until it has one.
 /// Giving up permanently would make that sentence permanent too.
-const REATTACH_INTERVAL_MS: u64 = 3_000;
+///
+/// A second rather than the operations stream's two, because the ordinary cause
+/// of a clean close here is not a failure at all: the server ends the stream
+/// when this session selects a different repository, and the reconnect is how
+/// the feed follows it. A user who has just opened a repository should not
+/// watch a panel say "couldn't tell" for longer than it takes to read it.
+const REATTACH_INTERVAL_MS: u64 = 1_000;
 
 /// The repository change feed, as the app holds it.
 #[derive(Clone, Copy)]

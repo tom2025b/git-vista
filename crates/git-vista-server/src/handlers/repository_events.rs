@@ -32,6 +32,16 @@
 //! watcher behind an abandoned stream must not keep consuming a shared system
 //! resource.
 //!
+//! # The stream ends when the session selects a different repository
+//!
+//! A feed is bound to one worktree, and the session can select another at any
+//! moment. A stream that kept publishing the old repository's generation would
+//! be answering a freshness question about a repository nobody is looking at,
+//! *confidently* — which is worse than not answering. So the loop re-reads the
+//! session's selection and closes when it has moved; the client reconnects,
+//! discards the log it can no longer difference against, and starts again on
+//! the new repository.
+//!
 //! # Registered with the reads
 //!
 //! This describes the repository, not a write outcome, so both listeners serve
@@ -46,7 +56,7 @@ use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 
-use git_vista_protocol::change_feed::SNAPSHOT_EVENT;
+use git_vista_protocol::change_feed::{ChangeFeedSnapshot, SNAPSHOT_EVENT};
 
 use crate::operations;
 use crate::reconciliation;
@@ -60,6 +70,16 @@ const HEARTBEAT: Duration = Duration::from_secs(15);
 /// the honest reading of "this client has not been told anything for a while",
 /// and the reason the deadline is safe to have at all.
 const MAX_STREAM_LIFETIME: Duration = Duration::from_secs(30 * 60);
+
+/// How often a quiet stream wakes to check whether the session has selected a
+/// different repository.
+///
+/// A poll rather than a notification, deliberately: the selection is a shared
+/// cell any request can write, and threading a change signal from every write
+/// site to every open stream would be a second mechanism to keep correct. One
+/// lock read per second per stream, against a hard cap of 32 streams, is not a
+/// cost worth a mechanism.
+const SELECTION_CHECK: Duration = Duration::from_secs(1);
 
 /// `GET /api/repository/events` — the change feed for the current selection.
 ///
@@ -81,16 +101,35 @@ pub(crate) async fn repository_events() -> Response {
     // watcher and releases its inotify watches.
     let feed = reconciliation::attach(&repo);
     let mut snapshots = feed.subscribe();
+    // Captured here, in the handler, while the request's selection scope is
+    // still on the task. The stream body below is polled by the response
+    // writer, outside that scope — a capture attempted down there would find
+    // nothing and silently pin the launch selection.
+    let selection = crate::state::SelectionReader::capture();
 
     let stream = async_stream::stream! {
         let _permit = permit;
         let _feed = feed;
         let deadline = tokio::time::Instant::now() + MAX_STREAM_LIFETIME;
+        let mut sent: Option<ChangeFeedSnapshot> = None;
         loop {
+            if selection.path().as_deref() != Some(repo.as_path()) {
+                break;
+            }
             let current = snapshots.borrow_and_update().clone();
-            if let Some(snapshot) = current {
+            // Only what the client has not already been sent. The loop also
+            // wakes on a timer to re-check the selection, and re-sending the
+            // same snapshot every few seconds would make a client's log full of
+            // readings nothing took.
+            if current.is_some() && current != sent {
+                let Some(snapshot) = current.clone() else {
+                    break;
+                };
                 match Event::default().event(SNAPSHOT_EVENT).json_data(&snapshot) {
-                    Ok(event) => yield Ok::<Event, Infallible>(event),
+                    Ok(event) => {
+                        sent = current;
+                        yield Ok::<Event, Infallible>(event);
+                    }
                     // A snapshot that will not serialise is this server's own
                     // defect, and sending "{}" would render as a feed with no
                     // health at all. Close instead: a closed stream reconnects
@@ -98,11 +137,16 @@ pub(crate) async fn repository_events() -> Response {
                     Err(_) => break,
                 }
             }
-            let next = tokio::select! {
+            let alive = tokio::select! {
                 changed = snapshots.changed() => changed.is_ok(),
+                // The selection heartbeat. A session can select a different
+                // repository while this feed is perfectly quiet, and a quiet
+                // feed is exactly the case where nothing else would wake this
+                // loop to notice.
+                () = tokio::time::sleep(SELECTION_CHECK) => true,
                 _ = tokio::time::sleep_until(deadline) => false,
             };
-            if !next {
+            if !alive {
                 break;
             }
         }
