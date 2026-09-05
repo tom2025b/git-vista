@@ -17,10 +17,11 @@
 use git_vista_core::activity::Undoable;
 use git_vista_protocol::plan::Advisory;
 use git_vista_protocol::{
-    branch_holder, BranchHolder, BranchName, CommitOid, Explanation, MergeStrategy, RiskLevel,
-    Serviceable, WorktreeCensus,
+    branch_holder, BranchHolder, BranchName, CommitOid, Explanation, MergeStrategy, Plan,
+    RiskLevel, Serviceable, WorktreeCensus,
 };
 
+use crate::features::freshness::core::PlanOnScreen;
 use crate::features::graph::core::short_oid;
 
 /// A branch operation awaiting confirmation in the modal (Issue #33 follow-up).
@@ -222,6 +223,44 @@ pub struct ForceWithLease {
     /// the words are `features::explain::core`'s job and live in the view,
     /// which is what keeps every sentence in one replaceable place.
     pub explanation: Explanation,
+    /// The generation **that same plan** was built against, and the refs it
+    /// says it will move (M12.05, #555; #664 review, finding 7).
+    ///
+    /// Carried for the third time for the same reason `risk`, `advisories` and
+    /// `explanation` are: this confirmation displays a server-built plan, and
+    /// everything the dialog says about it must come off *that* plan rather
+    /// than a second one. Without it the force-with-lease confirmation had no
+    /// plan the freshness check could see — `preview_subject(Push)` is
+    /// `NotPreviewable`, so `preview.plan()` is `None` here — and the button
+    /// stayed enabled with no notice after the repository moved. That is
+    /// precisely the plan-backed force-push case #555 exists for.
+    pub plan: PlanOnScreen,
+}
+
+impl ForceWithLease {
+    /// Everything this confirmation shows about a force-with-lease push, taken
+    /// off the leased plan the server just built.
+    ///
+    /// One constructor, called by the menu that opens the confirmation and by
+    /// the Rebuild that replaces it (#664 review, defect 2). Five values must
+    /// come off the *same* plan — the risk that colours the button, the
+    /// advisories, the explanation, the lease oid the button will send, and the
+    /// generation the freshness check compares — and the way they stop coming
+    /// off the same plan is two call sites assembling them separately.
+    ///
+    /// `expected_remote_tip` is passed in rather than re-read from `plan`
+    /// because it is the oid the *plain* probe established and the leased plan
+    /// was then built against: taking it from the leased plan's own
+    /// `expected_ref_changes` would be reading back the value we just sent.
+    pub fn from_leased_plan(plan: &Plan, expected_remote_tip: CommitOid) -> Self {
+        Self {
+            expected_remote_tip,
+            risk: plan.risk,
+            advisories: plan.advisories.clone(),
+            explanation: git_vista_protocol::explain(plan),
+            plan: PlanOnScreen::of(plan),
+        }
+    }
 }
 
 /// The live "which branch is checked out?" answer a menu pre-check hands the
@@ -481,6 +520,15 @@ mod tests {
     /// than carrying a plausible-looking one that a later reader might mistake
     /// for coverage. The panel's own behaviour is pinned in
     /// `features::explain::core` and in the protocol crate's parity test.
+    /// A plan-on-screen for the tests in this module, which are not about
+    /// freshness — the same posture `caption_only_explanation` takes below.
+    fn no_particular_plan() -> PlanOnScreen {
+        PlanOnScreen {
+            generation: "1".to_string(),
+            expects: Vec::new(),
+        }
+    }
+
     fn caption_only_explanation() -> Explanation {
         Explanation {
             sections: Vec::new(),
@@ -508,6 +556,7 @@ mod tests {
                     risk: RiskLevel::Destructive,
                     advisories: Vec::new(),
                     explanation: caption_only_explanation(),
+                    plan: no_particular_plan(),
                 }),
             },
             OperationKind::Delete {
@@ -579,6 +628,7 @@ mod tests {
                 risk: RiskLevel::Destructive,
                 advisories: Vec::new(),
                 explanation: caption_only_explanation(),
+                plan: no_particular_plan(),
             }),
         }
         .describe();

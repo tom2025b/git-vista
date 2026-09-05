@@ -41,6 +41,12 @@
 //!   pure [`diff_spec_argv`] mapping to `git diff`'s argv.
 //! - [`newtype`] — the validating-newtype machinery the three above share, so
 //!   every string-shaped wire value is checked in exactly one place.
+//! - [`change_feed`] — the repository change feed (M12, ADR 0094):
+//!   [`ChangeFeedSnapshot`](change_feed::ChangeFeedSnapshot), the reading one
+//!   sweep published, its [`RefDelta`](change_feed::RefDelta) against the
+//!   previous one, and the [`ChangeFeedHealth`](change_feed::ChangeFeedHealth)
+//!   that says what the feed can currently do — so a degraded feed is a stated
+//!   condition rather than a quiet one.
 //! - [`worktree`] — the read-only worktree census (M11.01, #546):
 //!   [`WorktreeSibling`], [`Serviceable`] (the app's fence, kept separate from
 //!   git's own `locked`/`prunable` flags), the fallible [`WorktreeCensus`],
@@ -75,6 +81,7 @@
 pub mod newtype;
 
 pub mod activity;
+pub mod change_feed;
 pub mod effects;
 
 pub mod conflict;
@@ -95,6 +102,9 @@ pub mod version;
 pub mod worktree;
 
 pub use activity::ActivityPage;
+pub use change_feed::{
+    ChangeFeedHealth, ChangeFeedSnapshot, RefDelta, WatchBudget, WatcherLoss, SNAPSHOT_EVENT,
+};
 pub use conflict::{
     ConflictSource, ConflictedFile, ContentResolutionRefused, Continuation, NotTextResolvable,
     Stage,

@@ -79,6 +79,18 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     // #68c: the generation-tagged WorktreeStatus DTO — same read posture as
     // the v1 endpoint immediately above.
     ("/api/status/v2", Method::GET, Authz::SessionRequired),
+    // M12.05 (#555): the repository change feed. A GET (no CSRF surface) and
+    // *not* full_routes-gated: it discloses a generation digest, what moved
+    // between two readings by ref name, and the feed's own health — the same
+    // class of fact `/api/frame`'s ref badges already carry, and never
+    // working-tree contents, which is the line ADR 0005 draws for what the LAN
+    // router may see. Session-gated like every other read; a stream is a long
+    // read, not an exemption from the gate.
+    (
+        "/api/repository/events",
+        Method::GET,
+        Authz::SessionRequired,
+    ),
     // M2.21b (#236): the tag listing. A GET (no CSRF surface) and *not*
     // full_routes-gated: unlike `/api/staging/diff` above it discloses only
     // committed, published history — the same class of fact `/api/frame`'s ref
@@ -333,13 +345,17 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
 ///
-/// 73 as of the #550 rebase: `/api/select-worktree` (M11.03, #548),
-/// `/api/add-worktree` (M11.04, #549) and `/api/remove-worktree` (M11.05,
-/// #550) were each developed on their own branch and each counted one past
-/// the trunk they branched from, so the number only became wrong once all
-/// three landed on one trunk. All three are classified `SessionAndCsrf`
-/// above.
-const EXPECTED_ROUTE_COUNT: usize = 73;
+/// The way this number moves is the reason the constant exists. FOUR routes
+/// crossed onto the trunk from four separate branches, each of which counted
+/// correctly for the trunk it branched from:
+/// `/api/select-worktree` (M11.03, #548), `/api/add-worktree` (M11.04, #549)
+/// and `/api/remove-worktree` (M11.05, #550) are classified `SessionAndCsrf`
+/// above; `/api/repository/events` (M12.05, #555) is `SessionRequired`.
+/// No branch could see the total — only the trunk can, which is exactly what
+/// this constant and its test are for. Derived by running
+/// `every_registered_route_is_classified`, never copied from either side of a
+/// merge.
+const EXPECTED_ROUTE_COUNT: usize = 74;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in

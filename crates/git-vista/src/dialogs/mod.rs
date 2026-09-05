@@ -40,7 +40,7 @@ mod reset;
 pub use commit::commit_dialog_view;
 pub use confirm::{confirm_modal_view, error_modal_view, pull_picker_view};
 pub use open_url::open_url_view;
-pub use preview_panel::preview_panel_view;
+pub use preview_panel::{freshness_notice_view, preview_panel_view};
 pub use reset::reset_repo_view;
 
 /// Pop a native alert with `msg` (there's always a window in the running SPA).

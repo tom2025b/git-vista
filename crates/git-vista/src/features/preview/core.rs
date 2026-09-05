@@ -483,6 +483,54 @@ pub fn preview_action(subject: Option<DialogSubject<'_>>) -> PreviewAction {
     }
 }
 
+/// Whether a rebuild-lease continuation issued at generation `issued` is
+/// still the live one — `current` is `Preview`'s generation counter, read at
+/// the moment this is checked.
+///
+/// # Moved here for the same reason `preview_action` was (#664 review round 3)
+///
+/// This one comparison is the entire fix for the round's browser-reproduced
+/// defect: `dialogs/confirm.rs`'s `rebuild_lease` held a reply after Cancel,
+/// and nothing checked whether the rebuild it was completing was still
+/// current before writing state or re-opening the confirmation. The
+/// comparison itself is one line either way it is written, which is exactly
+/// why it must live where a runner can execute it rather than in
+/// `features/preview/signals.rs` (`#[cfg(target_arch = "wasm32")]`, `cargo
+/// test` never compiles it) — the same gap ADR 0115 and #612 both name, and
+/// the same fix: move the decision, not the value.
+///
+/// `None` (a disposed owner; `try_get_value` found nothing) is never
+/// current — the same conservative reading `Preview::fetch`'s own guard
+/// already gives an unreadable generation, so an unreadable one and a
+/// stale one are not distinguished here either.
+pub fn rebuild_token_is_current(current: Option<u64>, issued: u64) -> bool {
+    current == Some(issued)
+}
+
+#[cfg(test)]
+mod rebuild_token_tests {
+    use super::rebuild_token_is_current;
+
+    #[test]
+    fn a_token_matching_the_live_generation_is_current() {
+        assert!(rebuild_token_is_current(Some(3), 3));
+    }
+
+    #[test]
+    fn a_token_behind_the_live_generation_is_not_current() {
+        // Cancel, or a newer rebuild, bumped past it.
+        assert!(!rebuild_token_is_current(Some(4), 3));
+    }
+
+    #[test]
+    fn an_unreadable_generation_is_never_current() {
+        // A disposed owner — never treated as "still fine", the same
+        // conservative reading an unreadable ref gets everywhere else in
+        // this app.
+        assert!(!rebuild_token_is_current(None, 3));
+    }
+}
+
 #[cfg(test)]
 mod preview_action_tests {
     use super::*;
@@ -693,12 +741,40 @@ mod preview_action_tests {
              composition #594's mutation proof could not see, back in a wasm-only \
              file. Effect body was:\n{body}"
         );
+        // Every request for a picture, whatever asks for it: the effect that
+        // opens the dialog (`preview.start`) and the Rebuild control a stale
+        // plan offers (`preview.rebuild`, #664 review).
+        //
+        // The rule this census protects was never "exactly one call site" — it
+        // is that **every** request is routed through
+        // `preview_action(preview_subject(op))`, so a dialog can never ask for
+        // a picture of an operation the core says has none. Counting call sites
+        // was a cheap proxy for that while there was one. Now the property is
+        // checked directly, for each of them — which is also what caught the
+        // rebuild that resolved to `Clear` and therefore asked for nothing.
+        let starts: Vec<_> = CONFIRM
+            .match_indices("preview.start(")
+            .chain(CONFIRM.match_indices("preview.rebuild("))
+            .collect();
         assert_eq!(
-            CONFIRM.matches("preview.start(").count(),
-            1,
-            "`preview.start` is reachable from more than one place in confirm.rs; \
-             only the `PreviewAction::Start` arm may ask for a picture"
+            starts.len(),
+            2,
+            "a new request for a preview appeared in confirm.rs. That is \
+             allowed, but it must be routed through `preview_action` like the \
+             two below — add it here deliberately rather than raising the number"
         );
+        for (at, _) in starts {
+            let before = &CONFIRM[..at];
+            let routed = before
+                .rfind("preview_action(")
+                .is_some_and(|routed| before[routed..].matches("fn ").count() == 0);
+            assert!(
+                routed,
+                "a preview request at byte {at} is not preceded by a \
+                 `preview_action` in the same function — that is the \
+                 composition #594's mutation proof could not see"
+            );
+        }
         assert_eq!(
             CONFIRM.matches("preview.clear(").count(),
             1,

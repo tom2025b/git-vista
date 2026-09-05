@@ -141,15 +141,21 @@ fn check_protocol(request: &Request) -> Result<(), (ErrorCode, String)> {
     }
 }
 
-/// Whether `path` is the one route allowed to name its protocol version in the
-/// query string — `GET /api/operations/{id}/events`, the SSE stream.
+/// The two routes allowed to name their protocol version in the query string,
+/// because both are opened by `EventSource`, which cannot set request headers
+/// at all: `GET /api/operations/{id}/events` (M1.08) and
+/// `GET /api/repository/events` (M12.05, #555).
 ///
-/// Matched structurally rather than by a wildcard so the exception cannot widen
-/// by accident: a new `/api/operations/...` route does not inherit it.
+/// Each is matched **exactly** rather than by a wildcard, so the exception
+/// cannot widen by accident: a new `/api/operations/…` or `/api/repository/…`
+/// route does not inherit it. A version in a URL is cacheable and log-visible
+/// in a way a header is not, so the exception stays as narrow as the browser
+/// limitation that forced it.
 fn accepts_protocol_query(path: &str) -> bool {
-    path.starts_with("/api/operations/")
+    let operations_stream = path.starts_with("/api/operations/")
         && path.ends_with("/events")
-        && path.matches('/').count() == 4
+        && path.matches('/').count() == 4;
+    operations_stream || path == "/api/repository/events"
 }
 
 /// The `protocol=` query parameter's value, if the request carries one.

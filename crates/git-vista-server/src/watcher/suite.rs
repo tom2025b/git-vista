@@ -60,7 +60,8 @@ async fn git_pack_refs_rewrite_requests_an_authoritative_sweep() {
     let mut watcher = RepositoryWatcher::start(repo.path());
     assert!(matches!(
         next_notice(&mut watcher).await,
-        WatcherNotice::Health(WatcherHealth::Watching { watches }) if watches >= 2
+        WatcherNotice::Health(WatcherHealth::Watching { installed, wanted, .. })
+            if installed >= 2 && installed == wanted
     ));
 
     // Acceptance requires the real Git operation: touching packed-refs would
@@ -239,4 +240,37 @@ fn a_symlinked_refs_root_is_named_as_watch_loss_not_followed() {
         Err(WatcherLoss::WatchLost { path, reason })
             if path == refs && reason == "refs root is not a real directory"
     ));
+}
+
+#[tokio::test]
+async fn a_budget_smaller_than_the_watch_set_reports_bounded_rather_than_watching() {
+    // #556 acceptance 2 and 5: the bound is enforced in code, and hitting it is
+    // an observable state. A watcher that quietly covered less while still
+    // reporting `Watching` is the failure this milestone exists to prevent,
+    // aimed at itself.
+    let repo = repository();
+    git(repo.path(), &["branch", "one"]);
+    git(repo.path(), &["branch", "team/two"]);
+    git(repo.path(), &["branch", "team/sub/three"]);
+
+    let mut watcher = RepositoryWatcher::start_with_budget(
+        repo.path(),
+        git_vista_protocol::change_feed::WatchBudget::Undetermined { watches: 2 },
+    );
+    let health = tokio::time::timeout(Duration::from_secs(5), watcher.recv())
+        .await
+        .expect("the watcher reported within five seconds")
+        .expect("the watcher's notice stream stayed open");
+    match health {
+        WatcherNotice::Health(WatcherHealth::Watching {
+            installed, wanted, ..
+        }) => {
+            assert_eq!(installed, 2, "the budget bound the installs");
+            assert!(
+                wanted > installed,
+                "and the watcher says how much it wanted: {wanted} > {installed}"
+            );
+        }
+        other => panic!("expected a bounded watching report, got {other:?}"),
+    }
 }

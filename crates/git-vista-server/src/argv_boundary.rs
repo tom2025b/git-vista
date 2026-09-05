@@ -274,6 +274,14 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // acceptance operation itself (`git pack-refs --all`). Production
     // `watcher.rs` constructs no process; notify events remain hints only.
     "src/watcher/suite.rs",
+    // M12.03-M12.06 (#553-#556): `#[cfg(test)]` change-feed fixtures. Two
+    // spawns, both literal `git`: one builds a throwaway repository, the other
+    // makes the *external* change the sweep is supposed to notice. The second
+    // is the point of the suite — a change this process made through its own
+    // planner would prove nothing about a repository moving underneath it.
+    // Production `reconciliation.rs` constructs no process at all; every read
+    // it makes goes through the planner's existing generation path.
+    "src/reconciliation/suite.rs",
     // #448 removed `src/conflicts.rs` from this list: its `#[cfg(test)]` git
     // fixtures now come from the `git-vista-fixtures` catalogue, so the file
     // constructs no `Command` at all and the entry had become a permission

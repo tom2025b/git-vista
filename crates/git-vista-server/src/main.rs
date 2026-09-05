@@ -110,6 +110,7 @@ mod state;
 // metadata. The authoritative sweep/feed lands in later M12 slices, so this
 // tested module is intentionally staged before production wiring reaches it.
 #[cfg_attr(not(test), allow(dead_code))]
+mod reconciliation;
 mod watcher;
 // M11.01 (#546): the read-only worktree census (`git worktree list
 // --porcelain` resolved into `git_vista_protocol::WorktreeCensus`). Contract
@@ -510,6 +511,15 @@ fn api_router(
         // alongside the v1 shape above — not a replacement. See handlers::read
         // for why both exist side by side.
         .route("/api/status/v2", get(worktree_status_v2))
+        // M12.05 (#555, ADR 0094): the repository change feed — the live
+        // planner-recipe generation, what moved since the last snapshot, and
+        // what the feed itself can currently do. A read of repository state,
+        // so both listeners serve it; it carries no write outcome, no plan and
+        // no filesystem path.
+        .route(
+            "/api/repository/events",
+            get(handlers::repository_events::repository_events),
+        )
         // M2.21b (#236): every tag with the metadata the `/api/frame` ref
         // badges throw away — lightweight vs annotated, the peeled target, and
         // an annotated tag's own object, tagger and message. A read of

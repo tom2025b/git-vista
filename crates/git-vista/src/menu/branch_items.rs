@@ -334,11 +334,14 @@ pub(super) fn build_branch_items(
                         // button. Building it from a second preview fetched
                         // when the modal opens would cost another round trip
                         // and could describe a repository that had moved.
-                        let (risk, advisories, explanation) = match leased {
-                            Ok(plan) => {
-                                let explanation = git_vista_protocol::explain(&plan);
-                                (plan.risk, plan.advisories, explanation)
-                            }
+                        // M12.05 (#555): the plan's own generation and the refs
+                        // it says it will move, taken off the SAME plan, for the
+                        // same reason the three values beside them are. A
+                        // force-with-lease confirmation has no graph preview, so
+                        // this is the only way the dialog can know whether the
+                        // plan it is displaying still describes the repository.
+                        let lease = match leased {
+                            Ok(plan) => ForceWithLease::from_leased_plan(&plan, oid),
                             Err(e) => {
                                 dialogs.open(Dialog::Error);
                                 shell.open_error(ErrorNotice {
@@ -352,12 +355,7 @@ pub(super) fn build_branch_items(
                         shell.open_confirm(PendingOp::Push {
                             branch,
                             set_upstream: false,
-                            force: Some(ForceWithLease {
-                                expected_remote_tip: oid,
-                                risk,
-                                advisories,
-                                explanation,
-                            }),
+                            force: Some(lease),
                         });
                     });
                 };
