@@ -1,6 +1,15 @@
 # Rust build output
 /target
 
+# Per-worktree cargo target-dir override (e.g. when a lane's own disk is
+# faster than this checkout's default). This is per-machine, per-lane local
+# state, never a repo setting: CI runs as a different user with no access to
+# an arbitrary absolute path, so a committed copy fails every build job with
+# "Permission denied" before it compiles anything (found on PR #665, 2026-09-05
+# — the whole gate was green locally and red on every CI job for this reason
+# alone). Set `CARGO_TARGET_DIR` as a shell environment variable instead.
+/.cargo/config.toml
+
 # Trunk build output for the Leptos frontend
 /crates/git-vista/dist
 

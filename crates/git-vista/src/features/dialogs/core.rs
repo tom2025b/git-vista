@@ -679,6 +679,49 @@ pub fn worktree_confirm(action: WorktreeAction, paths: &[String], armed: bool) -
 }
 
 // ---------------------------------------------------------------------------
+// The remove-worktree confirmation (M11.05, #550)
+// ---------------------------------------------------------------------------
+//
+// Same two-tap ceremony `WorktreeAction::DeleteUntracked` above gets, and for
+// the same reason: `RemoveWorktree` is `RecoveryStrategy::Irrecoverable`, and
+// an uncommitted, never-staged edit in the closed desk has no copy anywhere
+// once this runs. This is a **separate function** rather than a third
+// `WorktreeAction` arm — `WorktreeAction` addresses tracked/untracked
+// *paths* inside the served worktree; `RemoveWorktree` addresses a whole
+// *other* worktree by id, a different subject with nothing in common to
+// share a body with (no path list to render, no per-path recovery nuance to
+// word).
+
+/// The remove-worktree confirmation. `armed` is the live state of
+/// [`ArmStep`]'s toggle, exactly as [`worktree_confirm`]'s `DeleteUntracked`
+/// arm consumes it — this ceremony is never single-tap.
+pub fn remove_worktree_confirm(name: &str, armed: bool) -> ConfirmPrompt {
+    ConfirmPrompt {
+        title: "Close worktree",
+        body: format!(
+            "Close the worktree ‘{name}’?\n\n\
+             This removes its directory from disk. Any uncommitted change in it \
+             was never stored in git, so once it's gone nothing in this repository \
+             — and nothing in git-vista — holds a copy. This is permanent. (git \
+             refuses on its own if the worktree isn't clean — this never forces \
+             past that.)"
+        ),
+        confirm_label: "Close Worktree",
+        danger: true,
+        enabled: armed,
+        arm: Some(ArmStep {
+            label: if armed {
+                "Step 1 of 2 done — closing is enabled"
+            } else {
+                "Step 1 of 2 — I understand this is permanent"
+            },
+            pressed: armed,
+        }),
+        blocked_reason: (!armed).then_some("Complete step 1 first — this can't be undone."),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The branch merge/delete confirmations
 // ---------------------------------------------------------------------------
 
@@ -1553,6 +1596,34 @@ mod tests {
             delete.arm.is_some(),
             "the ceremony itself must differ, not only the wording"
         );
+    }
+
+    /// M11.05 (#550): `remove_worktree_confirm` never dispatches unarmed —
+    /// the same two-tap shape `WorktreeAction::DeleteUntracked` gets above,
+    /// for its own operation with no `WorktreeAction` variant of its own.
+    #[test]
+    fn remove_worktree_needs_two_taps() {
+        let unarmed = remove_worktree_confirm("desk-two", false);
+        assert!(!unarmed.enabled, "an unarmed removal must be inert");
+        assert_eq!(
+            unarmed.arm,
+            Some(ArmStep {
+                label: "Step 1 of 2 — I understand this is permanent",
+                pressed: false,
+            })
+        );
+        assert!(unarmed.blocked_reason.is_some());
+        assert!(unarmed.danger);
+        assert!(
+            unarmed.body.contains("desk-two"),
+            "the confirmation must name the desk it is about: {}",
+            unarmed.body
+        );
+
+        let armed = remove_worktree_confirm("desk-two", true);
+        assert!(armed.enabled, "arming is what makes it live");
+        assert!(armed.arm.is_some_and(|a| a.pressed));
+        assert_eq!(armed.blocked_reason, None);
     }
 
     /// Both are `danger: true` — the deviation from #220's literal bullet,

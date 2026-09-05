@@ -559,6 +559,14 @@ fn api_router(
                 "/api/select-worktree",
                 post(handlers::select::select_discovered_worktree),
             )
+            // M11.05 (#550): close a linked sibling desk, addressed by the
+            // same opaque census id `/api/select-worktree` uses. Its own
+            // route rather than the generic `/api/plan` seam — see
+            // `handlers::worktrees`'s module doc.
+            .route(
+                "/api/remove-worktree",
+                post(handlers::worktrees::remove_worktree),
+            )
             // ADR 0009: re-scan the configured repo root without a restart.
             .route("/api/rescan", post(rescan))
             // Issue #18: create a branch at a commit (shells out to `git branch`).

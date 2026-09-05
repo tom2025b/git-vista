@@ -111,6 +111,24 @@ validated_string!(
 );
 
 validated_string!(
+    /// Opaque id of a **linked sibling** worktree — the same string form
+    /// [`crate::WorktreeSibling::id`] carries in the census — addressed by
+    /// [`GitOperation::RemoveWorktree`] (M11.05, #550).
+    ///
+    /// # A separate type from [`WorktreeToken`], on purpose
+    ///
+    /// `WorktreeToken` names the worktree a plan is built *against* — the one
+    /// the served repository already is. This names a *different* desk the
+    /// operation acts on. The two are never interchangeable (removing the
+    /// worktree you are standing in is refused server-side, never requested),
+    /// and giving them distinct types is what makes a mixed-up call a type
+    /// error at the point it is written, rather than a runtime refusal
+    /// discovered later.
+    WorktreeSiblingId,
+    |v| require_non_empty(v, "worktree id")
+);
+
+validated_string!(
     /// The repository-generation the plan was built against, as an **opaque
     /// token** compared only for equality (ADR 0001: no ordering, no "newer").
     /// Today it is the decimal form of the core `RepositoryGeneration` `u64`;
@@ -910,6 +928,46 @@ pub enum GitOperation {
     /// `Irrecoverable`, previously used only by push and test-repo-reset,
     /// applies here for a stronger reason than either of those).
     DeleteUntrackedPaths { paths: Vec<WorktreePath> },
+    /// `git worktree remove <path>` — close a linked sibling desk
+    /// (`POST /api/remove-worktree`, M11.05, #550).
+    /// `docs/superpowers/specs/m3.23-worktrees.md` §3–4 designs this as the
+    /// destructive twin of [`GitOperation::AddWorktree`]: [`RiskLevel::Destructive`],
+    /// [`RecoveryStrategy::Irrecoverable`], and **`--force` is never offered,
+    /// permanently** — git's own refusal on a dirty tree is the entire
+    /// protection an uncommitted edit in that worktree has, since nothing
+    /// ever wrote it to the object database.
+    ///
+    /// # `id` only — no `path` field, and that is a correction to the spec's sketch
+    ///
+    /// The spec sketched `{ path: PathBuf, id: WorktreeId }`. It does not
+    /// ship, for the same crate-boundary reason [`GitOperation::AddWorktree`]
+    /// dropped its own `path` field: this crate is wasm-safe and carries no
+    /// filesystem type, so no operation here can hold one. The rule the spec
+    /// states — *"the stable id is the mutation authority; path is an
+    /// expected value, compare-and-swapped against a fresh census immediately
+    /// before execution"* — is honoured without a wire-level path at all: the
+    /// server resolves `id` to a path once when the plan is **built** (via
+    /// the same worktree census [`GitOperation::CheckoutBranch`] already
+    /// pays for), carries that resolution in its own server-side `Observed`
+    /// state rather than in this operation, and re-resolves `id` against a
+    /// **fresh** census immediately before running `git worktree remove` —
+    /// refusing on any mismatch. See `git-vista-server`'s `worktree_exec`
+    /// module and ADR 0119 for the full mechanism and why it sits there
+    /// rather than on the wire.
+    ///
+    /// # No `Precondition`, and that is deliberate
+    ///
+    /// Unlike almost every other destructive operation in this vocabulary,
+    /// `shape` gives this **no** `Precondition` at all. The real gate — the
+    /// id-to-path compare-and-swap — cannot be expressed as a build-time
+    /// check re-verified by `enforce_fresh`, because what it verifies is
+    /// itself only meaningful **inside** the coordinator guard, immediately
+    /// before the spawn: the same posture `DeleteUntrackedPaths`' per-path
+    /// re-verification already takes (see that variant's own executor,
+    /// `verify_path_states`), extended to a compare-and-swap because the
+    /// hazard here is a different *desk* being acted on rather than a
+    /// different *file state*.
+    RemoveWorktree { id: WorktreeSiblingId },
     /// `git commit --amend [--allow-empty] -m <message>` — rewrite the
     /// checked-out branch's tip commit in place (a new message, and,
     /// with `allow_empty` when nothing is staged, an otherwise-empty
