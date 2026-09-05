@@ -1,6 +1,6 @@
 # ADR 0120 — A closed desk is proved twice, and never once on the wire
 
-- **Status:** Accepted — implemented, mutation proof pending (see "Mutation proof" below)
+- **Status:** Accepted — implemented, mutation-proved two ways, both caught
 - **Date:** 2026-09-05
 - **Issue:** #550 (M11.05)
 - **Extends:** [ADR 0117](0117-a-discovered-desk-needs-a-door-and-the-door-does-not-move-the-fence.md) (the census and the fence this reads) · [ADR 0119](0119-a-guarantee-that-holds-only-on-the-success-arm-is-not-a-guarantee.md) (`CensusPaths`, which this is the second caller of)
@@ -234,16 +234,22 @@ servable, non-current row answers yes to both "can I switch to this?" and
 
 ## Mutation proof
 
-**Not run as of this PR.** The `failure-atlas` MCP server was killed mid-session
-by an unrelated lane's `pkill -f "failure-atlas-"` (which matched the server
-binary path, not only its mutation clones) and this session had no
-interactive input to reconnect it via `/mcp` until a resume. Planned, two
-disjoint arms:
+Two arms against `crates/git-vista-server/src/planner/worktree_exec.rs`,
+proved via `failure-atlas`'s `mutation_check` (a fresh clone at HEAD, run
+unmutated then mutated, never touching this working tree), both **caught** by
+the same test — `remove_worktree_refuses_when_the_id_now_resolves_elsewhere`
+— which drives the exact scenario the spec names: the reviewed desk is closed
+and a different one reoccupies the same admin-dir slot, so `id` is unchanged
+but the real path is not.
 
-| arm | mutation | expected red assertion |
-|---|---|---|
-| remove the compare-and-swap | delete the `fresh_path != expected_path` check in `exec_remove_worktree` (always proceed on the expected path) | `remove_worktree_refuses_when_the_id_now_resolves_elsewhere` — asserts `StatusCode::CONFLICT` and the exact refusal text; a removed check would run the stale removal against the OLD path instead, on a repository where that path is already gone, changing both the status and the body |
-| weaken the compare to id-only | change the comparison to `expected_sibling.id == fresh_sibling.id` (drop the path equality) | the same test — the whole scenario is "same id, different path," so an id-only compare passes exactly where the real one must refuse |
+| arm | mutation | baseline | mutated |
+|---|---|---|---|
+| remove the compare-and-swap | delete the `if fresh_path != expected_path { … }` block entirely (`let _ = &expected_path;`) | green | **red** — the operation actually ran: `200 Worktree removed.` where `409` was expected. Without the guard, the stale plan's authority (`id`) silently redirected onto whatever now occupies it |
+| invert the comparison | `!=` → `==` (refuse on a match, proceed on a mismatch — backwards) | green | **red** — same observable failure, `200` instead of `409`; the guard now actively waves through the exact case it exists to catch |
 
-This is left as an explicit open box rather than a silently skipped one; see
-the PR body for the same table and its resolution before merge.
+Both mutations are real, disjoint code changes (one deletes the mechanism,
+the other inverts its logic) and both were caught by the same assertion,
+which is the correct shape here: the test's whole claim is "a stale plan
+whose id now resolves elsewhere is refused," and both ways of breaking that
+guarantee should — and did — trip it. Neither survived. Run ids: 280
+(deletion), 281 (inversion); `run_key: gv-550-remove-worktree-cas`.
