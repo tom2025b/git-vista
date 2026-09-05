@@ -106,6 +106,10 @@ mod security;
 mod session;
 mod staging;
 mod state;
+// GitHub token resolution (#583, M13.02): keyring, then environment, then a
+// gitignored local file — the fallback chain `state::credential_token`
+// (M13.01, #582) was scaffolding for. See ADR 0122.
+mod token_store;
 // M12.02 (#552): native filesystem hints over the selected worktree's Git
 // metadata. The authoritative sweep/feed lands in later M12 slices, so this
 // tested module is intentionally staged before production wiring reaches it.
@@ -224,6 +228,12 @@ async fn main() {
         eprintln!("error: {refusal}");
         std::process::exit(1);
     }
+
+    // #583 (M13.02): say which token-storage tier answered, masked, at boot —
+    // never only silently. Prints one ordinary line when nothing is
+    // configured; that is expected for a public repository and not a
+    // warning.
+    println!("{}", token_store::provenance_line());
 
     // Resolve which repo to serve: first CLI arg, else the default checkout.
     // Canonicalise so relative paths (e.g. `.`) and the banner are absolute; if
