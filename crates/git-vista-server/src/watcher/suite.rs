@@ -60,7 +60,8 @@ async fn git_pack_refs_rewrite_requests_an_authoritative_sweep() {
     let mut watcher = RepositoryWatcher::start(repo.path());
     assert!(matches!(
         next_notice(&mut watcher).await,
-        WatcherNotice::Health(WatcherHealth::Watching { watches }) if watches >= 2
+        WatcherNotice::Health(WatcherHealth::Watching { installed, wanted, .. })
+            if installed >= 2 && installed == wanted
     ));
 
     // Acceptance requires the real Git operation: touching packed-refs would

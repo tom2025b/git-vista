@@ -20,7 +20,12 @@ use std::time::{Duration, Instant};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc as tokio_mpsc;
 
+use git_vista_protocol::change_feed::WatchBudget;
+
 use crate::sandbox::worktree::linked_worktree_dirs;
+
+#[path = "watcher/budget.rs"]
+pub(crate) mod budget;
 
 /// Wait this long after the last hint before requesting a sweep.
 pub(crate) const DEBOUNCE: Duration = Duration::from_millis(100);
@@ -38,7 +43,17 @@ pub(crate) enum WatcherNotice {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WatcherHealth {
-    Watching { watches: usize },
+    /// `installed` of `wanted` directories are watched, against `budget`.
+    ///
+    /// Both counts, always — never just the one. `installed` alone cannot say
+    /// whether the coverage is complete, and a watcher that quietly covers less
+    /// than it wanted while reporting a healthy-looking number is the exact
+    /// failure M12.06 (#556) exists to prevent (spec D5(e)).
+    Watching {
+        installed: usize,
+        wanted: usize,
+        budget: WatchBudget,
+    },
     Lost(WatcherLoss),
 }
 
@@ -47,6 +62,11 @@ pub(crate) enum WatcherLoss {
     UnsupportedGeometry { reason: String },
     Backend { reason: String },
     WatchLost { path: PathBuf, reason: String },
+    /// inotify itself refused a watch: the shared per-user limit is exhausted.
+    /// A **fact reported by the kernel**, never inferred from this process's own
+    /// budget — the budget bounds politely and reports `Bounded`; only a real
+    /// refusal is this.
+    LimitReached { at: usize },
 }
 
 /// A running native watcher and its single-consumer notice stream.
@@ -63,6 +83,14 @@ impl RepositoryWatcher {
     /// `Lost` health value. Returning a quiet or already-closed stream here
     /// would make a dead watcher indistinguishable from a quiet repository.
     pub(crate) fn start(worktree: &Path) -> Self {
+        Self::start_with_budget(worktree, budget::derive(budget::InotifyLimits::read()))
+    }
+
+    /// [`start`](Self::start) with the watch budget supplied rather than read
+    /// from the kernel — the seam a test uses to drive the bounded path on a
+    /// machine whose real limits are six thousand times larger than any
+    /// fixture could exhaust.
+    pub(crate) fn start_with_budget(worktree: &Path, budget: WatchBudget) -> Self {
         let (notice_tx, notice_rx) = tokio_mpsc::unbounded_channel();
         let roots = match WatchRoots::resolve(worktree) {
             Ok(roots) => roots,
@@ -86,7 +114,7 @@ impl RepositoryWatcher {
             .name("git-vista-repository-watcher".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_driver(roots, input_tx, input_rx, notice_tx);
+                    run_driver(roots, budget, input_tx, input_rx, notice_tx);
                 }));
                 if result.is_err() {
                     report_loss(
@@ -273,6 +301,7 @@ enum DriverInput {
 
 fn run_driver(
     roots: WatchRoots,
+    budget: WatchBudget,
     input_tx: mpsc::Sender<DriverInput>,
     input_rx: mpsc::Receiver<DriverInput>,
     notices: tokio_mpsc::UnboundedSender<WatcherNotice>,
@@ -294,13 +323,18 @@ fn run_driver(
     };
 
     let mut installed = BTreeSet::new();
-    if let Err(loss) = reconcile_watches(&roots, &mut watcher, &mut installed) {
-        report_loss(&notices, loss);
-        return;
-    }
+    let mut coverage = match reconcile_watches(&roots, &budget, &mut watcher, &mut installed) {
+        Ok(coverage) => coverage,
+        Err(loss) => {
+            report_loss(&notices, loss);
+            return;
+        }
+    };
     if notices
         .send(WatcherNotice::Health(WatcherHealth::Watching {
-            watches: installed.len(),
+            installed: installed.len(),
+            wanted: coverage,
+            budget: budget.clone(),
         }))
         .is_err()
     {
@@ -374,10 +408,25 @@ fn run_driver(
                 let invalidated =
                     forget_invalidated_directory_watches(&event, &mut watcher, &mut installed);
                 let before = installed.len();
-                if let Err(loss) = reconcile_watches(&roots, &mut watcher, &mut installed) {
-                    let _ = notices.send(WatcherNotice::Sweep);
-                    report_loss(&notices, loss);
-                    return;
+                let was_covering = coverage;
+                coverage = match reconcile_watches(&roots, &budget, &mut watcher, &mut installed) {
+                    Ok(coverage) => coverage,
+                    Err(loss) => {
+                        let _ = notices.send(WatcherNotice::Sweep);
+                        report_loss(&notices, loss);
+                        return;
+                    }
+                };
+                // Coverage that changed is a health transition, and it is
+                // published as one. A ref tree that grew past the budget while
+                // the process ran must not keep reporting the count it had
+                // when it still fitted.
+                if coverage != was_covering || installed.len() != before {
+                    let _ = notices.send(WatcherNotice::Health(WatcherHealth::Watching {
+                        installed: installed.len(),
+                        wanted: coverage,
+                        budget: budget.clone(),
+                    }));
                 }
                 debounce.hint(Instant::now());
                 if invalidated || installed.len() > before {
@@ -424,11 +473,33 @@ fn forget_invalidated_directory_watches(
     !invalidated.is_empty()
 }
 
+/// Bring the installed watch set in line with the wanted one, within `budget`.
+///
+/// Returns **how many directories were wanted**, which is not always how many
+/// were installed: past the budget this stops installing and says so through
+/// that difference, rather than watching everything and letting inotify fail
+/// somewhere the app cannot see (M12.06, #556).
+///
+/// # Why the budget bounds rather than fails
+///
+/// A bounded watcher is not a broken one. The sweep is the only thing that ever
+/// makes a claim about the repository (spec D1), so an unwatched ref namespace
+/// costs the sweep interval in latency and nothing in correctness. What must
+/// never happen is covering less *while reporting the same health* — which is
+/// why the count is returned rather than logged.
+///
+/// # The order is deterministic, and the required roots come first
+///
+/// `wanted_directories` is a `BTreeSet<PathBuf>`, so iteration is lexicographic
+/// and stable across runs; the two required roots are installed ahead of it so
+/// a budget too small for the whole ref tree still watches `HEAD`, `index` and
+/// `packed-refs` — the files that move on nearly every operation.
 fn reconcile_watches(
     roots: &WatchRoots,
+    budget: &WatchBudget,
     watcher: &mut RecommendedWatcher,
     installed: &mut BTreeSet<PathBuf>,
-) -> Result<(), WatcherLoss> {
+) -> Result<usize, WatcherLoss> {
     let wanted = roots.wanted_directories()?;
     for required in roots.required_roots() {
         if !wanted.contains(&required) || !required.is_dir() {
@@ -446,17 +517,37 @@ fn reconcile_watches(
         let _ = watcher.unwatch(&path);
         installed.remove(&path);
     }
-    let additions: Vec<_> = wanted.difference(installed).cloned().collect();
-    for path in additions {
+
+    let required = roots.required_roots();
+    let ordered = required
+        .iter()
+        .cloned()
+        .chain(wanted.iter().filter(|p| !required.contains(*p)).cloned());
+    for path in ordered {
+        if installed.contains(&path) {
+            continue;
+        }
+        // The bound, enforced in code rather than by convention (#556). It is
+        // checked before every install, so a ref tree that grows past it while
+        // the process runs is bounded at the same number as one that was
+        // already too large at start-up.
+        if installed.len() >= budget.watches() {
+            break;
+        }
         watcher
             .watch(&path, RecursiveMode::NonRecursive)
-            .map_err(|error| WatcherLoss::WatchLost {
-                path: path.clone(),
-                reason: error.to_string(),
+            .map_err(|error| match error.kind {
+                notify::ErrorKind::MaxFilesWatch => WatcherLoss::LimitReached {
+                    at: installed.len(),
+                },
+                _ => WatcherLoss::WatchLost {
+                    path: path.clone(),
+                    reason: error.to_string(),
+                },
             })?;
         installed.insert(path);
     }
-    Ok(())
+    Ok(wanted.len())
 }
 
 fn report_loss(notices: &tokio_mpsc::UnboundedSender<WatcherNotice>, loss: WatcherLoss) {
