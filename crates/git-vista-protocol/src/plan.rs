@@ -83,7 +83,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::newtype::{
     require_git_safe, require_hex, require_non_empty, require_non_empty_bounded,
-    require_remote_name, require_stash_selector, require_worktree_relative_path,
+    require_remote_name, require_stash_selector, require_worktree_name,
+    require_worktree_relative_path,
 };
 
 /// Why a plan field failed validation — see
@@ -226,6 +227,45 @@ validated_string!(
     /// sees it.
     RemoteName,
     |v| require_remote_name(v, "remote name", MAX_REMOTE_NAME_LEN)
+);
+
+/// The most bytes a [`WorktreeName`] may carry.
+///
+/// 100, matching [`MAX_REMOTE_NAME_LEN`], and for a compounding reason: the
+/// value is client-chosen, rides into a hashed and journaled [`Plan`], **and**
+/// becomes a directory name on disk. `NAME_MAX` is 255 on Linux, so this is
+/// comfortably under the filesystem's own limit — the cap is here to keep a
+/// hostile megabyte-long "name" a wire-boundary 400, not to approximate that
+/// limit.
+pub const MAX_WORKTREE_NAME_LEN: usize = 100;
+
+validated_string!(
+    /// The **folder name** of a new linked worktree — `review-547`,
+    /// `spike.2`, `desk_two`. A single path segment, never a path (M11.04,
+    /// #549, ADR 0118).
+    ///
+    /// # This is the containment boundary, and it is a type rather than a check
+    ///
+    /// ADR 0118 records the decision this type implements: new worktrees are
+    /// created under an app-owned managed root, and the operation names one
+    /// rather than locating it. The server computes
+    /// `worktrees_root().join(name)`, which can only ever be a direct child
+    /// **because** this type cannot hold a separator, a `..`, a leading dot, or
+    /// an absolute path. That last one matters more than it looks:
+    /// `Path::join` given an absolute argument discards the base entirely, so a
+    /// `path`-shaped field would have let a client replace the managed root
+    /// with any location on the filesystem.
+    ///
+    /// Running the validator from `Deserialize` — which the macro does — is
+    /// what makes the guarantee reach a *submitted plan* too, not just a freshly
+    /// built one: a plan carrying `../../etc` is a hard wire error before any
+    /// handler sees it.
+    ///
+    /// See [`newtype::require_worktree_name`](crate::newtype::require_worktree_name)
+    /// for the exact rule and why it deliberately does not share code with
+    /// [`RemoteName`]'s validator despite the rules matching today.
+    WorktreeName,
+    |v| require_worktree_name(v, "worktree name", MAX_WORKTREE_NAME_LEN)
 );
 
 validated_string!(
@@ -1236,6 +1276,33 @@ pub enum GitOperation {
         expected_oid: CommitOid,
     },
     //
+    /// `git worktree add <path> <branch>` — open a second desk on an existing
+    /// branch (M11.04, #549).
+    ///
+    /// [`RiskLevel::Safe`] and [`RecoveryStrategy::NotNeeded`]: it creates a
+    /// directory and a metadata file, moves no ref, and destroys nothing. git
+    /// itself refuses if the branch is already checked out somewhere else —
+    /// and [`Precondition::BranchFreeInEveryOtherWorktree`] (M11.02) states
+    /// that rule to the UI first, so the button is not offered on a check
+    /// nobody made.
+    ///
+    /// # It carries a NAME, not a path — see ADR 0118
+    ///
+    /// The design spec sketched `{ path: PathBuf, branch }`. That shape does
+    /// not ship. Tom's answer to the spec's open question 2 puts new worktrees
+    /// under an app-owned managed root, and a client-supplied path would turn
+    /// containment into a check some call site can forget — the one thing the
+    /// managed root exists to avoid. It would also be the only request body in
+    /// this codebase carrying a filesystem path.
+    ///
+    /// So the server computes the location: `worktrees_root().join(name)`.
+    /// [`WorktreeName`] cannot hold a separator, a `..`, a leading dot, or an
+    /// absolute path, so that join can only ever name a direct child of the
+    /// managed root. Containment is a property of the type, not of a check.
+    AddWorktree {
+        name: WorktreeName,
+        branch: BranchName,
+    },
     // `PopStash` is deliberately ABSENT (M3.24, decided 2026-08-18; the
     // variant that contradicted this comment was removed 2026-08-25, #493,
     // ADR 0078).

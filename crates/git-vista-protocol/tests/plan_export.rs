@@ -135,7 +135,7 @@ fn every_golden_operation_has_an_explicit_export_answer() {
     let plans = plans();
     assert_eq!(
         plans.len(),
-        37,
+        38,
         "the fixture census changed; inspect the new operation"
     );
     for plan in plans {

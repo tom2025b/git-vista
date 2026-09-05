@@ -242,6 +242,12 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
         Authz::SessionAndCsrf,
     ),
     ("/api/checkout", Method::POST, Authz::SessionAndCsrf),
+    // M11.04 (#549): creates a directory under the app's managed worktrees
+    // root and runs `git worktree add`. A git write, so the full write
+    // posture. It is also the only route that creates a directory outside the
+    // clones root, which is why its spawn carries an explicit extra grant —
+    // see `git_cmd::sandboxed_with_grant`.
+    ("/api/add-worktree", Method::POST, Authz::SessionAndCsrf),
     (
         "/api/force-delete-branch",
         Method::POST,
@@ -335,7 +341,15 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// dropped by a `main.rs` refactor that this scanner's pattern-matching
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
-const EXPECTED_ROUTE_COUNT: usize = 72;
+/// 73 as of the M12 merge, and the way it got there is the reason this
+/// constant exists. `/api/select-worktree` (M11.03, #548) and
+/// `/api/add-worktree` (M11.04, #549) were developed on branches that each
+/// counted 71, so the number only became wrong once both were on one trunk —
+/// and `/api/repository/events` (M12.05, #555) then made the same crossing
+/// from a third branch that counted 72. Three routes, three branches, each
+/// individually correct; only the trunk can see the total. The first two are
+/// classified `SessionAndCsrf` above and the third `SessionRequired`.
+const EXPECTED_ROUTE_COUNT: usize = 73;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in

@@ -245,6 +245,11 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // (M11's write path is a later slice) — it stands in for a user at a
     // terminal, never the path being proven.
     "src/planner/worktree_collision_suite.rs",
+    // #[cfg(test)] git fixtures for the M11.04 (#549) worktree-add suite:
+    // plain `git branch` to make a branch that is not checked out, and
+    // `git worktree list --porcelain` to read back what the executor actually
+    // created — outside the sandboxed harness under test.
+    "src/planner/worktree_add_suite.rs",
     // #[cfg(test)] git fixtures for the #214 (M2.17c) hunk/line-staging
     // suite: plain `git init`/`commit`/`add`/`diff` to build fixture
     // repositories and read back their state, outside the sandboxed harness
