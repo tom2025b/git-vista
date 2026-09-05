@@ -268,10 +268,40 @@ pub enum WorktreeCensus {
     Observed { siblings: Vec<WorktreeSibling> },
     /// `git worktree list --porcelain` could not be run, exited non-zero,
     /// printed something the parser does not understand, or resolved to a
-    /// row this application could not derive a stable identity for. `reason`
-    /// is for a human reading a diagnostic; nothing downstream may treat this
-    /// as evidence about any branch or any sibling.
-    CensusFailed { reason: String },
+    /// row this application could not derive a stable identity for. The two
+    /// fields are for a human reading a diagnostic; nothing downstream may
+    /// treat this as evidence about any branch or any sibling.
+    ///
+    /// # Why the diagnostic is split in two (#657)
+    ///
+    /// [`WorktreeSibling::path`] honours `GIT_VISTA_EXPOSE_PATHS`; a single
+    /// `reason` string did not, and every failure this variant carries is
+    /// serialized to the client on `GET /api/worktrees`, on
+    /// `POST /api/select-worktree`, and (through
+    /// [`BranchHolder::Unknown`]) in the planner's collision refusal. So the
+    /// flag was right on the arm everyone tests and absent from the arm
+    /// nobody does. Redacting the whole string instead would have cost the
+    /// diagnosability this variant exists to provide, which is the real
+    /// trade-off ADR 0119 weighs; splitting keeps both.
+    ///
+    /// The invariant a client may rely on: **`reason` is identical whether or
+    /// not the operator opted in.** The flag adds `detail`; it never rewrites
+    /// `reason`.
+    CensusFailed {
+        /// The always-client-safe half. Composed only of literals the census
+        /// writes itself plus values from a closed set proven path-free
+        /// (counts, base names, ref names, byte ceilings) — never a string
+        /// that arrived from git, from `gix`, or from a parser, since any of
+        /// those can name an absolute path.
+        reason: String,
+        /// The path-bearing half — omitted (`None`) unless the operator
+        /// opted into path exposure (`GIT_VISTA_EXPOSE_PATHS`), identically
+        /// to [`WorktreeSibling::path`]. Always written to the server's own
+        /// log regardless of the flag, so nothing is ever lost, only
+        /// withheld.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        detail: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -549,7 +579,10 @@ pub enum BranchHolder<'a> {
 /// strictly better than naming none.
 pub fn branch_holder<'a>(census: &'a WorktreeCensus, branch: &BranchName) -> BranchHolder<'a> {
     match census {
-        WorktreeCensus::CensusFailed { reason } => BranchHolder::Unknown(reason.as_str()),
+        // `reason`, never `detail`: this string is relayed into a refusal
+        // message the client reads, and `reason` is the half that carries no
+        // path whether or not the operator opted in (#657).
+        WorktreeCensus::CensusFailed { reason, .. } => BranchHolder::Unknown(reason.as_str()),
         WorktreeCensus::Observed { siblings } => siblings
             .iter()
             .find(|s| !s.is_current && s.branch.as_ref() == Some(branch))
@@ -689,6 +722,7 @@ mod tests {
     fn census_failed_is_not_an_empty_observed() {
         let failed = WorktreeCensus::CensusFailed {
             reason: "spawn failed".to_string(),
+            detail: None,
         };
         let empty = WorktreeCensus::Observed { siblings: vec![] };
         assert_ne!(failed, empty);
@@ -698,6 +732,53 @@ mod tests {
         assert_ne!(failed_json, empty_json);
         assert_eq!(failed_json["kind"], "census_failed");
         assert_eq!(empty_json["kind"], "observed");
+    }
+
+    /// `detail` is omitted from the wire entirely when `None`, exactly as
+    /// [`WorktreeSibling::path`] is — the leak-nothing-by-default posture
+    /// #657 exists to extend to this arm. Asserted on the raw JSON because a
+    /// round trip alone cannot tell "omitted" from "sent as null".
+    #[test]
+    fn absent_census_detail_is_omitted_not_sent_as_null() {
+        let json = serde_json::to_value(WorktreeCensus::CensusFailed {
+            reason: "spawn failed".to_string(),
+            detail: None,
+        })
+        .unwrap();
+        assert!(
+            !json.as_object().unwrap().contains_key("detail"),
+            "detail must be absent from the wire when None, not present as null: {json}"
+        );
+
+        let json = serde_json::to_value(WorktreeCensus::CensusFailed {
+            reason: "spawn failed".to_string(),
+            detail: Some("/home/someone/secret".to_string()),
+        })
+        .unwrap();
+        assert_eq!(json["detail"], "/home/someone/secret");
+    }
+
+    /// The refusal a client reads is built from `reason`, never from
+    /// `detail`. `BranchHolder::Unknown` is relayed verbatim into the
+    /// planner's collision refusal (`git-vista-server::planner`), which is
+    /// the third route #657's finding did not name — and the reason the fix
+    /// lives in the value rather than in each route.
+    #[test]
+    fn branch_holder_unknown_relays_the_safe_reason_not_the_detail() {
+        let census = WorktreeCensus::CensusFailed {
+            reason: "the worktree list could not be read".to_string(),
+            detail: Some("/home/someone/private/repo".to_string()),
+        };
+        match branch_holder(&census, &branch("feature/x")) {
+            BranchHolder::Unknown(r) => {
+                assert_eq!(r, "the worktree list could not be read");
+                assert!(
+                    !r.contains("/home/someone"),
+                    "the path-bearing half must never reach a refusal message: {r}"
+                );
+            }
+            other => panic!("a failed census is Unknown, got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -880,6 +961,7 @@ mod tests {
     fn a_failed_census_is_never_read_as_a_free_branch() {
         let census = WorktreeCensus::CensusFailed {
             reason: "`git worktree list --porcelain` failed: no such command".to_string(),
+            detail: None,
         };
         let holder = branch_holder(&census, &branch("feature/x"));
         assert!(

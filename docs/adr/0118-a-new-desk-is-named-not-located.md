@@ -199,12 +199,10 @@ tests.
 All three arms now go through `state::withheld_detail`: this function writes the
 client-safe sentence itself, git's own words are appended **only** when the
 operator opted in, and the full text is written to the server's log either way.
-The rule is ADR 0119's — *"A guarantee that holds only on the success arm is
-not a guarantee"*, which lands with #657 / PR #658, still open at the time of
-writing, so the link is deliberately omitted rather than left to 404 (the same
-habit this ADR's own header follows for 0117). It is applied without exception
-here: a string that arrived from git or from the OS is *detail*, and it is not
-inspected first to decide.
+The rule is [ADR 0119](0119-a-guarantee-that-holds-only-on-the-success-arm-is-not-a-guarantee.md)'s,
+landed with #657 as `23516d1f`. It is applied without exception here: a string
+that arrived from git or from the OS is *detail*, and it is not inspected first
+to decide.
 
 The refusal stays actionable because the two things the user actually chose —
 the desk name and the branch — are their own words, so the composed sentence
