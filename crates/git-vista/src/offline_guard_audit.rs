@@ -195,6 +195,7 @@ const OFFLINE_GUARDED: &[&str] = &[
     "undo_request",
     "discard_tracked_paths_request",
     "delete_untracked_paths_request",
+    "remove_worktree_request",
     "rebase_request",
     "reset_test_repo_request",
     // Fans out to FIVE distinct server routes via its caller-supplied `path`

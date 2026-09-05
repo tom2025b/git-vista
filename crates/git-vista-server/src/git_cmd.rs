@@ -237,38 +237,50 @@ fn sandboxed(
     })
 }
 
-/// [`sandboxed`] plus **one** extra read-write grant (M11.04, #549, ADR 0118).
+/// [`sandboxed`] plus **one** extra read-write grant.
 ///
-/// # One caller, and why it needs this at all
+/// # Two callers, and why each needs this
 ///
-/// `git worktree add` is the only operation whose destination is outside the
-/// repository it runs in: ADR 0118 puts new worktrees under an app-owned
-/// managed root, so the spawn needs write access to a tree `policy_for` would
-/// never grant, because `policy_for` grants the repository and the system
-/// trees and nothing else.
+/// `git worktree add` (M11.04, #549, ADR 0118) and `git worktree remove`
+/// (M11.05, #550, ADR 0120) are the two spawns whose target is outside the
+/// repository they run in — a new desk's directory, or a sibling's — which
+/// `policy_for` never grants: it grants the served repository (and its
+/// commondir, for a linked worktree) and the fixed system trees, nothing
+/// else. Without the extra grant, neither spawn could write where it needs
+/// to even after every other check has passed.
 ///
 /// # It composes `policy_for` rather than replacing it — the inverse of clone
 ///
 /// `policy_for_clone` is an *independent* constructor precisely because clone
 /// has no repository to look a trust flag up for, and must never be able to
-/// reach `Tier::Unsandboxed`. Worktree-add is the opposite case: it has a
-/// repository, and it must inherit **exactly** that repository's tier, trust
-/// state, hook mode and secret excludes — anything else would mean an
-/// operation on a repository ran under a policy that repository never earned.
-/// So this takes the policy the operation would otherwise have had and adds
-/// one grant to it, changing nothing else.
+/// reach `Tier::Unsandboxed`. Both worktree-add and worktree-remove are the
+/// opposite case: each has a repository, and each must inherit **exactly**
+/// that repository's tier, trust state, hook mode and secret excludes —
+/// anything else would mean an operation on a repository ran under a policy
+/// that repository never earned. So this takes the policy the operation
+/// would otherwise have had and adds one grant to it, changing nothing else.
 ///
-/// # `grant` is never request-derived, and that is the guarantee
+/// # `grant` is never request-derived, for either caller
 ///
-/// The only argument ever passed here is `state::worktrees_root()` — a
-/// constant of the installation, resolved from the environment at startup, and
-/// never assembled from anything a client sent. The client supplies a
+/// `AddWorktree`'s grant is always `state::worktrees_root()` — a constant of
+/// the installation, resolved from the environment at startup, never
+/// assembled from anything a client sent; the client supplies a
 /// [`WorktreeName`](git_vista_protocol::WorktreeName), which cannot hold a
 /// separator, a `..`, a leading dot or an absolute path, and the server joins
-/// it to that root itself. If a request could ever choose `grant`, this
-/// function would be a way to hand any directory on the filesystem to a git
-/// spawn — so the single call site is the whole safety argument, and it is
-/// pinned as such rather than left to inspection.
+/// it to that root itself. `RemoveWorktree`'s grant is the canonical path a
+/// **fresh worktree census** just resolved for a client-submitted opaque id
+/// — proven, at the moment this runs, to be `Serviceable::Yes` and therefore
+/// already inside this application's own allowed roots, exactly like every
+/// path this server already admits into the catalog. Neither caller ever
+/// lets a request choose `grant` directly; if either did, this function would
+/// be a way to hand any directory on the filesystem to a git spawn — so each
+/// call site is its own whole safety argument, pinned as such rather than
+/// left to inspection.
+///
+/// # Refuses to combine a grant with the network tier
+///
+/// A grant plus an open socket is a strictly larger surface than either
+/// alone, and no caller needs both.
 fn sandboxed_with_grant(
     repo: &Path,
     args: &[&str],
@@ -277,11 +289,11 @@ fn sandboxed_with_grant(
 ) -> Result<crate::sandbox::spawn::SandboxedCommand, String> {
     let read_only = crate::state::read_only_for_path(repo);
     let need = crate::sandbox::reconcile_need(declared, args);
-    // A grant plus a socket is a strictly larger surface than either alone,
-    // and no caller needs both. Refusing here keeps that combination
-    // unreachable rather than merely unused.
     if need == crate::sandbox::NetworkNeed::Remote {
-        return Err("a worktree-creating command may not also reach the network".to_string());
+        return Err(
+            "a command that needs an extra filesystem grant may not also reach the network"
+                .to_string(),
+        );
     }
     let mut policy =
         crate::sandbox::policy_for(repo, read_only, need).map_err(|e| e.to_string())?;
@@ -289,16 +301,30 @@ fn sandboxed_with_grant(
     Ok(crate::sandbox::spawn::command_async(&policy, repo, args))
 }
 
-/// [`git_output`] for the one operation that writes outside its repository
-/// (M11.04, #549): `git worktree add`, whose destination is the managed
-/// worktrees root. See [`sandboxed_with_grant`] for why the grant is safe and
-/// why it is not a general-purpose escape hatch.
+/// [`git_output`] for `git worktree add` (M11.04, #549), whose destination is
+/// always the managed worktrees root. See [`sandboxed_with_grant`] for why
+/// the grant is safe and why it is not a general-purpose escape hatch.
 pub(crate) async fn git_output_in_managed_root(
     repo: &Path,
     args: &[&str],
     grant: &Path,
 ) -> std::io::Result<Output> {
     sandboxed_with_grant(repo, args, crate::sandbox::NetworkNeed::Local, grant)
+        .map_err(std::io::Error::other)?
+        .output()
+        .await
+}
+
+/// [`git_output`] for `git worktree remove` (M11.05, #550) against a resolved
+/// sibling. See [`sandboxed_with_grant`] for why the grant is safe and why it
+/// is not a general-purpose escape hatch.
+pub(crate) async fn git_output_with_extra_grant(
+    repo: &Path,
+    args: &[&str],
+    declared: crate::sandbox::NetworkNeed,
+    grant: &Path,
+) -> std::io::Result<Output> {
+    sandboxed_with_grant(repo, args, declared, grant)
         .map_err(std::io::Error::other)?
         .output()
         .await
