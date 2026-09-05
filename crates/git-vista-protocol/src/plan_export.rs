@@ -645,16 +645,18 @@ pub enum Export {
     ///
     ///  1. **The operation's input is not arguments** — bytes on stdin, or a
     ///     file's contents. No amount of quoting expresses it.
-    ///  2. **An argument is a location this application chooses**, not one the
-    ///     user supplied (M11.04, #549: `AddWorktree`, under ADR 0118's
-    ///     managed root). The command shape is ordinary; the literal path
-    ///     depends on where git-vista stores its data on that machine, and
-    ///     this crate is wasm-safe and cannot resolve it. Printing a guess
-    ///     would print a *working* command that does the wrong thing, which is
-    ///     worse than printing none.
+    ///  2. **An argument is a location this application resolves or chooses**,
+    ///     never one the caller supplied. `AddWorktree` (M11.04, #549, ADR
+    ///     0118) chooses where a new desk goes, under its own managed root;
+    ///     `RemoveWorktree` (M11.05, #550, ADR 0120) carries only an opaque
+    ///     id and resolves it to a path via a live census immediately before
+    ///     acting. Either way the command shape is ordinary and the literal
+    ///     path is not knowable here: this crate is wasm-safe and cannot
+    ///     resolve it, and printing a guess would print a *working* command
+    ///     that acts on the wrong desk — worse than printing none.
     ///
-    /// Both reasons share the consequence this variant exists for: there is no
-    /// line a reader can copy that is the line the app runs.
+    /// Both reasons share the consequence this variant exists for: there is
+    /// no line a reader can copy that is the line the app runs.
     NotACommandLine {
         /// What the operation needs that arguments cannot carry.
         why: String,
@@ -1108,6 +1110,25 @@ pub fn export_operation(operation: &GitOperation) -> Export {
                   typed by hand."
                 .to_string(),
         },
+
+        // M11.05 (#550). `git worktree remove <path>` is an ordinary command
+        // line — what is missing is the path, and it is missing on purpose:
+        // this operation carries only an opaque id, resolved to a path by a
+        // live server-side census immediately before it runs (see the
+        // variant's own doc comment). This crate is wasm-safe and reads no
+        // filesystem, so it cannot resolve that id itself, and a printed
+        // command carrying a *guessed* path would not be an approximation of
+        // what the app does — it could name the wrong desk entirely, or one
+        // that no longer exists.
+        GitOperation::RemoveWorktree { .. } => Export::NotACommandLine {
+            why: "This closes a linked worktree addressed by an internal id, resolved to \
+                  a real path by this server immediately before it runs. Printing a \
+                  command with a guessed path could act on the wrong desk, so none is \
+                  printed. To do it by hand, first find the worktree's path with \
+                  `git worktree list`, then `git worktree remove <path>` — git itself \
+                  will refuse if the working tree is not clean."
+                .to_string(),
+        },
     }
 }
 
@@ -1530,6 +1551,7 @@ pub fn operation_name(operation: &GitOperation) -> &'static str {
         GitOperation::StageSelection { .. } => "stage a hand-picked selection",
         GitOperation::DiscardTrackedPaths { .. } => "discard changes to tracked files",
         GitOperation::DeleteUntrackedPaths { .. } => "delete untracked files",
+        GitOperation::RemoveWorktree { .. } => "remove a linked worktree",
         GitOperation::AmendCommit { .. } => "amend the last commit",
         GitOperation::FetchRemote { .. } => "fetch from a remote",
         GitOperation::PullBranch { .. } => "pull",

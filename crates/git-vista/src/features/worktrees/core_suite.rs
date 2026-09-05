@@ -204,6 +204,60 @@ fn an_openable_row_is_addressed_by_id_and_works_without_path_exposure() {
 }
 
 // ---------------------------------------------------------------------------
+// The remove offer (M11.05, #550)
+// ---------------------------------------------------------------------------
+
+/// A servable, non-current row is offered both at once: somewhere to switch
+/// to AND a desk that may be closed. The two are independent questions and
+/// this is the row where both happen to answer yes.
+#[test]
+fn a_servable_row_is_offered_both_open_and_remove() {
+    let rows = rows(drawer_view(observed(vec![sibling(
+        "desk-two",
+        Some("feature/x"),
+        Serviceable::Yes,
+    )])));
+    assert!(matches!(rows[0].offer, RowOffer::Open { .. }));
+    assert_eq!(
+        rows[0].remove_offer,
+        RemoveOffer::Offer {
+            id: "worktree-desk-two".to_string()
+        }
+    );
+}
+
+/// The worktree you are already in cannot close itself — checked before the
+/// fence, same reasoning `offer` gives for `RowOffer::Current`.
+#[test]
+fn the_current_worktree_is_never_offered_removal() {
+    let mut here = sibling("here", Some("main"), Serviceable::Yes);
+    here.is_current = true;
+    let rows = rows(drawer_view(observed(vec![here])));
+    assert_eq!(rows[0].remove_offer, RemoveOffer::NotOffered);
+}
+
+/// Neither refusal the drawer already renders for `offer` may be removable
+/// either: a `Missing` sibling's directory is already gone (releasing it is
+/// `git worktree prune`, a different operation), and `OutsideAllowedRoots` is
+/// visible for collision detection only — visibility must never widen into a
+/// mutation this application cannot verify.
+#[test]
+fn a_refused_row_is_never_offered_removal() {
+    for serviceable in [Serviceable::OutsideAllowedRoots, Serviceable::Missing] {
+        let rows = rows(drawer_view(observed(vec![sibling(
+            "refused",
+            Some("feature/x"),
+            serviceable.clone(),
+        )])));
+        assert_eq!(
+            rows[0].remove_offer,
+            RemoveOffer::NotOffered,
+            "{serviceable:?} must not be offered for removal"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // What is checked out
 // ---------------------------------------------------------------------------
 
