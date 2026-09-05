@@ -42,6 +42,11 @@ fn focus_blame_row(idx: usize) {
 /// warning when the walk hit one, and the ranges themselves — or, for a
 /// refused path (binary or absent), the banner alone with no row list at
 /// all, since there is nothing line-shaped to show.
+// Eight arguments, over clippy's default seven. Grouping them into a struct
+// would be a struct that exists only to satisfy a lint — every one is a
+// distinct signal this panel genuinely needs, and the two newest (the paging
+// windows) are exactly what the review asked for.
+#[allow(clippy::too_many_arguments)]
 pub fn blame_body(
     page: &BlamePage,
     history: Option<&Result<FileHistoryPage, String>>,
