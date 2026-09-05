@@ -2626,6 +2626,12 @@ fn every_git_write_route_reaches_the_planner() {
             "/api/select-worktree",
             "handlers::select::select_discovered_worktree",
         ),
+        // M11.05 (#550): close a linked sibling desk — a git write, funnel
+        // row below.
+        (
+            "/api/remove-worktree",
+            "handlers::worktrees::remove_worktree",
+        ),
         ("/api/rescan", "rescan"),
         ("/api/branch", "create_branch"),
         ("/api/commit", "create_commit"),
@@ -2835,6 +2841,7 @@ fn every_git_write_route_reaches_the_planner() {
         ("src/handlers/staging.rs", "staging_apply", None),
         ("src/handlers/discard.rs", "discard_tracked_paths", None),
         ("src/handlers/discard.rs", "delete_untracked_paths", None),
+        ("src/handlers/worktrees.rs", "remove_worktree", None),
         // M2.21d (#238): both tag write handlers build their operation and
         // call the planner directly — no `git tag` argv exists in that file.
         ("src/handlers/tags.rs", "create_tag", None),

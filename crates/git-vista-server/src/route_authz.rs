@@ -108,6 +108,9 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     // inside an allowed root, an unauthenticated caller must not be able to
     // reach the attempt at all.
     ("/api/select-worktree", Method::POST, Authz::SessionAndCsrf),
+    // M11.05 (#550): destructive and irrecoverable — the full write posture,
+    // same as every other mutation here.
+    ("/api/remove-worktree", Method::POST, Authz::SessionAndCsrf),
     ("/api/rescan", Method::POST, Authz::SessionAndCsrf),
     ("/api/branch", Method::POST, Authz::SessionAndCsrf),
     ("/api/commit", Method::POST, Authz::SessionAndCsrf),
@@ -323,7 +326,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// dropped by a `main.rs` refactor that this scanner's pattern-matching
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
-const EXPECTED_ROUTE_COUNT: usize = 71;
+const EXPECTED_ROUTE_COUNT: usize = 72;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in
