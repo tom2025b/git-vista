@@ -22,6 +22,7 @@ use git_vista_protocol::{MergeStrategy, RepoMode};
 // working; #651's body named this gap and this is where it closes.
 use crate::api::select_worktree_request;
 use crate::features::session::signals as session_state;
+use crate::features::shell::signals::Shell;
 
 use crate::features::dialogs::core::preview_subject;
 use crate::features::dialogs::core::{
@@ -34,12 +35,13 @@ use crate::features::preview::core::{preview_action, PreviewAction};
 use crate::features::freshness::core::{
     blocked_by_staleness, confirm_enabled, plan_on_screen, rebuild_is_offered,
 };
-use crate::features::preview::signals::PreviewSlot;
+use crate::features::preview::signals::{Preview, PreviewSlot};
 
 use super::{freshness_notice_view, preview_panel_view};
 use crate::features::explain::core::{render, LinkTarget, RenderedSection, Span};
 use crate::features::graph::core::{disabled_menu_item_copy, push_confirm_copy};
-use crate::features::operations::kind::OperationKind;
+use crate::features::graph::core::{remote_tip_from_plan, RemoteTipKnowledge};
+use crate::features::operations::kind::{ForceWithLease, OperationKind};
 use crate::state::{Features, PendingOp};
 
 /// The confirm/cancel button base style, with #65's 44x44 floor.
@@ -444,27 +446,36 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
             // plan and has no graph preview, so freshness taken only from
             // `preview.plan()` saw `None` on the most destructive confirmation
             // in the app and left its button enabled.
-            let plan_freshness = plan_on_screen(&op, preview.plan())
-                .map(|plan| freshness.of(&plan));
-            let enabled = confirm_enabled(enabled, plan_freshness.as_ref());
+            let plan_freshness = freshness.of(&plan_on_screen(&op, preview.plan()));
+            let enabled = confirm_enabled(enabled, &plan_freshness);
             // Rebuild is offered exactly when there is a plan on screen and it
             // is no longer current — the same condition the notice renders on,
             // read from the same verdict so the button and the sentence cannot
             // disagree.
-            let rebuild_offered = rebuild_is_offered(plan_freshness.as_ref());
+            let rebuild_offered = rebuild_is_offered(&plan_freshness);
             let rebuild_op = op.clone();
             let rebuild = move || {
-                // The same call the dialog makes when it opens: fetch a fresh
-                // plan and draw its picture. `Preview::start` bumps its own
-                // generation tag, so a reply from the plan this replaces cannot
-                // paint over the new one.
-                if let PreviewAction::Start(operation) =
-                    preview_action(Some(preview_subject(&rebuild_op)))
-                {
-                    preview.start(operation);
+                // Two ways a confirmation can hold a plan, so two ways to
+                // replace one — and the second was silently doing nothing
+                // (#664 review, defect 2). `preview_subject(Push)` is
+                // `NotPreviewable`, so routing a force-with-lease rebuild
+                // through `preview_action` resolved to `Clear`: the button was
+                // offered, clicking it issued no request, and the user still
+                // had to cancel and rediscover Force Push.
+                match preview_action(Some(preview_subject(&rebuild_op))) {
+                    // A previewable operation: the same call the dialog makes
+                    // when it opens, except that the slot says `Rebuilding`
+                    // while it is in flight. `Preview::rebuild` bumps its own
+                    // generation tag, so a reply from the plan this replaces
+                    // cannot paint over the new one.
+                    PreviewAction::Start(operation) => preview.rebuild(operation),
+                    // Not previewable. The only plan-backed arm here is the
+                    // force-with-lease push, whose plan came from the menu's
+                    // own two-step lease fetch rather than from `Preview`.
+                    PreviewAction::Clear => rebuild_lease(&rebuild_op, preview, shell),
                 }
             };
-            let blocked_reason = blocked_by_staleness(plan_freshness.as_ref()).or(blocked_reason);
+            let blocked_reason = blocked_by_staleness(&plan_freshness).or(blocked_reason);
             // The confirm button is muted when disabled, red for a destructive
             // delete, green otherwise.
             let confirm_style = if !enabled {
@@ -635,6 +646,84 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
             }
         })
     }
+}
+
+/// Replace a force-with-lease confirmation's plan with one built against the
+/// repository as it is now (#664 review, defect 2).
+///
+/// # Why this is not `Preview::rebuild`
+///
+/// A force-with-lease push has **no graph preview** — `preview_subject` calls
+/// it `NotPreviewable`, and `/api/preview` is never asked about it. Its plan
+/// comes from the menu's own two-step lease fetch: a plain probe establishes
+/// what this client last saw on the remote, and a second request builds the
+/// leased plan against that oid. Rebuilding therefore means re-running *that*,
+/// not asking `Preview` for a picture.
+///
+/// The two steps are not an implementation detail that could be collapsed. The
+/// lease is by definition "the remote where the reviewer last saw it", so the
+/// oid has to be re-established before the plan that carries it is built.
+///
+/// Every refusal lands on the same state: `RebuildFailed`, which keeps the
+/// confirmation withdrawn and says why. It does **not** open an error dialog
+/// over the modal the user is already reading — the menu does that because it
+/// has nowhere else to put the news, and this has the notice.
+fn rebuild_lease(op: &PendingOp, preview: Preview, shell: Shell) {
+    let PendingOp::Push {
+        branch,
+        set_upstream,
+        force: Some(_),
+    } = op
+    else {
+        return;
+    };
+    let branch = branch.clone();
+    let set_upstream = *set_upstream;
+    preview.note_rebuild_started();
+    spawn_local(async move {
+        let Ok(plain) = crate::api::preview_push(
+            "origin",
+            &branch,
+            set_upstream,
+            git_vista_protocol::ForcePublish::None,
+        )
+        .await
+        else {
+            preview.note_rebuild_failed();
+            return;
+        };
+        let RemoteTipKnowledge::Known(oid) = remote_tip_from_plan(&plain.expected_ref_changes)
+        else {
+            // The remote-tracking ref is gone or unreadable, so there is no oid
+            // to lease against. A force-with-lease plan cannot be built at all
+            // — which is a refusal, not a failed request, and it lands in the
+            // same place because the user's next move is the same either way.
+            preview.note_rebuild_failed();
+            return;
+        };
+        let Ok(leased) = crate::api::preview_push(
+            "origin",
+            &branch,
+            set_upstream,
+            git_vista_protocol::ForcePublish::WithLease {
+                expected_remote_tip: oid.clone(),
+            },
+        )
+        .await
+        else {
+            preview.note_rebuild_failed();
+            return;
+        };
+        // Re-open the confirmation on the replacement. The user approves again
+        // — the modal is still asking, and the button is live only because the
+        // new plan's generation is the live one.
+        shell.open_confirm(PendingOp::Push {
+            branch,
+            set_upstream,
+            force: Some(ForceWithLease::from_leased_plan(&leased, oid)),
+        });
+        preview.note_rebuild_landed();
+    });
 }
 
 /// Explain Mode's panel (M6.39b, #545): the plan, in ordinary language,

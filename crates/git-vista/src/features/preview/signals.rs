@@ -28,7 +28,7 @@ use leptos::*;
 use git_vista_protocol::GitOperation;
 
 use crate::api;
-use crate::features::freshness::core::PlanOnScreen;
+use crate::features::freshness::core::{PlanOnScreen, PlanSlot};
 use crate::features::preview::core::{view_of, PreviewView};
 
 /// What the panel is showing right now.
@@ -66,7 +66,12 @@ pub struct Preview {
     /// withdrawn — and neither is answerable without the plan's own generation.
     /// It is deliberately *not* re-fetched on a change: a plan that quietly
     /// re-derives itself is a plan the user did not approve.
-    plan: RwSignal<Option<PlanOnScreen>>,
+    ///
+    /// A [`PlanSlot`] rather than an `Option`, because "no plan yet" and "the
+    /// stale plan I just threw away to make room for a replacement" must never
+    /// be the same value — see `PlanSlot`'s own doc for what collapsing them
+    /// cost.
+    plan: RwSignal<PlanSlot>,
     /// Bumped by every start and every clear. A reply whose captured value no
     /// longer matches is discarded.
     ///
@@ -85,7 +90,7 @@ impl Preview {
     pub fn new() -> Self {
         Self {
             slot: create_rw_signal(PreviewSlot::Idle),
-            plan: create_rw_signal(None),
+            plan: create_rw_signal(PlanSlot::Absent),
             generation: store_value(0),
         }
     }
@@ -95,8 +100,8 @@ impl Preview {
         self.slot.get()
     }
 
-    /// The plan on screen, if one was built. A tracked read.
-    pub fn plan(&self) -> Option<PlanOnScreen> {
+    /// The plan on screen, and where it is in its life. A tracked read.
+    pub fn plan(&self) -> PlanSlot {
         self.plan.get()
     }
 
@@ -109,9 +114,30 @@ impl Preview {
     ///
     /// [`Plan`]: git_vista_protocol::Plan
     pub fn start(&self, op: GitOperation) {
+        self.fetch(op, false);
+    }
+
+    /// Replace the plan on screen with one built against the repository as it
+    /// is now — spec D4's **Rebuild**.
+    ///
+    /// The only difference from [`start`](Self::start) is what the slot says
+    /// while the request is in flight and if it fails, and that difference is
+    /// the whole point: this call follows a plan the user was just told is
+    /// stale, so until a replacement actually arrives there is nothing to
+    /// approve. `start`'s `Absent` would re-enable the button on the strength
+    /// of having discarded the evidence.
+    pub fn rebuild(&self, op: GitOperation) {
+        self.fetch(op, true);
+    }
+
+    fn fetch(&self, op: GitOperation, rebuilding: bool) {
         let issued = self.bump();
         self.slot.set(PreviewSlot::Pending);
-        self.plan.set(None);
+        self.plan.set(if rebuilding {
+            PlanSlot::Rebuilding
+        } else {
+            PlanSlot::Absent
+        });
         let slot = self.slot;
         let on_screen = self.plan;
         let generation = self.generation;
@@ -130,11 +156,25 @@ impl Preview {
                             .collect(),
                     };
                     match api::preview_request(&plan).await {
-                        Ok(response) => (PreviewSlot::Ready(view_of(response)), Some(on_screen)),
-                        Err(why) => (PreviewSlot::Failed(why), Some(on_screen)),
+                        Ok(response) => (
+                            PreviewSlot::Ready(view_of(response)),
+                            PlanSlot::Ready(on_screen),
+                        ),
+                        // The picture failed, but the PLAN arrived — and the
+                        // plan is what freshness is about. #594's rule that a
+                        // preview informs and never gates is exactly why this
+                        // is `Ready` and not a failure.
+                        Err(why) => (PreviewSlot::Failed(why), PlanSlot::Ready(on_screen)),
                     }
                 }
-                Err(why) => (PreviewSlot::Failed(why), None),
+                Err(why) => (
+                    PreviewSlot::Failed(why),
+                    if rebuilding {
+                        PlanSlot::RebuildFailed
+                    } else {
+                        PlanSlot::Absent
+                    },
+                ),
             };
             // The stale-response guard. `try_get_value` rather than
             // `get_value`: this future outlives nothing today, but a disposed
@@ -158,7 +198,33 @@ impl Preview {
         // the *next* dialog answer a freshness question about the last one's
         // plan — the same class of stale-reply defect the tag above exists to
         // stop, one field over.
-        self.plan.set(None);
+        self.plan.set(PlanSlot::Absent);
+    }
+
+    /// Note that a rebuild this `Preview` is not itself fetching has begun.
+    ///
+    /// The force-with-lease confirmation's plan does not come from here — it
+    /// has no graph preview at all — but its Rebuild has the same two states,
+    /// and they are held here so the dialog reads one slot rather than two.
+    pub fn note_rebuild_started(&self) {
+        self.bump();
+        self.plan.set(PlanSlot::Rebuilding);
+    }
+
+    /// Note that such a rebuild did not produce a plan.
+    pub fn note_rebuild_failed(&self) {
+        self.plan.set(PlanSlot::RebuildFailed);
+    }
+
+    /// Note that such a rebuild landed, and the replacement plan is now
+    /// carried by the operation itself.
+    ///
+    /// Required, and its absence would be a defect of exactly the shape this
+    /// whole slot exists to prevent: `Rebuilding` outranks the carried plan in
+    /// `plan_on_screen`, so a rebuild that never says it finished leaves the
+    /// confirmation disabled over a replacement that did arrive.
+    pub fn note_rebuild_landed(&self) {
+        self.plan.set(PlanSlot::Absent);
     }
 
     /// Take the next generation and return it.

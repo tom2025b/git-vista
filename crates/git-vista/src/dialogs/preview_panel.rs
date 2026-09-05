@@ -22,7 +22,7 @@
 
 use leptos::*;
 
-use crate::features::freshness::core::{freshness_headline, rebuild_framing, PlanFreshness};
+use crate::features::freshness::core::{verdict_framing, verdict_headline, PlanVerdict};
 use crate::features::freshness::signals::Freshness;
 use crate::features::preview::core::{reassurance, PreviewView};
 use crate::features::preview::scene::{
@@ -57,13 +57,12 @@ const STALE: &str = "margin-bottom:14px; padding:10px 12px; border-radius:8px;  
 /// reason every word of the panel below comes from `features::preview::core`.
 pub fn freshness_notice_view(preview: Preview, freshness: Freshness) -> impl IntoView {
     move || {
-        let plan = preview.plan()?;
-        let verdict = freshness.of(&plan);
-        if matches!(verdict, PlanFreshness::Current) {
+        let verdict = freshness.of(&preview.plan());
+        if matches!(verdict, PlanVerdict::NoPlan) {
             return None;
         }
-        let headline = freshness_headline(&verdict)?;
-        let framing = rebuild_framing(&verdict);
+        let headline = verdict_headline(&verdict)?;
+        let framing = verdict_framing(&verdict);
         Some(view! {
             <div class="plan-stale" style=STALE role="status">
                 <div style="font-weight:600;">{headline}</div>

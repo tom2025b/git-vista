@@ -27,7 +27,7 @@ use wasm_bindgen::prelude::*;
 use git_vista_protocol::change_feed::ChangeFeedSnapshot;
 use git_vista_protocol::{PROTOCOL_QUERY, PROTOCOL_VERSION};
 
-use super::core::{freshness, FeedLog, PlanFreshness, PlanOnScreen};
+use super::core::{verdict, FeedLog, PlanSlot, PlanVerdict};
 
 /// How long to wait before re-opening a change feed that dropped.
 ///
@@ -69,8 +69,11 @@ impl Freshness {
     }
 
     /// A tracked read: the panel re-renders when a snapshot arrives.
-    pub fn of(&self, plan: &PlanOnScreen) -> PlanFreshness {
-        self.log.with(|log| freshness(plan, log))
+    ///
+    /// One fold, so the button, the notice and the Rebuild offer are three
+    /// readings of one verdict rather than three computations that can drift.
+    pub fn of(&self, slot: &PlanSlot) -> PlanVerdict {
+        self.log.with(|log| verdict(slot, log))
     }
 }
 

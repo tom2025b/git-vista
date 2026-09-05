@@ -72,6 +72,42 @@ impl PlanOnScreen {
     }
 }
 
+/// What the confirmation on screen currently has to approve.
+///
+/// # Why "no plan" is two different states
+///
+/// The first slice of #555 asked one question — *is there a plan?* — and a
+/// `None` answered it for two situations that could not be more different:
+///
+/// - **a confirmation that never had a plan.** Most of this modal's arms are
+///   built from their arguments and have never seen one, and a previewable
+///   arm has not received one yet. #594 decided deliberately that a preview
+///   informs and never gates, so these stay offerable.
+/// - **a plan that was on screen, found stale, and thrown away to make room
+///   for its replacement.** Here we *know* the repository moved.
+///
+/// Collapsing the second into the first is a defect the review of #664 found
+/// and measured: clicking Rebuild cleared the plan, `confirm_enabled` saw
+/// `None`, and the execute control went **live** — the stale notice gone, no
+/// replacement to review, and the modal's own dispatch path sending a
+/// branch-only request the execution generation gate never sees. The button
+/// became live precisely because the user acted on being told it was stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanSlot {
+    /// No plan, and none has been thrown away to make room for one. The
+    /// confirmation's own verdict stands, untouched by this feature.
+    Absent,
+    /// A replacement was asked for and has not arrived. There is nothing to
+    /// approve, and there is a known-stale plan behind the request.
+    Rebuilding,
+    /// A replacement was asked for and did not arrive. Still nothing to
+    /// approve — and unlike `Absent`, silence here is not the absence of a
+    /// claim, it is a failed attempt to replace a claim we know was stale.
+    RebuildFailed,
+    /// The plan on screen.
+    Ready(PlanOnScreen),
+}
+
 /// Why the feed cannot currently say whether the plan is current.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeedUnavailable {
@@ -268,15 +304,18 @@ pub fn freshness(plan: &PlanOnScreen, log: &FeedLog) -> PlanFreshness {
 ///
 /// So the question is asked once, here, of the operation itself: *is there a
 /// plan on this screen?*
-pub fn plan_on_screen(op: &OperationKind, previewed: Option<PlanOnScreen>) -> Option<PlanOnScreen> {
-    if let Some(previewed) = previewed {
-        return Some(previewed);
-    }
-    match op {
-        OperationKind::Push {
-            force: Some(force), ..
-        } => Some(force.plan.clone()),
-        _ => None,
+pub fn plan_on_screen(op: &OperationKind, previewed: PlanSlot) -> PlanSlot {
+    match previewed {
+        // A rebuild in flight, or one that failed, is about the plan this
+        // confirmation was showing — whichever way that plan arrived. It
+        // outranks the carried plan below, which is the one being replaced.
+        slot @ (PlanSlot::Ready(_) | PlanSlot::Rebuilding | PlanSlot::RebuildFailed) => slot,
+        PlanSlot::Absent => match op {
+            OperationKind::Push {
+                force: Some(force), ..
+            } => PlanSlot::Ready(force.plan.clone()),
+            _ => PlanSlot::Absent,
+        },
     }
 }
 
@@ -290,8 +329,44 @@ pub fn plan_on_screen(op: &OperationKind, previewed: Option<PlanOnScreen>) -> Op
 /// A dialog with **no plan on screen** is unaffected: this feature makes no
 /// claim about an operation nobody built a plan for, and inventing one would
 /// disable half the app's confirmations on a feed that had not connected yet.
-pub fn confirm_enabled(prompt_enabled: bool, plan: Option<&PlanFreshness>) -> bool {
-    prompt_enabled && plan.is_none_or(|freshness| freshness.execute_offered())
+pub fn confirm_enabled(prompt_enabled: bool, plan: &PlanVerdict) -> bool {
+    prompt_enabled
+        && match plan {
+            PlanVerdict::NoPlan => true,
+            PlanVerdict::Fresh(freshness) => freshness.execute_offered(),
+            // Nothing to approve. Both of these follow a plan we know was
+            // stale, so re-enabling here would offer the operation on the
+            // strength of having discarded the evidence against it.
+            PlanVerdict::Rebuilding | PlanVerdict::RebuildFailed => false,
+        }
+}
+
+/// What this feature has to say about the confirmation on screen.
+///
+/// One value, folded once from the slot and the feed, so the button, the
+/// notice and the Rebuild offer cannot disagree with each other — they are
+/// three readings of this, not three computations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanVerdict {
+    /// This confirmation is not plan-backed, or its plan has not arrived and
+    /// none was discarded to make room for it. No claim is made.
+    NoPlan,
+    /// There is a plan, and this is how fresh it is.
+    Fresh(PlanFreshness),
+    /// A replacement is on its way.
+    Rebuilding,
+    /// A replacement was asked for and did not arrive.
+    RebuildFailed,
+}
+
+/// Fold the plan on screen and the feed into the one verdict everything reads.
+pub fn verdict(slot: &PlanSlot, log: &FeedLog) -> PlanVerdict {
+    match slot {
+        PlanSlot::Absent => PlanVerdict::NoPlan,
+        PlanSlot::Rebuilding => PlanVerdict::Rebuilding,
+        PlanSlot::RebuildFailed => PlanVerdict::RebuildFailed,
+        PlanSlot::Ready(plan) => PlanVerdict::Fresh(freshness(plan, log)),
+    }
 }
 
 /// Whether to offer a Rebuild control.
@@ -305,28 +380,38 @@ pub fn confirm_enabled(prompt_enabled: bool, plan: Option<&PlanFreshness>) -> bo
 /// to rebuild about a plan that still describes the repository, and `Unknown`
 /// is included deliberately — "couldn't tell" is exactly when a user most wants
 /// a fresh answer.
-pub fn rebuild_is_offered(plan: Option<&PlanFreshness>) -> bool {
-    matches!(
-        plan,
-        Some(
-            PlanFreshness::Moved { .. }
-                | PlanFreshness::MovedElsewhere
-                | PlanFreshness::Unknown { .. }
-        )
-    )
+pub fn rebuild_is_offered(plan: &PlanVerdict) -> bool {
+    match plan {
+        PlanVerdict::Fresh(freshness) => !freshness.execute_offered(),
+        // Already rebuilding: offering it again would fire a second request
+        // for the same replacement.
+        PlanVerdict::Rebuilding => false,
+        // The attempt failed, so offering it again is the only useful thing
+        // left on the dialog.
+        PlanVerdict::RebuildFailed => true,
+        PlanVerdict::NoPlan => false,
+    }
 }
 
 /// Why the confirm control is inert, when it is staleness that withdrew it.
 ///
 /// `None` when the plan is current or there is no plan — the dialog's own
 /// reasons are unchanged and keep their own words.
-pub fn blocked_by_staleness(plan: Option<&PlanFreshness>) -> Option<&'static str> {
+pub fn blocked_by_staleness(plan: &PlanVerdict) -> Option<&'static str> {
     match plan {
-        None | Some(PlanFreshness::Current) => None,
-        Some(PlanFreshness::Unknown { .. }) => {
+        PlanVerdict::NoPlan | PlanVerdict::Fresh(PlanFreshness::Current) => None,
+        PlanVerdict::Rebuilding => {
+            Some("This can't run yet: a new plan is being built for you to review.")
+        }
+        PlanVerdict::RebuildFailed => {
+            Some("This can't run: the new plan couldn't be built, so there is nothing to review.")
+        }
+        PlanVerdict::Fresh(PlanFreshness::Unknown { .. }) => {
             Some("This can't run while it isn't known whether the picture above is current.")
         }
-        Some(_) => Some("This can't run: the repository moved after this picture was drawn."),
+        PlanVerdict::Fresh(_) => {
+            Some("This can't run: the repository moved after this picture was drawn.")
+        }
     }
 }
 
@@ -334,6 +419,29 @@ pub fn blocked_by_staleness(plan: Option<&PlanFreshness>) -> Option<&'static str
 ///
 /// Every string this feature shows is minted here, so `cargo test` reads the
 /// words a browser would.
+pub fn verdict_headline(verdict: &PlanVerdict) -> Option<String> {
+    match verdict {
+        PlanVerdict::NoPlan => None,
+        PlanVerdict::Rebuilding => Some("Building a new plan…".to_string()),
+        PlanVerdict::RebuildFailed => {
+            Some("Couldn't build a new plan for the repository as it is now.".to_string())
+        }
+        PlanVerdict::Fresh(freshness) => freshness_headline(freshness),
+    }
+}
+
+/// How rebuilding is framed, beneath the headline.
+pub fn verdict_framing(verdict: &PlanVerdict) -> Option<&'static str> {
+    match verdict {
+        PlanVerdict::NoPlan => None,
+        PlanVerdict::Rebuilding => {
+            Some("Nothing can run until it arrives, and you will be asked to approve it.")
+        }
+        PlanVerdict::RebuildFailed => Some("Try again, or close this and start over."),
+        PlanVerdict::Fresh(freshness) => rebuild_framing(freshness),
+    }
+}
+
 pub fn freshness_headline(freshness: &PlanFreshness) -> Option<String> {
     match freshness {
         PlanFreshness::Current => None,

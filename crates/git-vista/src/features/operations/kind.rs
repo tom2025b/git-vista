@@ -17,8 +17,8 @@
 use git_vista_core::activity::Undoable;
 use git_vista_protocol::plan::Advisory;
 use git_vista_protocol::{
-    branch_holder, BranchHolder, BranchName, CommitOid, Explanation, MergeStrategy, RiskLevel,
-    Serviceable, WorktreeCensus,
+    branch_holder, BranchHolder, BranchName, CommitOid, Explanation, MergeStrategy, Plan,
+    RiskLevel, Serviceable, WorktreeCensus,
 };
 
 use crate::features::freshness::core::PlanOnScreen;
@@ -219,6 +219,32 @@ pub struct ForceWithLease {
     /// stayed enabled with no notice after the repository moved. That is
     /// precisely the plan-backed force-push case #555 exists for.
     pub plan: PlanOnScreen,
+}
+
+impl ForceWithLease {
+    /// Everything this confirmation shows about a force-with-lease push, taken
+    /// off the leased plan the server just built.
+    ///
+    /// One constructor, called by the menu that opens the confirmation and by
+    /// the Rebuild that replaces it (#664 review, defect 2). Five values must
+    /// come off the *same* plan — the risk that colours the button, the
+    /// advisories, the explanation, the lease oid the button will send, and the
+    /// generation the freshness check compares — and the way they stop coming
+    /// off the same plan is two call sites assembling them separately.
+    ///
+    /// `expected_remote_tip` is passed in rather than re-read from `plan`
+    /// because it is the oid the *plain* probe established and the leased plan
+    /// was then built against: taking it from the leased plan's own
+    /// `expected_ref_changes` would be reading back the value we just sent.
+    pub fn from_leased_plan(plan: &Plan, expected_remote_tip: CommitOid) -> Self {
+        Self {
+            expected_remote_tip,
+            risk: plan.risk,
+            advisories: plan.advisories.clone(),
+            explanation: git_vista_protocol::explain(plan),
+            plan: PlanOnScreen::of(plan),
+        }
+    }
 }
 
 /// The live "which branch is checked out?" answer a menu pre-check hands the

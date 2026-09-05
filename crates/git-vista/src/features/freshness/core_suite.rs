@@ -55,6 +55,12 @@ fn blind() -> ChangeFeedSnapshot {
     }
 }
 
+/// A verdict over a plan that is on screen — the shape every assertion below
+/// about freshness is really about.
+fn ready(freshness: PlanFreshness) -> PlanVerdict {
+    PlanVerdict::Fresh(freshness)
+}
+
 fn plan(generation: &str, expects: &[&str]) -> PlanOnScreen {
     PlanOnScreen {
         generation: generation.to_string(),
@@ -112,6 +118,10 @@ fn every_stale_arm_withdraws_the_execute_control() {
             "{verdict:?} must say something"
         );
         assert!(rebuild_framing(&verdict).is_some());
+        assert!(
+            !confirm_enabled(true, &ready(verdict.clone())),
+            "and the composed answer must withdraw it too"
+        );
     }
 }
 
@@ -298,43 +308,46 @@ fn a_confirmation_with_no_plan_on_screen_is_left_exactly_as_it_was() {
     // Most confirmations in this app have no preview and therefore no plan.
     // This feature must make no claim about them: a feed that has not connected
     // yet would otherwise disable half the dialogs in the app.
-    assert!(confirm_enabled(true, None));
-    assert!(!confirm_enabled(false, None));
-    assert_eq!(blocked_by_staleness(None), None);
+    assert!(confirm_enabled(true, &PlanVerdict::NoPlan));
+    assert!(!confirm_enabled(false, &PlanVerdict::NoPlan));
+    assert_eq!(blocked_by_staleness(&PlanVerdict::NoPlan), None);
 }
 
 #[test]
 fn a_stale_plan_withdraws_the_confirmation_and_says_which_kind_of_stale() {
-    let moved = PlanFreshness::Moved {
+    let moved = ready(PlanFreshness::Moved {
         refs: vec!["refs/heads/main".to_string()],
-    };
-    assert!(!confirm_enabled(true, Some(&moved)));
-    assert!(blocked_by_staleness(Some(&moved))
+    });
+    assert!(!confirm_enabled(true, &moved));
+    assert!(blocked_by_staleness(&moved)
         .unwrap()
         .contains("moved after this picture was drawn"));
 
-    let unknown = PlanFreshness::Unknown {
+    let unknown = ready(PlanFreshness::Unknown {
         reason: FeedUnavailable::NotConnected,
-    };
-    assert!(!confirm_enabled(true, Some(&unknown)));
-    assert!(blocked_by_staleness(Some(&unknown))
+    });
+    assert!(!confirm_enabled(true, &unknown));
+    assert!(blocked_by_staleness(&unknown)
         .unwrap()
         .contains("isn't known"));
 
     // Reassuring, and still refused — `enforce_fresh` compares the whole
     // digest, so this plan would 409.
-    assert!(!confirm_enabled(true, Some(&PlanFreshness::MovedElsewhere)));
-    assert!(blocked_by_staleness(Some(&PlanFreshness::MovedElsewhere)).is_some());
+    assert!(!confirm_enabled(
+        true,
+        &ready(PlanFreshness::MovedElsewhere)
+    ));
+    assert!(blocked_by_staleness(&ready(PlanFreshness::MovedElsewhere)).is_some());
 }
 
 #[test]
 fn a_current_plan_leaves_the_dialogs_own_verdict_alone() {
-    assert!(confirm_enabled(true, Some(&PlanFreshness::Current)));
+    assert!(confirm_enabled(true, &ready(PlanFreshness::Current)));
     assert!(
-        !confirm_enabled(false, Some(&PlanFreshness::Current)),
+        !confirm_enabled(false, &ready(PlanFreshness::Current)),
         "freshness may withdraw a confirmation, never grant one"
     );
-    assert_eq!(blocked_by_staleness(Some(&PlanFreshness::Current)), None);
+    assert_eq!(blocked_by_staleness(&ready(PlanFreshness::Current)), None);
 }
 
 // --- the seam census -------------------------------------------------------
@@ -359,9 +372,9 @@ const CONFIRM_DIALOG: &str = include_str!("../../dialogs/confirm.rs");
 #[test]
 fn the_feed_subscription_asks_core_for_the_verdict_and_forgets_across_a_gap() {
     assert!(
-        FEED_SIGNALS.contains("freshness(plan, log)"),
-        "the wasm wrapper must ask `core::freshness`, never re-derive the \
-         verdict where no host test compiles it"
+        FEED_SIGNALS.contains("verdict(slot, log)"),
+        "the wasm wrapper must ask `core::verdict`, never re-derive the \
+         answer where no host test compiles it"
     );
     assert!(
         FEED_SIGNALS.contains("log.clear()"),
@@ -392,7 +405,7 @@ fn the_preview_remembers_the_plan_it_drew_and_drops_it_with_the_picture() {
         .nth(1)
         .expect("Preview::clear exists");
     assert!(
-        clear.contains("self.plan.set(None)"),
+        clear.contains("self.plan.set(PlanSlot::Absent)"),
         "clearing the panel must clear the plan: a generation left behind \
          answers the next dialog's freshness question with the last one's plan"
     );
@@ -401,12 +414,12 @@ fn the_preview_remembers_the_plan_it_drew_and_drops_it_with_the_picture() {
 #[test]
 fn the_confirm_dialog_composes_the_two_halves_rather_than_reimplementing_them() {
     assert!(
-        CONFIRM_DIALOG.contains("confirm_enabled(enabled, plan_freshness.as_ref())"),
+        CONFIRM_DIALOG.contains("confirm_enabled(enabled, &plan_freshness)"),
         "the composition itself must be the host-tested function — an `&&` \
          written in this file is exactly #612's origin"
     );
     assert!(
-        CONFIRM_DIALOG.contains("blocked_by_staleness(plan_freshness.as_ref())"),
+        CONFIRM_DIALOG.contains("blocked_by_staleness(&plan_freshness)"),
         "a withdrawn button must carry its reason; #65's finding is that an \
          unspoken one is unreachable by the user it was written for"
     );
@@ -537,9 +550,12 @@ fn a_force_push_carries_its_own_plan_because_it_has_no_preview() {
         generation: "100".to_string(),
         expects: vec!["refs/heads/main".to_string()],
     };
-    let found = plan_on_screen(&force_push_op(carried.clone()), None)
-        .expect("a force-with-lease confirmation always has a plan on screen");
-    assert_eq!(found, carried);
+    let found = plan_on_screen(&force_push_op(carried.clone()), PlanSlot::Absent);
+    assert_eq!(
+        found,
+        PlanSlot::Ready(carried),
+        "a force-with-lease confirmation always has a plan on screen"
+    );
 }
 
 #[test]
@@ -553,8 +569,8 @@ fn a_previewed_plan_still_wins_where_there_is_one() {
         expects: vec!["refs/heads/side".to_string()],
     };
     assert_eq!(
-        plan_on_screen(&force_push_op(carried), Some(previewed.clone())),
-        Some(previewed),
+        plan_on_screen(&force_push_op(carried), PlanSlot::Ready(previewed.clone())),
+        PlanSlot::Ready(previewed),
         "the preview's plan is the one whose picture is on screen"
     );
 }
@@ -566,7 +582,7 @@ fn a_confirmation_with_neither_kind_of_plan_makes_no_claim() {
         current: Some("other".to_string()),
         elsewhere: CheckoutElsewhere::Free,
     };
-    assert_eq!(plan_on_screen(&op, None), None);
+    assert_eq!(plan_on_screen(&op, PlanSlot::Absent), PlanSlot::Absent);
 }
 
 #[test]
@@ -584,7 +600,7 @@ fn rebuild_is_offered_on_every_stale_arm_and_none_of_the_current_ones() {
         },
     ] {
         assert!(
-            rebuild_is_offered(Some(&stale)),
+            rebuild_is_offered(&ready(stale.clone())),
             "{stale:?} tells the user to rebuild, so it must let them"
         );
         assert!(
@@ -592,9 +608,9 @@ fn rebuild_is_offered_on_every_stale_arm_and_none_of_the_current_ones() {
             "and the offer is explained"
         );
     }
-    assert!(!rebuild_is_offered(Some(&PlanFreshness::Current)));
+    assert!(!rebuild_is_offered(&ready(PlanFreshness::Current)));
     assert!(
-        !rebuild_is_offered(None),
+        !rebuild_is_offered(&PlanVerdict::NoPlan),
         "a confirmation with no plan on screen has nothing to rebuild"
     );
 }
@@ -606,13 +622,14 @@ fn the_dialog_offers_the_rebuild_it_talks_about_and_asks_core_which_plan() {
     // the button absent and the force-push plan never consulted — which is
     // exactly how both shipped.
     assert!(
-        CONFIRM_DIALOG.contains("plan_on_screen(&op, preview.plan())"),
-        "the dialog must ask which plan is on screen, not assume the preview's"
+        CONFIRM_DIALOG.contains("freshness.of(&plan_on_screen(&op, preview.plan()))"),
+        "the dialog must ask which plan is on screen, not assume the preview's \
+         — and must fold it into ONE verdict, so the button, the notice and \
+         the Rebuild offer cannot disagree"
     );
     assert!(
-        CONFIRM_DIALOG.contains("rebuild_is_offered(plan_freshness.as_ref())"),
-        "and must ask core whether to offer Rebuild, from the same verdict the \
-         notice is rendered from"
+        CONFIRM_DIALOG.contains("rebuild_is_offered(&plan_freshness)"),
+        "and must ask core whether to offer Rebuild, from that same verdict"
     );
     assert!(
         CONFIRM_DIALOG.contains("\"Rebuild\""),
@@ -620,9 +637,18 @@ fn the_dialog_offers_the_rebuild_it_talks_about_and_asks_core_which_plan() {
          the defect this pins"
     );
     assert!(
-        CONFIRM_DIALOG.contains("preview.start(operation)"),
-        "Rebuild fetches a NEW plan through the same path the dialog opened \
-         with — it never re-derives one in place"
+        CONFIRM_DIALOG.contains("PreviewAction::Start(operation) => preview.rebuild(operation)"),
+        "a previewable Rebuild fetches a NEW plan through the same path the \
+         dialog opened with, in the REBUILD state — `start` would report \
+         `Absent` while the request is in flight and re-enable the button over \
+         a plan we know is stale (#664 review, defect 1)"
+    );
+    assert!(
+        CONFIRM_DIALOG.contains("PreviewAction::Clear => rebuild_lease("),
+        "and a NotPreviewable one — the force-with-lease push — must take its \
+         own path. Routing it through `preview_action` alone resolves to \
+         `Clear`, so the offered button issued no request at all (#664 review, \
+         defect 2)"
     );
     let rebuild = CONFIRM_DIALOG
         .split("let rebuild = move || {")
@@ -633,5 +659,154 @@ fn the_dialog_offers_the_rebuild_it_talks_about_and_asks_core_which_plan() {
         !body.contains("run_confirmed") && !body.contains("close_confirm"),
         "Rebuild never executes and never silently dismisses: it replaces the \
          plan and leaves the user to approve it again"
+    );
+
+    // The lease path's own two obligations, which nothing else in this file
+    // can see: it must say it has started (or the button stays live over a
+    // plan we know is stale) and it must say it landed (or the button stays
+    // dead over a replacement that arrived).
+    let lease = CONFIRM_DIALOG
+        .split("fn rebuild_lease(")
+        .nth(1)
+        .expect("the force-with-lease rebuild path exists");
+    assert!(
+        lease.contains("preview.note_rebuild_started()"),
+        "the lease rebuild must enter the rebuilding state before it awaits"
+    );
+    assert!(
+        lease.contains("preview.note_rebuild_landed()"),
+        "and must leave it when the replacement arrives, or the confirmation \
+         stays withdrawn over a plan that is right there"
+    );
+    assert!(
+        lease.matches("preview.note_rebuild_failed()").count() >= 3,
+        "every way it can fail — either request, and a remote tip it cannot \
+         read — must land in the same stated state rather than silently \
+         leaving the dialog rebuilding forever"
+    );
+}
+
+// --- #664 review round 2: the two transitions Rebuild passes through -------
+//
+// Both defects the review found live in a *transition*, not in a resting
+// state: what is true while a replacement is being fetched, and what is true
+// when the fetch fails. Every test above this line asserts a resting state,
+// which is exactly why they all passed over both.
+
+#[test]
+fn a_rebuild_in_flight_does_not_re_enable_the_confirmation() {
+    // Defect 1, and it is worse than the problem it replaced. Clicking Rebuild
+    // cleared the plan; `confirm_enabled` saw "no plan" and returned **true**,
+    // so the stale notice vanished and the execute control went live with no
+    // replacement to review. The user got there by acting on being told the
+    // plan was stale.
+    //
+    // The modal's own dispatch sends a branch-only request to the legacy merge
+    // endpoint rather than submitting a plan, so the execution generation-gate
+    // never sees it: this window could dispatch an unreviewed operation.
+    let rebuilding = verdict(&PlanSlot::Rebuilding, &FeedLog::new());
+    assert_eq!(rebuilding, PlanVerdict::Rebuilding);
+    assert!(
+        !confirm_enabled(true, &rebuilding),
+        "there is nothing to approve while the replacement is in flight"
+    );
+    assert!(
+        blocked_by_staleness(&rebuilding).is_some(),
+        "and the reason is said, not merely enforced"
+    );
+    assert!(
+        verdict_headline(&rebuilding).is_some(),
+        "the notice must not vanish the moment Rebuild is pressed — that is \
+         the user losing the only thing telling them why"
+    );
+    assert!(
+        !rebuild_is_offered(&rebuilding),
+        "and Rebuild is not offered twice for one replacement"
+    );
+}
+
+#[test]
+fn a_rebuild_that_failed_leaves_the_confirmation_withdrawn_and_offers_another_go() {
+    // The second half of defect 1: "if `/api/plan` fails, that state persists."
+    // A failed replacement is not the absence of a claim — it is a failed
+    // attempt to replace a claim we know was stale.
+    let failed = verdict(&PlanSlot::RebuildFailed, &FeedLog::new());
+    assert_eq!(failed, PlanVerdict::RebuildFailed);
+    assert!(!confirm_enabled(true, &failed));
+    assert!(blocked_by_staleness(&failed)
+        .unwrap()
+        .contains("couldn't be built"));
+    assert!(
+        rebuild_is_offered(&failed),
+        "trying again is the only useful thing left on this dialog"
+    );
+    assert!(verdict_headline(&failed).is_some());
+    assert!(verdict_framing(&failed).is_some());
+}
+
+#[test]
+fn a_confirmation_that_never_had_a_plan_is_still_left_alone() {
+    // The distinction the whole `PlanSlot` exists for, asserted directly:
+    // `Absent` and `Rebuilding` are both "no plan right now", and only one of
+    // them may leave the confirmation offerable. #594 decided a preview
+    // informs and never gates, so an ordinary dialog whose plan has not
+    // arrived keeps its own verdict.
+    let absent = verdict(&PlanSlot::Absent, &FeedLog::new());
+    assert_eq!(absent, PlanVerdict::NoPlan);
+    assert!(confirm_enabled(true, &absent));
+    assert_eq!(verdict_headline(&absent), None, "and says nothing about it");
+}
+
+#[test]
+fn a_rebuild_in_flight_outranks_the_plan_it_is_replacing() {
+    // The force-with-lease case specifically. Its plan is carried on the
+    // operation, so a rebuild that did not outrank it would read the plan it
+    // is in the middle of replacing — and report it fresh or stale on the
+    // strength of a generation the user has already asked to be rid of.
+    let carried = PlanOnScreen {
+        generation: "100".to_string(),
+        expects: vec!["refs/heads/main".to_string()],
+    };
+    assert_eq!(
+        plan_on_screen(&force_push_op(carried.clone()), PlanSlot::Rebuilding),
+        PlanSlot::Rebuilding
+    );
+    assert_eq!(
+        plan_on_screen(&force_push_op(carried.clone()), PlanSlot::RebuildFailed),
+        PlanSlot::RebuildFailed
+    );
+    // And when it lands, the carried plan is the new one and is read again.
+    assert_eq!(
+        plan_on_screen(&force_push_op(carried.clone()), PlanSlot::Absent),
+        PlanSlot::Ready(carried)
+    );
+}
+
+#[test]
+fn the_lease_rebuild_is_a_different_path_because_push_has_no_preview() {
+    // Defect 2, pinned where a host test can see it. `preview_subject(Push)`
+    // is `NotPreviewable`, so routing the force-with-lease rebuild through
+    // `preview_action` alone resolves to `Clear` — the button was offered,
+    // clicking it issued no request, and nothing changed.
+    use crate::features::dialogs::core::preview_subject;
+    use crate::features::preview::core::{preview_action, PreviewAction};
+
+    let op = force_push_op(PlanOnScreen {
+        generation: "100".to_string(),
+        expects: Vec::new(),
+    });
+    assert_eq!(
+        preview_action(Some(preview_subject(&op))),
+        PreviewAction::Clear,
+        "this is the routing that made the offered button inert; the dialog's \
+         `Clear` arm is what has to do the work"
+    );
+    assert!(
+        rebuild_is_offered(&verdict(
+            &plan_on_screen(&op, PlanSlot::Absent),
+            &FeedLog::new()
+        )),
+        "and a force-with-lease plan the feed cannot vouch for does offer \
+         Rebuild — so the arm above is reachable, not theoretical"
     );
 }

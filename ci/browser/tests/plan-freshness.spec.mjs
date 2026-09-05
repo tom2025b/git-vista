@@ -197,6 +197,73 @@ test.describe('#555 a plan the repository moved past', () => {
     }
   })
 
+  test('a rebuild held in flight does not re-enable the confirmation', async ({ page }) => {
+    // #664 review round 2, defect 1 — and the reason the first Rebuild spec
+    // could not see it: that one waits for the final picture, so it only ever
+    // observes the resting state at each end. The defect lives in the middle.
+    //
+    // `/api/plan` is held open here rather than raced, so the window is a
+    // state this test controls instead of a millisecond it hopes to catch.
+    await openMergeConfirmation(page)
+
+    let releasePlan
+    const planGate = new Promise((resolve) => {
+      releasePlan = resolve
+    })
+    let held = false
+    await page.route('**/api/plan', async (route) => {
+      if (!held) {
+        held = true
+        await planGate
+      }
+      await route.continue()
+    })
+
+    git(['tag', 'held-rebuild'])
+    try {
+      const notice = page.locator(STALE)
+      await expect(notice).toBeVisible({ timeout: 20_000 })
+      await page.getByRole('button', { name: 'Rebuild' }).click()
+
+      // The window. Before the fix: the notice vanished and the button went
+      // live, with no replacement plan in existence.
+      await expect(notice).toBeVisible()
+      await expect(notice).toContainText('Building a new plan')
+      await expect(confirmButton(page)).toHaveAttribute('aria-disabled', 'true')
+
+      releasePlan()
+      await expect(page.locator(STALE)).toHaveCount(0, { timeout: 20_000 })
+      await expect(confirmButton(page)).toHaveAttribute('aria-disabled', 'false')
+    } finally {
+      releasePlan()
+      await page.unroute('**/api/plan')
+      git(['tag', '-d', 'held-rebuild'])
+      await page.keyboard.press('Escape')
+    }
+  })
+
+  test('a rebuild that fails leaves the confirmation withdrawn and says so', async ({ page }) => {
+    // The other half of defect 1: "if `/api/plan` fails, that state persists."
+    // A failed replacement must not read as "no plan, carry on".
+    await openMergeConfirmation(page)
+    await page.route('**/api/plan', (route) => route.abort('failed'))
+
+    git(['tag', 'failed-rebuild'])
+    try {
+      const notice = page.locator(STALE)
+      await expect(notice).toBeVisible({ timeout: 20_000 })
+      await page.getByRole('button', { name: 'Rebuild' }).click()
+
+      await expect(notice).toContainText("Couldn't build a new plan", { timeout: 20_000 })
+      await expect(confirmButton(page)).toHaveAttribute('aria-disabled', 'true')
+      await expect(page.getByRole('button', { name: 'Rebuild' })).toBeVisible()
+    } finally {
+      await page.unroute('**/api/plan')
+      git(['tag', '-d', 'failed-rebuild'])
+      await page.keyboard.press('Escape')
+    }
+  })
+
   test('a ref the plan names is named back, loudly', async ({ page }) => {
     const before = git(['rev-parse', PREVIEW_INTO])
     await openMergeConfirmation(page)

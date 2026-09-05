@@ -340,13 +340,8 @@ pub(super) fn build_branch_items(
                         // force-with-lease confirmation has no graph preview, so
                         // this is the only way the dialog can know whether the
                         // plan it is displaying still describes the repository.
-                        let (risk, advisories, explanation, on_screen) = match leased {
-                            Ok(plan) => {
-                                let explanation = git_vista_protocol::explain(&plan);
-                                let on_screen =
-                                    crate::features::freshness::core::PlanOnScreen::of(&plan);
-                                (plan.risk, plan.advisories, explanation, on_screen)
-                            }
+                        let lease = match leased {
+                            Ok(plan) => ForceWithLease::from_leased_plan(&plan, oid),
                             Err(e) => {
                                 dialogs.open(Dialog::Error);
                                 shell.open_error(ErrorNotice {
@@ -360,13 +355,7 @@ pub(super) fn build_branch_items(
                         shell.open_confirm(PendingOp::Push {
                             branch,
                             set_upstream: false,
-                            force: Some(ForceWithLease {
-                                expected_remote_tip: oid,
-                                risk,
-                                advisories,
-                                explanation,
-                                plan: on_screen,
-                            }),
+                            force: Some(lease),
                         });
                     });
                 };
