@@ -297,5 +297,13 @@ this project's own history (#550's 280/281 pair) exists to enforce.
 | clear instead of append | change the forced flag from the non-empty helper literal to the empty form `credential.helper=` (the same shape `core.askpass=` legitimately uses to disable) | `the_forced_credential_helper_value_is_never_empty` goes red on an empty-string assertion — a **static, argv-shape** failure |
 | leak into argv | move the token from `credential_env`'s environment set into the `-c credential.helper=` literal itself (interpolating the value, not just the variable's name) | `a_supplied_token_reaches_the_helpers_environment_and_never_the_processs_own_argv` goes red on the **kernel's own `/proc/self/cmdline` reading containing the canary** — a real, dynamic, spawned-process failure, structurally different from the first arm: one is a string-shape check on a literal, the other is an empirical read of a live process's own memory |
 
-Both caught, neither survived. Run ids and `run_key` recorded once the
-proof is executed (see the PR).
+Both caught, neither survived, and the failure shapes disjoint exactly as
+intended: arm one failed on a *static* check (an empty argv-shape literal,
+caught by `the_forced_credential_helper_value_is_never_empty` and — because
+the mutation also dropped the variable name — the argv-name-presence
+assertion in the other test too, 2 of 3 targets red); arm two left the
+empty-value check untouched (its literal is non-empty, just wrong) and was
+caught purely on content — the token itself appearing in the composed argv,
+1 of 3 targets red, and a different assertion within that same test than
+arm one tripped. Run ids 320 (clear instead of append) and 321 (leak into
+argv), `run_key: gv-582-credential-helper`.
