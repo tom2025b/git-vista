@@ -334,6 +334,93 @@ fn an_unread_census_refuses_without_inventing_a_worktree() {
     );
 }
 
+/// **Route 3, driven from a real failing census rather than a fabricated
+/// one.** `collision_refusal` embeds `CensusFailed`'s reason verbatim in a
+/// 500 body, and that is the third route #657's finding did not enumerate —
+/// the one that made the fix belong in the value rather than in any handler.
+///
+/// The test above proves the refusal does not *invent* a worktree. It says
+/// nothing about what the relayed reason contains, and it stayed green
+/// throughout the leak because its census is hand-built with a path-free
+/// string (grok, reviewing PR #658). This one takes a census from a **real**
+/// failure — a `tempfile::tempdir` that is not a git repository — and asserts
+/// the body against that run's own absolute path.
+#[test]
+fn the_refusal_relays_a_real_censuss_reason_without_its_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let here = dir.path().to_string_lossy().into_owned();
+
+    let census = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a current-thread runtime")
+        .block_on(crate::worktree_census::worktree_census(
+            dir.path(),
+            crate::worktree_census::CensusPaths::from_flag(false),
+            &|_: &std::path::Path| true,
+        ));
+    assert!(
+        matches!(census, WorktreeCensus::CensusFailed { .. }),
+        "the fixture must actually fail the census"
+    );
+
+    let (status, body) = collision_refusal(
+        &BranchName::new("feature/x").unwrap(),
+        &census,
+        CollisionMoment::AlreadySo,
+    );
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        body.contains("couldn't check"),
+        "withholding the path must not cost the sentence: {body}"
+    );
+    assert!(
+        !body.contains(&here),
+        "the planner's refusal named `{here}`: {body}"
+    );
+}
+
+/// The paired positive for the test above, and the one that proves the
+/// refusal is reading `reason` rather than merely being handed a census with
+/// nothing in it: with the operator opted in, the census *does* carry the
+/// path — in `detail` — and the refusal still does not.
+///
+/// `branch_holder` is what makes that true (it relays `reason`, never
+/// `detail`), and this is that fact observed at the route rather than at the
+/// function.
+#[test]
+fn an_opted_in_censuss_detail_never_reaches_the_planners_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    let here = dir.path().to_string_lossy().into_owned();
+
+    let census = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a current-thread runtime")
+        .block_on(crate::worktree_census::worktree_census(
+            dir.path(),
+            crate::worktree_census::CensusPaths::from_flag(true),
+            &|_: &std::path::Path| true,
+        ));
+    let WorktreeCensus::CensusFailed { ref detail, .. } = census else {
+        panic!("the fixture must actually fail the census");
+    };
+    assert!(
+        detail.as_ref().is_some_and(|d| d.contains(&here)),
+        "the fixture must have produced a detail, or this proves nothing"
+    );
+
+    let (_status, body) = collision_refusal(
+        &BranchName::new("feature/x").unwrap(),
+        &census,
+        CollisionMoment::AlreadySo,
+    );
+    assert!(
+        !body.contains(&here),
+        "the path-bearing half reached a refusal message: {body}"
+    );
+}
+
 /// The placeholder census an operation that never needed one carries is a
 /// *failure*, not an empty observation — so a future operation that acquires
 /// this precondition without acquiring its census refuses rather than passes.

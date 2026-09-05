@@ -252,3 +252,36 @@ can choose not to read. An operator who wants the path has the server log and
 - Protocol-level: `detail` omitted-not-null on the wire, and
   `BranchHolder::Unknown` proven to relay `reason` and not `detail` — the third
   route, tested where it is decided.
+
+### The second pass: a value-level proof is not a route-level proof
+
+Grok reviewed this ADR's own PR and confirmed the split but found the tests one
+layer short: **every client-facing surface was tested on status and shape,
+never on content.** That is the same hole as the one #656 was fixed for a day
+earlier, and it is worth naming as a rule rather than as two incidents.
+
+> A test that proves a *value* is clean does not prove the *bytes a client
+> receives* are clean. Between them sits a route that composes, serializes, or
+> embeds — and that composition is where a second field, a `Debug` format, or a
+> different constructor can put the path back.
+
+Five surfaces, and what each needed:
+
+| surface | what it had | what it has now |
+|---|---|---|
+| `GET /api/worktrees` | nothing; the body was never serialized in a test | the census from a **real** failure is serialized and the JSON text searched for that run's own tempdir — plus a source pin that the route takes `CensusPaths::from_flag`, never `rows_for_local_use` |
+| `POST /api/select-worktree` | status only | the sentence is a free function (`census_failure_body`) and is asserted as a string, driven from a real `rows_for_local_use` census — the exact conflation this ADR is about |
+| the planner's collision refusal | status + `"couldn't check"` | the same, plus a real failing census and a paired positive proving an opted-in `detail` still never reaches the body |
+| the porcelain parser's quoted line (route 4) | implemented, commented, never driven | a real repository is made to fail parsing — a worktree directory named `desk\nHEAD 000…0` splits its own record, so git prints two `HEAD` lines and the parser quotes the absolute path |
+| the drawer's `detail` paragraph | wasm-only; `cargo test` never compiled it | the decision moved to `DrawerView::unreadable_paragraphs` in host-tested `core.rs`; the view now renders a list and decides nothing |
+
+The fourth row is the one worth keeping. The fix's own rule — *anything from
+outside this module is detail, without inspecting it* — was applied to the
+parser on the strength of reading its source. That was correct, and it was not
+evidence. Making git actually emit a record the parser chokes on, from a
+directory name any user of the served repository can create, is what turns the
+comment into a fact.
+
+The fifth is the standing ADR 0115 rule applied without an exemption: a
+decision about *disclosure* is exactly the kind that must not live where no
+runner reaches it.

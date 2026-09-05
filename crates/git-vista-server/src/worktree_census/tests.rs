@@ -897,3 +897,144 @@ fn is_null_oid_matches_exactly_40_or_64_zeros() {
     assert!(!is_null_oid(&format!("{}1", "0".repeat(39))));
     assert!(!is_null_oid(&"a".repeat(40)));
 }
+
+// ---------------------------------------------------------------------------
+// #658 follow-up (grok): route 4 driven live, and the JSON body a client
+// actually receives
+// ---------------------------------------------------------------------------
+
+/// **Route 4, driven rather than commented.** `parse_worktree_porcelain`'s own
+/// errors quote the record's path, and a `worktree` line *is* an absolute
+/// path — that was the fourth path-bearing source #657 found, and until this
+/// test it was handled in code and asserted nowhere.
+///
+/// # How a real `git worktree list --porcelain` is made to fail
+///
+/// No porcelain is fabricated. The format at this repository's git floor is
+/// newline-framed with no `-z`, so a worktree whose directory name *contains a
+/// newline* splits its own record — the module doc already names this as git's
+/// limitation at that floor. Naming a directory `desk\nHEAD 000…0` makes git
+/// print a second `HEAD` line inside one record (verified by hand against git
+/// 2.53), and the parser answers ``` `<abs path>` has more than one `HEAD`
+/// line ``` — a genuine absolute path, in a genuine parser error, from a
+/// genuine repository.
+///
+/// The name is hostile-looking and that is the point: it is exactly the input
+/// that turns the parser's own diagnostic into a disclosure, and it is
+/// reachable by anyone who can `git worktree add` in the served repository.
+#[tokio::test]
+async fn a_real_porcelain_parse_failure_withholds_the_path_it_quotes() {
+    let (_dir, repo) = seeded();
+    let side = tempfile::tempdir().unwrap();
+    let crafted = side.path().join(format!("desk\nHEAD {}", "0".repeat(40)));
+    fx::run(&repo, &["branch", "crafted"]);
+    fx::run(
+        &repo,
+        &["worktree", "add", crafted.to_str().unwrap(), "crafted"],
+    );
+    // The first line of the crafted name is what the parser quotes: everything
+    // up to the newline, which is an absolute path.
+    let quoted = crafted
+        .to_string_lossy()
+        .split('\n')
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(quoted.starts_with('/'), "the fixture must be absolute");
+
+    let (reason, detail) =
+        failed_pair(worktree_census(&repo, CensusPaths::from_flag(false), &allow_all).await);
+    assert!(
+        reason.contains("could not parse"),
+        "the client-safe half must still say what failed: {reason}"
+    );
+    assert!(
+        !reason.contains(&quoted),
+        "the parser's quoted path reached the client-safe half: {reason}"
+    );
+    assert_eq!(detail, None);
+
+    let (opted_reason, opted_detail) =
+        failed_pair(worktree_census(&repo, CensusPaths::from_flag(true), &allow_all).await);
+    assert_eq!(opted_reason, reason, "the flag never rewrites `reason`");
+    let opted_detail = opted_detail.expect("an opted-in operator gets the parser's own words");
+    assert!(
+        opted_detail.contains(&quoted),
+        "and those words are the ones that name the path: {opted_detail}"
+    );
+}
+
+/// **Route 1, as a response body rather than as a value.** `GET /api/worktrees`
+/// answers `Json(census)` and adds nothing of its own, so the bytes a client
+/// receives are exactly this serialization — and grok's finding was that
+/// nothing asserted on them.
+///
+/// Serializing a census built from a *real* failure and searching the actual
+/// JSON text for this run's own temporary directory is the assertion the
+/// value-level tests above cannot make: it would catch a `reason` that stayed
+/// clean while some other serialized field carried the path.
+#[tokio::test]
+async fn the_worktrees_response_body_carries_no_path_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let here = dir.path().to_string_lossy().into_owned();
+
+    let census = worktree_census(dir.path(), CensusPaths::from_flag(false), &allow_all).await;
+    let body = serde_json::to_string(&census).expect("the census serializes");
+    assert!(
+        body.contains("census_failed"),
+        "the fixture must actually be a failure: {body}"
+    );
+    assert!(
+        !body.contains(&here),
+        "GET /api/worktrees' body named `{here}`: {body}"
+    );
+    assert!(
+        !body.contains("\"detail\""),
+        "and the withheld half must be absent from the wire, not empty: {body}"
+    );
+
+    let census = worktree_census(dir.path(), CensusPaths::from_flag(true), &allow_all).await;
+    let body = serde_json::to_string(&census).expect("the census serializes");
+    assert!(
+        body.contains(&here),
+        "the paired positive: an opted-in operator's body does carry it: {body}"
+    );
+}
+
+/// The handler is what decides which [`CensusPaths`] the body above is built
+/// with, and that decision has no runtime signature — a route switched to
+/// `rows_for_local_use` would serialize the detail with the flag off and every
+/// test in this file would stay green, because none of them call the handler.
+///
+/// So it is pinned by reading the source, the same technique
+/// `worktree_add_suite`'s exact-body pin uses and for the same reason: the
+/// mistake makes the app disclose *more*, and nothing goes red.
+#[test]
+fn the_worktrees_route_builds_its_census_from_the_operator_flag_alone() {
+    const READ_RS: &str = include_str!("../handlers/read.rs");
+    let after = READ_RS
+        .split_once("pub(crate) async fn worktree_list(")
+        .expect("handlers/read.rs no longer defines `worktree_list`")
+        .1;
+    let end = after
+        .find("\n}\n")
+        .expect("`worktree_list` is no longer a closed block");
+    let body: String = after[..end]
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .flat_map(|l| l.split_whitespace())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    assert!(
+        body.contains(
+            "crate::worktree_census::CensusPaths::from_flag(crate::state::expose_paths())"
+        ),
+        "`worktree_list` must build its census from the operator's flag alone: {body}"
+    );
+    assert!(
+        !body.contains("rows_for_local_use"),
+        "this route serializes its census, so it may never take the \
+         local-use constructor: {body}"
+    );
+}

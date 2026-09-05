@@ -180,6 +180,42 @@ pub fn drawer_view(fetched: Result<WorktreeCensus, String>) -> DrawerView {
     }
 }
 
+impl DrawerView {
+    /// The exact paragraphs the drawer shows for an unreadable census, in
+    /// order — the sentence *and* the decision of whether the path-bearing
+    /// half appears at all.
+    ///
+    /// # Why this is here rather than in `view.rs`
+    ///
+    /// `view.rs` is `#[cfg(target_arch = "wasm32")]`, so `cargo test` never
+    /// compiles it and no runner ever executes it (ADR 0115). A `detail.map(…)`
+    /// living there is a *decision about disclosure* that no test can reach —
+    /// exactly the shape #612 is systematically moving out of the view layer,
+    /// and grok's fifth finding on PR #658. So the decision lives here, where a
+    /// host test drives it, and the view is left with nothing to decide: it
+    /// renders the strings this returns, one paragraph each.
+    ///
+    /// Returns an empty vector for [`DrawerView::Rows`], which renders rows
+    /// rather than paragraphs — a caller that asks the wrong variant for its
+    /// message gets nothing to draw, never a fabricated sentence.
+    pub fn unreadable_paragraphs(&self) -> Vec<String> {
+        let Self::Unreadable { reason, detail } = self else {
+            return Vec::new();
+        };
+        let mut out = vec![format!(
+            "Couldn't read this repository's worktrees: {reason}"
+        )];
+        // Present only when the server chose to send it, which it does only
+        // when the operator set `GIT_VISTA_EXPOSE_PATHS` (#657). This client
+        // never decides disclosure; it only decides whether there is a second
+        // paragraph to draw.
+        if let Some(detail) = detail {
+            out.push(detail.clone());
+        }
+        out
+    }
+}
+
 /// One sibling's row.
 fn row(sibling: &WorktreeSibling) -> WorktreeRow {
     WorktreeRow {

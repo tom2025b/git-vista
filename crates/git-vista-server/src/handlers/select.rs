@@ -118,18 +118,8 @@ pub(crate) async fn select_discovered_worktree(
     .await;
     let siblings = match census {
         WorktreeCensus::Observed { siblings } => siblings,
-        // `reason` alone: the census has already logged the full detail, and
-        // `detail` reaches a client only when the operator opted in — which
-        // this route answers as plain text, so appending it here would be the
-        // one place the flag could be bypassed by accident. An operator who
-        // wants the path has the log and `GET /api/worktrees`.
         WorktreeCensus::CensusFailed { reason, .. } => {
-            return (
-                StatusCode::CONFLICT,
-                format!(
-                    "Couldn't read this repository's worktrees, so nothing was selected: {reason}"
-                ),
-            );
+            return (StatusCode::CONFLICT, census_failure_body(&reason));
         }
     };
     let Some(sibling) = siblings.iter().find(|s| s.id == req.worktree) else {
@@ -175,6 +165,23 @@ pub(crate) async fn select_discovered_worktree(
             "That worktree was admitted but could not be opened.".to_string(),
         )
     }
+}
+
+/// The plain-text body this route answers a [`WorktreeCensus::CensusFailed`]
+/// with — a free function so it can be tested as a *string*, which is the one
+/// thing a status-code assertion cannot check (grok, reviewing PR #658).
+///
+/// # `reason` alone, never `detail`
+///
+/// The census has already written the full detail to the server's log, and
+/// `detail` reaches a client only when the operator opted in. This route
+/// answers plain text rather than JSON, so there is no field a client could
+/// choose not to read — appending the detail here would be the one place the
+/// flag could be bypassed by accident, and it would be bypassed for every
+/// operator rather than only for one who asked. An operator who wants the path
+/// has the log and `GET /api/worktrees`, both of which honour the flag.
+fn census_failure_body(reason: &str) -> String {
+    format!("Couldn't read this repository's worktrees, so nothing was selected: {reason}")
 }
 
 /// Re-scan the configured repo root and the clones root (ADR 0009/0008).
@@ -354,5 +361,72 @@ mod worktree_admission_tests {
              roots, so the second half of this route's defence is gone — and the \
              first half is a type, which cannot notice"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #658 follow-up (grok): the failure body, tested as a string
+    // -----------------------------------------------------------------------
+
+    use super::census_failure_body;
+    use git_vista_protocol::WorktreeCensus;
+
+    /// **Route 2, driven from a real failure rather than a fabricated reason.**
+    ///
+    /// The census is taken here with [`CensusPaths::rows_for_local_use`], which
+    /// is exactly the conflation #657 was about — this route's own local need
+    /// for row paths must not decide what a failure discloses. So the fixture
+    /// uses that constructor, not `from_flag`: a regression that made
+    /// `rows_for_local_use` publish the detail would show up in *this* body,
+    /// and this is the body a user reads.
+    #[tokio::test]
+    async fn the_failure_body_this_route_answers_carries_no_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().to_string_lossy().into_owned();
+
+        let census = crate::worktree_census::worktree_census(
+            dir.path(),
+            crate::worktree_census::CensusPaths::rows_for_local_use(false),
+            &|_: &std::path::Path| true,
+        )
+        .await;
+        let WorktreeCensus::CensusFailed { reason, .. } = census else {
+            panic!("the fixture must actually fail the census");
+        };
+
+        let body = census_failure_body(&reason);
+        assert!(
+            body.starts_with("Couldn't read this repository's worktrees"),
+            "the sentence a user reads must still say what happened: {body}"
+        );
+        assert!(
+            !body.contains(&here),
+            "POST /api/select-worktree's body named `{here}`: {body}"
+        );
+    }
+
+    /// The paired positive, and the one that keeps the redaction honest: an
+    /// opted-in operator's census carries a detail, and this route still does
+    /// not put it in the body. Withholding it here is a deliberate choice
+    /// (plain text has no field to ignore), so it is asserted rather than left
+    /// to a comment.
+    #[tokio::test]
+    async fn even_an_opted_in_census_detail_stays_out_of_this_routes_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().to_string_lossy().into_owned();
+
+        let census = crate::worktree_census::worktree_census(
+            dir.path(),
+            crate::worktree_census::CensusPaths::rows_for_local_use(true),
+            &|_: &std::path::Path| true,
+        )
+        .await;
+        let WorktreeCensus::CensusFailed { reason, detail } = census else {
+            panic!("the fixture must actually fail the census");
+        };
+        assert!(
+            detail.is_some_and(|d| d.contains(&here)),
+            "the fixture must have produced a detail, or this proves nothing"
+        );
+        assert!(!census_failure_body(&reason).contains(&here));
     }
 }
