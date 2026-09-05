@@ -47,6 +47,20 @@ pub enum ActivityKind {
     Fetch,
     Pull,
     Clone,
+    /// A bisect start/mark/reset step run by this app (M5.34, #87, ADR
+    /// 0121). One kind covers the whole sub-workflow; the summary string
+    /// says which verb and which commit, the same way `BranchDeleted`
+    /// covers both a safe and a force delete.
+    ///
+    /// A bisect step run externally (a human typing `git bisect` in a
+    /// terminal) does NOT arrive here — its reflog trace is a bare
+    /// `checkout: moving from X to Y`, indistinguishable from an ordinary
+    /// checkout by text (verified; see ADR 0121 §6), so it classifies as
+    /// [`Self::Checkout`] via [`parse_reflog_message`] like any other
+    /// external HEAD move. This variant exists only for the app's own,
+    /// fully-understood actions, which always call the journal with an
+    /// explicit kind at op time.
+    Bisect,
     Other,
 }
 

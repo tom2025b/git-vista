@@ -89,6 +89,7 @@ pub fn kind_label(kind: ActivityKind) -> &'static str {
         ActivityKind::Fetch => "Fetch",
         ActivityKind::Pull => "Pull",
         ActivityKind::Clone => "Clone",
+        ActivityKind::Bisect => "Bisect",
         ActivityKind::Other => "Event",
     }
 }
@@ -101,7 +102,7 @@ pub fn kind_glyph(ic: &GitIcons, kind: ActivityKind) -> &'static str {
         ActivityKind::Commit | ActivityKind::CherryPick | ActivityKind::Other => ic.commit,
         ActivityKind::Amend => ic.modified,
         ActivityKind::Merge | ActivityKind::Rebase | ActivityKind::Pull => ic.merge,
-        ActivityKind::Checkout => ic.checkout,
+        ActivityKind::Checkout | ActivityKind::Bisect => ic.checkout,
         ActivityKind::Reset | ActivityKind::Revert => ic.undo,
         ActivityKind::BranchCreated => ic.branch,
         ActivityKind::BranchDeleted => ic.deleted,
