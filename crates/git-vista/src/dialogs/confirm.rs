@@ -31,9 +31,10 @@ use crate::features::dialogs::core::{
 };
 use crate::features::preview::core::{preview_action, PreviewAction};
 
+use crate::features::freshness::core::{blocked_by_staleness, confirm_enabled};
 use crate::features::preview::signals::PreviewSlot;
 
-use super::preview_panel_view;
+use super::{freshness_notice_view, preview_panel_view};
 use crate::features::explain::core::{render, LinkTarget, RenderedSection, Span};
 use crate::features::graph::core::{disabled_menu_item_copy, push_confirm_copy};
 use crate::features::operations::kind::OperationKind;
@@ -58,6 +59,9 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
         operations,
         shell,
         preview,
+        // M12.05 (#555): the change feed. Read here so a plan whose repository
+        // moved under it withdraws its own confirmation.
+        freshness,
         // M11.02 (#547): the "open that worktree instead" path selects a
         // different worktree, which changes what every resource should be
         // reading — the same epoch bump the picker makes after its own
@@ -421,6 +425,21 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                     worktree_confirm(WorktreeAction::DeleteUntracked, paths, armed)
                 }
             };
+            // M12.05 (#555): a plan whose repository moved after its picture was
+            // drawn withdraws its own confirmation. The composition is
+            // `freshness::core::confirm_enabled`, host-tested, rather than an
+            // `&&` written here where no test runner compiles it.
+            //
+            // This does not contradict `PreviewView::advisory_only`. That rule
+            // is about the preview's *content* — a conflict, an unsupported
+            // operation — never deciding whether an operation may proceed, and
+            // it still holds exactly as written. This asks a different question
+            // with a different answer: not "what does the picture show" but
+            // "does the picture still describe the repository". A picture the
+            // repository has moved past is not advice, it is a receipt.
+            let plan_freshness = preview.plan().map(|plan| freshness.of(&plan));
+            let enabled = confirm_enabled(enabled, plan_freshness.as_ref());
+            let blocked_reason = blocked_by_staleness(plan_freshness.as_ref()).or(blocked_reason);
             // The confirm button is muted when disabled, red for a destructive
             // delete, green otherwise.
             let confirm_style = if !enabled {
@@ -516,6 +535,7 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                                     white-space:pre-wrap; max-height:50vh; \
                                     overflow-y:auto;">{body}</div>
                         {explanation.map(|e| explanation_panel_view(&e))}
+                        {freshness_notice_view(preview, freshness)}
                         {preview_panel_view(preview)}
                         {arm_control}
                         {visible_reason.map(|reason| view! {

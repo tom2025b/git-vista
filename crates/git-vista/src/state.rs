@@ -115,6 +115,7 @@ pub use crate::features::operations::kind::OperationKind as PendingOp;
 use crate::features::dialogs::signals::Dialogs;
 use crate::features::graph::core::GraphCore;
 use crate::features::operations::signals::Operations;
+use crate::features::freshness::signals::Freshness;
 use crate::features::preview::signals::Preview;
 use crate::features::shell::signals::Shell;
 use crate::features::stash::signals::StashDrawer;
@@ -240,6 +241,15 @@ pub struct Features {
     /// reply may paint lives inside it, where a rebuild would reset it to zero
     /// and re-admit exactly the stale answer it exists to drop.
     pub preview: Preview,
+    /// The repository change feed (M12.05, #555): what the server last
+    /// published about the repository's generation, and the log a plan on
+    /// screen is differenced against.
+    ///
+    /// Here, above the canvas, for the reason every other handle in this bundle
+    /// is: an epoch bump rebuilds the canvas, and a feed owned below it would
+    /// drop its `EventSource` and its log on every background refresh — leaving
+    /// every plan on screen saying "couldn't tell" a moment after any write.
+    pub freshness: Freshness,
 }
 
 /// The lazily-fetched commit detail (Phase 10): keyed on the open commit's hash,

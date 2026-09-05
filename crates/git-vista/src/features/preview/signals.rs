@@ -28,6 +28,7 @@ use leptos::*;
 use git_vista_protocol::GitOperation;
 
 use crate::api;
+use crate::features::freshness::core::PlanOnScreen;
 use crate::features::preview::core::{view_of, PreviewView};
 
 /// What the panel is showing right now.
@@ -57,6 +58,15 @@ pub enum PreviewSlot {
 #[derive(Clone, Copy)]
 pub struct Preview {
     slot: RwSignal<PreviewSlot>,
+    /// The plan this panel is showing a picture of, as M12.05 (#555) needs it:
+    /// the generation it was built against, and the refs it expects to move.
+    ///
+    /// Kept because the picture is what the user approves. When the repository
+    /// moves under it the panel must say so and the confirm control must be
+    /// withdrawn — and neither is answerable without the plan's own generation.
+    /// It is deliberately *not* re-fetched on a change: a plan that quietly
+    /// re-derives itself is a plan the user did not approve.
+    plan: RwSignal<Option<PlanOnScreen>>,
     /// Bumped by every start and every clear. A reply whose captured value no
     /// longer matches is discarded.
     ///
@@ -75,6 +85,7 @@ impl Preview {
     pub fn new() -> Self {
         Self {
             slot: create_rw_signal(PreviewSlot::Idle),
+            plan: create_rw_signal(None),
             generation: store_value(0),
         }
     }
@@ -82,6 +93,11 @@ impl Preview {
     /// A tracked read — the panel re-renders from it.
     pub fn slot(&self) -> PreviewSlot {
         self.slot.get()
+    }
+
+    /// The plan on screen, if one was built. A tracked read.
+    pub fn plan(&self) -> Option<PlanOnScreen> {
+        self.plan.get()
     }
 
     /// Ask for the preview of `op`, discarding whatever was on screen.
@@ -95,21 +111,37 @@ impl Preview {
     pub fn start(&self, op: GitOperation) {
         let issued = self.bump();
         self.slot.set(PreviewSlot::Pending);
+        self.plan.set(None);
         let slot = self.slot;
+        let on_screen = self.plan;
         let generation = self.generation;
         spawn_local(async move {
-            let outcome = match api::plan_request(&op).await {
-                Ok(plan) => match api::preview_request(&plan).await {
-                    Ok(response) => PreviewSlot::Ready(view_of(response)),
-                    Err(why) => PreviewSlot::Failed(why),
-                },
-                Err(why) => PreviewSlot::Failed(why),
+            let (outcome, plan) = match api::plan_request(&op).await {
+                Ok(plan) => {
+                    // #555: what the user is about to approve, remembered
+                    // before the picture is drawn — the generation the plan was
+                    // built against and the refs it says it will move.
+                    let on_screen = PlanOnScreen {
+                        generation: plan.generation.as_str().to_string(),
+                        expects: plan
+                            .expected_ref_changes
+                            .iter()
+                            .map(|change| change.ref_name.as_str().to_string())
+                            .collect(),
+                    };
+                    match api::preview_request(&plan).await {
+                        Ok(response) => (PreviewSlot::Ready(view_of(response)), Some(on_screen)),
+                        Err(why) => (PreviewSlot::Failed(why), Some(on_screen)),
+                    }
+                }
+                Err(why) => (PreviewSlot::Failed(why), None),
             };
             // The stale-response guard. `try_get_value` rather than
             // `get_value`: this future outlives nothing today, but a disposed
             // owner must drop the reply, never panic inside a browser.
             if generation.try_get_value() == Some(issued) {
                 slot.set(outcome);
+                on_screen.set(plan);
             }
         });
     }
@@ -122,6 +154,11 @@ impl Preview {
     pub fn clear(&self) {
         self.bump();
         self.slot.set(PreviewSlot::Idle);
+        // The plan goes with the picture. A generation left behind would make
+        // the *next* dialog answer a freshness question about the last one's
+        // plan — the same class of stale-reply defect the tag above exists to
+        // stop, one field over.
+        self.plan.set(None);
     }
 
     /// Take the next generation and return it.

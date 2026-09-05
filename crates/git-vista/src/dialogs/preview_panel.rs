@@ -22,6 +22,8 @@
 
 use leptos::*;
 
+use crate::features::freshness::core::{freshness_headline, rebuild_framing, PlanFreshness};
+use crate::features::freshness::signals::Freshness;
 use crate::features::preview::core::{reassurance, PreviewView};
 use crate::features::preview::scene::{
     scene_of, HalfScene, LegendEntry, PreviewScene, SceneNode, MARK_ADDED,
@@ -38,6 +40,40 @@ const PANEL_HEAD: &str = "padding:8px 12px; background:#0d1117; color:var(--mute
 const PANEL_BODY: &str = "padding:10px 12px; line-height:1.4;";
 /// Muted body text, for a reason or a caption.
 const MUTED: &str = "color:var(--muted); line-height:1.4;";
+
+/// The freshness notice's own chrome — amber rather than the panel grey, and
+/// above the picture rather than below it. A staleness warning printed *under*
+/// the thing it invalidates is one a reader meets after they have already
+/// believed the picture.
+const STALE: &str = "margin-bottom:14px; padding:10px 12px; border-radius:8px;                      border:1px solid #9e6a03; background:#2b2007;                      color:#f2cc60; line-height:1.4;";
+
+/// Is the plan on screen still current, and what does the panel say about it?
+///
+/// Renders nothing while the plan is current, and nothing at all when there is
+/// no plan on screen — most confirmations in this modal have no preview, and
+/// this feature makes no claim about them (M12.05, #555).
+///
+/// Every word comes from `features::freshness::core`, host-tested, for the same
+/// reason every word of the panel below comes from `features::preview::core`.
+pub fn freshness_notice_view(preview: Preview, freshness: Freshness) -> impl IntoView {
+    move || {
+        let plan = preview.plan()?;
+        let verdict = freshness.of(&plan);
+        if matches!(verdict, PlanFreshness::Current) {
+            return None;
+        }
+        let headline = freshness_headline(&verdict)?;
+        let framing = rebuild_framing(&verdict);
+        Some(view! {
+            <div class="plan-stale" style=STALE role="status">
+                <div style="font-weight:600;">{headline}</div>
+                {framing.map(|text| view! {
+                    <div style="margin-top:6px; opacity:0.9;">{text}</div>
+                })}
+            </div>
+        })
+    }
+}
 
 /// The graph-preview panel, under the confirmation it belongs to.
 ///
