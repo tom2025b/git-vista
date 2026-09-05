@@ -21,11 +21,10 @@
 
 use leptos::*;
 
-use git_vista_core::color::{branch_color, BADGE_DARK, HEAD_BADGE, TAG_BADGE};
-use git_vista_core::model::RefKind;
+use git_vista_core::color::branch_color;
 
 use crate::datetime::local_timestamp;
-use crate::features::graph::core::RenderCtx;
+use crate::features::graph::core::{badge_colors, commit_link, ref_glyph, BadgeSurface, RenderCtx};
 use crate::geometry::{
     badge_text_dx, badge_text_y, badge_top_y, badge_width, edge_path, label_bottom_y, label_top_y,
     node_cx, node_cy, stub_headroom_for, stub_node_cy, stub_path, BADGE_GAP, BADGE_HEIGHT,
@@ -40,20 +39,6 @@ const MAX_SUMMARY_CHARS: usize = 60;
 /// Rough per-character advance (px) of the 13px monospace message text, used
 /// only to size the sheet so no label is clipped.
 const MSG_CHAR_W: i32 = 8;
-
-/// The settled commit-link rule shared by the print and interactive labels:
-/// only GitHub-backed commits known to be on the remote have a reachable page.
-pub(crate) fn commit_github_url(
-    repo_url: Option<&str>,
-    on_remote: bool,
-    commit_id: &str,
-) -> Option<String> {
-    repo_url.and_then(|base| on_remote.then(|| format!("{base}/commit/{commit_id}")))
-}
-
-fn print_commit_url(repo_url: Option<&str>, on_remote: bool, commit_id: &str) -> Option<String> {
-    commit_github_url(repo_url, on_remote, commit_id)
-}
 
 /// Stamp (or clear) `data-print` on `<html>`, naming which surface is being
 /// printed.
@@ -240,7 +225,7 @@ fn graph_sheet(c: &RenderCtx, nerd: bool) -> View {
                 .refs
                 .iter()
                 .map(|r| {
-                    let icon = ref_icon(ic, &r.kind);
+                    let icon = ref_glyph(ic, &r.kind);
                     badge_width(&format!("{icon} {}", r.name)) + BADGE_GAP
                 })
                 .sum();
@@ -351,19 +336,16 @@ fn graph_sheet(c: &RenderCtx, nerd: bool) -> View {
                 .refs
                 .iter()
                 .map(|r| {
-                    let icon = ref_icon(ic, &r.kind);
+                    let icon = ref_glyph(ic, &r.kind);
                     let w = badge_width(&format!("{icon} {}", r.name));
                     let x = bx;
                     bx += w + BADGE_GAP;
-                    let branch = branch_color(gr.color);
-                    // Same colour mapping as labels.rs — except HEAD, whose
-                    // near-white fill needs a grey outline to exist on paper.
-                    let (fill, stroke, text_fill) = match r.kind {
-                        RefKind::Head => (HEAD_BADGE, "#57606a", BADGE_DARK),
-                        RefKind::Tag => (TAG_BADGE, TAG_BADGE, BADGE_DARK),
-                        RefKind::Branch => (branch, branch, BADGE_DARK),
-                        RefKind::RemoteBranch => ("none", branch, branch),
-                    };
+                    // One colour mapping for both surfaces, with the single
+                    // intended divergence named rather than copied: HEAD's
+                    // near-white fill needs a grey outline to exist on paper,
+                    // and `BadgeSurface::Paper` is what says so (#653).
+                    let colors = badge_colors(&r.kind, branch_color(gr.color), BadgeSurface::Paper);
+                    let (fill, stroke, text_fill) = (colors.fill, colors.stroke, colors.text);
                     let name = r.name.clone();
                     view! {
                         <rect
@@ -396,8 +378,13 @@ fn graph_sheet(c: &RenderCtx, nerd: bool) -> View {
                 gr.commit.author,
                 local_timestamp(gr.commit.time),
             );
+            // Same rule the interactive labels use, decided in
+            // `features::graph::core` where a host test runs it (#653). The
+            // three tests that used to sit at the bottom of this file asserted
+            // it from inside a `#[cfg(target_arch = "wasm32")]` module and so
+            // never once executed; they live in `label_link_suite` now.
             let commit_url =
-                print_commit_url(c.frame.repo_url.as_deref(), gr.on_remote, &gr.commit.id.0);
+                commit_link(c.frame.repo_url.as_deref(), gr.on_remote, &gr.commit.id.0).into_url();
             let commit_label = view! {
                 <text x=bx y=label_top_y(gr.row) class="label-msg pg-msg">{msg}</text>
                 <text x=tx y=label_bottom_y(gr.row) class="label-meta pg-meta">
@@ -439,42 +426,4 @@ fn graph_sheet(c: &RenderCtx, nerd: bool) -> View {
         </svg>
     }
     .into_view()
-}
-
-/// The badge glyph for a ref kind — same mapping as render/labels.rs.
-fn ref_icon(ic: &crate::icons::GitIcons, kind: &RefKind) -> &'static str {
-    match kind {
-        RefKind::Head => ic.commit,
-        RefKind::Tag => ic.tag,
-        RefKind::Branch => ic.branch,
-        RefKind::RemoteBranch => ic.branch_alt,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const COMMIT_ID: &str = "0123456789abcdef0123456789abcdef01234567";
-
-    #[test]
-    fn pushed_commits_print_as_links() {
-        assert_eq!(
-            print_commit_url(Some("https://github.com/owner/repo"), true, COMMIT_ID),
-            Some(format!("https://github.com/owner/repo/commit/{COMMIT_ID}"))
-        );
-    }
-
-    #[test]
-    fn unpushed_commits_print_unlinked() {
-        assert_eq!(
-            print_commit_url(Some("https://github.com/owner/repo"), false, COMMIT_ID),
-            None
-        );
-    }
-
-    #[test]
-    fn no_remote_prints_unlinked_and_does_not_panic() {
-        assert_eq!(print_commit_url(None, true, COMMIT_ID), None);
-    }
 }

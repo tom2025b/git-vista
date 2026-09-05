@@ -184,6 +184,11 @@
   },
   "census_failed": {
     "kind": "census_failed",
-    "reason": "`git worktree list --porcelain` failed: fatal: not a git repository"
+    "reason": "`git worktree list --porcelain` failed"
+  },
+  "census_failed_with_detail": {
+    "kind": "census_failed",
+    "reason": "`git worktree list --porcelain` failed",
+    "detail": "`git worktree list --porcelain` failed: fatal: not a git repository: '/home/someone/private/repo/.git'"
   }
 }
