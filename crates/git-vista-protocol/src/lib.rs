@@ -110,10 +110,11 @@ pub use dto::{
     CreateTagRequest, DeleteCloneRequest, DeleteRemoteTagRequest, DeleteTagRequest, DropContext,
     DropStashRequest, FetchError, FetchFailureKind, FetchRequest, FetchSuccess, HookPolicy,
     PullError, PullFailureKind, PullRequest, PullSuccess, PushRequest, PushStashRequest,
-    PushTagRequest, RebaseStatus, RemoteRefUpdate, RepoMode, RepositoryDescriptor, RepositoryKind,
-    ResolveConflictContentRequest, ResolveConflictRequest, SelectRequest, SelectWorktreeRequest,
-    SessionInfo, SessionRequest, SignTagError, SignTagFailureKind, SignatureStatus, StashEntry,
-    StashTarget, TagDetail, TagKind, WorktreePathsRequest, CLONE_IN_PROGRESS_SENTINEL,
+    PushTagRequest, RebaseStatus, RemoteRefUpdate, RemoveWorktreeRequest, RepoMode,
+    RepositoryDescriptor, RepositoryKind, ResolveConflictContentRequest, ResolveConflictRequest,
+    SelectRequest, SelectWorktreeRequest, SessionInfo, SessionRequest, SignTagError,
+    SignTagFailureKind, SignatureStatus, StashEntry, StashTarget, TagDetail, TagKind,
+    WorktreePathsRequest, CLONE_IN_PROGRESS_SENTINEL,
 };
 pub use effects::{network_need_for_operation, IndexEffect, NetworkNeed, WorktreeEffect};
 pub use error::{ApiError, ApiErrorBody, ErrorCode, RequestId};
@@ -134,8 +135,8 @@ pub use plan::{
     Advisory, BranchName, CommitMessage, CommitOid, ForcePublish, GenerationToken, GitOperation,
     MergeStrategy, OperationHash, Plan, PlanFieldError, Precondition, RecoveryStrategy, RefChange,
     RefName, RefState, RemoteName, RepositoryToken, RiskLevel, StashMessage, StashSelector,
-    TagAnnotation, TagMessage, TagName, UnixSeconds, WorktreeName, WorktreePath, WorktreeToken,
-    MAX_REMOTE_NAME_LEN, MAX_TAG_MESSAGE_LEN,
+    TagAnnotation, TagMessage, TagName, UnixSeconds, WorktreeName, WorktreePath, WorktreeSiblingId,
+    WorktreeToken, MAX_REMOTE_NAME_LEN, MAX_TAG_MESSAGE_LEN,
 };
 pub use status::{
     parse_porcelain_v2_z, ChangeKind, ChangeSides, ConflictKind, ParsedStatus, StatusEntry,

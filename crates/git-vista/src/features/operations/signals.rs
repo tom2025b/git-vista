@@ -621,6 +621,10 @@ async fn send(kind: &OperationKind, key: IdempotencyKey) -> Result<WriteReceipt,
             api::delete_untracked_paths_request(paths.clone(), key).await
         }
         OperationKind::DeleteLocalTag { tag } => api::delete_tag_request(tag, key).await,
+        // M11.05 (#550). `name` plays no part in the request — the server
+        // resolves `id` to a real path itself, via a fresh census — so only
+        // `id` crosses the wire.
+        OperationKind::RemoveWorktree { id, .. } => api::remove_worktree_request(id, key).await,
     }
 }
 

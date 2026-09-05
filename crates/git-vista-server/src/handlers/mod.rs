@@ -31,6 +31,8 @@
 //!     `Plan` would produce, computed by real git against the real objects in
 //!     a throwaway store and written nowhere. The picture half of the same
 //!     review roundtrip `plan` opens in words.
+//!   * [`worktrees`] — `POST /api/remove-worktree` (M11.05, #550): close a
+//!     linked sibling desk, addressed by opaque id.
 //!
 //! Since M1.06b (#143) the write handlers don't run git themselves: each
 //! validates its request, builds one typed `GitOperation` (#142), and hands it
@@ -76,6 +78,8 @@ pub(crate) mod stash;
 pub(crate) mod tags;
 // M1.04 (#57): establish / check / revoke a loopback session.
 pub(crate) mod session;
+// M11.05 (#550): close a linked sibling worktree.
+pub(crate) mod worktrees;
 
 /// One entry of a batched app journal write: exactly the five fields
 /// [`journal_app_event`] takes, minus the repository they are written to.

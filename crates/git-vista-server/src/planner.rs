@@ -972,6 +972,11 @@ fn needs_worktree_census(operation: &GitOperation) -> bool {
             // rather than silent, which is the whole reason this function
             // exists as one place both observation paths read.
             | GitOperation::AddWorktree { .. }
+            // M11.05 (#550): the compare-and-swap's "expected" half — see
+            // `census_for`'s own `RemoveWorktree` arm for why this one reads
+            // with `expose_paths` forced on regardless of the operator's
+            // setting.
+            | GitOperation::RemoveWorktree { .. }
     )
 }
 
@@ -992,15 +997,49 @@ fn no_census_taken() -> WorktreeCensus {
 /// parameters precisely so that every test can supply its own, and this is
 /// the one place that supplies the process-global pair.
 async fn census_for(repo: &Path, operation: &GitOperation) -> WorktreeCensus {
-    if needs_worktree_census(operation) {
-        crate::worktree_census::worktree_census(
-            repo,
-            crate::worktree_census::CensusPaths::from_flag(crate::state::expose_paths()),
-            &crate::state::path_is_allowed,
-        )
-        .await
-    } else {
-        no_census_taken()
+    match operation {
+        // M11.02 (#547) and M11.04 (#549) share this arm: both preconditions
+        // (`BranchFreeInEveryOtherWorktree`, `BranchFreeInEveryOtherWorktree`
+        // reused for the add-side check) read only the census's public,
+        // already-redaction-aware shape, so both follow the operator's own
+        // `GIT_VISTA_EXPOSE_PATHS` flag rather than forcing paths on.
+        GitOperation::CheckoutBranch { .. } | GitOperation::AddWorktree { .. } => {
+            crate::worktree_census::worktree_census(
+                repo,
+                crate::worktree_census::CensusPaths::from_flag(crate::state::expose_paths()),
+                &crate::state::path_is_allowed,
+            )
+            .await
+        }
+        // M11.05 (#550): `rows` is always `true` here, regardless of the
+        // operator's own `GIT_VISTA_EXPOSE_PATHS` setting — `rows_for_local_use`
+        // is exactly the constructor `handlers::select::select_discovered_worktree`
+        // already uses for the same reason (see its own doc comment): a path
+        // consumed only for this server's own internal use, never serialized
+        // to a client. This census's rows exist purely so
+        // `worktree_exec::exec_remove_worktree` can compare-and-swap a
+        // sibling's resolved path against a second, fresher read taken
+        // immediately before the spawn (both stay entirely server-side).
+        // Withholding the path here would defeat that check for the common
+        // case (path exposure off by default). `failure_detail` still follows
+        // the operator's flag — this arm never reads `CensusFailed::detail`,
+        // only `reason`, so its value is moot here but correct in spirit.
+        GitOperation::RemoveWorktree { .. } => {
+            crate::worktree_census::worktree_census(
+                repo,
+                crate::worktree_census::CensusPaths::rows_for_local_use(
+                    crate::state::expose_paths(),
+                ),
+                &crate::state::path_is_allowed,
+            )
+            .await
+        }
+        _ if needs_worktree_census(operation) => {
+            unreachable!(
+                "needs_worktree_census and census_for must agree on which operations need a census"
+            )
+        }
+        _ => no_census_taken(),
     }
 }
 
@@ -2769,6 +2808,28 @@ async fn shape(
             Vec::new(),
             RecoveryStrategy::Irrecoverable,
         ),
+        // M11.05 (#550). No `Precondition` here, and that is deliberate — see
+        // `GitOperation::RemoveWorktree`'s own doc comment in the protocol
+        // crate for why the real gate (the id-to-path compare-and-swap)
+        // cannot be expressed as one: it needs a path derived from a FRESH
+        // census taken immediately before the spawn, and nothing downstream
+        // of `shape`/`enforce_fresh` carries that value to the executor.
+        // `worktree_exec::exec_remove_worktree` takes its own fresh census
+        // read, inside the coordinator guard, and refuses there instead.
+        //
+        // `RiskLevel::Destructive` and `RecoveryStrategy::Irrecoverable` for
+        // the reason the spec is blunt about: an uncommitted edit in the
+        // removed worktree was never written to git's object database, so
+        // there is no ref to pin and nothing this app's recovery machinery
+        // could ever point at. git's own refusal on a dirty tree is the
+        // entire protection, which is why `--force` is never offered —
+        // permanently, not as a first pass to revisit.
+        GitOperation::RemoveWorktree { .. } => (
+            RiskLevel::Destructive,
+            Vec::new(),
+            Vec::new(),
+            RecoveryStrategy::Irrecoverable,
+        ),
         // M2.19a (#222) shaped this; M2.19b (#223) executes it — see
         // `GitOperation::AmendCommit`'s doc comment for the full reasoning
         // behind every choice below, and `exec_amend_commit` for execution.
@@ -3157,6 +3218,14 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
         }
         GitOperation::DeleteUntrackedPaths { paths } => {
             worktree_exec::exec_delete_untracked_paths(repo, need, &paths).await
+        }
+        // M11.05 (#550). `observed.census` is the plan-build-time read
+        // `census_for` took with `expose_paths: true` (see that function) —
+        // the "expected" half of the compare-and-swap. The executor takes
+        // its own fresh second read, inside this same coordinator guard,
+        // immediately before the spawn.
+        GitOperation::RemoveWorktree { id } => {
+            worktree_exec::exec_remove_worktree(repo, need, id.as_str(), &observed.census).await
         }
         // M2.19a (#222) shipped the typed contract; M2.19b (#223, ADR 0040)
         // wired this execution — `handlers::commit::amend_commit` builds the
@@ -3941,6 +4010,10 @@ pub(crate) fn honours_cancellation(op: &GitOperation) -> bool {
         | GitOperation::ResetTestRepo
         | GitOperation::DiscardTrackedPaths { .. }
         | GitOperation::DeleteUntrackedPaths { .. }
+        // M11.05 (#550): a compare-and-swap (two local census reads) plus one
+        // `git worktree remove` — local and millisecond-scale, same class as
+        // every other worktree-write arm above.
+        | GitOperation::RemoveWorktree { .. }
         | GitOperation::CreateTag { .. }
         | GitOperation::DeleteLocalTag { .. }
         | GitOperation::DeleteRemoteTag { .. }

@@ -419,3 +419,26 @@ export async function openWorktreeDrawer(page) {
   await expect(drawer.getByText('desk-two', { exact: true })).toBeVisible({ timeout: 20_000 })
   return drawer
 }
+
+/**
+ * Close the Activity panel and reopen it, returning a freshly fetched
+ * drawer region (M11.05, #550).
+ *
+ * The drawer's census resource is keyed on `(activity_is_open, graph epoch)`
+ * — removing a SIBLING worktree changes neither the served repository's
+ * generation nor its epoch, so `on_invalidate` correctly skips the bump
+ * (D3): nothing about the repository the graph draws actually changed. A
+ * spec that wants to see a completed removal therefore has to force the key
+ * to change the same way a user would — close the panel and open it again —
+ * rather than waiting on a re-render that has no reason to happen on its
+ * own.
+ */
+export async function reopenWorktreeDrawer(page) {
+  // The panel's own explicit ✕ (`activity.rs`'s `aria-label="Close activity"`)
+  // — never the topbar's `Activity` toggle, which the panel itself can sit
+  // in front of once open, exactly the overlap this control exists to avoid
+  // clicking through.
+  await page.getByRole('button', { name: 'Close activity' }).click()
+  await expect(page.getByRole('region', { name: WORKTREE_REGION_LABEL })).toHaveCount(0)
+  return openWorktreeDrawer(page)
+}

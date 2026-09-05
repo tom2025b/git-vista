@@ -26,8 +26,9 @@ use crate::features::session::signals as session_state;
 use crate::features::dialogs::core::preview_subject;
 use crate::features::dialogs::core::{
     checkout_confirm_action, checkout_confirm_prompt, cherry_pick_confirm_prompt,
-    delete_confirm_prompt, merge_confirm_prompt, worktree_confirm, CheckoutAction, ConfirmPrompt,
-    Dialog, ErrorNotice, PullTarget, WorktreeAction, TOUCH_TARGET_STYLE,
+    delete_confirm_prompt, merge_confirm_prompt, remove_worktree_confirm, worktree_confirm,
+    CheckoutAction, ConfirmPrompt, Dialog, ErrorNotice, PullTarget, WorktreeAction,
+    TOUCH_TARGET_STYLE,
 };
 use crate::features::preview::core::{preview_action, PreviewAction};
 
@@ -420,6 +421,9 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                 PendingOp::DeleteUntrackedPaths { paths } => {
                     worktree_confirm(WorktreeAction::DeleteUntracked, paths, armed)
                 }
+                // M11.05 (#550): its own function, not a third `WorktreeAction`
+                // arm — see `remove_worktree_confirm`'s own doc comment for why.
+                PendingOp::RemoveWorktree { name, .. } => remove_worktree_confirm(name, armed),
             };
             // The confirm button is muted when disabled, red for a destructive
             // delete, green otherwise.

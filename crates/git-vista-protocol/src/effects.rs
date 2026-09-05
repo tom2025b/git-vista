@@ -187,6 +187,17 @@ impl GitOperation {
             // only operation in the vocabulary that earns this variant.
             GitOperation::DeleteUntrackedPaths { .. } => WorktreeEffect::FilesRemoved,
 
+            // M11.05 (#550): `git worktree remove` deletes a whole working
+            // tree — but a DIFFERENT one, a linked sibling this field is not
+            // asking about. This field asks what happens to the worktree the
+            // user is looking at, and that one is not opened, rewritten or
+            // removed. The tempting wrong answer is `FilesRemoved`, from
+            // reasoning about "does this delete files anywhere" rather than
+            // the question this field actually asks — the same trap
+            // `DeleteUntrackedPaths` immediately above earns its own arm for,
+            // just aimed at the wrong tree instead of the wrong verb.
+            GitOperation::RemoveWorktree { .. } => WorktreeEffect::Untouched,
+
             // Everything that runs a merge, in git's sense: it rewrites
             // tracked files and can stop part-way leaving markers on disk.
             GitOperation::MergeBranch { .. } => WorktreeEffect::MayConflict,
@@ -254,6 +265,11 @@ impl GitOperation {
             // writes an index entry.
             GitOperation::DiscardTrackedPaths { .. } => IndexEffect::Untouched,
             GitOperation::DeleteUntrackedPaths { .. } => IndexEffect::Untouched,
+            // M11.05 (#550). The sibling being closed has an index of its
+            // own; this repository's index is neither read nor changed. Same
+            // "which tree does this field ask about" reasoning as the
+            // worktree-effect arm above.
+            GitOperation::RemoveWorktree { .. } => IndexEffect::Untouched,
 
             GitOperation::StageAll => IndexEffect::EntriesStaged,
             GitOperation::UnstageAll => IndexEffect::EntriesUnstaged,
@@ -456,6 +472,12 @@ pub fn network_need_for_operation(op: &GitOperation) -> NetworkNeed {
         // paths — index/worktree only, never a remote.
         GitOperation::DiscardTrackedPaths { .. } => NetworkNeed::Local,
         GitOperation::DeleteUntrackedPaths { .. } => NetworkNeed::Local,
+        // M11.05 (#550): `git worktree remove` deletes a directory and
+        // updates the shared repository's own administrative metadata —
+        // opens no socket, and the census it compare-and-swaps against
+        // (`git worktree list --porcelain`) is the same `Local` read
+        // `CheckoutBranch`'s own census already is.
+        GitOperation::RemoveWorktree { .. } => NetworkNeed::Local,
         // M2.19a (#222): `git commit --amend` rewrites the checked-out
         // branch's tip in place — index/object-database/ref work, never a
         // socket. Whether the *amended-away* commit had already been pushed

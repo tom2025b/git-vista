@@ -246,8 +246,10 @@ export const WORKTREE_OPEN_BRANCH = 'feature/desk-two'
 export const WORKTREE_LOCKED_DESK = 'locked-desk'
 export const WORKTREE_OUTSIDE_DESK = 'worktree-outside-desk'
 export const WORKTREE_GHOST_DESK = 'ghost-desk'
-/** The main worktree plus its four linked desks. */
-export const WORKTREE_ROW_COUNT = 5
+/** Clean and servable, and closed only by the removal spec (M11.05, #550). */
+export const WORKTREE_REMOVABLE_DESK = 'removable-desk'
+/** The main worktree plus its five linked desks. */
+export const WORKTREE_ROW_COUNT = 6
 
 /**
  * A NINTH repository, whose desks span every state the drawer must tell apart
@@ -272,6 +274,7 @@ export function buildWorktreeFixture(root) {
     lockedDesk: WORKTREE_LOCKED_DESK,
     outsideDesk: WORKTREE_OUTSIDE_DESK,
     ghostDesk: WORKTREE_GHOST_DESK,
+    removableDesk: WORKTREE_REMOVABLE_DESK,
     rowCount: WORKTREE_ROW_COUNT,
   }
 }
