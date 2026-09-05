@@ -85,12 +85,15 @@ pub fn worktree_section_view(features: Features) -> impl IntoView {
     let rows_view = move || match census.get().flatten() {
         None => view! { <p class="detail-status">{LOADING}</p> }.into_view(),
         Some(fetched) => match drawer_view(fetched) {
-            DrawerView::Unreadable { reason } => view! {
-                <p class="detail-status detail-error">
-                    {format!("Couldn't read this repository's worktrees: {reason}")}
-                </p>
-            }
-            .into_view(),
+            // Nothing is decided here: `unreadable_paragraphs` owns both the
+            // sentence and whether the path-bearing half appears, so that
+            // decision is host-tested in `core.rs` rather than living in a
+            // module `cargo test` never compiles (#658, ADR 0115).
+            view @ DrawerView::Unreadable { .. } => view
+                .unreadable_paragraphs()
+                .into_iter()
+                .map(|line| view! { <p class="detail-status detail-error">{line}</p> })
+                .collect_view(),
             DrawerView::Rows(rows) => rows
                 .into_iter()
                 .map(|row| worktree_row_view(row, features))

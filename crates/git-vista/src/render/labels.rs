@@ -8,20 +8,19 @@
 
 use leptos::*;
 
-use git_vista_core::model::RefKind;
-
 use crate::datetime::local_timestamp;
 use crate::geometry::{
     badge_text_dx, badge_text_y, badge_top_y, badge_width, label_bottom_y, label_top_y, BADGE_GAP,
     BADGE_HEIGHT, BADGE_RADIUS,
 };
 use crate::icons::icon_set;
-use crate::print::commit_github_url;
 use crate::text::truncate;
-use git_vista_core::color::{branch_color, BADGE_DARK, HEAD_BADGE, TAG_BADGE};
+use git_vista_core::color::branch_color;
 
 use crate::features::graph::collapse::{DisplayItem, DisplayProjection};
-use crate::features::graph::core::RenderCtx;
+use crate::features::graph::core::{
+    badge_colors, commit_link, ref_badge_link, ref_glyph, BadgeSurface, RenderCtx,
+};
 use crate::features::graph::signals::suppress;
 
 /// Commit messages longer than this are truncated with an ellipsis in the label
@@ -84,60 +83,32 @@ pub fn build_msg(
             .refs
             .iter()
             .map(|r| {
-                // Each badge leads with its kind's glyph (icons.rs): local
-                // branches get the branch icon, remote branches the alternate
-                // one — so local vs remote pills differ at a glance even
-                // before reading the name — tags the tag icon, and HEAD the
-                // commit icon (it marks the commit you're on). The glyph
-                // counts into the pill's width like any other monospace char.
-                let icon = match r.kind {
-                    RefKind::Head => ic.commit,
-                    RefKind::Tag => ic.tag,
-                    RefKind::Branch => ic.branch,
-                    RefKind::RemoteBranch => ic.branch_alt,
-                };
+                // Glyph, colours and link target are all `features::graph::core`'s
+                // to decide (#653) — `render/labels.rs` is wasm-only, so a copy
+                // of any of those rules kept here is a copy no host test can
+                // reach, and `print.rs` draws the same badges from the same
+                // three functions. This closure lays the pill out and hands the
+                // answers to the markup.
+                let icon = ref_glyph(ic, &r.kind);
                 let w = badge_width(&format!("{icon} {}", r.name));
                 let x = bx;
                 bx += w + BADGE_GAP;
-                // Branch badges take the row's label colour (filled for local,
-                // outlined for remote); HEAD and tags get fixed colours.
-                let branch = row_color;
-                let (fill, stroke, text_fill) = match r.kind {
-                    RefKind::Head => (HEAD_BADGE, HEAD_BADGE, BADGE_DARK),
-                    RefKind::Tag => (TAG_BADGE, TAG_BADGE, BADGE_DARK),
-                    RefKind::Branch => (branch, branch, BADGE_DARK),
-                    RefKind::RemoteBranch => ("none", branch, branch),
-                };
+                let colors = badge_colors(&r.kind, row_color, BadgeSurface::Screen);
+                let (fill, stroke, text_fill) = (colors.fill, colors.stroke, colors.text);
                 let name = r.name.clone();
-                // Where this badge links on GitHub (Issue #12) — but only when
-                // the target is actually on the remote, so a tap never 404s:
-                //  * HEAD / tag -> the commit they sit on, when it's pushed. (A
-                //    tag's own page can't be verified offline, so we link the
-                //    commit it points at, which resolves whenever it's pushed.)
-                //  * local branch -> its tree page, only if a remote branch of
-                //    the same name exists.
-                //  * remote branch -> its tree page (it's on the remote by
-                //    definition); its leading "<remote>/" is stripped.
-                let badge_url = match r.kind {
-                    RefKind::Head | RefKind::Tag => commit_github_url(
-                        c.frame.repo_url.as_deref(),
-                        commit_on_remote,
-                        &gr.commit.id.0,
-                    ),
-                    RefKind::Branch => c.frame.repo_url.as_ref().and_then(|base| {
-                        c.remote_branches
-                            .contains(&r.name)
-                            .then(|| format!("{base}/tree/{}", r.name))
-                    }),
-                    RefKind::RemoteBranch => c.frame.repo_url.as_ref().map(|base| {
-                        let branch = r.name.split_once('/').map_or(r.name.as_str(), |(_, b)| b);
-                        format!("{base}/tree/{branch}")
-                    }),
-                };
-                let clickable = badge_url.is_some();
+                let link = ref_badge_link(
+                    &r.kind,
+                    &r.name,
+                    c.frame.repo_url.as_deref(),
+                    commit_on_remote,
+                    &gr.commit.id.0,
+                    c.remote_branches.contains(&r.name),
+                );
+                let clickable = link.clickable();
                 // A GitHub repo where this ref simply isn't pushed: show it, but
                 // dimmed and unlinked, so it's clear it has no GitHub page yet.
-                let unpushed = c.frame.repo_url.is_some() && badge_url.is_none();
+                let unpushed = link.unpushed();
+                let badge_url = link.into_url();
                 let pill = view! {
                     <rect
                         x=x
@@ -190,13 +161,15 @@ pub fn build_msg(
         // The message links to the commit page on GitHub (Issue #12), but only
         // when the commit is on the remote — otherwise it's dimmed and the
         // tooltip says why, rather than linking to a page that would 404.
-        let msg_url = commit_github_url(
+        // `commit_link` is the same rule the print sheet uses, decided in core.
+        let msg_link = commit_link(
             c.frame.repo_url.as_deref(),
             commit_on_remote,
             &gr.commit.id.0,
         );
-        let msg_clickable = msg_url.is_some();
-        let msg_unpushed = c.frame.repo_url.is_some() && msg_url.is_none();
+        let msg_clickable = msg_link.clickable();
+        let msg_unpushed = msg_link.unpushed();
+        let msg_url = msg_link.into_url();
         let title = if msg_unpushed {
             format!("{} — not pushed to GitHub", gr.commit.summary)
         } else {

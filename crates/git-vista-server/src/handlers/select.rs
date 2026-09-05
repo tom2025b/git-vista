@@ -77,26 +77,27 @@ pub(crate) async fn select_repo(Json(req): Json<SelectRequest>) -> (StatusCode, 
 /// path comes from `git worktree list --porcelain` run inside the repository
 /// the session already has selected.
 ///
-/// # `expose_paths: true` on the internal census — precisely
+/// # `CensusPaths::rows_for_local_use` on the internal census — precisely
 ///
-/// The census is taken with paths on because registration takes a path. What
-/// that discloses differs by arm, and the honest statement has to say so:
+/// The census is taken with **row** paths on because registration takes a
+/// path. What that discloses differs by arm, and the honest statement has to
+/// say so:
 ///
 /// * **`Observed`** — the sibling rows are read locally and never serialized.
 ///   This handler answers with a status and a sentence it composes itself, so
 ///   nothing the operator's `GIT_VISTA_EXPOSE_PATHS` opt-in would have
 ///   withheld reaches the client.
-/// * **`CensusFailed`** — the `reason` **is** returned to the client, and
-///   `worktree_census` builds those reasons from porcelain output and
-///   `common_dir.display()`. Absolute paths do reach a response body on this
-///   arm, and they do so regardless of the flag.
+/// * **`CensusFailed`** — the `reason` **is** returned to the client. It is
+///   now the client-safe half by construction, and the path-bearing `detail`
+///   follows the operator's flag rather than this route's local need, which
+///   is why the two are separate arguments to `CensusPaths` at all.
 ///
-/// The second bullet is not introduced here: `GET /api/worktrees` (M11.01,
-/// #546) already answers `CensusFailed.reason` verbatim with `expose_paths`
-/// off. It is recorded because ADR 0117 originally claimed the first bullet
-/// covered both, which was wrong (Grok, round 6, finding 4) — see that ADR's
-/// §2a for why redacting it is a separate decision with a real cost, and not
-/// one this route should make on its own.
+/// The second bullet used to read the other way, and that was the defect:
+/// `GET /api/worktrees` (M11.01, #546) answered `CensusFailed.reason`
+/// verbatim with `expose_paths` off, so a control whose stated guarantee is
+/// "absolute paths do not leave the process unless the operator opts in" held
+/// on the success arm and not the failure one (Grok, round 6, finding 4;
+/// #657; ADR 0119). ADR 0117 §2a records the state before the fix.
 pub(crate) async fn select_discovered_worktree(
     Json(req): Json<SelectWorktreeRequest>,
 ) -> (StatusCode, String) {
@@ -111,18 +112,16 @@ pub(crate) async fn select_discovered_worktree(
 
     // 2. A fresh census of the repository this session has selected.
     let (repo, read_only) = crate::state::current();
-    let census =
-        crate::worktree_census::worktree_census(&repo, true, &crate::state::path_is_allowed).await;
+    let census = crate::worktree_census::worktree_census(
+        &repo,
+        crate::worktree_census::CensusPaths::rows_for_local_use(crate::state::expose_paths()),
+        &crate::state::path_is_allowed,
+    )
+    .await;
     let siblings = match census {
         WorktreeCensus::Observed { siblings } => siblings,
-        WorktreeCensus::CensusFailed { reason } => {
-            eprintln!("git-vista: /api/select-worktree could not read the census: {reason}");
-            return (
-                StatusCode::CONFLICT,
-                format!(
-                    "Couldn't read this repository's worktrees, so nothing was selected: {reason}"
-                ),
-            );
+        WorktreeCensus::CensusFailed { reason, .. } => {
+            return (StatusCode::CONFLICT, census_failure_body(&reason));
         }
     };
     let Some(sibling) = siblings.iter().find(|s| s.id == req.worktree) else {
@@ -168,6 +167,23 @@ pub(crate) async fn select_discovered_worktree(
             "That worktree was admitted but could not be opened.".to_string(),
         )
     }
+}
+
+/// The plain-text body this route answers a [`WorktreeCensus::CensusFailed`]
+/// with — a free function so it can be tested as a *string*, which is the one
+/// thing a status-code assertion cannot check (grok, reviewing PR #658).
+///
+/// # `reason` alone, never `detail`
+///
+/// The census has already written the full detail to the server's log, and
+/// `detail` reaches a client only when the operator opted in. This route
+/// answers plain text rather than JSON, so there is no field a client could
+/// choose not to read — appending the detail here would be the one place the
+/// flag could be bypassed by accident, and it would be bypassed for every
+/// operator rather than only for one who asked. An operator who wants the path
+/// has the log and `GET /api/worktrees`, both of which honour the flag.
+fn census_failure_body(reason: &str) -> String {
+    format!("Couldn't read this repository's worktrees, so nothing was selected: {reason}")
 }
 
 /// Re-scan the configured repo root, the clones root and the managed
@@ -355,5 +371,72 @@ mod worktree_admission_tests {
              roots, so the second half of this route's defence is gone — and the \
              first half is a type, which cannot notice"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #658 follow-up (grok): the failure body, tested as a string
+    // -----------------------------------------------------------------------
+
+    use super::census_failure_body;
+    use git_vista_protocol::WorktreeCensus;
+
+    /// **Route 2, driven from a real failure rather than a fabricated reason.**
+    ///
+    /// The census is taken here with [`CensusPaths::rows_for_local_use`], which
+    /// is exactly the conflation #657 was about — this route's own local need
+    /// for row paths must not decide what a failure discloses. So the fixture
+    /// uses that constructor, not `from_flag`: a regression that made
+    /// `rows_for_local_use` publish the detail would show up in *this* body,
+    /// and this is the body a user reads.
+    #[tokio::test]
+    async fn the_failure_body_this_route_answers_carries_no_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().to_string_lossy().into_owned();
+
+        let census = crate::worktree_census::worktree_census(
+            dir.path(),
+            crate::worktree_census::CensusPaths::rows_for_local_use(false),
+            &|_: &std::path::Path| true,
+        )
+        .await;
+        let WorktreeCensus::CensusFailed { reason, .. } = census else {
+            panic!("the fixture must actually fail the census");
+        };
+
+        let body = census_failure_body(&reason);
+        assert!(
+            body.starts_with("Couldn't read this repository's worktrees"),
+            "the sentence a user reads must still say what happened: {body}"
+        );
+        assert!(
+            !body.contains(&here),
+            "POST /api/select-worktree's body named `{here}`: {body}"
+        );
+    }
+
+    /// The paired positive, and the one that keeps the redaction honest: an
+    /// opted-in operator's census carries a detail, and this route still does
+    /// not put it in the body. Withholding it here is a deliberate choice
+    /// (plain text has no field to ignore), so it is asserted rather than left
+    /// to a comment.
+    #[tokio::test]
+    async fn even_an_opted_in_census_detail_stays_out_of_this_routes_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().to_string_lossy().into_owned();
+
+        let census = crate::worktree_census::worktree_census(
+            dir.path(),
+            crate::worktree_census::CensusPaths::rows_for_local_use(true),
+            &|_: &std::path::Path| true,
+        )
+        .await;
+        let WorktreeCensus::CensusFailed { reason, detail } = census else {
+            panic!("the fixture must actually fail the census");
+        };
+        assert!(
+            detail.is_some_and(|d| d.contains(&here)),
+            "the fixture must have produced a detail, or this proves nothing"
+        );
+        assert!(!census_failure_body(&reason).contains(&here));
     }
 }
