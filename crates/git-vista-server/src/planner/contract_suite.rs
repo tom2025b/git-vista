@@ -1609,14 +1609,19 @@ async fn remove_worktree_executes_through_the_pipeline() {
 /// later.
 #[tokio::test]
 async fn remove_worktree_never_passes_force() {
+    // The literal Rust string `"--force"`, quotes included — not the bare
+    // substring, which this module's own doc comments legitimately mention
+    // in prose (backtick-quoted, never double-quoted) when explaining why it
+    // is never offered. A quoted occurrence is the only shape that could
+    // ever reach an argv.
     let src = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src/planner/worktree_exec.rs"),
     )
     .unwrap();
     assert!(
-        !src.contains("--force"),
-        "worktree_exec.rs must never spell `--force` — offering an override on \
-         a destructive, irrecoverable operation removes its only guard"
+        !src.contains("\"--force\""),
+        "worktree_exec.rs must never spell the literal `\"--force\"` — offering an \
+         override on a destructive, irrecoverable operation removes its only guard"
     );
 }
 

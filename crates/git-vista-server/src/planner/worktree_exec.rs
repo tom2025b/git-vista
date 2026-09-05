@@ -848,17 +848,37 @@ pub(super) async fn exec_remove_worktree(
     // `git worktree remove` writes outside this repository — into the
     // sibling's own directory — so it needs the one-off extra grant
     // `git_output_with_extra_grant` composes on top of this repository's
-    // ordinary sandbox policy. The grant is `fresh_path`, never anything a
-    // client sent: it is the path this very call just proved, via a live
-    // census, to be `Serviceable::Yes` — already inside this application's
-    // own allowed roots.
+    // ordinary sandbox policy.
+    //
+    // The grant is `fresh_path`'s **parent**, not `fresh_path` itself —
+    // proven necessary by this module's own pipeline test, not assumed:
+    // `git worktree remove` deletes everything inside the directory (which a
+    // grant on the directory itself covers) and then unlinks the directory
+    // entry from its parent, which needs the *parent* writable. A grant on
+    // `fresh_path` alone failed that last step with a real "Permission
+    // denied" the first time this ran against the sandbox.
+    //
+    // Never anything a client sent: `fresh_path` is the path this very call
+    // just proved, via a live census, to be `Serviceable::Yes` — already
+    // inside this application's own allowed roots — and its parent is
+    // necessarily inside that same allowed root too (a root can only be
+    // registered as a whole subtree; see `state::allow_repo_root`).
+    let Some(grant) = fresh_path.parent() else {
+        eprintln!(
+            "git-vista: /api/remove-worktree: {} has no parent directory to grant",
+            fresh_path.display()
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Couldn't determine where that worktree lives, so nothing was removed.".to_string(),
+        );
+    };
     let fresh_path_str = fresh_path.to_string_lossy().into_owned();
     let args = ["worktree", "remove", fresh_path_str.as_str()];
-    let output =
-        match crate::git_cmd::git_output_with_extra_grant(repo, &args, need, &fresh_path).await {
-            Ok(o) => o,
-            Err(e) => return couldnt_run("/api/remove-worktree", &e),
-        };
+    let output = match crate::git_cmd::git_output_with_extra_grant(repo, &args, need, grant).await {
+        Ok(o) => o,
+        Err(e) => return couldnt_run("/api/remove-worktree", &e),
+    };
     if !output.status.success() {
         let msg = stderr_or(&output, "git worktree remove failed.");
         eprintln!("git-vista: /api/remove-worktree failed: {msg}");
