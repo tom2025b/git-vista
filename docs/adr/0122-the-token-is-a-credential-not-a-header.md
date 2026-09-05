@@ -1,4 +1,4 @@
-# ADR 0121 — The token is a credential, not a header
+# ADR 0122 — The token is a credential, not a header
 
 - **Status:** Accepted — implemented, mutation-proved two ways failing differently
 - **Date:** 2026-09-05

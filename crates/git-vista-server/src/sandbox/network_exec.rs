@@ -162,7 +162,7 @@ fn credential_helper_config() -> String {
 /// [`network_command`], plus Git-Vista's own credential helper when `token`
 /// is `Some` (M13.01, #582) — the mechanism the module doc's final section
 /// named as "an architectural decision that belongs in its own ADR" (ADR
-/// 0121, #587) rather than a unilateral widening of [`spawn::SandboxedCommand`].
+/// 0122, #587) rather than a unilateral widening of [`spawn::SandboxedCommand`].
 ///
 /// # The measurement this answers
 ///
