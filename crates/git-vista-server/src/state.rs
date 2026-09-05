@@ -114,6 +114,33 @@ pub(crate) fn expose_paths() -> bool {
     }
 }
 
+/// The token Git-Vista supplies to its own credential helper for a remote
+/// HTTPS operation (M13.01, #582) — `None` when there is nothing to offer,
+/// which every existing caller already treats as "behave exactly as before".
+///
+/// # This is a placeholder, on purpose, and it is meant to be replaced
+///
+/// #583 (M13.02) is the actual token-storage design — a keyring first, this
+/// environment variable second, a gitignored file last. This function
+/// implements only the **second** tier, early, because #582 needs a real
+/// production call site to prove the credential-helper mechanism works at
+/// all, not a mock. When #583 lands, this function's body becomes the `env`
+/// arm of that store's fallback chain; every caller of `credential_token()`
+/// stays unchanged; that is the whole point of the one-token-in, `Option`-out
+/// shape below rather than exposing anything about *how* the token was found.
+///
+/// Never logged, never `eprintln!`ed, never included in any `Display` this
+/// crate writes — the whole design (`sandbox::network_exec::network_command_with_credential`)
+/// exists so this value's only destinations are one child process's
+/// environment and, from there, one HTTPS request's Basic-auth header,
+/// something no HTTP client in this codebase constructs directly (see ADR
+/// 0121, #587).
+pub(crate) fn credential_token() -> Option<String> {
+    std::env::var("GIT_VISTA_GITHUB_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+}
+
 /// A short, non-path label for `path` — its directory base name — unless the
 /// operator opted into path exposure, in which case the full path is used. This
 /// is what the UI header shows; it never leaks the server's layout by default.

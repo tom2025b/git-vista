@@ -138,23 +138,58 @@ const SCRUBBED_GIT_GEOMETRY_ENV: &[&str] = &[
 ///
 /// Threading the real args into `sandboxed(repo, args)` does not close that on
 /// its own: a `-> Command` return still lets a caller append more. So the argv
-/// is sealed by the *type* instead. There is deliberately no `arg`, no `args`
-/// and no `env` here — only stdio configuration, which cannot change what runs.
-/// `env` is excluded for the same reason as `arg`: `GIT_DIR`, `GIT_SSH_COMMAND`
+/// is sealed by the *type* instead. There is deliberately no `arg` and no
+/// `args` here — only stdio configuration, which cannot change what runs.
+/// `env` is excluded on the same reasoning as `arg`: `GIT_DIR`, `GIT_SSH_COMMAND`
 /// and `GIT_EXTERNAL_DIFF` redirect or execute, so an environment appended
-/// after classification is an argv change wearing a different hat.
+/// after classification is an argv change wearing a different hat — with
+/// [`credential_env`](SandboxedCommand::credential_env) as the one deliberate,
+/// narrow exception (M13.01, #582): see [`CREDENTIAL_TOKEN_VAR`]'s doc for why
+/// that one variable does not carry the hazard the exclusion is about.
 ///
 /// The *inherited* environment gets the complementary treatment:
 /// [`command_async`] removes the fixed [`SCRUBBED_GIT_GEOMETRY_ENV`] family at
 /// construction, so a variable the server's own parent exported cannot re-aim
-/// the geometry the argv pinned either. Neither direction gives a caller an
-/// environment surface.
+/// the geometry the argv pinned either.
 ///
 /// The setters consume and return `Self` so a call site still reads as one
 /// chain ending in `output()`/`spawn()`.
 pub(crate) struct SandboxedCommand(tokio::process::Command);
 
+/// The one environment variable a production caller may set on a
+/// [`SandboxedCommand`] (M13.01, #582), via [`SandboxedCommand::credential_env`]
+/// — and the *only* exception to the "no `env`" rule this type's doc comment
+/// states, made narrow rather than reopening a general surface.
+///
+/// # Why this one variable does not carry the hazard `env` was excluded for
+///
+/// The excluded cases — `GIT_SSH_COMMAND`, `GIT_EXTERNAL_DIFF`, the
+/// [`SCRUBBED_GIT_GEOMETRY_ENV`] family — are all names **git itself**
+/// interprets: setting one changes what git does, unconditionally, by git's
+/// own design. This name means nothing to git. It only becomes meaningful
+/// because this crate's own `-c credential.helper=` literal
+/// (`network_exec::credential_helper_arg`) names it — a config value *this
+/// crate authored*, never request data, never something a served
+/// repository's own config can point at (a repo-local `credential.helper`
+/// pointing at `printenv GIT_VISTA_CREDENTIAL_TOKEN` gets nothing: this
+/// variable is set on the immediate child's environment only when that
+/// child *is itself* the credential-helper-forcing spawn — a hostile
+/// repo's own credential.helper runs as a *different* invocation, with the
+/// value never set). Setting an inert, git-opaque variable is data, not an
+/// argv change wearing a different hat, which is what the type doc's
+/// exclusion is actually about.
+pub(crate) const CREDENTIAL_TOKEN_VAR: &str = "GIT_VISTA_CREDENTIAL_TOKEN";
+
 impl SandboxedCommand {
+    /// Set [`CREDENTIAL_TOKEN_VAR`] to `token` on this command's environment —
+    /// the one deliberate exception to "no `env`", see that constant's doc.
+    /// Never call this with a value that did not come from Git-Vista's own
+    /// token source; it is not a general secret-passing mechanism.
+    pub(crate) fn credential_env(mut self, token: &str) -> Self {
+        self.0.env(CREDENTIAL_TOKEN_VAR, token);
+        self
+    }
+
     pub(crate) fn stdin(mut self, cfg: impl Into<std::process::Stdio>) -> Self {
         self.0.stdin(cfg);
         self
