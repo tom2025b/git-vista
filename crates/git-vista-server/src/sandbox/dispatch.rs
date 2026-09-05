@@ -316,6 +316,7 @@ fn variant_name(op: &GitOperation) -> &'static str {
         GitOperation::StageSelection { .. } => "StageSelection",
         GitOperation::DiscardTrackedPaths { .. } => "DiscardTrackedPaths",
         GitOperation::DeleteUntrackedPaths { .. } => "DeleteUntrackedPaths",
+        GitOperation::RemoveWorktree { .. } => "RemoveWorktree",
         GitOperation::AmendCommit { .. } => "AmendCommit",
         GitOperation::FetchRemote { .. } => "FetchRemote",
         GitOperation::PullBranch { .. } => "PullBranch",
@@ -493,6 +494,12 @@ fn every_operation() -> Vec<GitOperation> {
         GitOperation::DeleteUntrackedPaths {
             paths: vec![wpath("a.txt")],
         },
+        // M11.05 (#550). Local: two census reads (`git worktree list
+        // --porcelain`) plus one `git worktree remove`, all against this
+        // repository's own administrative area — no socket.
+        GitOperation::RemoveWorktree {
+            id: git_vista_protocol::WorktreeSiblingId::new("sibling-1").expect("valid id"),
+        },
         GitOperation::AmendCommit {
             message: CommitMessage::new("msg").expect("valid message"),
             expected_tip: oid(tip),
@@ -591,6 +598,7 @@ fn every_operation_declares_every_variant() {
         "StageSelection",
         "DiscardTrackedPaths",
         "DeleteUntrackedPaths",
+        "RemoveWorktree",
         "AmendCommit",
         "FetchRemote",
         "PullBranch",
@@ -743,8 +751,8 @@ fn exactly_the_five_remote_operations_declare_a_network_need() {
     let ops = every_operation();
     assert_eq!(
         ops.len(),
-        37,
-        "every_operation() must list every GitOperation variant; the enum has 37 \
+        38,
+        "every_operation() must list every GitOperation variant; the enum has 38 \
          (this literal is a tripwire, not the enforcement — \
          every_operation_covers_every_variant_the_enum_declares is what checks \
          the census against the enum itself and cannot be left stale with it)"
@@ -772,8 +780,8 @@ fn exactly_the_five_remote_operations_declare_a_network_need() {
     );
     assert_eq!(
         local.len(),
-        32,
-        "the other thirty-two operations must stay Local; declared Local: {local:?}"
+        33,
+        "the other thirty-three operations must stay Local; declared Local: {local:?}"
     );
 }
 

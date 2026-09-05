@@ -220,6 +220,18 @@ const EFFECTS: &[(&str, WorktreeEffect, ExpectedIndex, NetworkNeed)] = &[
         Always(I::Untouched),
         N::Local,
     ),
+    // M11.05 (#550). Written from the operation's description, not from
+    // reading `effects.rs`: `git worktree remove` deletes a whole working
+    // tree — but a DIFFERENT one, a linked sibling this row is not asking
+    // about. This repository's own tree and index are neither read nor
+    // changed, and the two census reads plus the removal spawn never touch a
+    // remote.
+    (
+        "remove_worktree",
+        W::Untouched,
+        Always(I::Untouched),
+        N::Local,
+    ),
     // Everything that runs a merge in git's sense: files are rewritten and
     // the operation can stop part-way with markers on disk.
     ("merge_branch", W::MayConflict, Always(I::Rebuilt), N::Local),

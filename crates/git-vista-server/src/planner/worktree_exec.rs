@@ -20,14 +20,14 @@
 //! importing safety gates from another.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use axum::http::StatusCode;
 
 use git_vista_core::activity::ActivityKind;
 use git_vista_core::seed::reset_plan;
 
-use git_vista_protocol::{plan_export, WorktreePath};
+use git_vista_protocol::{plan_export, WorktreeCensus, WorktreePath};
 
 use crate::git_cmd::{git_ok, rev_parse};
 use crate::journal;
@@ -714,4 +714,167 @@ pub(super) async fn exec_delete_untracked_paths(
     )
     .await;
     (status, body)
+}
+
+// ---------------------------------------------------------------------------
+// RemoveWorktree (M11.05, #550)
+// ---------------------------------------------------------------------------
+
+/// Resolve `id` in `census` to the sibling's live root path, refusing
+/// distinctly for each of the three cases #550's acceptance states
+/// explicitly: `id` no longer names a sibling, the sibling is
+/// [`Serviceable::Missing`](git_vista_protocol::Serviceable::Missing) (a
+/// prune, a different operation this design deliberately omits), or it is
+/// [`Serviceable::OutsideAllowedRoots`](git_vista_protocol::Serviceable::OutsideAllowedRoots)
+/// (visible for collision detection only — visibility must never widen the
+/// *mutation* boundary). A `CensusFailed` census refuses too: nothing was
+/// observed, so a destructive, irrecoverable operation may never proceed on
+/// an unread value.
+///
+/// Shared by both halves of [`exec_remove_worktree`]'s compare-and-swap, so
+/// the "expected" read and the "fresh" read are judged by the exact same
+/// rule — a refusal that differs between the two would itself be a bug in
+/// this function, not in the caller.
+fn resolve_removable(census: &WorktreeCensus, id: &str) -> Result<PathBuf, (StatusCode, String)> {
+    let siblings = match census {
+        WorktreeCensus::CensusFailed { reason } => {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "Couldn't read this repository's worktrees, so nothing was removed: {reason}"
+                ),
+            ))
+        }
+        WorktreeCensus::Observed { siblings } => siblings,
+    };
+    let Some(sibling) = siblings.iter().find(|s| s.id == id) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "No such worktree — it may already have been removed.".to_string(),
+        ));
+    };
+    // Defense in depth: the drawer never offers this for the worktree it is
+    // itself rendering from, but nothing stops a hand-built request from
+    // naming it.
+    if sibling.is_current {
+        return Err((
+            StatusCode::CONFLICT,
+            "That is the worktree currently being served — it can't remove itself.".to_string(),
+        ));
+    }
+    if let Some(why) = sibling.serviceable.refusal() {
+        return Err((StatusCode::CONFLICT, why.to_string()));
+    }
+    // `expose_paths: true` at both of this function's call sites (see
+    // `exec_remove_worktree`) is what makes this `Some` in the common case —
+    // an operator running with path exposure off would otherwise never reach
+    // here, and this function would have no way to name what to remove.
+    let Some(path) = sibling.path.as_deref() else {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Couldn't determine where that worktree lives, so nothing was removed.".to_string(),
+        ));
+    };
+    Ok(PathBuf::from(path))
+}
+
+/// `git worktree remove <path>` (`/api/remove-worktree`, M11.05, #550): close
+/// a linked sibling desk. See
+/// [`GitOperation::RemoveWorktree`](git_vista_protocol::GitOperation::RemoveWorktree)'s
+/// doc comment for the full design this implements and why the compare-and-
+/// swap lives here rather than in a `Precondition`.
+///
+/// # The compare-and-swap
+///
+/// `expected_census` is `planner::census_for`'s plan-**build**-time read,
+/// taken *before* the coordinator guard `plan_and_execute_in` acquires for
+/// this whole call. This function takes a second, independent, **fresh**
+/// read of its own — right here, already inside that guard — and refuses
+/// unless the two agree on exactly where `id` currently lives. The build-time
+/// read cannot see a sibling another writer (another git-vista tab or
+/// browser session, or `git worktree` run by hand outside this app
+/// entirely, since the coordinator guard only serialises this application's
+/// own writers against each other) removed, moved, or fenced off in the
+/// meantime; the fresh read can. Only the fresh read's resolved path is ever
+/// passed to git — never the build-time one, and never anything a client
+/// submitted directly, since the wire operation carries no path at all.
+///
+/// # Never `--force`
+///
+/// Not offered here, not offered anywhere in this vocabulary's wire contract,
+/// and not a first pass to revisit: git's own refusal on a dirty tree is the
+/// entire protection an uncommitted, never-staged edit in the removed
+/// worktree has, because it was never written to git's object database and
+/// this app's recovery machinery has nothing to pin. Adding `--force` later
+/// would be removing the only guard this operation has ever had.
+pub(super) async fn exec_remove_worktree(
+    repo: &Path,
+    need: NetworkNeed,
+    id: &str,
+    expected_census: &WorktreeCensus,
+) -> (StatusCode, String) {
+    let expected_path = match resolve_removable(expected_census, id) {
+        Ok(p) => p,
+        Err(refused) => return refused,
+    };
+
+    // The fresh half of the compare-and-swap — see the doc comment above.
+    // `expose_paths: true` regardless of the operator's own setting: this
+    // path is used only for the comparison and the git spawn below, never
+    // returned to a client, matching `planner::census_for`'s own reasoning
+    // for its build-time read of this same operation.
+    let fresh_census =
+        crate::worktree_census::worktree_census(repo, true, &crate::state::path_is_allowed).await;
+    let fresh_path = match resolve_removable(&fresh_census, id) {
+        Ok(p) => p,
+        Err(refused) => return refused,
+    };
+
+    if fresh_path != expected_path {
+        eprintln!(
+            "git-vista: /api/remove-worktree refusing a compare-and-swap mismatch for {id}: \
+             reviewed as {}, a fresh census now says {}",
+            expected_path.display(),
+            fresh_path.display()
+        );
+        return (
+            StatusCode::CONFLICT,
+            "This worktree changed since it was reviewed, so nothing was removed. \
+             Reopen the worktree drawer and try again."
+                .to_string(),
+        );
+    }
+
+    // `git worktree remove` writes outside this repository — into the
+    // sibling's own directory — so it needs the one-off extra grant
+    // `git_output_with_extra_grant` composes on top of this repository's
+    // ordinary sandbox policy. The grant is `fresh_path`, never anything a
+    // client sent: it is the path this very call just proved, via a live
+    // census, to be `Serviceable::Yes` — already inside this application's
+    // own allowed roots.
+    let fresh_path_str = fresh_path.to_string_lossy().into_owned();
+    let args = ["worktree", "remove", fresh_path_str.as_str()];
+    let output =
+        match crate::git_cmd::git_output_with_extra_grant(repo, &args, need, &fresh_path).await {
+            Ok(o) => o,
+            Err(e) => return couldnt_run("/api/remove-worktree", &e),
+        };
+    if !output.status.success() {
+        let msg = stderr_or(&output, "git worktree remove failed.");
+        eprintln!("git-vista: /api/remove-worktree failed: {msg}");
+        return (StatusCode::BAD_REQUEST, msg);
+    }
+
+    let summary = format!("removed worktree at {}", fresh_path.display());
+    println!("[/api/remove-worktree] {summary}");
+    journal_app_event(
+        repo,
+        ActivityKind::Other,
+        None,
+        Obs::Absent,
+        Obs::Absent,
+        summary,
+    )
+    .await;
+    (StatusCode::OK, "Worktree removed.".to_string())
 }

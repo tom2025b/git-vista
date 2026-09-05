@@ -949,6 +949,30 @@ pub struct DeleteCloneRequest {
     pub worktree: String,
 }
 
+/// Body of `POST /api/remove-worktree` (M11.05, #550): close a linked sibling
+/// worktree, addressed by the same opaque id [`SelectWorktreeRequest`] takes
+/// — the one the worktree census reports for it.
+///
+/// # No `path` field, and that is the point
+///
+/// `id` is the mutation authority; the path it resolves to is compare-and-
+/// swapped against a **fresh** census entirely server-side, immediately
+/// before `git worktree remove` runs (see
+/// [`crate::plan::GitOperation::RemoveWorktree`]'s doc comment for the full
+/// mechanism). A `path` field here would invite a client to submit one, and
+/// this crate carries no filesystem type to validate it with in the first
+/// place — like every other request body in this module, a location on disk
+/// is never something a request names.
+///
+/// `id` deserializes into a
+/// [`WorktreeSiblingId`](crate::plan::WorktreeSiblingId), so a malformed
+/// value is a wire-boundary 400 before any handler runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoveWorktreeRequest {
+    pub id: crate::plan::WorktreeSiblingId,
+}
+
 /// Body of a `POST /api/session` request (M1.04, #57): the one-time bootstrap
 /// `token` the SPA read from the `#s=<token>` URL fragment, exchanged for an
 /// HttpOnly session cookie. The only `/api` write body that legitimately carries

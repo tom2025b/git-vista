@@ -640,8 +640,20 @@ pub enum Export {
         /// The shape of the chain, in plain language.
         why: String,
     },
-    /// Not expressible as command arguments at any amount of quoting — the
-    /// operation's input is bytes on stdin or a file's contents.
+    /// The checklist cannot carry this command. Two different reasons land
+    /// here, and `why` says which:
+    ///
+    ///  1. **The operation's input is not arguments** — bytes on stdin, or a
+    ///     file's contents. No amount of quoting expresses it.
+    ///  2. **An argument is a location this application resolves, not one
+    ///     the caller supplied** (M11.05, #550: `RemoveWorktree` carries only
+    ///     an opaque id — this crate is wasm-safe and cannot resolve it to a
+    ///     path). The command shape is ordinary; the literal path depends on
+    ///     a live census of that machine's repository, and printing a guess
+    ///     would print a command that could act on the wrong desk.
+    ///
+    /// Both reasons share the consequence this variant exists for: there is
+    /// no line a reader can copy that is the line the app runs.
     NotACommandLine {
         /// What the operation needs that arguments cannot carry.
         why: String,
@@ -1065,6 +1077,25 @@ pub fn export_operation(operation: &GitOperation) -> Export {
                   typed by hand."
                 .to_string(),
         },
+
+        // M11.05 (#550). `git worktree remove <path>` is an ordinary command
+        // line — what is missing is the path, and it is missing on purpose:
+        // this operation carries only an opaque id, resolved to a path by a
+        // live server-side census immediately before it runs (see the
+        // variant's own doc comment). This crate is wasm-safe and reads no
+        // filesystem, so it cannot resolve that id itself, and a printed
+        // command carrying a *guessed* path would not be an approximation of
+        // what the app does — it could name the wrong desk entirely, or one
+        // that no longer exists.
+        GitOperation::RemoveWorktree { .. } => Export::NotACommandLine {
+            why: "This closes a linked worktree addressed by an internal id, resolved to \
+                  a real path by this server immediately before it runs. Printing a \
+                  command with a guessed path could act on the wrong desk, so none is \
+                  printed. To do it by hand, first find the worktree's path with \
+                  `git worktree list`, then `git worktree remove <path>` — git itself \
+                  will refuse if the working tree is not clean."
+                .to_string(),
+        },
     }
 }
 
@@ -1486,6 +1517,7 @@ pub fn operation_name(operation: &GitOperation) -> &'static str {
         GitOperation::StageSelection { .. } => "stage a hand-picked selection",
         GitOperation::DiscardTrackedPaths { .. } => "discard changes to tracked files",
         GitOperation::DeleteUntrackedPaths { .. } => "delete untracked files",
+        GitOperation::RemoveWorktree { .. } => "remove a linked worktree",
         GitOperation::AmendCommit { .. } => "amend the last commit",
         GitOperation::FetchRemote { .. } => "fetch from a remote",
         GitOperation::PullBranch { .. } => "pull",

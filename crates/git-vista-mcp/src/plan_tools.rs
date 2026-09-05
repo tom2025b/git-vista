@@ -197,6 +197,18 @@ pub(crate) fn exposure_of(op: &GitOperation) -> Exposure {
         ),
         GitOperation::DiscardTrackedPaths { .. } => Tool("plan_discard_tracked_paths"),
         GitOperation::DeleteUntrackedPaths { .. } => Tool("plan_delete_untracked_paths"),
+        // M11.05 (#550): destructive and irrecoverable, and its safety rests
+        // on a compare-and-swap against a fresh worktree census — the same
+        // reason `DropStash` above is excluded, restated for a different
+        // census. There is no MCP tool yet that lists an agent's own
+        // repository's linked worktrees, so an agent could only guess at
+        // `id`, and a guess that happens to resolve would be acted on with no
+        // way for the agent to have seen what it named.
+        GitOperation::RemoveWorktree { .. } => Excluded(
+            "destructive, and its safety rests on a compare-and-swap against a fresh \
+             worktree census an agent has no tool to read; exposing it would invite \
+             guessing at which desk `id` names",
+        ),
         GitOperation::AmendCommit { .. } => Tool("plan_amend_commit"),
         GitOperation::FetchRemote { .. } => Tool("plan_fetch_remote"),
         GitOperation::PullBranch { .. } => Tool("plan_pull_branch"),

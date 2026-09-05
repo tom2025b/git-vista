@@ -237,6 +237,77 @@ fn sandboxed(
     })
 }
 
+/// [`sandboxed`] plus **one** extra read-write grant (M11.05, #550).
+///
+/// # One caller, and why it needs this at all
+///
+/// `git worktree remove <path>` is the rare spawn whose target is outside the
+/// repository it runs in: `<path>` names a **sibling** working tree, which
+/// `policy_for` never grants — it grants the served repository (and its
+/// commondir, for a linked worktree) and the fixed system trees, nothing
+/// else. Without the extra grant, the sandboxed spawn cannot delete the
+/// sibling's directory even after every other check has passed.
+///
+/// # It composes `policy_for` rather than replacing it
+///
+/// The removal must run under **exactly** the served repository's own tier,
+/// trust state and secret excludes — anything else would mean a destructive
+/// operation ran under a policy that repository never earned. So this takes
+/// the policy the operation would otherwise have had and adds one grant to
+/// it, changing nothing else.
+///
+/// # `grant` is a resolved sibling, never a raw client string
+///
+/// The sole caller (`planner::worktree_exec::exec_remove_worktree`) passes
+/// the canonical path a **fresh worktree census** just resolved for a
+/// client-submitted opaque id — a path proven, at the moment this runs, to be
+/// `Serviceable::Yes`: inside this application's own allowed roots, exactly
+/// like every path this server already admits into the catalog. A client
+/// never supplies a path directly; it is always this function's caller that
+/// derives one, and only from a census read that already fenced it.
+///
+/// # Refuses to combine a grant with the network tier
+///
+/// A grant plus an open socket is a strictly larger surface than either
+/// alone, and no caller needs both — mirrors the same refusal
+/// `git-vista-server`'s worktree-creation grant helper takes for the same
+/// reason, should the two ever land in the same tree together.
+fn sandboxed_with_extra_grant(
+    repo: &Path,
+    args: &[&str],
+    declared: crate::sandbox::NetworkNeed,
+    grant: &Path,
+) -> Result<crate::sandbox::spawn::SandboxedCommand, String> {
+    let read_only = crate::state::read_only_for_path(repo);
+    let need = crate::sandbox::reconcile_need(declared, args);
+    if need == crate::sandbox::NetworkNeed::Remote {
+        return Err(
+            "a command that needs an extra filesystem grant may not also reach the network"
+                .to_string(),
+        );
+    }
+    let mut policy =
+        crate::sandbox::policy_for(repo, read_only, need).map_err(|e| e.to_string())?;
+    policy.rw_trees.push(grant.to_path_buf());
+    Ok(crate::sandbox::spawn::command_async(&policy, repo, args))
+}
+
+/// [`git_output`] for a spawn that needs write access to a path outside the
+/// repository it runs in (M11.05, #550): today, only `git worktree remove`
+/// against a resolved sibling. See [`sandboxed_with_extra_grant`] for why the
+/// grant is safe and why it is not a general-purpose escape hatch.
+pub(crate) async fn git_output_with_extra_grant(
+    repo: &Path,
+    args: &[&str],
+    declared: crate::sandbox::NetworkNeed,
+    grant: &Path,
+) -> std::io::Result<Output> {
+    sandboxed_with_extra_grant(repo, args, declared, grant)
+        .map_err(std::io::Error::other)?
+        .output()
+        .await
+}
+
 /// Run `git -C <repo> <args…>` through the sealed launcher and collect its
 /// full [`Output`] — the one path from "a module needs git's `Output`" to
 /// `sandboxed` above, for callers that want status/stdout/stderr together

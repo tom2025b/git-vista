@@ -18,7 +18,7 @@ use git_vista_protocol::{
     MergeStrategy, OperationHash, Plan, Precondition, RecoveryStrategy, RefChange, RefName,
     RefState, RemoteName, RepositoryToken, RiskLevel, SignatureStatus, StageDirection,
     StashMessage, StashSelector, TagAnnotation, TagDetail, TagKind, TagMessage, TagName,
-    UnixSeconds, WorktreePath, WorktreeToken,
+    UnixSeconds, WorktreePath, WorktreeSiblingId, WorktreeToken,
 };
 
 const FIXTURE: &str = include_str!("fixtures/plan_v1.json");
@@ -505,6 +505,22 @@ fn golden_plans() -> Vec<Plan> {
             'f',
             GitOperation::DeleteUntrackedPaths {
                 paths: vec![wpath("scratch/tmp.log")],
+            },
+            RiskLevel::Destructive,
+            Vec::new(),
+            Vec::new(),
+            RecoveryStrategy::Irrecoverable,
+        ),
+        // M11.05 (#550). `id` only — no `path` field, unlike the design
+        // spec's own sketch: this crate is wasm-safe and carries no
+        // filesystem type, so the wire shape cannot smuggle a location on
+        // disk. See `GitOperation::RemoveWorktree`'s doc comment for the
+        // compare-and-swap mechanism this pins nothing about — it is
+        // entirely server-side and never crosses the wire.
+        plan(
+            '1',
+            GitOperation::RemoveWorktree {
+                id: WorktreeSiblingId::new("sibling-1").unwrap(),
             },
             RiskLevel::Destructive,
             Vec::new(),

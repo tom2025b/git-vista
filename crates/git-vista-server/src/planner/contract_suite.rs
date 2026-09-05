@@ -243,6 +243,7 @@ fn covered_by(op: &GitOperation) -> &'static str {
         GitOperation::DeleteUntrackedPaths { .. } => {
             "delete_untracked_paths_executes_through_the_pipeline"
         }
+        GitOperation::RemoveWorktree { .. } => "remove_worktree_executes_through_the_pipeline",
         GitOperation::AmendCommit { .. } => "amend_commit_executes_through_the_pipeline",
         GitOperation::FetchRemote { .. } => "fetch_remote_executes_through_the_pipeline",
         GitOperation::PullBranch { .. } => "pull_branch_executes_through_the_pipeline",
@@ -298,6 +299,7 @@ fn covered_on_split_path(op: &GitOperation) -> &'static str {
         | GitOperation::StageSelection { .. }
         | GitOperation::DiscardTrackedPaths { .. }
         | GitOperation::DeleteUntrackedPaths { .. }
+        | GitOperation::RemoveWorktree { .. }
         | GitOperation::AmendCommit { .. }
         | GitOperation::FetchRemote { .. }
         | GitOperation::PullBranch { .. }
@@ -389,6 +391,15 @@ fn samples() -> Vec<GitOperation> {
         },
         GitOperation::DeleteUntrackedPaths {
             paths: vec![wpath("a.txt")],
+        },
+        // No sibling worktree needs to exist for this: `resolve_removable`
+        // refuses "no such worktree" identically on both the single-shot and
+        // split-path repos (fresh, unrelated temp dirs, so nothing about the
+        // refusal's wording can differ between them) — which is exactly the
+        // byte-identity sweep's own premise. The happy path and the compare-
+        // and-swap drift both have their own dedicated tests below.
+        GitOperation::RemoveWorktree {
+            id: git_vista_protocol::WorktreeSiblingId::new("sibling-1").unwrap(),
         },
         GitOperation::AmendCommit {
             message: message("m"),
@@ -1513,6 +1524,170 @@ async fn delete_untracked_paths_executes_through_the_pipeline() {
     assert_ok(status, &body);
     assert!(!repo.join("scratch.txt").exists());
     assert_eq!(out(&repo, &["status", "--porcelain"]), "");
+}
+
+// ---------------------------------------------------------------------------
+// RemoveWorktree (M11.05, #550)
+// ---------------------------------------------------------------------------
+
+/// A clean linked worktree named `desk` under its own temp root, so `git
+/// worktree add` gets a path that does not already exist — same shape
+/// `worktree_collision_suite::repo_with_a_sibling_on` uses.
+///
+/// Registers `desks`' root with `crate::state::allow_repo_root` so the
+/// sibling resolves `Serviceable::Yes` — without it every assertion in this
+/// section would be proving a refusal for the wrong reason (fenced off,
+/// never reviewed).
+fn repo_with_a_removable_sibling(
+    branch_name: &str,
+) -> (tempfile::TempDir, tempfile::TempDir, PathBuf, PathBuf) {
+    let (dir, repo) = seeded_repo();
+    run(&repo, &["branch", branch_name]);
+    let desks = tempfile::tempdir().unwrap();
+    let desk_path = desks.path().join("desk");
+    run(
+        &repo,
+        &["worktree", "add", desk_path.to_str().unwrap(), branch_name],
+    );
+    crate::state::allow_repo_root(desks.path());
+    (dir, desks, repo, desk_path)
+}
+
+/// The opaque id the census resolves for the one sibling of `repo` that is
+/// not the currently served worktree — a real read, never guessed, since
+/// [`git_vista_core::identity::WorktreeId`] is derived from the admin
+/// directory rather than from anything a test could construct by hand.
+async fn sibling_id(repo: &Path) -> String {
+    let census =
+        crate::worktree_census::worktree_census(repo, true, &crate::state::path_is_allowed).await;
+    let WorktreeCensus::Observed { siblings } = census else {
+        panic!("expected an observed census");
+    };
+    let sibling = siblings
+        .iter()
+        .find(|s| !s.is_current)
+        .expect("the linked worktree must appear in its own repository's census");
+    assert_eq!(
+        sibling.serviceable,
+        Serviceable::Yes,
+        "the sibling must resolve inside the allowed root for this test to prove anything"
+    );
+    sibling.id.clone()
+}
+
+fn remove_worktree(id: &str) -> GitOperation {
+    GitOperation::RemoveWorktree {
+        id: git_vista_protocol::WorktreeSiblingId::new(id).unwrap(),
+    }
+}
+
+/// Acceptance: the happy path actually closes the desk — the directory is
+/// gone and git no longer lists it, addressed by nothing but the opaque id
+/// the census reported.
+#[tokio::test]
+async fn remove_worktree_executes_through_the_pipeline() {
+    let (_dir, _desks, repo, desk_path) = repo_with_a_removable_sibling("side");
+    let id = sibling_id(&repo).await;
+
+    let (status, body) = pipeline(&repo, remove_worktree(&id)).await;
+    assert_ok(status, &body);
+    assert!(!desk_path.exists(), "the sibling's directory must be gone");
+    assert_eq!(
+        out(&repo, &["worktree", "list", "--porcelain"])
+            .lines()
+            .filter(|l| l.starts_with("worktree "))
+            .count(),
+        1,
+        "git must no longer list the removed sibling — only this repository's own row remains"
+    );
+}
+
+/// Acceptance: `--force` is never offered, anywhere in this vocabulary's
+/// argv — a dirty sibling must be refused by git's own guard, not overridden.
+/// A source scan, same posture `argv_boundary`'s tripwires already take: it
+/// pins the absence structurally rather than trusting that nobody adds it
+/// later.
+#[tokio::test]
+async fn remove_worktree_never_passes_force() {
+    let src = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/planner/worktree_exec.rs"),
+    )
+    .unwrap();
+    assert!(
+        !src.contains("--force"),
+        "worktree_exec.rs must never spell `--force` — offering an override on \
+         a destructive, irrecoverable operation removes its only guard"
+    );
+}
+
+/// Acceptance: a dirty sibling is refused by git itself, and the response
+/// says what is uncommitted rather than the exit code alone.
+#[tokio::test]
+async fn remove_worktree_refuses_a_dirty_sibling() {
+    let (_dir, _desks, repo, desk_path) = repo_with_a_removable_sibling("side");
+    std::fs::write(desk_path.join("scratch.txt"), "uncommitted\n").unwrap();
+    let id = sibling_id(&repo).await;
+
+    let (status, body) = pipeline(&repo, remove_worktree(&id)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        desk_path.exists(),
+        "a refused removal must leave the directory in place"
+    );
+}
+
+/// Acceptance: the compare-and-swap. `id` still names a real, servable
+/// sibling — but not the one this plan was built against. Between build and
+/// execute, the reviewed desk was closed and a *different* directory opened
+/// under the exact same admin-dir name (`git worktree remove` fully frees
+/// `.git/worktrees/desk`, so the next `add` of a worktree named `desk`
+/// reoccupies it and inherits the same derived id) — the id-confusion
+/// scenario the spec names by name: "the client reviews sibling A by
+/// WorktreeId, then submits A's id alongside B's path".
+///
+/// This is `run_prebuilt`'s pattern (`a_stale_plan_is_refused_at_submit_and_mutates_nothing`
+/// above): build the plan against the repository as it was, mutate the
+/// repository exactly as an external actor would, then run only
+/// `validate → enforce_fresh → execute` — the half of the pipeline this test
+/// is actually about.
+#[tokio::test]
+async fn remove_worktree_refuses_when_the_id_now_resolves_elsewhere() {
+    let (_dir, desks_a, repo, desk_path_a) = repo_with_a_removable_sibling("side");
+    let id = sibling_id(&repo).await;
+
+    let (plan, observed) = build_plan(&repo, remove_worktree(&id), tokens()).await;
+
+    // The race: the reviewed desk is closed, and a new one reoccupies the
+    // same admin-dir slot at a different location — never `--force`, since
+    // this repository has no uncommitted changes to force past.
+    run(
+        &repo,
+        &["worktree", "remove", desk_path_a.to_str().unwrap()],
+    );
+    let desks_b = tempfile::tempdir().unwrap();
+    let desk_path_b = desks_b.path().join("desk");
+    run(
+        &repo,
+        &["worktree", "add", desk_path_b.to_str().unwrap(), "side"],
+    );
+    crate::state::allow_repo_root(desks_b.path());
+    let id_after = sibling_id(&repo).await;
+    assert_eq!(
+        id, id_after,
+        "the test's premise requires the id to be reoccupied, not merely reused by accident"
+    );
+
+    let (status, body) = run_prebuilt(&repo, plan, observed).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.contains("changed since it was reviewed"),
+        "expected the compare-and-swap refusal, got: {body}"
+    );
+    assert!(
+        desk_path_b.exists(),
+        "the refused removal must not have touched the desk that actually occupies the id now"
+    );
+    let _ = desks_a; // kept alive for the duration of the test
 }
 
 /// The race guard, in isolation: [`exec_delete_untracked_paths`] refuses a
