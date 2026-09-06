@@ -125,6 +125,26 @@ html, body {
 .status-chip.dirty { color: #d29922; border-color: #9e6a03; }
 .status-chip.conflict { color: #f85149; border-color: #da3633; }
 
+/* #663 (ADR 0094 §7): the change feed's health, permanent and quiet. The
+   resting (Watching) state is a small muted dot and NOTHING else — no
+   colour that reads as an alert, no label, fixed size regardless of the
+   watch count or budget behind it, so it can never grow the topbar on its
+   own. A degraded state adds the amber dot and a short named label; that
+   visible growth is the point (ADR 0094 §7: "degraded is the thing that
+   changes, against a baseline that was always there"), not a regression of
+   the rule above. */
+.feed-health { display: inline-flex; align-items: center; gap: 5px; }
+.feed-health-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted, #8b949e);
+  flex-shrink: 0;
+}
+.feed-health-dot.degraded { background: #d29922; }
+.feed-health-label { font-size: 0.78rem; color: #d29922; white-space: nowrap; }
+
 /* A reading older than datetime::STALE_THRESHOLD_SECS (or one the server
    never stamped at all): dashed border and reduced opacity, stacked on top
    of whichever clean/dirty/conflict colour it also carries, rather than
