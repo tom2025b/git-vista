@@ -127,6 +127,72 @@ fn leading_number(file_name: &str) -> Option<String> {
     (head.len() == 4 && head.chars().all(|c| c.is_ascii_digit())).then_some(head)
 }
 
+/// The number an ADR's own first line claims, in either heading style the
+/// corpus actually uses: `# ADR NNNN — Title` or the older `# NNNN — Title`.
+///
+/// Returns `None` if the first line has no four-digit run in either of those
+/// two positions — that is a third, unrecognised format, and callers treat it
+/// as a mismatch rather than silently accepting it.
+fn heading_number(first_line: &str) -> Option<String> {
+    let rest = first_line
+        .strip_prefix("# ADR ")
+        .or_else(|| first_line.strip_prefix("# "))?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    (digits.len() == 4).then_some(digits)
+}
+
+/// `NNNN` -> (filename, the number its own H1 heading claims), for every
+/// `docs/adr/NNNN-*.md` on disk.
+fn heading_numbers_by_file_number() -> BTreeMap<String, (String, Option<String>)> {
+    let mut out = BTreeMap::new();
+    let dir = adr_dir();
+    for entry in std::fs::read_dir(&dir).expect("docs/adr must be readable") {
+        let name = entry.expect("a readable dir entry").file_name();
+        let name = name.to_string_lossy().into_owned();
+        if !name.ends_with(".md") {
+            continue;
+        }
+        let Some(number) = leading_number(&name) else {
+            continue;
+        };
+        let text = std::fs::read_to_string(dir.join(&name))
+            .unwrap_or_else(|e| panic!("{name} must be readable: {e}"));
+        let first_line = text.lines().next().unwrap_or("");
+        out.insert(number, (name, heading_number(first_line)));
+    }
+    out
+}
+
+#[test]
+fn every_adr_heading_names_its_own_filename_number() {
+    let by_file = heading_numbers_by_file_number();
+    assert!(
+        !by_file.is_empty(),
+        "no ADR files found under {} — this test would pass vacuously",
+        adr_dir().display()
+    );
+    let drifted: Vec<_> = by_file
+        .iter()
+        .filter_map(|(filename_number, (name, heading))| match heading {
+            Some(h) if h == filename_number => None,
+            Some(h) => Some(format!(
+                "{name}: filename says {filename_number}, heading says {h}"
+            )),
+            None => Some(format!(
+                "{name}: filename says {filename_number}, heading has no recognisable number \
+                 (first line must start with \"# ADR NNNN \" or \"# NNNN \")"
+            )),
+        })
+        .collect();
+    assert!(
+        drifted.is_empty(),
+        "these ADR files have a heading number that disagrees with their own filename: \
+         {drifted:?}. This is the #689/0126 drift: a rename updated the filename and the \
+         index but the document's own `# ADR NNNN` (or `# NNNN`) heading was left behind \
+         because the heading edit never got staged."
+    );
+}
+
 #[test]
 fn every_adr_file_has_a_row_in_the_index() {
     let files = files_by_number();
