@@ -913,10 +913,21 @@ pub struct SetTokenRequest {
 
 /// Response of `GET` and `POST /api/settings/token` (M13.03, #584): whether a
 /// token is configured, and if so, which tier answered and its last 4
-/// characters — never the value itself. This type is the one place #584's
-/// "never returned by any read endpoint" acceptance criterion lives on the
-/// wire: it has no field capable of carrying the full token, by
-/// construction, not by a caller remembering to mask one.
+/// characters — never the value itself. This is the wire shape #584's
+/// "never returned by any read endpoint" acceptance criterion is checked
+/// against.
+///
+/// `masked`/`source` are plain `Option<String>` — nothing at the type level
+/// stops a field from holding a raw token; a hand-built `TokenStatus`
+/// literal could put one there. The guarantee is narrower and lives one
+/// level down: the only production constructor,
+/// `token_store::token_status_of`, always builds `masked` from
+/// `mask_token()` and `source` from `TokenSource::label()`'s fixed
+/// `&'static str`s, and its host tests `serde_json::to_string` the real
+/// value and assert the actual secret substring is absent from the wire
+/// bytes, for all four resolution tiers — a constructor-and-wire-test
+/// guarantee, not a type-level seal. A future version wanting the stronger
+/// claim would need a newtype with a private inner rather than this struct.
 ///
 /// `configured` is kept alongside `masked`/`source` rather than derived from
 /// them so a client only needs the one field for its primary yes/no

@@ -5,9 +5,12 @@ use git_vista_protocol::{SetTokenRequest, TokenStatus};
 use super::{network_error, refuse_if_offline, req_get, response_error, write_json};
 
 /// Whether a GitHub token is configured, and which tier answered — never the
-/// value itself. The server-side `TokenStatus` DTO structurally cannot carry
-/// it (see `git-vista-server::token_store::token_status_of`'s own doc), so
-/// there is nothing this function could leak even if it wanted to.
+/// value itself. The guarantee lives in the server's only production
+/// constructor for this DTO, `token_store::token_status_of`, which always
+/// masks the value and is wire-tested against a real secret for every
+/// resolution tier (see its own doc) — not in `TokenStatus`'s fields, which
+/// are plain `Option<String>` with nothing stopping a hand-built value from
+/// holding one.
 pub async fn token_status_request() -> Result<TokenStatus, String> {
     let resp = req_get("/api/settings/token")
         .send()

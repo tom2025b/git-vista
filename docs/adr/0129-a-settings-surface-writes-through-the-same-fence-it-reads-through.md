@@ -88,30 +88,43 @@ where a keyring failure resolves to `None` silently and a stale
 whichever tier is *actually* winning right now, live, on every call — never
 a cached belief about the write that once succeeded.
 
-### 4. `TokenStatus` cannot carry the value, and that is proved at the wire, not by inspection
+### 4. The only production constructor cannot put the value on the wire, and that is proved at the wire, not by inspecting the type
 
-The issue's acceptance criterion is explicit: *"The value is never
-returned by any read endpoint — asserted at the wire level, not by
-inspection."* Two things make this a proof rather than a claim:
+`TokenStatus { configured: bool, masked: Option<String>, source:
+Option<String> }` is not itself sealed against carrying the value —
+`masked`/`source` are plain `Option<String>`, and nothing at the type
+level stops a hand-built literal from putting a raw token in either one.
+The guarantee is one level down, in construction, and the issue's
+acceptance criterion is explicit that inspecting the type is not how it
+gets checked: *"The value is never returned by any read endpoint —
+asserted at the wire level, not by inspection."*
 
 ```mermaid
 flowchart TD
-    RT["resolve_token, returns the resolved token plus which tier answered"] --> TSO["token_status_of — pure, dependency-injected"]
+    RT["resolve_token, returns the resolved token plus which tier answered"] --> TSO["token_status_of — pure, dependency-injected, the ONLY production constructor"]
     TSO -->|builds only: configured, masked, source| TS["TokenStatus"]
     TS -->|serde_json::to_string| WIRE["the actual HTTP response body"]
 ```
 
-- **The type.** `TokenStatus { configured: bool, masked: Option<String>,
-  source: Option<String> }` has no field that could hold the resolved
-  `String` — `masked` is always the output of `mask_token`, `source` is
-  always `TokenSource::label()`'s `&'static str`. There is no field to
-  forget to mask.
+- **The constructor.** `token_status_of` is the only place production code
+  builds a `TokenStatus`. It always sets `masked` from `mask_token`'s
+  output and `source` from `TokenSource::label()`'s fixed `&'static str` —
+  never the resolved `String` itself. A future caller that hand-built a
+  `TokenStatus` some other way would not be stopped by the type; it would
+  be a new, unaudited construction site.
 - **The test.** `token_status_of`'s host tests do not merely construct a
   `TokenStatus` and inspect its fields — they call
   `serde_json::to_string(&status)` (the actual wire serialization a client
   receives) and assert the real secret substring is absent from the
   **whole serialized value**, for all four resolution tiers, not only the
   one a hand-picked example might have exercised.
+
+This is a constructor-and-wire-test guarantee, not a type-level seal — a
+narrower and more honest claim than "the type cannot carry it." A type-level
+seal would need a newtype with a private inner (`Masked(String)`, say,
+constructible only via `mask_token`); nothing here builds one, because the
+one production path is already covered and a newtype is a bigger change
+than #584 asked for.
 
 ### 5. Both routes sit behind the full write posture, and never the LAN listener
 
@@ -143,11 +156,11 @@ shaped failure (a keyring gone unreadable after a successful save)
 extra — it is already a fast, local call — and answers the question users
 actually have.
 
-**Mask by inspection only (read the struct definition, confirm no `String`
-field holds the full value) rather than a runtime wire-level test.**
-Rejected — decision 4, and the issue's own wording ("asserted at the wire
-level, not by inspection") rules this out explicitly. A structural
-guarantee and a behavioral proof are different claims; ADR 0115's own
+**Mask by inspection only (read the struct definition, confirm the only
+production constructor masks the value) rather than a runtime wire-level
+test.** Rejected — decision 4, and the issue's own wording ("asserted at
+the wire level, not by inspection") rules this out explicitly. Reading the
+code and running it are different claims; ADR 0115's own
 finding (a composition site outside either of two well-tested functions
 could still be wrong) is the general shape of why "the two pieces are each
 correct" does not imply "the wire format is correct."
