@@ -1353,7 +1353,7 @@ async fn generation_token(repo: &Path, observed: &Observed) -> GenerationToken {
 /// is the property `staging.rs:26-35` records the cost of losing.
 struct GenerationParts {
     /// HEAD's short symbolic branch name, captured by the same `gix` open as
-    /// [`refs`]. `None` means detached, unborn without a symbolic name, or an
+    /// `refs`. `None` means detached or an
     /// unreadable ref store. Keeping this beside the ref values lets the live
     /// sweep consume the one HEAD read it already paid for.
     head_branch: Option<String>,
@@ -1435,18 +1435,18 @@ pub(crate) struct LiveReading {
 
 /// Read the live generation and keep the parts (M12.03, #553).
 ///
-/// Built from [`observe_live_for_feed`] and [`read_generation_parts`],
-/// which is exactly the pair the post-execution generation and the stash pop's
-/// freshness check already use — so this mints the planner recipe by *calling*
-/// it, never by reproducing it. `m3.26-external-changes.md` D4 records what
+/// Combines [`observe_live_for_feed`] with [`read_generation_parts`], reusing
+/// the latter's HEAD branch before calling the shared [`fold_generation`]
+/// recipe used by operation freshness checks. `m3.26-external-changes.md` D4 records what
 /// minting a look-alike costs: a sixth generation namespace that "409s forever,
 /// never admits".
 pub(crate) async fn live_reading(repo: &Path) -> LiveReading {
     // The ref walk below also returns HEAD's symbolic branch. This feed-only
     // observation omits the standalone branch open that operation freshness
     // checks still need for their precondition diagnostics.
-    let observed = observe_live_for_feed(repo).await;
+    let mut observed = observe_live_for_feed(repo).await;
     let parts = read_generation_parts(repo).await;
+    observed.head_branch = parts.head_branch.clone();
     let blind = if !parts.refs_read {
         Some("the ref store could not be read".to_string())
     } else if observed.head_tip.is_unknown() {
@@ -1467,7 +1467,7 @@ pub(crate) async fn live_reading(repo: &Path) -> LiveReading {
     // publishes neither value.
     let other = format!(
         "head\u{0}{}\u{0}{}\u{0}stash\u{0}{}\u{0}merge_ff\u{0}{}\u{0}status\u{0}{}",
-        parts.head_branch.as_deref().unwrap_or(""),
+        observed.head_branch.as_deref().unwrap_or(""),
         observed.head_tip.digest_field(),
         parts.stash.value,
         parts.merge_ff.value,
@@ -1491,11 +1491,7 @@ fn fold_generation(observed: &Observed, parts: &GenerationParts) -> GenerationTo
         "head",
         format!(
             "{}\u{0}{}",
-            observed
-                .head_branch
-                .as_deref()
-                .or(parts.head_branch.as_deref())
-                .unwrap_or(""),
+            observed.head_branch.as_deref().unwrap_or(""),
             observed.head_tip.digest_field()
         ),
     );
@@ -1698,12 +1694,11 @@ async fn refs_reading(
     tokio::task::spawn_blocking(move || match git_vista_git::read_refs_at(&repo) {
         Ok(read) => {
             let head_branch = match read.head {
-                HeadAtEvent::OnBranch { symbolic, .. } | HeadAtEvent::Unborn { symbolic } => Some(
-                    symbolic
-                        .strip_prefix("refs/heads/")
-                        .unwrap_or(&symbolic)
-                        .to_string(),
-                ),
+                HeadAtEvent::OnBranch { symbolic, .. } | HeadAtEvent::Unborn { symbolic } => {
+                    gix::refs::FullName::try_from(symbolic)
+                        .ok()
+                        .map(|name| name.shorten().to_string())
+                }
                 HeadAtEvent::Detached { .. }
                 | HeadAtEvent::Unresolvable
                 | HeadAtEvent::Unreadable { .. } => None,
@@ -1849,11 +1844,7 @@ async fn observe_live(repo: &Path, operation: &GitOperation) -> Observed {
 async fn observe_live_for_generation(repo: &Path) -> Observed {
     Observed {
         head_branch: read_head_branch_blocking(repo).await,
-        head_tip: Obs::from_read(rev_parse(repo, "HEAD").await),
-        branch_tip: Obs::Absent,
-        status: worktree_status(repo).await,
-        held_at_build: Vec::new(),
-        census: no_census_taken(),
+        ..observe_live_for_feed(repo).await
     }
 }
 

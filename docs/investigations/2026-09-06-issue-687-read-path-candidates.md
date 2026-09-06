@@ -1,57 +1,51 @@
 # Issue #687 — read-path candidates
 
-The handoff's #661 measurement is structurally useful but its wall-clock
-values are load-contaminated on this shared host. I will repeat the supplied
-measurement harness before and after, with multiple runs, and report the
-spread and host load instead of treating one sample as a speed claim.
+The reconciliation sweep now retains the symbolic HEAD already returned by
+`read_refs_at`, avoiding its separate `read_head_branch_blocking` open. The
+feed fills `Observed::head_branch` before calling the existing generation
+fold; operation preconditions keep their original observation path. Both
+paths use gix's ref-name shortening, including symbolic targets outside
+`refs/heads`. Detached HEAD stays branchless; unborn symbolic HEAD keeps its
+name. There is no new generation recipe, cache, wire shape, or ADR.
 
-Candidate 1 (`refs_reading`) is a ref-walk/API-shape investigation. It is not a
-safe cache opportunity: the sweep is the authority and must observe current
-refs. I will not replace a complete walk with a guessed incremental cache in
-this issue. If the supplied measurements confirm the walk dominates, the
-report will preserve that as an open investigation.
+## Measurement correction
 
-Candidate 2 is a bounded correctness-preserving optimization. `read_refs_at`
-already computes `HeadAtEvent` while opening and walking refs. The planner
-currently throws that result away, then opens the repository again only to
-derive HEAD's short branch name. I will retain the symbolic branch in the
-existing `GenerationParts` value and make the generation fold and live-feed
-payload consume it. The separate `read_head_branch_blocking` call used only by
-the generation/live-reading path can then be removed. Operation-specific
-observation still keeps its `Observed::head_branch`, because executors use
-that value for operation preconditions and execution messages.
+The earlier baseline/optimized timing table in this document is withdrawn.
+Both fresh target directories lacked `gv-sandbox`. The ignored harness
+discarded return values, so the four git components timed failed reads
+(0.00–0.03 ms), not production work. The claimed whole-path improvement was
+therefore invalid even with repeated samples. Ref-only timings do not repair
+that comparison. The harness now rejects a blind production reading before
+measurement and during every whole-path iteration, and asserts raw git
+commands succeeded. Its component-sum difference is labelled timing noise,
+not concurrency savings: all production reads are awaited sequentially.
 
-The generation token remains the same logical recipe: HEAD's symbolic branch,
-HEAD tip, every display ref, stash, merge.ff, and status. A failed ref read
-remains unreadable and fails closed; detached and unborn HEADs remain branchless.
-No contract or wire shape changes, so no ADR is planned.
+Replacement measurements and final validation are pending.
+
+## Ref-walk investigation
+
+The pinned gix 0.84 implementation of `Reference::peel_to_id` calls
+gix-ref 0.64's `ReferenceExt::peel_to_id`. That refreshes the packed-ref
+buffer, follows symbolic targets, and, unless a peeled target is already
+available, reads objects until the first non-tag object. Replacing this
+with the raw target ID would skip tag peeling and missing-object checks.
+The harness adds open-plus-enumeration without peeling to separate listing
+from object work. Its raw `for-each-ref` comparison now requests peeled tag
+IDs, but is still a scale comparison, not proof of identical error handling
+or recursive tag semantics.
+
+## Correctness checkpoint
+
+The real-repository test creates both branches before the first reading,
+requires readable/stable input, and verifies that switching branches at the
+same tip leaves the ref map unchanged while changing the generation. A
+separate pure-fold test holds the tip and every other input constant. The
+feed/operation comparison covers attached, detached, unborn, tag-symbolic,
+and linked-worktree HEAD states.
+
+Atlas records 371 and 375 describe earlier revisions; record 372 exposed a
+vacuous token-change assertion (a new ref and unreadable-input nonces could
+change the token). Fresh proofs against the corrected implementation are
+pending; earlier IDs are retained as history, not final verification.
 
 Signed: codex
-
-## Measurement snapshot
-
-The supplied ignored harness was run for 20 warm iterations per component on
-each revision. The baseline was a disposable worktree at `origin/main`
-(`0d1d8634`); the optimized sample was this branch. The shared host reported
-load averages of `6.46, 6.57, 5.13` during the optimized run, so these are
-directional wall-clock observations rather than isolated benchmarks.
-
-| component | baseline mean (range) | optimized mean (range) |
-| --- | ---: | ---: |
-| `refs_reading` | 81.73 ms (65.21–99.83) | 52.11 ms (39.33–72.27) |
-| whole `live_reading` | 105.43 ms (68.17–130.95) | 56.75 ms (40.75–81.24) |
-
-The baseline's separate `read_head_branch_blocking` read averaged 4.38 ms
-(3.29–5.16). In the optimized path, `refs_reading` returns the symbolic HEAD
-state it already obtained during the ref walk, so that second repository open
-is gone. The ref walk remains the dominant cost: `gix::open_opts` alone was
-2.81 ms median in the baseline sample versus 82.20 ms median for the full
-`refs_reading` call.
-
-Failure-atlas mutation proofs are recorded for both correctness seams. Record
-371 replaced the feed's branch payload with an empty string and was **caught**
-by `live_reading_keeps_a_symbolic_head_move_in_the_generation`. Record 375
-replaced the generation fold's refs-pass branch fallback with a constant empty
-string and was **caught** by
-`fold_generation_keeps_the_refs_pass_head_branch`; this test holds the other
-generation inputs constant.

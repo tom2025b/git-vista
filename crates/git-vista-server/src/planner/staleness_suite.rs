@@ -501,16 +501,32 @@ async fn live_reading_keeps_a_symbolic_head_move_in_the_generation() {
     let branch = String::from_utf8_lossy(&branch.stdout).trim().to_string();
     assert!(!branch.is_empty());
 
+    run(&repo, &["branch", "same-tip"]);
     let before = live_reading(&repo).await;
+    assert!(
+        before.blind.is_none(),
+        "fixture unreadable: {:?}",
+        before.blind
+    );
+    assert_eq!(
+        before.token,
+        live_reading(&repo).await.token,
+        "unchanged readings must agree"
+    );
     assert!(
         before.other.starts_with(&format!("head\u{0}{branch}\u{0}")),
         "the baseline reading must name the fixture's symbolic HEAD: {:?}",
         before.other
     );
 
-    run(&repo, &["branch", "same-tip"]);
     run(&repo, &["checkout", "-q", "same-tip"]);
     let after = live_reading(&repo).await;
+    assert!(
+        after.blind.is_none(),
+        "fixture unreadable: {:?}",
+        after.blind
+    );
+    assert_eq!(before.refs, after.refs, "only symbolic HEAD may change");
     assert!(
         after.other.starts_with("head\u{0}same-tip\u{0}"),
         "the second reading must name the new symbolic HEAD: {:?}",
@@ -523,17 +539,17 @@ async fn live_reading_keeps_a_symbolic_head_move_in_the_generation() {
 }
 
 #[test]
-fn fold_generation_keeps_the_refs_pass_head_branch() {
-    let observed = Observed {
-        head_branch: None,
+fn fold_generation_keeps_symbolic_head_distinct_from_tip() {
+    let observed = |branch: &str| Observed {
+        head_branch: Some(branch.to_string()),
         head_tip: Obs::Known("tip".to_string()),
         branch_tip: Obs::Absent,
         status: Obs::Known(String::new()),
         held_at_build: Vec::new(),
         census: super::no_census_taken(),
     };
-    let parts = |head_branch: &str| GenerationParts {
-        head_branch: Some(head_branch.to_string()),
+    let parts = GenerationParts {
+        head_branch: None,
         refs: vec![("refs/heads/main".to_string(), "tip".to_string())],
         named_refs: std::collections::BTreeMap::new(),
         refs_read: true,
@@ -548,10 +564,53 @@ fn fold_generation_keeps_the_refs_pass_head_branch() {
     };
 
     assert_ne!(
-        fold_generation(&observed, &parts("main")),
-        fold_generation(&observed, &parts("same-tip")),
-        "the refs pass symbolic HEAD must participate in the generation fold"
+        fold_generation(&observed("main"), &parts),
+        fold_generation(&observed("same-tip"), &parts),
+        "the symbolic HEAD must participate in the generation fold"
     );
+}
+
+/// The optimized sweep and the operation path must mint the same namespace,
+/// including gix's shortening rules for symbolic HEAD outside refs/heads.
+#[tokio::test]
+async fn live_reading_matches_operation_generation_across_head_states() {
+    let (dir, repo) = seeded_repo();
+    async fn agrees(repo: &Path) {
+        let reading = live_reading(repo).await;
+        assert!(
+            reading.blind.is_none(),
+            "fixture unreadable: {:?}",
+            reading.blind
+        );
+        let observed = observe_live_for_generation(repo).await;
+        assert_eq!(reading.token, generation_token(repo, &observed).await);
+    }
+    agrees(&repo).await;
+    run(&repo, &["checkout", "-q", "--detach"]);
+    agrees(&repo).await;
+    run(&repo, &["symbolic-ref", "HEAD", "refs/heads/unborn/nested"]);
+    agrees(&repo).await;
+    run(&repo, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    run(&repo, &["tag", "symbolic-target"]);
+    run(
+        &repo,
+        &["symbolic-ref", "HEAD", "refs/tags/symbolic-target"],
+    );
+    agrees(&repo).await;
+    run(&repo, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    let linked = dir.path().join("linked");
+    run(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "linked/nested",
+            linked.to_str().unwrap(),
+        ],
+    );
+    agrees(&linked).await;
 }
 
 /// The digest tags are load-bearing on their own: an observed empty status
