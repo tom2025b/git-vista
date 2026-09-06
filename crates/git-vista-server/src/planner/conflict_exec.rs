@@ -24,7 +24,7 @@ use git_vista_protocol::{
 
 use crate::sandbox::NetworkNeed;
 
-use super::{couldnt_run, run_git, run_git_argv, stderr_or, symlink_containment_guard};
+use super::{couldnt_run, run_git, run_git_argv, stderr_or, symlink_containment_guard, RunFailure};
 
 /// Resolve one conflicted path by taking a whole side, or by deleting it
 /// (M4.31, #84).
@@ -114,7 +114,7 @@ pub(super) async fn exec_resolve_conflict(
 
     let output = match run_git_argv(repo, need, &argv).await {
         Ok(o) => o,
-        Err(e) => return couldnt_run("/api/resolve-conflict", &e),
+        Err(e) => return couldnt_run("/api/resolve-conflict", RunFailure::Spawn, &e),
     };
     if !output.status.success() {
         let msg = stderr_or(&output, "git could not apply that resolution.");
@@ -130,7 +130,7 @@ pub(super) async fn exec_resolve_conflict(
         let add = match run_git_argv(repo, need, &plan_export::stage_resolved_path_argv(path)).await
         {
             Ok(o) => o,
-            Err(e) => return couldnt_run("/api/resolve-conflict", &e),
+            Err(e) => return couldnt_run("/api/resolve-conflict", RunFailure::Spawn, &e),
         };
         if !add.status.success() {
             let msg = stderr_or(&add, "git could not stage the resolved file.");

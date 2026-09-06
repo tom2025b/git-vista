@@ -1,0 +1,57 @@
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RunFailure {
+    Spawn,
+    ResolveCommit,
+    VerifyPlan,
+    VerifyBranchHolder,
+    VerifyRef,
+    VerifyCleanWorktree,
+    ReadStatus,
+    VerifyPaths,
+    ResolveWorktreeRoot,
+    ResolvePath,
+    ContainmentTask,
+    ResolveGitDirectory,
+    ReadRebaseBase,
+    ReadRebaseState,
+    CompareAndSwap,
+    VerifySeed,
+    PullFetchUnobserved,
+    ReadFetchedTip,
+    ReadPullHead,
+    PullUnobserved,
+    FetchUnobserved,
+    ReadRemoteRefs,
+    PushUnobserved,
+}
+
+impl RunFailure {
+    pub(super) fn summary(self) -> &'static str {
+        match self {
+            Self::Spawn => "Couldn't run git. Check the server log for details.",
+            Self::ResolveCommit => "Couldn't run git: the requested commit could not be resolved.",
+            Self::VerifyPlan => "Couldn't run git: the repository's state could not be read, so this plan cannot be re-verified before executing.",
+            Self::VerifyBranchHolder => "Couldn't run git: couldn't check whether another worktree has this branch checked out, so this plan cannot be verified.",
+            Self::VerifyRef => "Couldn't run git: the reference could not be checked, so this plan cannot be verified.",
+            Self::VerifyCleanWorktree => "Couldn't run git status, so the working tree cannot be verified.",
+            Self::ReadStatus => "Couldn't run git status. Check the server log for details.",
+            Self::VerifyPaths => "git status failed, so these paths cannot be re-verified before executing.",
+            Self::ResolveWorktreeRoot => "Couldn't resolve the worktree root, so path containment cannot be verified.",
+            Self::ResolvePath => "Couldn't resolve a requested path, so path containment cannot be verified.",
+            Self::ContainmentTask => "The path containment check failed, so this operation cannot be verified.",
+            Self::ResolveGitDirectory => "Couldn't run git: the git directory could not be resolved, so repository locks cannot be checked.",
+            Self::ReadRebaseBase => "Couldn't run git: the rebase base could not be determined.",
+            Self::ReadRebaseState => "Couldn't run git: the rebase state could not be read.",
+            Self::CompareAndSwap => "Couldn't run git: the reference could not be resolved for the compare-and-swap, so the commit was not attempted.",
+            Self::VerifySeed => "Couldn't run git: the seed commit could not be verified, so the test repository was not reset.",
+            Self::PullFetchUnobserved => "The pull's fetch ran but remote-tracking refs could not be re-read, so there is no state to integrate from.",
+            Self::ReadFetchedTip => "The fetch succeeded but its remote-tracking branch could not be read, so integration was not attempted.",
+            Self::ReadPullHead => "The checked-out branch's tip could not be read, so a pull's effect on it could not be reported. Integration was not attempted.",
+            Self::PullUnobserved => "The integration reported success but the checked-out branch's tip could not be re-read, so what the pull did to it is unknown. Check its state before retrying.",
+            Self::FetchUnobserved => "The fetch ran but remote-tracking refs could not be re-read, so its result is unknown. Check their state before retrying.",
+            Self::ReadRemoteRefs => "Couldn't run git: remote-tracking refs could not be listed, so the push was not attempted.",
+            Self::PushUnobserved => "The push ran but remote-tracking refs could not be re-read, so what it did to the remote is unknown. Check its state before retrying.",
+        }
+    }
+}

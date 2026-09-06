@@ -13,6 +13,7 @@ use git_vista_protocol::{BranchName, GitOperation, RebaseStatus, RefName};
 
 use crate::git_cmd::{git_ref_exists, is_ancestor, rev_parse, ExecUnavailable};
 use crate::planner;
+use crate::planner::RunFailure;
 use crate::state::{current, reject_if_read_only};
 
 /// Rebase the checked-out branch onto main (Issue #33 follow-up): `git rebase
@@ -49,6 +50,7 @@ pub(crate) async fn rebase() -> (StatusCode, String) {
         Err(e) => {
             return planner::couldnt_run(
                 "/api/rebase",
+                RunFailure::ReadRebaseBase,
                 &format!("couldn't determine the rebase base: {e}"),
             )
         }
@@ -121,6 +123,7 @@ pub(crate) async fn rebase_status() -> axum::response::Response {
                 no_store,
                 planner::couldnt_run(
                     "/api/rebase-status",
+                    RunFailure::ReadRebaseState,
                     &format!("couldn't read the rebase state: {e}"),
                 ),
             )
