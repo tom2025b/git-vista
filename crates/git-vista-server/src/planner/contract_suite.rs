@@ -2727,12 +2727,177 @@ fn route_call_spans(src: &str) -> Vec<String> {
     out
 }
 
+/// Every POST route `main.rs`'s `api_router` registers, and the handler each
+/// one reaches — the write-surface half of the route census. Hoisted to a
+/// module-level `const` (rather than a local binding inside the test below,
+/// which is where this table used to live) so that
+/// [`route_authz_and_write_contract_agree_on_every_post_route`] (#690) can
+/// read it directly, the same way it reads `route_authz`'s `ROUTE_AUTHZ` —
+/// two independently hand-maintained tables checked against each other by
+/// one third test, instead of trusting a human (or an agent) to remember the
+/// second table exists at all.
+///
+/// `create_session` is this table's one exception: it names a handler, not a
+/// path, because it is routed with a bare `.post(…)` — see its own entry
+/// below.
+pub(crate) const KNOWN_POST_ROUTES: &[(&str, &str)] = &[
+    // Session bootstrap (`POST /session` behind the sign-in token) — an
+    // auth write, not a git write; routed with `.post(…)` directly.
+    ("create_session", "create_session"),
+    ("/api/clone", "clone_repo"),
+    ("/api/delete-clone", "delete_clone_repo"),
+    ("/api/select", "select_repo"),
+    // M11.03 (#548): switch to a linked worktree of the served repository.
+    // A **catalog write, not a git write** — it can admit a discovered
+    // sibling to the catalog and move the selection, but it constructs no
+    // argv, mints no plan and touches no ref, so it has no funnel row
+    // below. Classified here rather than allowed to slip past the tally,
+    // exactly as `/api/operations/{id}/cancel` is: the whole point of this
+    // table is that a new POST cannot appear without someone deciding
+    // which kind it is. The git it does run is the census's read-only
+    // `git worktree list --porcelain`.
+    (
+        "/api/select-worktree",
+        "handlers::select::select_discovered_worktree",
+    ),
+    // M11.05 (#550): close a linked sibling desk — a git write, funnel
+    // row below.
+    (
+        "/api/remove-worktree",
+        "handlers::worktrees::remove_worktree",
+    ),
+    ("/api/rescan", "rescan"),
+    // M13.03 (#584): save the GitHub token. A **credential write, not a
+    // git write** — it calls `keyring::Entry::set_password` and touches
+    // no repository, constructs no argv, and mints no plan. Classified
+    // here rather than allowed to slip past the tally, the same as
+    // `/api/select-worktree`'s catalog write above.
+    ("/api/settings/token", "handlers::settings::set_token"),
+    ("/api/branch", "create_branch"),
+    ("/api/commit", "create_commit"),
+    // M2.19b (#223): amend — a git write, funnel row below.
+    ("/api/amend-commit", "amend_commit"),
+    // M10.09 (#596): cherry-pick — a git write, funnel row below. The
+    // operation and its executor predate this route by a whole milestone
+    // (#576); what #596 added is the only way for a client to ask for it.
+    ("/api/cherry-pick", "cherry_pick"),
+    ("/api/stage", "stage_all"),
+    // Staging selections (M2.17b, #213): apply is a git write and MUST
+    // reach the planner (funnel row below). Preview is deliberately not
+    // one — it builds the same bytes but mutates nothing and never mints
+    // a plan; its refusals (400/409) happen before any operation exists.
+    ("/api/staging/preview", "staging_preview"),
+    ("/api/staging/apply", "staging_apply"),
+    // M2.16 (#69): the four explicit DiffSpec diff modes. A POST, and
+    // emphatically **not** a git write — it spawns a read-only `git diff`
+    // through `git_stdout_capped`, constructs no plan, and leaves the
+    // repository byte-for-byte unchanged. It has no funnel row below for
+    // the same reason `/api/staging/preview` does not.
+    //
+    // It is a POST only because `DiffSpec` is an internally-tagged enum
+    // whose variants carry different fields; a query string could carry it
+    // only by flattening it into loose optional parameters, which is the
+    // un-explicit shape the type exists to remove. `/api/plan` sits in this
+    // table for the same reason — a read wearing a write's verb because the
+    // CSRF gate keys on the method.
+    ("/api/diff/spec", "spec_diff"),
+    ("/api/unstage", "unstage_all"),
+    ("/api/undo", "activity::undo"),
+    ("/api/merge", "merge_branch"),
+    ("/api/push", "push_branch"),
+    // M2.20c (#229): fetch — a git write, funnel row below.
+    ("/api/fetch", "fetch_remote"),
+    // M2.20d (#230): pull — a git write, funnel row below.
+    ("/api/pull", "pull_branch"),
+    ("/api/delete-branch", "delete_branch"),
+    // The stash drawer (M3.24, #77). All three are git writes and all
+    // three go through the planner — push moves worktree state into
+    // refs/stash, apply moves it back, and drop destroys an entry. Listed
+    // here so the census sees three considered rows rather than three
+    // routes nothing checked.
+    ("/api/stash/push", "handlers::stash::push_stash"),
+    ("/api/stash/apply", "handlers::stash::apply_stash"),
+    ("/api/stash/drop", "handlers::stash::drop_stash"),
+    ("/api/stash/branch", "handlers::stash::branch_from_stash"),
+    // M2.21d (#238): the two local tag writes — git writes, funnel rows
+    // below. M2.21f (#240) added the two remote ones right after. The
+    // tag *listing* is a GET and so never reaches this table.
+    ("/api/tag", "handlers::tags::create_tag"),
+    ("/api/delete-tag", "handlers::tags::delete_tag"),
+    ("/api/push-tag", "handlers::tags::push_tag"),
+    (
+        "/api/delete-remote-tag",
+        "handlers::tags::delete_remote_tag",
+    ),
+    ("/api/checkout", "checkout_branch"),
+    // M11.04 (#549): a git write — it reaches the planner and runs
+    // `git worktree add` — so it is a funnel row below like every other
+    // mutation, not a catalog write.
+    ("/api/add-worktree", "handlers::branch::add_worktree"),
+    ("/api/force-delete-branch", "force_delete_branch"),
+    ("/api/rebase", "rebase"),
+    ("/api/reset-test-repo", "reset_test_repo"),
+    // #219 (M2.18a): discard/delete of working-tree paths.
+    ("/api/discard-tracked-paths", "discard_tracked_paths"),
+    ("/api/delete-untracked-paths", "delete_untracked_paths"),
+    // M4.31b (#429): resolving one conflicted path by taking a whole
+    // side, or removing the file. A git write — it runs `checkout --ours`
+    // / `--theirs` / `rm -f` — so it goes through the planner like every
+    // other mutation, and appears in the funnel below.
+    ("/api/resolve-conflict", "resolve_conflict"),
+    ("/api/resolve-conflict-content", "resolve_conflict_content"),
+    // M2.20c (#229): cancelling a running operation. A POST, and a write
+    // in the "changes what the server is doing" sense — it kills a child
+    // process — but **not** a git write: it constructs no argv and mints
+    // no plan, so it has no funnel row below. It is classified here, on
+    // purpose, rather than being allowed to slip past the tally.
+    (
+        "/api/operations/{id}/cancel",
+        "handlers::operations::cancel_operation",
+    ),
+    // M2.23d (#248, ADR 0046): build a reviewable Plan and hand it back.
+    // Deliberately NOT a funnel row below — it must never reach
+    // `plan_and_execute`. The `build_only` block after the funnel loop
+    // states the inverse requirement and checks it.
+    ("/api/plan", "plan_operation"),
+    // M2.23e (#249, ADR 0046 continued): submit a plan for execution. Not
+    // a funnel row either — it reaches the planner through
+    // `submit_plan_tracked`, the submit path's own tracked entry, never
+    // `plan_and_execute` (which would rebuild the operation instead of
+    // executing the plan that was actually approved). The
+    // `submit_execute` block right after the `build_only` one below
+    // checks this route's own chain.
+    ("/api/execute-plan", "execute_plan"),
+    // M10.08 (#576, ADR 0099): the graph a Plan would produce. A POST, and
+    // deliberately NOT a git write: it mints no plan, builds no mutating
+    // argv, and must never reach any execution entry point. Its git work
+    // is `merge-tree`/`commit-tree` run against a throwaway object store
+    // whose only writable target is itself, so the repository it names is
+    // byte-for-byte unchanged (asserted by `preview::suite`'s A2). No
+    // funnel row below, for the same reason `/api/plan` has none — and,
+    // like `/api/plan`, the inverse requirement is stated and checked, in
+    // the `preview_is_read_only` block after the `build_only` one.
+    ("/api/preview", "preview_plan"),
+    // M3.25 (#78): executing one past operation's recovery. A git write —
+    // it reaches the planner — but not a funnel row below, because it
+    // enters through `plan_and_execute_recovery` rather than
+    // `plan_and_execute` (it carries the `recovers` link the plain entry
+    // point has no parameter for). The `recovery_chain` block after the
+    // funnel loop checks its own chain, the same way `/api/execute-plan`
+    // gets `submit_execute`.
+    (
+        "/api/operations/{id}/recover",
+        "recovery_center::recover_operation",
+    ),
+];
+
 /// The single-funnel proof: the router's POST table is exactly the known
-/// write surface, and every **git-mutating** route's handler reaches
-/// [`plan_and_execute`] — directly or through the one named local helper it
-/// delegates to. A new POST route, a renamed handler, or a handler that stops
-/// calling the planner all fail here. (The other half — nothing *outside*
-/// the planner spawns a mutating process — is `argv_boundary`'s tripwire.)
+/// write surface ([`KNOWN_POST_ROUTES`], above), and every **git-mutating**
+/// route's handler reaches [`plan_and_execute`] — directly or through the one
+/// named local helper it delegates to. A new POST route, a renamed handler,
+/// or a handler that stops calling the planner all fail here. (The other
+/// half — nothing *outside* the planner spawns a mutating process — is
+/// `argv_boundary`'s tripwire.)
 #[test]
 fn every_git_write_route_reaches_the_planner() {
     let main_src = source("src/main.rs");
@@ -2752,156 +2917,7 @@ fn every_git_write_route_reaches_the_planner() {
         .into_iter()
         .filter(|span| span.contains("post("))
         .collect();
-    let expected: &[(&str, &str)] = &[
-        // Session bootstrap (`POST /session` behind the sign-in token) — an
-        // auth write, not a git write; routed with `.post(…)` directly.
-        ("create_session", "create_session"),
-        ("/api/clone", "clone_repo"),
-        ("/api/delete-clone", "delete_clone_repo"),
-        ("/api/select", "select_repo"),
-        // M11.03 (#548): switch to a linked worktree of the served repository.
-        // A **catalog write, not a git write** — it can admit a discovered
-        // sibling to the catalog and move the selection, but it constructs no
-        // argv, mints no plan and touches no ref, so it has no funnel row
-        // below. Classified here rather than allowed to slip past the tally,
-        // exactly as `/api/operations/{id}/cancel` is: the whole point of this
-        // table is that a new POST cannot appear without someone deciding
-        // which kind it is. The git it does run is the census's read-only
-        // `git worktree list --porcelain`.
-        (
-            "/api/select-worktree",
-            "handlers::select::select_discovered_worktree",
-        ),
-        // M11.05 (#550): close a linked sibling desk — a git write, funnel
-        // row below.
-        (
-            "/api/remove-worktree",
-            "handlers::worktrees::remove_worktree",
-        ),
-        ("/api/rescan", "rescan"),
-        // M13.03 (#584): save the GitHub token. A **credential write, not a
-        // git write** — it calls `keyring::Entry::set_password` and touches
-        // no repository, constructs no argv, and mints no plan. Classified
-        // here rather than allowed to slip past the tally, the same as
-        // `/api/select-worktree`'s catalog write above.
-        ("/api/settings/token", "handlers::settings::set_token"),
-        ("/api/branch", "create_branch"),
-        ("/api/commit", "create_commit"),
-        // M2.19b (#223): amend — a git write, funnel row below.
-        ("/api/amend-commit", "amend_commit"),
-        // M10.09 (#596): cherry-pick — a git write, funnel row below. The
-        // operation and its executor predate this route by a whole milestone
-        // (#576); what #596 added is the only way for a client to ask for it.
-        ("/api/cherry-pick", "cherry_pick"),
-        ("/api/stage", "stage_all"),
-        // Staging selections (M2.17b, #213): apply is a git write and MUST
-        // reach the planner (funnel row below). Preview is deliberately not
-        // one — it builds the same bytes but mutates nothing and never mints
-        // a plan; its refusals (400/409) happen before any operation exists.
-        ("/api/staging/preview", "staging_preview"),
-        ("/api/staging/apply", "staging_apply"),
-        // M2.16 (#69): the four explicit DiffSpec diff modes. A POST, and
-        // emphatically **not** a git write — it spawns a read-only `git diff`
-        // through `git_stdout_capped`, constructs no plan, and leaves the
-        // repository byte-for-byte unchanged. It has no funnel row below for
-        // the same reason `/api/staging/preview` does not.
-        //
-        // It is a POST only because `DiffSpec` is an internally-tagged enum
-        // whose variants carry different fields; a query string could carry it
-        // only by flattening it into loose optional parameters, which is the
-        // un-explicit shape the type exists to remove. `/api/plan` sits in this
-        // table for the same reason — a read wearing a write's verb because the
-        // CSRF gate keys on the method.
-        ("/api/diff/spec", "spec_diff"),
-        ("/api/unstage", "unstage_all"),
-        ("/api/undo", "activity::undo"),
-        ("/api/merge", "merge_branch"),
-        ("/api/push", "push_branch"),
-        // M2.20c (#229): fetch — a git write, funnel row below.
-        ("/api/fetch", "fetch_remote"),
-        // M2.20d (#230): pull — a git write, funnel row below.
-        ("/api/pull", "pull_branch"),
-        ("/api/delete-branch", "delete_branch"),
-        // The stash drawer (M3.24, #77). All three are git writes and all
-        // three go through the planner — push moves worktree state into
-        // refs/stash, apply moves it back, and drop destroys an entry. Listed
-        // here so the census sees three considered rows rather than three
-        // routes nothing checked.
-        ("/api/stash/push", "handlers::stash::push_stash"),
-        ("/api/stash/apply", "handlers::stash::apply_stash"),
-        ("/api/stash/drop", "handlers::stash::drop_stash"),
-        ("/api/stash/branch", "handlers::stash::branch_from_stash"),
-        // M2.21d (#238): the two local tag writes — git writes, funnel rows
-        // below. M2.21f (#240) added the two remote ones right after. The
-        // tag *listing* is a GET and so never reaches this table.
-        ("/api/tag", "handlers::tags::create_tag"),
-        ("/api/delete-tag", "handlers::tags::delete_tag"),
-        ("/api/push-tag", "handlers::tags::push_tag"),
-        (
-            "/api/delete-remote-tag",
-            "handlers::tags::delete_remote_tag",
-        ),
-        ("/api/checkout", "checkout_branch"),
-        // M11.04 (#549): a git write — it reaches the planner and runs
-        // `git worktree add` — so it is a funnel row below like every other
-        // mutation, not a catalog write.
-        ("/api/add-worktree", "handlers::branch::add_worktree"),
-        ("/api/force-delete-branch", "force_delete_branch"),
-        ("/api/rebase", "rebase"),
-        ("/api/reset-test-repo", "reset_test_repo"),
-        // #219 (M2.18a): discard/delete of working-tree paths.
-        ("/api/discard-tracked-paths", "discard_tracked_paths"),
-        ("/api/delete-untracked-paths", "delete_untracked_paths"),
-        // M4.31b (#429): resolving one conflicted path by taking a whole
-        // side, or removing the file. A git write — it runs `checkout --ours`
-        // / `--theirs` / `rm -f` — so it goes through the planner like every
-        // other mutation, and appears in the funnel below.
-        ("/api/resolve-conflict", "resolve_conflict"),
-        ("/api/resolve-conflict-content", "resolve_conflict_content"),
-        // M2.20c (#229): cancelling a running operation. A POST, and a write
-        // in the "changes what the server is doing" sense — it kills a child
-        // process — but **not** a git write: it constructs no argv and mints
-        // no plan, so it has no funnel row below. It is classified here, on
-        // purpose, rather than being allowed to slip past the tally.
-        (
-            "/api/operations/{id}/cancel",
-            "handlers::operations::cancel_operation",
-        ),
-        // M2.23d (#248, ADR 0046): build a reviewable Plan and hand it back.
-        // Deliberately NOT a funnel row below — it must never reach
-        // `plan_and_execute`. The `build_only` block after the funnel loop
-        // states the inverse requirement and checks it.
-        ("/api/plan", "plan_operation"),
-        // M2.23e (#249, ADR 0046 continued): submit a plan for execution. Not
-        // a funnel row either — it reaches the planner through
-        // `submit_plan_tracked`, the submit path's own tracked entry, never
-        // `plan_and_execute` (which would rebuild the operation instead of
-        // executing the plan that was actually approved). The
-        // `submit_execute` block right after the `build_only` one below
-        // checks this route's own chain.
-        ("/api/execute-plan", "execute_plan"),
-        // M10.08 (#576, ADR 0099): the graph a Plan would produce. A POST, and
-        // deliberately NOT a git write: it mints no plan, builds no mutating
-        // argv, and must never reach any execution entry point. Its git work
-        // is `merge-tree`/`commit-tree` run against a throwaway object store
-        // whose only writable target is itself, so the repository it names is
-        // byte-for-byte unchanged (asserted by `preview::suite`'s A2). No
-        // funnel row below, for the same reason `/api/plan` has none — and,
-        // like `/api/plan`, the inverse requirement is stated and checked, in
-        // the `preview_is_read_only` block after the `build_only` one.
-        ("/api/preview", "preview_plan"),
-        // M3.25 (#78): executing one past operation's recovery. A git write —
-        // it reaches the planner — but not a funnel row below, because it
-        // enters through `plan_and_execute_recovery` rather than
-        // `plan_and_execute` (it carries the `recovers` link the plain entry
-        // point has no parameter for). The `recovery_chain` block after the
-        // funnel loop checks its own chain, the same way `/api/execute-plan`
-        // gets `submit_execute`.
-        (
-            "/api/operations/{id}/recover",
-            "recovery_center::recover_operation",
-        ),
-    ];
+    let expected = KNOWN_POST_ROUTES;
     assert_eq!(
         posts.len(),
         expected.len(),
@@ -3205,6 +3221,74 @@ fn every_git_write_route_reaches_the_planner() {
          submit path must share the composed path's admit/spawn/terminalise layer \
          (ADR 0016), not duplicate it"
     );
+}
+
+/// #690: the meta-census. `route_authz::ROUTE_AUTHZ` (crates/git-vista-server/
+/// src/route_authz.rs) classifies every route's authorization;
+/// [`KNOWN_POST_ROUTES`] above classifies every POST route's relationship to
+/// the planner. Both are independently hand-maintained against the same
+/// `main.rs` router, and until this test nothing linked them: a route added
+/// to one table and not the other passed every test that existed — the
+/// missing entry only ever surfaced as a *different* test failing in a
+/// *different* file. That is exactly what happened building #584/PR#688:
+/// `route_authz.rs`'s own census (enforced locally by a PostToolUse hook the
+/// moment `main.rs` changes) passed, and `KNOWN_POST_ROUTES`'s table only
+/// failed in CI's `M1.06 write contract +` job, because the local check that
+/// ran alongside the edit was `cargo test -p git-vista-server --bins`, which
+/// never compiles `#[cfg(test)] mod contract_suite` at all.
+///
+/// This test reads both tables directly — not by re-scanning `main.rs` a
+/// third way, which would just be a third hand-maintained thing to keep in
+/// sync — and asserts their POST route sets are identical, naming exactly
+/// which route and which table is missing it. A route present in one but not
+/// the other now fails here, loudly, by name, in the same test binary as
+/// both tables — not silently, and not only in whichever CI job happens to
+/// exercise the table nobody thought to check.
+#[test]
+fn route_authz_and_write_contract_agree_on_every_post_route() {
+    use std::collections::BTreeSet;
+
+    let authz_posts: BTreeSet<&str> = crate::route_authz::ROUTE_AUTHZ
+        .iter()
+        .filter(|(_, method, _)| *method == axum::http::Method::POST)
+        .map(|(path, _, _)| *path)
+        .collect();
+
+    // `create_session` is `KNOWN_POST_ROUTES`'s one exception: it names a
+    // handler, not a path (see its own doc comment above), because it is
+    // routed with a bare `.post(…)`. Its real route is `POST /api/session`,
+    // which is exactly how `route_authz.rs` names it — map across so both
+    // sets are keyed the same way.
+    let contract_posts: BTreeSet<&str> = KNOWN_POST_ROUTES
+        .iter()
+        .map(|(route, _)| {
+            if *route == "create_session" {
+                "/api/session"
+            } else {
+                route
+            }
+        })
+        .collect();
+
+    for route in authz_posts.difference(&contract_posts) {
+        panic!(
+            "ROUTE CENSUS MISMATCH: POST {route} is classified in ROUTE_AUTHZ \
+             (crates/git-vista-server/src/route_authz.rs) but has no entry in \
+             this file's KNOWN_POST_ROUTES table (used by \
+             every_git_write_route_reaches_the_planner). Classify it there too: \
+             a git write needs a funnel row below; a non-git write (a catalog \
+             write, a credential write, a cancel, ...) needs a row here saying \
+             so, the same as /api/select-worktree or /api/settings/token."
+        );
+    }
+    for route in contract_posts.difference(&authz_posts) {
+        panic!(
+            "ROUTE CENSUS MISMATCH: POST {route} is classified in this file's \
+             KNOWN_POST_ROUTES table but has no entry in ROUTE_AUTHZ \
+             (crates/git-vista-server/src/route_authz.rs). Classify its \
+             authorization there."
+        );
+    }
 }
 
 /// The production composition itself: [`plan_and_execute`]'s body must call
