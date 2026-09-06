@@ -734,13 +734,6 @@ const EXEMPT: &[(&str, &str)] = &[
         "git-vista/src/features/shell/signals.rs",
         "commit_dialog_untracked",
     ),
-    // menu/remote_items.rs's `remote_op_running` reimplements the same
-    // underlying .in_flight() iteration directly rather than calling this
-    // accessor (moved from menu.rs by the menu.rs split, refactor/split-menu-rs).
-    (
-        "git-vista/src/features/operations/signals.rs",
-        "in_flight_count",
-    ),
     // status/core.rs:186's own doc: StatusSections::headline() "matches
     // RepoStatus::change_count()'s identical semantics, which this
     // replaces" — self-documented as deliberately superseded.
