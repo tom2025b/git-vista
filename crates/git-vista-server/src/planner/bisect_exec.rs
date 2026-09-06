@@ -37,6 +37,16 @@ use super::{
     RunFailure,
 };
 
+/// The reviewed-adapter set for automated bisect test execution (ADR 0130
+/// §7) — a closed, compiled-in enum, not a runtime config file. Zero
+/// variants at ship time: #87 ships no adapter, and an empty enum is what
+/// makes "no adapter can be requested" a compile-time fact rather than a
+/// runtime empty list that a later bug could quietly stop enforcing. A
+/// later milestone adds a variant here, reviewed in that PR, when a real
+/// served repository needs one — no HTTP surface reads this type yet.
+#[allow(dead_code)]
+pub(crate) enum BisectAdapterId {}
+
 // ---------------------------------------------------------------------------
 // Discovery — read git's own state, never mirror it
 // ---------------------------------------------------------------------------
