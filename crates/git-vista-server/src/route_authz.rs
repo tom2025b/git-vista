@@ -372,7 +372,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// this constant and its test are for. Derived by running
 /// `every_registered_route_is_classified`, never copied from either side of a
 /// merge.
-const EXPECTED_ROUTE_COUNT: usize = 78;
+const EXPECTED_ROUTE_COUNT: usize = 79;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in
