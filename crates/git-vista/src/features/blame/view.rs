@@ -18,7 +18,7 @@ use git_vista_protocol::CommitOid;
 
 use crate::features::a11y::focus::GraphFocus;
 use crate::features::blame::core::{path_state_message, rename_limit_banner, BlameSelection};
-use crate::features::graph::core::{offer_for, roving_row_key, CompareOffer, RowKey};
+use crate::features::graph::core::{offer_for, roving_row_key, CompareOffer, KeyMods, RowKey};
 use crate::features::shell::signals::Shell;
 use crate::state::ViewerDoc;
 
@@ -359,10 +359,20 @@ fn blame_row(
     };
     let on_focus = move |_| focus.update(|f| f.focus_landed(idx));
     let on_keydown = move |ev: web_sys::KeyboardEvent| {
-        if ev.alt_key() || ev.ctrl_key() || ev.meta_key() {
-            return;
-        }
-        let Some(intent) = roving_row_key(&ev.key()) else {
+        // Modifier policy is `roving_row_key`'s alone to decide (#653, #660)
+        // — this site's own Ctrl/Cmd/Alt-only guard was, before #660, a
+        // *third* undocumented copy of the policy the issue never named.
+        // Shift is deliberately still read below: it is this surface's own
+        // selector (extend the blame range) rather than the roving-row map's
+        // concern, the same "Shift means something here, so it must reach
+        // this handler" shape as Shift-Space on the canvas.
+        let mods = KeyMods {
+            shift: ev.shift_key(),
+            ctrl: ev.ctrl_key(),
+            meta: ev.meta_key(),
+            alt: ev.alt_key(),
+        };
+        let Some(intent) = roving_row_key(&ev.key(), mods) else {
             return;
         };
         ev.prevent_default();

@@ -214,23 +214,22 @@ fn home_and_zero_reset_the_same_view_but_only_home_stops_the_browser() {
 
 // ---- the roving-row map ----------------------------------------------------
 
+/// `roving_row_key` with no modifier held — the ordinary press.
+fn plain_row(key: &str) -> Option<RowKey> {
+    roving_row_key(key, PLAIN)
+}
+
 #[test]
 fn the_roving_row_keys_map_to_the_focus_moves_they_are_named_for() {
-    assert_eq!(
-        roving_row_key("ArrowDown"),
-        Some(RowKey::Move(FocusMove::Next))
-    );
-    assert_eq!(
-        roving_row_key("ArrowUp"),
-        Some(RowKey::Move(FocusMove::Prev))
-    );
-    assert_eq!(roving_row_key("Home"), Some(RowKey::Move(FocusMove::First)));
-    assert_eq!(roving_row_key("End"), Some(RowKey::Move(FocusMove::Last)));
-    assert_eq!(roving_row_key("Enter"), Some(RowKey::Activate));
-    assert_eq!(roving_row_key(" "), Some(RowKey::Activate));
-    assert_eq!(roving_row_key("Escape"), Some(RowKey::Dismiss));
-    assert_eq!(roving_row_key("PageDown"), None);
-    assert_eq!(roving_row_key("r"), None);
+    assert_eq!(plain_row("ArrowDown"), Some(RowKey::Move(FocusMove::Next)));
+    assert_eq!(plain_row("ArrowUp"), Some(RowKey::Move(FocusMove::Prev)));
+    assert_eq!(plain_row("Home"), Some(RowKey::Move(FocusMove::First)));
+    assert_eq!(plain_row("End"), Some(RowKey::Move(FocusMove::Last)));
+    assert_eq!(plain_row("Enter"), Some(RowKey::Activate));
+    assert_eq!(plain_row(" "), Some(RowKey::Activate));
+    assert_eq!(plain_row("Escape"), Some(RowKey::Dismiss));
+    assert_eq!(plain_row("PageDown"), None);
+    assert_eq!(plain_row("r"), None);
 }
 
 #[test]
@@ -238,14 +237,14 @@ fn space_and_enter_are_equivalent_on_a_roving_row() {
     // Keyboard/VoiceOver equivalence (#215 Task 1, #65): whatever a tap does,
     // Space or Enter on the focused row does too. Binding only one of them
     // leaves VoiceOver users without the other.
-    assert_eq!(roving_row_key(" "), roving_row_key("Enter"));
+    assert_eq!(plain_row(" "), plain_row("Enter"));
 }
 
 #[test]
 fn every_arrow_direction_has_a_distinct_move() {
     let moves: Vec<RowKey> = ["ArrowDown", "ArrowUp", "Home", "End"]
         .iter()
-        .map(|k| roving_row_key(k).expect("bound"))
+        .map(|k| plain_row(k).expect("bound"))
         .collect();
     let mut seen = moves.clone();
     seen.dedup();
@@ -255,6 +254,49 @@ fn every_arrow_direction_has_a_distinct_move() {
         "two navigation keys resolved to the same move: {moves:?} — the \
          omission shape that leaves Home and ArrowUp both meaning Prev"
     );
+}
+
+// ---- #660: one modifier policy, pinned at the map itself -------------------
+
+#[test]
+fn ctrl_cmd_and_alt_bail_a_roving_row_press_out_too() {
+    // Same rule as the canvas map's `ctrl_cmd_and_alt_leave_the_key_to_the_
+    // browser` above, reused rather than reinvented: Ctrl/Cmd/Alt-Arrow is
+    // the browser's or the OS's to have (tab switching, history navigation),
+    // not this row's.
+    for mods in [
+        KeyMods {
+            ctrl: true,
+            ..PLAIN
+        },
+        KeyMods {
+            meta: true,
+            ..PLAIN
+        },
+        KeyMods { alt: true, ..PLAIN },
+    ] {
+        assert_eq!(
+            roving_row_key("ArrowDown", mods),
+            None,
+            "a modified arrow press must be left to the browser: {mods:?}"
+        );
+    }
+}
+
+#[test]
+fn shift_does_not_bail_a_roving_row_press_out() {
+    // #660: before this, the staging view bailed on Shift too (so
+    // Shift+Arrow moved canvas focus but did nothing on a hunk header) while
+    // the canvas node handler checked no modifiers at all. Folding the
+    // policy into this one function means both surfaces now agree: Shift is
+    // not part of the bail-out, matching `canvas_key_action`'s existing rule
+    // 3 for Shift-Space.
+    assert_eq!(
+        roving_row_key("ArrowDown", SHIFT),
+        Some(RowKey::Move(FocusMove::Next)),
+        "Shift-Arrow must still move the roving focus, on both surfaces"
+    );
+    assert_eq!(roving_row_key("Enter", SHIFT), Some(RowKey::Activate));
 }
 
 // ---- the seam --------------------------------------------------------------
@@ -317,12 +359,34 @@ fn the_node_keydown_handler_asks_core_what_a_row_key_means() {
 }
 
 #[test]
+fn the_node_keydown_handler_passes_its_own_modifiers_to_the_row_map() {
+    // #660: the bail-out policy moved into `roving_row_key` itself, so
+    // `on_node_keydown` must feed it real `KeyMods` rather than calling
+    // `roving_row_key(&ev.key())` unmodified — that older shape is exactly
+    // "checks no modifiers at all," the half of the #660 asymmetry that
+    // lived on this surface.
+    assert!(
+        GESTURES.contains("roving_row_key(&ev.key(), mods)"),
+        "gestures.rs's per-row keydown handler no longer passes `KeyMods` to \
+         `roving_row_key` — Ctrl/Cmd/Alt-Arrow would once again move the \
+         roving focus instead of being left to the browser"
+    );
+}
+
+#[test]
 fn the_staging_view_asks_core_what_a_row_key_means() {
     assert!(
         STAGING_VIEW.contains("roving_row_key("),
         "features/diff/staging_view.rs no longer calls `roving_row_key`. It \
          is wasm-only too, so its copy of the map was the second unwatched \
          one — that duplication is the whole reason the map moved to core"
+    );
+    assert!(
+        !STAGING_VIEW.contains("ev.shift_key() {") && !STAGING_VIEW.contains("|| ev.shift_key()"),
+        "features/diff/staging_view.rs branches on Shift in its own guard \
+         again (#660) — the modifier policy, Shift included, is \
+         `roving_row_key`'s alone to decide, or the two surfaces can drift \
+         back apart the way they did before this issue"
     );
     assert!(
         !STAGING_VIEW.contains("FocusMove::Prev"),

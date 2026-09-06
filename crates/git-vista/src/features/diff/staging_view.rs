@@ -37,7 +37,7 @@ use crate::features::diff::core::{
     preview_state, selectable_hunks, stage_direction_copy, staging_actions, PreviewState,
 };
 use crate::features::diff::selection::{drag_range, DiffSelection};
-use crate::features::graph::core::{roving_row_key, RenderCtx, RowKey};
+use crate::features::graph::core::{roving_row_key, KeyMods, RenderCtx, RowKey};
 use crate::features::shell::signals::Shell;
 use crate::features::status::signals::StatusResource;
 
@@ -109,20 +109,20 @@ fn hunk_row(
     let on_keydown = {
         let file = file.clone();
         move |ev: web_sys::KeyboardEvent| {
-            // This surface ignores a press with ANY modifier held, Shift
-            // included — unlike `gestures::on_node_keydown`, which checks
-            // none. The asymmetry is real and predates #653; it is recorded
-            // in `roving_row_key`'s doc rather than resolved here, because
-            // resolving it changes behaviour on one of the two surfaces.
-            if ev.alt_key() || ev.ctrl_key() || ev.meta_key() || ev.shift_key() {
-                return;
-            }
-            // Which key means what is `features::graph::core::roving_row_key`'s
-            // to say (#653): the canvas's own row handler drives the same
-            // focus model with the same keys, and both files are wasm-only, so
-            // each held a copy no host test could reach. What each intent
-            // *does* here — toggling a hunk rather than opening a menu — stays.
-            let Some(intent) = roving_row_key(&ev.key()) else {
+            // Which key means what, and the modifier policy that bails a
+            // press out entirely, is `features::graph::core::roving_row_key`'s
+            // to say (#653, #660): the canvas's own row handler drives the
+            // same focus model with the same keys and the same policy, and
+            // both files are wasm-only, so each held a copy no host test
+            // could reach. What each intent *does* here — toggling a hunk
+            // rather than opening a menu — stays.
+            let mods = KeyMods {
+                shift: ev.shift_key(),
+                ctrl: ev.ctrl_key(),
+                meta: ev.meta_key(),
+                alt: ev.alt_key(),
+            };
+            let Some(intent) = roving_row_key(&ev.key(), mods) else {
                 return;
             };
             ev.prevent_default();
