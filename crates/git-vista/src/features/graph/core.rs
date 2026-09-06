@@ -1327,15 +1327,19 @@ pub fn canvas_key_action(
 }
 
 /// What a key press means to one roving-tabindex row — a commit row's hit
-/// circle in the canvas (`gestures::on_node_keydown`), or a hunk header in
-/// the staging view (`features::diff::staging_view`).
+/// circle in the canvas (`gestures::on_node_keydown`), a hunk header in the
+/// staging view (`features::diff::staging_view`), or a blame row
+/// (`features::blame::view`).
 ///
-/// Both surfaces drive the same [`GraphFocus`](crate::features::a11y::focus::GraphFocus)
+/// All three surfaces drive the same [`GraphFocus`](crate::features::a11y::focus::GraphFocus)
 /// state machine with the same keys, and each held its own copy of this
 /// `match` inside a wasm-only file. What they do with the answer still
-/// differs — [`Self::Activate`] opens a commit's context menu on one surface
-/// and toggles a hunk's selection checkbox on the other — and that is why
-/// this returns an intent rather than performing anything.
+/// differs — [`Self::Activate`] opens a commit's context menu on the canvas,
+/// toggles a hunk's selection checkbox on the staging view, and opens a
+/// commit detail panel on a blame row; the blame row additionally reads
+/// Shift on its own, outside this map, to extend a range selection on
+/// [`Self::Move`] — and that is why this returns an intent rather than
+/// performing anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowKey {
     /// Move the roving focus.
@@ -1348,14 +1352,35 @@ pub enum RowKey {
     Dismiss,
 }
 
-/// The roving-row key map. Pure key → intent: neither caller's modifier guard
-/// lives here, because the two guards genuinely differ and folding them in
-/// would change behaviour rather than describe it. The staging view ignores a
-/// press with **any** modifier held including Shift; the canvas node handler
-/// checks none at all. That asymmetry is recorded, not resolved, by #653 —
-/// resolving it is a behaviour change and wants its own issue.
-pub fn roving_row_key(key: &str) -> Option<RowKey> {
+/// The roving-row key map, and its modifier policy (#653, #660).
+///
+/// **The policy, stated once:** a roving-row press bails out under the same
+/// rule as [`KeyMods::bails_out`] — Ctrl, Cmd, or Alt held means the press
+/// belongs to the browser or the OS, not to this row, so it is left alone.
+/// Shift is *not* part of that bail-out: nothing here gives Shift a distinct
+/// meaning of its own (there is no shift-select intent among the `RowKey`
+/// variants), but there is also no reason to swallow it — a plain arrow and a
+/// Shift-arrow both mean "move," exactly as an unmodified press does. This is
+/// the same shape [`canvas_key_action`]'s rule 3 already uses for Shift-Space,
+/// applied here for consistency rather than reinvented.
+///
+/// Before #660 the three call sites disagreed, in three different ways: the
+/// staging view bailed on *any* modifier, Shift included, so Shift+Arrow
+/// moved canvas focus but did nothing on a hunk header; the canvas node
+/// handler checked no modifiers at all, so Ctrl/Cmd/Alt-Arrow moved focus
+/// there instead of being left to the browser; and the blame row — named
+/// nowhere in the issue that opened this, because nobody had gone looking for
+/// a *third* copy — already matched the policy landed here (bail on
+/// Ctrl/Cmd/Alt, read Shift itself for range-select), independently. That
+/// third site is the closest thing to evidence this is the right answer
+/// rather than an arbitrary pick. All three call sites now build a
+/// [`KeyMods`] from the event and pass it here — this function is the only
+/// place the bail-out is decided, so they cannot drift apart again.
+pub fn roving_row_key(key: &str, mods: KeyMods) -> Option<RowKey> {
     use crate::features::a11y::focus::FocusMove;
+    if mods.bails_out() {
+        return None;
+    }
     match key {
         "ArrowDown" => Some(RowKey::Move(FocusMove::Next)),
         "ArrowUp" => Some(RowKey::Move(FocusMove::Prev)),
