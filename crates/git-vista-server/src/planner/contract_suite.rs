@@ -3024,6 +3024,12 @@ fn every_git_write_route_reaches_the_planner() {
         // build the operation, call the planner directly.
         ("src/handlers/tags.rs", "push_tag", None),
         ("src/handlers/tags.rs", "delete_remote_tag", None),
+        // M5.34 (#87, ADR 0130): the three bisect writes. All three build
+        // their operation and call the planner directly — no `git bisect`
+        // argv exists in this file.
+        ("src/handlers/bisect.rs", "bisect_start", None),
+        ("src/handlers/bisect.rs", "bisect_mark", None),
+        ("src/handlers/bisect.rs", "bisect_reset", None),
     ];
     for (file, handler, helper) in funnel {
         let src = source(file);

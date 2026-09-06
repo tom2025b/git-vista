@@ -19,6 +19,22 @@ import { expect, test } from '@playwright/test'
 
 import { openMergePreviewRepo, runtime } from './helpers.mjs'
 
+// This fixture is shared with other specs (preview-panel, plan-freshness).
+// A failure mid-test — say, at the "git bisect good" poll — would otherwise
+// leave BISECT_START and a detached HEAD behind for whichever spec runs
+// next against the same checkout. Reset unconditionally; "we are not
+// bisecting" is the expected, harmless case on a clean pass.
+test.afterEach(() => {
+  const { mergePreviewFixture } = runtime()
+  try {
+    execFileSync('git', ['-C', mergePreviewFixture.root, 'bisect', 'reset'], {
+      encoding: 'utf8',
+    })
+  } catch {
+    // Not bisecting — nothing to clean up.
+  }
+})
+
 /** Run git in the merge-preview fixture — shared with several other specs,
  *  so every change here is undone before the test ends. */
 function git(args) {
