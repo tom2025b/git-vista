@@ -52,6 +52,9 @@ pub enum Dialog {
     /// `Shell::confirm_op`, the signal every other `Dialog::Confirm` opener
     /// writes to. It still shares this guard, same as every other modal.
     PullStrategy,
+    /// The settings surface (M13.03, #584) — one field to save the GitHub
+    /// token the credential helper offers for private-repository operations.
+    Settings,
 }
 
 /// How long (ms) after a modal opens to ignore a backdrop dismiss.

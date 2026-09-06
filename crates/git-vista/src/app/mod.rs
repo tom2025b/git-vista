@@ -682,6 +682,10 @@ pub fn App() -> impl IntoView {
     // because its button sits in the topbar, not the graph canvas.
     let reset_open = create_rw_signal(false);
 
+    // The settings surface (M13.03, #584): the button sits in the topbar,
+    // like the two above, for the same reason — outside the graph canvas.
+    let settings_open = create_rw_signal(false);
+
     // ADR 0006: ask every time — the repo picker opens on load (the sign-in and
     // protocol overlays sit above it when they apply) and from the topbar
     // "Repos" button. `mode_for` holds the repo awaiting a Visualize/Active
@@ -865,6 +869,16 @@ pub fn App() -> impl IntoView {
                 </button>
                 <button
                     class="refresh"
+                    on:click=move |_| {
+                        dialogs_guard.open(Dialog::Settings);
+                        settings_open.set(true);
+                    }
+                    title="GitHub token for private repositories"
+                >
+                    "Settings"
+                </button>
+                <button
+                    class="refresh"
                     on:click=move |_| picker_open.set(true)
                     title="Open another repository — the launch repo, a repo from \
                            the configured root, or a clone"
@@ -1044,6 +1058,8 @@ pub fn App() -> impl IntoView {
             // The "Reset Test Repo" confirmation (only reachable via the gated
             // topbar button above).
             {dialogs::reset_repo_view(reset_open, dialogs_guard, graph)}
+            // The settings surface (M13.03, #584), factored into `dialogs`.
+            {dialogs::settings_view(settings_open, dialogs_guard)}
             // The repo picker + mode screens (ADR 0006): blocking overlays under
             // the sign-in/protocol screens, over everything else.
             {crate::picker::picker_view(picker_open, mode_for, open_url, clone_url, dialogs_guard, graph)}
