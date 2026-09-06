@@ -45,20 +45,14 @@
 //! prompt through, so forcing it off costs nothing.
 //!
 //! That said, a credential helper is itself an arbitrary program (repo-local
-//! `credential.helper` is exactly as executable as `core.askpass`), and its
-//! stderr is forwarded by git verbatim, unfiltered — verified directly below
+//! `credential.helper` is exactly as executable as `core.askpass`), and git
+//! forwards its stderr verbatim — verified directly below
 //! (`network_exec_redacts_a_real_credential_helpers_leaked_url`): a helper
 //! that prints a secret-bearing URL to its own stderr puts that URL in git's
-//! stderr unchanged. Closing *that* execution surface is a materially bigger
-//! decision (it is the credential-helper reinjection design the M1.13
-//! design-trail's operator lens devotes its own finding to — `m1.13-findings.md`
-//! lines 89-92, "the helper is a fixed, server-authored literal" vs. "the
-//! test needs it to be injectable" — a productization question this slice
-//! does not have to answer) than this slice's scope, so it stays open here —
-//! but [`redact_output`] means
-//! whatever a helper prints is still sanitised before this harness hands it
-//! back, which is the redaction half of the deliverable regardless of what
-//! produced the leak.
+//! stderr unchanged. [`redact_output`] removes URL userinfo for ordinary
+//! Network-tier output. A [`CredentialedCommand`] additionally knows and
+//! removes the exact token it supplied, so a bare-token diagnostic cannot
+//! leave that value even though it is not URL-shaped (#680, ADR 0128).
 //!
 //! **Post-M13.01 update:** the above is still why this module never forces
 //! `credential.helper=` *off*. [`network_command_with_credential`] does the
@@ -101,6 +95,8 @@ use std::path::Path;
 use std::process::Output;
 
 use super::{spawn, Policy};
+
+const REDACTED_CREDENTIAL: &[u8] = b"[REDACTED CREDENTIAL]";
 
 /// Prepended to every Network-tier spawn's args, ahead of the subcommand —
 /// see the module doc for why this is the one flag this harness forces.
@@ -159,10 +155,8 @@ fn credential_helper_config() -> String {
     )
 }
 
-/// [`network_command`], plus Git-Vista's own credential helper when `token`
-/// is `Some` (M13.01, #582) — the mechanism the module doc's final section
-/// named as "an architectural decision that belongs in its own ADR" (ADR
-/// 0122, #587) rather than a unilateral widening of [`spawn::SandboxedCommand`].
+/// A sealed credential-bearing command whose only production completion path
+/// redacts the exact value it supplied before returning captured output (#680).
 ///
 /// # The measurement this answers
 ///
@@ -196,21 +190,75 @@ fn credential_helper_config() -> String {
 /// existing Remote-tier caller (`exec_push`, and everywhere else this
 /// crate's `git_cmd::sandboxed()` routes `NetworkNeed::Remote`) is
 /// unaffected until it deliberately opts in.
+pub(crate) struct CredentialedCommand {
+    command: spawn::SandboxedCommand,
+    token: Option<Vec<u8>>,
+}
+
+impl CredentialedCommand {
+    pub(crate) fn kill_on_drop(mut self, kill: bool) -> Self {
+        self.command = self.command.kill_on_drop(kill);
+        self
+    }
+
+    /// Run the command and return only output with both URL userinfo and the
+    /// exact credential removed. The raw bytes never leave this value, so a
+    /// caller cannot remember one redaction rule and forget the other.
+    pub(crate) async fn output(self) -> std::io::Result<Output> {
+        let output = self.command.output().await?;
+        Ok(redact_output_with_credential(output, self.token.as_deref()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pinned_env_for_test<K, V>(mut self, profile: &[(K, V)]) -> Self
+    where
+        K: AsRef<std::ffi::OsStr>,
+        V: AsRef<std::ffi::OsStr>,
+    {
+        self.command = self.command.pinned_env_for_test(profile);
+        self
+    }
+
+    #[cfg(test)]
+    fn credential_env_for_test(&self) -> Option<String> {
+        self.command.credential_env_for_test()
+    }
+}
+
+/// [`network_command`], plus Git-Vista's own credential helper when `token`
+/// is `Some` (M13.01, #582). The distinct return type is ADR 0128's output
+/// guarantee: a credential-bearing caller cannot recover raw captured bytes.
 pub(crate) fn network_command_with_credential(
     policy: &Policy,
     repo: &Path,
     args: &[&str],
     token: Option<&str>,
-) -> spawn::SandboxedCommand {
-    let Some(token) = token else {
-        return network_command(policy, repo, args);
+) -> CredentialedCommand {
+    let command = if let Some(token) = token {
+        let helper_config = format!("credential.helper={}", credential_helper_config());
+        let mut full: Vec<&str> = FORCED_NETWORK_ARGS.to_vec();
+        full.push("-c");
+        full.push(&helper_config);
+        full.extend_from_slice(args);
+        spawn::command_async(policy, repo, &full).credential_env(token)
+    } else {
+        network_command(policy, repo, args)
     };
-    let helper_config = format!("credential.helper={}", credential_helper_config());
-    let mut full: Vec<&str> = FORCED_NETWORK_ARGS.to_vec();
-    full.push("-c");
-    full.push(&helper_config);
-    full.extend_from_slice(args);
-    spawn::command_async(policy, repo, &full).credential_env(token)
+    CredentialedCommand {
+        command,
+        token: token.map(|value| value.as_bytes().to_vec()),
+    }
+}
+
+/// A Network-tier command for the phase after credential use has ended.
+/// It preserves the normal network, hook, and filter policy while removing
+/// every token-bearing environment variable known to the resolver.
+pub(crate) fn network_command_without_credential(
+    policy: &Policy,
+    repo: &Path,
+    args: &[&str],
+) -> spawn::SandboxedCommand {
+    network_command(policy, repo, args).without_credential_env()
 }
 
 /// Strip `user[:pass]@` userinfo from every `<scheme>://…` URL substring
@@ -345,6 +393,33 @@ pub(crate) fn redact_output(output: Output) -> Output {
         stdout: redact_bytes(&output.stdout),
         stderr: redact_bytes(&output.stderr),
     }
+}
+
+fn redact_output_with_credential(output: Output, token: Option<&[u8]>) -> Output {
+    let output = redact_output(output);
+    let Some(token) = token.filter(|value| !value.is_empty()) else {
+        return output;
+    };
+    Output {
+        status: output.status,
+        stdout: redact_literal(&output.stdout, token),
+        stderr: redact_literal(&output.stderr, token),
+    }
+}
+
+fn redact_literal(bytes: &[u8], secret: &[u8]) -> Vec<u8> {
+    let mut redacted = Vec::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while let Some(index) = rest
+        .windows(secret.len())
+        .position(|window| window == secret)
+    {
+        redacted.extend_from_slice(&rest[..index]);
+        redacted.extend_from_slice(REDACTED_CREDENTIAL);
+        rest = &rest[index + secret.len()..];
+    }
+    redacted.extend_from_slice(rest);
+    redacted
 }
 
 fn redact_bytes(bytes: &[u8]) -> Vec<u8> {
@@ -556,10 +631,10 @@ mod tests {
              disagrees: {kernel_cmdline}"
         );
         assert_eq!(
-            env_value, CANARY,
-            "the helper's environment does not carry the token at all — a \
-             fix that merely withholds it everywhere would pass the two \
-             assertions above without doing anything useful"
+            env_value.as_bytes(),
+            REDACTED_CREDENTIAL,
+            "a credential-bearing command must not return the environment \
+             value its child printed"
         );
         assert!(
             composed_argv.contains(spawn::CREDENTIAL_TOKEN_VAR),
@@ -632,30 +707,22 @@ mod tests {
         let repo = fixture().await;
         let policy = production_policy(repo.path());
         let dumper = which_dumper(repo.path());
-        let hermetic = |c: spawn::SandboxedCommand| {
-            c.pinned_env_for_test(&[
-                ("PATH", dumper.clone()),
-                ("HOME", std::env::var("HOME").unwrap()),
-            ])
-        };
+        let profile = [
+            ("PATH", dumper.clone()),
+            ("HOME", std::env::var("HOME").unwrap()),
+        ];
 
-        let with_none = hermetic(network_command_with_credential(
-            &policy,
-            repo.path(),
-            &["ls-remote", "origin"],
-            None,
-        ))
-        .output()
-        .await
-        .expect("fake git runs (None leg)");
-        let plain = hermetic(network_command(
-            &policy,
-            repo.path(),
-            &["ls-remote", "origin"],
-        ))
-        .output()
-        .await
-        .expect("fake git runs (plain leg)");
+        let with_none =
+            network_command_with_credential(&policy, repo.path(), &["ls-remote", "origin"], None)
+                .pinned_env_for_test(&profile)
+                .output()
+                .await
+                .expect("fake git runs (None leg)");
+        let plain = network_command(&policy, repo.path(), &["ls-remote", "origin"])
+            .pinned_env_for_test(&profile)
+            .output()
+            .await
+            .expect("fake git runs (plain leg)");
 
         assert_eq!(
             with_none.stdout, plain.stdout,
@@ -864,6 +931,26 @@ mod tests {
         let redacted = redact_output(raw);
         assert_eq!(redacted.stdout, b"cloning https://host/a.git");
         assert_eq!(redacted.stderr, b"fatal: https://host/a.git unreachable");
+    }
+
+    #[test]
+    fn credential_redaction_removes_a_bare_token_from_both_output_streams() {
+        let token = b"clone-hook-canary";
+        let raw = Output {
+            status: std::process::ExitStatus::default(),
+            stdout: b"progress clone-hook-canary\xff".to_vec(),
+            stderr: b"fatal: clone-hook-canary".to_vec(),
+        };
+
+        let redacted = redact_output_with_credential(raw, Some(token));
+
+        assert!(!redacted.stdout.windows(token.len()).any(|w| w == token));
+        assert!(!redacted.stderr.windows(token.len()).any(|w| w == token));
+        assert!(redacted.stdout.contains(&0xff));
+        assert!(redacted
+            .stderr
+            .windows(REDACTED_CREDENTIAL.len())
+            .any(|w| w == REDACTED_CREDENTIAL));
     }
 }
 

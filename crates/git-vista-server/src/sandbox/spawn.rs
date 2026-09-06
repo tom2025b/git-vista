@@ -191,10 +191,13 @@ pub(crate) struct SandboxedCommand(tokio::process::Command);
 /// environment. Append is what the code does; isolation is the claim that
 /// loses.
 ///
-/// Why this is nonetheless acceptable **today**: the only production caller
-/// is `POST /api/clone` (`handlers/clone.rs`), which has no repository at
-/// spawn time, so no repo-local config exists to declare a hostile helper.
-/// Helpers that do inherit it there are the operator's own global config.
+/// #680 showed why “no repo-local config exists yet” was not enough: global
+/// `core.hooksPath` or filter configuration can let fetched content select a
+/// descendant during clone's implicit checkout. Clone now uses this method
+/// only for a `--no-checkout` transfer and lets that process exit before a
+/// separately spawned, credentialless checkout runs hooks and filters (ADR
+/// 0128). This method also removes the two ambient token-source variables so
+/// an env-backed credential has only this internal name in the child.
 ///
 /// **Read this before reusing `network_command_with_credential` on
 /// fetch/push/pull.** Those run against an *existing* repository whose
@@ -212,7 +215,21 @@ impl SandboxedCommand {
     /// Never call this with a value that did not come from Git-Vista's own
     /// token source; it is not a general secret-passing mechanism.
     pub(crate) fn credential_env(mut self, token: &str) -> Self {
+        for var in crate::token_store::TOKEN_SOURCE_ENV_VARS {
+            self.0.env_remove(var);
+        }
         self.0.env(CREDENTIAL_TOKEN_VAR, token);
+        self
+    }
+
+    /// Remove every credential value Git-Vista knows how to place in its own
+    /// environment. Used by the checkout half of clone: hooks and filters run
+    /// there deliberately, but the credentialed transfer has already exited.
+    pub(crate) fn without_credential_env(mut self) -> Self {
+        for var in crate::token_store::TOKEN_SOURCE_ENV_VARS {
+            self.0.env_remove(var);
+        }
+        self.0.env_remove(CREDENTIAL_TOKEN_VAR);
         self
     }
 
@@ -333,6 +350,30 @@ pub(crate) fn command_async(policy: &Policy, repo: &Path, args: &[&str]) -> Sand
 mod tests {
     use super::super::shim_cli::{fixture, production_policy};
     use super::*;
+
+    #[test]
+    fn credentialless_command_records_removal_of_every_token_environment_variable() {
+        let repo = std::path::PathBuf::from("/srv/repo");
+        let policy = production_policy(&repo);
+        let command = command_async(&policy, &repo, &["checkout", "-f"]).without_credential_env();
+
+        for name in crate::token_store::TOKEN_SOURCE_ENV_VARS
+            .iter()
+            .copied()
+            .chain(std::iter::once(CREDENTIAL_TOKEN_VAR))
+        {
+            let override_value = command
+                .0
+                .as_std()
+                .get_envs()
+                .find_map(|(key, value)| (key == std::ffi::OsStr::new(name)).then_some(value));
+            assert_eq!(
+                override_value,
+                Some(None),
+                "{name} must be explicitly removed rather than inherited"
+            );
+        }
+    }
 
     /// The wrapper's argv is exactly the sandbox argv with `-C <repo> <args>`
     /// appended — no more, no less. If this drifts, a spawn site is no longer
