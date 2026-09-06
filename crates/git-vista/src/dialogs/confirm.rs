@@ -478,7 +478,9 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                     // Not previewable. The only plan-backed arm here is the
                     // force-with-lease push, whose plan came from the menu's
                     // own two-step lease fetch rather than from `Preview`.
-                    PreviewAction::Clear => rebuild_lease(&rebuild_op, preview, shell, graph),
+                    PreviewAction::Clear => {
+                        rebuild_lease(&rebuild_op, preview, shell, graph)
+                    }
                 }
             };
             let blocked_reason = blocked_by_staleness(&plan_freshness).or(blocked_reason);

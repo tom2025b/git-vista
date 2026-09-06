@@ -692,11 +692,33 @@ fn the_dialog_offers_the_rebuild_it_talks_about_and_asks_core_which_plan() {
     // unnecessary: ONE commit point, reached with no `.await` after it, so
     // "check then act" cannot interleave on wasm's single-threaded executor.
     assert!(
-        lease.contains("let token = preview.note_rebuild_started(epoch)"),
+        lease.contains("let token = preview.note_rebuild_started(graph.get_untracked().epoch())"),
         "the lease rebuild must enter the rebuilding state before it awaits, \
          and must capture a token carrying BOTH axes — its own generation and \
          the graph epoch that repository selection moves (#664 review rounds \
          3 and 5)"
+    );
+    // Re-pinned in #664/#673 review round 6: a bare `epoch: u64` parameter,
+    // read once and threaded through to the commit point unchanged, compares
+    // a captured value against itself — always true, fencing nothing. The
+    // fix is not the comparison (already host-tested in
+    // `rebuild_key_tests`) but WHEN the second read happens: live, after
+    // both awaits, not at mint time. See
+    // `features::preview::core::rebuild_lease_epoch_census` for the fuller
+    // three-assertion pin on this same shape.
+    assert!(
+        lease.matches("graph.get_untracked().epoch()").count() == 2,
+        "the graph epoch must be read twice — once to mint the token, once \
+         more, live, at the commit point — not captured once and reused. A \
+         single shared read is the tautology round 6 found: `token.epoch == \
+         live_epoch` by construction, regardless of whether the repository \
+         actually moved during the two awaits"
+    );
+    assert!(
+        lease.rfind("graph.get_untracked().epoch()") > lease.find(".await"),
+        "the second epoch read must come after the awaits, not before — two \
+         reads that both happen at mint time are still comparing the \
+         click-time value against itself"
     );
     assert_eq!(
         lease.matches("rebuild_commit(").count(),
