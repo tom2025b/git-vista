@@ -158,7 +158,16 @@ fn heading_numbers_by_file_number() -> BTreeMap<String, (String, Option<String>)
         let text = std::fs::read_to_string(dir.join(&name))
             .unwrap_or_else(|e| panic!("{name} must be readable: {e}"));
         let first_line = text.lines().next().unwrap_or("");
-        out.insert(number, (name, heading_number(first_line)));
+        if let Some((previous, _)) =
+            out.insert(number.clone(), (name.clone(), heading_number(first_line)))
+        {
+            panic!(
+                "two ADR files claim number {number}: {previous} and {name}. \
+                 (files_by_number() above would also panic on this; this function keeps its \
+                 own check so `cargo test -- --exact every_adr_heading_names_its_own_filename_number` \
+                 cannot silently drop one of the two and report a false pass.)"
+            );
+        }
     }
     out
 }

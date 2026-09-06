@@ -87,6 +87,16 @@ to the new number. It refuses to run against a dirty working tree (a
 failed run is then a plain `git checkout .`) and refuses a `NEW` that is
 already taken.
 
+`OLD` names which file moves, and — this is the part that matters for the
+0121/0125/0127/0128 shape specifically — it is not always a bare number.
+When two files claim the same `OLD`, a bare number cannot say which one
+the operator means, so the script refuses and lists both stems rather than
+silently picking one (`find | head -1`, the shape a first draft of this
+script shipped with and a fresh reviewer caught before merge). `OLD` also
+accepts the filename's stem (`0128-a-settings-surface`) or the exact
+filename, either of which resolves to one specific file even when the
+number alone does not.
+
 This does not prevent a collision — nothing about the numbering scheme
 changed. It changes the cost of the outcome the table above shows already
 happens regularly: today, resolving one costs a lane an hour of careful
@@ -96,13 +106,35 @@ silently didn't get staged). A single reviewable command with nothing
 left to forget removes the opportunity for that specific slip, whatever
 caused the original collision.
 
-Tested by round-tripping a real ADR (`0001` → `9998` → `0001`) against
-this repository's actual corpus: the forward run touched 20 files (the
-ADR itself, its PDF-less case, the README row, and 17 cross-references in
-other ADRs, specs, and Rust doc-comments), `adr_index_matches_the_files`
-passed clean at the intermediate state, and the reverse run restored the
-tree to a byte-identical `git status --porcelain` (empty) against the
-starting commit.
+Tested two ways against a scratch clone of this repository's real corpus
+(never against this checkout — the script mutates files in place and a
+test run should never be the thing that renumbers a real ADR):
+
+- **The unique-file case**, round-tripping a real ADR (`0001` → `9998` →
+  `0001`): the forward run touched 20 files (the ADR itself, the README
+  row, and 17 cross-references in other ADRs, specs, and Rust doc-
+  comments — this ADR has no PDF-twin case since 0001 predates the
+  tracked-PDF convention), `adr_index_matches_the_files` passed clean at
+  the intermediate state, and the reverse run restored the tree to a
+  byte-identical `git status --porcelain` (empty) against the starting
+  commit.
+- **The actual collision shape** — two files sharing one number, the case
+  the round trip above does not exercise — built as a fixture (two real
+  ADR bodies copied under `9997-test-collision-a.md` and
+  `9997-test-collision-b.md`, both headed `# ADR 9997`). A bare `9997` was
+  refused with both stems listed; `9997-test-collision-a` moved only that
+  file; the sibling still legitimately claiming `9997` was left with its
+  filename AND its own heading untouched. That last check is not
+  incidental: an earlier version of the cross-reference sweep matched the
+  literal phrase `ADR 9997` tree-wide with no exclusion, which is exactly
+  the phrase both colliding files' own headings contain — it correctly
+  fixed dangling references elsewhere and incorrectly rewrote the
+  sibling's own H1 to the new number while its filename stayed at the old
+  one, replacing the resolved collision with a fresh instance of the
+  0126 bug this same script exists to make cheap to fix. The sweep now
+  excludes any other `docs/adr/OLD-*.md` file from both patterns — a
+  same-numbered sibling is a different document, not a reference to this
+  one.
 
 ## Alternatives considered
 
@@ -181,3 +213,9 @@ neither could have passed by accidentally tripping the other's assertion.
 Both files were restored from a pre-mutation copy and reconfirmed
 byte-identical (`git status --porcelain` empty) before this ADR was
 written.
+
+`heading_numbers_by_file_number()`'s own map insert also gained the same
+duplicate-number panic `files_by_number()` already had, so an `--exact`
+run of only the heading test cannot silently drop one of two same-numbered
+files and report a false pass — a gap a fresh review of this PR found
+before merge, alongside the collision-fixture finding decision 2 records.
