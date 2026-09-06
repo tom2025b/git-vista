@@ -21,13 +21,13 @@ use crate::sandbox::NetworkNeed;
 
 use git_vista_protocol::plan_export;
 
-use super::{couldnt_run, run_git, run_git_argv, stderr_or};
+use super::{couldnt_run, run_git, run_git_argv, stderr_or, RunFailure};
 
 /// `git add -A` (`/api/stage`).
 pub(super) async fn exec_stage_all(repo: &Path, need: NetworkNeed) -> (StatusCode, String) {
     let output = match run_git_argv(repo, need, &plan_export::stage_all_argv()).await {
         Ok(o) => o,
-        Err(e) => return couldnt_run("/api/stage", &e),
+        Err(e) => return couldnt_run("/api/stage", RunFailure::Spawn, &e),
     };
     if output.status.success() {
         println!("[/api/stage] staged all changes (git add -A)");
@@ -103,7 +103,7 @@ pub(super) async fn exec_stage_selection(
         let output =
             match crate::git_cmd::git_output_with_stdin(repo, args, need, patch.as_bytes()).await {
                 Ok(o) => o,
-                Err(e) => return couldnt_run("/api/staging/apply", &e),
+                Err(e) => return couldnt_run("/api/staging/apply", RunFailure::Spawn, &e),
             };
         if !output.status.success() {
             let mut msg = stderr_or(&output, "git apply failed.");
@@ -136,7 +136,7 @@ pub(super) async fn exec_stage_selection(
                     let msg = stderr_or(&o, "pathspec check failed.");
                     return (StatusCode::BAD_REQUEST, msg);
                 }
-                Err(e) => return couldnt_run("/api/staging/apply", &e),
+                Err(e) => return couldnt_run("/api/staging/apply", RunFailure::Spawn, &e),
             };
             let matched: std::collections::HashSet<&str> =
                 listed.split('\0').filter(|p| !p.is_empty()).collect();
@@ -154,7 +154,7 @@ pub(super) async fn exec_stage_selection(
         args.extend(whole_files.iter().map(String::as_str));
         let output = match run_git(repo, need, &args).await {
             Ok(o) => o,
-            Err(e) => return couldnt_run("/api/staging/apply", &e),
+            Err(e) => return couldnt_run("/api/staging/apply", RunFailure::Spawn, &e),
         };
         if !output.status.success() {
             let msg = stderr_or(&output, "pathspec staging failed.");
@@ -184,7 +184,7 @@ pub(super) async fn exec_stage_selection(
 pub(super) async fn exec_unstage_all(repo: &Path, need: NetworkNeed) -> (StatusCode, String) {
     let output = match run_git_argv(repo, need, &plan_export::unstage_all_argv()).await {
         Ok(o) => o,
-        Err(e) => return couldnt_run("/api/unstage", &e),
+        Err(e) => return couldnt_run("/api/unstage", RunFailure::Spawn, &e),
     };
     if output.status.success() {
         println!("[/api/unstage] unstaged all changes (git reset -q HEAD)");

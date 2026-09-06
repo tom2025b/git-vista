@@ -19,6 +19,7 @@ use git_vista_protocol::{
 
 use crate::git_cmd::rev_parse;
 use crate::planner;
+use crate::planner::RunFailure;
 use crate::state::reject_if_read_only;
 
 /// Create a commit in the served repository (Issue #33).
@@ -223,6 +224,7 @@ async fn commit_empty_on_branch(
         Err(e) => {
             return planner::couldnt_run(
                 "/api/commit",
+                RunFailure::CompareAndSwap,
                 &format!("couldn't resolve ‘{refname}’ for the compare-and-swap: {e}"),
             )
         }
