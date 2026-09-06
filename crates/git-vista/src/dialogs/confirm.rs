@@ -108,9 +108,18 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                     // choice has always been made.
                     let mode = session_state::ui_mode().unwrap_or(RepoMode::Visualize);
                     match select_worktree_request(&id, mode).await {
-                        Ok(()) => graph.update(|g| {
-                            g.force_bump();
-                        }),
+                        Ok(()) => {
+                            // #676: belt-and-suspenders with the close_confirm
+                            // above — this confirm is already gone by the time
+                            // this reply lands, but the invariant is "every
+                            // force_bump after a selection tears down
+                            // confirm", not "this one call site happens to be
+                            // safe already".
+                            shell.close_confirm();
+                            graph.update(|g| {
+                                g.force_bump();
+                            });
+                        }
                         Err(e) => shell.open_error(ErrorNotice {
                             title: "Couldn't open that worktree",
                             body: format!(
