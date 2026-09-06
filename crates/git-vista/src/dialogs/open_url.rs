@@ -10,6 +10,7 @@ use crate::features::dialogs::core::{
 };
 use crate::features::dialogs::signals::Dialogs;
 use crate::features::graph::core::GraphCore;
+use crate::features::shell::signals::Shell;
 
 /// The "Open URL" modal (Phase 12): clone a public repo and view it read-only.
 /// Same iPad-proven inline-styled overlay as the commit modal, and a `<textarea>`
@@ -35,6 +36,7 @@ pub fn open_url_view(
     dialogs: Dialogs,
     graph: RwSignal<GraphCore>,
     mode_for: RwSignal<Option<RepositoryDescriptor>>,
+    shell: Shell,
 ) -> impl IntoView {
     let submit_clone = move || {
         let url = clone_url.get_untracked().trim().to_string();
@@ -79,6 +81,10 @@ pub fn open_url_view(
             if bump_epoch {
                 // The server opened the clone look-only; the reload shows it,
                 // and the mode screen asks Visualize/Active (ADR 0008).
+                // #676: a confirmation is about an operation in the repository
+                // just left — tear it down rather than let it reopen a plan
+                // against the newly-cloned one.
+                shell.close_confirm();
                 graph.update(|g| {
                     g.force_bump();
                 });

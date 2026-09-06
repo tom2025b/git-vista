@@ -409,6 +409,7 @@ pub fn mode_view(
     mode_for: RwSignal<Option<RepositoryDescriptor>>,
     picker_open: RwSignal<bool>,
     graph: RwSignal<GraphCore>,
+    shell: shell_state::Shell,
 ) -> impl IntoView {
     // Tracks which mode (if any) is mid-request, so only the button the user
     // actually clicked can show "opening…" (#244 follow-up) — the other stays
@@ -442,6 +443,10 @@ pub fn mode_view(
                                 let _ = session_state::apply(SessionEvent::UiModeSelected(mode));
                                 mode_for.set(None);
                                 picker_open.set(false);
+                                // #676: a confirmation is about an operation in the
+                                // repository just left — tear it down rather than let it
+                                // reopen a plan against the newly-selected one.
+                                shell.close_confirm();
                                 graph.update(|g| {
                                     g.force_bump();
                                 });
