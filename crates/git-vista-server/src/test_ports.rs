@@ -141,6 +141,7 @@ impl PortClaim {
 fn acquire_cross_process_lock() -> std::fs::File {
     let file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .open(CROSS_PROCESS_LOCK_PATH)
         .unwrap_or_else(|e| {
