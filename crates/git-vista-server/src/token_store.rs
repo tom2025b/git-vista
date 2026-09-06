@@ -10,6 +10,8 @@
 
 use std::path::Path;
 
+use git_vista_protocol::TokenStatus;
+
 /// Which tier answered, so a caller can report *why* a resolution came out
 /// the way it did — a user whose stale `GH_TOKEN` shadows a fresh keyring
 /// entry has no way to diagnose that otherwise (#583).
@@ -133,6 +135,79 @@ pub(crate) fn mask_token(token: &str) -> String {
     format!("...{tail}")
 }
 
+/// Why a save attempt did not persist. Every variant's `Display` is safe to
+/// return to the client verbatim: neither carries the submitted value —
+/// [`Blank`](StoreTokenError::Blank) names no value at all, and
+/// [`Keyring`](StoreTokenError::Keyring)'s string comes from the `keyring`
+/// crate's own error text (backend/platform diagnostics such as "no storage
+/// access"), never from anything this process wrote into it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StoreTokenError {
+    /// A blank or whitespace-only value — the same rule [`non_blank`] applies
+    /// to every read tier, applied here to what would otherwise be written.
+    Blank,
+    /// The OS keyring rejected the write (no D-Bus session, no storage
+    /// access, a locked store, …). Unlike a *read* failure, this must not
+    /// collapse to a quiet `None` — the user asked for something to happen
+    /// and it did not, so the reason is reported rather than swallowed.
+    Keyring(String),
+}
+
+/// Save `token` to the OS keyring — the highest tier in
+/// [`resolve_token`]'s precedence, so a value saved here is what every
+/// subsequent resolution finds first (M13.03, #584).
+///
+/// Deliberately the ONLY tier a settings surface can write to. The
+/// environment-variable tiers are read from whatever launched this process
+/// and are not this program's to rewrite; the tier-3 file exists for a
+/// human to place a token by hand on a machine with no keyring (its own doc,
+/// [`crate::state::token_file_path`], says as much) rather than for the app
+/// to write plaintext to disk on the user's behalf when a secure store is
+/// sitting right there. A settings surface that could also fall back to
+/// writing the plaintext file would make "did this persist securely"
+/// depend on which machine it ran on, silently — see this module's own
+/// header on why absence folds to `None` at every READ tier; a WRITE has no
+/// equivalent safe default to fold into.
+pub(crate) fn store_token(token: &str) -> Result<(), StoreTokenError> {
+    let trimmed = non_blank(token.to_string()).ok_or(StoreTokenError::Blank)?;
+    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USERNAME)
+        .map_err(|e| StoreTokenError::Keyring(e.to_string()))?;
+    entry
+        .set_password(&trimmed)
+        .map_err(|e| StoreTokenError::Keyring(e.to_string()))
+}
+
+/// The settings surface's read side (M13.03, #584): whether a token is
+/// configured right now, through the exact same resolver the credential
+/// helper uses.
+pub(crate) fn token_status() -> TokenStatus {
+    token_status_of(resolve_token())
+}
+
+/// Pure half of [`token_status`], dependency-injected so the property that
+/// matters most is host-tested directly rather than only reasoned about:
+/// **the resolved token itself never reaches the returned value.** `masked`
+/// is built from [`mask_token`] and `source` from [`TokenSource::label`] —
+/// there is no path from `resolved`'s `String` into this function's return
+/// value at all, which is the wire-level guarantee #584's acceptance
+/// criterion asks for, proved at the type that IS the wire (see
+/// `settings_suite`'s HTTP-level test for the other half: that the real
+/// handler actually calls this and nothing else).
+pub(crate) fn token_status_of(resolved: Option<(String, TokenSource)>) -> TokenStatus {
+    match resolved {
+        Some((token, source)) => TokenStatus {
+            configured: true,
+            masked: Some(mask_token(&token)),
+            source: Some(source.label().to_string()),
+        },
+        None => TokenStatus {
+            configured: false,
+            masked: None,
+            source: None,
+        },
+    }
+}
+
 /// One line, safe to print unconditionally, saying whether a token was
 /// found and — if so — which tier answered, masked. This is the concrete
 /// answer to #583's "the resolver says which source answered": a stale env
@@ -197,6 +272,114 @@ mod tests {
     #[test]
     fn mask_token_one_past_the_window_shows_exactly_four() {
         assert_eq!(mask_token("abcde"), "...bcde");
+    }
+
+    // -- token_status_of: pure, dependency-injected, the settings surface's
+    // read side (M13.03, #584) --
+
+    #[test]
+    fn token_status_of_absent_reports_unconfigured_with_nothing_else_set() {
+        assert_eq!(
+            token_status_of(None),
+            TokenStatus {
+                configured: false,
+                masked: None,
+                source: None,
+            }
+        );
+    }
+
+    #[test]
+    fn token_status_of_present_names_the_source_and_masks_the_value() {
+        let real = format!("ghp_{}", "abcdefghijklmnopqrstuvwxyz");
+        let status = token_status_of(Some((real.clone(), TokenSource::Keyring)));
+        assert!(status.configured);
+        assert_eq!(status.source.as_deref(), Some(TokenSource::Keyring.label()));
+        assert_eq!(status.masked.as_deref(), Some("...wxyz"));
+        // The property #584's acceptance actually asks for, checked directly
+        // rather than inferred from the struct's field list: the real value
+        // is not merely absent from a specific field, it is absent from the
+        // ENTIRE serialized value — the same wire bytes a client receives.
+        let wire = serde_json::to_string(&status).expect("TokenStatus serializes");
+        assert!(
+            !wire.contains(&real),
+            "the resolved token leaked into the wire representation: {wire}"
+        );
+    }
+
+    #[test]
+    fn token_status_of_never_lets_the_value_reach_the_wire_whichever_tier_answered() {
+        // Every tier, not just keyring — a mutation that special-cased one
+        // arm of `resolve_from` to leak would only be caught by exercising
+        // all four.
+        let real = "super-secret-canary-0123456789abcdef";
+        for source in [
+            TokenSource::Keyring,
+            TokenSource::EnvGitVista,
+            TokenSource::EnvGh,
+            TokenSource::File,
+        ] {
+            let status = token_status_of(Some((real.to_string(), source)));
+            let wire = serde_json::to_string(&status).expect("TokenStatus serializes");
+            assert!(
+                !wire.contains(real),
+                "{source:?} tier leaked the token into the wire representation: {wire}"
+            );
+        }
+    }
+
+    // -- store_token: the write side (M13.03, #584) --
+
+    #[test]
+    fn store_token_rejects_a_blank_value_before_touching_the_keyring() {
+        assert_eq!(store_token(""), Err(StoreTokenError::Blank));
+        assert_eq!(store_token("   "), Err(StoreTokenError::Blank));
+    }
+
+    #[test]
+    fn store_token_error_messages_never_contain_the_attempted_value() {
+        // The keyring backend in this sandbox has no storage access, so this
+        // exercises the real failure path store_token must report honestly
+        // (unlike a read, a write failure is not folded to a quiet `None`).
+        // Built at runtime, like every other token-shaped fixture in this
+        // file (see `mask_token_keeps_only_the_last_four_characters` above)
+        // — a literal here would be a real-length `ghp_` token shape in
+        // tracked source, which the credential tripwire (#586, ADR 0123)
+        // and gitleaks' own full-history scan both exist to catch, even
+        // though the value itself grants access to nothing.
+        let attempted = format!("ghp_{}", "wouldbeasecretifthisreallysaved0123456789");
+        if let Err(e) = store_token(&attempted) {
+            let message = match &e {
+                StoreTokenError::Blank => String::new(),
+                StoreTokenError::Keyring(reason) => reason.clone(),
+            };
+            assert!(
+                !message.contains(&attempted),
+                "a keyring failure message echoed the attempted token: {message}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a live OS keyring / D-Bus secret service; run manually with \
+                `cargo test -p git-vista-server --bins token_store::tests::store_token_round_trip_against_a_real_backend -- --ignored`"]
+    fn store_token_round_trip_against_a_real_backend() {
+        // A throwaway service/username, never KEYRING_SERVICE/KEYRING_USERNAME
+        // — this must not read, overwrite, or delete a real token a
+        // developer has already stored. store_token itself always targets
+        // the production entry, so this proves the WRITE mechanism (the
+        // `keyring` crate's `set_password`) against a scratch entry rather
+        // than calling `store_token` directly.
+        let entry = keyring::Entry::new("git-vista-test", "token-store-write-round-trip")
+            .expect("a live keyring backend for this manual test");
+        entry
+            .set_password("write-round-trip-canary")
+            .expect("writing the test entry");
+        let read_back = entry.get_password().expect("reading the test entry back");
+        assert_eq!(read_back, "write-round-trip-canary");
+        entry
+            .delete_credential()
+            .expect("cleaning up the test entry");
     }
 
     // -- keyring tier: the real glue, exercised directly --

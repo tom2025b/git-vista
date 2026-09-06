@@ -134,6 +134,8 @@ const API_SRC: &str = concat!(
     "\n",
     include_str!("api/session.rs"),
     "\n",
+    include_str!("api/settings.rs"),
+    "\n",
     include_str!("api/staging.rs"),
     "\n",
     include_str!("api/stash.rs"),
@@ -290,6 +292,12 @@ const OFFLINE_GUARDED: &[&str] = &[
     // it is no diff, and the guard's refusal text is more actionable than the
     // transport error the fetch would otherwise raise.
     "fetch_spec_diff",
+    // M13.03 (#584). The settings surface's one write: POST
+    // /api/settings/token. A credential write, not a git write, but the same
+    // reasoning as every other entry here applies undiminished — an offline
+    // attempt should surface the guard's own refusal text, not a bare
+    // network error the user has to interpret themselves.
+    "set_token_request",
 ];
 
 /// The pinned, argued exception list — mirrors `route_authz`'s
