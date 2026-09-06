@@ -15,14 +15,16 @@ async function openActiveApp(page) {
   await expect(page.getByRole('heading', { name: 'git-vista' })).toBeVisible()
 
   const pickerEntry = page.getByRole('button', { name: /fixture-repo/i }).first()
-  if (await pickerEntry.isVisible().catch(() => false)) {
-    await pickerEntry.click()
-  }
+  // Selection is required on every load. A one-shot isVisible probe can
+  // race catalog loading and leave the picker covering an already-live graph.
+  await expect(pickerEntry).toBeVisible()
+  await pickerEntry.click()
 
   const active = page.getByRole('button', { name: /full git operations/ })
-  if (await active.isVisible().catch(() => false)) {
-    await active.click()
-  }
+  await expect(active).toBeVisible()
+  await active.click()
+  await expect(pickerEntry).toHaveCount(0)
+  await expect(active).toHaveCount(0)
 
   await expect(page.getByRole('region', { name: 'Commit history graph' })).toBeVisible()
   await expect(page.locator('circle.node-hit').first()).toBeAttached()
