@@ -182,11 +182,10 @@ async fn measure_sweep_components() {
             tokio::task::spawn_blocking(move || {
                 let repo = gix::open_opts(repo, gix::open::Options::isolated()).unwrap();
                 let platform = repo.references().unwrap();
-                platform
-                    .all()
-                    .unwrap()
-                    .map(|reference| reference.unwrap())
-                    .count()
+                platform.all().unwrap().fold(0, |count, reference| {
+                    reference.expect("read ref during enumeration");
+                    count + 1
+                })
             })
             .await
             .unwrap()
