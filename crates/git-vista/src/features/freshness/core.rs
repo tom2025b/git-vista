@@ -585,12 +585,22 @@ pub struct FeedHealthDisplay {
     pub degraded: bool,
 }
 
-/// `health` is `None` before the feed's first snapshot arrives (freshly
-/// connected, or just after a reconnect clears the log) — treated the same
-/// as `Watching`, the quiet resting state, rather than as its own alarming
-/// case: the gap is one HTTP round trip, and a UI that flashed a degraded
-/// look on every page load would train a user to ignore exactly the signal
-/// this issue exists to make legible.
+/// `health` is `None` before the feed's first snapshot arrives, and again
+/// after every reconnect clears the log (`signals.rs`'s `onerror` calls
+/// `log.clear()` before it retries) — this is genuinely "I couldn't tell
+/// yet", not a fact that watching is underway, and it must say so: the same
+/// rule `git_vista_protocol::change_feed`'s own header states for this
+/// entire wire format, "'I could not tell' must never render as 'nothing
+/// changed'." Folding it into the `Watching` arm would say the feed is live
+/// on a client that has no idea whether it is — not a one-frame flash, since
+/// a stream that never publishes leaves it there permanently.
+///
+/// It still stays visually quiet (`degraded: false`, the muted resting dot,
+/// no label — see [`FeedHealthDisplay::degraded`]): quiet and honest are not
+/// in tension here. A gap of one HTTP round trip is normal, and painting it
+/// amber would train a user to ignore exactly the signal this issue exists
+/// to make legible — the fix for the dishonesty is a different sentence,
+/// not a different colour.
 ///
 /// `now` is the caller's live clock, passed in rather than read here so this
 /// function stays pure and host-testable — the same split `Playback::start`
@@ -601,7 +611,12 @@ pub fn feed_health_display(
     now: UnixSeconds,
 ) -> FeedHealthDisplay {
     match health {
-        None | Some(ChangeFeedHealth::Watching { .. }) => FeedHealthDisplay {
+        None => FeedHealthDisplay {
+            label: "Connecting",
+            announcement: "Change feed: couldn't tell yet — no reading has arrived.".to_string(),
+            degraded: false,
+        },
+        Some(ChangeFeedHealth::Watching { .. }) => FeedHealthDisplay {
             label: "Live",
             announcement: "Change feed: watching for repository changes.".to_string(),
             degraded: false,

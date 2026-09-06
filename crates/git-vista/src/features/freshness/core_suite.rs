@@ -927,12 +927,33 @@ fn the_preview_wrapper_asks_core_for_both_transitions() {
 // --- #663 (ADR 0094 §7): the topbar's change-feed-health affordance -------
 
 #[test]
-fn no_snapshot_yet_reads_the_same_as_watching() {
-    // The gap before the first snapshot arrives must not look alarming — it
-    // is one HTTP round trip, not a fact about the repository.
+fn no_snapshot_yet_looks_the_same_as_watching_but_says_something_different() {
+    // The gap before the first snapshot arrives — and every gap after a
+    // reconnect clears the log — must not look alarming: same quiet dot, no
+    // label, not degraded (a genuine round trip, not a fact about the
+    // repository). But it must NOT claim to be watching when it has no idea
+    // whether it is — "I couldn't tell" must never render as "nothing
+    // changed" (git_vista_protocol::change_feed's own rule). A prior version
+    // of this function folded `None` into the `Watching` arm outright, and a
+    // prior version of THIS test asserted the two were `eq`, which pinned
+    // that bug as correct behaviour instead of catching it.
     let no_snapshot = feed_health_display(None, UnixSeconds(100));
     let live = feed_health_display(Some(&watching()), UnixSeconds(100));
-    assert_eq!(no_snapshot, live);
+
+    assert_eq!(no_snapshot.degraded, live.degraded);
+    assert!(
+        !no_snapshot.degraded,
+        "no reading yet must not read as an alert"
+    );
+    assert_ne!(
+        no_snapshot.announcement, live.announcement,
+        "a client with no reading yet must not announce that it is watching"
+    );
+    assert!(
+        !no_snapshot.announcement.to_lowercase().contains("watching"),
+        "no-reading-yet announced: {:?}",
+        no_snapshot.announcement
+    );
 }
 
 #[test]
