@@ -68,6 +68,16 @@ at once and each picks "the next free number", they all pick the same one and
 the index conflicts. That happened on 25 August. 0074–0077 are taken; this batch
 claims 0078–0083.
 
+> **Superseded for future batches by ADR 0132 (2026-09-06).** Manually
+> assigning a range up front here had the same gap this section describes —
+> it narrows the collision window, it does not close it, and it recurred six
+> times on 6 September including once on the PR meant to fix the first five.
+> A batch written from here on claims each handoff's number with
+> `scripts/adr-reserve.sh <branch> [title]` per session as that session's
+> work actually starts, not as a range guessed for the whole batch in
+> advance — the script's own atomicity is what the up-front assignment here
+> was always approximating by hand.
+
 ### One handoff was written and withdrawn
 
 `CLOUD-4` was originally about **#326** (moving `shape()`'s match arms into
