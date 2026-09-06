@@ -189,6 +189,16 @@ pub struct TweenBadge {
     /// it fades in at `to` instead, exactly like [`NodeLifecycle::Entering`].
     pub from: Option<(i32, i32)>,
     pub to: (i32, i32),
+    /// The landing commit's id — not just its pixel. #670 item E: once the
+    /// landing node's own `→{ref}` mark tag has revealed (`REVEAL_AFTER`),
+    /// this floating badge sitting on the exact same pixel is the same fact
+    /// said twice. `sample` uses this id to look up whether that tag is
+    /// actually showing on THIS frame before hiding the badge, rather than
+    /// hiding on a bare time cutoff — the mark tag can itself be dropped for
+    /// width (`scene::half_scene`'s own doc: "a row missing its badge would
+    /// read as nothing moved here"), and a blind cutoff would silently drop
+    /// the only surviving indicator in exactly that case.
+    pub to_commit_id: String,
 }
 
 /// The whole animated scene: static geometry only, no notion of time.
@@ -366,6 +376,7 @@ fn badges_of(
                 text: mv.ref_name.clone(),
                 from,
                 to: (to.cx, to.cy),
+                to_commit_id: mv.to.clone(),
             })
         })
         .collect()
@@ -536,22 +547,43 @@ pub fn sample(scene: &TweenScene, t: f64) -> Frame {
         })
         .collect();
 
+    // #670 item E: a badge whose landing commit is ALREADY showing the same
+    // ref as a `→{name}` mark tag this frame is the same fact drawn twice —
+    // looked up by commit id and exact tag text, never by a bare `t` cutoff,
+    // so a mark tag `half_scene` drops for width (its own doc: "a row
+    // missing its badge would read as nothing moved here") leaves the
+    // floating badge as the sole, still-visible, indicator instead of
+    // silently losing both.
+    let tags_by_commit: HashMap<&str, &Vec<FrameTag>> = frame_nodes
+        .iter()
+        .map(|n| (n.commit_id.as_str(), &n.tags))
+        .collect();
+    let already_shown_as_tag = |badge: &TweenBadge| {
+        let mark_text = format!("→{}", badge.text);
+        tags_by_commit
+            .get(badge.to_commit_id.as_str())
+            .is_some_and(|tags| tags.iter().any(|tag| tag.text == mark_text))
+    };
+
     let frame_badges = scene
         .badges
         .iter()
-        .map(|badge| match badge.from {
-            Some(from) => FrameBadge {
-                text: badge.text.clone(),
-                cx: lerp(from.0 as f64, badge.to.0 as f64, eased),
-                cy: lerp(from.1 as f64, badge.to.1 as f64, eased),
-                opacity: 1.0,
-            },
-            None => FrameBadge {
-                text: badge.text.clone(),
-                cx: badge.to.0 as f64,
-                cy: badge.to.1 as f64,
-                opacity: t,
-            },
+        .map(|badge| {
+            let hide = already_shown_as_tag(badge);
+            match badge.from {
+                Some(from) => FrameBadge {
+                    text: badge.text.clone(),
+                    cx: lerp(from.0 as f64, badge.to.0 as f64, eased),
+                    cy: lerp(from.1 as f64, badge.to.1 as f64, eased),
+                    opacity: if hide { 0.0 } else { 1.0 },
+                },
+                None => FrameBadge {
+                    text: badge.text.clone(),
+                    cx: badge.to.0 as f64,
+                    cy: badge.to.1 as f64,
+                    opacity: if hide { 0.0 } else { t },
+                },
+            }
         })
         .collect();
 

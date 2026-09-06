@@ -369,20 +369,124 @@ fn a_ref_with_no_drawn_origin_fades_in_at_its_destination_rather_than_sliding_fr
         "no honest starting pixel exists, so this must not invent one"
     );
 
+    // Sampled well before REVEAL_AFTER, where the destination's own `→main`
+    // mark tag is still hidden — this is the window the fade-in is actually
+    // about, and where a stray hide-on-arrival mutation could not hide
+    // behind #670 item E's fix below (see that test).
     let at_0 = sample(&scene, 0.0);
-    let at_1 = sample(&scene, 1.0);
-    let b0 = at_0.badges.iter().find(|b| b.text == "main").unwrap();
-    let b1 = at_1.badges.iter().find(|b| b.text == "main").unwrap();
+    let at_mid = sample(&scene, REVEAL_AFTER - 0.3);
+    let b0 = main_badge_at(&at_0);
+    let b_mid = main_badge_at(&at_mid);
     assert_eq!(
         (b0.cx, b0.cy),
-        (b1.cx, b1.cy),
+        (b_mid.cx, b_mid.cy),
         "fixed at the destination throughout"
     );
     assert!(
-        b0.opacity < b1.opacity,
+        b0.opacity < b_mid.opacity,
         "fades in rather than appearing instantly"
     );
-    assert_eq!(b1.opacity, 1.0);
+}
+
+/// #670 item E: once the landing commit's own `→{ref}` mark tag has
+/// revealed, this floating badge sitting on the exact same pixel is the same
+/// fact drawn twice. The static After view never draws both — only the tag —
+/// so the animation must stop drawing the badge by the time it settles,
+/// rather than leaving it at full opacity forever, which is what shipped in
+/// #667 and is what grok's review of #667 (issue #670) flagged.
+#[test]
+fn a_landed_ref_badge_disappears_once_its_own_mark_tag_takes_over() {
+    let p = picture(before_chain(), after_with_added(), added_commit_changes());
+    let scene = tween_of(&p);
+
+    let at_1 = sample(&scene, 1.0);
+    let landing = at_1
+        .nodes
+        .iter()
+        .find(|n| n.tags.iter().any(|t| t.text == "→main"))
+        .expect("the landing commit's mark tag has revealed by rest");
+    assert_eq!(
+        landing.opacity, 1.0,
+        "the tag this test is about must actually be showing, not merely present pre-filter"
+    );
+    let b1 = main_badge_at(&at_1);
+    assert_eq!(
+        b1.opacity, 0.0,
+        "the floating badge must be gone once the mark tag it duplicates is showing — \
+         both visible at once is the same fact said twice"
+    );
+}
+
+fn main_badge_at(frame: &Frame) -> &FrameBadge {
+    frame
+        .badges
+        .iter()
+        .find(|b| b.text == "main")
+        .expect("the main ref badge exists in this frame")
+}
+
+/// #670 item E, the other half of the claim: the fix's own doc says a mark
+/// tag `half_scene` drops for width must leave the floating badge as the
+/// SOLE surviving indicator, not vanish alongside it. A mutation that hides
+/// the badge on a bare `t >= REVEAL_AFTER` cutoff — rather than checking the
+/// tag is genuinely showing — passes every other test in this file (none of
+/// their fixtures ever hit the row-tag width budget) and only breaks here.
+///
+/// Forces the drop deliberately: `LABEL_W` is a 208px budget and
+/// `tag_width` costs `len*6 + 8` per pill, `TAG_GAP` 4px between them. A
+/// 28-char filler branch costs 176px — comfortably under budget alone — but
+/// leaves only 28px free, and `→main`'s pill costs 38, so it is the one
+/// `half_scene::push` silently drops (its own doc: "a row missing its badge
+/// would read as nothing moved here").
+#[test]
+fn a_landed_ref_whose_mark_tag_is_dropped_for_width_keeps_its_floating_badge() {
+    let filler = "a".repeat(28);
+    let before = Half {
+        rows: vec![
+            row(0, 0, vec![head(0), branch("main", 0)]),
+            row(1, 0, Vec::new()),
+        ],
+        edges: vec![edge(0, 0, 1, 0)],
+        stubs: Vec::new(),
+        lane_count: 1,
+    };
+    let after = Half {
+        rows: vec![
+            row(0, 0, vec![head(0)]),
+            row(1, 0, vec![branch(&filler, 1), branch("main", 1)]),
+        ],
+        edges: vec![edge(0, 0, 1, 0)],
+        stubs: Vec::new(),
+        lane_count: 1,
+    };
+    let changes = vec![PreviewChange::RefMoved {
+        ref_name: "main".into(),
+        from: oid(0),
+        to: oid(1),
+    }];
+    let p = picture(before, after, changes);
+    let scene = tween_of(&p);
+
+    let at_1 = sample(&scene, 1.0);
+    let landing = at_1
+        .nodes
+        .iter()
+        .find(|n| n.commit_id == oid(1).0)
+        .expect("commit 1 is drawn in the after picture");
+    assert!(
+        !landing.tags.iter().any(|t| t.text == "→main"),
+        "the fixture's own premise: the mark tag must actually be dropped for \
+         width here, or this test proves nothing about the fallback path. \
+         Tags drawn: {:?}",
+        landing.tags.iter().map(|t| &t.text).collect::<Vec<_>>()
+    );
+    let b1 = main_badge_at(&at_1);
+    assert_eq!(
+        b1.opacity, 1.0,
+        "the floating badge must stay visible when its mark tag was dropped \
+         for width — hiding it too would silently lose the only indicator \
+         that this ref moved at all"
+    );
 }
 
 #[test]
@@ -607,6 +711,19 @@ fn reduced_motion_returns_before_scheduling_a_frame() {
     assert!(
         !arm.contains("self.schedule("),
         "the reduced_motion arm must never call schedule: {arm}"
+    );
+    // #670 item C: the two assertions above pin that the arm returns early
+    // and never schedules a frame, but neither pins WHICH frame it returns
+    // to. A `return` that left `progress` at its default `0.0` would pass
+    // both and render the animation's START, not its end state — silently
+    // failing the very degrade-to-resting-frame rule this arm exists to
+    // satisfy. Pin the resting value explicitly.
+    assert!(
+        arm.contains("progress.set(1.0)"),
+        "the reduced_motion arm must set progress to its resting value \
+         (1.0) before returning — otherwise a correct-looking early return \
+         could leave the panel showing the animation's start frame instead \
+         of its end state. Arm was:\n{arm}"
     );
     assert!(
         body.contains("self.schedule("),

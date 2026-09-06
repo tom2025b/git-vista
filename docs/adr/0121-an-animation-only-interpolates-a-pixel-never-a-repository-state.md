@@ -153,11 +153,15 @@ being the only way to see the result").
 ### 8. Branch stubs are not animated, on purpose
 
 A stub (a branch with no commits of its own, drawn as a ring cascading off
-its anchor) is drawn at its final position only, for the whole transition.
-Tweening a stub's staircase offset adds real complexity — its own anchor,
-its own depth-based cascade math — for a secondary annotation neither the
-issue nor Tom's sketch mentions. Left for a later iteration if it turns out
-to matter; not built speculatively here.
+its anchor) has no field on `TweenScene` at all — it is simply absent from
+the animated SVG for the whole transition, and present only on the static
+before/after halves either side of it. This is a correction from an earlier
+draft of this decision, which said a stub is "drawn at its final position
+throughout" — that overclaims: nothing about a stub is drawn during the
+animation, final position included. Tweening a stub's staircase offset adds
+real complexity — its own anchor, its own depth-based cascade math — for a
+secondary annotation neither the issue nor Tom's sketch mentions. Left for a
+later iteration if it turns out to matter; not built speculatively here.
 
 ## Alternatives considered
 
