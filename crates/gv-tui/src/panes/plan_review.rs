@@ -236,6 +236,9 @@ fn recovery(value: &RecoveryStrategy) -> String {
             "recreate the conflict while its operation remains in progress".to_string()
         }
         RecoveryStrategy::Irrecoverable => "Git-Vista offers no recovery".to_string(),
+        RecoveryStrategy::BisectReset => {
+            "run git bisect reset to restore the pre-bisect HEAD".to_string()
+        }
     }
 }
 

@@ -305,6 +305,27 @@ const EFFECTS: &[(&str, WorktreeEffect, ExpectedIndex, NetworkNeed)] = &[
         Always(I::RebuiltIfCheckedOut),
         N::Local,
     ),
+    // M5.34 (#87): each bisect step is a real checkout of a different
+    // candidate commit — files and the index change the same way an
+    // ordinary checkout's do, and it never leaves this repository.
+    (
+        "bisect_start",
+        W::FilesRewritten,
+        Always(I::Rebuilt),
+        N::Local,
+    ),
+    (
+        "bisect_mark",
+        W::FilesRewritten,
+        Always(I::Rebuilt),
+        N::Local,
+    ),
+    (
+        "bisect_reset",
+        W::FilesRewritten,
+        Always(I::Rebuilt),
+        N::Local,
+    ),
 ];
 
 /// The `op` tag serde writes for this operation. An identity handle obtained

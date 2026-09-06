@@ -67,6 +67,7 @@ use super::worktree_exec::{
 use super::*;
 use git_vista_fixtures::seeded as seeded_repo;
 use git_vista_fixtures::seeded_dated as seeded_repo_dated;
+use git_vista_protocol::plan::BisectVerdict;
 use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
@@ -254,6 +255,9 @@ fn covered_by(op: &GitOperation) -> &'static str {
         GitOperation::DeleteLocalTag { .. } => "delete_local_tag_executes_through_the_pipeline",
         GitOperation::DeleteRemoteTag { .. } => "delete_remote_tag_executes_through_the_pipeline",
         GitOperation::PushTag { .. } => "push_tag_executes_through_the_pipeline",
+        GitOperation::BisectStart { .. } => "bisect_start_executes_through_the_pipeline",
+        GitOperation::BisectMark { .. } => "bisect_mark_executes_through_the_pipeline",
+        GitOperation::BisectReset => "bisect_reset_executes_through_the_pipeline",
     }
 }
 
@@ -310,9 +314,10 @@ fn covered_on_split_path(op: &GitOperation) -> &'static str {
         | GitOperation::CreateTag { .. }
         | GitOperation::DeleteLocalTag { .. }
         | GitOperation::DeleteRemoteTag { .. }
-        | GitOperation::PushTag { .. } => {
-            "the_split_path_is_byte_identical_to_the_single_shot_path"
-        }
+        | GitOperation::PushTag { .. }
+        | GitOperation::BisectStart { .. }
+        | GitOperation::BisectMark { .. }
+        | GitOperation::BisectReset => "the_split_path_is_byte_identical_to_the_single_shot_path",
     }
 }
 
@@ -434,6 +439,14 @@ fn samples() -> Vec<GitOperation> {
             name: TagName::new("v1").unwrap(),
             remote: RemoteName::new("origin").unwrap(),
         },
+        GitOperation::BisectStart {
+            bad: oid(&zeros),
+            good: vec![oid(&zeros)],
+        },
+        GitOperation::BisectMark {
+            verdict: BisectVerdict::Good,
+        },
+        GitOperation::BisectReset,
     ]
 }
 
@@ -7504,5 +7517,113 @@ async fn aborting_unwinds_the_sequence() {
     assert!(
         body.contains("resolutions made during it are gone"),
         "the response must say what was discarded, not just that it worked: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M5.34 (#87, ADR 0129) — bisect
+// ---------------------------------------------------------------------------
+
+/// Three commits, so `good` (the seed) and `bad` (HEAD) have exactly one
+/// candidate strictly between them — enough for `git bisect start` to have
+/// something real to narrow to, rather than an empty range it would settle
+/// immediately.
+fn bisect_repo() -> (tempfile::TempDir, PathBuf, String, String, String) {
+    let (dir, repo) = seeded_repo();
+    let good = tip(&repo, "HEAD");
+    std::fs::write(repo.join("a.txt"), "a middle\n").unwrap();
+    run(&repo, &["commit", "-aqm", "middle"]);
+    let middle = tip(&repo, "HEAD");
+    std::fs::write(repo.join("a.txt"), "a bad\n").unwrap();
+    run(&repo, &["commit", "-aqm", "bad"]);
+    let bad = tip(&repo, "HEAD");
+    (dir, repo, good, middle, bad)
+}
+
+/// MUTATION: pass `good` as `bad` and `bad` as `good` in the argv builder —
+/// `git bisect start` refuses (good must be an ancestor of bad), the pipeline
+/// returns non-OK, and this goes red on `assert_ok`.
+#[tokio::test]
+async fn bisect_start_executes_through_the_pipeline() {
+    let (_dir, repo, good, middle, bad) = bisect_repo();
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::BisectStart {
+            bad: oid(&bad),
+            good: vec![oid(&good)],
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+
+    assert!(
+        repo.join(".git/BISECT_START").exists(),
+        "git bisect start must leave a real session behind"
+    );
+    assert_eq!(
+        tip(&repo, "HEAD"),
+        middle,
+        "with exactly one candidate between good and bad, bisect must check it out"
+    );
+}
+
+/// MUTATION: swap `bisect_mark_argv`'s `Good`/`Bad` strings — marking the
+/// sole candidate `good` would refuse to finish (there is nothing left bad
+/// to narrow to) instead of naming `middle` as the culprit, and this goes
+/// red on the `finished`/`bad` assertions.
+#[tokio::test]
+async fn bisect_mark_executes_through_the_pipeline() {
+    let (_dir, repo, good, middle, bad) = bisect_repo();
+    run(&repo, &["bisect", "start", &bad, &good]);
+    assert_eq!(
+        tip(&repo, "HEAD"),
+        middle,
+        "fixture precondition: git itself must land on the same midpoint"
+    );
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::BisectMark {
+            verdict: BisectVerdict::Bad,
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+
+    let status = super::bisect_exec::discover(&repo).await;
+    assert!(
+        status.finished,
+        "one candidate, marked bad: the range has collapsed to it, so the \
+         session must report finished"
+    );
+    assert_eq!(
+        status.bad.as_deref(),
+        Some(middle.as_str()),
+        "the culprit git bisect found must be the commit just marked, not the \
+         original bad HEAD"
+    );
+}
+
+/// MUTATION: make the executor return early before running `git bisect
+/// reset`'s argv — `BISECT_START` survives and this goes red on the first
+/// assertion; HEAD also never returns to `bad`, catching a mutation that ran
+/// some OTHER git command in reset's place.
+#[tokio::test]
+async fn bisect_reset_executes_through_the_pipeline() {
+    let (_dir, repo, good, _middle, bad) = bisect_repo();
+    run(&repo, &["bisect", "start", &bad, &good]);
+
+    let (status, body) = pipeline(&repo, GitOperation::BisectReset).await;
+    assert_ok(status, &body);
+
+    assert!(
+        !repo.join(".git/BISECT_START").exists(),
+        "reset must clear the bisect session"
+    );
+    assert_eq!(
+        tip(&repo, "HEAD"),
+        bad,
+        "reset returns to the branch bisect start was run from"
     );
 }

@@ -234,6 +234,7 @@ fn the_production_policy_is_never_unsandboxed_today() {
 // "local gets Strict" proves very little on its own, since a `policy_for` that
 // returned Strict unconditionally would also pass it.
 
+use git_vista_protocol::plan::BisectVerdict;
 use git_vista_protocol::{
     BranchName, CommitMessage, CommitOid, ForcePublish, GenerationToken, GitOperation,
     MergeStrategy, RefName, RemoteName, StageDirection, TagAnnotation, TagMessage, TagName,
@@ -325,6 +326,9 @@ fn variant_name(op: &GitOperation) -> &'static str {
         GitOperation::DeleteLocalTag { .. } => "DeleteLocalTag",
         GitOperation::DeleteRemoteTag { .. } => "DeleteRemoteTag",
         GitOperation::PushTag { .. } => "PushTag",
+        GitOperation::BisectStart { .. } => "BisectStart",
+        GitOperation::BisectMark { .. } => "BisectMark",
+        GitOperation::BisectReset => "BisectReset",
     }
 }
 
@@ -548,6 +552,17 @@ fn every_operation() -> Vec<GitOperation> {
             name: TagName::new("v1.0.0").expect("valid tag name"),
             remote: RemoteName::new("origin").expect("valid remote"),
         },
+        // M5.34 (#87) — all three bisect verbs are Local: `git bisect
+        // start|good|bad|skip|reset` only ever moves refs/bisect/* and HEAD
+        // inside this repository, never a remote.
+        GitOperation::BisectStart {
+            bad: oid(tip),
+            good: vec![oid(tip)],
+        },
+        GitOperation::BisectMark {
+            verdict: BisectVerdict::Good,
+        },
+        GitOperation::BisectReset,
     ]
 }
 
@@ -623,6 +638,9 @@ fn every_operation_declares_every_variant() {
         "ApplyStash",
         "BranchFromStash",
         "DropStash",
+        "BisectStart",
+        "BisectMark",
+        "BisectReset",
     ]
     .into_iter()
     .collect();
@@ -764,8 +782,8 @@ fn exactly_the_five_remote_operations_declare_a_network_need() {
     let ops = every_operation();
     assert_eq!(
         ops.len(),
-        39,
-        "every_operation() must list every GitOperation variant; the enum has 39 \
+        42,
+        "every_operation() must list every GitOperation variant; the enum has 42 \
          (this literal is a tripwire, not the enforcement — \
          every_operation_covers_every_variant_the_enum_declares is what checks \
          the census against the enum itself and cannot be left stale with it)"
@@ -793,8 +811,8 @@ fn exactly_the_five_remote_operations_declare_a_network_need() {
     );
     assert_eq!(
         local.len(),
-        34,
-        "the other thirty-four operations must stay Local; declared Local: {local:?}"
+        37,
+        "the other thirty-seven operations must stay Local; declared Local: {local:?}"
     );
 }
 

@@ -166,7 +166,7 @@ impl GitOperation {
             GitOperation::CheckoutBranch { .. } => WorktreeEffect::FilesRewritten,
             // A bisect step (start/mark) IS a checkout — git drives it
             // internally, but tracked files are rewritten exactly the same
-            // way (M5.34, #87, ADR 0121). Reset returns to the pre-bisect
+            // way (M5.34, #87, ADR 0129). Reset returns to the pre-bisect
             // position, which is itself a checkout.
             GitOperation::BisectStart { .. } => WorktreeEffect::FilesRewritten,
             GitOperation::BisectMark { .. } => WorktreeEffect::FilesRewritten,

@@ -365,6 +365,15 @@ pub(crate) async fn classify_recovery(
         RecoveryStrategy::RevertCommit { commit } => {
             classify_revert_commit(repo, operation_id, commit).await
         }
+
+        // M5.34 (#87, ADR 0129): bisect runs detached, so there is no ref to
+        // resolve and no `recovery_oid` to check against — the same shape
+        // `RecreateStashEntry` is in, not the same shape as a named ref's
+        // strategies above. Real and recorded, no live check or button wired
+        // yet.
+        RecoveryStrategy::BisectReset => RecoveryClass::KnownNotWired {
+            strategy: strategy.clone(),
+        },
     }
 }
 

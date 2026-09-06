@@ -1,6 +1,6 @@
 //! The bisect executors — start, mark (good/bad/skip) and reset — plus
 //! [`discover`], which reads git's own on-disk bisect state fresh every
-//! time it is asked, never mirrors it (M5.34, #87, ADR 0121).
+//! time it is asked, never mirrors it (M5.34, #87, ADR 0129).
 //!
 //! # Why this is its own module
 //!
@@ -12,7 +12,7 @@
 //! worktrees), `.git/BISECT_LOG` (ordered history, parsed as the replay
 //! script `git bisect replay` itself trusts), and `refs/bisect/*` (the
 //! current bad/good/skip set, read via `git for-each-ref`'s own
-//! machine-readable format, never git's prose). See ADR 0121 for what was
+//! machine-readable format, never git's prose). See ADR 0129 for what was
 //! verified empirically in a scratch repo before any of this was written —
 //! most importantly that `git bisect good|bad` **exits 1** on the step
 //! that finds the culprit, so [`discover`]'s candidate-range computation is
@@ -32,14 +32,17 @@ use git_vista_core::activity::ActivityKind;
 use crate::git_cmd::{git_output, rev_parse};
 use crate::sandbox::NetworkNeed;
 
-use super::{couldnt_run, journal_app_event, run_git_argv, short, stderr_stdout_or, Obs, Observed};
+use super::{
+    couldnt_run, journal_app_event, run_git_argv, short, stderr_stdout_or, Obs, Observed,
+    RunFailure,
+};
 
 // ---------------------------------------------------------------------------
 // Discovery — read git's own state, never mirror it
 // ---------------------------------------------------------------------------
 
 /// One decision this session made, in the order git ran it — one line of
-/// `.git/BISECT_LOG`'s command script (ADR 0121 §1). Comment lines
+/// `.git/BISECT_LOG`'s command script (ADR 0129 §1). Comment lines
 /// (`# bad: [...] subject`) are git's own human-readable annotation of the
 /// command that follows and are not parsed here; the command line is
 /// authoritative.
@@ -52,7 +55,7 @@ pub(crate) struct BisectLogStep {
 }
 
 /// Git's own bisect state, read fresh — never cached, never mirrored
-/// (ADR 0121 §1). Every field comes from `.git/BISECT_START`,
+/// (ADR 0129 §1). Every field comes from `.git/BISECT_START`,
 /// `.git/BISECT_LOG` or `refs/bisect/*`; there is no field here this app
 /// invented state for.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -71,7 +74,7 @@ pub(crate) struct BisectStatus {
     pub history: Vec<BisectLogStep>,
     /// The candidate range has narrowed to exactly one commit (`bad`
     /// itself) — computed from `git rev-list`, never from git's printed
-    /// sentence or `git bisect`'s exit code (ADR 0121 §2).
+    /// sentence or `git bisect`'s exit code (ADR 0129 §2).
     pub finished: bool,
 }
 
@@ -157,7 +160,7 @@ async fn refs_bisect(repo: &Path) -> (Option<String>, Vec<String>, Vec<String>) 
 
 /// Has the candidate range narrowed to exactly one commit? `git rev-list
 /// --count <bad> ^<good...>` — never git's printed "is the first bad
-/// commit", never `git bisect`'s exit code (ADR 0121 §2, verified: that
+/// commit", never `git bisect`'s exit code (ADR 0129 §2, verified: that
 /// command exits 1 on exactly this step). Skip commits are deliberately
 /// left IN the range — they were never resolved as good, so excluding them
 /// would under-count and report "finished" too early.
@@ -181,7 +184,7 @@ async fn is_finished(repo: &Path, bad: &str, good: &[String]) -> bool {
 
 /// Read git's own bisect state fresh. Called by `GET /api/bisect/status`
 /// and by every executor in this module after it runs, to decide what
-/// happened — never cached, never mirrored (ADR 0121 §1).
+/// happened — never cached, never mirrored (ADR 0129 §1).
 pub(crate) async fn discover(repo: &Path) -> BisectStatus {
     let started_from = read_git_file(repo, "BISECT_START")
         .await
@@ -214,18 +217,24 @@ pub(crate) async fn discover(repo: &Path) -> BisectStatus {
 }
 
 // ---------------------------------------------------------------------------
-// Notes — app-only metadata, outside the GitOperation vocabulary (ADR 0121 §5)
+// Notes — app-only metadata, outside the GitOperation vocabulary (ADR 0129 §5)
 // ---------------------------------------------------------------------------
 
 /// A free-text note never moves a ref or touches the index, so it does not
 /// go through the planner — see `GitOperation`'s doc comment on why every
-/// *mutation* does, and ADR 0121 §5 on why a note is not one. Stored at the
+/// *mutation* does, and ADR 0129 §5 on why a note is not one. Stored at the
 /// per-worktree private path `git rev-path --git-path
 /// git-vista-bisect-notes.json` — the same worktree-correct resolution
 /// [`discover`] uses, since notes are scoped to the bisect session running
 /// in THIS worktree, not shared with the repository's other worktrees.
 const NOTES_FILE: &str = "git-vista-bisect-notes.json";
 
+// #87: no HTTP route calls either of these yet — `discover`'s `BisectStatus`
+// carries no notes field, and there is no `/api/bisect/note` endpoint to
+// write one. Both are real, host-tested (see the suite below) and awaiting
+// their wiring, the same status `exec_start`/`exec_mark`/`exec_reset` were
+// in before this branch's merge with current main.
+#[allow(dead_code)]
 pub(crate) async fn read_notes(repo: &Path) -> std::collections::BTreeMap<String, String> {
     let Some(text) = read_git_file(repo, NOTES_FILE).await else {
         return std::collections::BTreeMap::new();
@@ -233,6 +242,7 @@ pub(crate) async fn read_notes(repo: &Path) -> std::collections::BTreeMap<String
     serde_json::from_str(&text).unwrap_or_default()
 }
 
+#[allow(dead_code)] // #87: same status as read_notes above — see its comment.
 pub(crate) async fn write_note(repo: &Path, commit: &str, note: &str) -> Result<(), String> {
     let Some(path) = git_path(repo, NOTES_FILE).await else {
         return Err("could not resolve this worktree's git directory".to_string());
@@ -250,7 +260,7 @@ pub(crate) async fn write_note(repo: &Path, commit: &str, note: &str) -> Result<
 }
 
 /// Cleared when a bisect ends — notes are scoped to the session they were
-/// written during (ADR 0121 §5).
+/// written during (ADR 0129 §5).
 async fn clear_notes(repo: &Path) {
     if let Some(path) = git_path(repo, NOTES_FILE).await {
         let _ = tokio::fs::remove_file(path).await;
@@ -285,11 +295,11 @@ pub(super) async fn exec_start(
     }
     let output = match run_git_argv(repo, need, &bisect_start_argv(bad, good)).await {
         Ok(o) => o,
-        Err(e) => return couldnt_run("/api/bisect/start", &e),
+        Err(e) => return couldnt_run("/api/bisect/start", RunFailure::Spawn, &e),
     };
     // `git bisect start` writes BISECT_START/refs before attempting the
     // first checkout, so a failed checkout (dirty worktree — verified,
-    // ADR 0121 §1) can still leave a real session behind. Discover state
+    // ADR 0129 §1) can still leave a real session behind. Discover state
     // after the call regardless of whether the checkout itself succeeded.
     let status = discover(repo).await;
     if !status.in_progress {
@@ -348,7 +358,7 @@ pub(super) async fn exec_mark(
     }
     let output = match run_git_argv(repo, need, &bisect_mark_argv(verdict)).await {
         Ok(o) => o,
-        Err(e) => return couldnt_run("/api/bisect/mark", &e),
+        Err(e) => return couldnt_run("/api/bisect/mark", RunFailure::Spawn, &e),
     };
     let new = Obs::from_read(rev_parse(repo, "HEAD").await);
     let word = match verdict {
@@ -366,7 +376,7 @@ pub(super) async fn exec_mark(
     )
     .await;
     // `git bisect bad|good` EXITS 1 on the step that finds the culprit —
-    // verified empirically, not assumed (ADR 0121 §1). Exit code alone
+    // verified empirically, not assumed (ADR 0129 §1). Exit code alone
     // cannot distinguish "found it" from "the command failed"; `discover`'s
     // candidate-range computation is what decides, never the code or git's
     // printed sentence.
@@ -409,7 +419,7 @@ pub(super) async fn exec_reset(
     }
     let output = match run_git_argv(repo, need, &bisect_reset_argv()).await {
         Ok(o) => o,
-        Err(e) => return couldnt_run("/api/bisect/reset", &e),
+        Err(e) => return couldnt_run("/api/bisect/reset", RunFailure::Spawn, &e),
     };
     if !output.status.success() {
         return (
