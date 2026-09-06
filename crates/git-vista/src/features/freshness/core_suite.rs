@@ -2,7 +2,7 @@
 
 use super::*;
 
-use git_vista_protocol::change_feed::{ChangeFeedHealth, WatchBudget};
+use git_vista_protocol::change_feed::{ChangeFeedHealth, WatchBudget, WatcherLoss};
 use git_vista_protocol::{GenerationToken, RefName, UnixSeconds};
 
 fn watching() -> ChangeFeedHealth {
@@ -921,5 +921,154 @@ fn the_preview_wrapper_asks_core_for_both_transitions() {
         PREVIEW_SIGNALS.contains("slot_when_request_failed(rebuilding)"),
         "and what state a failed one enters — the half the review found \
          persisting"
+    );
+}
+
+// --- #663 (ADR 0094 §7): the topbar's change-feed-health affordance -------
+
+#[test]
+fn no_snapshot_yet_looks_the_same_as_watching_but_says_something_different() {
+    // The gap before the first snapshot arrives — and every gap after a
+    // reconnect clears the log — must not look alarming: same quiet dot, no
+    // label, not degraded (a genuine round trip, not a fact about the
+    // repository). But it must NOT claim to be watching when it has no idea
+    // whether it is — "I couldn't tell" must never render as "nothing
+    // changed" (git_vista_protocol::change_feed's own rule). A prior version
+    // of this function folded `None` into the `Watching` arm outright, and a
+    // prior version of THIS test asserted the two were `eq`, which pinned
+    // that bug as correct behaviour instead of catching it.
+    let no_snapshot = feed_health_display(None, UnixSeconds(100));
+    let live = feed_health_display(Some(&watching()), UnixSeconds(100));
+
+    assert_eq!(no_snapshot.degraded, live.degraded);
+    assert!(
+        !no_snapshot.degraded,
+        "no reading yet must not read as an alert"
+    );
+    assert_ne!(
+        no_snapshot.announcement, live.announcement,
+        "a client with no reading yet must not announce that it is watching"
+    );
+    assert!(
+        !no_snapshot.announcement.to_lowercase().contains("watching"),
+        "no-reading-yet announced: {:?}",
+        no_snapshot.announcement
+    );
+}
+
+#[test]
+fn watching_is_quiet_and_names_nothing_variable() {
+    let display = feed_health_display(Some(&watching()), UnixSeconds(100));
+    assert!(
+        !display.degraded,
+        "the resting state must not read as an alert"
+    );
+    assert_eq!(display.label, "Live");
+    // The label must never encode the watch count or budget — see the
+    // type's own doc on why: a resting state whose label could vary in
+    // length could grow the topbar on its own, which #663's acceptance
+    // criterion rules out.
+    assert!(!display.label.contains(char::is_numeric));
+}
+
+#[test]
+fn bounded_is_degraded_and_names_watched_of_wanted() {
+    let health = ChangeFeedHealth::Bounded {
+        watched: 3,
+        wanted: 12,
+        budget: WatchBudget::Undetermined { watches: 3 },
+    };
+    let display = feed_health_display(Some(&health), UnixSeconds(100));
+    assert!(display.degraded);
+    assert!(display.announcement.contains('3'));
+    assert!(display.announcement.contains("12"));
+}
+
+#[test]
+fn sweep_only_is_degraded_and_names_its_reason() {
+    let health = ChangeFeedHealth::SweepOnly {
+        reason: WatcherLoss::LimitReached { at: 4038 },
+    };
+    let display = feed_health_display(Some(&health), UnixSeconds(100));
+    assert!(display.degraded);
+    assert!(
+        display.announcement.contains("4038"),
+        "the reason's own detail must reach the sentence: {}",
+        display.announcement
+    );
+}
+
+#[test]
+fn blind_is_degraded_and_says_couldnt_tell_and_for_how_long() {
+    let health = ChangeFeedHealth::Blind {
+        reason: "git status could not be run".to_string(),
+        since: UnixSeconds(100 - 3_600), // one hour before `now`
+    };
+    let display = feed_health_display(Some(&health), UnixSeconds(100));
+    assert!(display.degraded);
+    assert!(display.announcement.contains("couldn't read"));
+    assert!(display.announcement.contains("git status could not be run"));
+    assert!(
+        display.announcement.contains("1h ago"),
+        "must name how long the feed has been blind, not only that it is: {}",
+        display.announcement
+    );
+}
+
+#[test]
+fn the_four_degraded_states_are_distinguishable_from_each_other() {
+    // #663 acceptance: "each degraded state is distinguishable and says
+    // which" — not merely "degraded is true for all of them".
+    let bounded = feed_health_display(
+        Some(&ChangeFeedHealth::Bounded {
+            watched: 1,
+            wanted: 2,
+            budget: WatchBudget::Undetermined { watches: 1 },
+        }),
+        UnixSeconds(100),
+    );
+    let sweep_only = feed_health_display(
+        Some(&ChangeFeedHealth::SweepOnly {
+            reason: WatcherLoss::Unsupported {
+                detail: "no backend".to_string(),
+            },
+        }),
+        UnixSeconds(100),
+    );
+    let blind = feed_health_display(
+        Some(&ChangeFeedHealth::Blind {
+            reason: "x".to_string(),
+            since: UnixSeconds(0),
+        }),
+        UnixSeconds(100),
+    );
+    let labels = [bounded.label, sweep_only.label, blind.label];
+    for (i, a) in labels.iter().enumerate() {
+        for b in &labels[i + 1..] {
+            assert_ne!(a, b, "two degraded states must not share a label");
+        }
+    }
+}
+
+/// `dialogs/settings.rs`-style composition census: `feed_health_badge.rs` is
+/// wasm-only, so `cargo test` never compiles it. This proves the view
+/// actually CALLS `feed_health_display` rather than reimplementing any of
+/// its decisions inline.
+///
+/// **What this catches:** the view stops calling `feed_health_display` (a
+/// future edit that inlines "if watching { ... } else { ... }" directly,
+/// silently duplicating and un-testing the decision).
+///
+/// **What this does NOT catch:** the view calling it with the wrong
+/// arguments, or misreading `display.degraded`/`.label` once it has the
+/// answer — text-scanning for a call site cannot see argument or
+/// consumption correctness. That class of defect needs a browser spec (see
+/// `ci/browser/tests/feed-health.spec.mjs`).
+#[test]
+fn the_topbar_badge_calls_feed_health_display_rather_than_reimplementing_it() {
+    const FEED_HEALTH_BADGE: &str = include_str!("../../feed_health_badge.rs");
+    assert!(
+        FEED_HEALTH_BADGE.contains("feed_health_display("),
+        "feed_health_badge.rs no longer calls core::feed_health_display"
     );
 }
