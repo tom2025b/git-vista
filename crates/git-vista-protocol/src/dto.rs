@@ -1700,6 +1700,30 @@ pub fn validate_clone_url(url: &str) -> Result<String, String> {
     Ok(url.to_string())
 }
 
+/// Body of `POST /api/bisect/start` (M5.34, #87, ADR 0130).
+///
+/// `good` is a `Vec` — see [`crate::plan::GitOperation::BisectStart`]'s own
+/// doc comment for why more than one is legal. An empty `good` is refused by
+/// the executor before it reaches git, not here: this DTO's job is the wire
+/// shape, not the domain rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BisectStartRequest {
+    pub bad: crate::plan::CommitOid,
+    pub good: Vec<crate::plan::CommitOid>,
+}
+
+/// Body of `POST /api/bisect/mark` (M5.34, #87, ADR 0130).
+///
+/// No commit field — see [`crate::plan::GitOperation::BisectMark`]'s own doc
+/// comment for why: the candidate under test is whatever `HEAD` already is,
+/// read by the executor itself, never supplied by the client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BisectMarkRequest {
+    pub verdict: crate::plan::BisectVerdict,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

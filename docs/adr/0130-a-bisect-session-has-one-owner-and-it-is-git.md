@@ -1,4 +1,4 @@
-# ADR 0129 — A bisect session has one owner, and it is git
+# ADR 0130 — A bisect session has one owner, and it is git
 
 - **Status:** Proposed — design settled, implementation in progress
 - **Date:** 2026-09-05
@@ -275,3 +275,24 @@ Both `discover_bisect_state`'s "finished" derivation (§2) and the
 two disjoint ways each via `failure-atlas`'s `mutation_check` — see the PR
 for `run_key`, mutation ids and caught/survived counts; recorded here once
 the implementation lands rather than guessed at in advance.
+
+The route/handler wiring for the three `/api/bisect/*` endpoints (added
+after this ADR's design section was written) is mutation-proved two
+disjoint ways as well, but **by hand, not via `failure-atlas`**:
+`mutation_check`'s throwaway clone could not build `git-vista-server`'s
+`gv-sandbox` shim binary, a pre-existing gap unrelated to this feature (hit
+independently by two lanes the same night). Applied and reverted manually
+in the working tree instead:
+
+1. **Wrong route → handler mapping** (`main.rs` routed `/api/bisect/mark`
+   to `bisect_reset`) — caught by the existing
+   `every_git_write_route_reaches_the_planner` census.
+2. **Handler ignoring its request body**, hardcoding a verdict — the
+   existing host-level pipeline tests (`bisect_*_executes_through_the_pipeline`)
+   call the planner directly and do **not** reach this bug, since they
+   bypass the HTTP handler entirely. Caught by the new
+   `ci/browser/tests/bisect.spec.mjs`, which asserts against `git bisect
+   log`'s own output rather than "no error was shown" — a handler
+   constructing the wrong `GitOperation` still returns 200.
+
+Both legs re-verified green on the real (reverted) code afterward.

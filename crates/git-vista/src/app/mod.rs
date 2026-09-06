@@ -626,6 +626,9 @@ pub fn App() -> impl IntoView {
     // signal owned below it would lose the user's chosen anchor on every
     // background refresh.
     let compare_anchor = create_rw_signal(None::<String>);
+    // M5.34 (#87, ADR 0130): the bad endpoint of a bisect about to start.
+    // Same shape and same reason as `compare_anchor` immediately above.
+    let bisect_bad_anchor = create_rw_signal(None::<String>);
     // M3.24 (#77): the stash drawer's signals, created here for the same reason
     // as `compare_anchor` above it — the Activity panel is rebuilt by an epoch
     // bump, and every drawer write ends with a bump. Owned below it, the
@@ -653,6 +656,7 @@ pub fn App() -> impl IntoView {
         shell,
         stash,
         compare_anchor,
+        bisect_bad_anchor,
         preview,
         freshness,
     };

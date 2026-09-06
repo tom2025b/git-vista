@@ -237,6 +237,11 @@ pub struct Features {
     /// the USER chose, and a background refresh re-reading the repo must not
     /// silently discard it.
     pub compare_anchor: RwSignal<Option<String>>,
+    /// The bad endpoint of a bisect about to start (M5.34, #87, ADR 0130),
+    /// once one has been marked. `None` when no start is in progress. Same
+    /// shape and same reason as `compare_anchor` just above — see
+    /// `menu::bisect_items`'s module doc.
+    pub bisect_bad_anchor: RwSignal<Option<String>>,
     /// The confirm dialog's before/after graph (M10.08 A6, #594).
     ///
     /// In this bundle for the reason every other handle here is: it is created

@@ -2838,6 +2838,11 @@ fn every_git_write_route_reaches_the_planner() {
         ("/api/stash/apply", "handlers::stash::apply_stash"),
         ("/api/stash/drop", "handlers::stash::drop_stash"),
         ("/api/stash/branch", "handlers::stash::branch_from_stash"),
+        // M5.34 (#87, ADR 0130): the three bisect writes — git writes, funnel
+        // rows below.
+        ("/api/bisect/start", "handlers::bisect::bisect_start"),
+        ("/api/bisect/mark", "handlers::bisect::bisect_mark"),
+        ("/api/bisect/reset", "handlers::bisect::bisect_reset"),
         // M2.21d (#238): the two local tag writes — git writes, funnel rows
         // below. M2.21f (#240) added the two remote ones right after. The
         // tag *listing* is a GET and so never reaches this table.
@@ -7521,7 +7526,7 @@ async fn aborting_unwinds_the_sequence() {
 }
 
 // ---------------------------------------------------------------------------
-// M5.34 (#87, ADR 0129) — bisect
+// M5.34 (#87, ADR 0130) — bisect
 // ---------------------------------------------------------------------------
 
 /// Three commits, so `good` (the seed) and `bad` (HEAD) have exactly one

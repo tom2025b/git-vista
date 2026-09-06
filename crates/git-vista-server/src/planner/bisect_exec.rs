@@ -1,6 +1,6 @@
 //! The bisect executors — start, mark (good/bad/skip) and reset — plus
 //! [`discover`], which reads git's own on-disk bisect state fresh every
-//! time it is asked, never mirrors it (M5.34, #87, ADR 0129).
+//! time it is asked, never mirrors it (M5.34, #87, ADR 0130).
 //!
 //! # Why this is its own module
 //!
@@ -12,7 +12,7 @@
 //! worktrees), `.git/BISECT_LOG` (ordered history, parsed as the replay
 //! script `git bisect replay` itself trusts), and `refs/bisect/*` (the
 //! current bad/good/skip set, read via `git for-each-ref`'s own
-//! machine-readable format, never git's prose). See ADR 0129 for what was
+//! machine-readable format, never git's prose). See ADR 0130 for what was
 //! verified empirically in a scratch repo before any of this was written —
 //! most importantly that `git bisect good|bad` **exits 1** on the step
 //! that finds the culprit, so [`discover`]'s candidate-range computation is
@@ -42,7 +42,7 @@ use super::{
 // ---------------------------------------------------------------------------
 
 /// One decision this session made, in the order git ran it — one line of
-/// `.git/BISECT_LOG`'s command script (ADR 0129 §1). Comment lines
+/// `.git/BISECT_LOG`'s command script (ADR 0130 §1). Comment lines
 /// (`# bad: [...] subject`) are git's own human-readable annotation of the
 /// command that follows and are not parsed here; the command line is
 /// authoritative.
@@ -55,7 +55,7 @@ pub(crate) struct BisectLogStep {
 }
 
 /// Git's own bisect state, read fresh — never cached, never mirrored
-/// (ADR 0129 §1). Every field comes from `.git/BISECT_START`,
+/// (ADR 0130 §1). Every field comes from `.git/BISECT_START`,
 /// `.git/BISECT_LOG` or `refs/bisect/*`; there is no field here this app
 /// invented state for.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -74,7 +74,7 @@ pub(crate) struct BisectStatus {
     pub history: Vec<BisectLogStep>,
     /// The candidate range has narrowed to exactly one commit (`bad`
     /// itself) — computed from `git rev-list`, never from git's printed
-    /// sentence or `git bisect`'s exit code (ADR 0129 §2).
+    /// sentence or `git bisect`'s exit code (ADR 0130 §2).
     pub finished: bool,
 }
 
@@ -160,7 +160,7 @@ async fn refs_bisect(repo: &Path) -> (Option<String>, Vec<String>, Vec<String>) 
 
 /// Has the candidate range narrowed to exactly one commit? `git rev-list
 /// --count <bad> ^<good...>` — never git's printed "is the first bad
-/// commit", never `git bisect`'s exit code (ADR 0129 §2, verified: that
+/// commit", never `git bisect`'s exit code (ADR 0130 §2, verified: that
 /// command exits 1 on exactly this step). Skip commits are deliberately
 /// left IN the range — they were never resolved as good, so excluding them
 /// would under-count and report "finished" too early.
@@ -184,7 +184,7 @@ async fn is_finished(repo: &Path, bad: &str, good: &[String]) -> bool {
 
 /// Read git's own bisect state fresh. Called by `GET /api/bisect/status`
 /// and by every executor in this module after it runs, to decide what
-/// happened — never cached, never mirrored (ADR 0129 §1).
+/// happened — never cached, never mirrored (ADR 0130 §1).
 pub(crate) async fn discover(repo: &Path) -> BisectStatus {
     let started_from = read_git_file(repo, "BISECT_START")
         .await
@@ -217,12 +217,12 @@ pub(crate) async fn discover(repo: &Path) -> BisectStatus {
 }
 
 // ---------------------------------------------------------------------------
-// Notes — app-only metadata, outside the GitOperation vocabulary (ADR 0129 §5)
+// Notes — app-only metadata, outside the GitOperation vocabulary (ADR 0130 §5)
 // ---------------------------------------------------------------------------
 
 /// A free-text note never moves a ref or touches the index, so it does not
 /// go through the planner — see `GitOperation`'s doc comment on why every
-/// *mutation* does, and ADR 0129 §5 on why a note is not one. Stored at the
+/// *mutation* does, and ADR 0130 §5 on why a note is not one. Stored at the
 /// per-worktree private path `git rev-path --git-path
 /// git-vista-bisect-notes.json` — the same worktree-correct resolution
 /// [`discover`] uses, since notes are scoped to the bisect session running
@@ -260,7 +260,7 @@ pub(crate) async fn write_note(repo: &Path, commit: &str, note: &str) -> Result<
 }
 
 /// Cleared when a bisect ends — notes are scoped to the session they were
-/// written during (ADR 0129 §5).
+/// written during (ADR 0130 §5).
 async fn clear_notes(repo: &Path) {
     if let Some(path) = git_path(repo, NOTES_FILE).await {
         let _ = tokio::fs::remove_file(path).await;
@@ -299,7 +299,7 @@ pub(super) async fn exec_start(
     };
     // `git bisect start` writes BISECT_START/refs before attempting the
     // first checkout, so a failed checkout (dirty worktree — verified,
-    // ADR 0129 §1) can still leave a real session behind. Discover state
+    // ADR 0130 §1) can still leave a real session behind. Discover state
     // after the call regardless of whether the checkout itself succeeded.
     let status = discover(repo).await;
     if !status.in_progress {
@@ -376,7 +376,7 @@ pub(super) async fn exec_mark(
     )
     .await;
     // `git bisect bad|good` EXITS 1 on the step that finds the culprit —
-    // verified empirically, not assumed (ADR 0129 §1). Exit code alone
+    // verified empirically, not assumed (ADR 0130 §1). Exit code alone
     // cannot distinguish "found it" from "the command failed"; `discover`'s
     // candidate-range computation is what decides, never the code or git's
     // printed sentence.

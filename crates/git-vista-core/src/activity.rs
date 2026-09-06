@@ -55,7 +55,7 @@ pub enum ActivityKind {
     /// A bisect step run externally (a human typing `git bisect` in a
     /// terminal) does NOT arrive here — its reflog trace is a bare
     /// `checkout: moving from X to Y`, indistinguishable from an ordinary
-    /// checkout by text (verified; see ADR 0129 §6), so it classifies as
+    /// checkout by text (verified; see ADR 0130 §6), so it classifies as
     /// [`Self::Checkout`] via [`parse_reflog_message`] like any other
     /// external HEAD move. This variant exists only for the app's own,
     /// fully-understood actions, which always call the journal with an
