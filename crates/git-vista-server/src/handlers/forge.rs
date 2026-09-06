@@ -92,9 +92,14 @@ fn service() -> &'static ForgeService {
     SERVICE.get_or_init(ForgeService::new)
 }
 
-/// Mapping accepts only a normalized github.com owner/repo pair. API and web
-/// links are constructed here; neither browser input nor upstream links supply
-/// a credential destination. Path/query/fragment injection is rejected.
+/// Validate the complete configured origin before constructing API/web links.
+/// Browser input and upstream links never supply a credential destination.
+fn repository_at(path: &std::path::Path) -> Option<ForgeRepository> {
+    git_vista_git::origin_url(path)
+        .as_deref()
+        .and_then(repository_from_remote)
+}
+
 fn repository_from_remote(remote: &str) -> Option<ForgeRepository> {
     let path = if remote.contains("://") {
         let url = Url::parse(remote).ok()?;
@@ -182,11 +187,11 @@ pub(crate) async fn pulls(
     let Ok(_request) = svc.requests.clone().try_acquire_owned() else {
         return Ok(response(empty(query.page, Availability::Unavailable)));
     };
-    let base = tokio::task::spawn_blocking(move || git_vista_git::origin_url(&path))
+    let mapped = tokio::task::spawn_blocking(move || repository_at(&path))
         .await
         .ok()
         .flatten();
-    let Some(repo) = base.as_deref().and_then(repository_from_remote) else {
+    let Some(repo) = mapped else {
         return Ok(response(empty(query.page, Availability::Unsupported)));
     };
     if let Some(seconds) = svc.retry_after() {

@@ -147,6 +147,7 @@ async fn http_adapter_transmits_token_only_as_header_and_returns_no_store_summar
     let request = task.await.unwrap();
     assert!(request.contains(&format!("authorization: Bearer {token}\r\n")));
     assert!(!request.lines().next().unwrap().contains(&token));
+    assert!(request.contains("x-github-api-version: 2026-03-10\r\n"));
 }
 
 #[tokio::test]
@@ -314,7 +315,24 @@ fn actual_origin_config_is_validated_before_lossy_display_normalization() {
             .unwrap()
             .status
             .success());
-        let raw = git_vista_git::origin_url(dir.path()).unwrap();
-        assert_eq!(repository_from_remote(&raw).is_some(), accepted, "{remote}");
+        assert_eq!(repository_at(dir.path()).is_some(), accepted, "{remote}");
     }
+}
+
+#[tokio::test]
+async fn successful_last_quota_response_stays_ready_and_starts_cooldown() {
+    let svc = ForgeService::new();
+    let (url, task) = upstream(
+        200,
+        "X-RateLimit-Remaining: 0\r\nRetry-After: 120\r\n",
+        FIXTURE,
+    )
+    .await;
+    let page = fetch_page(&fixture_client(), url, repo(), 1, None, &svc).await;
+    assert_eq!(page.availability, Availability::Ready);
+    assert_eq!(page.pulls.len(), 2);
+    assert!(svc
+        .retry_after()
+        .is_some_and(|seconds| (119..=121).contains(&seconds)));
+    task.await.unwrap();
 }
