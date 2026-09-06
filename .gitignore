@@ -13,6 +13,15 @@
 # Trunk build output for the Leptos frontend
 /crates/git-vista/dist
 
+# `./dev testbed`'s isolated per-worktree XDG_STATE_HOME (see `dev`'s
+# cmd_testbed) — the one place `state::state_dir()` can resolve INSIDE a
+# checkout of this repo instead of the user's real `~/.local/state`. From
+# #583 (M13.02) onward that directory can hold `github-token`, the
+# token-storage tier-3 fallback file — added here in the same commit that
+# added the code that can first write it, per that issue's acceptance
+# criterion, not after.
+/.state/
+
 # Claude Code local settings (machine-specific permissions), including the
 # transient `*.tmp.<pid>.<hash>` files it writes while updating them.
 .claude/settings.local.json
