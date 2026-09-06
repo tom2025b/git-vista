@@ -595,6 +595,16 @@ fn api_router(
             )
             // ADR 0009: re-scan the configured repo root without a restart.
             .route("/api/rescan", post(rescan))
+            // M13.03 (#584): the one settings surface for the GitHub token
+            // #582/#583/#586 already know how to use. `full_routes` only,
+            // deliberately — a LAN viewer has no legitimate reason to learn
+            // whether the operator has configured a token at all, masked or
+            // not (same reasoning ADR 0005 already applies to every other
+            // write/select/clone endpoint here).
+            .route(
+                "/api/settings/token",
+                get(handlers::settings::get_token_status).post(handlers::settings::set_token),
+            )
             // Issue #18: create a branch at a commit (shells out to `git branch`).
             .route("/api/branch", post(create_branch))
             // Issue #33: create a commit on top of HEAD (shells out to `git commit`).

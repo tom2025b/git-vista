@@ -334,14 +334,20 @@ mod tests {
         // The keyring backend in this sandbox has no storage access, so this
         // exercises the real failure path store_token must report honestly
         // (unlike a read, a write failure is not folded to a quiet `None`).
-        let attempted = "ghp_wouldbeasecretifthisreallysaved0123456789";
-        if let Err(e) = store_token(attempted) {
+        // Built at runtime, like every other token-shaped fixture in this
+        // file (see `mask_token_keeps_only_the_last_four_characters` above)
+        // — a literal here would be a real-length `ghp_` token shape in
+        // tracked source, which the credential tripwire (#586, ADR 0123)
+        // and gitleaks' own full-history scan both exist to catch, even
+        // though the value itself grants access to nothing.
+        let attempted = format!("ghp_{}", "wouldbeasecretifthisreallysaved0123456789");
+        if let Err(e) = store_token(&attempted) {
             let message = match &e {
                 StoreTokenError::Blank => String::new(),
                 StoreTokenError::Keyring(reason) => reason.clone(),
             };
             assert!(
-                !message.contains(attempted),
+                !message.contains(&attempted),
                 "a keyring failure message echoed the attempted token: {message}"
             );
         }
