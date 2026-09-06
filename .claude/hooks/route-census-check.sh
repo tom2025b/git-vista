@@ -11,7 +11,7 @@
 # fired, ran the one test it knew about, and said nothing about the second
 # table, which only failed later in CI's `M1.06 write contract +` job. Now
 # also runs `route_authz_and_write_contract_agree_on_every_post_route`
-# (ADR 0131's meta-census, which reads both tables directly) so an edit to
+# (ADR 0134's meta-census, which reads both tables directly) so an edit to
 # either side of that relationship gets checked against the other at edit
 # time, not merge time.
 set -uo pipefail

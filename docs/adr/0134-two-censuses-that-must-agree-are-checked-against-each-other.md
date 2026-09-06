@@ -1,4 +1,4 @@
-# ADR 0131 — Two censuses that must agree are checked against each other
+# ADR 0134 — Two censuses that must agree are checked against each other
 
 - **Status:** Accepted — implemented, mutation-proved two ways failing differently
 - **Date:** 2026-09-06
