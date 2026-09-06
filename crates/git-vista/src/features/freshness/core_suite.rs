@@ -715,10 +715,11 @@ fn the_dialog_offers_the_rebuild_it_talks_about_and_asks_core_which_plan() {
          actually moved during the two awaits"
     );
     assert!(
-        lease.rfind("graph.get_untracked().epoch()") > lease.find(".await"),
-        "the second epoch read must come after the awaits, not before — two \
-         reads that both happen at mint time are still comparing the \
-         click-time value against itself"
+        lease.rfind("graph.get_untracked().epoch()") > lease.rfind(".await"),
+        "the second epoch read must come after the LAST await, not just the \
+         first — a read slipped between the two internal requests is still \
+         comparing a value captured before the second one settles, which is \
+         the same class of stale-by-construction bug one await earlier"
     );
     assert_eq!(
         lease.matches("rebuild_commit(").count(),
