@@ -685,6 +685,8 @@ pub fn App() -> impl IntoView {
     // The settings surface (M13.03, #584): the button sits in the topbar,
     // like the two above, for the same reason — outside the graph canvas.
     let settings_open = create_rw_signal(false);
+    let forge_open = create_rw_signal(false);
+    let forge_repo = Signal::derive(move || frame().and_then(|f| f.worktree_id));
 
     // ADR 0006: ask every time — the repo picker opens on load (the sign-in and
     // protocol overlays sit above it when they apply) and from the topbar
@@ -872,6 +874,9 @@ pub fn App() -> impl IntoView {
                         }
                     }}
                 </button>
+                <Show when=move || !session_state::is_lan()>
+                    <button class="refresh" on:click=move |_| forge_open.set(true)>"Pull requests"</button>
+                </Show>
                 <button
                     class="refresh"
                     on:click=move |_| {
@@ -1066,6 +1071,7 @@ pub fn App() -> impl IntoView {
             {dialogs::reset_repo_view(reset_open, dialogs_guard, graph)}
             // The settings surface (M13.03, #584), factored into `dialogs`.
             {dialogs::settings_view(settings_open, dialogs_guard)}
+            {crate::features::forge::view::forge_view(forge_open, forge_repo)}
             // The repo picker + mode screens (ADR 0006): blocking overlays under
             // the sign-in/protocol screens, over everything else.
             {crate::picker::picker_view(picker_open, mode_for, open_url, clone_url, dialogs_guard, graph)}

@@ -130,8 +130,8 @@ pub(crate) fn expose_paths() -> bool {
 /// crate writes — the whole design (`sandbox::network_exec::network_command_with_credential`)
 /// exists so this value's only destinations are one child process's
 /// environment and, from there, one HTTPS request's Basic-auth header,
-/// something no HTTP client in this codebase constructs directly (see ADR
-/// 0122, #587).
+/// for Git transfers (ADR 0122). The read-only forge handler also consumes
+/// this interface for a fixed-origin HTTPS API header (ADR 0133).
 pub(crate) fn credential_token() -> Option<String> {
     crate::token_store::resolve_token().map(|(token, _source)| token)
 }

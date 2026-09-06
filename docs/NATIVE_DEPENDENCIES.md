@@ -21,3 +21,13 @@ a step in CI's `audit` job.
    *depends* on `libc` does not belong here.
 2. Add it to `KERNEL_API_CRATES` in `crates/git-vista-server/src/sandbox/deps.rs`.
 3. Add a row here, in the same commit, with a real alternative considered.
+
+### Read-only forge HTTPS (#89, ADR 0133)
+
+`git-vista-server` now depends on `reqwest` 0.12 with default features disabled
+and `rustls-tls` enabled. HTTPS uses Rustls and its `ring` cryptography backend;
+`ring` builds its bundled C/assembly through `cc`, so the existing native C
+compiler toolchain remains required. There is no OpenSSL/libssl development
+package requirement. The dependency is server-only and is absent from the wasm
+frontend's dependency path. The adapter disables redirects and ambient proxies,
+uses fixed API destinations, and marks authorization values sensitive.

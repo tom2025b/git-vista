@@ -76,6 +76,7 @@ pub(crate) mod repository_events;
 pub(crate) mod reset;
 pub(crate) mod select;
 // M13.03 (#584): the one settings surface — GET/POST the GitHub token.
+pub(crate) mod forge;
 pub(crate) mod settings;
 pub(crate) mod staging;
 pub(crate) mod stash;

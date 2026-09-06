@@ -572,6 +572,7 @@ fn api_router(
     // exist at all.
     if full_routes {
         api = api
+            .route("/api/forge/pulls", get(handlers::forge::pulls))
             // Phase 12: clone a public URL into a temp dir and view it read-only.
             .route("/api/clone", post(clone_repo))
             // #263: what happened to a clone attempt admitted under an
@@ -870,6 +871,13 @@ fn api_router(
         // The profile is a property of the listener, not of any one handler.
         // Stamp it at the router boundary so every registered API response
         // declares the capability table that served it.
+        // Error-envelope rewriting can replace the auth layer's response.
+        // Stamp no-store outside it so private provider reads and refusals
+        // retain the same cache policy as successful local reads.
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ))
         .layer(SetResponseHeaderLayer::overriding(
             header::HeaderName::from_static(LISTENER_PROFILE_HEADER),
             HeaderValue::from_static(listener_profile.as_header_value()),
@@ -921,6 +929,13 @@ fn build_app(
         // That is the live LAN failure shape: POST /api/select falls through
         // to the file service and receives an ordinary 405.  The response must
         // still say which listener profile produced it.
+        // Error-envelope rewriting can replace the auth layer's response.
+        // Stamp no-store outside it so private provider reads and refusals
+        // retain the same cache policy as successful local reads.
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ))
         .layer(SetResponseHeaderLayer::overriding(
             header::HeaderName::from_static(LISTENER_PROFILE_HEADER),
             HeaderValue::from_static(listener_profile.as_header_value()),
@@ -1148,7 +1163,7 @@ mod tests {
         // must not be able to ask for one — ADR 0005 says the route is never
         // *built* on this router, and a 404 is what proves that (a 403 would
         // mean it exists and something gated it).
-        for path in ["/api/commit", "/api/plan"] {
+        for path in ["/api/commit", "/api/plan", "/api/forge/pulls"] {
             let resp = router
                 .clone()
                 .oneshot(
@@ -1218,6 +1233,46 @@ mod tests {
                 "{path} is not registered on the loopback router"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn forge_route_requires_session_and_validates_page_before_resolving_credentials() {
+        let sessions = Arc::new(SessionManager::new(None));
+        let token = sessions.current_bootstrap();
+        let router = api_router(
+            SessionState {
+                manager: sessions,
+                via_lan: false,
+                rate_limiter: None,
+            },
+            HostPolicy::loopback(PORT),
+            true,
+            Arc::new(CursorCodec::new()),
+            test_request_token_resolver(),
+        );
+        let request = |cookie: Option<String>| {
+            let mut req = Request::builder()
+                .uri("/api/forge/pulls?page=0")
+                .header(header::HOST, "localhost:8080")
+                .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string());
+            if let Some(cookie) = cookie {
+                req = req.header(header::COOKIE, cookie);
+            }
+            req.body(Body::empty()).unwrap()
+        };
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(request(None))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let cookie = bootstrap_cookie(router.clone(), "localhost:8080", &token).await;
+        let response = router.oneshot(request(Some(cookie))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     }
 
     /// M2.21b (#236) end to end: a real request through the real router — auth
