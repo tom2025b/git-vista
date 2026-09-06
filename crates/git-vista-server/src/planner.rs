@@ -36,7 +36,7 @@ use std::process::Output;
 use axum::http::StatusCode;
 use sha2::{Digest, Sha256};
 
-use git_vista_core::activity::{ActivityKind, HeadAtEvent};
+use git_vista_core::activity::ActivityKind;
 use git_vista_core::identity::{GenerationInputs, RepositoryHandle, RepositoryId, WorktreeId};
 use git_vista_core::seed::{parse_seed, Seed};
 use git_vista_protocol::{branch_holder, BranchHolder, Serviceable, WorktreeCensus};
@@ -1693,16 +1693,7 @@ async fn refs_reading(
     let repo = repo.to_path_buf();
     tokio::task::spawn_blocking(move || match git_vista_git::read_refs_at(&repo) {
         Ok(read) => {
-            let head_branch = match read.head {
-                HeadAtEvent::OnBranch { symbolic, .. } | HeadAtEvent::Unborn { symbolic } => {
-                    gix::refs::FullName::try_from(symbolic)
-                        .ok()
-                        .map(|name| name.shorten().to_string())
-                }
-                HeadAtEvent::Detached { .. }
-                | HeadAtEvent::Unresolvable
-                | HeadAtEvent::Unreadable { .. } => None,
-            };
+            let head_branch = read.head_branch;
             let refs = read.refs;
             let digest = refs
                 .iter()
