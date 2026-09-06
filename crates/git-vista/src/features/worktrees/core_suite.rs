@@ -453,6 +453,34 @@ fn the_open_button_uses_the_worktree_route() {
     );
 }
 
+/// #676's fourth site — grok's review of PR #677 found this one:
+/// `confirm_modal_view` mounts inside the canvas, `Shell`'s `confirm_op`
+/// lives above it, and `force_bump` unmounts/remounts the canvas — so a
+/// confirmation left open when this button is pressed can come back
+/// looking current on the desk this button just opened, exactly the
+/// failure item C exists to prevent. `picker.rs`, `dialogs/confirm.rs` and
+/// `dialogs/open_url.rs` each got a `repo_selection_teardown_census`
+/// assertion for the same shape; this file already reads `view.rs` as
+/// bytes for [`the_open_button_uses_the_worktree_route`], so the fourth
+/// site is an assertion here rather than a new census module.
+#[test]
+fn the_open_button_closes_confirm_before_bumping() {
+    let anchor_pos = VIEW
+        .find("select_worktree_request(&id, mode).await")
+        .expect("open_button's selection call moved — re-pin this test against the new shape");
+    let after_anchor = &VIEW[anchor_pos..];
+    let bump_pos = after_anchor
+        .find("g.force_bump();")
+        .expect("no `g.force_bump();` found after open_button's selection outcome");
+    let window = &after_anchor[..bump_pos];
+    assert!(
+        window.contains("shell.close_confirm();"),
+        "open_button's `Ok` arm no longer calls `shell.close_confirm()` before \
+         `force_bump()` — a confirmation left open here would show a plan against \
+         the desk the user just left, remounted onto the one just opened (#676)"
+    );
+}
+
 /// #65's 44x44 floor. `.act-undo` already carries it and its `:focus-visible`
 /// twin; a new class would need its own entry in `features::a11y::audit`'s
 /// `INTERACTIVE_CENSUS`, and this asserts the drawer did not quietly grow one.
