@@ -637,6 +637,14 @@ pub fn App() -> impl IntoView {
     // preview reply may paint lives inside it, and a rebuild would reset it to
     // zero and re-admit the stale answer it exists to drop.
     let preview = crate::features::preview::signals::Preview::new();
+    // M12.05 (#555): the repository change feed. Created here for the same
+    // reason as the handles above it, and connected immediately — the feed
+    // exists only while a client stream holds it, so nothing runs on the server
+    // until this line does. A tab that reconnects gets the current snapshot as
+    // its first event rather than waiting for a transition that already
+    // happened.
+    let freshness = crate::features::freshness::signals::Freshness::new();
+    freshness.connect();
     let features = Features {
         graph,
         dialogs: dialogs_guard,
@@ -646,6 +654,7 @@ pub fn App() -> impl IntoView {
         stash,
         compare_anchor,
         preview,
+        freshness,
     };
     let settings = Settings {
         nerd_icons,
@@ -1031,6 +1040,7 @@ pub fn App() -> impl IntoView {
                 dialogs_guard,
                 graph,
                 mode_for,
+                shell,
             )}
             // The "Reset Test Repo" confirmation (only reachable via the gated
             // topbar button above).
@@ -1038,7 +1048,7 @@ pub fn App() -> impl IntoView {
             // The repo picker + mode screens (ADR 0006): blocking overlays under
             // the sign-in/protocol screens, over everything else.
             {crate::picker::picker_view(picker_open, mode_for, open_url, clone_url, dialogs_guard, graph)}
-            {crate::picker::mode_view(mode_for, picker_open, graph)}
+            {crate::picker::mode_view(mode_for, picker_open, graph, shell)}
             {move || {
                 (shell.detail_id().is_some() && sheet.placement().is_sheet()).then(|| view! {
                     <div

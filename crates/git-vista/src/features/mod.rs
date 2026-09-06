@@ -33,6 +33,8 @@ pub mod core_traits;
 
 pub mod a11y;
 pub mod activity;
+// M5.33 (#86): rename-aware file history and blame.
+pub mod blame;
 // No `conflicts` module here any more. M4.31's four-pane view model and its
 // marker-file block editor moved to the `git-vista-conflicts` crate for
 // M10.07 (#462; ADR 0105), so the terminal client resolves conflicts through
@@ -42,6 +44,9 @@ pub mod activity;
 pub mod dialogs;
 pub mod diff;
 pub mod explain;
+// M12.05 (#555): is the plan on screen still true? The decision and its
+// sentences are host-tested in `core`; `signals` is the one EventSource.
+pub mod freshness;
 pub mod graph;
 // #612: the graph panel's load phase. The signal lives in the `App` shell
 // (wasm-only); the three rules that move it are here, where a host test runs

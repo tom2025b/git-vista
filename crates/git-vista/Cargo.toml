@@ -82,5 +82,9 @@ web-sys = { version = "0.3", features = [
     # over-reports while the URL bar is expanded), so the menu is clamped
     # against what's actually visible.
     "VisualViewport",
+    # #591: `window.matchMedia("(prefers-reduced-motion: reduce)")`, so the
+    # preview animation can degrade to its resting frame instead of playing
+    # for a user who asked the platform for less motion.
+    "MediaQueryList",
 ] }
 gloo-net = { version = "0.7.0", default-features = false, features = ["http", "json"] }

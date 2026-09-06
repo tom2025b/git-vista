@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use axum::http::StatusCode;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
+use crate::planner::RunFailure;
 use git_vista_core::identity::RepositoryId;
 
 /// One async guard per shared repository, created on first use.
@@ -137,6 +138,7 @@ pub(crate) async fn refuse_if_git_busy(repo: &Path) -> Option<(StatusCode, Strin
         // function is that the lock it looks for is git's, not ours.
         Err(e) => Some(crate::planner::couldnt_run(
             "busy preflight",
+            RunFailure::ResolveGitDirectory,
             &format!(
                 "couldn't resolve the git directory of {}: {e}",
                 repo.display()

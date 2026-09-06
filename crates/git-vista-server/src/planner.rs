@@ -492,6 +492,28 @@ pub(crate) async fn plan_and_execute_in(
     op: GitOperation,
     proof: DropProof,
 ) -> (StatusCode, String) {
+    // M12.04 (#554): publish what this write left behind — and publish it
+    // *after* the write, through a wrapper the write cannot skip. Nothing here
+    // records "what I wrote"; the wrapper asks the feed to read the world and
+    // publish whatever it finds, so an external change that landed alongside
+    // this one is announced rather than swallowed. A write that panics never
+    // reaches the wrapper's publish and therefore records nothing, which leaves
+    // the next ordinary sweep free to announce it. See `reconciliation`'s
+    // module doc for why that is the whole mechanism.
+    crate::reconciliation::with_publish(
+        repo,
+        plan_and_execute_within(repo, repo_id, tokens, op, proof),
+    )
+    .await
+}
+
+async fn plan_and_execute_within(
+    repo: &Path,
+    repo_id: Option<RepositoryId>,
+    tokens: (RepositoryToken, WorktreeToken),
+    op: GitOperation,
+    proof: DropProof,
+) -> (StatusCode, String) {
     // The stage reports are no-ops unless this pipeline is running under a
     // tracked operation (M1.08), so the seam the test suites drive is
     // unchanged. `Waiting` is reported *before* the guard on purpose: it is the
@@ -656,6 +678,17 @@ pub(crate) async fn submit_plan(
     tokens: (RepositoryToken, WorktreeToken),
     plan: Plan,
 ) -> (StatusCode, String) {
+    // M12.04 (#554), same wrapper and same reason as `plan_and_execute_in`:
+    // the *other* path a write can take out of this module.
+    crate::reconciliation::with_publish(repo, submit_plan_within(repo, repo_id, tokens, plan)).await
+}
+
+async fn submit_plan_within(
+    repo: &Path,
+    repo_id: Option<RepositoryId>,
+    tokens: (RepositoryToken, WorktreeToken),
+    plan: Plan,
+) -> (StatusCode, String) {
     let (repository, worktree) = tokens;
     if plan.repository != repository || plan.worktree != worktree {
         return (
@@ -780,6 +813,7 @@ pub(crate) async fn resolve_commit_oid(
         // and it would send them to fix a request that is probably fine.
         Err(e) => Err(couldnt_run(
             "resolve_commit_oid",
+            RunFailure::ResolveCommit,
             &format!("couldn't resolve ‘{given}’: {e}"),
         )),
     }
@@ -1299,6 +1333,147 @@ async fn proof_holds(repo: &Path, proof: &DropProof) -> Result<(), (StatusCode, 
 /// Async since #60: the ref read below is synchronous filesystem work and now
 /// runs on a blocking thread instead of an async worker.
 async fn generation_token(repo: &Path, observed: &Observed) -> GenerationToken {
+    fold_generation(observed, &read_generation_parts(repo).await)
+}
+
+/// Everything [`fold_generation`] digests apart from the [`Observed`] it is
+/// handed, read **once, together** (M12.03, #553).
+///
+/// # Why this is a struct rather than three awaits inside the fold
+///
+/// The change feed's sweep needs two things out of one reading: the token, and
+/// the ref values the token was folded from — so it can say *which* ref moved
+/// without reading the ref store a second time a few milliseconds later. Two
+/// reads would be two instants, and a delta computed across them can name a ref
+/// that did not move in the interval the token describes, or miss one that did.
+///
+/// So the reading is a value and the fold is pure. `generation_token` is the
+/// same function it always was, expressed as "read, then fold"; the feed uses
+/// the same two steps and keeps the middle. There is exactly one recipe, which
+/// is the property `staging.rs:26-35` records the cost of losing.
+struct GenerationParts {
+    /// `(digest field name, value)` pairs, in `read_refs` order — byte-for-byte
+    /// what the digest has always been folded from.
+    refs: Vec<(String, String)>,
+    /// The same refs as full ref names (`refs/heads/main`, `HEAD`) mapped to
+    /// their targets, from the same read. Not a digest input; the feed's delta
+    /// is computed from it.
+    named_refs: std::collections::BTreeMap<String, String>,
+    /// `false` when the ref store could not be opened at all.
+    ///
+    /// The digest does not change behaviour on this — an unreadable ref store
+    /// still digests as "no ref fields", which is finding F2 in
+    /// `m3.26-external-changes.md` and is not this milestone's to fix. What
+    /// this field does is stop the **feed** inheriting it: a sweep that could
+    /// not read the refs must say "couldn't tell", never "nothing changed".
+    refs_read: bool,
+    stash: DigestInput,
+    merge_ff: DigestInput,
+}
+
+/// One digest input, plus whether it is a real reading or the tagged
+/// `unreadable\0<second>` placeholder.
+///
+/// The placeholder is deliberately *different every second* so an unreadable
+/// input invalidates every plan (see [`stash_digest_input`]). That is right for
+/// the staleness gate and wrong for a change feed read literally: a token that
+/// differs every second is not evidence that anything moved. Carrying the
+/// distinction is what lets the feed publish `Blind` instead of announcing a
+/// change per second.
+struct DigestInput {
+    value: String,
+    read: bool,
+}
+
+async fn read_generation_parts(repo: &Path) -> GenerationParts {
+    let (refs, named_refs, refs_read) = refs_reading(repo).await;
+    GenerationParts {
+        refs,
+        named_refs,
+        refs_read,
+        stash: stash_digest_input(repo).await,
+        merge_ff: merge_ff_digest_input(repo).await,
+    }
+}
+
+/// One complete live reading of the repository's generation (M12.03, #553) —
+/// the token, the refs it was folded from, everything else it was folded from,
+/// and whether any of it was a placeholder for something that could not be read.
+///
+/// This is the change feed's only way to learn the repository's state, and it
+/// deliberately hands back **the same reading** the token came from rather than
+/// a token plus an invitation to go and look again.
+pub(crate) struct LiveReading {
+    /// The planner-recipe generation — the same token `Plan::generation`
+    /// carries and [`enforce_fresh`] compares. Meaningless while `blind` is
+    /// `Some`, because two of its inputs then carry a nonce or a timestamp and
+    /// differ on every reading whether or not anything moved.
+    pub(crate) token: GenerationToken,
+    /// Full ref name → target oid, from the same read the token folded.
+    pub(crate) refs: std::collections::BTreeMap<String, String>,
+    /// Everything in the digest that is not a ref — HEAD's branch and tip, the
+    /// stash, `merge.ff`, and the worktree status — as one value that can be
+    /// compared for equality against the previous reading's.
+    ///
+    /// One opaque string rather than five fields because the feed asks exactly
+    /// one question of it: *did anything here move?* Splitting it would invite
+    /// a consumer to act on which one, and "the stash moved" is not a
+    /// distinction any panel draws.
+    pub(crate) other: String,
+    /// `Some(reason)` when at least one input could not be read at all. The
+    /// sweep publishes this as `Blind` rather than as a change: a token that
+    /// differs every second because git cannot be run is not evidence that the
+    /// repository moved.
+    pub(crate) blind: Option<String>,
+}
+
+/// Read the live generation and keep the parts (M12.03, #553).
+///
+/// Built from [`observe_live_for_generation`] and [`read_generation_parts`],
+/// which is exactly the pair the post-execution generation and the stash pop's
+/// freshness check already use — so this mints the planner recipe by *calling*
+/// it, never by reproducing it. `m3.26-external-changes.md` D4 records what
+/// minting a look-alike costs: a sixth generation namespace that "409s forever,
+/// never admits".
+pub(crate) async fn live_reading(repo: &Path) -> LiveReading {
+    let observed = observe_live_for_generation(repo).await;
+    let parts = read_generation_parts(repo).await;
+    let blind = if !parts.refs_read {
+        Some("the ref store could not be read".to_string())
+    } else if observed.head_tip.is_unknown() {
+        Some("HEAD could not be read".to_string())
+    } else if observed.status.is_unknown() {
+        Some("git status could not be run".to_string())
+    } else if !parts.stash.read {
+        Some("refs/stash could not be read".to_string())
+    } else if !parts.merge_ff.read {
+        Some("the merge.ff setting could not be read".to_string())
+    } else {
+        None
+    };
+    // Read before the fold, and from the same `observed`: `Obs::digest_field`
+    // mints a fresh nonce on every call for `Unknown`, so these two strings
+    // disagree about an unreadable input by construction. That is harmless
+    // precisely because `blind` is `Some` in exactly that case and the sweep
+    // publishes neither value.
+    let other = format!(
+        "head\u{0}{}\u{0}{}\u{0}stash\u{0}{}\u{0}merge_ff\u{0}{}\u{0}status\u{0}{}",
+        observed.head_branch.as_deref().unwrap_or(""),
+        observed.head_tip.digest_field(),
+        parts.stash.value,
+        parts.merge_ff.value,
+        observed.status.digest_field(),
+    );
+    LiveReading {
+        token: fold_generation(&observed, &parts),
+        refs: parts.named_refs.clone(),
+        other,
+        blind,
+    }
+}
+
+/// The pure fold — the one place the generation recipe is written down.
+fn fold_generation(observed: &Observed, parts: &GenerationParts) -> GenerationToken {
     let mut inputs = GenerationInputs::new();
     // D5: each observation contributes a *tagged* field, so "git said the ref
     // is not there" and "git could not be asked" are different digests — and
@@ -1311,8 +1486,8 @@ async fn generation_token(repo: &Path, observed: &Observed) -> GenerationToken {
             observed.head_tip.digest_field()
         ),
     );
-    for (name, target) in refs_digest_input(repo).await {
-        inputs.field(name, target);
+    for (name, target) in &parts.refs {
+        inputs.field(name.clone(), target.clone());
     }
     // refs/stash, explicitly (M3.24, #77).
     //
@@ -1328,7 +1503,7 @@ async fn generation_token(repo: &Path, observed: &Observed) -> GenerationToken {
     // selector in it addressed a different entry, because dropping renumbers
     // the list. Caught by a test written for #77's "generation updates are
     // correct" criterion, not by inspection.
-    inputs.field("stash", stash_digest_input(repo).await);
+    inputs.field("stash", parts.stash.value.clone());
     // `merge.ff`, explicitly (#576 finding 9).
     //
     // Every other input here is something a ref, the stash or the worktree can
@@ -1345,7 +1520,7 @@ async fn generation_token(repo: &Path, observed: &Observed) -> GenerationToken {
     // the token is only ever compared for equality across those call sites. A
     // token that meant different things depending on which caller built it
     // would not be comparable at all.
-    inputs.field("merge_ff", merge_ff_digest_input(repo).await);
+    inputs.field("merge_ff", parts.merge_ff.value.clone());
     inputs.field("status", observed.status.digest_field());
     GenerationToken::new(inputs.generation().to_string())
         .expect("a RepositoryGeneration displays as non-empty decimal")
@@ -1388,11 +1563,20 @@ async fn read_head_branch_blocking(repo: &Path) -> Option<String> {
 /// whole seconds, so two reads inside one second while the stash stays
 /// unreadable do digest identically. See [`merge_ff_digest_input`], which
 /// carries the same construction and spells out why that is benign here.
-async fn stash_digest_input(repo: &Path) -> String {
+async fn stash_digest_input(repo: &Path) -> DigestInput {
     match rev_parse_ref_unpeeled(repo, "refs/stash").await {
-        Ok(Some(oid)) => format!("at\u{0}{oid}"),
-        Ok(None) => "absent".to_string(),
-        Err(_) => format!("unreadable\u{0}{}", crate::activity::now_secs()),
+        Ok(Some(oid)) => DigestInput {
+            value: format!("at\u{0}{oid}"),
+            read: true,
+        },
+        Ok(None) => DigestInput {
+            value: "absent".to_string(),
+            read: true,
+        },
+        Err(_) => DigestInput {
+            value: format!("unreadable\u{0}{}", crate::activity::now_secs()),
+            read: false,
+        },
     }
 }
 
@@ -1434,14 +1618,21 @@ async fn stash_digest_input(repo: &Path) -> String {
 /// wording `stash_digest_input` already produces for the same reason, and it
 /// fails closed; a message bound to the cause would need a channel this
 /// function does not have.
-async fn merge_ff_digest_input(repo: &Path) -> String {
+async fn merge_ff_digest_input(repo: &Path) -> DigestInput {
+    let unreadable = || DigestInput {
+        value: format!("unreadable\u{0}{}", crate::activity::now_secs()),
+        read: false,
+    };
     // Local (D3): reading config touches no socket.
     let out = match run_git(repo, NetworkNeed::Local, &["config", "--get", "merge.ff"]).await {
         Ok(out) => out,
-        Err(_) => return format!("unreadable\u{0}{}", crate::activity::now_secs()),
+        Err(_) => return unreadable(),
     };
     match out.status.code() {
-        Some(1) => "absent".to_string(),
+        Some(1) => DigestInput {
+            value: "absent".to_string(),
+            read: true,
+        },
         Some(0) => {
             // `--get` prints the value and one newline; the value may legally
             // contain trailing whitespace of its own, so exactly one trailing
@@ -1449,26 +1640,76 @@ async fn merge_ff_digest_input(repo: &Path) -> String {
             // reading `fast_forward_policy` performs.
             let printed = String::from_utf8_lossy(&out.stdout).into_owned();
             let raw = printed.strip_suffix('\n').unwrap_or(&printed);
-            format!("known\u{0}{raw}")
+            DigestInput {
+                value: format!("known\u{0}{raw}"),
+                read: true,
+            }
         }
-        _ => format!("unreadable\u{0}{}", crate::activity::now_secs()),
+        _ => unreadable(),
     }
 }
 
-/// Every ref as `(digest field name, target oid)`, read off the async workers.
-/// Shaped for [`generation_token`]'s digest so the blocking read happens once,
-/// in one place, rather than a `Refs` value being held across an await.
-async fn refs_digest_input(repo: &Path) -> Vec<(String, String)> {
+/// Every ref, three ways, from **one** blocking read off the async workers:
+/// the `(digest field name, target oid)` pairs [`fold_generation`] digests, the
+/// same refs under their full names for the change feed's delta, and whether
+/// the ref store could be opened at all.
+///
+/// Shaped for the digest so the blocking read happens once, in one place,
+/// rather than a `Refs` value being held across an await.
+///
+/// # The full names are reconstructed, and that is a decision
+///
+/// `read_refs` shortens three namespaces into one display namespace on purpose
+/// — `refs/heads/main` and `refs/tags/main` both arrive as `name: "main"`, told
+/// apart only by `kind` (see `GitRef::is_branch`'s neighbours in
+/// `git-vista-core`). The change feed's consumer compares against
+/// `Plan::expected_ref_changes`, whose `ref_name` is a **full** ref name, so
+/// the namespace has to be put back. It is put back from `kind`, which is the
+/// field that carries it, and never from the shape of the name.
+///
+/// Refs outside those three namespaces (`refs/stash`, `refs/notes/*`) are not
+/// in `read_refs` at all and so are not in this map. That is not a hole the
+/// feed falls through: `refs/stash` is a digest input in its own right
+/// ([`stash_digest_input`]), and anything else that moves without appearing
+/// here moves the token while naming no ref — which the feed publishes as
+/// "something else moved", the conservative reading.
+async fn refs_reading(
+    repo: &Path,
+) -> (
+    Vec<(String, String)>,
+    std::collections::BTreeMap<String, String>,
+    bool,
+) {
     let repo = repo.to_path_buf();
     tokio::task::spawn_blocking(move || match git_vista_git::read_refs(&repo) {
-        Ok(refs) => refs
-            .iter()
-            .map(|r| (format!("ref:{:?}:{}", r.kind, r.name), r.target.0.clone()))
-            .collect(),
-        Err(_) => Vec::new(),
+        Ok(refs) => {
+            let digest = refs
+                .iter()
+                .map(|r| (format!("ref:{:?}:{}", r.kind, r.name), r.target.0.clone()))
+                .collect();
+            let named = refs
+                .iter()
+                .map(|r| (full_ref_name(r), r.target.0.clone()))
+                .collect();
+            (digest, named, true)
+        }
+        // F2 (`m3.26-external-changes.md`): the digest treats an unreadable ref
+        // store as "no refs", which is fail-open and is not this milestone's to
+        // fix. The `false` is what stops the change feed inheriting it.
+        Err(_) => (Vec::new(), std::collections::BTreeMap::new(), false),
     })
     .await
-    .unwrap_or_default()
+    .unwrap_or_else(|_| (Vec::new(), std::collections::BTreeMap::new(), false))
+}
+
+/// One display ref put back into its full ref namespace, from `kind`.
+fn full_ref_name(r: &git_vista_core::model::GitRef) -> String {
+    match r.kind {
+        git_vista_core::model::RefKind::Head => "HEAD".to_string(),
+        git_vista_core::model::RefKind::Branch => format!("refs/heads/{}", r.name),
+        git_vista_core::model::RefKind::RemoteBranch => format!("refs/remotes/{}", r.name),
+        git_vista_core::model::RefKind::Tag => format!("refs/tags/{}", r.name),
+    }
 }
 
 /// Record one successful app operation in the journal, off the async workers.
@@ -1621,6 +1862,7 @@ async fn enforce_fresh(
     if unknown {
         return Err(couldnt_run(
             "staleness gate",
+            RunFailure::VerifyPlan,
             &"couldn't read the repository's state, so this plan cannot be \
               re-verified before executing",
         ));
@@ -1832,6 +2074,7 @@ fn collision_refusal(
         // this feature replaces.
         BranchHolder::Unknown(reason) => couldnt_run(
             &format!("precondition on ‘{branch}’"),
+            RunFailure::VerifyBranchHolder,
             &format!(
                 "couldn't check whether another worktree has ‘{branch}’ checked out, so this \
                  plan cannot be verified: {reason}"
@@ -1891,6 +2134,7 @@ async fn verify_precondition(
     let unreadable = |ref_name: &str, e: &ExecUnavailable| {
         Err(couldnt_run(
             &format!("precondition on ‘{ref_name}’"),
+            RunFailure::VerifyRef,
             &format!("couldn't check ‘{ref_name}’, so this plan cannot be verified: {e}"),
         ))
     };
@@ -1984,6 +2228,7 @@ async fn verify_precondition(
             // repository's.
             Obs::Unknown => Err(couldnt_run(
                 "precondition CleanWorktree",
+                RunFailure::VerifyCleanWorktree,
                 &"couldn't run git status, so the working tree cannot be verified",
             )),
         },
@@ -3557,27 +3802,28 @@ async fn run_git_hooked(
     crate::git_cmd::git_output_bounded(repo, args, need, hooked_git_timeout()).await
 }
 
-/// The uniform 500 for a git binary that couldn't be spawned, with the same
-/// per-endpoint log line the handlers printed.
+mod run_failure;
+pub(crate) use run_failure::RunFailure;
+
+/// A 500 for an unavailable execution or observation, never a git refusal.
 ///
-/// Generic over the reason since D5 (#66, Task 19): it takes the executors'
-/// `std::io::Error` exactly as before, and also
-/// [`ExecUnavailable`](crate::git_cmd::ExecUnavailable) from the gate sites,
-/// so **one** response shape covers every "git could not run" in the server.
-/// That single shape is what makes it distinguishable from a refusal: the
-/// gates that used to answer 400 ("no such branch", "not a valid object name")
-/// on this input now answer 500 here, and nothing else in the planner returns
-/// a 500 for a repository-state reason.
+/// The reason is a closed, payload-free vocabulary: callers cannot put an
+/// OS/git error (or even a formatted path) in the client-safe sentence.
+/// Every arbitrary Display value is detail, logged unconditionally and
+/// disclosed only through GIT_VISTA_EXPOSE_PATHS. See ADR 0127 and #666.
 pub(crate) fn couldnt_run<E: std::fmt::Display + ?Sized>(
     endpoint: &str,
-    e: &E,
+    reason: RunFailure,
+    detail: &E,
 ) -> (StatusCode, String) {
-    eprintln!("git-vista: {endpoint} couldn't run git: {e}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        format!("Couldn't run git: {e}"),
+        crate::state::withheld_detail(endpoint, reason.summary(), &detail.to_string()),
     )
 }
+
+#[cfg(test)]
+mod couldnt_run_suite;
 
 /// git's own explanation from stderr, or `fallback` when it said nothing.
 fn stderr_or(output: &Output, fallback: &str) -> String {
@@ -3756,6 +4002,7 @@ async fn verify_path_states(
         Err(e) => {
             return Err(couldnt_run(
                 op_name,
+                RunFailure::ReadStatus,
                 &format!("couldn't run git status: {e}"),
             ))
         }
@@ -3763,6 +4010,7 @@ async fn verify_path_states(
     if !output.status.success() {
         return Err(couldnt_run(
             op_name,
+            RunFailure::VerifyPaths,
             &"git status failed, so these paths cannot be re-verified before executing",
         ));
     }
@@ -3827,7 +4075,11 @@ async fn symlink_containment_guard(
     let rels: Vec<String> = paths.iter().map(|p| p.as_str().to_string()).collect();
     let result = tokio::task::spawn_blocking(move || -> Result<(), (StatusCode, String)> {
         let repo_canon = std::fs::canonicalize(&repo_owned).map_err(|e| {
-            couldnt_run(op_name, &format!("couldn't resolve the worktree root: {e}"))
+            couldnt_run(
+                op_name,
+                RunFailure::ResolveWorktreeRoot,
+                &format!("couldn't resolve the worktree root: {e}"),
+            )
         })?;
         for rel in &rels {
             let joined = repo_owned.join(rel);
@@ -3868,6 +4120,7 @@ async fn symlink_containment_guard(
                 Err(e) => {
                     return Err(couldnt_run(
                         op_name,
+                        RunFailure::ResolvePath,
                         &format!("couldn't resolve ‘{rel}’: {e}"),
                     ));
                 }
@@ -3880,6 +4133,7 @@ async fn symlink_containment_guard(
         Ok(inner) => inner,
         Err(join_err) => Err(couldnt_run(
             op_name,
+            RunFailure::ContainmentTask,
             &format!("containment check task panicked: {join_err}"),
         )),
     }

@@ -1,4 +1,4 @@
-# ADR 0121 — A bisect session has one owner, and it is git
+# ADR 0129 — A bisect session has one owner, and it is git
 
 - **Status:** Proposed — design settled, implementation in progress
 - **Date:** 2026-09-05

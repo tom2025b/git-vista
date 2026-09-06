@@ -99,3 +99,76 @@ fingerprints = [
   "8e2cec76183ced717792ee84ca324fee519c88c1:.github/actions/host-sandbox-setup/action.yml:private-key:179",
   "056bd4282542e0eddd1dd1d4d2d32fffe7267df9:.github/actions/host-sandbox-setup/action.yml:private-key:179",
 ]
+
+[[allowlists]]
+targetRules = ["generic-api-key"]
+description = """
+False positive, commit 6f9ef5da only. #586 (M13.05), ADR 0123.
+
+ADR 0123's mutation-proof section records the failure-atlas run key its two
+mutation arms were filed under. That commit wrote it as an inline
+`<the underscore spelling of "run key">:`-then-value pair, and the
+`generic-api-key` rule scores that adjacency as a secret because the value
+carries enough entropy to clear its threshold.
+
+It is not a credential. It is a label this repository's own tooling
+generates to group mutation runs — `mutation_check`'s `run_key` argument —
+and it grants access to nothing. Nothing needs rotating. Other ADRs' run
+keys (gv-582-credential-helper, gv-583-mask-token, gv-591-tween) were
+measured against this rule and do not trip it; only this one had the
+entropy to.
+
+The working tree no longer contains the tripping adjacency — the sentence
+was reworded so that new commits do not re-trip the rule, exactly as the
+PEM placeholder above was. This entry exists solely because the
+full-history scan still reaches commit 6f9ef5da, which cannot be edited.
+
+Recorded rather than rewritten deliberately: the branch had already been
+pushed, and this file's header rules that out ("force-pushing a shared
+branch to silence a scanner is a cure worse than the disease"). The
+alternative considered and rejected was a force-push dropping the commit —
+see ADR 0123's own footnote, which records the correction.
+"""
+# `commits` for the same reason as the block above: a top-level
+# [[allowlists]] needs one of commits/paths/regexes/stopwords before
+# `fingerprints` will load, and commit-scoping is the only one of the four
+# that cannot widen. NOT `paths` — a path entry would blind every future
+# commit of this ADR to real key material, which the header records as
+# measured and rejected.
+commits = [
+  "6f9ef5da0bce57709b1c075b8e9bd0112564e89d",
+]
+fingerprints = [
+  "6f9ef5da0bce57709b1c075b8e9bd0112564e89d:docs/adr/0123-the-safety-lives-in-the-shape-not-a-list.md:generic-api-key:211",
+]
+
+[[allowlists]]
+targetRules = ["github-pat"]
+description = """
+False positive, commit 62ef8a67 only. #584 (M13.03).
+
+A test fixture (store_token_error_messages_never_contain_the_attempted_
+value, token_store.rs) built a `ghp_`-prefixed, real-length string to
+exercise the write-failure path — the same shape `mask_token`'s own test
+fixtures use elsewhere in this file, but as a bare literal rather than
+built via format!() at runtime the way those are. It is not a credential:
+nothing was ever minted with this value, and it grants access to nothing.
+
+The literal was reworded to build at runtime in a LATER commit on this same
+branch, so no commit on the branch's current tip contains it — but this
+entry is still required. gitleaks' full-history scan reaches every commit
+reachable in the local clone, not only the branch tip's own ancestry filtered
+to what changed, and commit 62ef8a67 (the ORIGINAL commit containing the
+literal) was already pushed to origin before the reword landed. Editing
+that commit now would mean rewriting already-pushed history, which this
+file's header rules out for the same reason the gv-586-tripwire entry
+above does — a force-push to silence a scanner is a cure worse than the
+disease, whether or not the branch has reached main yet. The commit is
+history the moment it is pushed, not only once merged.
+"""
+commits = [
+  "62ef8a6745e063e102d2891dd725d4d2198ca002",
+]
+fingerprints = [
+  "62ef8a6745e063e102d2891dd725d4d2198ca002:crates/git-vista-server/src/token_store.rs:github-pat:337",
+]

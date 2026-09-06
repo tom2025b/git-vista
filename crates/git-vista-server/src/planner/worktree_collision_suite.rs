@@ -335,9 +335,10 @@ fn an_unread_census_refuses_without_inventing_a_worktree() {
 }
 
 /// **Route 3, driven from a real failing census rather than a fabricated
-/// one.** `collision_refusal` embeds `CensusFailed`'s reason verbatim in a
-/// 500 body, and that is the third route #657's finding did not enumerate —
-/// the one that made the fix belong in the value rather than in any handler.
+/// one.** `collision_refusal` used to embed `CensusFailed`'s reason verbatim
+/// in a 500 body, the third route #657's finding did not enumerate. Since
+/// #666 it selects a fixed branch-check reason and keeps the census reason
+/// as flag-gated detail; the useful refusal sentence must still survive.
 ///
 /// The test above proves the refusal does not *invent* a worktree. It says
 /// nothing about what the relayed reason contains, and it stayed green

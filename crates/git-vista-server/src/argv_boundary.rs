@@ -56,6 +56,12 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // `crate::git_cmd::git_output`, the sealed sandbox launcher (#66 Task 6);
     // this entry now covers only its `#[cfg(test)]` fixture setup.
     "src/planner.rs",
+    // #666: cfg(test)-only probe of the real environment flag. This file
+    // launches this test binary itself, with one exact test name, so each
+    // child owns its environment and the parent suite never mutates it.
+    // The scan below pins the sole program expression to current_exe(); it
+    // does not receive the general LAUNCHER_SPAWN_SITES exemption.
+    "src/planner/couldnt_run_suite.rs",
     // `git update-ref` for recovery refs (#62) — see the module doc above.
     // The production call (`write_recovery_ref`) now goes through
     // `crate::git_cmd::git_output` (#66 Task 6); this entry now covers only
@@ -108,6 +114,18 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     "src/handlers/read/content_suite.rs",
     "src/handlers/read/graph_suite.rs",
     "src/handlers/read/status_suite.rs",
+    // M5.33 (#86): `#[cfg(test)]` fixture setup only — one `git fast-import`
+    // spawn per fixture, feeding a stream this file builds, into a fresh
+    // `tempfile::tempdir()`. It is here rather than using
+    // `git_vista_fixtures`'s helpers because the two fixtures it needs are
+    // deliberately large (a 12-hop rename chain inside ~3,000 commits, and a
+    // 3,000-commit single-line-per-commit file), and thousands of `git
+    // commit` spawns would take minutes — the same argument
+    // `git_vista_git::history::tests::deep_remote_chain` already makes for
+    // the same tool. Nothing in `handlers/blame.rs` itself constructs a
+    // `Command`: both endpoints go through `git_cmd`'s sandboxed, capped
+    // helpers, which is the seam this census exists to keep them behind.
+    "src/handlers/blame/perf_suite.rs",
     // M2.21b (#236): `#[cfg(test)]` fixture setup only. No handler in this
     // file runs a subprocess in production. `GET /api/tags` runs none at all —
     // `git_vista_git::read_tags` opens the repository with `gix` and decodes
@@ -274,6 +292,14 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // acceptance operation itself (`git pack-refs --all`). Production
     // `watcher.rs` constructs no process; notify events remain hints only.
     "src/watcher/suite.rs",
+    // M12.03-M12.06 (#553-#556): `#[cfg(test)]` change-feed fixtures. Two
+    // spawns, both literal `git`: one builds a throwaway repository, the other
+    // makes the *external* change the sweep is supposed to notice. The second
+    // is the point of the suite — a change this process made through its own
+    // planner would prove nothing about a repository moving underneath it.
+    // Production `reconciliation.rs` constructs no process at all; every read
+    // it makes goes through the planner's existing generation path.
+    "src/reconciliation/suite.rs",
     // #448 removed `src/conflicts.rs` from this list: its `#[cfg(test)]` git
     // fixtures now come from the `git-vista-fixtures` catalogue, so the file
     // constructs no `Command` at all and the entry had become a permission
@@ -544,7 +570,20 @@ fn every_process_spawn_site_is_allowlisted_and_spawns_only_git() {
             // This file talks *about* spawning without doing it; every other
             // allowlisted site must spawn `git` literally — no shells, no
             // dynamically chosen program names.
-            if rel != "src/argv_boundary.rs" && !LAUNCHER_SPAWN_SITES.contains(&rel.as_str()) {
+            if rel == "src/planner/couldnt_run_suite.rs" {
+                let self_test = [&spawn, "std::env::current_exe().unwrap())"].concat();
+                assert_eq!(hits, 1, "the flag probe has exactly one spawn site");
+                assert_eq!(
+                    text.matches(&self_test).count(),
+                    1,
+                    "the flag probe may only launch itself"
+                );
+                assert!(
+                    include_str!("planner.rs").contains("#[cfg(test)]\nmod couldnt_run_suite;"),
+                    "the self-spawning flag probe must remain test-only"
+                );
+            } else if rel != "src/argv_boundary.rs" && !LAUNCHER_SPAWN_SITES.contains(&rel.as_str())
+            {
                 assert_eq!(
                     text.matches(&spawn_git).count(),
                     hits,

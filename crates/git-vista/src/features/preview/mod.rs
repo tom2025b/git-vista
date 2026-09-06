@@ -13,6 +13,10 @@
 
 pub mod core;
 pub mod scene;
+// The animated before→after transition (#591): a tween between the two real
+// layouts `core`/`scene` already compute. Framework-free for the same reason
+// they are — see `tween`'s own doc for the honesty rule this split protects.
+pub mod tween;
 // The reactive half. Gated because it imports Leptos and `crate::api`, which is
 // itself wasm-gated; `core` and `scene` above are not, so every rule and every
 // pixel of geometry is decided somewhere `cargo test` can reach.

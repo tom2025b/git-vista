@@ -114,6 +114,41 @@ pub(crate) fn expose_paths() -> bool {
     }
 }
 
+/// The token Git-Vista supplies to its own credential helper for a remote
+/// HTTPS operation (M13.01, #582) — `None` when there is nothing to offer,
+/// which every existing caller already treats as "behave exactly as before".
+///
+/// #583 (M13.02) implemented the real token-storage design in
+/// [`crate::token_store`] — a keyring first, an environment variable second,
+/// a gitignored file last, with each tier's provenance available via
+/// [`crate::token_store::resolve_token`]. This function stays the thin,
+/// provenance-discarding shape every existing caller already expects, per
+/// the plan the M13.01 placeholder wrote down: no caller of
+/// `credential_token()` changed when #583 landed.
+///
+/// Never logged, never `eprintln!`ed, never included in any `Display` this
+/// crate writes — the whole design (`sandbox::network_exec::network_command_with_credential`)
+/// exists so this value's only destinations are one child process's
+/// environment and, from there, one HTTPS request's Basic-auth header,
+/// something no HTTP client in this codebase constructs directly (see ADR
+/// 0122, #587).
+pub(crate) fn credential_token() -> Option<String> {
+    crate::token_store::resolve_token().map(|(token, _source)| token)
+}
+
+/// Where the token-storage tier-3 fallback file lives (#583, M13.02):
+/// `state_dir()/github-token`, `0600`, next to the bootstrap token and the
+/// sandbox trust markers. Documented here, not only in code, because #583's
+/// acceptance requires the path be written down: set this file's contents to
+/// a GitHub token to use it when neither the OS keyring nor
+/// `GIT_VISTA_GITHUB_TOKEN`/`GH_TOKEN` has one. Never a tracked file — see
+/// the `/.state/` entry `.gitignore` picked up in the same commit that added
+/// this function, covering the one place `state_dir()` can resolve inside a
+/// worktree (`./dev testbed`'s isolated `XDG_STATE_HOME`).
+pub(crate) fn token_file_path() -> PathBuf {
+    state_dir().join("github-token")
+}
+
 /// A short, non-path label for `path` — its directory base name — unless the
 /// operator opted into path exposure, in which case the full path is used. This
 /// is what the UI header shows; it never leaks the server's layout by default.
@@ -162,11 +197,13 @@ pub(crate) fn withheld_detail(context: &str, summary: &str, detail: &str) -> Str
 /// function that reads it directly cannot be unit tested without a global
 /// lock, and a test that sets it races every other test that does not.
 fn withheld_detail_when(expose: bool, context: &str, summary: &str, detail: &str) -> String {
+    // Keep every original byte in the operator log; trimming is only for
+    // client composition. The flag withholds detail, never destroys it.
+    eprintln!("git-vista: {context}: {summary} — {detail}");
     let detail = detail.trim();
     if detail.is_empty() {
         return summary.to_string();
     }
-    eprintln!("git-vista: {context}: {summary} — {detail}");
     if expose {
         format!("{summary} {detail}")
     } else {
@@ -632,6 +669,42 @@ pub(crate) fn current() -> (PathBuf, bool) {
 /// policy is known" rather than a panic or a fabricated value.
 pub(crate) fn current_path_if_set() -> Option<PathBuf> {
     current_snapshot().map(|current| current.path)
+}
+
+/// A handle on "which repository is this session serving **now**".
+///
+/// Captured inside a request's selection scope and read later from somewhere
+/// that has none — which is exactly what a long-lived SSE stream is: its body
+/// is polled by the response writer, outside the task-local scope the handler
+/// ran in (the same capture-synchronously reasoning [`inherit_selection`]
+/// spells out).
+///
+/// It exists for the change feed (M12.05, #555). A stream opens against one
+/// repository and the session can select a different one at any moment; a feed
+/// that kept publishing the old repository's generation would be answering a
+/// freshness question about a repository nobody is looking at — and answering
+/// it *confidently*, which is worse than not answering.
+#[derive(Clone)]
+pub(crate) struct SelectionReader(Option<SelectionCell>);
+
+impl SelectionReader {
+    /// Capture the calling request's selection cell. Synchronously, and in the
+    /// handler — a capture attempted from inside the stream body would find no
+    /// scope and silently pin the launch selection.
+    pub(crate) fn capture() -> Self {
+        Self(SELECTION.try_with(Arc::clone).ok())
+    }
+
+    /// The path this session is serving right now, resolving an unchosen cell
+    /// to the launch selection exactly as [`current`] does.
+    pub(crate) fn path(&self) -> Option<PathBuf> {
+        if let Some(cell) = &self.0 {
+            if let Some(chosen) = cell.read().expect("selection lock not poisoned").as_ref() {
+                return Some(chosen.path.clone());
+            }
+        }
+        current_path_if_set()
+    }
 }
 
 /// The mode the current selection is open in (ADR 0006/0007).

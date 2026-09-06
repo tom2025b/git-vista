@@ -89,6 +89,16 @@ tower-http = { version = "0.7.0", features = ["fs", "set-header", "catch-panic"]
 # dev-dependency crate is unresolved (E0433) from code the release binary
 # actually calls.
 tempfile = "3"
+# GitHub token storage, tier 1 (#583, M13.02): the OS secret store. `v1` is
+# the crate's simple synchronous Entry API — get/set/delete by (service,
+# username), nothing more. `default-features = false` drops the Windows and
+# Apple backends this Linux-only server never runs; `zbus-secret-service-
+# keyring-store` talks to the D-Bus Secret Service in pure Rust, so no
+# libdbus headers are needed at build time (unlike the `dbus-*` alternative).
+# A machine with no D-Bus session (most CI, some containers) makes every
+# `Entry::new` call fail — by design, per #583's "absent is a normal state":
+# `token_store::keyring_token` folds that into `None`, same as no entry set.
+keyring = { version = "4.2.0", default-features = false, features = ["v1", "zbus-secret-service-keyring-store"] }
 
 [dev-dependencies]
 # The #448 fixture catalogue: every deliberately-broken repository shape these

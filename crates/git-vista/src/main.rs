@@ -82,6 +82,12 @@ mod reachability_census;
 // above.
 #[cfg(test)]
 mod wasm_module_census;
+// #676: a source census over `picker.rs`, `dialogs/confirm.rs` and
+// `dialogs/open_url.rs`'s force_bump-after-selection call sites — all three
+// are wasm32-gated, so this reads their bytes rather than compiling them.
+// Test-only, like the other censuses above.
+#[cfg(test)]
+mod repo_selection_teardown_census;
 
 // The frontend, split out of the former monolithic `app.rs`. Every one of these
 // pulls in Leptos / web-sys (wasm-only deps), so — like `app` — they compile only

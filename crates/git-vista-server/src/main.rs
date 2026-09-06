@@ -106,10 +106,15 @@ mod security;
 mod session;
 mod staging;
 mod state;
+// GitHub token resolution (#583, M13.02): keyring, then environment, then a
+// gitignored local file — the fallback chain `state::credential_token`
+// (M13.01, #582) was scaffolding for. See ADR 0122.
+mod token_store;
 // M12.02 (#552): native filesystem hints over the selected worktree's Git
 // metadata. The authoritative sweep/feed lands in later M12 slices, so this
 // tested module is intentionally staged before production wiring reaches it.
 #[cfg_attr(not(test), allow(dead_code))]
+mod reconciliation;
 mod watcher;
 // M11.01 (#546): the read-only worktree census (`git worktree list
 // --porcelain` resolved into `git_vista_protocol::WorktreeCensus`). Contract
@@ -224,6 +229,12 @@ async fn main() {
         eprintln!("error: {refusal}");
         std::process::exit(1);
     }
+
+    // #583 (M13.02): say which token-storage tier answered, masked, at boot —
+    // never only silently. Prints one ordinary line when nothing is
+    // configured; that is expected for a public repository and not a
+    // warning.
+    println!("{}", token_store::provenance_line());
 
     // Resolve which repo to serve: first CLI arg, else the default checkout.
     // Canonicalise so relative paths (e.g. `.`) and the banner are absolute; if
@@ -499,6 +510,12 @@ fn api_router(
         // Full file viewer: one file's whole content at one commit (`git show
         // <id>:<path>`), read on demand when a file in the diff list is tapped.
         .route("/api/file/{id}/{*path}", get(file_at_commit))
+        // M5.33 (#86): rename-aware file history and line-range blame, both
+        // paged and explicit about rename limits, binary files and absent
+        // paths. Reads of committed history exactly like `/api/diff`, so
+        // registered alongside it.
+        .route("/api/file-history", get(handlers::blame::file_history))
+        .route("/api/blame", get(handlers::blame::blame))
         // Issue #33 follow-up: the live checked-out branch, resolved fresh on every
         // request so the merge dialog shows the true target even without a Refresh.
         .route("/api/head-branch", get(head_branch))
@@ -510,6 +527,15 @@ fn api_router(
         // alongside the v1 shape above — not a replacement. See handlers::read
         // for why both exist side by side.
         .route("/api/status/v2", get(worktree_status_v2))
+        // M12.05 (#555, ADR 0094): the repository change feed — the live
+        // planner-recipe generation, what moved since the last snapshot, and
+        // what the feed itself can currently do. A read of repository state,
+        // so both listeners serve it; it carries no write outcome, no plan and
+        // no filesystem path.
+        .route(
+            "/api/repository/events",
+            get(handlers::repository_events::repository_events),
+        )
         // M2.21b (#236): every tag with the metadata the `/api/frame` ref
         // badges throw away — lightweight vs annotated, the peeled target, and
         // an annotated tag's own object, tagger and message. A read of

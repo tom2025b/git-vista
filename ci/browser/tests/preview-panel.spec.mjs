@@ -195,6 +195,59 @@ test.describe('the graph preview inside a confirmation', () => {
     await expect(page.getByText(PREVIEW_HEADING)).toBeVisible()
   })
 
+  test('#591: the animation reaches the real after state, not merely towards it', async ({
+    page,
+  }) => {
+    // #623's root cause: a spec that samples a single point in time passes
+    // trivially when the state was already there before the thing under test
+    // ever ran. So this proves motion happened (the `new` pill is absent the
+    // moment the animated scene first exists) AND that it settles on the
+    // real endpoint (the pill appears, and the hypothetical commit's dot
+    // lands on the exact pixel the static after picture draws it at) —
+    // never one alone.
+    await openMergePreviewRepo(page)
+    const merge = await openBranchMenu(page, PREVIEW_BRANCH)
+    await merge.click()
+    await expect(dialog(page)).toBeVisible()
+
+    const animated = page.getByRole('img', { name: /^An animation/ })
+    await expect(animated).toBeVisible({ timeout: 30_000 })
+
+    // #670 item B: this used to say Playwright's `toHaveCount(0)` captures
+    // once, immediately, with no retry — false, it polls until it passes or
+    // the timeout elapses, same as `toBeVisible` below. That does not make
+    // this assertion vacuous: it is fail-closed rather than fail-open (a
+    // `new` pill present at ANY point before the gate should have lifted
+    // still fails it), so it does not recreate #623's trivial pass. What
+    // makes the check meaningful is that this line runs immediately after
+    // the scene first becomes visible, well before REVEAL_AFTER's 0.92 of a
+    // 900ms transition could have elapsed — `tween::REVEAL_AFTER` (ADR 0121,
+    // decision 6) withholds every outcome-only pill, `new` included, until
+    // then, so a `new` pill visible at this early a poll would mean the gate
+    // never engaged at all.
+    await expect(animated.getByText('new', { exact: true })).toHaveCount(0)
+
+    // Reached, not merely not-yet-arrived: the same pill must actually show
+    // up once the transition settles — well inside the ~900ms duration.
+    await expect(animated.getByText('new', { exact: true })).toBeVisible({
+      timeout: 3_000,
+    })
+
+    // And the settled dot is on the exact pixel the static after picture
+    // draws it at — the tween's real endpoint, not an approximation of it.
+    // The halo (a dashed ring, drawn only around the hypothetical commit) is
+    // the one element both scenes render with the same distinguishing shape.
+    const animatedHalo = animated.locator('circle[stroke-dasharray]').first()
+    const after = page.getByRole('img', { name: /^After:/ })
+    const afterHalo = after.locator('circle[stroke-dasharray]').first()
+    await expect(afterHalo).toBeAttached()
+    const [animatedPos, afterPos] = await Promise.all([
+      animatedHalo.evaluate((el) => [el.getAttribute('cx'), el.getAttribute('cy')]),
+      afterHalo.evaluate((el) => [el.getAttribute('cx'), el.getAttribute('cy')]),
+    ])
+    expect(animatedPos).toEqual(afterPos)
+  })
+
   test('4: the preview informs and never gates — Confirm stays live throughout', async ({
     page,
   }) => {

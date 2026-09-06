@@ -298,11 +298,26 @@ pub struct SceneTag {
     pub stroke: &'static str,
     /// Text colour.
     pub fg: &'static str,
+    /// Whether this pill exists *because of the operation* — `new`, a
+    /// `→ref` landing, a `lane a→b` — versus a ref that already pointed here
+    /// and is simply carried through unchanged.
+    ///
+    /// The static two-panel picture draws every pill the moment it has one:
+    /// there is no "before this happened" to protect against. The animation
+    /// (#591) is the first reader that needs the distinction — a `→main`
+    /// pill is a claim about the *after* state, and showing it while the
+    /// commit dot is still mid-flight from its `before` position would put a
+    /// finished-looking label on an unfinished picture. See
+    /// `tween::REVEAL_AFTER`.
+    pub is_mark: bool,
 }
 
 /// One commit dot, with its label and marks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SceneNode {
+    /// Full commit id. Not drawn — [`super::tween`] is the reader that needs
+    /// it, to match a dot in one half against its counterpart in the other.
+    pub commit_id: String,
     pub cx: i32,
     pub cy: i32,
     pub r: i32,
@@ -373,13 +388,22 @@ pub struct PreviewScene {
     pub legend: Vec<LegendEntry>,
 }
 
-/// Lay a [`Picture`] out as two static SVG scenes.
+/// The windowing and lane-count decisions [`scene_of`] and `tween::tween_of`
+/// both need, computed once so the two can never disagree about which rows or
+/// how many lanes are on screen.
 ///
-/// Both halves are laid out together, and share one lane count and one width,
-/// so a commit that did not move sits at the same height and the same x in
-/// both pictures. That is what makes a difference visible by comparison rather
-/// than by reading two independent diagrams.
-pub fn scene_of(picture: &Picture) -> PreviewScene {
+/// Sharing this is what makes the animation's `from`/`to` coordinates land on
+/// the exact pixels the static picture already draws: same window, same lane
+/// count, same [`lane_cx`]/[`row_cy`] arithmetic, just consulted twice.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct LayoutParams {
+    pub before_window: RowWindow,
+    pub after_window: RowWindow,
+    pub lanes: usize,
+    pub lanes_clamped: bool,
+}
+
+pub(super) fn layout_params(picture: &Picture) -> LayoutParams {
     let after_window = window_for_after(&picture.after, &picture.marks, MAX_ROWS);
     let before_window = window_for_before(&picture.before, &picture.after, after_window, MAX_ROWS);
 
@@ -392,8 +416,27 @@ pub fn scene_of(picture: &Picture) -> PreviewScene {
         .lane_count
         .max(picture.after.lane_count)
         .max(1);
-    let lanes = raw_lanes.min(MAX_LANES);
-    let clamped = raw_lanes > MAX_LANES;
+    LayoutParams {
+        before_window,
+        after_window,
+        lanes: raw_lanes.min(MAX_LANES),
+        lanes_clamped: raw_lanes > MAX_LANES,
+    }
+}
+
+/// Lay a [`Picture`] out as two static SVG scenes.
+///
+/// Both halves are laid out together, and share one lane count and one width,
+/// so a commit that did not move sits at the same height and the same x in
+/// both pictures. That is what makes a difference visible by comparison rather
+/// than by reading two independent diagrams.
+pub fn scene_of(picture: &Picture) -> PreviewScene {
+    let LayoutParams {
+        before_window,
+        after_window,
+        lanes,
+        lanes_clamped: clamped,
+    } = layout_params(picture);
 
     let before = half_scene(
         "Before",
@@ -459,14 +502,19 @@ fn legend_for(
 }
 
 /// x of a lane's centre, with lanes past the gutter squashed onto the last one.
-fn lane_cx(lane: usize, lanes: usize) -> i32 {
+///
+/// `pub(super)`: `tween::tween_of` positions its `from`/`to` coordinates with
+/// this same function, off the same [`LayoutParams`], so a persistent
+/// commit's animated position starts and ends on the exact pixel the static
+/// picture draws it at.
+pub(super) fn lane_cx(lane: usize, lanes: usize) -> i32 {
     PAD_X + (lane.min(lanes.saturating_sub(1))) as i32 * LANE_W
 }
 
 /// y of a row value, relative to the window's first row. Rows outside the
 /// window get a y outside the drawn band, which is what lets an edge leaving
 /// the window be clipped by arithmetic rather than by a special case.
-fn row_cy(row: usize, window: RowWindow) -> i32 {
+pub(super) fn row_cy(row: usize, window: RowWindow) -> i32 {
     PAD_Y + (row as i32 - window.first as i32) * ROW_H
 }
 
@@ -481,7 +529,11 @@ pub fn tag_width(text: &str) -> i32 {
 }
 
 /// Lay one half out.
-fn half_scene(
+///
+/// `pub(super)`: `tween::tween_of` calls this directly (once per half, same
+/// arguments `scene_of` passes) rather than re-deriving node positions, so
+/// the animation's endpoints are the exact pixels this function draws.
+pub(super) fn half_scene(
     title: &'static str,
     half: &Half,
     window: RowWindow,
@@ -543,6 +595,7 @@ fn half_scene(
         let color = branch_color(r.color);
         let (tags, label_x, label) = row_label(r, mark, lanes, cy);
         nodes.push(SceneNode {
+            commit_id: r.commit.id.0.clone(),
             cx,
             cy,
             r: DOT_R,
@@ -633,6 +686,7 @@ fn row_label(
                 fill: &'static str,
                 stroke: &'static str,
                 fg: &'static str,
+                is_mark: bool,
                 x: &mut i32,
                 tags: &mut Vec<SceneTag>| {
         let w = tag_width(&text);
@@ -652,6 +706,7 @@ fn row_label(
             fill,
             stroke,
             fg,
+            is_mark,
         });
         *x += w + TAG_GAP;
     };
@@ -662,6 +717,7 @@ fn row_label(
             MARK_ADDED,
             MARK_ADDED,
             BADGE_DARK,
+            true,
             &mut x,
             &mut tags,
         );
@@ -680,7 +736,7 @@ fn row_label(
             gref.name.clone()
         };
         let stroke = if moved { MARK_REF } else { fill };
-        push(text, fill, stroke, BADGE_DARK, &mut x, &mut tags);
+        push(text, fill, stroke, BADGE_DARK, moved, &mut x, &mut tags);
     }
     // A ref the server says lands here that the layout did not attach to this
     // row is still reported. Silence would be the one wrong answer: the change
@@ -693,6 +749,7 @@ fn row_label(
                 MARK_REF,
                 MARK_REF,
                 BADGE_DARK,
+                true,
                 &mut x,
                 &mut tags,
             );
@@ -704,6 +761,7 @@ fn row_label(
             MERGE_FILL,
             MARK_LANE,
             MARK_LANE,
+            true,
             &mut x,
             &mut tags,
         );
