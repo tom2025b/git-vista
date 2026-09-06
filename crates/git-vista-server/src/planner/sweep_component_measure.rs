@@ -49,16 +49,19 @@ async fn measure_sweep_components() {
     let repo = std::path::PathBuf::from(repo);
     const N: u32 = 20;
 
+    let reading = live_reading(&repo).await;
+    assert!(
+        reading.blind.is_none(),
+        "measurement requires successful production reads (build gv-sandbox first): {:?}",
+        reading.blind
+    );
+
     println!(
         "repository {}                                    ({N} warm runs each)",
         repo.display()
     );
     println!();
-    println!("--- observe_live_for_generation's three reads ---");
-    let head_branch = timed("read_head_branch_blocking (gix open #1)", N, || {
-        read_head_branch_blocking(&repo)
-    })
-    .await;
+    println!("--- observe_live_for_feed's two reads ---");
     let head_rev_parse = timed("rev_parse(HEAD)          (git spawn, sandboxed)", N, || {
         crate::git_cmd::rev_parse(&repo, "HEAD")
     })
@@ -72,9 +75,11 @@ async fn measure_sweep_components() {
 
     println!();
     println!("--- read_generation_parts's three reads ---");
-    let refs = timed("refs_reading              (gix open #2, N refs)", N, || {
-        refs_reading(&repo)
-    })
+    let refs = timed(
+        "refs_reading              (gix open, N refs + HEAD)",
+        N,
+        || refs_reading(&repo),
+    )
     .await;
     let stash = timed(
         "stash_digest_input        (git spawn, sandboxed)",
@@ -89,24 +94,29 @@ async fn measure_sweep_components() {
     )
     .await;
 
-    let sum_of_parts = head_branch + head_rev_parse + status + refs + stash + merge_ff;
+    let sum_of_parts = head_rev_parse + status + refs + stash + merge_ff;
     println!();
     println!(
-        "sum of the six components (sequential)     {:>8.2} ms",
+        "sum of the five components (sequential)    {:>8.2} ms",
         sum_of_parts.as_secs_f64() * 1000.0
     );
 
-    let whole = timed("live_reading (the whole read path)", N, || {
-        crate::planner::live_reading(&repo)
+    let whole = timed("live_reading (the whole read path)", N, || async {
+        let reading = crate::planner::live_reading(&repo).await;
+        assert!(
+            reading.blind.is_none(),
+            "measurement became unreadable: {:?}",
+            reading.blind
+        );
+        reading
     })
     .await;
     println!();
     println!(
-        "concurrency saved: {:>6.2} ms ({:.0}% of the sum) — \
-         observe_live_for_generation's three reads and read_generation_parts's \
-         three reads run sequentially WITHIN each group via `.await` chaining, \
-         but the two groups and the gix opens go through separate spawn_blocking \
-         tasks, so some overlap is real, not measurement noise",
+        "separate component sum minus whole: {:>6.2} ms ({:.0}% of the sum) — \
+         observe_live_for_feed's two reads and read_generation_parts's \
+         three reads are all awaited sequentially; these samples are taken \
+         at different times, so their difference includes load and timing noise",
         (sum_of_parts.as_secs_f64() - whole.as_secs_f64()) * 1000.0,
         (1.0 - whole.as_secs_f64() / sum_of_parts.as_secs_f64()) * 100.0
     );
@@ -118,7 +128,13 @@ async fn measure_sweep_components() {
     })
     .await;
     let raw_for_each_ref = timed("git for-each-ref          (raw std::process)", N, || {
-        raw_git(&repo, &["for-each-ref"])
+        raw_git(
+            &repo,
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname) %(*objectname)",
+            ],
+        )
     })
     .await;
     println!();
@@ -158,6 +174,24 @@ async fn measure_sweep_components() {
         refs.as_secs_f64() * 1000.0,
         (refs.as_secs_f64() - open_only.as_secs_f64()) * 1000.0
     );
+
+    let repo_for_enumeration = repo.clone();
+    timed("gix open + enumerate refs, without peeling", N, move || {
+        let repo = repo_for_enumeration.clone();
+        async move {
+            tokio::task::spawn_blocking(move || {
+                let repo = gix::open_opts(repo, gix::open::Options::isolated()).unwrap();
+                let platform = repo.references().unwrap();
+                platform.all().unwrap().fold(0, |count, reference| {
+                    reference.expect("read ref during enumeration");
+                    count + 1
+                })
+            })
+            .await
+            .unwrap()
+        }
+    })
+    .await;
 }
 
 /// A raw, unsandboxed spawn — `std::process::Command`, not `git_cmd`'s
@@ -169,12 +203,14 @@ async fn raw_git(repo: &std::path::Path, args: &[&str]) -> std::process::Output 
     let repo = repo.to_path_buf();
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     tokio::task::spawn_blocking(move || {
-        std::process::Command::new("git")
+        let output = std::process::Command::new("git")
             .arg("-C")
             .arg(&repo)
             .args(&args)
             .output()
-            .expect("raw git spawn")
+            .expect("raw git spawn");
+        assert!(output.status.success(), "raw git failed: {:?}", output);
+        output
     })
     .await
     .expect("join raw git spawn")
