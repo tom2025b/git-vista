@@ -197,11 +197,13 @@ pub(crate) fn withheld_detail(context: &str, summary: &str, detail: &str) -> Str
 /// function that reads it directly cannot be unit tested without a global
 /// lock, and a test that sets it races every other test that does not.
 fn withheld_detail_when(expose: bool, context: &str, summary: &str, detail: &str) -> String {
+    // Keep every original byte in the operator log; trimming is only for
+    // client composition. The flag withholds detail, never destroys it.
+    eprintln!("git-vista: {context}: {summary} — {detail}");
     let detail = detail.trim();
     if detail.is_empty() {
         return summary.to_string();
     }
-    eprintln!("git-vista: {context}: {summary} — {detail}");
     if expose {
         format!("{summary} {detail}")
     } else {

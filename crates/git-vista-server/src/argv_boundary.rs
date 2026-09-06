@@ -56,6 +56,12 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // `crate::git_cmd::git_output`, the sealed sandbox launcher (#66 Task 6);
     // this entry now covers only its `#[cfg(test)]` fixture setup.
     "src/planner.rs",
+    // #666: cfg(test)-only probe of the real environment flag. This file
+    // launches this test binary itself, with one exact test name, so each
+    // child owns its environment and the parent suite never mutates it.
+    // The scan below pins the sole program expression to current_exe(); it
+    // does not receive the general LAUNCHER_SPAWN_SITES exemption.
+    "src/planner/couldnt_run_suite.rs",
     // `git update-ref` for recovery refs (#62) — see the module doc above.
     // The production call (`write_recovery_ref`) now goes through
     // `crate::git_cmd::git_output` (#66 Task 6); this entry now covers only
@@ -570,7 +576,20 @@ fn every_process_spawn_site_is_allowlisted_and_spawns_only_git() {
             // This file talks *about* spawning without doing it; every other
             // allowlisted site must spawn `git` literally — no shells, no
             // dynamically chosen program names.
-            if rel != "src/argv_boundary.rs" && !LAUNCHER_SPAWN_SITES.contains(&rel.as_str()) {
+            if rel == "src/planner/couldnt_run_suite.rs" {
+                let self_test = [&spawn, "std::env::current_exe().unwrap())"].concat();
+                assert_eq!(hits, 1, "the flag probe has exactly one spawn site");
+                assert_eq!(
+                    text.matches(&self_test).count(),
+                    1,
+                    "the flag probe may only launch itself"
+                );
+                assert!(
+                    include_str!("planner.rs").contains("#[cfg(test)]\nmod couldnt_run_suite;"),
+                    "the self-spawning flag probe must remain test-only"
+                );
+            } else if rel != "src/argv_boundary.rs" && !LAUNCHER_SPAWN_SITES.contains(&rel.as_str())
+            {
                 assert_eq!(
                     text.matches(&spawn_git).count(),
                     hits,
