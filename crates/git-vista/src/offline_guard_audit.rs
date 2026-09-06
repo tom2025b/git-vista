@@ -110,6 +110,8 @@ const API_SRC: &str = concat!(
     "\n",
     include_str!("api/activity.rs"),
     "\n",
+    include_str!("api/blame.rs"),
+    "\n",
     include_str!("api/branches.rs"),
     "\n",
     include_str!("api/clone.rs"),

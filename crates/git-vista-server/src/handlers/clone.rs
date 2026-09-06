@@ -655,6 +655,15 @@ async fn run_clone(req: CloneRequest) -> Result<Json<RepositoryDescriptor>, (Sta
     let dest_str = dest.to_string_lossy();
     // `--` so the URL is never read as an option, even past validation.
     let args: [&str; 4] = ["clone", "--", url.as_str(), &dest_str];
+    // M13.01 (#582): routed through `network_exec::network_command_with_credential`
+    // rather than a bare `spawn::command_async` — this was the one production
+    // Remote-tier spawn in the crate that never went through the askpass-hardening
+    // harness at all (every other Network-tier spawn reaches it via
+    // `git_cmd::sandboxed()`; clone has no repository yet, so it never calls
+    // that function). Fixing #582 meant touching this exact call site anyway,
+    // so it gets both fixes at once: `-c core.askpass=` hardening it was
+    // missing, and Git-Vista's own credential helper when a token is held.
+    let token = crate::state::credential_token();
     let output = match crate::sandbox::policy_for_clone(&root) {
         Ok(policy) => {
             // #216: bound the child's lifetime. `git clone` against a remote that
@@ -677,9 +686,14 @@ async fn run_clone(req: CloneRequest) -> Result<Json<RepositoryDescriptor>, (Sta
             // below has already removed. The orphan outlives the request that
             // authorised it, which is precisely what this milestone's process
             // lifecycle work (INV-8) exists to prevent.
-            let spawned = crate::sandbox::spawn::command_async(&policy, &root, &args)
-                .kill_on_drop(true)
-                .output();
+            let spawned = crate::sandbox::network_exec::network_command_with_credential(
+                &policy,
+                &root,
+                &args,
+                token.as_deref(),
+            )
+            .kill_on_drop(true)
+            .output();
             match run_guarded(&dest, CLONE_TIMEOUT, spawned).await {
                 Ok(o) => o,
                 Err(GuardedOutcome::Failed(e)) => {
