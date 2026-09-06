@@ -27,5 +27,8 @@ Implementation checkpoint: pure sentences and action policy, repository-pinned
 shared readings, touch-sized modal, existing action wiring, and source census
 are implemented. Ten core tests and the initial five browser cases passed.
 Failure Atlas caught direction mutation 388 and read-only mutation 389.
-Final stage-to-commit and keyboard focus checks, full gate, and PR are pending.
+Final stage-to-commit and keyboard focus checks passed. After merging main
+17fda1cf, the all-target workspace build passed and the full gate was green:
+3379 host tests passed (21 ignored), 120 browser tests passed. The finish
+report records the PR and quotes each state’s actual English.
 Refs #141.
