@@ -531,7 +531,7 @@ pub enum ForcePublish {
     },
 }
 
-/// The verdict of a [`GitOperation::BisectMark`] step (M5.34, #87, ADR 0130)
+/// The verdict of a [`GitOperation::BisectMark`] step (M5.34, #87, ADR 0131)
 /// — `git bisect good|bad|skip` on the current candidate.
 ///
 /// Named `Verdict` rather than reusing a bool: `Skip` is a real third answer
@@ -1381,7 +1381,7 @@ pub enum GitOperation {
         branch: BranchName,
     },
     /// `git bisect start <bad> <good...>` — open a bisect session, checking
-    /// out the first candidate (M5.34, #87, ADR 0130).
+    /// out the first candidate (M5.34, #87, ADR 0131).
     ///
     /// # No session id, and that is deliberate
     ///
@@ -1406,7 +1406,7 @@ pub enum GitOperation {
         good: Vec<CommitOid>,
     },
     /// `git bisect good|bad|skip` on the current candidate — advance an
-    /// in-progress bisect by one step (M5.34, #87, ADR 0130).
+    /// in-progress bisect by one step (M5.34, #87, ADR 0131).
     ///
     /// # No commit field — see `SequenceContinue`'s doc comment
     ///
@@ -1425,7 +1425,7 @@ pub enum GitOperation {
     /// express either half of that.
     BisectMark { verdict: BisectVerdict },
     /// `git bisect reset` — return to the pre-bisect position and clear all
-    /// bisect state (M5.34, #87, ADR 0130).
+    /// bisect state (M5.34, #87, ADR 0131).
     ///
     /// # Always safe to offer, never safe to skip
     ///

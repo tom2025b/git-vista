@@ -1,4 +1,4 @@
-//! The bisect menu items (M5.34, #87, ADR 0130): mark a commit bad to start,
+//! The bisect menu items (M5.34, #87, ADR 0131): mark a commit bad to start,
 //! mark another good to launch the search, then good/bad/skip the candidate
 //! git checks out, or reset.
 //!
@@ -15,7 +15,7 @@
 //!
 //! # No client-side "is a bisect in progress" tracking
 //!
-//! Deliberately absent, matching ADR 0130's whole thesis: the app reads
+//! Deliberately absent, matching ADR 0131's whole thesis: the app reads
 //! git's own state rather than mirroring it. Mark/reset are offered
 //! unconditionally; the executor answers 409 ("no bisect in progress") or
 //! 200 ("nothing to reset") itself, and the existing `ErrorNotice` path

@@ -163,7 +163,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     // Creates a branch, moves HEAD and consumes the entry — three writes in
     // one verb, so the full posture without argument.
     ("/api/stash/branch", Method::POST, Authz::SessionAndCsrf),
-    // M5.34 (#87, ADR 0130): each bisect step is a real checkout, the same
+    // M5.34 (#87, ADR 0131): each bisect step is a real checkout, the same
     // write posture as checkout/reset — full session + CSRF, no exception.
     ("/api/bisect/start", Method::POST, Authz::SessionAndCsrf),
     ("/api/bisect/mark", Method::POST, Authz::SessionAndCsrf),

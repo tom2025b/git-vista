@@ -512,7 +512,7 @@ pub fn sequence_argv(kind: SequenceKind, verb: SequenceVerb) -> Vec<String> {
     vec![kind.subcommand().to_string(), verb.flag().to_string()]
 }
 
-/// `git bisect start <bad> <good...>` (M5.34, #87, ADR 0130).
+/// `git bisect start <bad> <good...>` (M5.34, #87, ADR 0131).
 pub fn bisect_start_argv(bad: &CommitOid, good: &[CommitOid]) -> Vec<String> {
     let mut argv = vec![
         "bisect".to_string(),
@@ -1160,7 +1160,7 @@ pub fn export_operation(operation: &GitOperation) -> Export {
                 .to_string(),
         },
 
-        // M5.34 (#87, ADR 0130). Unlike the sequencer's continue/skip/abort,
+        // M5.34 (#87, ADR 0131). Unlike the sequencer's continue/skip/abort,
         // a bisect step's command is never ambiguous: `start` carries its
         // own bad/good oids, and `good`/`bad`/`skip` take no argument at
         // all — the current candidate is whatever HEAD already is, on the

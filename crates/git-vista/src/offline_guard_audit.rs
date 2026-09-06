@@ -186,7 +186,7 @@ const TRANSPORT_HELPERS: &[&str] = &[
 /// whether a new write needs the offline guard is a decision, and this table
 /// is where a human is forced to make it.
 const OFFLINE_GUARDED: &[&str] = &[
-    // M5.34 (#87, ADR 0130): the three bisect writes — real git writes, same
+    // M5.34 (#87, ADR 0131): the three bisect writes — real git writes, same
     // posture as every other write in this table.
     "bisect_start_request",
     "bisect_mark_request",

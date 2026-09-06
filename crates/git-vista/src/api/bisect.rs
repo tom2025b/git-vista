@@ -1,5 +1,5 @@
 //! Bisect endpoints — `POST /api/bisect/start`, `/mark`, `/reset` (M5.34,
-//! #87, ADR 0130).
+//! #87, ADR 0131).
 //!
 //! No status read here yet: the server side of that (`bisect_exec::discover`)
 //! exists and is host-tested, but there is no `GET /api/bisect/status` route

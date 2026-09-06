@@ -2844,7 +2844,7 @@ fn every_git_write_route_reaches_the_planner() {
         ("/api/stash/apply", "handlers::stash::apply_stash"),
         ("/api/stash/drop", "handlers::stash::drop_stash"),
         ("/api/stash/branch", "handlers::stash::branch_from_stash"),
-        // M5.34 (#87, ADR 0130): the three bisect writes — git writes, funnel
+        // M5.34 (#87, ADR 0131): the three bisect writes — git writes, funnel
         // rows below.
         ("/api/bisect/start", "handlers::bisect::bisect_start"),
         ("/api/bisect/mark", "handlers::bisect::bisect_mark"),
@@ -3024,7 +3024,7 @@ fn every_git_write_route_reaches_the_planner() {
         // build the operation, call the planner directly.
         ("src/handlers/tags.rs", "push_tag", None),
         ("src/handlers/tags.rs", "delete_remote_tag", None),
-        // M5.34 (#87, ADR 0130): the three bisect writes. All three build
+        // M5.34 (#87, ADR 0131): the three bisect writes. All three build
         // their operation and call the planner directly — no `git bisect`
         // argv exists in this file.
         ("src/handlers/bisect.rs", "bisect_start", None),
@@ -7538,7 +7538,7 @@ async fn aborting_unwinds_the_sequence() {
 }
 
 // ---------------------------------------------------------------------------
-// M5.34 (#87, ADR 0130) — bisect
+// M5.34 (#87, ADR 0131) — bisect
 // ---------------------------------------------------------------------------
 
 /// Three commits, so `good` (the seed) and `bad` (HEAD) have exactly one

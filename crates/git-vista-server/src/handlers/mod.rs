@@ -60,7 +60,7 @@ pub(crate) mod conflicts;
 pub(crate) mod discard;
 // M2.20c (#229): fetch from a configured remote.
 pub(crate) mod fetch;
-// M5.34 (#87, ADR 0130): start/mark/reset a bisect session.
+// M5.34 (#87, ADR 0131): start/mark/reset a bisect session.
 pub(crate) mod bisect;
 // M2.20d (#230): fetch and integrate, with a mandatory merge/rebase strategy.
 pub(crate) mod pull;

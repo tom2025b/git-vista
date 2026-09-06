@@ -1,4 +1,4 @@
-//! The bisect HTTP surface (M5.34, #87, ADR 0130).
+//! The bisect HTTP surface (M5.34, #87, ADR 0131).
 //!
 //! Three write endpoints, one operation each — the mechanism itself
 //! (`discover`, the executors) lives in `planner::bisect_exec`; this file is

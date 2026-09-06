@@ -2957,7 +2957,7 @@ async fn shape(
             };
             (RiskLevel::Destructive, preconditions, changes, recovery)
         }
-        // M5.34 (#87, ADR 0130). No `Precondition` on `BisectStart`: the
+        // M5.34 (#87, ADR 0131). No `Precondition` on `BisectStart`: the
         // fields are bare commit oids (git itself refuses an unknown one,
         // the same protection `CreateBranch`'s `at` field relies on), and
         // starting while another bisect is already in progress is refused
@@ -4225,7 +4225,7 @@ mod worktree_exec;
 
 /// The bisect executors — start/mark/reset, and `discover` — git's own
 /// on-disk bisect state read fresh, never mirrored; see the module doc and
-/// ADR 0130 (M5.34, #87).
+/// ADR 0131 (M5.34, #87).
 pub(crate) mod bisect_exec;
 
 /// `POST /api/amend-commit`'s one 400 constructor — the handler's own

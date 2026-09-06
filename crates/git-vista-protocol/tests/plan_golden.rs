@@ -788,7 +788,7 @@ fn golden_plans() -> Vec<Plan> {
                 message: Some(StashMessage::new("wip: half-done refactor").unwrap()),
             },
         ),
-        // M5.34 (#87, ADR 0130): no Precondition on any of the three — the
+        // M5.34 (#87, ADR 0131): no Precondition on any of the three — the
         // real gate lives in the executor reading `.git/BISECT_START` itself
         // (this crate is wasm-safe, no filesystem), the same posture
         // RemoveWorktree takes. `after: Computed` on all three because which

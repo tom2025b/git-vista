@@ -1237,7 +1237,7 @@ fn recovery_oid(recovery: &RecoveryStrategy) -> Option<&CommitOid> {
         // A dangling blob (if any) isn't a commit a ref can point at — this
         // function only ever writes a ref naming a commit.
         | RecoveryStrategy::RecoverableIfStaged
-        // M5.34 (#87, ADR 0130): carries no commit field at all — the
+        // M5.34 (#87, ADR 0131): carries no commit field at all — the
         // repository's own bisect state already names what is under test,
         // and `git bisect reset` restores the pre-bisect HEAD from
         // BISECT_START, not from a pinned oid this ref could hold open.

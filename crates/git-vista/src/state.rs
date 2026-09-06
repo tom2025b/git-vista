@@ -237,7 +237,7 @@ pub struct Features {
     /// the USER chose, and a background refresh re-reading the repo must not
     /// silently discard it.
     pub compare_anchor: RwSignal<Option<String>>,
-    /// The bad endpoint of a bisect about to start (M5.34, #87, ADR 0130),
+    /// The bad endpoint of a bisect about to start (M5.34, #87, ADR 0131),
     /// once one has been marked. `None` when no start is in progress. Same
     /// shape and same reason as `compare_anchor` just above — see
     /// `menu::bisect_items`'s module doc.
