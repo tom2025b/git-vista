@@ -25,6 +25,7 @@ use crate::features::shell::signals as shell_state;
 use crate::listener_policy::{capability_refusal, is_capability_refusal};
 
 mod activity;
+mod blame;
 mod branches;
 mod clone;
 mod commits;
@@ -45,6 +46,7 @@ mod status;
 mod tags;
 
 pub use activity::{fetch_activity, fetch_undoables, undo_request};
+pub use blame::{fetch_blame, fetch_file_history};
 pub use branches::{
     branch_op_request, create_branch_request, fetch_head_branch, fetch_rebase_status,
     fetch_worktree_census, rebase_request,

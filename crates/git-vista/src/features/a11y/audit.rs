@@ -344,7 +344,12 @@ const INTERACTIVE_CENSUS: &[(&str, bool)] = &[
     // for it to be the exception.
     (".act-status-card-open", true),
     (".act-undo", true),
-    ("button.detail-file", true),
+    // M5.33 (#86): `button.detail-file` is gone — a file row is now a flex
+    // container (`.detail-file`) holding two sibling buttons, because native
+    // buttons cannot nest and the row needed a second action ("Blame")
+    // alongside "open the file". Both halves take the shared #65 rule.
+    (".detail-file-open", true),
+    (".detail-file-blame", true),
     (".detail-expand", true),
     (".viewer-btn", true),
     (".scale-btn", true),
@@ -364,6 +369,16 @@ const INTERACTIVE_CENSUS: &[(&str, bool)] = &[
     // only see CSS selectors) — given its own class specifically to close
     // that gap, and picked up the shared #65 44x44 rule at the same time.
     (".op-cancel-btn", true),
+    // M5.33 (#86): the blame panel's row body and its adjacent range-select
+    // target — the same two-separate-44px-targets split `.stage-hunk-text` /
+    // `.stage-hunk-check` made for staging, and for the same reason: one tap
+    // must never mean both "open this commit" and "select this line for a
+    // comparison". `.blame-history-commit` is the file-history list's own
+    // commit button (a plain native button, in the tab order by default —
+    // no roving model, nothing custom to size).
+    (".blame-row", true),
+    (".blame-select", true),
+    (".blame-history-commit", true),
 ];
 
 #[test]

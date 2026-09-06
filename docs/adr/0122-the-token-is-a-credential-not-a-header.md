@@ -181,18 +181,53 @@ one byte-exact test string.
 `CREDENTIAL_TOKEN_VAR` does not carry the hazard the exclusion was written
 against: git does not interpret this name at all. It only becomes
 meaningful because this crate's own `-c credential.helper=` literal names
-it — a config value this crate authored, never request data, and never
-something a served repository's own `.git/config` can point at (a
-repo-local `credential.helper` naming `printenv GIT_VISTA_CREDENTIAL_TOKEN`
-gets nothing, because that variable is set on this specific child's
-environment only when this specific spawn is the one that set it — a
-different invocation, such as a hostile repository's own configured
-helper running under a different `-c credential.helper=` entry earlier in
-the chain, never sees it). Setting an inert, git-opaque variable is data,
-not an argv change wearing a different hat, which is what the exclusion is
-actually about. `network_exec::network_command_with_credential`'s doc
-comment carries the full argument; this ADR is the record of it having been
-made deliberately, once, rather than each call site re-deciding it.
+it — a config value this crate authored, never request data. Setting an
+inert, git-opaque variable is data, not an argv change wearing a different
+hat, which is what the exclusion is actually about.
+`network_exec::network_command_with_credential`'s doc comment carries the
+full argument; this ADR is the record of it having been made deliberately,
+once, rather than each call site re-deciding it.
+
+**Correction (2026-09-05, grok's read-only review of #668).** This decision
+originally continued: "and never something a served repository's own
+`.git/config` can point at (a repo-local `credential.helper` naming
+`printenv GIT_VISTA_CREDENTIAL_TOKEN` gets nothing, because that variable
+is set on this specific child's environment only when this specific spawn
+is the one that set it)." **That isolation claim is false and is
+withdrawn.**
+
+The variable is set on the *git* process; `gv-sandbox` `execve`s git
+without clearing the environment (verified: its exec path contains no
+`env_clear`/`env_remove`); git's credential helpers are children of that
+git and inherit it. Decision 8's append-never-clear is exactly what places
+an operator's — or a repository's — own helper *earlier in the same chain,
+in the same process, with the same environment*. Decision 7's isolation and
+decision 8's append cannot both hold of a token living in git's
+environment. Append is what the code does, so isolation is the claim that
+loses.
+
+What still holds, and what does not:
+
+- **Not exploitable by a served repository today.** The only production
+  caller is `POST /api/clone`, which has no repository at spawn time, so
+  there is no repo-local `.git/config` to declare a hostile helper. The
+  helpers that do inherit the value there are the operator's own global
+  configuration.
+- **It becomes a real exfiltration path the moment fetch/push/pull adopt
+  `network_command_with_credential`**, because those run against an
+  *existing* repository whose `.git/config` may name a helper that runs
+  first and can read the variable straight out of its environment.
+  **Treat this as a blocker on reusing this helper for those paths** until
+  the token is genuinely isolated to Git-Vista's own helper — handing it
+  over a pipe the helper reads, rather than an inherited environment
+  variable, is the shape that would actually deliver what this decision
+  originally, wrongly, claimed. That is its own decision and its own ADR,
+  not a quiet addition beside a new call site.
+
+Recorded as a correction in place rather than a silent edit: the wrong
+version of this paragraph is what a later session would otherwise have
+trusted, and the reasoning error — asserting isolation for a value that
+lives in an inherited environment — is the part worth not repeating.
 
 ### 8. Never clears, only appends
 

@@ -287,6 +287,92 @@ html, body {
   padding-top: 0.5rem;
 }
 
+/* M5.33 (#86): the blame panel. `.blame-row-wrap` mirrors `.stage-hunk`'s
+   shape exactly — a select target and the row body as two independent
+   #65-compliant 44px targets, never one tap meaning both "focus/open" and
+   "select for comparison". */
+.blame-panel { display: flex; flex-direction: column; gap: 0.5rem; }
+.blame-rows { display: flex; flex-direction: column; }
+.blame-row-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid #21262d;
+}
+.blame-select {
+  cursor: pointer;
+  box-sizing: border-box;
+  min-height: 44px;
+  min-width: 44px;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  color: #2f81f7;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+  font: inherit;
+}
+.blame-select[aria-pressed="true"] {
+  background: #1f6feb;
+  border-color: #1f6feb;
+  color: #fff;
+}
+.blame-row {
+  color: var(--fg);
+  cursor: pointer;
+  display: flex;
+  gap: 0.6rem;
+  align-items: baseline;
+  box-sizing: border-box;
+  min-height: 44px;
+  flex: 1;
+  padding: 6px 0;
+  font-size: 0.85rem;
+}
+.blame-row:focus-visible { background: #10233d; }
+.blame-lines {
+  flex: 0 0 auto;
+  width: 5rem;
+  color: var(--muted, #8b949e);
+  font-variant-numeric: tabular-nums;
+}
+.blame-commit { flex: 0 0 auto; color: #2f81f7; }
+.blame-author { flex: 0 0 auto; color: var(--muted, #8b949e); }
+.blame-summary { flex: 1; word-break: break-word; }
+.blame-toolbar { display: flex; gap: 8px; margin: 0.5rem 0; }
+.blame-pager {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 0.5rem 0;
+  font-size: 0.85rem;
+}
+.blame-pager-at { color: var(--muted, #8b949e); font-variant-numeric: tabular-nums; }
+.blame-rename-warning { color: #d29922; }
+.blame-history { margin-top: 0.75rem; border-top: 1px solid #21262d; padding-top: 0.5rem; }
+.blame-history-list { list-style: none; margin: 0; padding: 0; }
+.blame-history-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  padding: 0.15rem 0;
+  font-size: 0.85rem;
+}
+.blame-history-commit {
+  flex: 0 0 auto;
+  font: inherit;
+  color: #2f81f7;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  min-height: 44px;
+}
+.blame-history-summary { flex: 1; word-break: break-word; }
+.blame-history-renamed { color: var(--muted, #8b949e); font-style: italic; }
+
 /* The graph panel. `position: relative` (M1.10, #63) makes it the containing
    block for the paging affordance below, which must sit at a fixed spot over
    the canvas rather than travel with the camera. Still `overflow: hidden`: the
@@ -950,11 +1036,17 @@ html .detail-panel.detail-panel--full .detail-body {
 }
 .act-when { color: var(--muted); font-size: 0.75rem; }
 
-/* The detail panel's file rows are now buttons (they open the full file
-   viewer), so flatten the button chrome back to the row layout they had as
-   divs, and add the tap affordance. */
-button.detail-file {
-  width: 100%;
+/* The detail panel's file rows are `.detail-file` flex containers (see the
+   layout rule above) holding two sibling buttons — the file itself (opens
+   the full file viewer) and, since M5.33 (#86), a "Blame" button (opens
+   rename-aware history/blame) — native buttons cannot nest, which is why
+   this is two buttons rather than one wrapping the other. */
+.detail-file-open {
+  flex: 1;
+  display: flex;
+  gap: 0.4rem;
+  align-items: baseline;
+  min-width: 0;
   font: inherit;
   color: var(--fg);
   background: transparent;
@@ -963,8 +1055,23 @@ button.detail-file {
   text-align: left;
   cursor: pointer;
 }
-button.detail-file:hover { background: #21262d; }
-button.detail-file:hover .detail-file-path { color: var(--accent); }
+.detail-file-open:hover { background: #21262d; }
+.detail-file-open:focus-visible { background: #21262d; }
+.detail-file-open:hover .detail-file-path { color: var(--accent); }
+.detail-file-open:focus-visible .detail-file-path { color: var(--accent); }
+.detail-file-blame {
+  flex: 0 0 auto;
+  font: inherit;
+  font-size: 0.78rem;
+  color: var(--accent);
+  background: transparent;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 0.1rem 0.5rem;
+  cursor: pointer;
+}
+.detail-file-blame:hover { background: #21262d; }
+.detail-file-blame:focus-visible { background: #21262d; }
 
 /* "Expand Full Diff" in the Changes header — small, right-aligned, styled
    like the panel's other secondary buttons (.act-refresh). */
@@ -1314,8 +1421,6 @@ button.detail-file:hover .detail-file-path { color: var(--accent); }
 .detail-parent:focus-visible { border-color: var(--accent); }
 .detail-github:focus-visible { text-decoration: underline; }
 .detail-expand:focus-visible { border-color: var(--accent); }
-button.detail-file:focus-visible { background: #21262d; }
-button.detail-file:focus-visible .detail-file-path { color: var(--accent); }
 
 /* Activity feed. */
 .act-refresh:focus-visible { border-color: var(--accent); }
@@ -1374,10 +1479,25 @@ button.detail-file:focus-visible .detail-file-path { color: var(--accent); }
 /* M4.31a (#428): a conflicted status card opens the four-pane view. */
 .act-status-card-open,
 .act-undo,
-button.detail-file,
+/* M5.33 (#86): a detail-panel file row is now a flex container holding two
+   sibling buttons (native buttons cannot nest) — the file itself and its
+   "Blame" button — so the row's own former entry (`button.detail-file`) is
+   replaced by one per button. Both are ordinary CSS-sized controls with
+   nothing SVG about them, so both take the shared rule rather than being
+   recorded as exceptions. */
+.detail-file-open,
+.detail-file-blame,
 .detail-expand,
 .viewer-btn,
 .scale-btn,
+/* M5.33 (#86): the blame panel's three controls — the row body (roving
+   keyboard/tap stop, mirrors `.stage-hunk-text`), its adjacent range-select
+   target (mirrors `.stage-hunk-check`), and a history entry's commit button.
+   `.blame-row` and `.blame-select` also declare their own min-height in the
+   blame block above; the shared rule is what guarantees the *width* half. */
+.blame-row,
+.blame-select,
+.blame-history-commit,
 .op-cancel-btn {
   min-height: 44px;
   min-width: 44px;

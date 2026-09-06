@@ -493,12 +493,31 @@ mod tests {
     /// reasoned." This does not read the argv this module *composed* and
     /// trust it — it spawns a real child, has that child read its own
     /// `/proc/self/cmdline` from the kernel, and greps the canary out of
-    /// that. It also proves the positive half in the same run: the helper
-    /// really does receive the token, via the environment, so a
-    /// "withholds by never actually supplying it" non-fix cannot pass this
-    /// test either (that is the shape #665's paired-positive lesson is
-    /// about, applied here before the fact rather than after a review
-    /// catches it).
+    /// that.
+    ///
+    /// # What this test does NOT prove — corrected after review
+    ///
+    /// This comment used to claim the run "also proves the positive half:
+    /// the helper really does receive the token, via the environment, so a
+    /// 'withholds by never actually supplying it' non-fix cannot pass this
+    /// test either." **That was false.** `pinned_env_for_test` does
+    /// `env_clear()` and then applies its profile — which includes
+    /// `CREDENTIAL_TOKEN_VAR` — so it wipes whatever `credential_env` set
+    /// and supplies the canary itself. The env assertion below therefore
+    /// checks the test's own profile, not the production supply path.
+    ///
+    /// Measured, not argued: deleting `.credential_env(token)` from
+    /// `network_command_with_credential` left this test **green**
+    /// (`failure-atlas` mutation 332, verdict `survived`) — the exact
+    /// "structurally complete, semantically inert" shape the claim above
+    /// said could not pass. Found by grok's read-only review of #668,
+    /// 2026-09-05.
+    ///
+    /// The argv/kernel-cmdline half below is sound and is what this test is
+    /// for. The supply half is pinned separately by
+    /// [`the_composed_command_actually_carries_the_token_in_its_environment`],
+    /// which reads the composed command instead of a spawned child, because
+    /// the spawn's environment is exactly what this harness overwrites.
     #[tokio::test]
     async fn a_supplied_token_reaches_the_helpers_environment_and_never_the_processs_own_argv() {
         const CANARY: &str = "gv-test-canary-token-should-never-appear-in-argv-8f2c";
@@ -547,6 +566,60 @@ mod tests {
             "the credential.helper config should name the variable BY NAME so \
              the helper knows where to read it, even though the value never \
              appears: {composed_argv}"
+        );
+    }
+
+    /// The supply half, pinned where the spawn-based test cannot pin it:
+    /// `network_command_with_credential` must actually put the token on the
+    /// command's environment via `credential_env`.
+    ///
+    /// Separate from the `/proc/self/cmdline` test on purpose. That one
+    /// spawns a real child under `pinned_env_for_test`, which `env_clear()`s
+    /// and re-supplies `CREDENTIAL_TOKEN_VAR` from its own profile — so no
+    /// assertion made on the *spawned* environment can distinguish "the
+    /// composer supplied it" from "the test profile supplied it". Deleting
+    /// `.credential_env(token)` left that test green (`failure-atlas`
+    /// mutation 332, `survived`). This test is the one that goes red for
+    /// that defect.
+    ///
+    /// The negative arm matters as much as the positive one: `None` must
+    /// leave the variable unset, so this cannot pass by the composer
+    /// setting it unconditionally.
+    #[tokio::test]
+    async fn the_composed_command_actually_carries_the_token_in_its_environment() {
+        const CANARY: &str = "gv-test-supply-canary-9d41";
+
+        let repo = fixture().await;
+        let policy = production_policy(repo.path());
+
+        let with_token = network_command_with_credential(
+            &policy,
+            repo.path(),
+            &["ls-remote", "https://example.invalid/repo.git"],
+            Some(CANARY),
+        );
+        assert_eq!(
+            with_token.credential_env_for_test().as_deref(),
+            Some(CANARY),
+            "the composed command does not carry the token in its \
+             environment — the helper would have nothing to read, and the \
+             spawn-based test cannot catch this because its own pinned \
+             profile re-supplies the variable"
+        );
+
+        let without_token = network_command_with_credential(
+            &policy,
+            repo.path(),
+            &["ls-remote", "https://example.invalid/repo.git"],
+            None,
+        );
+        assert_eq!(
+            without_token.credential_env_for_test(),
+            None,
+            "a tokenless call must leave {} unset; setting it \
+             unconditionally would make the positive assertion above \
+             vacuous",
+            spawn::CREDENTIAL_TOKEN_VAR
         );
     }
 

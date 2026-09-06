@@ -74,6 +74,10 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
         Method::GET,
         Authz::SessionRequired,
     ),
+    // M5.33 (#86): committed history + blame, the same read posture as
+    // `/api/diff/{id}` and `/api/file/{id}/{*path}` immediately above.
+    ("/api/file-history", Method::GET, Authz::SessionRequired),
+    ("/api/blame", Method::GET, Authz::SessionRequired),
     ("/api/head-branch", Method::GET, Authz::SessionRequired),
     ("/api/status", Method::GET, Authz::SessionRequired),
     // #68c: the generation-tagged WorktreeStatus DTO — same read posture as
@@ -345,17 +349,19 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
 ///
-/// The way this number moves is the reason the constant exists. FOUR routes
-/// crossed onto the trunk from four separate branches, each of which counted
+/// The way this number moves is the reason the constant exists. Routes have
+/// crossed onto the trunk from separate branches, each of which counted
 /// correctly for the trunk it branched from:
 /// `/api/select-worktree` (M11.03, #548), `/api/add-worktree` (M11.04, #549)
 /// and `/api/remove-worktree` (M11.05, #550) are classified `SessionAndCsrf`
-/// above; `/api/repository/events` (M12.05, #555) is `SessionRequired`.
+/// above; `/api/repository/events` (M12.05, #555) is `SessionRequired`; the
+/// rename-aware history and blame routes (M5.33, #86) are classified above
+/// with the rest of the read surface.
 /// No branch could see the total — only the trunk can, which is exactly what
 /// this constant and its test are for. Derived by running
 /// `every_registered_route_is_classified`, never copied from either side of a
 /// merge.
-const EXPECTED_ROUTE_COUNT: usize = 74;
+const EXPECTED_ROUTE_COUNT: usize = 76;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in

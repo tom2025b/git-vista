@@ -33,6 +33,8 @@ pub mod core_traits;
 
 pub mod a11y;
 pub mod activity;
+// M5.33 (#86): rename-aware file history and blame.
+pub mod blame;
 // No `conflicts` module here any more. M4.31's four-pane view model and its
 // marker-file block editor moved to the `git-vista-conflicts` crate for
 // M10.07 (#462; ADR 0105), so the terminal client resolves conflicts through

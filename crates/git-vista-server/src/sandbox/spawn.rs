@@ -169,15 +169,41 @@ pub(crate) struct SandboxedCommand(tokio::process::Command);
 /// own design. This name means nothing to git. It only becomes meaningful
 /// because this crate's own `-c credential.helper=` literal
 /// (`network_exec::credential_helper_arg`) names it — a config value *this
-/// crate authored*, never request data, never something a served
-/// repository's own config can point at (a repo-local `credential.helper`
-/// pointing at `printenv GIT_VISTA_CREDENTIAL_TOKEN` gets nothing: this
-/// variable is set on the immediate child's environment only when that
-/// child *is itself* the credential-helper-forcing spawn — a hostile
-/// repo's own credential.helper runs as a *different* invocation, with the
-/// value never set). Setting an inert, git-opaque variable is data, not an
-/// argv change wearing a different hat, which is what the type doc's
-/// exclusion is actually about.
+/// crate authored*, never request data. Setting an inert, git-opaque
+/// variable is data, not an argv change wearing a different hat, which is
+/// what the type doc's exclusion is actually about.
+///
+/// # What this does NOT give you: the value is not isolated to our helper
+///
+/// An earlier version of this comment claimed a repo-local
+/// `credential.helper` pointing at `printenv GIT_VISTA_CREDENTIAL_TOKEN`
+/// "gets nothing", on the reasoning that the variable is set only on the
+/// spawn that forces our own helper. **That is false, and it was corrected
+/// after review (#668, grok, 2026-09-05).** The variable is set on the
+/// *git* process; `gv-sandbox` `execve`s git without clearing the
+/// environment, and git's credential helpers are children of that git. So
+/// **every helper in the chain inherits this value**, not only ours — and
+/// `network_exec`'s append-never-clear rule (ADR 0122 decision 8) is
+/// precisely what puts an operator's or a repository's own helper *earlier*
+/// in that chain, in the same process, with the same environment.
+///
+/// Isolation and append cannot both be true of a value that lives in git's
+/// environment. Append is what the code does; isolation is the claim that
+/// loses.
+///
+/// Why this is nonetheless acceptable **today**: the only production caller
+/// is `POST /api/clone` (`handlers/clone.rs`), which has no repository at
+/// spawn time, so no repo-local config exists to declare a hostile helper.
+/// Helpers that do inherit it there are the operator's own global config.
+///
+/// **Read this before reusing `network_command_with_credential` on
+/// fetch/push/pull.** Those run against an *existing* repository whose
+/// `.git/config` may declare a `credential.helper` that runs first and can
+/// read this variable straight out of its environment. That is a
+/// served-repo exfiltration path, and closing it is a separate decision
+/// (isolating the token to our own helper — e.g. passing it on a pipe the
+/// helper reads rather than an inherited variable), not something to add
+/// silently alongside a new call site.
 pub(crate) const CREDENTIAL_TOKEN_VAR: &str = "GIT_VISTA_CREDENTIAL_TOKEN";
 
 impl SandboxedCommand {
@@ -188,6 +214,34 @@ impl SandboxedCommand {
     pub(crate) fn credential_env(mut self, token: &str) -> Self {
         self.0.env(CREDENTIAL_TOKEN_VAR, token);
         self
+    }
+
+    /// Test-only: what [`CREDENTIAL_TOKEN_VAR`] is set to on this composed
+    /// command, if anything.
+    ///
+    /// This exists because the *spawn*-based proof cannot answer the
+    /// question. `pinned_env_for_test` deliberately does `env_clear()` and
+    /// then applies its profile wholesale, so any `credential_env` set
+    /// before it is wiped and re-supplied by the profile itself — which
+    /// means a spawned child observing the variable proves only that the
+    /// test put it there. Measured, not reasoned: deleting
+    /// `.credential_env(token)` from `network_exec::
+    /// network_command_with_credential` left the real-spawn test green
+    /// (`failure-atlas` mutation 332, `survived`), which is what this
+    /// accessor and its test exist to fix.
+    ///
+    /// Reading the composed command is the weaker kind of evidence this
+    /// crate normally avoids — but here it is the *only* view of the
+    /// supply step that the test harness does not overwrite, and it is
+    /// paired with, not a replacement for, the real spawn that reads
+    /// `/proc/self/cmdline` back from the kernel.
+    #[cfg(test)]
+    pub(crate) fn credential_env_for_test(&self) -> Option<String> {
+        self.0.as_std().get_envs().find_map(|(k, v)| {
+            (k == std::ffi::OsStr::new(CREDENTIAL_TOKEN_VAR))
+                .then(|| v.map(|v| v.to_string_lossy().into_owned()))
+                .flatten()
+        })
     }
 
     pub(crate) fn stdin(mut self, cfg: impl Into<std::process::Stdio>) -> Self {
