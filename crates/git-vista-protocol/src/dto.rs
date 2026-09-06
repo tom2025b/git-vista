@@ -899,6 +899,37 @@ pub struct SelectRequest {
     pub mode: RepoMode,
 }
 
+/// Body of `POST /api/settings/token` (M13.03, #584): set the GitHub token
+/// the credential helper offers for HTTPS operations against private
+/// repositories. Persists via #583's OS-keyring tier — the highest in
+/// `token_store::resolve_token`'s precedence — so a value saved here is what
+/// every subsequent resolution finds first, without touching the
+/// environment-variable or file tiers #583 also supports for headless use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetTokenRequest {
+    pub token: String,
+}
+
+/// Response of `GET` and `POST /api/settings/token` (M13.03, #584): whether a
+/// token is configured, and if so, which tier answered and its last 4
+/// characters — never the value itself. This type is the one place #584's
+/// "never returned by any read endpoint" acceptance criterion lives on the
+/// wire: it has no field capable of carrying the full token, by
+/// construction, not by a caller remembering to mask one.
+///
+/// `configured` is kept alongside `masked`/`source` rather than derived from
+/// them so a client only needs the one field for its primary yes/no
+/// question — a future version could in principle drop the other two and
+/// this would still answer it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenStatus {
+    pub configured: bool,
+    pub masked: Option<String>,
+    pub source: Option<String>,
+}
+
 /// Body of `POST /api/select-worktree` (M11.03, #548): switch to a linked
 /// worktree of the **currently served repository**, addressed by the opaque id
 /// the worktree census reports for it.
