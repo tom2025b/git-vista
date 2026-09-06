@@ -136,6 +136,21 @@ test run should never be the thing that renumbers a real ADR):
   same-numbered sibling is a different document, not a reference to this
   one.
 
+  **This is worth naming on its own terms.** A collision-resolver bug whose
+  failure mode is exactly the defect class this ADR's own new heading test
+  exists to catch is not a coincidence worth glossing over: it is evidence
+  about what kind of bug hides from reading and shows up under execution.
+  Two independent readers (a cross-family review and this session's own
+  re-check) read the sweep's exclusion logic before the fixture existed and
+  neither found it — the code looked right, because the failure only
+  appears when a specific *state* exists (two files sharing a number, both
+  headed with the phrase the sweep searches for) that no amount of reading
+  the sweep's logic in isolation reveals. Building the fixture and running
+  the script against it is what found it. That is the argument for treating
+  a fixture with a genuine two-file collision as the bar for proving this
+  script works, not the unique-file round trip — a bar this ADR's own first
+  draft fell short of before review.
+
 ## Alternatives considered
 
 **Reserve a number on branch creation** — a lane claims its number in a
