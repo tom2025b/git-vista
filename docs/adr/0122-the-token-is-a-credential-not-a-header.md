@@ -4,7 +4,7 @@
 - **Date:** 2026-09-05
 - **Issue:** #582 (M13.01) · #587 (M13.06, this record)
 - **Extends:** [ADR 0033](0033-ssh-agent-and-known-hosts-carveout.md) (the sibling carve-out for SSH; this is the HTTPS half of the same question) · `docs/SECURITY_MODEL.md`'s "Remote and Forge Credentials" section, which this annotates
-- **Supersedes / superseded by:** —
+- **Superseded in part by:** [ADR 0128](0128-a-credential-exists-only-before-untrusted-checkout.md) (#680), which contains the inherited value during clone and makes token-aware output redaction structural
 
 ## Context
 
@@ -206,13 +206,17 @@ decision 8's append cannot both hold of a token living in git's
 environment. Append is what the code does, so isolation is the claim that
 loses.
 
-What still holds, and what does not:
+What held after that correction, and what did not:
 
-- **Not exploitable by a served repository today.** The only production
-  caller is `POST /api/clone`, which has no repository at spawn time, so
-  there is no repo-local `.git/config` to declare a hostile helper. The
-  helpers that do inherit the value there are the operator's own global
-  configuration.
+- **The only production caller was `POST /api/clone`.** It had no
+  repo-local `.git/config` at spawn time, but that fact was not sufficient
+  to make inheritance unexploitable. An operator-level relative
+  `core.hooksPath` or filter definition can let fetched, attacker-chosen
+  content select a program during clone's implicit checkout. That program
+  inherits the token from the still-running git process. #680 reproduced
+  this with a tracked `hooks/post-checkout` and a canary value. The earlier
+  “not exploitable ... today” conclusion was therefore conditional on
+  operator configuration and is withdrawn.
 - **It becomes a real exfiltration path the moment fetch/push/pull adopt
   `network_command_with_credential`**, because those run against an
   *existing* repository whose `.git/config` may name a helper that runs
@@ -228,6 +232,18 @@ Recorded as a correction in place rather than a silent edit: the wrong
 version of this paragraph is what a later session would otherwise have
 trusted, and the reasoning error — asserting isolation for a value that
 lives in an inherited environment — is the part worth not repeating.
+
+**Second correction (2026-09-06, #680).** ADR 0128 now closes the clone
+case without disabling hooks or filters. Clone fetches objects and refs with
+`--no-checkout` while the helper variable exists, then lets that process
+exit. A second Network-tier command performs checkout with hooks and filters
+enabled and with `GIT_VISTA_CREDENTIAL_TOKEN`,
+`GIT_VISTA_GITHUB_TOKEN`, and `GH_TOKEN` explicitly removed. The last two
+matter because an environment-backed token source was already present in
+the server process and would otherwise bypass containment of the internal
+helper variable. The fetch/push/pull reuse blocker above remains: those
+operations act on an already-existing hostile repository before the
+credentialed process can be separated from repository-selected execution.
 
 ### 8. Never clears, only appends
 
