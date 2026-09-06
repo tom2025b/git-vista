@@ -76,6 +76,23 @@ impl RowMark {
     }
 }
 
+/// One ref's journey from its current commit to where the operation lands it.
+///
+/// [`RowMark::refs_landed`] keeps only the destination — enough for the static
+/// picture, which marks the after row and says nothing about the before row.
+/// The animation (#591) needs the other end too: a ref can only be drawn
+/// *sliding* between two commits it actually points at, one before the
+/// operation and one after, and [`PreviewChange::RefMoved`] is the only place
+/// that origin survives. Kept as a plain struct of ids rather than re-deriving
+/// `from` by name-searching `before` — the server already computed it once,
+/// and a second computation could only ever disagree with the first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefMove {
+    pub ref_name: String,
+    pub from: String,
+    pub to: String,
+}
+
 /// A before/after picture, with the after half marked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Picture {
@@ -83,6 +100,8 @@ pub struct Picture {
     pub after: Half,
     /// Commit id -> what to mark it with. Only marked rows appear.
     pub marks: HashMap<String, RowMark>,
+    /// Every ref the operation moves, with both endpoints. See [`RefMove`].
+    pub ref_moves: Vec<RefMove>,
     /// One plain sentence describing the change, for readers who will not read
     /// a graph — and for a screen reader, which cannot.
     pub summary: String,
@@ -138,11 +157,13 @@ pub fn view_of(response: PreviewResponse) -> PreviewView {
             changes,
         } => {
             let marks = marks_from(&changes);
+            let ref_moves = ref_moves_from(&changes);
             let summary = summarize(&changes);
             PreviewView::Picture(Picture {
                 before,
                 after,
                 marks,
+                ref_moves,
                 summary,
             })
         }
@@ -220,6 +241,26 @@ fn marks_from(changes: &[PreviewChange]) -> HashMap<String, RowMark> {
         }
     }
     marks
+}
+
+/// Pull every ref move out of the change list, both endpoints intact.
+///
+/// A `LaneShifted`/`Added` change carries no ref, so only `RefMoved` produces
+/// an entry — an operation with none (a fast-forward merge that lands no new
+/// ref, or a preview with only a lane shuffle) simply returns an empty list,
+/// and the animation draws no floating badge, which is the honest answer.
+fn ref_moves_from(changes: &[PreviewChange]) -> Vec<RefMove> {
+    changes
+        .iter()
+        .filter_map(|c| match c {
+            PreviewChange::RefMoved { ref_name, from, to } => Some(RefMove {
+                ref_name: ref_name.clone(),
+                from: from.0.clone(),
+                to: to.0.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 /// One plain sentence for the change list.
@@ -442,6 +483,54 @@ pub fn preview_action(subject: Option<DialogSubject<'_>>) -> PreviewAction {
     }
 }
 
+/// Whether a rebuild-lease continuation issued at generation `issued` is
+/// still the live one — `current` is `Preview`'s generation counter, read at
+/// the moment this is checked.
+///
+/// # Moved here for the same reason `preview_action` was (#664 review round 3)
+///
+/// This one comparison is the entire fix for the round's browser-reproduced
+/// defect: `dialogs/confirm.rs`'s `rebuild_lease` held a reply after Cancel,
+/// and nothing checked whether the rebuild it was completing was still
+/// current before writing state or re-opening the confirmation. The
+/// comparison itself is one line either way it is written, which is exactly
+/// why it must live where a runner can execute it rather than in
+/// `features/preview/signals.rs` (`#[cfg(target_arch = "wasm32")]`, `cargo
+/// test` never compiles it) — the same gap ADR 0115 and #612 both name, and
+/// the same fix: move the decision, not the value.
+///
+/// `None` (a disposed owner; `try_get_value` found nothing) is never
+/// current — the same conservative reading `Preview::fetch`'s own guard
+/// already gives an unreadable generation, so an unreadable one and a
+/// stale one are not distinguished here either.
+pub fn rebuild_token_is_current(current: Option<u64>, issued: u64) -> bool {
+    current == Some(issued)
+}
+
+#[cfg(test)]
+mod rebuild_token_tests {
+    use super::rebuild_token_is_current;
+
+    #[test]
+    fn a_token_matching_the_live_generation_is_current() {
+        assert!(rebuild_token_is_current(Some(3), 3));
+    }
+
+    #[test]
+    fn a_token_behind_the_live_generation_is_not_current() {
+        // Cancel, or a newer rebuild, bumped past it.
+        assert!(!rebuild_token_is_current(Some(4), 3));
+    }
+
+    #[test]
+    fn an_unreadable_generation_is_never_current() {
+        // A disposed owner — never treated as "still fine", the same
+        // conservative reading an unreadable ref gets everywhere else in
+        // this app.
+        assert!(!rebuild_token_is_current(None, 3));
+    }
+}
+
 #[cfg(test)]
 mod preview_action_tests {
     use super::*;
@@ -652,12 +741,40 @@ mod preview_action_tests {
              composition #594's mutation proof could not see, back in a wasm-only \
              file. Effect body was:\n{body}"
         );
+        // Every request for a picture, whatever asks for it: the effect that
+        // opens the dialog (`preview.start`) and the Rebuild control a stale
+        // plan offers (`preview.rebuild`, #664 review).
+        //
+        // The rule this census protects was never "exactly one call site" — it
+        // is that **every** request is routed through
+        // `preview_action(preview_subject(op))`, so a dialog can never ask for
+        // a picture of an operation the core says has none. Counting call sites
+        // was a cheap proxy for that while there was one. Now the property is
+        // checked directly, for each of them — which is also what caught the
+        // rebuild that resolved to `Clear` and therefore asked for nothing.
+        let starts: Vec<_> = CONFIRM
+            .match_indices("preview.start(")
+            .chain(CONFIRM.match_indices("preview.rebuild("))
+            .collect();
         assert_eq!(
-            CONFIRM.matches("preview.start(").count(),
-            1,
-            "`preview.start` is reachable from more than one place in confirm.rs; \
-             only the `PreviewAction::Start` arm may ask for a picture"
+            starts.len(),
+            2,
+            "a new request for a preview appeared in confirm.rs. That is \
+             allowed, but it must be routed through `preview_action` like the \
+             two below — add it here deliberately rather than raising the number"
         );
+        for (at, _) in starts {
+            let before = &CONFIRM[..at];
+            let routed = before
+                .rfind("preview_action(")
+                .is_some_and(|routed| before[routed..].matches("fn ").count() == 0);
+            assert!(
+                routed,
+                "a preview request at byte {at} is not preceded by a \
+                 `preview_action` in the same function — that is the \
+                 composition #594's mutation proof could not see"
+            );
+        }
         assert_eq!(
             CONFIRM.matches("preview.clear(").count(),
             1,

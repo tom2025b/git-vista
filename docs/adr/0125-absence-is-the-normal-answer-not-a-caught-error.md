@@ -1,4 +1,4 @@
-# ADR 0121 — Absence is the normal answer, not a caught error
+# ADR 0125 — Absence is the normal answer, not a caught error
 
 - **Status:** Accepted — implemented, mutation-proved two ways failing differently
 - **Date:** 2026-09-05
