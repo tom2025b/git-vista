@@ -32,8 +32,8 @@ mod commits;
 // M4.31a (#428): inspect a conflict — the three reads and the pane assembler.
 mod conflicts;
 mod diff;
-mod graph;
 mod forge;
+mod graph;
 mod operations;
 // M10.08 A6 (#594): the /api/plan -> /api/preview round trip the confirm
 // dialogs draw their before/after picture from.

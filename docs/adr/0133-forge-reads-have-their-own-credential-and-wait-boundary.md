@@ -30,9 +30,9 @@ The independent Settings work in #698 does not supply operation credentials.
 The token lives in server memory and a sensitive HTTP authorization header.
 Only the fixed `https://api.github.com` origin receives it. The HTTP client has
 TLS, a three-second connect/eight-second total HTTP deadline, no redirects and
-no ambient proxies. No child process receives the token. Repo paths are mapped
-through the existing origin normalization and then strictly validated as two
-safe path components. Upstream `html_url` and Link destinations never become
+no ambient proxies. No child process receives the token. The exact origin URL is read through a neutral Git adapter, then HTTPS/SSH/scp
+GitHub forms are parsed at the handler boundary and strictly validated as two
+safe path components. Lossy display-link normalization is not used. Upstream `html_url` and Link destinations never become
 request destinations. Web links are constructed from the validated repository
 and numeric PR number. Exact-token redaction covers titles; a repository name
 containing the resolved token fails closed. Upstream bodies, headers, and HTTP

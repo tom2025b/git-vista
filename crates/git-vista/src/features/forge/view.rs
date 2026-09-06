@@ -1,10 +1,11 @@
 //! DOM wiring only. Provider requests never participate in the graph resource.
-use leptos::*;
+use super::core::{accepts_response, availability_line, capability_line, page_for};
 use git_vista_protocol::forge::ForgePage;
-use super::core::{accepts_response, availability_line, capability_line};
+use leptos::*;
 
 pub fn forge_view(open: RwSignal<bool>, repo: Signal<Option<String>>) -> impl IntoView {
     let page = create_rw_signal(1u32);
+    let previous_repo = store_value(None::<String>);
     let refresh = create_rw_signal(0u64);
     let epoch = create_rw_signal(0u64);
     let result = create_rw_signal(None::<Result<ForgePage, String>>);
@@ -14,7 +15,15 @@ pub fn forge_view(open: RwSignal<bool>, repo: Signal<Option<String>>) -> impl In
     create_effect(move |_| {
         let is_open = open.get();
         let selected = repo.get();
-        let requested_page = page.get();
+        let requested_page = page_for(
+            previous_repo.get_value().as_deref(),
+            selected.as_deref(),
+            page.get(),
+        );
+        // One effect decides the reset before fetching; a second reset effect
+        // would issue both old-page and page-1 requests for the new repo.
+        page.set_untracked(requested_page);
+        previous_repo.set_value(selected.clone());
         refresh.get();
         let request_epoch = epoch.get_untracked().wrapping_add(1);
         epoch.set(request_epoch);
@@ -24,16 +33,24 @@ pub fn forge_view(open: RwSignal<bool>, repo: Signal<Option<String>>) -> impl In
             loading.set(true);
             spawn_local(async move {
                 let answer = crate::api::fetch_forge_page(&requested_repo, requested_page).await;
-                if accepts_response(open.get_untracked(), request_epoch, epoch.get_untracked(), &requested_repo, repo.get_untracked().as_deref()) {
+                if accepts_response(
+                    open.get_untracked(),
+                    request_epoch,
+                    epoch.get_untracked(),
+                    &requested_repo,
+                    repo.get_untracked().as_deref(),
+                ) {
                     result.set(Some(answer));
                     loading.set(false);
                 }
             });
         }
     });
-    // Repository changes reset pagination even while the panel is closed.
-    create_effect(move |_| { repo.get(); page.set(1); });
-    let close = move || { open.set(false); result.set(None); page.set(1); };
+    let close = move || {
+        open.set(false);
+        result.set(None);
+        page.set(1);
+    };
     view! {
         <Show when=move || open.get()>
             <div style="position:fixed; inset:0; z-index:910; display:flex; align-items:center; justify-content:center; background:rgba(1,4,9,0.6);">

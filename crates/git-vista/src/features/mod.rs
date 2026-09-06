@@ -46,9 +46,9 @@ pub mod diff;
 pub mod explain;
 // M12.05 (#555): is the plan on screen still true? The decision and its
 // sentences are host-tested in `core`; `signals` is the one EventSource.
+pub mod forge;
 pub mod freshness;
 pub mod graph;
-pub mod forge;
 // #612: the graph panel's load phase. The signal lives in the `App` shell
 // (wasm-only); the three rules that move it are here, where a host test runs
 // them and a source census pins the shell to their answers.

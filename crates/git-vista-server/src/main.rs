@@ -855,6 +855,13 @@ fn api_router(
         // The profile is a property of the listener, not of any one handler.
         // Stamp it at the router boundary so every registered API response
         // declares the capability table that served it.
+        // Error-envelope rewriting can replace the auth layer's response.
+        // Stamp no-store outside it so private provider reads and refusals
+        // retain the same cache policy as successful local reads.
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ))
         .layer(SetResponseHeaderLayer::overriding(
             header::HeaderName::from_static(LISTENER_PROFILE_HEADER),
             HeaderValue::from_static(listener_profile.as_header_value()),
@@ -899,6 +906,13 @@ fn build_app(
         // That is the live LAN failure shape: POST /api/select falls through
         // to the file service and receives an ordinary 405.  The response must
         // still say which listener profile produced it.
+        // Error-envelope rewriting can replace the auth layer's response.
+        // Stamp no-store outside it so private provider reads and refusals
+        // retain the same cache policy as successful local reads.
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ))
         .layer(SetResponseHeaderLayer::overriding(
             header::HeaderName::from_static(LISTENER_PROFILE_HEADER),
             HeaderValue::from_static(listener_profile.as_header_value()),
@@ -1196,17 +1210,34 @@ mod tests {
         let sessions = Arc::new(SessionManager::new(None));
         let token = sessions.current_bootstrap();
         let router = api_router(
-            SessionState { manager: sessions, via_lan: false, rate_limiter: None },
-            HostPolicy::loopback(PORT), true, Arc::new(CursorCodec::new()),
+            SessionState {
+                manager: sessions,
+                via_lan: false,
+                rate_limiter: None,
+            },
+            HostPolicy::loopback(PORT),
+            true,
+            Arc::new(CursorCodec::new()),
         );
         let request = |cookie: Option<String>| {
-            let mut req = Request::builder().uri("/api/forge/pulls?page=0")
+            let mut req = Request::builder()
+                .uri("/api/forge/pulls?page=0")
                 .header(header::HOST, "localhost:8080")
                 .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string());
-            if let Some(cookie) = cookie { req = req.header(header::COOKIE, cookie); }
+            if let Some(cookie) = cookie {
+                req = req.header(header::COOKIE, cookie);
+            }
             req.body(Body::empty()).unwrap()
         };
-        assert_eq!(router.clone().oneshot(request(None)).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(request(None))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
         let cookie = bootstrap_cookie(router.clone(), "localhost:8080", &token).await;
         let response = router.oneshot(request(Some(cookie))).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
