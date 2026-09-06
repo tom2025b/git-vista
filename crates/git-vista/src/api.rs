@@ -33,6 +33,7 @@ mod commits;
 mod conflicts;
 mod diff;
 mod graph;
+mod forge;
 mod operations;
 // M10.08 A6 (#594): the /api/plan -> /api/preview round trip the confirm
 // dialogs draw their before/after picture from.
@@ -61,6 +62,7 @@ pub use conflicts::{
     resolve_conflict_request,
 };
 pub use diff::{fetch_diff, fetch_diff_full, fetch_file, fetch_spec_diff};
+pub use forge::fetch_forge_page;
 pub use graph::{fetch_frame, fetch_page};
 pub use operations::{
     cancel_operation_request, fetch_operation_status, resolve_operation_id, CancelOutcome,

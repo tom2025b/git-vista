@@ -560,6 +560,7 @@ fn api_router(
     // exist at all.
     if full_routes {
         api = api
+            .route("/api/forge/pulls", get(handlers::forge::pulls))
             // Phase 12: clone a public URL into a temp dir and view it read-only.
             .route("/api/clone", post(clone_repo))
             // #263: what happened to a clone attempt admitted under an
@@ -1119,7 +1120,7 @@ mod tests {
         // must not be able to ask for one — ADR 0005 says the route is never
         // *built* on this router, and a 404 is what proves that (a 403 would
         // mean it exists and something gated it).
-        for path in ["/api/commit", "/api/plan"] {
+        for path in ["/api/commit", "/api/plan", "/api/forge/pulls"] {
             let resp = router
                 .clone()
                 .oneshot(
@@ -1188,6 +1189,28 @@ mod tests {
                 "{path} is not registered on the loopback router"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn forge_route_requires_session_and_validates_page_before_resolving_credentials() {
+        let sessions = Arc::new(SessionManager::new(None));
+        let token = sessions.current_bootstrap();
+        let router = api_router(
+            SessionState { manager: sessions, via_lan: false, rate_limiter: None },
+            HostPolicy::loopback(PORT), true, Arc::new(CursorCodec::new()),
+        );
+        let request = |cookie: Option<String>| {
+            let mut req = Request::builder().uri("/api/forge/pulls?page=0")
+                .header(header::HOST, "localhost:8080")
+                .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string());
+            if let Some(cookie) = cookie { req = req.header(header::COOKIE, cookie); }
+            req.body(Body::empty()).unwrap()
+        };
+        assert_eq!(router.clone().oneshot(request(None)).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        let cookie = bootstrap_cookie(router.clone(), "localhost:8080", &token).await;
+        let response = router.oneshot(request(Some(cookie))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     }
 
     /// M2.21b (#236) end to end: a real request through the real router — auth

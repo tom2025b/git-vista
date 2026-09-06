@@ -84,6 +84,7 @@ pub mod activity;
 pub mod blame;
 pub mod change_feed;
 pub mod effects;
+pub mod forge;
 
 pub mod conflict;
 pub mod diff;

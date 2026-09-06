@@ -106,6 +106,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     ("/api/rebase-status", Method::GET, Authz::SessionRequired),
     // -- registered only when `full_routes` is set (ADR 0005: never built at
     //    all on the LAN router, not merely gated) --
+    ("/api/forge/pulls", Method::GET, Authz::SessionRequired),
     ("/api/clone", Method::POST, Authz::SessionAndCsrf),
     // #263: a read of a clone attempt's outcome, same posture as the
     // `/api/operations/{id}` read below it — a GET, so no CSRF surface.

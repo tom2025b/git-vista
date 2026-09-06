@@ -77,6 +77,7 @@ pub(crate) mod reset;
 pub(crate) mod select;
 // M13.03 (#584): the one settings surface — GET/POST the GitHub token.
 pub(crate) mod settings;
+pub(crate) mod forge;
 pub(crate) mod staging;
 pub(crate) mod stash;
 // M2.21b (#236): `GET /api/tags`, the tag listing with type/target/tagger/message.
