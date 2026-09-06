@@ -93,6 +93,82 @@ enum GuardedOutcome<E> {
     TimedOut,
 }
 
+enum CloneExecutionError {
+    CouldntRun(std::io::Error),
+    GitFailed(std::process::Output),
+}
+
+fn clone_transfer_args<'a>(url: &'a str, dest: &'a str) -> [&'a str; 5] {
+    ["clone", "--no-checkout", "--", url, dest]
+}
+
+fn clone_checkout_args() -> [&'static str; 2] {
+    ["checkout", "-f"]
+}
+
+/// Fetch objects and refs while the credential exists, then let that process
+/// exit before materialising attacker-chosen files. The second phase keeps the
+/// clone policy's network access, hooks, and filters, but explicitly removes
+/// every credential-bearing environment variable.
+async fn execute_clone(
+    policy: &crate::sandbox::Policy,
+    root: &Path,
+    dest: &Path,
+    url: &str,
+    token: Option<&str>,
+) -> Result<(), CloneExecutionError> {
+    let dest_str = dest.to_string_lossy();
+    let transfer_args = clone_transfer_args(url, dest_str.as_ref());
+    let transfer = crate::sandbox::network_exec::network_command_with_credential(
+        policy,
+        root,
+        &transfer_args,
+        token,
+    )
+    .kill_on_drop(true)
+    .output()
+    .await
+    .map_err(CloneExecutionError::CouldntRun)?;
+    if !transfer.status.success() {
+        return Err(CloneExecutionError::GitFailed(transfer));
+    }
+
+    // `git clone` succeeds for an empty repository. Its symbolic HEAD has no
+    // target to check out, so preserve that behaviour instead of turning the
+    // split phase into a failure for an otherwise-valid empty remote.
+    let head = crate::sandbox::network_exec::network_command_without_credential(
+        policy,
+        dest,
+        &["show-ref", "--verify", "--quiet", "HEAD"],
+    )
+    .kill_on_drop(true)
+    .output()
+    .await
+    .map(crate::sandbox::network_exec::redact_output)
+    .map_err(CloneExecutionError::CouldntRun)?;
+    if head.status.code() == Some(1) {
+        return Ok(());
+    }
+    if !head.status.success() {
+        return Err(CloneExecutionError::GitFailed(head));
+    }
+
+    let checkout = crate::sandbox::network_exec::network_command_without_credential(
+        policy,
+        dest,
+        &clone_checkout_args(),
+    )
+    .kill_on_drop(true)
+    .output()
+    .await
+    .map(crate::sandbox::network_exec::redact_output)
+    .map_err(CloneExecutionError::CouldntRun)?;
+    if !checkout.status.success() {
+        return Err(CloneExecutionError::GitFailed(checkout));
+    }
+    Ok(())
+}
+
 /// Await `fut` under `timeout`, removing `dest` unless `fut` resolves to `Ok`
 /// before the deadline fires.
 ///
@@ -652,9 +728,6 @@ async fn run_clone(req: CloneRequest) -> Result<Json<RepositoryDescriptor>, (Sta
     // harmless (the clones root is a real directory, created just above) and
     // keeps one argv shape for every spawn site. The URL still travels as its
     // own argv entry, after `validate_clone_url`, behind `--`.
-    let dest_str = dest.to_string_lossy();
-    // `--` so the URL is never read as an option, even past validation.
-    let args: [&str; 4] = ["clone", "--", url.as_str(), &dest_str];
     // M13.01 (#582): routed through `network_exec::network_command_with_credential`
     // rather than a bare `spawn::command_async` — this was the one production
     // Remote-tier spawn in the crate that never went through the askpass-hardening
@@ -664,7 +737,7 @@ async fn run_clone(req: CloneRequest) -> Result<Json<RepositoryDescriptor>, (Sta
     // so it gets both fixes at once: `-c core.askpass=` hardening it was
     // missing, and Git-Vista's own credential helper when a token is held.
     let token = crate::state::credential_token();
-    let output = match crate::sandbox::policy_for_clone(&root) {
+    match crate::sandbox::policy_for_clone(&root) {
         Ok(policy) => {
             // #216: bound the child's lifetime. `git clone` against a remote that
             // stops answering mid-transfer does not fail — it *waits*, and this
@@ -686,22 +759,25 @@ async fn run_clone(req: CloneRequest) -> Result<Json<RepositoryDescriptor>, (Sta
             // below has already removed. The orphan outlives the request that
             // authorised it, which is precisely what this milestone's process
             // lifecycle work (INV-8) exists to prevent.
-            let spawned = crate::sandbox::network_exec::network_command_with_credential(
-                &policy,
-                &root,
-                &args,
-                token.as_deref(),
-            )
-            .kill_on_drop(true)
-            .output();
-            match run_guarded(&dest, CLONE_TIMEOUT, spawned).await {
-                Ok(o) => o,
-                Err(GuardedOutcome::Failed(e)) => {
+            let execution = execute_clone(&policy, &root, &dest, &url, token.as_deref());
+            match run_guarded(&dest, CLONE_TIMEOUT, execution).await {
+                Ok(()) => {}
+                Err(GuardedOutcome::Failed(CloneExecutionError::CouldntRun(e))) => {
                     eprintln!("git-vista: /api/clone couldn't run git: {e}");
                     return Err((
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("Couldn't run git: {e}"),
                     ));
+                }
+                Err(GuardedOutcome::Failed(CloneExecutionError::GitFailed(output))) => {
+                    let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    let msg = if msg.is_empty() {
+                        "git clone failed.".to_string()
+                    } else {
+                        msg
+                    };
+                    eprintln!("git-vista: /api/clone failed: {msg}");
+                    return Err((StatusCode::BAD_REQUEST, msg));
                 }
                 Err(GuardedOutcome::TimedOut) => {
                     eprintln!(
@@ -726,19 +802,6 @@ async fn run_clone(req: CloneRequest) -> Result<Json<RepositoryDescriptor>, (Sta
                 format!("Couldn't run git: {e}"),
             ));
         }
-    };
-
-    if !output.status.success() {
-        // git printed why (host down, repo not found, auth needed…) on stderr.
-        let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let msg = if msg.is_empty() {
-            "git clone failed.".to_string()
-        } else {
-            msg
-        };
-        cleanup_clone(&dest); // remove the empty/partial dir git may have left
-        eprintln!("git-vista: /api/clone failed: {msg}");
-        return Err((StatusCode::BAD_REQUEST, msg));
     }
 
     // Defence in depth (M1.03): the destination is built under the clones root by
@@ -854,6 +917,120 @@ mod tests {
         assert_eq!(unique_dest(root.path(), "repo"), root.path().join("repo-2"));
         std::fs::create_dir_all(root.path().join("repo-2")).unwrap();
         assert_eq!(unique_dest(root.path(), "repo"), root.path().join("repo-3"));
+    }
+
+    /// Permanent form of #680's dynamic reproduction. The credentialed
+    /// transfer leaves the worktree empty; the later checkout still runs the
+    /// attacker-selected hook, but only after the token-bearing process has
+    /// exited and every credential environment name has been removed.
+    #[tokio::test]
+    async fn clone_checkout_runs_the_hook_without_any_credential_environment() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        fn git(command: &mut Command) {
+            let output = command.output().expect("git starts");
+            assert!(
+                output.status.success(),
+                "git command failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        const CANARY: &str = "clone-hook-canary";
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let source = root.join("source");
+        let dest = root.join("clone");
+        std::fs::create_dir_all(&source).unwrap();
+        git(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&source));
+        git(Command::new("git")
+            .args(["config", "user.name", "git-vista-test"])
+            .current_dir(&source));
+        git(Command::new("git")
+            .args(["config", "user.email", "test@example.invalid"])
+            .current_dir(&source));
+
+        let hooks = source.join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("post-checkout");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\nprintf '%s|%s|%s' \
+             \"${GIT_VISTA_CREDENTIAL_TOKEN-unset}\" \
+             \"${GIT_VISTA_GITHUB_TOKEN-unset}\" \
+             \"${GH_TOKEN-unset}\" > hook-observed\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&hook, permissions).unwrap();
+        std::fs::write(source.join("tracked"), "attacker-chosen content\n").unwrap();
+        git(Command::new("git").args(["add", "."]).current_dir(&source));
+        git(Command::new("git")
+            .args(["commit", "-qm", "fixture"])
+            .current_dir(&source));
+
+        let policy = crate::sandbox::policy_for_clone(root).expect("clone policy");
+        let source_str = source.to_string_lossy();
+        let dest_str = dest.to_string_lossy();
+        let transfer_env = [
+            ("PATH", "/usr/bin:/bin".to_string()),
+            ("HOME", std::env::var("HOME").unwrap()),
+            (
+                crate::sandbox::spawn::CREDENTIAL_TOKEN_VAR,
+                CANARY.to_string(),
+            ),
+            ("GIT_CONFIG_COUNT", "1".to_string()),
+            ("GIT_CONFIG_KEY_0", "core.hooksPath".to_string()),
+            ("GIT_CONFIG_VALUE_0", "hooks".to_string()),
+        ];
+        let transfer = crate::sandbox::network_exec::network_command_with_credential(
+            &policy,
+            root,
+            &clone_transfer_args(source_str.as_ref(), dest_str.as_ref()),
+            Some(CANARY),
+        )
+        .pinned_env_for_test(&transfer_env)
+        .output()
+        .await
+        .expect("credentialed transfer starts");
+        assert!(
+            transfer.status.success(),
+            "credentialed transfer failed: {}",
+            String::from_utf8_lossy(&transfer.stderr)
+        );
+        assert!(
+            !dest.join("tracked").exists() && !dest.join("hook-observed").exists(),
+            "the credentialed phase must not materialise content or run post-checkout"
+        );
+
+        // Reproduce the operator-level config precondition without touching
+        // the developer's real global config. This selects the tracked hook
+        // exactly as `core.hooksPath=hooks` did in the original canary run.
+        git(Command::new("git")
+            .args(["config", "core.hooksPath", "hooks"])
+            .current_dir(&dest));
+        let checkout = crate::sandbox::network_exec::network_command_without_credential(
+            &policy,
+            &dest,
+            &clone_checkout_args(),
+        )
+        .output()
+        .await
+        .expect("credentialless checkout starts");
+        assert!(
+            checkout.status.success(),
+            "credentialless checkout failed: {}",
+            String::from_utf8_lossy(&checkout.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("hook-observed")).unwrap(),
+            "unset|unset|unset",
+            "the hook must still run, but it must inherit no credential source"
+        );
     }
 
     /// The missing paired positive for #216's Drop-guard fix: the earlier
