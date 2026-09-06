@@ -1,6 +1,6 @@
 # ADR 0132 — A Settings read never negotiates with a locked keyring
 
-- **Status:** Accepted — implemented; mutation proof pending
+- **Status:** Accepted — implemented, mutation-proved two ways failing at disjoint assertions
 - **Date:** 2026-09-06
 - **Issue:** #692
 - **Extends:** [ADR 0126](0126-absence-is-the-normal-answer-not-a-caught-error.md) (#583), whose resolver precedence remains the credential-operation contract
@@ -211,5 +211,17 @@ instead moved wholly to the blocking pool and awaited.
 
 ## Mutation proof
 
-Pending two disjoint, caught mutations: one against the lazy evaluation
-boundary and one against the request keyring snapshot/no-repeat boundary.
+Failure Atlas ran both experiments from clean commit `ce464980` with green
+baselines and no warnings:
+
+1. `mutation_check` **#369** inserted a `file()` call below a winning keyring
+   source. The lazy-boundary test failed on the exact extra evaluation:
+   `[1, 0, 0, 1]` observed against `[1, 0, 0, 0]` expected.
+2. `mutation_check` **#370** removed the successful-write assignment to the
+   masked keyring snapshot. The post-write test failed at a disjoint status
+   assertion: unconfigured/empty observed against configured/`...tail` from
+   `OS keyring` expected.
+
+Both outcomes were `caught`; one proves the general resolver's evaluation
+boundary, while the other proves request status is advanced after an explicit
+write without a D-Bus read-back.
