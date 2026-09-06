@@ -522,6 +522,38 @@ async fn live_reading_keeps_a_symbolic_head_move_in_the_generation() {
     );
 }
 
+#[test]
+fn fold_generation_keeps_the_refs_pass_head_branch() {
+    let observed = Observed {
+        head_branch: None,
+        head_tip: Obs::Known("tip".to_string()),
+        branch_tip: Obs::Absent,
+        status: Obs::Known(String::new()),
+        held_at_build: Vec::new(),
+        census: super::no_census_taken(),
+    };
+    let parts = |head_branch: &str| GenerationParts {
+        head_branch: Some(head_branch.to_string()),
+        refs: vec![("refs/heads/main".to_string(), "tip".to_string())],
+        named_refs: std::collections::BTreeMap::new(),
+        refs_read: true,
+        stash: DigestInput {
+            value: "absent".to_string(),
+            read: true,
+        },
+        merge_ff: DigestInput {
+            value: "true".to_string(),
+            read: true,
+        },
+    };
+
+    assert_ne!(
+        fold_generation(&observed, &parts("main")),
+        fold_generation(&observed, &parts("same-tip")),
+        "the refs pass symbolic HEAD must participate in the generation fold"
+    );
+}
+
 /// The digest tags are load-bearing on their own: an observed empty status
 /// (a *clean* worktree) must not hash the same as one that could not be
 /// read. Pre-D5 both went in as `""` via `unwrap_or_default`.
