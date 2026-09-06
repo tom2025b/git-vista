@@ -1,6 +1,6 @@
 # ADR 0135 — Offline refuses writes and persistence is explicit
 
-- **Status:** Proposed — verification in progress
+- **Status:** Proposed — implemented; physical device verification outstanding
 - **Date:** 2026-09-06
 - **Issue:** #75; verification follow-up #244
 - **Relationship:** Extends ADR 0032; retains its no-service-worker decision.
@@ -59,6 +59,12 @@ Playwright covers an already-open git confirmation offline, reconnection without
 replay, connectivity lost before retry, the v9–v9 mismatch with a loaded client,
 no persistent diff response cache, and actual Settings download/clear controls.
 The harness replaces its normal forced-online override and also cuts transport.
+
+Failure-atlas 386 admits private keys into export and fails the exact-output
+assertion. Run 387 deletes the retry's guard and fails the attempt-composition
+assertion. Each executed one passing baseline test and one failing mutated test
+against `ca52ec15`; these are disjoint failures. Run 385 failed during temporary
+clone setup and is not counted as a proof. All five browser cases passed.
 
 Physical iPad installation/standalone launch and the device input/accessibility
 matrix remain **unverified** on titan. Use `Refs #75`, not `Closes #75`. The

@@ -1,7 +1,6 @@
-//! The settings surface (M13.03, #584): one field to save the GitHub token
-//! the credential helper offers for private-repository operations.
+//! Settings: the GitHub token field (#584) and local browser-data controls (#75).
 //!
-//! Every decision lives in `features::settings::core` (framework-free,
+//! Decisions live in `features::settings::{core, storage}` (framework-free,
 //! host-tested); this file is the DOM shell around it — fetch the status on
 //! open, render `core::status_line`'s sentence, gate the Save button with
 //! `core::save_enabled`, and apply `core::input_after_save`'s answer once a
@@ -134,7 +133,7 @@ pub fn settings_view(settings_open: RwSignal<bool>, dialogs: Dialogs) -> impl In
                 })}
                 <section aria-label="Browser data" style="margin-top:16px; max-width:440px;">
                     <h2 style="font-size:1em;">"Browser data"</h2>
-                    <p>"Repository responses and private diffs are not saved for offline use. Static files use the browser's revalidated HTTP cache; clear that cache in browser settings."</p>
+                    <p>"Repository data and private diffs are not saved for offline use. To clear cached app files, use your browser settings."</p>
                     <p>"Export includes only icon and checkpoint-folding preferences. Clear removes saved preferences, commit drafts, comparison choices, and operation tracking from this browser, then reloads. It does not cancel server operations or erase server credentials. Other open tabs can save data again."</p>
                     <button style="min-height:44px; margin:4px;" on:click=move |_| {
                         storage_notice.set(Some(match crate::features::settings::browser_storage::export_saved_preferences() {

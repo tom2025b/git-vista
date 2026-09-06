@@ -918,10 +918,8 @@ fn every_guarded_function_consults_the_guard_before_it_sends() {
 /// claim `every_write_reaching_function_is_classified` does not check on its
 /// own: a transport helper sits *below* the endpoint guard. The retrying
 /// helper additionally guards each attempt (#75), pinned separately below.
-/// An exemption is supposed to have an argued reason it never needs
-/// to. If either starts calling `refuse_if_offline()`, that claim is now
-/// false, and the entry needs to move — visibly, not silently keep working
-/// either way.
+/// Other helpers and exemptions must not silently start guarding themselves:
+/// their classification and the corresponding checks must change together.
 #[test]
 fn the_exempt_and_transport_tables_do_not_rot() {
     let bodies = bodies_map();
