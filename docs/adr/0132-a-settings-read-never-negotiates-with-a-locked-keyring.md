@@ -211,13 +211,13 @@ instead moved wholly to the blocking pool and awaited.
 
 ## Mutation proof
 
-Failure Atlas ran both experiments from clean commit `ce464980` with green
+Failure Atlas ran both experiments from clean commit `4605fdfa` with green
 baselines and no warnings:
 
-1. `mutation_check` **#369** inserted a `file()` call below a winning keyring
+1. `mutation_check` **#373** inserted a `file()` call below a winning keyring
    source. The lazy-boundary test failed on the exact extra evaluation:
    `[1, 0, 0, 1]` observed against `[1, 0, 0, 0]` expected.
-2. `mutation_check` **#370** removed the successful-write assignment to the
+2. `mutation_check` **#374** removed the successful-write assignment to the
    masked keyring snapshot. The post-write test failed at a disjoint status
    assertion: unconfigured/empty observed against configured/`...tail` from
    `OS keyring` expected.
