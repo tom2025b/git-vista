@@ -526,6 +526,8 @@ mod tests {
         PlanOnScreen {
             generation: "1".to_string(),
             expects: Vec::new(),
+            repository: "repo-1".to_string(),
+            worktree: "wt-1".to_string(),
         }
     }
 
