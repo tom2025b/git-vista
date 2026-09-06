@@ -1,6 +1,6 @@
 # ADR 0128 — A credential exists only before untrusted checkout
 
-- **Status:** Accepted — implemented; mutation proof pending
+- **Status:** Accepted — implemented, mutation-proved two ways failing differently
 - **Date:** 2026-09-06
 - **Issue:** #680
 - **Extends:** [ADR 0122](0122-the-token-is-a-credential-not-a-header.md)
@@ -153,5 +153,15 @@ exact-token removal from stdout and stderr while preserving a neighboring
 invalid UTF-8 byte. The existing live private-clone tests continue to exercise
 the credential helper and recorded remote URL.
 
-Mutation proof is recorded here after the implementation is committed, because
-`failure-atlas mutation_check` clones `HEAD`.
+`failure-atlas mutation_check` ran against committed HEAD `6e631a51` under
+run key `gv-680-clone-token-containment`. Both baselines were green and both
+mutations were caught:
+
+| Run | Mutation | Distinct failure |
+|---|---|---|
+| 354 | Remove `--no-checkout` from `clone_transfer_args` | The real tracked `post-checkout` hook ran during the credentialed transfer; `clone_checkout_runs_the_hook_without_any_credential_environment` failed because the transfer materialised content and created the marker. |
+| 355 | Return `output.stdout`/`output.stderr` directly instead of applying `redact_literal` | `credential_redaction_removes_a_bare_token_from_both_output_streams` failed on the canary bytes still present in stdout. |
+
+The first arm is a spawned-git lifecycle failure through the production clone
+command builder. The second is a pure byte-redaction failure. Neither mutation
+failed to build, neither survived, and neither relies on the other's assertion.
