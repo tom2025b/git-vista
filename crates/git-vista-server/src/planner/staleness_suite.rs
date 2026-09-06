@@ -483,6 +483,45 @@ async fn two_unknown_observations_never_compare_equal() {
     );
 }
 
+/// #687: the reconciliation reading must keep HEAD's symbolic branch from
+/// the same `read_refs_at` pass as the ref values. Switching branches at the
+/// same commit changes no ref target and no worktree bytes, so this catches a
+/// reader that silently drops the symbolic name while still looking correct
+/// for ordinary commit moves.
+#[tokio::test]
+async fn live_reading_keeps_a_symbolic_head_move_in_the_generation() {
+    let (_dir, repo) = seeded_repo();
+    let branch = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(&repo)
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .output()
+        .expect("read the fixture's current branch");
+    assert!(branch.status.success());
+    let branch = String::from_utf8_lossy(&branch.stdout).trim().to_string();
+    assert!(!branch.is_empty());
+
+    let before = live_reading(&repo).await;
+    assert!(
+        before.other.starts_with(&format!("head\u{0}{branch}\u{0}")),
+        "the baseline reading must name the fixture's symbolic HEAD: {:?}",
+        before.other
+    );
+
+    run(&repo, &["branch", "same-tip"]);
+    run(&repo, &["checkout", "-q", "same-tip"]);
+    let after = live_reading(&repo).await;
+    assert!(
+        after.other.starts_with("head\u{0}same-tip\u{0}"),
+        "the second reading must name the new symbolic HEAD: {:?}",
+        after.other
+    );
+    assert_ne!(
+        before.token, after.token,
+        "changing only symbolic HEAD must invalidate the generation"
+    );
+}
+
 /// The digest tags are load-bearing on their own: an observed empty status
 /// (a *clean* worktree) must not hash the same as one that could not be
 /// read. Pre-D5 both went in as `""` via `unwrap_or_default`.

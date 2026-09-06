@@ -54,11 +54,7 @@ async fn measure_sweep_components() {
         repo.display()
     );
     println!();
-    println!("--- observe_live_for_generation's three reads ---");
-    let head_branch = timed("read_head_branch_blocking (gix open #1)", N, || {
-        read_head_branch_blocking(&repo)
-    })
-    .await;
+    println!("--- observe_live_for_generation's two reads ---");
     let head_rev_parse = timed("rev_parse(HEAD)          (git spawn, sandboxed)", N, || {
         crate::git_cmd::rev_parse(&repo, "HEAD")
     })
@@ -72,9 +68,11 @@ async fn measure_sweep_components() {
 
     println!();
     println!("--- read_generation_parts's three reads ---");
-    let refs = timed("refs_reading              (gix open #2, N refs)", N, || {
-        refs_reading(&repo)
-    })
+    let refs = timed(
+        "refs_reading              (gix open, N refs + HEAD)",
+        N,
+        || refs_reading(&repo),
+    )
     .await;
     let stash = timed(
         "stash_digest_input        (git spawn, sandboxed)",
@@ -89,10 +87,10 @@ async fn measure_sweep_components() {
     )
     .await;
 
-    let sum_of_parts = head_branch + head_rev_parse + status + refs + stash + merge_ff;
+    let sum_of_parts = head_rev_parse + status + refs + stash + merge_ff;
     println!();
     println!(
-        "sum of the six components (sequential)     {:>8.2} ms",
+        "sum of the five components (sequential)    {:>8.2} ms",
         sum_of_parts.as_secs_f64() * 1000.0
     );
 
@@ -103,7 +101,7 @@ async fn measure_sweep_components() {
     println!();
     println!(
         "concurrency saved: {:>6.2} ms ({:.0}% of the sum) — \
-         observe_live_for_generation's three reads and read_generation_parts's \
+         observe_live_for_generation's two reads and read_generation_parts's \
          three reads run sequentially WITHIN each group via `.await` chaining, \
          but the two groups and the gix opens go through separate spawn_blocking \
          tasks, so some overlap is real, not measurement noise",
