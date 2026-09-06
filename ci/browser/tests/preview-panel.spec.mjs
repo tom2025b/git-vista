@@ -213,11 +213,18 @@ test.describe('the graph preview inside a confirmation', () => {
     const animated = page.getByRole('img', { name: /^An animation/ })
     await expect(animated).toBeVisible({ timeout: 30_000 })
 
-    // Captured once, immediately, with no retry: `tween::REVEAL_AFTER`
-    // (ADR 0121, decision 6) withholds every outcome-only pill — `new`
-    // included — until progress crosses 0.92 of a 900ms transition, so a
-    // `new` pill already present the instant this scene first mounts would
-    // mean the gate never engaged at all.
+    // #670 item B: this used to say Playwright's `toHaveCount(0)` captures
+    // once, immediately, with no retry — false, it polls until it passes or
+    // the timeout elapses, same as `toBeVisible` below. That does not make
+    // this assertion vacuous: it is fail-closed rather than fail-open (a
+    // `new` pill present at ANY point before the gate should have lifted
+    // still fails it), so it does not recreate #623's trivial pass. What
+    // makes the check meaningful is that this line runs immediately after
+    // the scene first becomes visible, well before REVEAL_AFTER's 0.92 of a
+    // 900ms transition could have elapsed — `tween::REVEAL_AFTER` (ADR 0121,
+    // decision 6) withholds every outcome-only pill, `new` included, until
+    // then, so a `new` pill visible at this early a poll would mean the gate
+    // never engaged at all.
     await expect(animated.getByText('new', { exact: true })).toHaveCount(0)
 
     // Reached, not merely not-yet-arrived: the same pill must actually show
