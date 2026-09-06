@@ -3,6 +3,8 @@
 //! the menu whether a rebase would do anything right now. Both resolve the base
 //! (`origin/main` if present, else `main`) through the shared [`rebase_base`].
 
+use crate::planner::RunFailure;
+
 use std::path::Path;
 
 use axum::http::{header, HeaderValue, StatusCode};
@@ -49,6 +51,7 @@ pub(crate) async fn rebase() -> (StatusCode, String) {
         Err(e) => {
             return planner::couldnt_run(
                 "/api/rebase",
+                RunFailure::ReadRebaseBase,
                 &format!("couldn't determine the rebase base: {e}"),
             )
         }
@@ -121,6 +124,7 @@ pub(crate) async fn rebase_status() -> axum::response::Response {
                 no_store,
                 planner::couldnt_run(
                     "/api/rebase-status",
+                    RunFailure::ReadRebaseState,
                     &format!("couldn't read the rebase state: {e}"),
                 ),
             )

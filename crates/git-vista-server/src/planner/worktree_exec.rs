@@ -19,6 +19,8 @@
 //! containment check, so the parent owns them rather than one sibling
 //! importing safety gates from another.
 
+use crate::planner::RunFailure;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -100,6 +102,7 @@ pub(super) async fn exec_reset_test_repo(repo: &Path, need: NetworkNeed) -> (Sta
             Err(e) => {
                 return couldnt_run(
                     "/api/reset-test-repo",
+                    RunFailure::VerifySeed,
                     &format!("couldn't verify seed commit for ‘{}’: {e}", r.name),
                 )
             }
@@ -344,7 +347,7 @@ pub(super) async fn exec_discard_tracked_paths(
     let args = plan_export::discard_tracked_argv(paths);
     let output = match run_git_argv(repo, need, &args).await {
         Ok(o) => o,
-        Err(e) => return couldnt_run("/api/discard-tracked-paths", &e),
+        Err(e) => return couldnt_run("/api/discard-tracked-paths", RunFailure::Spawn, &e),
     };
     let git_err = if output.status.success() {
         None
@@ -668,7 +671,7 @@ pub(super) async fn exec_delete_untracked_paths(
     let present_before = present_paths(repo, &requested);
     let output = match run_git_argv(repo, need, &args).await {
         Ok(o) => o,
-        Err(e) => return couldnt_run("/api/delete-untracked-paths", &e),
+        Err(e) => return couldnt_run("/api/delete-untracked-paths", RunFailure::Spawn, &e),
     };
     if !output.status.success() {
         let msg = stderr_or(&output, "git clean failed.");
@@ -884,9 +887,9 @@ pub(super) async fn exec_remove_worktree(
     let output = match crate::git_cmd::git_output_with_extra_grant(repo, &args, need, grant).await {
         Ok(o) => o,
         // A spawn/sandbox error routinely names the grant or the repository
-        // path — the shared `couldnt_run` helper embeds it unconditionally,
-        // which is exactly the #656 class of leak (confirmed by grok on this
-        // PR, #665) applied to a different error source. `withheld_detail`
+        // path — before #666 the shared `couldnt_run` helper embedded it
+        // unconditionally (#665, grok). This earlier local fix and the now
+        // safe shared helper both use `withheld_detail`, which
         // is the fix every one of `AddWorktree`'s three failure arms already
         // uses (`branch_exec.rs::exec_add_worktree`); this arm is this
         // operation's equivalent of that function's spawn-error arm.

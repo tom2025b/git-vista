@@ -15,6 +15,8 @@
 //! animal — they park in MERGE_HEAD/rebase state, not the sequencer — and
 //! stay with [`super::branch_exec`].
 
+use crate::planner::RunFailure;
+
 use std::path::Path;
 
 use axum::http::StatusCode;
@@ -110,7 +112,7 @@ pub(super) async fn exec_sequence(
     let kind = sequence.subcommand();
     let output = match run_git_argv(repo, need, &plan_export::sequence_argv(sequence, verb)).await {
         Ok(o) => o,
-        Err(e) => return couldnt_run("/api/sequence", &e),
+        Err(e) => return couldnt_run("/api/sequence", RunFailure::Spawn, &e),
     };
 
     if verb == SequenceVerb::Abort {
@@ -206,7 +208,7 @@ pub(super) async fn exec_cherry_pick(
 
     let output = match run_git_argv(repo, need, &argv).await {
         Ok(o) => o,
-        Err(e) => return couldnt_run("/api/cherry-pick", &e),
+        Err(e) => return couldnt_run("/api/cherry-pick", RunFailure::Spawn, &e),
     };
 
     // Asked in both branches for the same reason pop does: a cherry-pick git

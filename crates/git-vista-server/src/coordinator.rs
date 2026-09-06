@@ -20,6 +20,8 @@
 //! [`refuse_if_git_busy`] for how that is detected instead, and ADR 0019 for
 //! why detection rather than exclusion is the honest posture.
 
+use crate::planner::RunFailure;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -137,6 +139,7 @@ pub(crate) async fn refuse_if_git_busy(repo: &Path) -> Option<(StatusCode, Strin
         // function is that the lock it looks for is git's, not ours.
         Err(e) => Some(crate::planner::couldnt_run(
             "busy preflight",
+            RunFailure::ResolveGitDirectory,
             &format!(
                 "couldn't resolve the git directory of {}: {e}",
                 repo.display()

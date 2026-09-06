@@ -18,6 +18,8 @@
 //! for sentences of its own, so the parent owns it rather than one sibling
 //! importing prose helpers from another.
 
+use crate::planner::RunFailure;
+
 use std::path::Path;
 
 use axum::http::StatusCode;
@@ -47,7 +49,7 @@ pub(super) async fn exec_create_branch(
 ) -> (StatusCode, String) {
     let output = match run_git_argv(repo, need, &plan_export::create_branch_argv(name, at)).await {
         Ok(o) => o,
-        Err(e) => return couldnt_run("/api/branch", &e),
+        Err(e) => return couldnt_run("/api/branch", RunFailure::Spawn, &e),
     };
     if output.status.success() {
         println!("[/api/branch] created branch '{name}' at {at}");
@@ -90,7 +92,7 @@ async fn run_branch_cmd(
 ) -> (StatusCode, String) {
     let output = match run_git_argv(repo, need, argv).await {
         Ok(o) => o,
-        Err(e) => return couldnt_run(endpoint, &e),
+        Err(e) => return couldnt_run(endpoint, RunFailure::Spawn, &e),
     };
     if output.status.success() {
         println!("[{endpoint}] {ok_msg}");
@@ -304,7 +306,7 @@ pub(super) async fn exec_rebase(
 
     let output = match run_git_argv(repo, need, &plan_export::rebase_argv(target)).await {
         Ok(o) => o,
-        Err(e) => return couldnt_run("/api/rebase", &e),
+        Err(e) => return couldnt_run("/api/rebase", RunFailure::Spawn, &e),
     };
     if output.status.success() {
         let new = Obs::from_read(rev_parse(repo, "HEAD").await);

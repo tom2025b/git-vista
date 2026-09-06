@@ -15,6 +15,8 @@
 //! single writer makes that invariant easy to hold (which is why `undoables`
 //! reads the same sources but leaves the snapshot alone).
 
+use crate::planner::RunFailure;
+
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -773,6 +775,7 @@ async fn undo_commit_oid(repo: &Path, given: &str) -> Result<CommitOid, (StatusC
         // came straight out of the app's own activity feed.
         Err(e) => Err(crate::planner::couldnt_run(
             "/api/undo",
+            RunFailure::ResolveCommit,
             &format!("couldn't resolve ‘{given}’: {e}"),
         )),
     }

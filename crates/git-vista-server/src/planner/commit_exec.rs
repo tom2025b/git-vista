@@ -21,6 +21,8 @@
 //! not commit vocabulary, and `hook_timeout_suite` reaches the override
 //! through `planner`'s own namespace.
 
+use crate::planner::RunFailure;
+
 use std::path::{Path, PathBuf};
 
 use axum::http::StatusCode;
@@ -174,7 +176,7 @@ pub(super) async fn exec_commit_on_head(
                 &hook_timeout_message(&check),
             );
         }
-        Err(e) => return couldnt_run("/api/commit", &e),
+        Err(e) => return couldnt_run("/api/commit", RunFailure::Spawn, &e),
     };
     if output.status.success() {
         println!("[/api/commit] created commit (allow_empty={allow_empty})");
@@ -409,7 +411,7 @@ pub(super) async fn exec_amend_commit(
                 &hook_timeout_message(&check),
             );
         }
-        Err(e) => return couldnt_run("/api/amend-commit", &e),
+        Err(e) => return couldnt_run("/api/amend-commit", RunFailure::Spawn, &e),
     };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

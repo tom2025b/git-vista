@@ -9,6 +9,8 @@
 //! [`planner::plan_and_execute`]; the git execution and journaling live in the
 //! planner's executor.
 
+use crate::planner::RunFailure;
+
 use axum::http::StatusCode;
 use axum::Json;
 
@@ -223,6 +225,7 @@ async fn commit_empty_on_branch(
         Err(e) => {
             return planner::couldnt_run(
                 "/api/commit",
+                RunFailure::CompareAndSwap,
                 &format!("couldn't resolve ‘{refname}’ for the compare-and-swap: {e}"),
             )
         }
