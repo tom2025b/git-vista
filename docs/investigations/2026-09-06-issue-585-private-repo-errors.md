@@ -17,9 +17,11 @@ Required messages:
 - private repo — token invalid or expired
 - private repo — token lacks `repo` scope, or this account cannot see it
 
-Tests will inject transport outcomes and pin both exact messages and failed
-responses. Keep the existing credential redaction and two-phase clone boundary.
-Token resolution order is outside this change.
+Tests inject transport outcomes and pin exact messages, HTTP 400 responses,
+partial-clone cleanup, failure status polling, and idempotent error replay.
+The existing credential redaction and two-phase clone boundary stay in place.
+Token resolution order is outside this change. The browser already propagates
+the clone response and failed poll message; no wasm decision or wire type changes.
 
 No new ADR planned: this applies the existing absence/failure and credential
 containment contracts to the clone error response without a new wire type.
