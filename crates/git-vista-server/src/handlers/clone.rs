@@ -1,5 +1,5 @@
 //! `POST /api/clone` and `POST /api/delete-clone` (Phase 12, reshaped by ADR
-//! 0008): clone a public repo from a pasted URL into the persistent clones
+//! 0008): clone a repo from a pasted URL into the persistent clones
 //! store and hand its descriptor back so the browser can offer the mode
 //! picker; delete a clone again on request, guarded to the clones root.
 //!
@@ -47,6 +47,8 @@ use crate::state::{
     set_current, DeleteCloneOutcome,
 };
 
+mod private_repo;
+
 /// A human-recognisable directory name for a clone of `url` — the URL's last
 /// path segment, minus any `.git` suffix, restricted to safe filename
 /// characters. `None` when nothing usable survives (the caller falls back to a
@@ -93,9 +95,54 @@ enum GuardedOutcome<E> {
     TimedOut,
 }
 
+#[derive(Debug)]
 enum CloneExecutionError {
     CouldntRun(std::io::Error),
     GitFailed(std::process::Output),
+    PrivateRepository(&'static str),
+}
+
+/// The transport seam is injected so failed GitHub responses can be exercised
+/// without contacting GitHub or resolving a real token. Production passes only
+/// the sealed credential command's redacted output future (#680).
+async fn clone_transfer(
+    url: &str,
+    has_token: bool,
+    transport: impl std::future::Future<Output = std::io::Result<std::process::Output>>,
+) -> Result<(), CloneExecutionError> {
+    let output = transport.await.map_err(CloneExecutionError::CouldntRun)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    if let Some(message) =
+        private_repo::failure_message(url, has_token, &String::from_utf8_lossy(&output.stderr))
+    {
+        return Err(CloneExecutionError::PrivateRepository(message));
+    }
+    Err(CloneExecutionError::GitFailed(output))
+}
+
+fn clone_execution_failure(error: CloneExecutionError) -> (StatusCode, String) {
+    match error {
+        CloneExecutionError::CouldntRun(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Couldn't run git: {e}"),
+        ),
+        CloneExecutionError::PrivateRepository(message) => {
+            (StatusCode::BAD_REQUEST, message.to_string())
+        }
+        CloneExecutionError::GitFailed(output) => {
+            let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            (
+                StatusCode::BAD_REQUEST,
+                if message.is_empty() {
+                    "git clone failed.".to_string()
+                } else {
+                    message
+                },
+            )
+        }
+    }
 }
 
 fn clone_transfer_args<'a>(url: &'a str, dest: &'a str) -> [&'a str; 5] {
@@ -126,12 +173,8 @@ async fn execute_clone(
         token,
     )
     .kill_on_drop(true)
-    .output()
-    .await
-    .map_err(CloneExecutionError::CouldntRun)?;
-    if !transfer.status.success() {
-        return Err(CloneExecutionError::GitFailed(transfer));
-    }
+    .output();
+    clone_transfer(url, token.is_some(), transfer).await?;
 
     // `git clone` succeeds for an empty repository. Its symbolic HEAD has no
     // target to check out, so preserve that behaviour instead of turning the
@@ -611,11 +654,12 @@ fn clone_status_not_found() -> Response {
         .into_response()
 }
 
-/// Clone a public repository from a pasted URL into the persistent clones
+/// Clone a repository from a pasted URL into the persistent clones
 /// store (ADR 0008) and open it look-only pending the operator's mode choice.
 ///
 /// Same B3 posture as the other git handlers: shell out to `git clone` and forward
-/// git's own error text (bad host, repo not found, …) verbatim. The URL is
+/// git's redacted error text, with credential-aware messages for GitHub
+/// authentication/access failures (#585). The URL is
 /// validated by [`validate_clone_url`] — only `http(s)://`/`git://`, so a pasted
 /// SSH URL can't trigger a key prompt — and is passed as its own argv entry, never
 /// a shell line. A full clone is made; the graph view's paged history walk
@@ -762,22 +806,10 @@ async fn run_clone(req: CloneRequest) -> Result<Json<RepositoryDescriptor>, (Sta
             let execution = execute_clone(&policy, &root, &dest, &url, token.as_deref());
             match run_guarded(&dest, CLONE_TIMEOUT, execution).await {
                 Ok(()) => {}
-                Err(GuardedOutcome::Failed(CloneExecutionError::CouldntRun(e))) => {
-                    eprintln!("git-vista: /api/clone couldn't run git: {e}");
-                    return Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Couldn't run git: {e}"),
-                    ));
-                }
-                Err(GuardedOutcome::Failed(CloneExecutionError::GitFailed(output))) => {
-                    let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                    let msg = if msg.is_empty() {
-                        "git clone failed.".to_string()
-                    } else {
-                        msg
-                    };
-                    eprintln!("git-vista: /api/clone failed: {msg}");
-                    return Err((StatusCode::BAD_REQUEST, msg));
+                Err(GuardedOutcome::Failed(error)) => {
+                    let failure = clone_execution_failure(error);
+                    eprintln!("git-vista: /api/clone failed: {}", failure.1);
+                    return Err(failure);
                 }
                 Err(GuardedOutcome::TimedOut) => {
                     eprintln!(
@@ -873,6 +905,178 @@ pub(crate) async fn delete_clone_repo(Json(req): Json<DeleteCloneRequest>) -> (S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn transport_output(code: i32, stderr: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    /// Exercise the production transfer/cleanup/response/replay composition.
+    /// Only the Git transport is mocked; no token resolver or real network runs.
+    async fn assert_private_transfer_failure(
+        has_token: bool,
+        stderr: &str,
+        expected: &str,
+        key: &str,
+    ) {
+        let url = "https://github.com/example/private.git";
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("partial-clone");
+        std::fs::create_dir(&dest).unwrap();
+        let key = IdempotencyKey::new(key).unwrap();
+        let CloneAdmission::Fresh(guard) = admit_clone(Some(key.clone()), url).unwrap() else {
+            panic!("fresh attempt must be admitted");
+        };
+        let transport = std::future::ready(Ok(transport_output(128, stderr)));
+        let outcome = run_guarded(
+            &dest,
+            std::time::Duration::from_secs(1),
+            clone_transfer(url, has_token, transport),
+        )
+        .await;
+        let error = match outcome {
+            Err(GuardedOutcome::Failed(error)) => error,
+            _ => panic!(
+                "a refused private transfer must fail, never yield an empty successful clone"
+            ),
+        };
+        assert!(
+            !dest.exists(),
+            "failed transfer must remove the partial clone"
+        );
+        let failure = clone_execution_failure(error);
+        guard.finish(&Err(failure.clone()));
+        let response = failure.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), expected);
+
+        let status = clone_status(PathParam(key.as_str().to_string())).await;
+        let body = axum::body::to_bytes(status.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["state"], "failed");
+        assert_eq!(value["status"], 400);
+        assert_eq!(value["message"], expected);
+        assert!(
+            value.get("descriptor").is_none(),
+            "failure cannot publish a repository descriptor"
+        );
+        match admit_clone(Some(key), url).unwrap() {
+            CloneAdmission::Replay(Err((status, message))) => {
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert_eq!(message, expected);
+            }
+            _ => panic!("retry must replay the failure"),
+        }
+    }
+
+    #[tokio::test]
+    async fn private_transfer_without_token_fails_with_no_token_message() {
+        assert_private_transfer_failure(
+            false,
+            "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+            "private repo — no token configured",
+            "test-585-no-token",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn private_transfer_401_fails_with_invalid_token_message() {
+        assert_private_transfer_failure(
+            true,
+            "fatal: The requested URL returned error: 401",
+            "private repo — token invalid or expired",
+            "test-585-invalid-token",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn private_transfer_403_and_404_fail_with_access_message() {
+        for (code, key) in [(403, "test-585-forbidden"), (404, "test-585-not-found")] {
+            assert_private_transfer_failure(
+                true,
+                &format!("fatal: The requested URL returned error: {code}"),
+                "private repo — token lacks `repo` scope, or this account cannot see it",
+                key,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_transfer_can_be_empty_and_needs_no_token() {
+        for has_token in [false, true] {
+            let transport = std::future::ready(Ok(transport_output(
+                0,
+                "warning: You appear to have cloned an empty repository.",
+            )));
+            assert!(
+                clone_transfer("https://github.com/example/empty.git", has_token, transport)
+                    .await
+                    .is_ok()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn other_transfer_errors_keep_their_original_diagnostic() {
+        for (url, stderr) in [
+            (
+                "https://github.com/example/private.git",
+                "fatal: Could not resolve host: github.com",
+            ),
+            (
+                "https://gitlab.com/example/private.git",
+                "fatal: The requested URL returned error: 404",
+            ),
+        ] {
+            let error = clone_transfer(
+                url,
+                false,
+                std::future::ready(Ok(transport_output(128, stderr))),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                clone_execution_failure(error),
+                (StatusCode::BAD_REQUEST, stderr.to_string())
+            );
+        }
+        let error = clone_transfer(
+            "https://github.com/example/private.git",
+            true,
+            std::future::ready(Err(std::io::Error::other("spawn failed"))),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            clone_execution_failure(error),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Couldn't run git: spawn failed".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn checkout_error_is_not_diagnosed_as_a_rejected_token() {
+        let stderr = "post-checkout hook: Authentication failed";
+        let error = CloneExecutionError::GitFailed(transport_output(1, stderr));
+        assert_eq!(
+            clone_execution_failure(error),
+            (StatusCode::BAD_REQUEST, stderr.to_string())
+        );
+    }
 
     #[test]
     fn clone_dir_name_takes_the_last_segment_and_strips_dot_git() {
