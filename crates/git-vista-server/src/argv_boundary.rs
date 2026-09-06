@@ -120,6 +120,12 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // `Command`: both endpoints go through `git_cmd`'s sandboxed, capped
     // helpers, which is the seam this census exists to keep them behind.
     "src/handlers/blame/perf_suite.rs",
+    // #680: `#[cfg(test)]` fixture setup only. These direct spawns create a
+    // local source repository and select its tracked post-checkout hook for
+    // the permanent clone credential-containment canary. Production clone
+    // still goes through `network_exec`'s sealed command builders; no handler
+    // constructs or appends a raw git argv.
+    "src/handlers/clone.rs",
     // M2.21b (#236): `#[cfg(test)]` fixture setup only. No handler in this
     // file runs a subprocess in production. `GET /api/tags` runs none at all —
     // `git_vista_git::read_tags` opens the repository with `gix` and decodes

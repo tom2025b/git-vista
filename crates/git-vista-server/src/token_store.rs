@@ -39,8 +39,15 @@ impl TokenSource {
 const KEYRING_SERVICE: &str = "git-vista";
 const KEYRING_USERNAME: &str = "github-token";
 
-const GIT_VISTA_ENV: &str = "GIT_VISTA_GITHUB_TOKEN";
-const GH_ENV: &str = "GH_TOKEN";
+pub(crate) const GIT_VISTA_ENV: &str = "GIT_VISTA_GITHUB_TOKEN";
+pub(crate) const GH_ENV: &str = "GH_TOKEN";
+
+/// Ambient variables from which this process may resolve the GitHub token.
+/// A child that receives the resolved credential through the dedicated
+/// helper channel must not also inherit either source variable: doing so
+/// would make removing the helper channel irrelevant for an env-backed
+/// token.
+pub(crate) const TOKEN_SOURCE_ENV_VARS: &[&str] = &[GIT_VISTA_ENV, GH_ENV];
 
 /// Resolve the token by trying each source in the documented precedence
 /// order, stopping at the first that has one. `None` means every tier came
