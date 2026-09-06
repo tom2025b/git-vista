@@ -69,8 +69,10 @@ clone setup and is not counted as a proof. All five browser cases passed.
 After integrating main `e2bfb312`, workspace all-targets tests passed: 3,355
 passed, 20 ignored. One full-gate attempt then hit a localhost connection
 refusal in the existing SSH sandbox fixture; its exact isolated recheck passed
-(1/1). No source change or skip was used. The full gate is required to pass
-again before publishing; a passing recheck alone does not satisfy that gate.
+(1/1). A complete rerun then passed fmt, native and wasm clippy, workspace
+tests, Trunk, and all 117 Playwright cases (including the five new #75 cases).
+No source change or test skip was used between the failed fixture run and the
+green gate.
 
 Physical iPad installation/standalone launch and the device input/accessibility
 matrix remain **unverified** on titan. Use `Refs #75`, not `Closes #75`. The
