@@ -270,4 +270,51 @@ mod tests {
         // The claim this test is really about: it must succeed anyway.
         let _claim = PortClaim::acquire();
     }
+
+    /// The cross-process half (#674) actually excludes — and specifically
+    /// across *independently-opened file descriptors*, not just within one.
+    ///
+    /// `a_claim_serializes_concurrent_holders` above proves the in-process
+    /// `Mutex` excludes concurrent threads sharing this binary's one static.
+    /// It cannot prove anything about `acquire_cross_process_lock`: two
+    /// threads calling `PortClaim::acquire()` are already serialized by that
+    /// Mutex before either reaches the file lock, so a defect confined to the
+    /// file-lock call would hide behind the Mutex in that test. This test
+    /// calls `acquire_cross_process_lock` directly, bypassing the Mutex
+    /// entirely, so each thread opens its own independent fd on the same
+    /// path — the same shape two separate `cargo test` processes would
+    /// produce — and only the file lock stands between them.
+    #[test]
+    fn the_cross_process_lock_excludes_independent_openers() {
+        let inside = Arc::new(AtomicUsize::new(0));
+        let overlapped = Arc::new(AtomicBool::new(false));
+        let mut threads = Vec::new();
+        for _ in 0..4 {
+            let inside = Arc::clone(&inside);
+            let overlapped = Arc::clone(&overlapped);
+            threads.push(std::thread::spawn(move || {
+                let _lock = acquire_cross_process_lock();
+                if inside.fetch_add(1, Ordering::SeqCst) != 0 {
+                    overlapped.store(true, Ordering::SeqCst);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                if inside.fetch_sub(1, Ordering::SeqCst) != 1 {
+                    overlapped.store(true, Ordering::SeqCst);
+                }
+            }));
+        }
+        for t in threads {
+            t.join().expect("claimant thread must not panic");
+        }
+        assert!(
+            !overlapped.load(Ordering::SeqCst),
+            "two independent openers of the cross-process lock were inside \
+             the critical section at once"
+        );
+        assert_eq!(
+            inside.load(Ordering::SeqCst),
+            0,
+            "critical-section counter must unwind to zero"
+        );
+    }
 }
