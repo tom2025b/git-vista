@@ -24,7 +24,7 @@
 use leptos::*;
 use wasm_bindgen::prelude::*;
 
-use git_vista_protocol::change_feed::ChangeFeedSnapshot;
+use git_vista_protocol::change_feed::{ChangeFeedHealth, ChangeFeedSnapshot};
 use git_vista_protocol::{PROTOCOL_QUERY, PROTOCOL_VERSION};
 
 use super::core::{verdict, FeedLog, PlanSlot, PlanVerdict};
@@ -74,6 +74,15 @@ impl Freshness {
     /// readings of one verdict rather than three computations that can drift.
     pub fn of(&self, slot: &PlanSlot) -> PlanVerdict {
         self.log.with(|log| verdict(slot, log))
+    }
+
+    /// The most recently published health, or `None` before the first
+    /// snapshot (or just after a reconnect clears the log) — a tracked read,
+    /// so #663's topbar affordance re-renders on every publication like the
+    /// plan panel does. `Clone`d out rather than borrowed: the caller may
+    /// hold this across the reactive scope that produced it.
+    pub fn health(&self) -> Option<ChangeFeedHealth> {
+        self.log.with(|log| log.latest().map(|s| s.health.clone()))
     }
 }
 

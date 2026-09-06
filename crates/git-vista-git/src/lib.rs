@@ -35,7 +35,7 @@ pub mod refs;
 pub mod stash;
 pub mod tags;
 
-pub use github::{github_web_base, remote_web_base};
+pub use github::{github_web_base, origin_url, remote_web_base};
 pub use history::{
     read_commit, read_remote_commits, remote_membership, walk_history, walk_history_topo,
 };

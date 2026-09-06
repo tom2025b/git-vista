@@ -112,8 +112,13 @@ async fn history_routes_exist_on_loopback_and_lan_read_profile() {
         } else {
             crate::security::HostPolicy::loopback(crate::state::PORT)
         };
-        let router =
-            crate::api_router(session_state, hosts, full_routes, Arc::new(history_codec()));
+        let router = crate::api_router(
+            session_state,
+            hosts,
+            full_routes,
+            Arc::new(history_codec()),
+            Arc::new(crate::token_store::RequestTokenResolver::without_keyring()),
+        );
         let cookie = bootstrap_cookie_for(router.clone(), host, &token).await;
 
         for (method, uri) in [("GET", "/api/frame"), ("GET", "/api/commits")] {

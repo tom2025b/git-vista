@@ -112,6 +112,7 @@ pub(crate) const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     ("/api/rebase-status", Method::GET, Authz::SessionRequired),
     // -- registered only when `full_routes` is set (ADR 0005: never built at
     //    all on the LAN router, not merely gated) --
+    ("/api/forge/pulls", Method::GET, Authz::SessionRequired),
     ("/api/clone", Method::POST, Authz::SessionAndCsrf),
     // #263: a read of a clone attempt's outcome, same posture as the
     // `/api/operations/{id}` read below it — a GET, so no CSRF surface.
@@ -377,7 +378,7 @@ pub(crate) const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// this constant and its test are for. Derived by running
 /// `every_registered_route_is_classified`, never copied from either side of a
 /// merge.
-const EXPECTED_ROUTE_COUNT: usize = 78;
+const EXPECTED_ROUTE_COUNT: usize = 79;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in

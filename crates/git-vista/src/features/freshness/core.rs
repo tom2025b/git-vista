@@ -30,7 +30,10 @@
 
 use std::collections::VecDeque;
 
-use git_vista_protocol::change_feed::{ChangeFeedHealth, ChangeFeedSnapshot, RefDelta};
+use git_vista_protocol::change_feed::{
+    ChangeFeedHealth, ChangeFeedSnapshot, RefDelta, WatcherLoss,
+};
+use git_vista_protocol::UnixSeconds;
 
 use crate::features::operations::kind::OperationKind;
 
@@ -551,6 +554,114 @@ pub fn rebuild_framing(freshness: &PlanFreshness) -> Option<&'static str> {
             Some("Rebuilding will produce the same operation against the current state.")
         }
         PlanFreshness::Unknown { .. } => Some("Rebuild to be sure."),
+    }
+}
+
+/// #663 (ADR 0094 §7): what the topbar's change-feed-health affordance
+/// shows, for **every** state including the resting one. The decision this
+/// exists to protect is the same one this module's own header states for
+/// plan freshness, aimed at a different surface: an indicator drawn only
+/// when something is wrong is indistinguishable, at a glance, from one that
+/// has stopped working — so the healthy state is drawn too, deliberately
+/// unremarkable rather than absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedHealthDisplay {
+    /// The topbar's visible label. Fixed text per category, never
+    /// interpolating a count that could change size while the category
+    /// itself does not — `Watching`'s label is the same word whether 3
+    /// watches are installed or 300, so the resting state can never grow the
+    /// topbar's footprint on its own (#663 acceptance: "no growth in the
+    /// topbar's footprint when it changes state" — a genuine transition to a
+    /// degraded state is a size change too, and that one is the whole point
+    /// of ADR 0094 §7, not the thing this field guards against).
+    pub label: &'static str,
+    /// The full sentence, present in every state and read by assistive tech
+    /// regardless of whether the visible label alone would convey it (#663
+    /// acceptance: "announced, not conveyed by colour alone").
+    pub announcement: String,
+    /// Whether this state should visually stand out. `false` is the resting
+    /// state — ADR 0094 §7: "healthy is quiet... not a green badge competing
+    /// for attention."
+    pub degraded: bool,
+}
+
+/// `health` is `None` before the feed's first snapshot arrives, and again
+/// after every reconnect clears the log (`signals.rs`'s `onerror` calls
+/// `log.clear()` before it retries) — this is genuinely "I couldn't tell
+/// yet", not a fact that watching is underway, and it must say so: the same
+/// rule `git_vista_protocol::change_feed`'s own header states for this
+/// entire wire format, "'I could not tell' must never render as 'nothing
+/// changed'." Folding it into the `Watching` arm would say the feed is live
+/// on a client that has no idea whether it is — not a one-frame flash, since
+/// a stream that never publishes leaves it there permanently.
+///
+/// It still stays visually quiet (`degraded: false`, the muted resting dot,
+/// no label — see [`FeedHealthDisplay::degraded`]): quiet and honest are not
+/// in tension here. A gap of one HTTP round trip is normal, and painting it
+/// amber would train a user to ignore exactly the signal this issue exists
+/// to make legible — the fix for the dishonesty is a different sentence,
+/// not a different colour.
+///
+/// `now` is the caller's live clock, passed in rather than read here so this
+/// function stays pure and host-testable — the same split `Playback::start`
+/// (`features/preview/signals.rs`) already uses for its own wasm-only
+/// `js_sys::Date::now()` reading.
+pub fn feed_health_display(
+    health: Option<&ChangeFeedHealth>,
+    now: UnixSeconds,
+) -> FeedHealthDisplay {
+    match health {
+        None => FeedHealthDisplay {
+            label: "Connecting",
+            announcement: "Change feed: couldn't tell yet — no reading has arrived.".to_string(),
+            degraded: false,
+        },
+        Some(ChangeFeedHealth::Watching { .. }) => FeedHealthDisplay {
+            label: "Live",
+            announcement: "Change feed: watching for repository changes.".to_string(),
+            degraded: false,
+        },
+        Some(ChangeFeedHealth::Bounded {
+            watched, wanted, ..
+        }) => FeedHealthDisplay {
+            label: "Partial",
+            announcement: format!(
+                "Change feed: watching {watched} of {wanted} refs; the rest \
+                 are still covered by the periodic sweep, at its own cadence."
+            ),
+            degraded: true,
+        },
+        Some(ChangeFeedHealth::SweepOnly { reason }) => FeedHealthDisplay {
+            label: "Sweep only",
+            announcement: format!(
+                "Change feed: no live watcher ({}); relying on the periodic sweep.",
+                watcher_loss_reason(reason)
+            ),
+            degraded: true,
+        },
+        Some(ChangeFeedHealth::Blind { reason, since }) => FeedHealthDisplay {
+            label: "Unreadable",
+            announcement: format!(
+                "Change feed: couldn't read the repository ({}) — {reason}",
+                crate::datetime::freshness_label(Some(now.0 - since.0))
+            ),
+            degraded: true,
+        },
+    }
+}
+
+/// One sentence naming why the live watcher is gone — the same "a fact that
+/// was observed, never an inference from silence" posture
+/// [`WatcherLoss`]'s own doc states.
+fn watcher_loss_reason(loss: &WatcherLoss) -> String {
+    match loss {
+        WatcherLoss::LimitReached { at } => format!("the watch limit was reached at {at}"),
+        WatcherLoss::WatchLost { location } => format!("lost the watch on {location}"),
+        WatcherLoss::Unreliable { missed, hinted } => {
+            format!("missed {missed} of {hinted} hinted changes")
+        }
+        WatcherLoss::Unsupported { detail } => format!("not supported on this platform: {detail}"),
+        WatcherLoss::Backend { detail } => format!("the watcher backend failed: {detail}"),
     }
 }
 

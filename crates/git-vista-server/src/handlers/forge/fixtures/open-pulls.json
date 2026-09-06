@@ -1,0 +1,4 @@
+[
+  {"url":"https://api.github.com/repos/octocat/Hello-World/pulls/1347","id":1,"node_id":"PR_fixture","html_url":"https://github.com/octocat/Hello-World/pull/1347","number":1347,"state":"open","locked":false,"title":"Improve the documentation — café","user":{"login":"octocat","id":1,"type":"User"},"body":"A markdown body omitted from the browser contract","draft":false,"head":{"ref":"topic","sha":"abc","repo":null},"base":{"ref":"main","repo":{"private":true}},"labels":[],"requested_reviewers":[],"unknown_future_field":true},
+  {"number":1348,"title":"Draft with <script>text</script>","state":"open","draft":true,"user":null,"head":{"repo":null},"html_url":"https://malicious.invalid/never-follow"}
+]

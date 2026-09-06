@@ -122,6 +122,8 @@ const API_SRC: &str = concat!(
     "\n",
     include_str!("api/diff.rs"),
     "\n",
+    include_str!("api/forge.rs"),
+    "\n",
     include_str!("api/graph.rs"),
     "\n",
     include_str!("api/operations.rs"),

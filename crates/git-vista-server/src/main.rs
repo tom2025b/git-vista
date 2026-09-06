@@ -234,11 +234,20 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // #583 (M13.02): say which token-storage tier answered, masked, at boot —
-    // never only silently. Prints one ordinary line when nothing is
-    // configured; that is expected for a public repository and not a
-    // warning.
-    println!("{}", token_store::provenance_line());
+    // #583/#692: probe the keyring once for request-facing status, off the
+    // runtime worker and with a bounded wait, then say which tier answered at
+    // boot. Settings GETs retain only this probe's masked keyring status and
+    // never repeat a locked Secret Service interaction.
+    let token_store::StartupTokenPolicy {
+        request_resolver,
+        provenance_line,
+        warning,
+    } = token_store::initialize_request_token_policy().await;
+    println!("{provenance_line}");
+    if let Some(warning) = warning {
+        eprintln!("warning: {warning}");
+    }
+    let request_token_resolver = Arc::new(request_resolver);
 
     // Resolve which repo to serve: first CLI arg, else the default checkout.
     // Canonicalise so relative paths (e.g. `.`) and the banner are absolute; if
@@ -408,6 +417,7 @@ async fn main() {
         HostPolicy::loopback(PORT),
         true,
         history_codec.clone(),
+        request_token_resolver.clone(),
     );
 
     print_startup_banner(&bootstrap_token_path(), lan_addr);
@@ -427,6 +437,7 @@ async fn main() {
                 HostPolicy::lan(lan_ip, PORT),
                 false,
                 history_codec.clone(),
+                request_token_resolver.clone(),
             );
             let loopback_serve = axum::serve(
                 listener,
@@ -467,6 +478,7 @@ fn api_router(
     hosts: HostPolicy,
     full_routes: bool,
     codec: Arc<CursorCodec>,
+    request_token_resolver: Arc<token_store::RequestTokenResolver>,
 ) -> Router {
     // #589: declare the profile from the exact boolean that selects the route
     // table below.  It is not reconstructed from Host, peer address, or
@@ -564,6 +576,7 @@ fn api_router(
     // exist at all.
     if full_routes {
         api = api
+            .route("/api/forge/pulls", get(handlers::forge::pulls))
             // Phase 12: clone a public URL into a temp dir and view it read-only.
             .route("/api/clone", post(clone_repo))
             // #263: what happened to a clone attempt admitted under an
@@ -852,12 +865,23 @@ fn api_router(
         // and passed into both listener builds — never a fresh codec per
         // router — so a cursor minted on one listener decodes on the other.
         .layer(Extension(codec))
+        // #692: the process-lifetime masked keyring snapshot used only by
+        // Settings. The LAN router never registers those routes, but sharing
+        // this object across both builds keeps listener state unambiguous.
+        .layer(Extension(request_token_resolver))
         // The session store the session handlers (and the auth layer) resolve
         // against. Erases the router's state type back to `()`.
         .with_state(session_state)
         // The profile is a property of the listener, not of any one handler.
         // Stamp it at the router boundary so every registered API response
         // declares the capability table that served it.
+        // Error-envelope rewriting can replace the auth layer's response.
+        // Stamp no-store outside it so private provider reads and refusals
+        // retain the same cache policy as successful local reads.
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ))
         .layer(SetResponseHeaderLayer::overriding(
             header::HeaderName::from_static(LISTENER_PROFILE_HEADER),
             HeaderValue::from_static(listener_profile.as_header_value()),
@@ -871,6 +895,7 @@ fn build_app(
     hosts: HostPolicy,
     full_routes: bool,
     codec: Arc<CursorCodec>,
+    request_token_resolver: Arc<token_store::RequestTokenResolver>,
 ) -> Router {
     let listener_profile = ListenerProfile::from_write_routes(full_routes);
     // Serve the SPA bundle with `Cache-Control: no-cache` so the browser always
@@ -885,7 +910,13 @@ fn build_app(
     .layer(ServeDir::new(DIST_DIR).append_index_html_on_directories(true));
 
     Router::new()
-        .merge(api_router(session_state, hosts, full_routes, codec))
+        .merge(api_router(
+            session_state,
+            hosts,
+            full_routes,
+            codec,
+            request_token_resolver,
+        ))
         // Anything that isn't the API is served from the built SPA bundle.
         .fallback_service(spa)
         // Global backstop for the static SPA / fallback. The `/api` space has its
@@ -902,6 +933,13 @@ fn build_app(
         // That is the live LAN failure shape: POST /api/select falls through
         // to the file service and receives an ordinary 405.  The response must
         // still say which listener profile produced it.
+        // Error-envelope rewriting can replace the auth layer's response.
+        // Stamp no-store outside it so private provider reads and refusals
+        // retain the same cache policy as successful local reads.
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ))
         .layer(SetResponseHeaderLayer::overriding(
             header::HeaderName::from_static(LISTENER_PROFILE_HEADER),
             HeaderValue::from_static(listener_profile.as_header_value()),
@@ -964,6 +1002,10 @@ mod tests {
         ListenerProfile, SessionInfo, LISTENER_PROFILE_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION,
     };
     use tower::ServiceExt;
+
+    fn test_request_token_resolver() -> Arc<token_store::RequestTokenResolver> {
+        Arc::new(token_store::RequestTokenResolver::without_keyring())
+    }
 
     /// Establish a session against `router` (whichever host it expects) and
     /// return just the `Cookie` header value. Only exercises the session
@@ -1063,6 +1105,7 @@ mod tests {
                 },
                 full_routes,
                 Arc::new(CursorCodec::new()),
+                test_request_token_resolver(),
             );
             let resp = app
                 .oneshot(
@@ -1110,6 +1153,7 @@ mod tests {
             HostPolicy::lan("192.168.1.42".parse().unwrap(), PORT),
             false,
             Arc::new(CursorCodec::new()),
+            test_request_token_resolver(),
         );
         assert_eq!(
             declared_profile(router.clone(), "192.168.1.42:8080").await,
@@ -1123,7 +1167,7 @@ mod tests {
         // must not be able to ask for one — ADR 0005 says the route is never
         // *built* on this router, and a 404 is what proves that (a 403 would
         // mean it exists and something gated it).
-        for path in ["/api/commit", "/api/plan"] {
+        for path in ["/api/commit", "/api/plan", "/api/forge/pulls"] {
             let resp = router
                 .clone()
                 .oneshot(
@@ -1160,6 +1204,7 @@ mod tests {
             HostPolicy::loopback(PORT),
             true,
             Arc::new(CursorCodec::new()),
+            test_request_token_resolver(),
         );
         assert_eq!(
             declared_profile(router.clone(), "localhost:8080").await,
@@ -1194,6 +1239,46 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn forge_route_requires_session_and_validates_page_before_resolving_credentials() {
+        let sessions = Arc::new(SessionManager::new(None));
+        let token = sessions.current_bootstrap();
+        let router = api_router(
+            SessionState {
+                manager: sessions,
+                via_lan: false,
+                rate_limiter: None,
+            },
+            HostPolicy::loopback(PORT),
+            true,
+            Arc::new(CursorCodec::new()),
+            test_request_token_resolver(),
+        );
+        let request = |cookie: Option<String>| {
+            let mut req = Request::builder()
+                .uri("/api/forge/pulls?page=0")
+                .header(header::HOST, "localhost:8080")
+                .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string());
+            if let Some(cookie) = cookie {
+                req = req.header(header::COOKIE, cookie);
+            }
+            req.body(Body::empty()).unwrap()
+        };
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(request(None))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let cookie = bootstrap_cookie(router.clone(), "localhost:8080", &token).await;
+        let response = router.oneshot(request(Some(cookie))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    }
+
     /// M2.21b (#236) end to end: a real request through the real router — auth
     /// gate, contract layer, route table, handler, `git_vista_git::read_tags`,
     /// and the `TagDetail` mapping — against a repository on disk.
@@ -1225,6 +1310,7 @@ mod tests {
             HostPolicy::loopback(PORT),
             true,
             Arc::new(CursorCodec::new()),
+            test_request_token_resolver(),
         );
         let cookie = bootstrap_cookie(router.clone(), "localhost:8080", &token).await;
         let resp = router
