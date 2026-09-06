@@ -109,10 +109,17 @@ fn drag_select_is_wired_on_all_three_pointer_phases() {
 #[test]
 fn keyboard_navigation_uses_the_shared_key_map_not_a_local_one() {
     assert!(
-        VIEW_SRC.contains("roving_row_key(&ev.key())"),
+        VIEW_SRC.contains("roving_row_key(&ev.key(), mods)"),
         "the blame rows no longer route keys through the shared \
          `roving_row_key` — a local key match is a third copy of a map #653 \
          deliberately unified"
+    );
+    assert!(
+        !VIEW_SRC.contains("if ev.alt_key() || ev.ctrl_key() || ev.meta_key() {"),
+        "this row's own hand-rolled Ctrl/Cmd/Alt guard is back (#660) — this \
+         was the THIRD, undocumented copy of the roving-row modifier policy \
+         the issue never named; the guard is `roving_row_key`'s alone to \
+         apply now, via the `mods` it is passed"
     );
     assert!(
         VIEW_SRC.contains("ev.shift_key()"),
