@@ -8,8 +8,8 @@ use git_vista_protocol::operation::IdempotencyKey;
 use git_vista_protocol::{RemoveWorktreeRequest, WorktreePathsRequest, WorktreeStatus};
 
 use super::{
-    network_error, receipt, refuse_if_offline, refuse_if_visualize, req_get, response_error,
-    send_read, send_write_with_key, WriteReceipt, REQUEST_TIMEOUT_MS,
+    receipt, refuse_if_offline, refuse_if_visualize, response_error, send_read,
+    send_write_with_key, WriteReceipt, REQUEST_TIMEOUT_MS,
 };
 
 /// Fetch the live working-tree status (`GET /api/status`) — branch, ahead/
@@ -17,8 +17,16 @@ use super::{
 /// panel's status section. Resolved fresh server-side per request and cache-
 /// busted like the other live reads, since it changes with every edit.
 pub async fn fetch_status() -> Result<RepoStatus, String> {
-    let url = format!("/api/status?t={}", js_sys::Date::now());
-    let resp = req_get(&url).send().await.map_err(network_error)?;
+    fetch_status_for(None).await
+}
+
+/// Pin chip/commit readings to the accepted frame's opaque repository id.
+pub async fn fetch_status_for(repo: Option<&str>) -> Result<RepoStatus, String> {
+    let mut url = format!("/api/status?t={}", js_sys::Date::now());
+    if let Some(repo) = repo {
+        url.push_str(&format!("&repo={}", js_sys::encode_uri_component(repo)));
+    }
+    let resp = send_read(&url).await.map_err(|e| e.to_string())?;
     if resp.ok() {
         resp.json::<RepoStatus>().await.map_err(|e| e.to_string())
     } else {

@@ -114,6 +114,11 @@ html, body {
    with the graph via the shared reload counter; hidden entirely if the status
    probe fails. */
 .status-chip {
+  min-width: 44px;
+  min-height: 44px;
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
   align-self: center;
   padding: 0.15rem 0.6rem;
   font-size: 0.8rem;
@@ -1703,3 +1708,13 @@ html .detail-panel.detail-panel--full .detail-body {
   overflow-wrap: normal;
   overflow-x: auto;
 }
+
+/* #141: a touch-sized status explanation, using the existing shell palette. */
+.status-detail-backdrop { position: fixed; inset: 0; z-index: 910; background: rgba(1,4,9,.6); display: flex; align-items: center; justify-content: center; white-space: normal; }
+.status-detail { width: 580px; max-width: calc(100vw - 32px); max-height: 80vh; overflow: auto; padding: 16px; box-sizing: border-box; background: #161b22; border: 1px solid #30363d; border-radius: 10px; color: var(--fg); font-size: 1rem; }
+.status-detail-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.status-detail h2 { margin: 0; font-size: 1.2rem; }
+.status-detail p { line-height: 1.5; }
+.status-detail button { min-height: 44px; min-width: 44px; }
+.status-detail-action { border-top: 1px solid #30363d; padding: 8px 0; }
+.status-chip:focus-visible, .status-detail button:focus-visible { outline: 2px solid #58a6ff; outline-offset: 2px; }
