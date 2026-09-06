@@ -268,12 +268,20 @@ pub fn on_node_keydown(
     ev: web_sys::KeyboardEvent,
     activate: &impl Fn(f64, f64),
 ) {
-    // Which key means what is `features::graph::core::roving_row_key`'s to
-    // say (#653) — the staging view drives the same focus model with the same
-    // keys, and a second copy of the map inside a wasm-only file is a copy no
-    // host test can reach. This handler still owns what each intent *does*
-    // here, which is the part that differs between the two surfaces.
-    let Some(intent) = roving_row_key(&ev.key()) else {
+    // Which key means what, and the modifier policy that bails a press out
+    // entirely, is `features::graph::core::roving_row_key`'s to say (#653,
+    // #660) — the staging view drives the same focus model with the same
+    // keys and the same policy, and a second copy of either inside a
+    // wasm-only file is a copy no host test can reach. This handler still
+    // owns what each intent *does* here, which is the part that differs
+    // between the two surfaces.
+    let mods = KeyMods {
+        shift: ev.shift_key(),
+        ctrl: ev.ctrl_key(),
+        meta: ev.meta_key(),
+        alt: ev.alt_key(),
+    };
+    let Some(intent) = roving_row_key(&ev.key(), mods) else {
         return;
     };
     if let RowKey::Move(dir) = intent {
