@@ -203,23 +203,32 @@ in this issue asks for, for a feature that — per the issue's own wording,
 with any adapter wired up.
 
 So: a closed Rust enum, `BisectAdapterId`, compiled into the server, is the
-entire reviewed set. "Reviewed" means what it literally says — a human
-reviewed the exact argv in a PR before it could ever run, the same review
-every other line of this server already gets, rather than an
-operator-editable file this ADR would have to design a trust model for. The
-client can `GET` the (possibly empty) list of configured adapters and
-`POST {id}` to run one; there is no field anywhere in that request shape a
-string could occupy. #87 ships this table **empty** — no served repository
-is guaranteed to share a test command with any other (this app serves
-arbitrary repos, so a hardcoded `cargo test` would be actively wrong for a
-non-Rust one) — and the empty state is itself the tested, working
-behaviour: the endpoint reports zero adapters, and the UI's automated-run
-affordance does not appear. A later milestone that wants one concrete
-adapter for one concrete repository adds a variant, reviewed in that PR,
-exactly like every other one-variant-per-real-thing addition in this
-vocabulary. Building the config-file version now, before anything needs the
-second adapter, is exactly the complexity the "Future Me Check" this
-project holds itself to would reject.
+intended shape of the entire reviewed set, once it exists. "Reviewed" would
+mean what it literally says — a human reviewing the exact argv in a PR
+before it could ever run, the same review every other line of this server
+already gets, rather than an operator-editable file this ADR would have to
+design a trust model for. A future slice's client would `GET` the (possibly
+empty) list of configured adapters and `POST {id}` to run one, with no field
+anywhere in that request shape a string could occupy.
+
+**What #87 actually ships is narrower than that design: no adapter, and no
+endpoint of any kind.** `BisectAdapterId` exists in `bisect_exec.rs` today as
+an unwired, zero-variant placeholder — `#[allow(dead_code)]`, nothing
+constructs it, nothing matches on it, no route reads it. The real safety
+property right now is **scope, not type**: there is no `run-adapter`-shaped
+endpoint at all, so there is nothing for any value of any type to reach.
+The type is named in advance so the future slice — a `GET`/`POST` pair, a
+first real variant, and the review that comes with adding it — has an
+obvious home when a served repository actually needs automated test
+execution; it does not itself enforce anything yet, and describing it as
+already doing so would be exactly the "declaration that names a guarantee
+nothing enforces" this project has already found and fixed in a census
+table once this same day (the funnel-row gap PR #695's review caught) —
+the same defect shape, on a type instead of on a table. Building the
+config-file alternative now, before anything needs a second adapter, is
+exactly the complexity the "Future Me Check" this project holds itself to
+would reject — but so is naming a compile-time guarantee this code does not
+provide.
 
 ## Alternatives considered
 
@@ -257,13 +266,16 @@ project holds itself to would reject.
   disagreed with git's."
 - The activity feed gains one new, precise kind rather than an `Other`
   fallback or a `Checkout` misclassification.
-- The security boundary for automated execution is provable by inspection:
-  `BisectAdapterId` has zero variants at ship time, so the wire shape for
-  "run an adapter" cannot be constructed with anything resembling a
-  command string, by the type system, not by a runtime check.
-- The cost paid for the compiled-in adapter table is that adding the first
-  real adapter needs a code change and a PR, not a config edit. Given #87
-  ships none, that cost is not yet incurred by anyone.
+- The security boundary for automated execution, right now, is that no
+  `run-adapter`-shaped endpoint exists at all — a scope guarantee, not a
+  type-system one. `BisectAdapterId` is an unwired, zero-variant
+  placeholder nothing in this codebase constructs, matches, or routes
+  through; it names where a future reviewed set would live, and claims
+  nothing about what is enforced today.
+- The cost paid for the compiled-in-table design, once a future slice
+  wires it up, is that adding the first real adapter needs a code change
+  and a PR, not a config edit. Given #87 ships neither the adapter nor the
+  endpoint, that cost is not yet incurred by anyone.
 - `git bisect reset`'s exit-code quirk (the step that finds the culprit
   exits 1) means the executor must be tested against that exact case, not
   only the "still narrowing" case — the mutation proof below covers both.

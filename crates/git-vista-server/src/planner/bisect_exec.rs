@@ -37,13 +37,16 @@ use super::{
     RunFailure,
 };
 
-/// The reviewed-adapter set for automated bisect test execution (ADR 0131
-/// §7) — a closed, compiled-in enum, not a runtime config file. Zero
-/// variants at ship time: #87 ships no adapter, and an empty enum is what
-/// makes "no adapter can be requested" a compile-time fact rather than a
-/// runtime empty list that a later bug could quietly stop enforcing. A
-/// later milestone adds a variant here, reviewed in that PR, when a real
-/// served repository needs one — no HTTP surface reads this type yet.
+/// Placeholder for the reviewed-adapter set a future milestone wires up for
+/// automated bisect test execution (ADR 0131 §7) — **not load-bearing
+/// today**. Nothing constructs, matches on, or routes through this type;
+/// the actual safety property right now is scope, not type: there is no
+/// `POST /api/bisect/run-adapter`-shaped endpoint of any kind, so there is
+/// nothing for any value of this type, real or otherwise, to reach. When a
+/// served repository needs one, the endpoint and its first real variant
+/// land together, reviewed in that PR — this shape is named in advance so
+/// that slice has a home, not to claim an enforcement this file does not
+/// yet perform.
 #[allow(dead_code)]
 pub(crate) enum BisectAdapterId {}
 
