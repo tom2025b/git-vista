@@ -25,9 +25,9 @@ export function runtime() {
  * which an unprivileged user namespace does not grant. So this forges the one
  * signal instead, and pays for it explicitly:
  *
- *   THIS HARNESS CANNOT TEST THE OFFLINE GUARD. It fabricates the exact value
- *   that guard reads. The guard's own coverage must come from somewhere else --
- *   today that is a manual device pass.
+ *   Ordinary specs do not test the offline guard. pwa-offline.spec.mjs
+ *   replaces this override, dispatches real connectivity events, and cuts
+ *   transport with context.setOffline to exercise offline refusal explicitly.
  */
 export async function forceOnline(page) {
   await page.addInitScript(() => {
