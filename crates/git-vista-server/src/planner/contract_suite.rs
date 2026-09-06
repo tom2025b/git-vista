@@ -3270,25 +3270,25 @@ fn route_authz_and_write_contract_agree_on_every_post_route() {
         })
         .collect();
 
-    for route in authz_posts.difference(&contract_posts) {
-        panic!(
-            "ROUTE CENSUS MISMATCH: POST {route} is classified in ROUTE_AUTHZ \
-             (crates/git-vista-server/src/route_authz.rs) but has no entry in \
-             this file's KNOWN_POST_ROUTES table (used by \
-             every_git_write_route_reaches_the_planner). Classify it there too: \
-             a git write needs a funnel row below; a non-git write (a catalog \
-             write, a credential write, a cancel, ...) needs a row here saying \
-             so, the same as /api/select-worktree or /api/settings/token."
-        );
-    }
-    for route in contract_posts.difference(&authz_posts) {
-        panic!(
-            "ROUTE CENSUS MISMATCH: POST {route} is classified in this file's \
-             KNOWN_POST_ROUTES table but has no entry in ROUTE_AUTHZ \
-             (crates/git-vista-server/src/route_authz.rs). Classify its \
-             authorization there."
-        );
-    }
+    let missing_from_contract: Vec<&str> =
+        authz_posts.difference(&contract_posts).copied().collect();
+    assert!(
+        missing_from_contract.is_empty(),
+        "ROUTE CENSUS MISMATCH: POST {missing_from_contract:?} classified in ROUTE_AUTHZ \
+         (crates/git-vista-server/src/route_authz.rs) but has no entry in this file's \
+         KNOWN_POST_ROUTES table (used by every_git_write_route_reaches_the_planner). \
+         Classify it there too: a git write needs a funnel row below; a non-git write \
+         (a catalog write, a credential write, a cancel, ...) needs a row here saying so, \
+         the same as /api/select-worktree or /api/settings/token."
+    );
+
+    let missing_from_authz: Vec<&str> = contract_posts.difference(&authz_posts).copied().collect();
+    assert!(
+        missing_from_authz.is_empty(),
+        "ROUTE CENSUS MISMATCH: POST {missing_from_authz:?} classified in this file's \
+         KNOWN_POST_ROUTES table but has no entry in ROUTE_AUTHZ \
+         (crates/git-vista-server/src/route_authz.rs). Classify its authorization there."
+    );
 }
 
 /// The production composition itself: [`plan_and_execute`]'s body must call
