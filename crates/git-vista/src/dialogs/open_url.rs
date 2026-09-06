@@ -28,6 +28,11 @@ use crate::features::shell::signals::Shell;
 /// timed out, or reported "already in progress". `cloning` alone still gates
 /// dismissal (the pin is "any attempt in flight, whichever phase"); this one
 /// only changes what the button says while that later phase runs.
+// Eight arguments, over clippy's default seven. Grouping them into a struct
+// would be a struct that exists only to satisfy a lint — every one is a
+// distinct signal this modal genuinely needs, and the newest (#676's `shell`,
+// to close a stale confirmation on a completed clone) is exactly that.
+#[allow(clippy::too_many_arguments)]
 pub fn open_url_view(
     open_url: RwSignal<bool>,
     clone_url: RwSignal<String>,
