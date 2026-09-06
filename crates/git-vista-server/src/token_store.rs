@@ -286,7 +286,7 @@ mod tests {
     fn token_status_of_present_names_the_source_and_masks_the_value() {
         let real = format!("ghp_{}", "abcdefghijklmnopqrstuvwxyz");
         let status = token_status_of(Some((real.clone(), TokenSource::Keyring)));
-        assert_eq!(status.configured, true);
+        assert!(status.configured);
         assert_eq!(status.source.as_deref(), Some(TokenSource::Keyring.label()));
         assert_eq!(status.masked.as_deref(), Some("...wxyz"));
         // The property #584's acceptance actually asks for, checked directly
