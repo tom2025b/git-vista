@@ -48,6 +48,7 @@ use git_vista_core::activity::{ActivityEvent, ActivityKind, ActivitySource};
 
 use crate::{activity, journal};
 
+pub(crate) mod blame;
 pub(crate) mod branch;
 pub(crate) mod catalog;
 pub(crate) mod clone;
