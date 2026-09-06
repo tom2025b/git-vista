@@ -324,8 +324,9 @@ sync by hand.
 - `crates/git-vista-server/src/argv_boundary.rs` — the census entry for
   `src/sandbox/network_exec.rs` (test-only `Command::new` fixtures; the one production
   function in this file builds no `Command` of its own).
-- `docs/SECURITY_MODEL.md` — the "Implemented vs. aspirational (as of #228, M2.20b)" table
-  under "Remote and Forge Credentials," kept consistent with this ADR's Consequences.
+- `docs/SECURITY_MODEL.md` — the "Implemented vs. aspirational — current
+  credential-surface census" table under "Remote and Forge Credentials,"
+  introduced by this ADR and extended by later credential work.
 
 ---
 
