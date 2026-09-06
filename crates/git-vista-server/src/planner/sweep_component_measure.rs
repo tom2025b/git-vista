@@ -54,7 +54,7 @@ async fn measure_sweep_components() {
         repo.display()
     );
     println!();
-    println!("--- observe_live_for_generation's two reads ---");
+    println!("--- observe_live_for_feed's two reads ---");
     let head_rev_parse = timed("rev_parse(HEAD)          (git spawn, sandboxed)", N, || {
         crate::git_cmd::rev_parse(&repo, "HEAD")
     })
@@ -101,7 +101,7 @@ async fn measure_sweep_components() {
     println!();
     println!(
         "concurrency saved: {:>6.2} ms ({:.0}% of the sum) — \
-         observe_live_for_generation's two reads and read_generation_parts's \
+         observe_live_for_feed's two reads and read_generation_parts's \
          three reads run sequentially WITHIN each group via `.await` chaining, \
          but the two groups and the gix opens go through separate spawn_blocking \
          tasks, so some overlap is real, not measurement noise",
