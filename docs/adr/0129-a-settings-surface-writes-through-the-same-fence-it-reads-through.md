@@ -1,4 +1,4 @@
-# ADR 0128 — A settings surface writes through the same fence it reads through
+# ADR 0129 — A settings surface writes through the same fence it reads through
 
 - **Status:** Accepted — implemented, mutation-proved two ways failing differently
 - **Date:** 2026-09-06
