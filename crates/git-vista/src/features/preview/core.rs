@@ -734,6 +734,95 @@ mod rebuild_token_tests {
     }
 }
 
+/// `rebuild_lease`'s epoch axis, pinned from the host side (#664/#673
+/// review). `dialogs/confirm.rs` is `#[cfg(target_arch = "wasm32")]`, so
+/// `cargo test` never compiles it — a mutation to this file's own
+/// `rebuild_key_is_current` cannot catch a defect that lives entirely in
+/// which VALUE the wasm-only caller passes it. This module reads the file as
+/// text instead, the same way `preview_action_tests::CONFIRM` does.
+///
+/// The defect this exists to catch shipped once already: `rebuild_lease` took
+/// a single `epoch: u64`, read once before either `.await`, and passed that
+/// same captured value back into `rebuild_is_current` at the commit point.
+/// `token.epoch == live_epoch` was then true by construction — a value
+/// compared against itself — so the axis fenced nothing regardless of
+/// whether the graph epoch actually moved during the two awaits. The fix
+/// is not "check the epoch harder"; it is reading it a second time, live,
+/// after both requests have settled.
+#[cfg(test)]
+mod rebuild_lease_epoch_census {
+    const CONFIRM: &str = include_str!("../../dialogs/confirm.rs");
+
+    /// `rebuild_lease`'s body, isolated by the same start/end-marker slicing
+    /// `preview_action_tests::preview_effect_body` uses. The end marker is
+    /// the next top-level function rather than brace-counting, which would
+    /// need to understand Rust to get right; a fixed neighbor is simpler and
+    /// the neighbor's name is itself worth pinning against drifting away.
+    fn rebuild_lease_body() -> String {
+        let after = CONFIRM
+            .split_once("fn rebuild_lease(op: &PendingOp")
+            .expect("dialogs/confirm.rs no longer defines rebuild_lease with this signature")
+            .1;
+        let end = after
+            .find("\nfn explanation_panel_view")
+            .expect("rebuild_lease is no longer directly followed by explanation_panel_view");
+        after[..end].to_string()
+    }
+
+    /// A bare `epoch: u64` parameter is exactly the shape that shipped the
+    /// tautology: a plain integer can only ever hold whatever value the
+    /// caller read once, before the awaits. Taking the signal itself is what
+    /// makes a second, live, post-await read possible at all.
+    #[test]
+    fn rebuild_lease_takes_the_graph_signal_not_a_bare_epoch() {
+        let body = rebuild_lease_body();
+        assert!(
+            body.contains("graph: RwSignal<GraphCore>"),
+            "rebuild_lease no longer takes the graph signal itself, which is what \
+             makes a live re-read possible at the commit point. Body was:\n{body}"
+        );
+    }
+
+    /// Two independent reads, not one value threaded through twice: the
+    /// mint-time read (for the token) and the commit-time read (for the
+    /// comparison) must each call `graph.get_untracked().epoch()` on their
+    /// own. A mutation that deletes the second call and feeds the mint-time
+    /// local back in — reintroducing the exact defect — drops this to one.
+    #[test]
+    fn the_epoch_is_read_twice_not_captured_once() {
+        let body = rebuild_lease_body();
+        let reads = body.matches("graph.get_untracked().epoch()").count();
+        assert_eq!(
+            reads, 2,
+            "rebuild_lease must read the graph epoch exactly twice — once to mint \
+             the token, once more, live, at the commit point. Found {reads} read(s). \
+             Body was:\n{body}"
+        );
+    }
+
+    /// The second read has to sit after the last `.await` in the function —
+    /// two textually-distinct reads that both happen before either request is
+    /// sent would still be comparing the same click-time value against
+    /// itself, just written twice instead of stored once.
+    #[test]
+    fn the_second_epoch_read_comes_after_the_last_await() {
+        let body = rebuild_lease_body();
+        let last_await = body
+            .rfind(".await")
+            .expect("rebuild_lease no longer awaits anything");
+        let last_read = body
+            .rfind("graph.get_untracked().epoch()")
+            .expect("rebuild_lease no longer reads the graph epoch at all");
+        assert!(
+            last_read > last_await,
+            "the live epoch read must come after the last `.await`, not before it — \
+             otherwise it is just a second mint-time read, not a live one. \
+             last .await at byte {last_await}, last epoch read at byte {last_read}. \
+             Body was:\n{body}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod preview_action_tests {
     use super::*;

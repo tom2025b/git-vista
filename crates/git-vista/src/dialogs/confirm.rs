@@ -41,7 +41,7 @@ use crate::features::preview::signals::{Preview, PreviewSlot};
 use super::{freshness_notice_view, preview_panel_view};
 use crate::features::explain::core::{render, LinkTarget, RenderedSection, Span};
 use crate::features::freshness::core::PlanOnScreen;
-use crate::features::graph::core::{disabled_menu_item_copy, push_confirm_copy};
+use crate::features::graph::core::{disabled_menu_item_copy, push_confirm_copy, GraphCore};
 use crate::features::graph::core::{remote_tip_from_plan, RemoteTipKnowledge};
 use crate::features::operations::kind::{ForceWithLease, OperationKind};
 use crate::features::preview::core::{rebuild_commit, RebuildEffect, RebuildOutcome};
@@ -478,9 +478,7 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                     // Not previewable. The only plan-backed arm here is the
                     // force-with-lease push, whose plan came from the menu's
                     // own two-step lease fetch rather than from `Preview`.
-                    PreviewAction::Clear => {
-                        rebuild_lease(&rebuild_op, preview, shell, graph.get_untracked().epoch())
-                    }
+                    PreviewAction::Clear => rebuild_lease(&rebuild_op, preview, shell, graph),
                 }
             };
             let blocked_reason = blocked_by_staleness(&plan_freshness).or(blocked_reason);
@@ -701,7 +699,14 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
 /// desk**. The second is the one no counter can supply — see
 /// `rebuild_commit`'s doc and
 /// `ci/browser/tests/rebuild-lease-two-tabs.spec.mjs`.
-fn rebuild_lease(op: &PendingOp, preview: Preview, shell: Shell, epoch: u64) {
+///
+/// Takes the `graph` signal itself, not a pre-read epoch, and reads it twice
+/// — once here at mint time, once more at the commit point below. A single
+/// read passed through both ends compares a captured value against itself,
+/// which is always true and fences nothing; the whole reason this axis
+/// exists is to catch a selection that moves **during** the two awaits, and
+/// only a second, live read after them can see that.
+fn rebuild_lease(op: &PendingOp, preview: Preview, shell: Shell, graph: RwSignal<GraphCore>) {
     let PendingOp::Push {
         branch,
         set_upstream,
@@ -717,7 +722,7 @@ fn rebuild_lease(op: &PendingOp, preview: Preview, shell: Shell, epoch: u64) {
     // about the selection, which is exactly the belief the two-tab case
     // invalidates.
     let opened_desk = opened_with.plan.clone();
-    let token = preview.note_rebuild_started(epoch);
+    let token = preview.note_rebuild_started(graph.get_untracked().epoch());
     spawn_local(async move {
         // Nothing in this block writes shared state. It yields a value.
         let built = async {
@@ -759,7 +764,17 @@ fn rebuild_lease(op: &PendingOp, preview: Preview, shell: Shell, epoch: u64) {
         let same_desk = built
             .as_ref()
             .is_none_or(|(leased, _)| opened_desk.same_desk(&PlanOnScreen::of(leased)));
-        match rebuild_commit(outcome, preview.rebuild_is_current(token, epoch), same_desk) {
+        // Read fresh, here, after both awaits — not the mint-time value above.
+        // `graph` is `RwSignal<GraphCore>` (`Copy`), moved into this future
+        // unchanged; this is the live epoch as of the commit, which is the
+        // only read that can see a selection that moved while this was in
+        // flight.
+        let live_epoch = graph.get_untracked().epoch();
+        match rebuild_commit(
+            outcome,
+            preview.rebuild_is_current(token, live_epoch),
+            same_desk,
+        ) {
             RebuildEffect::Reopen => {
                 let Some((leased, oid)) = built else {
                     // Unreachable: `Reopen` is only returned for `Landed`,
