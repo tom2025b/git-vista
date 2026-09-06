@@ -306,6 +306,15 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // Production `reconciliation.rs` constructs no process at all; every read
     // it makes goes through the planner's existing generation path.
     "src/reconciliation/suite.rs",
+    // #661: `#[cfg(test)]` measurement, `raw_git`. A raw, unsandboxed
+    // `std::process::Command::new("git")` spawn, deliberately outside the
+    // sandboxed launcher — the whole point of it is to measure git's own
+    // execution time apart from `sandboxed`'s bwrap overhead, for the
+    // component breakdown this file reports. Never a mutation, always a
+    // read (`status`, `for-each-ref`); never reachable outside `#[ignore]`d
+    // measurement code. Production `reconciliation.rs`/`planner.rs` still
+    // construct no unsandboxed process anywhere.
+    "src/planner/sweep_component_measure.rs",
     // #448 removed `src/conflicts.rs` from this list: its `#[cfg(test)]` git
     // fixtures now come from the `git-vista-fixtures` catalogue, so the file
     // constructs no `Command` at all and the entry had become a permission
