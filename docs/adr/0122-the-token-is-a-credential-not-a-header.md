@@ -6,6 +6,8 @@
 - **Extends:** [ADR 0033](0033-ssh-agent-and-known-hosts-carveout.md) (the sibling carve-out for SSH; this is the HTTPS half of the same question) · `docs/SECURITY_MODEL.md`'s "Remote and Forge Credentials" section, which this annotates
 - **Superseded in part by:** [ADR 0128](0128-a-credential-exists-only-before-untrusted-checkout.md) (#680), which contains the inherited value during clone and makes token-aware output redaction structural
 
+- **Superseded in part by:** [ADR 0133](0133-forge-reads-have-their-own-credential-and-wait-boundary.md): the read-only forge API introduces a server HTTP client; Git transfers retain this helper boundary.
+
 ## Context
 
 M13 is "private repositories for anyone." #582 is the issue that blocks
