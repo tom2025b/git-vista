@@ -96,10 +96,9 @@ inspection."* Two things make this a proof rather than a claim:
 
 ```mermaid
 flowchart TD
-    RT["resolve_token() -> Option&lt;(String, TokenSource)&gt;"] --> TSO["token_status_of(resolved)"]
-    TSO -->|configured, masked, source| TS["TokenStatus"]
+    RT["resolve_token, returns the resolved token plus which tier answered"] --> TSO["token_status_of — pure, dependency-injected"]
+    TSO -->|builds only: configured, masked, source| TS["TokenStatus"]
     TS -->|serde_json::to_string| WIRE["the actual HTTP response body"]
-    TSO -.->|no code path from token String to TS's fields.-> TS
 ```
 
 - **The type.** `TokenStatus { configured: bool, masked: Option<String>,
