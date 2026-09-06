@@ -101,6 +101,13 @@ Earlier records 371/375 were superseded. Record 372 exposed a vacuous
 token-change assertion; records 376/377 rejected a production build that
 used a dev-only gix dependency. Both defects were fixed before 378/379.
 
+The unpublished branch's early checkpoint authors were corrected to `codex`
+before publication, preserving every tree. Original measurement/proof commit
+`5685728f` is `d8476b33` in the published ancestry; the Atlas records retain
+their original SHA. The planner, regression tests, and git reader are byte
+identical to that proved revision. The pre-correction history is retained
+locally at `wip/687-before-author-correction`.
+
 Full all-targets and gate results will be recorded in the finish report.
 
 Signed: codex
