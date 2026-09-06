@@ -920,9 +920,9 @@ pub struct SetTokenRequest {
 /// `masked`/`source` are plain `Option<String>` — nothing at the type level
 /// stops a field from holding a raw token; a hand-built `TokenStatus`
 /// literal could put one there. The guarantee is narrower and lives one
-/// level down: the only production constructor,
-/// `token_store::token_status_of`, always builds `masked` from
-/// `mask_token()` and `source` from `TokenSource::label()`'s fixed
+/// level down: the only server production response-construction path that
+/// receives the resolved secret, `token_store::token_status_of`, builds
+/// `masked` from `mask_token()` and `source` from `TokenSource::label()`'s fixed
 /// `&'static str`s, and its host tests `serde_json::to_string` the real
 /// value and assert the actual secret substring is absent from the wire
 /// bytes, for all four resolution tiers — a constructor-and-wire-test

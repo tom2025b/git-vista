@@ -2,10 +2,10 @@
 //! for the GitHub token #582/#583/#586 already know how to use.
 //!
 //! Deliberately thin: every decision that matters — precedence, masking, what
-//! counts as blank, which tier a save targets — already lives in
-//! [`crate::token_store`], most of it host-tested there since #583. This file
-//! is only the HTTP plumbing: decode the body, call the store, map the
-//! outcome to a status code.
+//! counts as blank, which tier a save targets, and the bounded request policy
+//! for a locked keyring — lives in [`crate::token_store`]. This file is the
+//! HTTP plumbing and the async/synchronous boundary: keyring writes run on
+//! Tokio's blocking pool, never on a runtime worker (#692).
 //!
 //! Both routes are registered `full_routes`-only in `main.rs`, never on the
 //! LAN listener — ADR 0005's reasoning for every write/select/clone endpoint
@@ -13,33 +13,71 @@
 //! to learn whether the operator has configured a GitHub token, masked or
 //! not. See `route_authz.rs` for the explicit classification.
 
+use std::sync::Arc;
+
+use axum::extract::Extension;
 use axum::http::StatusCode;
 use axum::Json;
 
 use git_vista_protocol::{SetTokenRequest, TokenStatus};
 
-use crate::token_store::{store_token, token_status, StoreTokenError};
+use crate::token_store::{RequestTokenResolver, StoreTokenError};
 
-/// Whether a GitHub token is configured right now, and which tier answered —
-/// resolved fresh on every call through the same [`crate::token_store::resolve_token`]
-/// the credential helper itself uses, never a cached answer or a
-/// keyring-specific existence check. A settings surface that only checked
-/// "did my save happen" rather than "what is actually live" would tell the
-/// user their token is configured on the strength of a keyring entry an
-/// unrelated D-Bus outage has since made unreadable.
-pub(crate) async fn get_token_status() -> Json<TokenStatus> {
-    Json(token_status())
+/// Report token status under #692's bounded request policy. The keyring part
+/// is the masked startup/post-write snapshot; this call has no path to the
+/// synchronous keyring API. When that snapshot is absent, the environment
+/// and fallback file are still resolved lazily and live.
+pub(crate) async fn get_token_status(
+    Extension(resolver): Extension<Arc<RequestTokenResolver>>,
+) -> Json<TokenStatus> {
+    Json(resolver.status())
 }
 
-/// Save a token to the OS keyring (`POST /api/settings/token`). Returns the
-/// freshly-resolved status on success — the same shape a `GET` would return —
-/// so the client never has to guess whether its own optimistic update
-/// matches what the server actually persisted.
+/// Save a token to the OS keyring (`POST /api/settings/token`). The blocking
+/// platform call runs on Tokio's blocking pool. On success the response is
+/// constructed from the value just persisted and the masked request snapshot
+/// is updated; there is deliberately no immediate D-Bus read-back.
 pub(crate) async fn set_token(
+    Extension(resolver): Extension<Arc<RequestTokenResolver>>,
     Json(req): Json<SetTokenRequest>,
 ) -> Result<Json<TokenStatus>, (StatusCode, String)> {
-    store_token(&req.token).map_err(|e| store_error_response(&e))?;
-    Ok(Json(token_status()))
+    let status = store_on_blocking_pool(req.token, resolver, crate::token_store::store_token)
+        .await
+        .map_err(|error| match error {
+            BlockingStoreError::Store(error) => store_error_response(&error),
+            BlockingStoreError::Worker(reason) => {
+                eprintln!("git-vista: settings keyring worker failed: {reason}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Couldn't save to the OS keyring: the blocking worker failed.".to_string(),
+                )
+            }
+        })?;
+    Ok(Json(status))
+}
+
+enum BlockingStoreError {
+    Store(StoreTokenError),
+    Worker(String),
+}
+
+/// Isolated so a host test can prove the keyring write executes on a blocking
+/// thread rather than merely inspecting `set_token` for a `spawn_blocking`
+/// call.
+async fn store_on_blocking_pool<F>(
+    token: String,
+    resolver: Arc<RequestTokenResolver>,
+    store: F,
+) -> Result<TokenStatus, BlockingStoreError>
+where
+    F: FnOnce(&str) -> Result<(), StoreTokenError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        store(&token).map_err(BlockingStoreError::Store)?;
+        Ok(resolver.record_successful_store(&token))
+    })
+    .await
+    .map_err(|error| BlockingStoreError::Worker(error.to_string()))?
 }
 
 /// Pure: maps a [`StoreTokenError`] to the client-facing status and message.
@@ -89,5 +127,32 @@ mod tests {
         let (blank_status, _) = store_error_response(&StoreTokenError::Blank);
         let (keyring_status, _) = store_error_response(&StoreTokenError::Keyring("x".to_string()));
         assert_ne!(blank_status, keyring_status);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn keyring_store_work_runs_off_the_async_runtime_thread() {
+        let runtime_thread = std::thread::current().id();
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let observed_by_store = observed.clone();
+        let resolver = Arc::new(RequestTokenResolver::without_keyring());
+
+        let result = store_on_blocking_pool("saved-token".to_string(), resolver, move |_| {
+            *observed_by_store.lock().unwrap() = Some(std::thread::current().id());
+            Ok(())
+        })
+        .await;
+
+        assert!(matches!(
+            result,
+            Ok(TokenStatus {
+                configured: true,
+                ..
+            })
+        ));
+        assert_ne!(
+            *observed.lock().unwrap(),
+            Some(runtime_thread),
+            "the synchronous keyring writer ran on Tokio's runtime thread"
+        );
     }
 }

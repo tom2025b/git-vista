@@ -230,11 +230,20 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // #583 (M13.02): say which token-storage tier answered, masked, at boot —
-    // never only silently. Prints one ordinary line when nothing is
-    // configured; that is expected for a public repository and not a
-    // warning.
-    println!("{}", token_store::provenance_line());
+    // #583/#692: probe the keyring once for request-facing status, off the
+    // runtime worker and with a bounded wait, then say which tier answered at
+    // boot. Settings GETs retain only this probe's masked keyring status and
+    // never repeat a locked Secret Service interaction.
+    let token_store::StartupTokenPolicy {
+        request_resolver,
+        provenance_line,
+        warning,
+    } = token_store::initialize_request_token_policy().await;
+    println!("{provenance_line}");
+    if let Some(warning) = warning {
+        eprintln!("warning: {warning}");
+    }
+    let request_token_resolver = Arc::new(request_resolver);
 
     // Resolve which repo to serve: first CLI arg, else the default checkout.
     // Canonicalise so relative paths (e.g. `.`) and the banner are absolute; if
@@ -404,6 +413,7 @@ async fn main() {
         HostPolicy::loopback(PORT),
         true,
         history_codec.clone(),
+        request_token_resolver.clone(),
     );
 
     print_startup_banner(&bootstrap_token_path(), lan_addr);
@@ -423,6 +433,7 @@ async fn main() {
                 HostPolicy::lan(lan_ip, PORT),
                 false,
                 history_codec.clone(),
+                request_token_resolver.clone(),
             );
             let loopback_serve = axum::serve(
                 listener,
@@ -463,6 +474,7 @@ fn api_router(
     hosts: HostPolicy,
     full_routes: bool,
     codec: Arc<CursorCodec>,
+    request_token_resolver: Arc<token_store::RequestTokenResolver>,
 ) -> Router {
     // #589: declare the profile from the exact boolean that selects the route
     // table below.  It is not reconstructed from Host, peer address, or
@@ -849,6 +861,10 @@ fn api_router(
         // and passed into both listener builds — never a fresh codec per
         // router — so a cursor minted on one listener decodes on the other.
         .layer(Extension(codec))
+        // #692: the process-lifetime masked keyring snapshot used only by
+        // Settings. The LAN router never registers those routes, but sharing
+        // this object across both builds keeps listener state unambiguous.
+        .layer(Extension(request_token_resolver))
         // The session store the session handlers (and the auth layer) resolve
         // against. Erases the router's state type back to `()`.
         .with_state(session_state)
@@ -875,6 +891,7 @@ fn build_app(
     hosts: HostPolicy,
     full_routes: bool,
     codec: Arc<CursorCodec>,
+    request_token_resolver: Arc<token_store::RequestTokenResolver>,
 ) -> Router {
     let listener_profile = ListenerProfile::from_write_routes(full_routes);
     // Serve the SPA bundle with `Cache-Control: no-cache` so the browser always
@@ -889,7 +906,13 @@ fn build_app(
     .layer(ServeDir::new(DIST_DIR).append_index_html_on_directories(true));
 
     Router::new()
-        .merge(api_router(session_state, hosts, full_routes, codec))
+        .merge(api_router(
+            session_state,
+            hosts,
+            full_routes,
+            codec,
+            request_token_resolver,
+        ))
         // Anything that isn't the API is served from the built SPA bundle.
         .fallback_service(spa)
         // Global backstop for the static SPA / fallback. The `/api` space has its
@@ -975,6 +998,10 @@ mod tests {
         ListenerProfile, SessionInfo, LISTENER_PROFILE_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION,
     };
     use tower::ServiceExt;
+
+    fn test_request_token_resolver() -> Arc<token_store::RequestTokenResolver> {
+        Arc::new(token_store::RequestTokenResolver::without_keyring())
+    }
 
     /// Establish a session against `router` (whichever host it expects) and
     /// return just the `Cookie` header value. Only exercises the session
@@ -1074,6 +1101,7 @@ mod tests {
                 },
                 full_routes,
                 Arc::new(CursorCodec::new()),
+                test_request_token_resolver(),
             );
             let resp = app
                 .oneshot(
@@ -1121,6 +1149,7 @@ mod tests {
             HostPolicy::lan("192.168.1.42".parse().unwrap(), PORT),
             false,
             Arc::new(CursorCodec::new()),
+            test_request_token_resolver(),
         );
         assert_eq!(
             declared_profile(router.clone(), "192.168.1.42:8080").await,
@@ -1171,6 +1200,7 @@ mod tests {
             HostPolicy::loopback(PORT),
             true,
             Arc::new(CursorCodec::new()),
+            test_request_token_resolver(),
         );
         assert_eq!(
             declared_profile(router.clone(), "localhost:8080").await,
@@ -1218,6 +1248,7 @@ mod tests {
             HostPolicy::loopback(PORT),
             true,
             Arc::new(CursorCodec::new()),
+            test_request_token_resolver(),
         );
         let request = |cookie: Option<String>| {
             let mut req = Request::builder()
@@ -1275,6 +1306,7 @@ mod tests {
             HostPolicy::loopback(PORT),
             true,
             Arc::new(CursorCodec::new()),
+            test_request_token_resolver(),
         );
         let cookie = bootstrap_cookie(router.clone(), "localhost:8080", &token).await;
         let resp = router
