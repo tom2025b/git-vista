@@ -36,6 +36,9 @@ pub struct RefsAt {
     /// the commit alone, so it cannot say *which branch* HEAD was on — the
     /// one fact a "watch the HEAD move" replay is made of.
     pub head: HeadAtEvent,
+    /// The same short symbolic name as [`read_head_branch`], from this open.
+    /// Kept separately so callers need not reproduce gix's shortening rules.
+    pub head_branch: Option<String>,
 }
 
 /// Read [`RefsAt`]: the badge refs and HEAD's state together, from one open.
@@ -79,6 +82,11 @@ pub fn read_refs_at(path: &Path) -> Result<RefsAt, RepoError> {
     // The two questions gix answers separately: the symbolic name HEAD holds,
     // and the commit it resolves to.
     let head_name = repo.head_name();
+    let head_branch = head_name
+        .as_ref()
+        .ok()
+        .and_then(|name| name.as_ref())
+        .map(|name| name.shorten().to_string());
     let resolved = repo.head_id().ok().map(|id| id.detach().to_string());
 
     // HEAD first, so it's the leading badge on its commit — and badged from the
@@ -156,7 +164,11 @@ pub fn read_refs_at(path: &Path) -> Result<RefsAt, RepoError> {
         }
     }
 
-    Ok(RefsAt { refs, head })
+    Ok(RefsAt {
+        refs,
+        head,
+        head_branch,
+    })
 }
 
 /// Everything a paged-history snapshot needs, read from **one** opened
