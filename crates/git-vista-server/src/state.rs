@@ -118,16 +118,13 @@ pub(crate) fn expose_paths() -> bool {
 /// HTTPS operation (M13.01, #582) — `None` when there is nothing to offer,
 /// which every existing caller already treats as "behave exactly as before".
 ///
-/// # This is a placeholder, on purpose, and it is meant to be replaced
-///
-/// #583 (M13.02) is the actual token-storage design — a keyring first, this
-/// environment variable second, a gitignored file last. This function
-/// implements only the **second** tier, early, because #582 needs a real
-/// production call site to prove the credential-helper mechanism works at
-/// all, not a mock. When #583 lands, this function's body becomes the `env`
-/// arm of that store's fallback chain; every caller of `credential_token()`
-/// stays unchanged; that is the whole point of the one-token-in, `Option`-out
-/// shape below rather than exposing anything about *how* the token was found.
+/// #583 (M13.02) implemented the real token-storage design in
+/// [`crate::token_store`] — a keyring first, an environment variable second,
+/// a gitignored file last, with each tier's provenance available via
+/// [`crate::token_store::resolve_token`]. This function stays the thin,
+/// provenance-discarding shape every existing caller already expects, per
+/// the plan the M13.01 placeholder wrote down: no caller of
+/// `credential_token()` changed when #583 landed.
 ///
 /// Never logged, never `eprintln!`ed, never included in any `Display` this
 /// crate writes — the whole design (`sandbox::network_exec::network_command_with_credential`)
@@ -136,9 +133,20 @@ pub(crate) fn expose_paths() -> bool {
 /// something no HTTP client in this codebase constructs directly (see ADR
 /// 0122, #587).
 pub(crate) fn credential_token() -> Option<String> {
-    std::env::var("GIT_VISTA_GITHUB_TOKEN")
-        .ok()
-        .filter(|t| !t.trim().is_empty())
+    crate::token_store::resolve_token().map(|(token, _source)| token)
+}
+
+/// Where the token-storage tier-3 fallback file lives (#583, M13.02):
+/// `state_dir()/github-token`, `0600`, next to the bootstrap token and the
+/// sandbox trust markers. Documented here, not only in code, because #583's
+/// acceptance requires the path be written down: set this file's contents to
+/// a GitHub token to use it when neither the OS keyring nor
+/// `GIT_VISTA_GITHUB_TOKEN`/`GH_TOKEN` has one. Never a tracked file — see
+/// the `/.state/` entry `.gitignore` picked up in the same commit that added
+/// this function, covering the one place `state_dir()` can resolve inside a
+/// worktree (`./dev testbed`'s isolated `XDG_STATE_HOME`).
+pub(crate) fn token_file_path() -> PathBuf {
+    state_dir().join("github-token")
 }
 
 /// A short, non-path label for `path` — its directory base name — unless the
