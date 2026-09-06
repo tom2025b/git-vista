@@ -4469,3 +4469,10 @@ mod worktree_add_suite;
 // rather than a second time at the spawn site.
 #[cfg(test)]
 mod export_argv_suite;
+
+// #661: a component breakdown of one reconciliation sweep's read path —
+// which of `live_reading`'s six reads costs what. Temporary, same
+// `#[ignore]`d-measurement convention as `reconciliation::suite`'s sibling;
+// delete once #661 is closed.
+#[cfg(test)]
+mod sweep_component_measure;

@@ -1498,6 +1498,7 @@ dependencies = [
  "git-vista-fixtures",
  "git-vista-git",
  "git-vista-protocol",
+ "gix",
  "hmac 0.12.1",
  "http-body",
  "http-body-util",
