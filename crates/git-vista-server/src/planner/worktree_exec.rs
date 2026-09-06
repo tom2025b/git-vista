@@ -19,8 +19,6 @@
 //! containment check, so the parent owns them rather than one sibling
 //! importing safety gates from another.
 
-use crate::planner::RunFailure;
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -38,6 +36,7 @@ use crate::sandbox::NetworkNeed;
 use super::{
     classify_path_states, couldnt_run, journal_app_event, journal_clear_blocking, read_seed,
     run_git, run_git_argv, stderr_or, symlink_containment_guard, verify_path_states, Obs, PathKind,
+    RunFailure,
 };
 
 /// Reset a *test repo* to its recorded seed (`/api/reset-test-repo`): move

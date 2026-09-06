@@ -26,8 +26,6 @@
 //! pins that over the whole input space, the tag-shaped twin of
 //! `push::no_push_argv_can_carry_a_bare_force`.
 
-use crate::planner::RunFailure;
-
 use axum::http::StatusCode;
 
 use git_vista_protocol::{plan_export, RemoteName, TagName};

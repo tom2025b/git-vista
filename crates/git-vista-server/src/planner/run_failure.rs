@@ -36,7 +36,7 @@ impl RunFailure {
             Self::Spawn => "Couldn't run git. Check the server log for details.",
             Self::ResolveCommit => "Couldn't run git: the requested commit could not be resolved.",
             Self::VerifyPlan => "Couldn't run git: the repository's state could not be read, so this plan cannot be re-verified before executing.",
-            Self::VerifyBranchHolder => "Couldn't run git: could not check whether another worktree has this branch checked out, so this plan cannot be verified.",
+            Self::VerifyBranchHolder => "Couldn't run git: couldn't check whether another worktree has this branch checked out, so this plan cannot be verified.",
             Self::VerifyRef => "Couldn't run git: the reference could not be checked, so this plan cannot be verified.",
             Self::VerifyCleanWorktree => "Couldn't run git status, so the working tree cannot be verified.",
             Self::ReadStatus => "Couldn't run git status. Check the server log for details.",

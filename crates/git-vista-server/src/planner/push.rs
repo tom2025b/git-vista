@@ -54,8 +54,6 @@
 //! the D5 posture applied to the one place where the thing being observed is not
 //! on this host.
 
-use crate::planner::RunFailure;
-
 use axum::http::StatusCode;
 
 use git_vista_protocol::plan_export;

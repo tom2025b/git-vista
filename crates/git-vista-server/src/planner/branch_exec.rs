@@ -18,8 +18,6 @@
 //! for sentences of its own, so the parent owns it rather than one sibling
 //! importing prose helpers from another.
 
-use crate::planner::RunFailure;
-
 use std::path::Path;
 
 use axum::http::StatusCode;
@@ -36,7 +34,7 @@ use crate::sandbox::NetworkNeed;
 use super::{
     couldnt_run, git_argv, journal_app_event, read_head_branch_blocking,
     remove_from_snapshot_blocking, run_git_argv, short, stderr_or, stderr_stdout_or, strategy_word,
-    worktree_dirty, Obs, Observed,
+    worktree_dirty, Obs, Observed, RunFailure,
 };
 
 /// `git branch <name> <at>` (`/api/branch`). B3 posture: git validates the

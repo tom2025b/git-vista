@@ -15,8 +15,6 @@
 //! animal — they park in MERGE_HEAD/rebase state, not the sequencer — and
 //! stay with [`super::branch_exec`].
 
-use crate::planner::RunFailure;
-
 use std::path::Path;
 
 use axum::http::StatusCode;
@@ -31,7 +29,7 @@ use crate::sandbox::NetworkNeed;
 
 use super::{
     couldnt_run, git_argv, journal_app_event, read_head_branch_blocking, run_git_argv, short,
-    stderr_or, Obs, Observed,
+    stderr_or, Obs, Observed, RunFailure,
 };
 
 /// Which way a sequence is being driven (M4.28, #81).

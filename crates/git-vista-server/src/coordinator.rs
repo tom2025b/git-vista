@@ -20,8 +20,6 @@
 //! [`refuse_if_git_busy`] for how that is detected instead, and ADR 0019 for
 //! why detection rather than exclusion is the honest posture.
 
-use crate::planner::RunFailure;
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -29,6 +27,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use axum::http::StatusCode;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
+use crate::planner::RunFailure;
 use git_vista_core::identity::RepositoryId;
 
 /// One async guard per shared repository, created on first use.

@@ -13,8 +13,6 @@
 //! other executor leans on. `hunk_staging_suite` drives
 //! [`exec_stage_selection`] directly.
 
-use crate::planner::RunFailure;
-
 use std::path::Path;
 
 use axum::http::StatusCode;
@@ -23,7 +21,7 @@ use crate::sandbox::NetworkNeed;
 
 use git_vista_protocol::plan_export;
 
-use super::{couldnt_run, run_git, run_git_argv, stderr_or};
+use super::{couldnt_run, run_git, run_git_argv, stderr_or, RunFailure};
 
 /// `git add -A` (`/api/stage`).
 pub(super) async fn exec_stage_all(repo: &Path, need: NetworkNeed) -> (StatusCode, String) {

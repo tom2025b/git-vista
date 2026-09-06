@@ -19,8 +19,6 @@
 //!
 //! [`stash_entry_still_at`] is it. Everything else is argv construction.
 
-use crate::planner::RunFailure;
-
 use std::path::Path;
 
 use axum::http::StatusCode;
@@ -31,7 +29,7 @@ use git_vista_core::activity::ActivityKind;
 
 use crate::sandbox::NetworkNeed;
 
-use super::{couldnt_run, journal_app_event, run_git, run_git_argv, stderr_or, Obs};
+use super::{couldnt_run, journal_app_event, run_git, run_git_argv, stderr_or, Obs, RunFailure};
 
 /// Resolve a stash selector to the oid it names **right now**, and refuse
 /// unless that matches what the plan was built against (M3.24, #77).

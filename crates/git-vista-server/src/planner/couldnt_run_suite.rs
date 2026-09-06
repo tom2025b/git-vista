@@ -147,7 +147,7 @@ fn the_helper_and_closed_reason_vocabulary_are_pinned() {
     );
     assert_eq!(
         normalise(include_str!("run_failure.rs")),
-        include_str!("fixtures/couldnt_run_reasons.txt").trim(),
+        normalise(include_str!("fixtures/couldnt_run_reasons.txt")),
         "Review every reason: fixed client-safe text, no arbitrary payload or raw escape hatch."
     );
 }
@@ -215,5 +215,25 @@ fn every_caller_is_censused_with_its_reason_and_unmodified_detail() {
         calls.join("\n"),
         include_str!("fixtures/couldnt_run_calls.txt").trim(),
         "A caller changed or was added. Review its reason, preserve the full diagnostic, then update this census deliberately."
+    );
+}
+
+/// The census must discover caller 53 in a newly added nested module, not
+/// merely keep counting the files already present when this fix was written.
+#[test]
+fn the_census_discovers_a_caller_in_a_new_module() {
+    let dir = tempfile::tempdir().unwrap();
+    let nested = dir.path().join("future");
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::write(
+        nested.join("operation.rs"),
+        r#"fn future() { crate::planner::couldnt_run("future", RunFailure::Spawn, &error) }"#,
+    )
+    .unwrap();
+    let mut calls = Vec::new();
+    collect_calls(dir.path(), dir.path(), &mut calls);
+    assert_eq!(
+        calls,
+        [r#"future/operation.rs: couldnt_run("future", RunFailure::Spawn, &error)"#]
     );
 }

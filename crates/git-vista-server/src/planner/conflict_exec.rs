@@ -14,8 +14,6 @@
 //! the discard/delete executors in [`super::worktree_exec`] guard with it
 //! too.
 
-use crate::planner::RunFailure;
-
 use std::path::Path;
 
 use axum::http::StatusCode;
@@ -26,7 +24,7 @@ use git_vista_protocol::{
 
 use crate::sandbox::NetworkNeed;
 
-use super::{couldnt_run, run_git, run_git_argv, stderr_or, symlink_containment_guard};
+use super::{couldnt_run, run_git, run_git_argv, stderr_or, symlink_containment_guard, RunFailure};
 
 /// Resolve one conflicted path by taking a whole side, or by deleting it
 /// (M4.31, #84).

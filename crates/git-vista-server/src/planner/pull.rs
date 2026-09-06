@@ -53,8 +53,6 @@
 //! is gettext-translated). The half that must not be a guess — "is the working
 //! tree usable?" — is the observed half.
 
-use crate::planner::RunFailure;
-
 use axum::http::StatusCode;
 
 use git_vista_protocol::{

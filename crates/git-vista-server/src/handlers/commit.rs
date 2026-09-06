@@ -9,8 +9,6 @@
 //! [`planner::plan_and_execute`]; the git execution and journaling live in the
 //! planner's executor.
 
-use crate::planner::RunFailure;
-
 use axum::http::StatusCode;
 use axum::Json;
 
@@ -21,6 +19,7 @@ use git_vista_protocol::{
 
 use crate::git_cmd::rev_parse;
 use crate::planner;
+use crate::planner::RunFailure;
 use crate::state::reject_if_read_only;
 
 /// Create a commit in the served repository (Issue #33).

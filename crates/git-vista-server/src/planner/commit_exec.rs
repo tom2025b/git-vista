@@ -21,8 +21,6 @@
 //! not commit vocabulary, and `hook_timeout_suite` reaches the override
 //! through `planner`'s own namespace.
 
-use crate::planner::RunFailure;
-
 use std::path::{Path, PathBuf};
 
 use axum::http::StatusCode;
@@ -39,7 +37,7 @@ use crate::sandbox::NetworkNeed;
 
 use super::{
     couldnt_run, hooked_git_timeout, journal_app_event, read_head_branch_blocking, run_git,
-    run_git_hooked, short, stderr_or, stderr_stdout_or, Obs, Observed,
+    run_git_hooked, short, stderr_or, stderr_stdout_or, Obs, Observed, RunFailure,
 };
 
 /// What the bounded post-kill `rev-parse HEAD` read — performed by both

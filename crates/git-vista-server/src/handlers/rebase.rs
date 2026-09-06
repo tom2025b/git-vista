@@ -3,8 +3,6 @@
 //! the menu whether a rebase would do anything right now. Both resolve the base
 //! (`origin/main` if present, else `main`) through the shared [`rebase_base`].
 
-use crate::planner::RunFailure;
-
 use std::path::Path;
 
 use axum::http::{header, HeaderValue, StatusCode};
@@ -15,6 +13,7 @@ use git_vista_protocol::{BranchName, GitOperation, RebaseStatus, RefName};
 
 use crate::git_cmd::{git_ref_exists, is_ancestor, rev_parse, ExecUnavailable};
 use crate::planner;
+use crate::planner::RunFailure;
 use crate::state::{current, reject_if_read_only};
 
 /// Rebase the checked-out branch onto main (Issue #33 follow-up): `git rebase

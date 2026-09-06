@@ -15,8 +15,6 @@
 //! single writer makes that invariant easy to hold (which is why `undoables`
 //! reads the same sources but leaves the snapshot alone).
 
-use crate::planner::RunFailure;
-
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -40,7 +38,7 @@ use git_vista_protocol::{ActivityPage, BranchName, CommitOid, GenerationToken, G
 use crate::git_cmd;
 use crate::history::{CursorCodec, CursorScope};
 use crate::journal;
-
+use crate::planner::RunFailure;
 /// How many events one page returns by default, and at most. `MAX_PAGE_LIMIT`
 /// bounds one response, never the folded feed: older events remain reachable
 /// through the response cursor.

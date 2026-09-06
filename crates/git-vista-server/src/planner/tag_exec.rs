@@ -23,8 +23,6 @@
 //! bounded primitive. Renaming either item, or moving one of them out of
 //! this file, moves that test's anchors — keep them together here.
 
-use crate::planner::RunFailure;
-
 use std::path::Path;
 use std::process::Output;
 
@@ -40,7 +38,7 @@ use crate::sandbox::NetworkNeed;
 
 use super::{
     couldnt_run, journal_app_event, rev_parse_ref_unpeeled, run_git, run_git_argv, short,
-    stderr_or, Obs, Observed,
+    stderr_or, Obs, Observed, RunFailure,
 };
 
 // `create_tag_argv` moved to `git_vista_protocol::plan_export` with M10

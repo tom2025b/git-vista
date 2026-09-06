@@ -1,6 +1,6 @@
 # ADR 0127 — An unavailable execution carries a reason, not an error string
 
-- **Status:** Implemented; validation in progress
+- **Status:** Accepted — implemented, mutation-proved two ways failing at disjoint assertions
 - **Date:** 2026-09-06
 - **Issue:** #666
 - **Extends:** [ADR 0119](0119-a-guarantee-that-holds-only-on-the-success-arm-is-not-a-guarantee.md)
@@ -80,7 +80,9 @@ as the original detail rather than preserving the old unstructured body.
 
 `planner::couldnt_run_suite` invokes the real helper in isolated subprocesses
 with the real environment flag. No test mutates the parent test process's
-shared environment. It checks path-bearing `io::Error` text, a path-bearing
+shared environment. The spawn-boundary census admits exactly one test-only
+self-spawn with its program pinned to `current_exe()`; this is not a general
+launcher exemption and no production spawn permission changes. It checks path-bearing `io::Error` text, a path-bearing
 endpoint, every false spelling, opt-in disclosure, unchanged HTTP status,
 complete unconditional logs, and useful pre/post-execution explanations.
 
@@ -90,11 +92,28 @@ modules and pins all 52 calls with their reason and detail. There is no
 hand-maintained list of source files; changes to the boundary, vocabulary or
 callers become explicit review diffs.
 
-Two `failure-atlas.mutation_check` experiments will run against committed
-HEAD: one restores unconditional raw-detail disclosure, the other replaces
-the default safe sentence with `Error`. Each targets a different behavioral
-assertion rather than claiming proof from the source pins alone. Run records
-will be added after validation.
+Two `failure-atlas.mutation_check` experiments ran against committed HEAD
+`1f0eebfe`, with clean source trees and green baselines. Both compiled and
+were caught by behavioral assertions, without relying on the source pins:
+
+- **Leak, record 352**, run key `gv-666-couldnt-run-leak`: replace the helper's
+  `withheld_detail` call with unconditional reason/detail formatting.
+  `path_bearing_errors_are_withheld_for_every_off_spelling` fails because the
+  client body contains `/home/operator/private-repo/.git/config`.
+- **Over-redaction, record 353**, run key `gv-666-couldnt-run-overredact`:
+  replace the `Spawn` sentence with `Error`.
+  `withholding_preserves_the_failure_stage_and_a_useful_next_step` fails on
+  exact equality: `Error` instead of the explanation and server-log advice.
+
+These are different faults at different assertions: leaking a path versus
+withholding the useful sentence. The latter would pass a path-absence test.
+The atlas stores both baselines, mutated transcripts and diffs as content.
+
+The full server suite exposed two existing collision assertions spelling
+“couldn't check”; the fixed reason preserves that wording, leaving those
+behavioral assertions unchanged. The spawn-boundary census also required
+reviewing and recording the new test-only self-spawn. A separate positive
+census test proves discovery of caller 53 in a newly created nested module.
 
 ## Scope and follow-up
 

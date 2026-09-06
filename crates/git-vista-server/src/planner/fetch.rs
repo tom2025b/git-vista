@@ -35,8 +35,6 @@
 //! typed operation would be a flag the plan's reviewer never sees and the
 //! plan's hash never binds.
 
-use crate::planner::RunFailure;
-
 use axum::http::StatusCode;
 
 use git_vista_protocol::{
