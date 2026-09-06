@@ -224,7 +224,7 @@ pub(super) async fn exec_push_tag(
     .await;
     let run = match run {
         Ok(run) => run,
-        Err(e) => return couldnt_run(PUSH_ENDPOINT, &e),
+        Err(e) => return couldnt_run(PUSH_ENDPOINT, RunFailure::Spawn, &e),
     };
 
     if run.cancelled {
@@ -331,7 +331,7 @@ pub(super) async fn exec_delete_remote_tag(
     .await;
     let run = match run {
         Ok(run) => run,
-        Err(e) => return couldnt_run(DELETE_ENDPOINT, &e),
+        Err(e) => return couldnt_run(DELETE_ENDPOINT, RunFailure::Spawn, &e),
     };
 
     if run.cancelled {

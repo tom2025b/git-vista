@@ -1054,6 +1054,7 @@ pub fn App() -> impl IntoView {
                 dialogs_guard,
                 graph,
                 mode_for,
+                shell,
             )}
             // The "Reset Test Repo" confirmation (only reachable via the gated
             // topbar button above).
@@ -1063,7 +1064,7 @@ pub fn App() -> impl IntoView {
             // The repo picker + mode screens (ADR 0006): blocking overlays under
             // the sign-in/protocol screens, over everything else.
             {crate::picker::picker_view(picker_open, mode_for, open_url, clone_url, dialogs_guard, graph)}
-            {crate::picker::mode_view(mode_for, picker_open, graph)}
+            {crate::picker::mode_view(mode_for, picker_open, graph, shell)}
             {move || {
                 (shell.detail_id().is_some() && sheet.placement().is_sheet()).then(|| view! {
                     <div

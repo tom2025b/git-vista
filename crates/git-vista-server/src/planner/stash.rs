@@ -29,7 +29,7 @@ use git_vista_core::activity::ActivityKind;
 
 use crate::sandbox::NetworkNeed;
 
-use super::{couldnt_run, journal_app_event, run_git, run_git_argv, stderr_or, Obs};
+use super::{couldnt_run, journal_app_event, run_git, run_git_argv, stderr_or, Obs, RunFailure};
 
 /// Resolve a stash selector to the oid it names **right now**, and refuse
 /// unless that matches what the plan was built against (M3.24, #77).
@@ -70,7 +70,7 @@ pub(super) async fn stash_entry_still_at(
     .await
     {
         Ok(o) => o,
-        Err(e) => return Err(couldnt_run(endpoint, &e)),
+        Err(e) => return Err(couldnt_run(endpoint, RunFailure::Spawn, &e)),
     };
     if !output.status.success() {
         // git's documented "this ref does not resolve" is exit 1 with nothing
@@ -121,7 +121,7 @@ pub(super) async fn exec_push_stash(
     let args = plan_export::push_stash_argv(message, keep_index, include_untracked);
     let output = match run_git_argv(repo, need, &args).await {
         Ok(o) => o,
-        Err(e) => return couldnt_run("/api/stash/push", &e),
+        Err(e) => return couldnt_run("/api/stash/push", RunFailure::Spawn, &e),
     };
     if !output.status.success() {
         let msg = stderr_or(&output, "git stash push failed.");
@@ -401,7 +401,7 @@ pub(super) async fn exec_apply_stash(
     }
     let output = match run_git_argv(repo, need, &plan_export::apply_stash_argv(entry)).await {
         Ok(o) => o,
-        Err(e) => return couldnt_run("/api/stash/apply", &e),
+        Err(e) => return couldnt_run("/api/stash/apply", RunFailure::Spawn, &e),
     };
 
     // Asked on BOTH outcomes, not only on failure — see the doc comment above
@@ -484,7 +484,7 @@ pub(super) async fn exec_branch_from_stash(
     .await
     {
         Ok(o) => o,
-        Err(e) => return couldnt_run("/api/stash/branch", &e),
+        Err(e) => return couldnt_run("/api/stash/branch", RunFailure::Spawn, &e),
     };
 
     let continuation = crate::conflicts::continuation(repo).await;
@@ -594,7 +594,7 @@ pub(super) async fn exec_drop_stash(
     }
     let output = match run_git_argv(repo, need, &plan_export::drop_stash_argv(entry)).await {
         Ok(o) => o,
-        Err(e) => return couldnt_run("/api/stash/drop", &e),
+        Err(e) => return couldnt_run("/api/stash/drop", RunFailure::Spawn, &e),
     };
     if !output.status.success() {
         let msg = stderr_or(&output, "git stash drop failed.");

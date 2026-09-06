@@ -266,10 +266,11 @@ pub(super) async fn exec_pull(
 
     // --- half one: the fetch ------------------------------------------------
     let updated = match super::fetch::run_fetch(repo, need, remote, ENDPOINT).await {
-        FetchStep::CouldNotRun { why } => return couldnt_run(ENDPOINT, &why),
+        FetchStep::CouldNotRun { why } => return couldnt_run(ENDPOINT, RunFailure::Spawn, &why),
         FetchStep::Unobservable { why } => {
             return couldnt_run(
                 ENDPOINT,
+                RunFailure::PullFetchUnobserved,
                 &format!(
                     "the pull's fetch ran but refs/remotes/{} could not be re-read, so \
                      there is no state to integrate from: {why}",
@@ -340,6 +341,7 @@ pub(super) async fn exec_pull(
         Obs::Unknown => {
             return couldnt_run(
                 ENDPOINT,
+                RunFailure::ReadFetchedTip,
                 &format!("the fetch succeeded but {tracking} could not be read"),
             )
         }
@@ -358,6 +360,7 @@ pub(super) async fn exec_pull(
         // answer. Refuse rather than integrate and then guess.
         return couldnt_run(
             ENDPOINT,
+            RunFailure::ReadPullHead,
             "the checked-out branch's tip could not be read, so a pull's effect on it \
              could not be reported",
         );
@@ -412,6 +415,7 @@ pub(super) async fn exec_pull(
     if head_after.is_unknown() {
         return couldnt_run(
             ENDPOINT,
+            RunFailure::PullUnobserved,
             "the integration reported success but the checked-out branch's tip could \
              not be re-read, so what the pull did to it is unknown",
         );
