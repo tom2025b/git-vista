@@ -899,6 +899,48 @@ pub struct SelectRequest {
     pub mode: RepoMode,
 }
 
+/// Body of `POST /api/settings/token` (M13.03, #584): set the GitHub token
+/// the credential helper offers for HTTPS operations against private
+/// repositories. Persists via #583's OS-keyring tier — the highest in
+/// `token_store::resolve_token`'s precedence — so a value saved here is what
+/// every subsequent resolution finds first, without touching the
+/// environment-variable or file tiers #583 also supports for headless use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetTokenRequest {
+    pub token: String,
+}
+
+/// Response of `GET` and `POST /api/settings/token` (M13.03, #584): whether a
+/// token is configured, and if so, which tier answered and its last 4
+/// characters — never the value itself. This is the wire shape #584's
+/// "never returned by any read endpoint" acceptance criterion is checked
+/// against.
+///
+/// `masked`/`source` are plain `Option<String>` — nothing at the type level
+/// stops a field from holding a raw token; a hand-built `TokenStatus`
+/// literal could put one there. The guarantee is narrower and lives one
+/// level down: the only production constructor,
+/// `token_store::token_status_of`, always builds `masked` from
+/// `mask_token()` and `source` from `TokenSource::label()`'s fixed
+/// `&'static str`s, and its host tests `serde_json::to_string` the real
+/// value and assert the actual secret substring is absent from the wire
+/// bytes, for all four resolution tiers — a constructor-and-wire-test
+/// guarantee, not a type-level seal. A future version wanting the stronger
+/// claim would need a newtype with a private inner rather than this struct.
+///
+/// `configured` is kept alongside `masked`/`source` rather than derived from
+/// them so a client only needs the one field for its primary yes/no
+/// question — a future version could in principle drop the other two and
+/// this would still answer it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenStatus {
+    pub configured: bool,
+    pub masked: Option<String>,
+    pub source: Option<String>,
+}
+
 /// Body of `POST /api/select-worktree` (M11.03, #548): switch to a linked
 /// worktree of the **currently served repository**, addressed by the opaque id
 /// the worktree census reports for it.

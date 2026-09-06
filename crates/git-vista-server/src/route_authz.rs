@@ -128,6 +128,16 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     // same as every other mutation here.
     ("/api/remove-worktree", Method::POST, Authz::SessionAndCsrf),
     ("/api/rescan", Method::POST, Authz::SessionAndCsrf),
+    // M13.03 (#584): reading whether a token is configured (masked) is still
+    // an operator-configuration fact, not a repository read — a live
+    // session is required, same posture as every other `full_routes`-only
+    // GET here (`/api/clone-status`, `/api/worktrees`), never
+    // `Unauthenticated`.
+    ("/api/settings/token", Method::GET, Authz::SessionRequired),
+    // Setting the token is a write in the fullest sense this app has: it
+    // changes what credential every future HTTPS operation authenticates
+    // with. Full write posture, no narrower than `/api/rescan` beside it.
+    ("/api/settings/token", Method::POST, Authz::SessionAndCsrf),
     ("/api/branch", Method::POST, Authz::SessionAndCsrf),
     ("/api/commit", Method::POST, Authz::SessionAndCsrf),
     // M2.19b (#223): amend rewrites the tip commit — a Destructive git write,
@@ -367,7 +377,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// this constant and its test are for. Derived by running
 /// `every_registered_route_is_classified`, never copied from either side of a
 /// merge.
-const EXPECTED_ROUTE_COUNT: usize = 79;
+const EXPECTED_ROUTE_COUNT: usize = 81;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in

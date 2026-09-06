@@ -2792,6 +2792,12 @@ fn every_git_write_route_reaches_the_planner() {
             "handlers::worktrees::remove_worktree",
         ),
         ("/api/rescan", "rescan"),
+        // M13.03 (#584): save the GitHub token. A **credential write, not a
+        // git write** — it calls `keyring::Entry::set_password` and touches
+        // no repository, constructs no argv, and mints no plan. Classified
+        // here rather than allowed to slip past the tally, the same as
+        // `/api/select-worktree`'s catalog write above.
+        ("/api/settings/token", "handlers::settings::set_token"),
         ("/api/branch", "create_branch"),
         ("/api/commit", "create_commit"),
         // M2.19b (#223): amend — a git write, funnel row below.

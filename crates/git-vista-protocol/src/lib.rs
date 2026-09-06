@@ -123,9 +123,9 @@ pub use dto::{
     PullError, PullFailureKind, PullRequest, PullSuccess, PushRequest, PushStashRequest,
     PushTagRequest, RebaseStatus, RemoteRefUpdate, RemoveWorktreeRequest, RepoMode,
     RepositoryDescriptor, RepositoryKind, ResolveConflictContentRequest, ResolveConflictRequest,
-    SelectRequest, SelectWorktreeRequest, SessionInfo, SessionRequest, SignTagError,
-    SignTagFailureKind, SignatureStatus, StashEntry, StashTarget, TagDetail, TagKind,
-    WorktreePathsRequest, CLONE_IN_PROGRESS_SENTINEL,
+    SelectRequest, SelectWorktreeRequest, SessionInfo, SessionRequest, SetTokenRequest,
+    SignTagError, SignTagFailureKind, SignatureStatus, StashEntry, StashTarget, TagDetail, TagKind,
+    TokenStatus, WorktreePathsRequest, CLONE_IN_PROGRESS_SENTINEL,
 };
 pub use effects::{network_need_for_operation, IndexEffect, NetworkNeed, WorktreeEffect};
 pub use error::{ApiError, ApiErrorBody, ErrorCode, RequestId};

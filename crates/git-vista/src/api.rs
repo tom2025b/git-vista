@@ -41,6 +41,7 @@ mod preview;
 mod remotes;
 mod repositories;
 mod session;
+mod settings;
 mod staging;
 mod stash;
 mod status;
@@ -73,6 +74,7 @@ pub use repositories::{
     select_worktree_request,
 };
 pub use session::{fetch_protocol, get_session, post_session};
+pub use settings::{set_token_request, token_status_request};
 pub use staging::{
     stage_request, staging_apply_request, staging_diff_request, staging_preview_request,
     unstage_request,

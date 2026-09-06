@@ -58,6 +58,10 @@ pub mod preview;
 // staleness check `viewer.rs`'s body match already makes, not a new signal.
 pub mod readiness;
 pub mod session;
+// M13.03 (#584): the settings surface's decisions (status line, save-button
+// gating) — host-tested here; the dialog view is the wasm-only shell around
+// them.
+pub mod settings;
 pub mod shell;
 pub mod status;
 // M3.24 (#77): the stash drawer — rows, action offers, push preview,
