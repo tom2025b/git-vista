@@ -47,3 +47,11 @@ state it already obtained during the ref walk, so that second repository open
 is gone. The ref walk remains the dominant cost: `gix::open_opts` alone was
 2.81 ms median in the baseline sample versus 82.20 ms median for the full
 `refs_reading` call.
+
+Failure-atlas mutation proofs are recorded for both correctness seams. Record
+371 replaced the feed's branch payload with an empty string and was **caught**
+by `live_reading_keeps_a_symbolic_head_move_in_the_generation`. Record 375
+replaced the generation fold's refs-pass branch fallback with a constant empty
+string and was **caught** by
+`fold_generation_keeps_the_refs_pass_head_branch`; this test holds the other
+generation inputs constant.
