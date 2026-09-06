@@ -191,9 +191,15 @@ fn open_button(id: String, name: String, features: Features) -> impl IntoView {
             // same rule M11.02's "Open Worktree" offer follows.
             let mode = session_state::ui_mode().unwrap_or(RepoMode::Visualize);
             match select_worktree_request(&id, mode).await {
-                Ok(()) => graph.update(|g| {
-                    g.force_bump();
-                }),
+                Ok(()) => {
+                    // #676: a confirmation is about an operation in the
+                    // repository just left — tear it down rather than let a
+                    // canvas remount show it again over the desk just opened.
+                    shell.close_confirm();
+                    graph.update(|g| {
+                        g.force_bump();
+                    });
+                }
                 Err(e) => shell.open_error(ErrorNotice {
                     title: "Couldn't open that worktree",
                     body: format!("‘{name}’ could not be opened: {e}"),
