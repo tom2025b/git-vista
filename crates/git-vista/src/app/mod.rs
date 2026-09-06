@@ -830,6 +830,11 @@ pub fn App() -> impl IntoView {
                         </span>
                     }
                 })}
+                // #663 (ADR 0094 §7): the change feed's health, drawn
+                // permanently and quietly, beside the working-tree status
+                // chip it shares a "trust signal about repository state"
+                // role with — present in every state, including watching.
+                {crate::feed_health_badge::feed_health_badge_view(freshness)}
                 <button
                     class="refresh"
                     on:click=toggle_icons
