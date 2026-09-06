@@ -37,7 +37,7 @@ use crate::sandbox::NetworkNeed;
 
 use super::{
     couldnt_run, hooked_git_timeout, journal_app_event, read_head_branch_blocking, run_git,
-    run_git_hooked, short, stderr_or, stderr_stdout_or, Obs, Observed,
+    run_git_hooked, short, stderr_or, stderr_stdout_or, Obs, Observed, RunFailure,
 };
 
 /// What the bounded post-kill `rev-parse HEAD` read — performed by both
@@ -174,7 +174,7 @@ pub(super) async fn exec_commit_on_head(
                 &hook_timeout_message(&check),
             );
         }
-        Err(e) => return couldnt_run("/api/commit", &e),
+        Err(e) => return couldnt_run("/api/commit", RunFailure::Spawn, &e),
     };
     if output.status.success() {
         println!("[/api/commit] created commit (allow_empty={allow_empty})");
@@ -409,7 +409,7 @@ pub(super) async fn exec_amend_commit(
                 &hook_timeout_message(&check),
             );
         }
-        Err(e) => return couldnt_run("/api/amend-commit", &e),
+        Err(e) => return couldnt_run("/api/amend-commit", RunFailure::Spawn, &e),
     };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

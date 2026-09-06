@@ -34,7 +34,7 @@ use crate::sandbox::NetworkNeed;
 use super::{
     couldnt_run, git_argv, journal_app_event, read_head_branch_blocking,
     remove_from_snapshot_blocking, run_git_argv, short, stderr_or, stderr_stdout_or, strategy_word,
-    worktree_dirty, Obs, Observed,
+    worktree_dirty, Obs, Observed, RunFailure,
 };
 
 /// `git branch <name> <at>` (`/api/branch`). B3 posture: git validates the
@@ -47,7 +47,7 @@ pub(super) async fn exec_create_branch(
 ) -> (StatusCode, String) {
     let output = match run_git_argv(repo, need, &plan_export::create_branch_argv(name, at)).await {
         Ok(o) => o,
-        Err(e) => return couldnt_run("/api/branch", &e),
+        Err(e) => return couldnt_run("/api/branch", RunFailure::Spawn, &e),
     };
     if output.status.success() {
         println!("[/api/branch] created branch '{name}' at {at}");
@@ -90,7 +90,7 @@ async fn run_branch_cmd(
 ) -> (StatusCode, String) {
     let output = match run_git_argv(repo, need, argv).await {
         Ok(o) => o,
-        Err(e) => return couldnt_run(endpoint, &e),
+        Err(e) => return couldnt_run(endpoint, RunFailure::Spawn, &e),
     };
     if output.status.success() {
         println!("[{endpoint}] {ok_msg}");
@@ -304,7 +304,7 @@ pub(super) async fn exec_rebase(
 
     let output = match run_git_argv(repo, need, &plan_export::rebase_argv(target)).await {
         Ok(o) => o,
-        Err(e) => return couldnt_run("/api/rebase", &e),
+        Err(e) => return couldnt_run("/api/rebase", RunFailure::Spawn, &e),
     };
     if output.status.success() {
         let new = Obs::from_read(rev_parse(repo, "HEAD").await);

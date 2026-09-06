@@ -813,6 +813,7 @@ pub(crate) async fn resolve_commit_oid(
         // and it would send them to fix a request that is probably fine.
         Err(e) => Err(couldnt_run(
             "resolve_commit_oid",
+            RunFailure::ResolveCommit,
             &format!("couldn't resolve ‘{given}’: {e}"),
         )),
     }
@@ -1861,6 +1862,7 @@ async fn enforce_fresh(
     if unknown {
         return Err(couldnt_run(
             "staleness gate",
+            RunFailure::VerifyPlan,
             &"couldn't read the repository's state, so this plan cannot be \
               re-verified before executing",
         ));
@@ -2072,6 +2074,7 @@ fn collision_refusal(
         // this feature replaces.
         BranchHolder::Unknown(reason) => couldnt_run(
             &format!("precondition on ‘{branch}’"),
+            RunFailure::VerifyBranchHolder,
             &format!(
                 "couldn't check whether another worktree has ‘{branch}’ checked out, so this \
                  plan cannot be verified: {reason}"
@@ -2131,6 +2134,7 @@ async fn verify_precondition(
     let unreadable = |ref_name: &str, e: &ExecUnavailable| {
         Err(couldnt_run(
             &format!("precondition on ‘{ref_name}’"),
+            RunFailure::VerifyRef,
             &format!("couldn't check ‘{ref_name}’, so this plan cannot be verified: {e}"),
         ))
     };
@@ -2224,6 +2228,7 @@ async fn verify_precondition(
             // repository's.
             Obs::Unknown => Err(couldnt_run(
                 "precondition CleanWorktree",
+                RunFailure::VerifyCleanWorktree,
                 &"couldn't run git status, so the working tree cannot be verified",
             )),
         },
@@ -3713,27 +3718,28 @@ async fn run_git_hooked(
     crate::git_cmd::git_output_bounded(repo, args, need, hooked_git_timeout()).await
 }
 
-/// The uniform 500 for a git binary that couldn't be spawned, with the same
-/// per-endpoint log line the handlers printed.
+mod run_failure;
+pub(crate) use run_failure::RunFailure;
+
+/// A 500 for an unavailable execution or observation, never a git refusal.
 ///
-/// Generic over the reason since D5 (#66, Task 19): it takes the executors'
-/// `std::io::Error` exactly as before, and also
-/// [`ExecUnavailable`](crate::git_cmd::ExecUnavailable) from the gate sites,
-/// so **one** response shape covers every "git could not run" in the server.
-/// That single shape is what makes it distinguishable from a refusal: the
-/// gates that used to answer 400 ("no such branch", "not a valid object name")
-/// on this input now answer 500 here, and nothing else in the planner returns
-/// a 500 for a repository-state reason.
+/// The reason is a closed, payload-free vocabulary: callers cannot put an
+/// OS/git error (or even a formatted path) in the client-safe sentence.
+/// Every arbitrary Display value is detail, logged unconditionally and
+/// disclosed only through GIT_VISTA_EXPOSE_PATHS. See ADR 0127 and #666.
 pub(crate) fn couldnt_run<E: std::fmt::Display + ?Sized>(
     endpoint: &str,
-    e: &E,
+    reason: RunFailure,
+    detail: &E,
 ) -> (StatusCode, String) {
-    eprintln!("git-vista: {endpoint} couldn't run git: {e}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        format!("Couldn't run git: {e}"),
+        crate::state::withheld_detail(endpoint, reason.summary(), &detail.to_string()),
     )
 }
+
+#[cfg(test)]
+mod couldnt_run_suite;
 
 /// git's own explanation from stderr, or `fallback` when it said nothing.
 fn stderr_or(output: &Output, fallback: &str) -> String {
@@ -3912,6 +3918,7 @@ async fn verify_path_states(
         Err(e) => {
             return Err(couldnt_run(
                 op_name,
+                RunFailure::ReadStatus,
                 &format!("couldn't run git status: {e}"),
             ))
         }
@@ -3919,6 +3926,7 @@ async fn verify_path_states(
     if !output.status.success() {
         return Err(couldnt_run(
             op_name,
+            RunFailure::VerifyPaths,
             &"git status failed, so these paths cannot be re-verified before executing",
         ));
     }
@@ -3983,7 +3991,11 @@ async fn symlink_containment_guard(
     let rels: Vec<String> = paths.iter().map(|p| p.as_str().to_string()).collect();
     let result = tokio::task::spawn_blocking(move || -> Result<(), (StatusCode, String)> {
         let repo_canon = std::fs::canonicalize(&repo_owned).map_err(|e| {
-            couldnt_run(op_name, &format!("couldn't resolve the worktree root: {e}"))
+            couldnt_run(
+                op_name,
+                RunFailure::ResolveWorktreeRoot,
+                &format!("couldn't resolve the worktree root: {e}"),
+            )
         })?;
         for rel in &rels {
             let joined = repo_owned.join(rel);
@@ -4024,6 +4036,7 @@ async fn symlink_containment_guard(
                 Err(e) => {
                     return Err(couldnt_run(
                         op_name,
+                        RunFailure::ResolvePath,
                         &format!("couldn't resolve ‘{rel}’: {e}"),
                     ));
                 }
@@ -4036,6 +4049,7 @@ async fn symlink_containment_guard(
         Ok(inner) => inner,
         Err(join_err) => Err(couldnt_run(
             op_name,
+            RunFailure::ContainmentTask,
             &format!("containment check task panicked: {join_err}"),
         )),
     }

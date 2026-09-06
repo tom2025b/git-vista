@@ -351,9 +351,10 @@ pub(super) async fn exec_fetch(
     remote: &RemoteName,
 ) -> (StatusCode, String) {
     match run_fetch(repo, need, remote, ENDPOINT).await {
-        FetchStep::CouldNotRun { why } => couldnt_run(ENDPOINT, &why),
+        FetchStep::CouldNotRun { why } => couldnt_run(ENDPOINT, RunFailure::Spawn, &why),
         FetchStep::Unobservable { why } => couldnt_run(
             ENDPOINT,
+            RunFailure::FetchUnobserved,
             &format!(
                 "the fetch ran but refs/remotes/{} could not be re-read: {why}",
                 remote.as_str()
