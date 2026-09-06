@@ -27,3 +27,23 @@ remains unreadable and fails closed; detached and unborn HEADs remain branchless
 No contract or wire shape changes, so no ADR is planned.
 
 Signed: codex
+
+## Measurement snapshot
+
+The supplied ignored harness was run for 20 warm iterations per component on
+each revision. The baseline was a disposable worktree at `origin/main`
+(`0d1d8634`); the optimized sample was this branch. The shared host reported
+load averages of `6.46, 6.57, 5.13` during the optimized run, so these are
+directional wall-clock observations rather than isolated benchmarks.
+
+| component | baseline mean (range) | optimized mean (range) |
+| --- | ---: | ---: |
+| `refs_reading` | 81.73 ms (65.21–99.83) | 52.11 ms (39.33–72.27) |
+| whole `live_reading` | 105.43 ms (68.17–130.95) | 56.75 ms (40.75–81.24) |
+
+The baseline's separate `read_head_branch_blocking` read averaged 4.38 ms
+(3.29–5.16). In the optimized path, `refs_reading` returns the symbolic HEAD
+state it already obtained during the ref walk, so that second repository open
+is gone. The ref walk remains the dominant cost: `gix::open_opts` alone was
+2.81 ms median in the baseline sample versus 82.20 ms median for the full
+`refs_reading` call.

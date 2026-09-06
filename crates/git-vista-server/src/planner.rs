@@ -1435,7 +1435,7 @@ pub(crate) struct LiveReading {
 
 /// Read the live generation and keep the parts (M12.03, #553).
 ///
-/// Built from [`observe_live_for_generation`] and [`read_generation_parts`],
+/// Built from [`observe_live_for_feed`] and [`read_generation_parts`],
 /// which is exactly the pair the post-execution generation and the stash pop's
 /// freshness check already use — so this mints the planner recipe by *calling*
 /// it, never by reproducing it. `m3.26-external-changes.md` D4 records what
@@ -4411,7 +4411,7 @@ mod worktree_add_suite;
 mod export_argv_suite;
 
 // #661: a component breakdown of one reconciliation sweep's read path —
-// which of `live_reading`'s six reads costs what. Temporary, same
+// which of `live_reading`'s five reads costs what. Temporary, same
 // `#[ignore]`d-measurement convention as `reconciliation::suite`'s sibling;
 // delete once #661 is closed.
 #[cfg(test)]
