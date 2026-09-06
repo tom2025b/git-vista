@@ -1,6 +1,6 @@
 # ADR 0129 — A settings surface writes through the same fence it reads through
 
-- **Status:** Accepted — implemented, mutation-proved two ways failing differently
+- **Status:** Accepted — implemented, mutation-proved two ways failing differently · Amended 2026-09-06 (#693): decision 4 scopes uniqueness to the server response path that receives the resolved secret
 - **Date:** 2026-09-06
 - **Issue:** #584 (M13.03)
 - **Extends:** [ADR 0126](0126-absence-is-the-normal-answer-not-a-caught-error.md) (#583) — that ADR's own Consequences section names this exact gap: "A future settings surface (#584 territory) that lets an operator *write* a token still needs its own design — this ADR covers resolution (reading), not provisioning." · `docs/SECURITY_MODEL.md`'s token-storage row, which this adds a sibling row beside
@@ -101,7 +101,7 @@ successful Settings write or restart. That deliberate staleness replaces an
 unbounded, repeatable unlock interaction on the request path; ADR 0132 owns
 the trade-off and exact locked-keyring behavior.
 
-### 4. The only production constructor cannot put the value on the wire, and that is proved at the wire, not by inspecting the type
+### 4. The only server response-construction path that receives the resolved secret cannot put it on the wire, and that is proved at the wire, not by inspecting the type
 
 `TokenStatus { configured: bool, masked: Option<String>, source:
 Option<String> }` is not itself sealed against carrying the value —
@@ -113,18 +113,21 @@ gets checked: *"The value is never returned by any read endpoint —
 asserted at the wire level, not by inspection."*
 
 ```mermaid
-flowchart TD
-    RT["resolve_token, returns the resolved token plus which tier answered"] --> TSO["token_status_of — pure, dependency-injected, the ONLY production constructor"]
-    TSO -->|builds only: configured, masked, source| TS["TokenStatus"]
-    TS -->|serde_json::to_string| WIRE["the actual HTTP response body"]
+flowchart LR
+    RT["resolve_token — resolved token plus source"] --> TSO["token_status_of — ONLY server response path given the secret"]
+    TSO -->|configured, masked, source| TS["TokenStatus"]
+    TS -->|serialize| WIRE["HTTP response body"]
 ```
 
-- **The constructor.** `token_status_of` is the only place production code
-  builds a `TokenStatus`. It always sets `masked` from `mask_token`'s
+- **The server response path.** `token_status_of` is the only server
+  production response-construction path that receives the resolved secret.
+  It always sets `masked` from `mask_token`'s
   output and `source` from `TokenSource::label()`'s fixed `&'static str` —
-  never the resolved `String` itself. A future caller that hand-built a
-  `TokenStatus` some other way would not be stopped by the type; it would
-  be a new, unaudited construction site.
+  never the resolved `String` itself. The shipped frontend separately builds
+  an unconfigured `TokenStatus` literal for initial dialog state; that site
+  receives no resolved secret and is outside this narrower invariant. A
+  future server response path that received the secret without using
+  `token_status_of` would be a new, unaudited construction site.
 - **The test.** `token_status_of`'s host tests do not merely construct a
   `TokenStatus` and inspect its fields — they call
   `serde_json::to_string(&status)` (the actual wire serialization a client
@@ -136,7 +139,8 @@ This is a constructor-and-wire-test guarantee, not a type-level seal — a
 narrower and more honest claim than "the type cannot carry it." A type-level
 seal would need a newtype with a private inner (`Masked(String)`, say,
 constructible only via `mask_token`); nothing here builds one, because the
-one production path is already covered and a newtype is a bigger change
+one server production response path that receives the resolved secret is
+already covered and a newtype is a bigger change
 than #584 asked for.
 
 ### 5. Both routes sit behind the full write posture, and never the LAN listener
@@ -169,7 +173,8 @@ was necessary because the supposedly "fast, local" keyring call is a
 synchronous D-Bus operation that can attempt an unlock and wait indefinitely.
 
 **Mask by inspection only (read the struct definition, confirm the only
-production constructor masks the value) rather than a runtime wire-level
+server production response path with the resolved secret masks the value)
+rather than a runtime wire-level
 test.** Rejected — decision 4, and the issue's own wording ("asserted at
 the wire level, not by inspection") rules this out explicitly. Reading the
 code and running it are different claims; ADR 0115's own
