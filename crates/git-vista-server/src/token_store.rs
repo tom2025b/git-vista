@@ -328,12 +328,24 @@ pub(crate) enum StoreTokenError {
 /// header on why absence folds to `None` at every READ tier; a WRITE has no
 /// equivalent safe default to fold into.
 pub(crate) fn store_token(token: &str) -> Result<(), StoreTokenError> {
+    store_token_with(token, |trimmed| {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USERNAME)
+            .map_err(|error| error.to_string())?;
+        entry
+            .set_password(trimmed)
+            .map_err(|error| error.to_string())
+    })
+}
+
+/// Dependency-injected half of [`store_token`]. Besides making the blank and
+/// error boundaries directly testable, this keeps ordinary host tests from
+/// ever opening — or overwriting — the operator's real keyring entry.
+fn store_token_with<F>(token: &str, write: F) -> Result<(), StoreTokenError>
+where
+    F: FnOnce(&str) -> Result<(), String>,
+{
     let trimmed = non_blank(token.to_string()).ok_or(StoreTokenError::Blank)?;
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USERNAME)
-        .map_err(|e| StoreTokenError::Keyring(e.to_string()))?;
-    entry
-        .set_password(&trimmed)
-        .map_err(|e| StoreTokenError::Keyring(e.to_string()))
+    write(&trimmed).map_err(StoreTokenError::Keyring)
 }
 
 /// Pure status constructor, dependency-injected so the property that matters
@@ -490,32 +502,39 @@ mod tests {
 
     #[test]
     fn store_token_rejects_a_blank_value_before_touching_the_keyring() {
-        assert_eq!(store_token(""), Err(StoreTokenError::Blank));
-        assert_eq!(store_token("   "), Err(StoreTokenError::Blank));
+        let writes = std::cell::Cell::new(0);
+        for blank in ["", "   "] {
+            assert_eq!(
+                store_token_with(blank, |_| {
+                    writes.set(writes.get() + 1);
+                    Ok(())
+                }),
+                Err(StoreTokenError::Blank)
+            );
+        }
+        assert_eq!(writes.get(), 0, "a blank token reached the keyring writer");
     }
 
     #[test]
     fn store_token_error_messages_never_contain_the_attempted_value() {
-        // The keyring backend in this sandbox has no storage access, so this
-        // exercises the real failure path store_token must report honestly
-        // (unlike a read, a write failure is not folded to a quiet `None`).
-        // Built at runtime, like every other token-shaped fixture in this
-        // file (see `mask_token_keeps_only_the_last_four_characters` above)
-        // — a literal here would be a real-length `ghp_` token shape in
-        // tracked source, which the credential tripwire (#586, ADR 0123)
-        // and gitleaks' own full-history scan both exist to catch, even
-        // though the value itself grants access to nothing.
+        // Inject the backend refusal: an ordinary test must neither depend on
+        // Secret Service availability nor risk replacing the operator's real
+        // entry when it happens to be unlocked. Built at runtime, like every
+        // other token-shaped fixture in this file (see
+        // `mask_token_keeps_only_the_last_four_characters` above).
         let attempted = format!("ghp_{}", "wouldbeasecretifthisreallysaved0123456789");
-        if let Err(e) = store_token(&attempted) {
-            let message = match &e {
-                StoreTokenError::Blank => String::new(),
-                StoreTokenError::Keyring(reason) => reason.clone(),
-            };
-            assert!(
-                !message.contains(&attempted),
-                "a keyring failure message echoed the attempted token: {message}"
-            );
-        }
+        let result = store_token_with(&attempted, |received| {
+            assert_eq!(received, attempted);
+            Err("no storage access".to_string())
+        });
+        let StoreTokenError::Keyring(message) = result.unwrap_err() else {
+            panic!("the injected backend failure changed kind");
+        };
+        assert_eq!(message, "no storage access");
+        assert!(
+            !message.contains(&attempted),
+            "a keyring failure message echoed the attempted token: {message}"
+        );
     }
 
     #[test]
