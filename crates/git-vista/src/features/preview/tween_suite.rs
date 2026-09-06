@@ -369,20 +369,60 @@ fn a_ref_with_no_drawn_origin_fades_in_at_its_destination_rather_than_sliding_fr
         "no honest starting pixel exists, so this must not invent one"
     );
 
+    // Sampled well before REVEAL_AFTER, where the destination's own `→main`
+    // mark tag is still hidden — this is the window the fade-in is actually
+    // about, and where a stray hide-on-arrival mutation could not hide
+    // behind #670 item E's fix below (see that test).
     let at_0 = sample(&scene, 0.0);
-    let at_1 = sample(&scene, 1.0);
-    let b0 = at_0.badges.iter().find(|b| b.text == "main").unwrap();
-    let b1 = at_1.badges.iter().find(|b| b.text == "main").unwrap();
+    let at_mid = sample(&scene, REVEAL_AFTER - 0.3);
+    let b0 = main_badge_at(&at_0);
+    let b_mid = main_badge_at(&at_mid);
     assert_eq!(
         (b0.cx, b0.cy),
-        (b1.cx, b1.cy),
+        (b_mid.cx, b_mid.cy),
         "fixed at the destination throughout"
     );
     assert!(
-        b0.opacity < b1.opacity,
+        b0.opacity < b_mid.opacity,
         "fades in rather than appearing instantly"
     );
-    assert_eq!(b1.opacity, 1.0);
+}
+
+/// #670 item E: once the landing commit's own `→{ref}` mark tag has
+/// revealed, this floating badge sitting on the exact same pixel is the same
+/// fact drawn twice. The static After view never draws both — only the tag —
+/// so the animation must stop drawing the badge by the time it settles,
+/// rather than leaving it at full opacity forever, which is what shipped in
+/// #667 and is what grok's review of #667 (issue #670) flagged.
+#[test]
+fn a_landed_ref_badge_disappears_once_its_own_mark_tag_takes_over() {
+    let p = picture(before_chain(), after_with_added(), added_commit_changes());
+    let scene = tween_of(&p);
+
+    let at_1 = sample(&scene, 1.0);
+    let landing = at_1
+        .nodes
+        .iter()
+        .find(|n| n.tags.iter().any(|t| t.text == "→main"))
+        .expect("the landing commit's mark tag has revealed by rest");
+    assert_eq!(
+        landing.opacity, 1.0,
+        "the tag this test is about must actually be showing, not merely present pre-filter"
+    );
+    let b1 = main_badge_at(&at_1);
+    assert_eq!(
+        b1.opacity, 0.0,
+        "the floating badge must be gone once the mark tag it duplicates is showing — \
+         both visible at once is the same fact said twice"
+    );
+}
+
+fn main_badge_at(frame: &Frame) -> &FrameBadge {
+    frame
+        .badges
+        .iter()
+        .find(|b| b.text == "main")
+        .expect("the main ref badge exists in this frame")
 }
 
 #[test]
@@ -607,6 +647,19 @@ fn reduced_motion_returns_before_scheduling_a_frame() {
     assert!(
         !arm.contains("self.schedule("),
         "the reduced_motion arm must never call schedule: {arm}"
+    );
+    // #670 item C: the two assertions above pin that the arm returns early
+    // and never schedules a frame, but neither pins WHICH frame it returns
+    // to. A `return` that left `progress` at its default `0.0` would pass
+    // both and render the animation's START, not its end state — silently
+    // failing the very degrade-to-resting-frame rule this arm exists to
+    // satisfy. Pin the resting value explicitly.
+    assert!(
+        arm.contains("progress.set(1.0)"),
+        "the reduced_motion arm must set progress to its resting value \
+         (1.0) before returning — otherwise a correct-looking early return \
+         could leave the panel showing the animation's start frame instead \
+         of its end state. Arm was:\n{arm}"
     );
     assert!(
         body.contains("self.schedule("),
