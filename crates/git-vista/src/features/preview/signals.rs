@@ -64,8 +64,19 @@ pub enum PreviewSlot {
 /// `rebuild_is_current` — a continuation cannot write state or act on a
 /// stale rebuild without presenting a token, and presenting a stale one is
 /// simply inert rather than a check the caller could forget.
+///
+/// Two axes since #664 review round 5, not one: `generation` is `Preview`'s
+/// own counter, and `epoch` is the shared graph epoch that **repository
+/// selection** moves. The private counter alone was blind to selection —
+/// `force_bump` has never bumped `Preview` — which is the axis a held
+/// continuation most needs to be refused on. Same shape as
+/// `RequestKey { epoch, generation }`, which history paging has used since
+/// #555.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RebuildToken(u64);
+pub struct RebuildToken {
+    generation: u64,
+    epoch: u64,
+}
 
 /// The preview panel's state, owned by `App` and handed down in `Features`.
 #[derive(Clone, Copy)]
@@ -155,15 +166,17 @@ impl Preview {
                 Ok(plan) => {
                     // #555: what the user is about to approve, remembered
                     // before the picture is drawn — the generation the plan was
-                    // built against and the refs it says it will move.
-                    let on_screen = PlanOnScreen {
-                        generation: plan.generation.as_str().to_string(),
-                        expects: plan
-                            .expected_ref_changes
-                            .iter()
-                            .map(|change| change.ref_name.as_str().to_string())
-                            .collect(),
-                    };
+                    // built against, the refs it says it will move, and (since
+                    // #664 review round 5) the desk it was built for.
+                    //
+                    // Through `PlanOnScreen::of`, not hand-built. This site
+                    // used to duplicate that constructor's body, which is
+                    // precisely how it came to be missing two fields the
+                    // constructor had: "one constructor, so every surface that
+                    // displays a plan takes the same things off the same
+                    // object" is only true while every surface actually calls
+                    // it.
+                    let on_screen = PlanOnScreen::of(&plan);
                     match api::preview_request(&plan).await {
                         Ok(response) => (
                             PreviewSlot::Ready(view_of(response)),
@@ -228,38 +241,48 @@ impl Preview {
     /// and [`Self::rebuild_is_current`] — each checks it against the live
     /// generation before doing anything, so a stale token is inert rather
     /// than a convention a caller has to remember to honour.
-    pub fn note_rebuild_started(&self) -> RebuildToken {
+    pub fn note_rebuild_started(&self, epoch: u64) -> RebuildToken {
         let issued = self.bump();
         self.plan.set(PlanSlot::Rebuilding);
-        RebuildToken(issued)
+        RebuildToken {
+            generation: issued,
+            epoch,
+        }
     }
 
-    /// Note that such a rebuild did not produce a plan — unless `token` is no
-    /// longer current, in which case this does nothing: a newer rebuild or a
-    /// cancel already wrote whatever state now holds, and this stale reply
-    /// must not overwrite it.
-    pub fn note_rebuild_failed(&self, token: RebuildToken) {
-        if self.rebuild_is_current(token) {
-            self.plan.set(PlanSlot::RebuildFailed);
-        }
+    /// Note that such a rebuild did not produce a plan.
+    ///
+    /// # No guard here any more, on purpose (#664 review round 5)
+    ///
+    /// This used to re-check the token itself. It no longer does, and that is
+    /// the fix rather than a regression: the currency decision is made **once**,
+    /// by `core::rebuild_commit`, inside a block with no `.await` in it — which
+    /// on wasm's single-threaded executor cannot interleave. A second check
+    /// here would re-ask a question that was just answered atomically, and its
+    /// presence invited the shape the round was about: six guarded sites, each
+    /// one a thing to remember, with the *set* of sites discovered one review
+    /// at a time.
+    ///
+    /// What keeps this honest is that there is exactly one caller, pinned by
+    /// `freshness::core_suite`'s source census. A second caller appearing
+    /// without going through the commit point is what that census is for.
+    pub fn note_rebuild_failed(&self) {
+        self.plan.set(PlanSlot::RebuildFailed);
     }
 
     /// Note that such a rebuild landed, and the replacement plan is now
-    /// carried by the operation itself — unless `token` is no longer
-    /// current, in which case this does nothing, for the same reason
-    /// [`Self::note_rebuild_failed`] guards: a newer rebuild's own
-    /// `Rebuilding` (or a cancel's `Absent`) must not be clobbered by a
-    /// reply to the rebuild it replaced.
+    /// carried by the operation itself.
     ///
-    /// A *current* call is still required, and its absence would be a defect
-    /// of exactly the shape this whole slot exists to prevent: `Rebuilding`
-    /// outranks the carried plan in `plan_on_screen`, so a rebuild that never
-    /// says it finished leaves the confirmation disabled over a replacement
-    /// that did arrive.
-    pub fn note_rebuild_landed(&self, token: RebuildToken) {
-        if self.rebuild_is_current(token) {
-            self.plan.set(PlanSlot::Absent);
-        }
+    /// Unguarded for the same reason [`Self::note_rebuild_failed`] is — see
+    /// its doc. The other half of the old comment still holds and still
+    /// matters: a call is *required* on the landing path, because
+    /// `Rebuilding` outranks the carried plan in `plan_on_screen`, so a
+    /// rebuild that never says it finished leaves the confirmation disabled
+    /// over a replacement that did arrive. That is why `RebuildEffect::Reopen`
+    /// names both effects together — re-open and mark landed are one
+    /// transition, and splitting them is how one of them goes missing.
+    pub fn note_rebuild_landed(&self) {
+        self.plan.set(PlanSlot::Absent);
     }
 
     /// Whether a rebuild started with `token` is still the live one —
@@ -269,13 +292,17 @@ impl Preview {
     /// directly for an action this `Preview` does not itself own, such as
     /// re-opening the confirmation dialog on the replacement plan (#664
     /// review round 3).
-    pub fn rebuild_is_current(&self, token: RebuildToken) -> bool {
-        // The comparison itself lives in `core::rebuild_token_is_current`,
+    pub fn rebuild_is_current(&self, token: RebuildToken, live_epoch: u64) -> bool {
+        // The comparison itself lives in `core::rebuild_key_is_current`,
         // host-tested — this wrapper only supplies the wasm-only signal read
-        // (#664 review round 3; see that function's own doc comment).
-        crate::features::preview::core::rebuild_token_is_current(
+        // (#664 review rounds 3 and 5; see that function's own doc comment).
+        // `live_epoch` is passed in rather than read here because the epoch is
+        // the caller's own `GraphCore`, not this panel's state.
+        crate::features::preview::core::rebuild_key_is_current(
+            Some(live_epoch),
             self.generation.try_get_value(),
-            token.0,
+            token.epoch,
+            token.generation,
         )
     }
 
