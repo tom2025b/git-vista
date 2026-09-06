@@ -30,7 +30,7 @@ async function openActive(page) {
   await expect(page.locator('p.status.repo')).toContainText('fixture-repo', { timeout: 20_000 })
 }
 async function panel(page) {
-  const chip = page.getByRole('button', { name: 'Repository status', exact: true })
+  const chip = page.getByRole('button', { name: /^Repository status:/ })
   const box = await chip.boundingBox()
   expect(box.width).toBeGreaterThanOrEqual(44)
   expect(box.height).toBeGreaterThanOrEqual(44)
@@ -55,7 +55,7 @@ test('tap explains staged, unstaged, untracked and diverged counts; Visualize co
   await expect(detail.getByRole('button', { name: 'Close' })).toBeFocused()
   await detail.getByRole('button', { name: 'Close' }).click()
   await expect(detail).toHaveCount(0)
-  await expect(page.getByRole('button', { name: 'Repository status', exact: true })).toBeFocused()
+  await expect(page.getByRole('button', { name: /^Repository status:/ })).toBeFocused()
 })
 
 test('Active offers guided staging and committing without writing on panel open', async ({ page }) => {
@@ -101,7 +101,7 @@ test('clean zero counts describe a local reading and Escape returns focus', asyn
   await expect(detail).toContainText('Zero can also mean Git could not calculate the comparison.')
   await page.keyboard.press('Escape')
   await expect(detail).toHaveCount(0)
-  await expect(page.getByRole('button', { name: 'Repository status', exact: true })).toBeFocused()
+  await expect(page.getByRole('button', { name: /^Repository status:/ })).toBeFocused()
 })
 
 
@@ -126,5 +126,5 @@ test('staging uses the existing endpoint, then commit opens the staged-file revi
   await detail.getByRole('button', { name: 'Review and commit…', exact: true }).click()
   await expect(detail).toHaveCount(0)
   await expect(page.getByText('Commit staged changes', { exact: true })).toBeVisible()
-  await expect(page.getByText('new.txt', { exact: true })).toBeVisible()
+  await expect(page.getByRole('listitem').filter({ hasText: /^added new\.txt$/ })).toBeVisible()
 })

@@ -212,14 +212,14 @@ pub fn status_chip_view(
     };
     view! {
         <button node_ref=trigger type="button" class=move || chip().0 title=move || chip().2
-            aria-label="Repository status" aria-haspopup="dialog" aria-expanded=move || open.get().to_string()
+            aria-label=move || format!("Repository status: {}", chip().2) aria-haspopup="dialog" aria-expanded=move || open.get().to_string()
             on:click=move |_| { if open.get() { close(); } else { status.refetch(); open.set(true); } }>
-            <span aria-live="polite" aria-atomic="true">{move || chip().1}</span>
+            <span class="nf" aria-live="polite" aria-atomic="true">{move || chip().1}</span>
         </button>
         <Show when=move || open.get()>
             <div class="status-detail-backdrop">
                 <section class="status-detail" role="dialog" aria-modal="true" aria-label="Repository status details"
-                    on:keydown=move |e| { keep_focus_inside(&e); if e.key() == "Escape" { e.prevent_default(); e.stop_propagation(); close(); } }>
+                    on:keydown:undelegated=move |e| { keep_focus_inside(&e); if e.key() == "Escape" { e.prevent_default(); e.stop_propagation(); close(); } }>
                     <div class="status-detail-heading"><h2>"Repository status"</h2>
                         <button node_ref=close_button type="button" class="refresh" on:click=move |_| close()>"Close"</button>
                     </div>
