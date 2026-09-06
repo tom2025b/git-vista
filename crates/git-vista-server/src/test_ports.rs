@@ -1,4 +1,5 @@
-//! M1.13b (#66): the one owner of TCP port 9418 inside this test binary.
+//! M1.13b (#66): the one owner of TCP port 9418 — across every process on this
+//! host, not only inside one test binary.
 //!
 //! Two unrelated tests in this binary need port 9418 and neither can move off
 //! it: it is the only unprivileged entry in `sandbox::DEFAULT_GIT_PORTS`, so it
@@ -16,8 +17,24 @@
 //! rendezvous whichever lands second fails (or, worse for the third, degrades
 //! into a silently-vacuous `Outcome::CapabilityAbsent` when its baseline bind
 //! returns `EADDRINUSE`). This module is that rendezvous: a claim, not a port
-//! allocator — the port number is fixed by the Landlock grant, so the only
-//! thing left to arbitrate is *who has it right now*.
+//! allocator — the port number is fixed by the Landlock grant (see
+//! `sandbox::DEFAULT_GIT_PORTS`), so the only thing left to arbitrate is *who
+//! has it right now*.
+//!
+//! # Why a `Mutex` alone is not enough (#674)
+//!
+//! A `Mutex` only ever excludes threads *inside this one process*. Two lanes
+//! each running their own `cargo test` invocation get two entirely separate
+//! copies of `GIT_PROTOCOL_PORT`, and neither knows the other exists — so two
+//! test binaries running concurrently on the same host can both believe they
+//! own port 9418 and race for it, `errno 98 (EADDRINUSE)`, regardless of how
+//! careful either one is internally. `buildlock`'s `GV_BUILD_SLOTS` is
+//! supposed to keep concurrent lanes from overlapping cargo invocations at
+//! all, but that is a convention layered on top — an env var a caller can
+//! override, or a direct `cargo test` invocation that bypasses `buildlock`
+//! entirely still reaches this code. Giving port 9418 itself a cross-process
+//! lock (`CROSS_PROCESS_LOCK`, below) makes the claim's exclusivity a property
+//! of the claim, not of whoever remembered to serialize the build.
 
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,6 +48,14 @@ static GIT_PROTOCOL_PORT: Mutex<()> = Mutex::new(());
 /// a nested re-acquire from a silent whole-binary deadlock into a named panic.
 static OWNER: AtomicU64 = AtomicU64::new(0);
 
+/// Fixed, host-wide path for the cross-process half of the claim below.
+/// Deliberately *not* per-worktree or per-PID: the resource being arbitrated
+/// (TCP port 9418 on `127.0.0.1`) is itself host-wide, so the lock that
+/// protects it has to be too, or two lanes each computing a "unique" path
+/// would just get two different locks guarding the one port neither of them
+/// actually has exclusive claim to.
+const CROSS_PROCESS_LOCK_PATH: &str = "/tmp/git-vista-test-port-9418.lock";
+
 /// An exclusive claim on port 9418, released on drop.
 ///
 /// Hold it for as long as anything is bound to the port — a claim released
@@ -38,6 +63,12 @@ static OWNER: AtomicU64 = AtomicU64::new(0);
 /// port that is still occupied, which is the whole failure this type exists to
 /// prevent.
 pub(crate) struct PortClaim {
+    /// Released by `File`'s own `Drop` (closing the fd releases the `flock`).
+    /// Declared before `_guard` so it is dropped first — not load-bearing for
+    /// correctness (the two locks guard the same resource, so either release
+    /// order is safe), but it keeps the *widest* exclusion (cross-process)
+    /// held at least as long as the narrower one (cross-thread).
+    _cross_process: std::fs::File,
     _guard: MutexGuard<'static, ()>,
 }
 
@@ -82,12 +113,45 @@ impl PortClaim {
         // `wait_until_free`'s job, below, and it runs either way.
         let guard = GIT_PROTOCOL_PORT.lock().unwrap_or_else(|e| e.into_inner());
         OWNER.store(me, Ordering::Release);
-        // Only after the mutex is ours: a previous holder's socket can linger
+        // Cross-process next: a concurrent lane's test binary has its own
+        // `GIT_PROTOCOL_PORT` mutex, entirely invisible to this one. Blocking
+        // on the file lock is what actually keeps two lanes off port 9418 at
+        // once — see the module docs' "#674" section.
+        let cross_process = acquire_cross_process_lock();
+        // Only after both locks are ours: a previous holder's socket can linger
         // briefly while it closes, and a *leaked* `git daemon` from an earlier
-        // SIGKILLed run is outside this mutex's knowledge entirely.
+        // SIGKILLed run is outside either lock's knowledge entirely.
         wait_until_free();
-        Self { _guard: guard }
+        Self {
+            _cross_process: cross_process,
+            _guard: guard,
+        }
     }
+}
+
+/// Block until this process holds the host-wide `flock` for port 9418.
+///
+/// `create(true)` rather than `create_new`: unlike `preview::ScratchStore`'s
+/// marker, this file has no payload and no ownership claim beyond the lock
+/// itself — any process is welcome to have created it first, and none of them
+/// ever writes to it. `.lock()` is the blocking form (the same family as
+/// `preview.rs`'s `try_lock`, stable since 1.89): it queues behind whichever
+/// process holds it rather than failing, matching the in-process `Mutex` this
+/// pairs with.
+fn acquire_cross_process_lock() -> std::fs::File {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(CROSS_PROCESS_LOCK_PATH)
+        .unwrap_or_else(|e| {
+            panic!(
+                "test_ports: could not open cross-process lock file {CROSS_PROCESS_LOCK_PATH}: {e}"
+            )
+        });
+    file.lock().unwrap_or_else(|e| {
+        panic!("test_ports: could not take cross-process lock on {CROSS_PROCESS_LOCK_PATH}: {e}")
+    });
+    file
 }
 
 impl Drop for PortClaim {
