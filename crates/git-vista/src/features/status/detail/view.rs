@@ -5,6 +5,50 @@ use crate::features::graph::core::Frame;
 use crate::features::status::{core::chip_label, signals::read};
 use crate::state::{CommitIntent, Features, PendingOp};
 use leptos::*;
+use wasm_bindgen::JsCast;
+
+fn keep_focus_inside(event: &web_sys::KeyboardEvent) {
+    if event.key() != "Tab" {
+        return;
+    }
+    let Some(section) = event
+        .current_target()
+        .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+    else {
+        return;
+    };
+    let Ok(buttons) = section.query_selector_all("button:not([disabled])") else {
+        return;
+    };
+    let Some(first) = buttons
+        .item(0)
+        .and_then(|n| n.dyn_into::<web_sys::HtmlElement>().ok())
+    else {
+        return;
+    };
+    let Some(last) = buttons
+        .item(buttons.length().saturating_sub(1))
+        .and_then(|n| n.dyn_into::<web_sys::HtmlElement>().ok())
+    else {
+        return;
+    };
+    let active = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.active_element());
+    if let Some(active) = active {
+        let target = if event.shift_key() && first.is_same_node(Some(&active)) {
+            Some(last)
+        } else if !event.shift_key() && last.is_same_node(Some(&active)) {
+            Some(first)
+        } else {
+            None
+        };
+        if let Some(target) = target {
+            event.prevent_default();
+            let _ = target.focus();
+        }
+    }
+}
 
 pub fn status_chip_view(
     features: Features,
@@ -59,6 +103,9 @@ pub fn status_chip_view(
         }
         match action {
             Action::Stage => {
+                if let Some(button) = close_button.get() {
+                    let _ = button.focus();
+                }
                 busy.set(true);
                 let epoch = graph.get_untracked().epoch();
                 spawn_local(async move {
@@ -172,7 +219,7 @@ pub fn status_chip_view(
         <Show when=move || open.get()>
             <div class="status-detail-backdrop">
                 <section class="status-detail" role="dialog" aria-modal="true" aria-label="Repository status details"
-                    on:keydown=move |e| { if e.key() == "Escape" { e.prevent_default(); e.stop_propagation(); close(); } }>
+                    on:keydown=move |e| { keep_focus_inside(&e); if e.key() == "Escape" { e.prevent_default(); e.stop_propagation(); close(); } }>
                     <div class="status-detail-heading"><h2>"Repository status"</h2>
                         <button node_ref=close_button type="button" class="refresh" on:click=move |_| close()>"Close"</button>
                     </div>

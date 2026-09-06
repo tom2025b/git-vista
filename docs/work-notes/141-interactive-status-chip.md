@@ -3,7 +3,7 @@
 The existing /api/status read will supply a tappable status explanation panel.
 No new endpoint or wire contract is needed. Explanations and available guided
 actions belong in a host-tested pure core; the wasm view only renders and
-routes to existing confirmations and the Activity staging/commit flow.
+routes to existing staging, commit review, pull/push confirmations, and Activity conflict review.
 
 Unknown/loading/failed status must say it cannot tell, never imply clean.
 Explain staged, unstaged, untracked and conflicted files in actual English;
@@ -23,5 +23,9 @@ tests for tapping the chip, fixture sentences and absent read-only actions.
 Use the repository gate before the implementation PR. No ADR unless a contract
 change proves necessary. Finish report must quote the actual panel sentences.
 
-Current checkpoint: issue and existing chip/status resource read; implementation
-and validation pending. Refs #141.
+Implementation checkpoint: pure sentences and action policy, repository-pinned
+shared readings, touch-sized modal, existing action wiring, and source census
+are implemented. Ten core tests and the initial five browser cases passed.
+Failure Atlas caught direction mutation 388 and read-only mutation 389.
+Final stage-to-commit and keyboard focus checks, full gate, and PR are pending.
+Refs #141.

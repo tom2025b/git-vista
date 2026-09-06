@@ -50,6 +50,9 @@ test('tap explains staged, unstaged, untracked and diverged counts; Visualize co
   await expect(detail).toContainText('The branches have diverged: each has commits the other does not.')
   await expect(detail.locator('[data-status-action]')).toHaveCount(0)
   await expect(detail.getByRole('button')).toHaveCount(1) // Close only, no disabled substitutes.
+  await expect(detail.getByRole('button', { name: 'Close' })).toBeFocused()
+  await page.keyboard.press('Tab')
+  await expect(detail.getByRole('button', { name: 'Close' })).toBeFocused()
   await detail.getByRole('button', { name: 'Close' }).click()
   await expect(detail).toHaveCount(0)
   await expect(page.getByRole('button', { name: 'Repository status', exact: true })).toBeFocused()
@@ -76,7 +79,7 @@ test('a behind-only clean branch opens the existing pull strategy picker without
   await expect(detail).toContainText('1 commit on origin/main is missing from main.')
   await detail.getByRole('button', { name: 'Choose how to pull…' }).click()
   await expect(detail).toHaveCount(0)
-  await expect(page.getByText('How should pull combine the histories?', { exact: true })).toBeVisible()
+  await expect(page.getByText('Pull branch', { exact: true })).toBeVisible()
   expect(pulls).toBe(0)
 })
 
@@ -99,4 +102,29 @@ test('clean zero counts describe a local reading and Escape returns focus', asyn
   await page.keyboard.press('Escape')
   await expect(detail).toHaveCount(0)
   await expect(page.getByRole('button', { name: 'Repository status', exact: true })).toBeFocused()
+})
+
+
+test('staging uses the existing endpoint, then commit opens the staged-file review', async ({ page }) => {
+  let staged = false
+  await page.route('**/api/status?**', route => route.fulfill({ json: staged
+    ? { ...clean, staged: [{ path: 'new.txt', kind: 'Added' }] }
+    : { ...clean, untracked: ['new.txt'] } }))
+  await page.route('**/api/stage', route => {
+    expect(route.request().method()).toBe('POST')
+    staged = true
+    return route.fulfill({ status: 200, body: '' })
+  })
+  await openActive(page)
+  const detail = await panel(page)
+  await detail.getByRole('button', { name: 'Stage all changes', exact: true }).click()
+  await expect(detail).toContainText('1 file is staged for the next commit;')
+  expect(staged).toBe(true)
+  await expect(detail.getByRole('button', { name: 'Stage all changes', exact: true })).toHaveCount(0)
+  await page.keyboard.press('Shift+Tab')
+  await expect(detail.getByRole('button', { name: 'Review and commit…', exact: true })).toBeFocused()
+  await detail.getByRole('button', { name: 'Review and commit…', exact: true }).click()
+  await expect(detail).toHaveCount(0)
+  await expect(page.getByText('Commit staged changes', { exact: true })).toBeVisible()
+  await expect(page.getByText('new.txt', { exact: true })).toBeVisible()
 })
