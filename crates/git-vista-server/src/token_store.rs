@@ -1,7 +1,7 @@
-//! GitHub token resolution (#583, M13.02) — the fallback chain
+//! GitHub token resolution (#583/#692, M13.02) — the fallback chain
 //! `state::credential_token` (M13.01, #582) was scaffolding for: an OS
-//! keyring first, an environment variable second, a gitignored local file
-//! last. See ADR 0122.
+//! keyring first, two environment variables, then a gitignored local file.
+//! See ADR 0126 and ADR 0132.
 //!
 //! Absence at every tier is the normal state: a public repository works
 //! with no token at all, so nothing here treats "not found" as an error —
@@ -9,6 +9,8 @@
 //! variable) into `None` rather than surfacing it.
 
 use std::path::Path;
+use std::sync::RwLock;
+use std::time::Duration;
 
 use git_vista_protocol::TokenStatus;
 
@@ -56,27 +58,40 @@ pub(crate) const TOKEN_SOURCE_ENV_VARS: &[&str] = &[GIT_VISTA_ENV, GH_ENV];
 /// up empty — the normal, unremarkable case for a public repository.
 pub(crate) fn resolve_token() -> Option<(String, TokenSource)> {
     resolve_from(
-        keyring_token(),
-        env_token(GIT_VISTA_ENV),
-        env_token(GH_ENV),
-        file_token(),
+        keyring_token,
+        || env_token(GIT_VISTA_ENV),
+        || env_token(GH_ENV),
+        file_token,
     )
 }
 
-/// The precedence engine, isolated from every real source so a test can
-/// assert the ORDER without touching the OS keyring, the environment, or
-/// disk (#583 acceptance: "precedence is asserted, not assumed").
-fn resolve_from(
-    keyring: Option<String>,
-    env_git_vista: Option<String>,
-    env_gh: Option<String>,
-    file: Option<String>,
-) -> Option<(String, TokenSource)> {
-    keyring
-        .map(|t| (t, TokenSource::Keyring))
-        .or_else(|| env_git_vista.map(|t| (t, TokenSource::EnvGitVista)))
-        .or_else(|| env_gh.map(|t| (t, TokenSource::EnvGh)))
-        .or_else(|| file.map(|t| (t, TokenSource::File)))
+/// The lazy precedence engine, isolated from every real source so tests can
+/// assert both the order and the evaluation boundary without touching the OS
+/// keyring, environment, or disk (#583/#692). Taking source functions rather
+/// than already-built `Option`s is the important part: once one returns a
+/// value, no lower-priority function can run.
+fn resolve_from<K, V, G, F>(
+    keyring: K,
+    env_git_vista: V,
+    env_gh: G,
+    file: F,
+) -> Option<(String, TokenSource)>
+where
+    K: FnOnce() -> Option<String>,
+    V: FnOnce() -> Option<String>,
+    G: FnOnce() -> Option<String>,
+    F: FnOnce() -> Option<String>,
+{
+    if let Some(token) = keyring() {
+        return Some((token, TokenSource::Keyring));
+    }
+    if let Some(token) = env_git_vista() {
+        return Some((token, TokenSource::EnvGitVista));
+    }
+    if let Some(token) = env_gh() {
+        return Some((token, TokenSource::EnvGh));
+    }
+    file().map(|token| (token, TokenSource::File))
 }
 
 /// A blank or whitespace-only value is treated the same as absent, at every
@@ -95,14 +110,158 @@ fn env_token(name: &str) -> Option<String> {
 /// failure — no D-Bus session, no entry set, a locked store — collapses to
 /// `None`; keyring absence must never surface as a server error (#583).
 ///
-/// `keyring::Entry::new` performs a blocking round trip to the platform
-/// credential store (a D-Bus call, on Linux) the first time it runs in this
-/// process. That is acceptable here: this only runs once per clone/push
-/// (`state::credential_token`'s one call site), a request that already
-/// waits on a real child git process for as long as ten minutes (#216).
+/// This is synchronous, potentially blocking platform I/O. Credentialed git
+/// operations call it while resolving a token for their already-blocking
+/// operation path. The settings request path does not: it uses
+/// [`RequestTokenResolver`]'s startup snapshot, and a settings write runs its
+/// one requested keyring call on Tokio's blocking pool (#692).
 fn keyring_token() -> Option<String> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USERNAME).ok()?;
     entry.get_password().ok().and_then(non_blank)
+}
+
+/// The startup keyring probe is allowed this long to answer. A healthy local
+/// Secret Service normally answers immediately; a locked store may wait for an
+/// unlock interaction that an autologin session cannot complete. Timing out
+/// makes that tier unavailable to Settings until restart. Dropping Tokio's
+/// `JoinHandle` cannot cancel a synchronous D-Bus call already in progress, so
+/// one blocking task may remain, but repeated Settings opens never create more.
+const SETTINGS_KEYRING_PROBE_BUDGET: Duration = Duration::from_secs(2);
+
+enum KeyringProbe {
+    Completed(Option<String>),
+    TimedOut,
+    WorkerFailed(String),
+}
+
+async fn probe_keyring_with<F>(read: F, budget: Duration) -> KeyringProbe
+where
+    F: FnOnce() -> Option<String> + Send + 'static,
+{
+    match tokio::time::timeout(budget, tokio::task::spawn_blocking(read)).await {
+        Ok(Ok(token)) => KeyringProbe::Completed(token),
+        Ok(Err(error)) => KeyringProbe::WorkerFailed(error.to_string()),
+        Err(_) => KeyringProbe::TimedOut,
+    }
+}
+
+/// Request-facing status policy for the keyring tier (#692).
+///
+/// Only a masked status is retained. A GET can therefore report a keyring
+/// value observed during the bounded startup probe without storing another
+/// copy of the credential or touching D-Bus. If startup found no usable
+/// keyring (including a timeout), GETs resolve the non-blocking environment
+/// and file tiers lazily. A successful settings POST replaces the snapshot
+/// from the submitted value after the blocking-pool write succeeds; it never
+/// reads the keyring back.
+pub(crate) struct RequestTokenResolver {
+    keyring_status: RwLock<Option<TokenStatus>>,
+}
+
+impl RequestTokenResolver {
+    fn from_startup_keyring(token: Option<&str>) -> Self {
+        let keyring_status =
+            token.map(|token| token_status_of(Some((token.to_string(), TokenSource::Keyring))));
+        Self {
+            keyring_status: RwLock::new(keyring_status),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn without_keyring() -> Self {
+        Self::from_startup_keyring(None)
+    }
+
+    /// Resolve status under the request policy. There is deliberately no
+    /// keyring source function here: a request can only read the masked
+    /// startup/post-write snapshot, so repeated opens cannot re-enter D-Bus.
+    pub(crate) fn status(&self) -> TokenStatus {
+        self.status_from(
+            || env_token(GIT_VISTA_ENV),
+            || env_token(GH_ENV),
+            file_token,
+        )
+    }
+
+    fn status_from<V, G, F>(&self, env_git_vista: V, env_gh: G, file: F) -> TokenStatus
+    where
+        V: FnOnce() -> Option<String>,
+        G: FnOnce() -> Option<String>,
+        F: FnOnce() -> Option<String>,
+    {
+        let keyring_status = self
+            .keyring_status
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(status) = keyring_status {
+            return status;
+        }
+
+        token_status_of(resolve_from(|| None, env_git_vista, env_gh, file))
+    }
+
+    /// Record a keyring write only after [`store_token`] returned success.
+    /// The same normalization as the writer is applied, and only the masked
+    /// DTO is retained. Returning that DTO lets POST respond without a second
+    /// keyring lookup.
+    pub(crate) fn record_successful_store(&self, token: &str) -> TokenStatus {
+        let token =
+            non_blank(token.to_string()).expect("store_token cannot succeed for a blank token");
+        let status = token_status_of(Some((token, TokenSource::Keyring)));
+        *self
+            .keyring_status
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(status.clone());
+        status
+    }
+}
+
+/// Startup result consumed by `main`: the request-only resolver, the ordinary
+/// masked provenance line, and an optional diagnostic explaining why the
+/// keyring is being treated as unavailable for Settings until restart.
+pub(crate) struct StartupTokenPolicy {
+    pub(crate) request_resolver: RequestTokenResolver,
+    pub(crate) provenance_line: String,
+    pub(crate) warning: Option<String>,
+}
+
+/// Probe Secret Service once, off the async worker and under a fixed budget,
+/// then freeze only its masked request-facing status. Clone/push resolution
+/// remains the ordinary live [`resolve_token`] path.
+pub(crate) async fn initialize_request_token_policy() -> StartupTokenPolicy {
+    let probe = probe_keyring_with(keyring_token, SETTINGS_KEYRING_PROBE_BUDGET).await;
+    let (keyring, warning) = match probe {
+        KeyringProbe::Completed(token) => (token, None),
+        KeyringProbe::TimedOut => (
+            None,
+            Some(format!(
+                "OS keyring did not answer within {}s; treating it as unavailable for Settings until restart",
+                SETTINGS_KEYRING_PROBE_BUDGET.as_secs()
+            )),
+        ),
+        KeyringProbe::WorkerFailed(reason) => (
+            None,
+            Some(format!(
+                "OS keyring startup worker failed ({reason}); treating it as unavailable for Settings until restart"
+            )),
+        ),
+    };
+
+    let request_resolver = RequestTokenResolver::from_startup_keyring(keyring.as_deref());
+    let resolved = resolve_from(
+        || keyring,
+        || env_token(GIT_VISTA_ENV),
+        || env_token(GH_ENV),
+        file_token,
+    );
+    let provenance_line = provenance_line_of(resolved.as_ref());
+
+    StartupTokenPolicy {
+        request_resolver,
+        provenance_line,
+        warning,
+    }
 }
 
 /// Where the tier-3 fallback file lives and what it holds, read as plain
@@ -169,23 +328,28 @@ pub(crate) enum StoreTokenError {
 /// header on why absence folds to `None` at every READ tier; a WRITE has no
 /// equivalent safe default to fold into.
 pub(crate) fn store_token(token: &str) -> Result<(), StoreTokenError> {
+    store_token_with(token, |trimmed| {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USERNAME)
+            .map_err(|error| error.to_string())?;
+        entry
+            .set_password(trimmed)
+            .map_err(|error| error.to_string())
+    })
+}
+
+/// Dependency-injected half of [`store_token`]. Besides making the blank and
+/// error boundaries directly testable, this keeps ordinary host tests from
+/// ever opening — or overwriting — the operator's real keyring entry.
+fn store_token_with<F>(token: &str, write: F) -> Result<(), StoreTokenError>
+where
+    F: FnOnce(&str) -> Result<(), String>,
+{
     let trimmed = non_blank(token.to_string()).ok_or(StoreTokenError::Blank)?;
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USERNAME)
-        .map_err(|e| StoreTokenError::Keyring(e.to_string()))?;
-    entry
-        .set_password(&trimmed)
-        .map_err(|e| StoreTokenError::Keyring(e.to_string()))
+    write(&trimmed).map_err(StoreTokenError::Keyring)
 }
 
-/// The settings surface's read side (M13.03, #584): whether a token is
-/// configured right now, through the exact same resolver the credential
-/// helper uses.
-pub(crate) fn token_status() -> TokenStatus {
-    token_status_of(resolve_token())
-}
-
-/// Pure half of [`token_status`], dependency-injected so the property that
-/// matters most is host-tested directly rather than only reasoned about:
+/// Pure status constructor, dependency-injected so the property that matters
+/// most is host-tested directly rather than only reasoned about:
 /// **the resolved token itself never reaches the returned value.** `masked`
 /// is built from [`mask_token`] and `source` from [`TokenSource::label`] —
 /// there is no path from `resolved`'s `String` into this function's return
@@ -213,13 +377,19 @@ pub(crate) fn token_status_of(resolved: Option<(String, TokenSource)>) -> TokenS
 /// answer to #583's "the resolver says which source answered": a stale env
 /// var shadowing a fresh keyring entry shows up here as `env var
 /// GIT_VISTA_GITHUB_TOKEN (...wxyz)`, not silence.
+#[cfg(test)]
 pub(crate) fn provenance_line() -> String {
-    match resolve_token() {
+    let resolved = resolve_token();
+    provenance_line_of(resolved.as_ref())
+}
+
+fn provenance_line_of(resolved: Option<&(String, TokenSource)>) -> String {
+    match resolved {
         Some((token, source)) => {
             format!(
                 "git-vista: GitHub token: {} ({})",
                 source.label(),
-                mask_token(&token)
+                mask_token(token)
             )
         }
         None => "git-vista: GitHub token: none configured (only needed for private repositories)"
@@ -332,32 +502,39 @@ mod tests {
 
     #[test]
     fn store_token_rejects_a_blank_value_before_touching_the_keyring() {
-        assert_eq!(store_token(""), Err(StoreTokenError::Blank));
-        assert_eq!(store_token("   "), Err(StoreTokenError::Blank));
+        let writes = std::cell::Cell::new(0);
+        for blank in ["", "   "] {
+            assert_eq!(
+                store_token_with(blank, |_| {
+                    writes.set(writes.get() + 1);
+                    Ok(())
+                }),
+                Err(StoreTokenError::Blank)
+            );
+        }
+        assert_eq!(writes.get(), 0, "a blank token reached the keyring writer");
     }
 
     #[test]
     fn store_token_error_messages_never_contain_the_attempted_value() {
-        // The keyring backend in this sandbox has no storage access, so this
-        // exercises the real failure path store_token must report honestly
-        // (unlike a read, a write failure is not folded to a quiet `None`).
-        // Built at runtime, like every other token-shaped fixture in this
-        // file (see `mask_token_keeps_only_the_last_four_characters` above)
-        // — a literal here would be a real-length `ghp_` token shape in
-        // tracked source, which the credential tripwire (#586, ADR 0123)
-        // and gitleaks' own full-history scan both exist to catch, even
-        // though the value itself grants access to nothing.
+        // Inject the backend refusal: an ordinary test must neither depend on
+        // Secret Service availability nor risk replacing the operator's real
+        // entry when it happens to be unlocked. Built at runtime, like every
+        // other token-shaped fixture in this file (see
+        // `mask_token_keeps_only_the_last_four_characters` above).
         let attempted = format!("ghp_{}", "wouldbeasecretifthisreallysaved0123456789");
-        if let Err(e) = store_token(&attempted) {
-            let message = match &e {
-                StoreTokenError::Blank => String::new(),
-                StoreTokenError::Keyring(reason) => reason.clone(),
-            };
-            assert!(
-                !message.contains(&attempted),
-                "a keyring failure message echoed the attempted token: {message}"
-            );
-        }
+        let result = store_token_with(&attempted, |received| {
+            assert_eq!(received, attempted);
+            Err("no storage access".to_string())
+        });
+        let StoreTokenError::Keyring(message) = result.unwrap_err() else {
+            panic!("the injected backend failure changed kind");
+        };
+        assert_eq!(message, "no storage access");
+        assert!(
+            !message.contains(&attempted),
+            "a keyring failure message echoed the attempted token: {message}"
+        );
     }
 
     #[test]
@@ -416,10 +593,10 @@ mod tests {
     #[test]
     fn precedence_prefers_keyring_over_every_other_source() {
         let resolved = resolve_from(
-            Some("from-keyring".to_string()),
-            Some("from-env-gv".to_string()),
-            Some("from-env-gh".to_string()),
-            Some("from-file".to_string()),
+            || Some("from-keyring".to_string()),
+            || Some("from-env-gv".to_string()),
+            || Some("from-env-gh".to_string()),
+            || Some("from-file".to_string()),
         );
         assert_eq!(
             resolved,
@@ -430,10 +607,10 @@ mod tests {
     #[test]
     fn precedence_falls_back_to_git_vista_env_when_keyring_is_absent() {
         let resolved = resolve_from(
-            None,
-            Some("from-env-gv".to_string()),
-            Some("from-env-gh".to_string()),
-            Some("from-file".to_string()),
+            || None,
+            || Some("from-env-gv".to_string()),
+            || Some("from-env-gh".to_string()),
+            || Some("from-file".to_string()),
         );
         assert_eq!(
             resolved,
@@ -444,10 +621,10 @@ mod tests {
     #[test]
     fn precedence_falls_back_to_gh_env_when_keyring_and_git_vista_env_are_absent() {
         let resolved = resolve_from(
-            None,
-            None,
-            Some("from-env-gh".to_string()),
-            Some("from-file".to_string()),
+            || None,
+            || None,
+            || Some("from-env-gh".to_string()),
+            || Some("from-file".to_string()),
         );
         assert_eq!(
             resolved,
@@ -457,13 +634,142 @@ mod tests {
 
     #[test]
     fn precedence_falls_back_to_file_when_every_other_source_is_absent() {
-        let resolved = resolve_from(None, None, None, Some("from-file".to_string()));
+        let resolved = resolve_from(|| None, || None, || None, || Some("from-file".to_string()));
         assert_eq!(resolved, Some(("from-file".to_string(), TokenSource::File)));
     }
 
     #[test]
     fn precedence_is_none_when_every_source_is_absent() {
-        assert_eq!(resolve_from(None, None, None, None), None);
+        assert_eq!(resolve_from(|| None, || None, || None, || None), None);
+    }
+
+    fn counted_source<'a>(
+        calls: &'a std::cell::Cell<usize>,
+        value: Option<&'static str>,
+    ) -> impl FnOnce() -> Option<String> + 'a {
+        move || {
+            calls.set(calls.get() + 1);
+            value.map(str::to_string)
+        }
+    }
+
+    fn assert_lazy_resolution(
+        values: [Option<&'static str>; 4],
+        expected_calls: [usize; 4],
+        expected_source: Option<TokenSource>,
+    ) {
+        let calls: [std::cell::Cell<usize>; 4] = std::array::from_fn(|_| 0.into());
+        let resolved = resolve_from(
+            counted_source(&calls[0], values[0]),
+            counted_source(&calls[1], values[1]),
+            counted_source(&calls[2], values[2]),
+            counted_source(&calls[3], values[3]),
+        );
+
+        assert_eq!(
+            calls.each_ref().map(std::cell::Cell::get),
+            expected_calls,
+            "a source below the winning tier was evaluated"
+        );
+        assert_eq!(resolved.map(|(_, source)| source), expected_source);
+    }
+
+    #[test]
+    fn resolution_evaluates_source_functions_only_through_the_winning_tier() {
+        assert_lazy_resolution(
+            [Some("keyring"), Some("gv"), Some("gh"), Some("file")],
+            [1, 0, 0, 0],
+            Some(TokenSource::Keyring),
+        );
+        assert_lazy_resolution(
+            [None, Some("gv"), Some("gh"), Some("file")],
+            [1, 1, 0, 0],
+            Some(TokenSource::EnvGitVista),
+        );
+        assert_lazy_resolution(
+            [None, None, Some("gh"), Some("file")],
+            [1, 1, 1, 0],
+            Some(TokenSource::EnvGh),
+        );
+        assert_lazy_resolution(
+            [None, None, None, Some("file")],
+            [1, 1, 1, 1],
+            Some(TokenSource::File),
+        );
+    }
+
+    #[test]
+    fn request_status_uses_the_masked_keyring_snapshot_without_lower_reads() {
+        let resolver = RequestTokenResolver::from_startup_keyring(Some("keyring-secret-tail"));
+        let lower_calls = std::cell::Cell::new(0);
+        let status = resolver.status_from(
+            || {
+                lower_calls.set(lower_calls.get() + 1);
+                None
+            },
+            || {
+                lower_calls.set(lower_calls.get() + 1);
+                None
+            },
+            || {
+                lower_calls.set(lower_calls.get() + 1);
+                None
+            },
+        );
+
+        assert_eq!(lower_calls.get(), 0);
+        assert_eq!(status.source.as_deref(), Some(TokenSource::Keyring.label()));
+        assert_eq!(status.masked.as_deref(), Some("...tail"));
+    }
+
+    #[tokio::test]
+    async fn repeated_request_status_calls_never_repeat_the_startup_keyring_probe() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let keyring_calls = Arc::new(AtomicUsize::new(0));
+        let calls_in_probe = keyring_calls.clone();
+        let probe = probe_keyring_with(
+            move || {
+                calls_in_probe.fetch_add(1, Ordering::SeqCst);
+                None
+            },
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(probe, KeyringProbe::Completed(None)));
+
+        let resolver = RequestTokenResolver::without_keyring();
+        for _ in 0..3 {
+            let status = resolver.status_from(|| None, || None, || None);
+            assert!(!status.configured);
+        }
+        assert_eq!(keyring_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_stuck_startup_keyring_probe_times_out() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let probe = probe_keyring_with(
+            move || {
+                let _ = release_rx.recv();
+                None
+            },
+            Duration::from_millis(10),
+        )
+        .await;
+        assert!(matches!(probe, KeyringProbe::TimedOut));
+        let _ = release_tx.send(());
+    }
+
+    #[test]
+    fn a_successful_store_updates_status_without_a_keyring_read_back() {
+        let resolver = RequestTokenResolver::without_keyring();
+        let status = resolver.record_successful_store("  newly-saved-tail  ");
+        assert!(status.configured);
+        assert_eq!(status.source.as_deref(), Some(TokenSource::Keyring.label()));
+        assert_eq!(status.masked.as_deref(), Some("...tail"));
+        assert_eq!(resolver.status(), status);
     }
 
     // -- env tier: blank values are absent, not "found but empty" --

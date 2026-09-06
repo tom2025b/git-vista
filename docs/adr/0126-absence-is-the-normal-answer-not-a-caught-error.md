@@ -4,7 +4,7 @@
 - **Date:** 2026-09-05
 - **Issue:** #583 (M13.02)
 - **Extends:** [ADR 0122](0122-the-token-is-a-credential-not-a-header.md) (decision 9 names `state::credential_token()` as the placeholder this ADR replaces) · `docs/SECURITY_MODEL.md`'s "Remote and Forge Credentials" section, whose "OS keyring / encrypted local store" row this moves from Aspirational to Implemented
-- **Supersedes / superseded by:** —
+- **Supersedes / superseded by:** evaluation mechanism amended by [ADR 0132](0132-a-settings-read-never-negotiates-with-a-locked-keyring.md) (#692): the precedence engine now takes lazy source functions rather than pre-built values
 
 ## Context
 
@@ -15,8 +15,8 @@ comes from* as a one-line placeholder, `state::credential_token()` reading
 `GIT_VISTA_GITHUB_TOKEN` directly, because #582 needed a real production
 call site to prove the helper mechanism, not a mock.
 
-#583 is the real answer to that placeholder: a keyring first, an
-environment variable second, a gitignored local file last. The issue names
+#583 is the real answer to that placeholder: a keyring first, two
+environment variables, then a gitignored local file. The issue names
 four rules verbatim, and each shaped a decision below:
 
 - Never printed. Masked to the last 4 characters anywhere its existence is
@@ -54,27 +54,30 @@ more than it first looked).
 
 ```mermaid
 flowchart TD
-    RT["resolve_token()"] --> KT["keyring_token()"]
-    RT --> GVT["env_token(GIT_VISTA_GITHUB_TOKEN)"]
-    RT --> GHT["env_token(GH_TOKEN)"]
-    RT --> FT["file_token()"]
-    KT --> RF["resolve_from(keyring, env_gv, env_gh, file)"]
-    GVT --> RF
-    GHT --> RF
-    FT --> RF
-    RF -->|first Some, in order| OUT["Option<(String, TokenSource)>"]
+    RT["resolve_token()"] --> RF["resolve_from(source functions, in order)"]
+    RF --> KT["keyring_token()"]
+    KT -->|Some| OUT["Option<(String, TokenSource)>"]
+    KT -->|None| GVT["env_token(GIT_VISTA_GITHUB_TOKEN)"]
+    GVT -->|Some| OUT
+    GVT -->|None| GHT["env_token(GH_TOKEN)"]
+    GHT -->|Some| OUT
+    GHT -->|None| FT["file_token()"]
+    FT --> OUT
 ```
 
-`resolve_from` takes four `Option<String>` values and returns the first
-`Some`, tagged with which position it came from — nothing else. It never
-touches the OS keyring, the environment, or disk, which is what makes
+As amended by ADR 0132, `resolve_from` takes four
+`FnOnce() -> Option<String>` source functions, invokes them in order, and
+returns immediately on the first `Some`, tagged with which position it came
+from. The injected functions keep it separated from any particular OS
+keyring, environment, or disk implementation, which is what makes
 "precedence is asserted, not assumed" (the issue's own acceptance wording)
-a claim a test can actually check: five tests exercise every ordering
+a claim a test can actually check. Five value tests exercise every ordering
 (keyring beats everything, `GIT_VISTA_GITHUB_TOKEN` beats `GH_TOKEN` and
 the file, `GH_TOKEN` beats only the file, the file is the last resort, and
-all-absent is `None`) by constructing the four inputs directly, with no
-real credential store, environment mutation, or filesystem I/O in any of
-them. The real sources (`keyring_token`, `env_token`, `file_token`) are
+all-absent is `None`); a separate counter test proves no function below a
+winner is evaluated. None uses a real credential store, environment
+mutation, or filesystem I/O. The real sources (`keyring_token`, `env_token`,
+`file_token`) are
 each tested once, separately, against their own concerns (a blank value is
 absent, whitespace is trimmed, a missing file is absent) — composition and
 per-source correctness are two different claims, tested two different

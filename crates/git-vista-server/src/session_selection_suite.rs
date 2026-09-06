@@ -46,7 +46,13 @@ fn router_and_manager() -> (Router, Arc<SessionManager>) {
         rate_limiter: None,
     };
     let hosts = crate::security::HostPolicy::loopback(state::PORT);
-    let router = crate::api_router(session_state, hosts, true, Arc::new(codec()));
+    let router = crate::api_router(
+        session_state,
+        hosts,
+        true,
+        Arc::new(codec()),
+        Arc::new(crate::token_store::RequestTokenResolver::without_keyring()),
+    );
     (router, sessions)
 }
 
