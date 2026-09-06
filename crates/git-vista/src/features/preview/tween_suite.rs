@@ -425,6 +425,70 @@ fn main_badge_at(frame: &Frame) -> &FrameBadge {
         .expect("the main ref badge exists in this frame")
 }
 
+/// #670 item E, the other half of the claim: the fix's own doc says a mark
+/// tag `half_scene` drops for width must leave the floating badge as the
+/// SOLE surviving indicator, not vanish alongside it. A mutation that hides
+/// the badge on a bare `t >= REVEAL_AFTER` cutoff — rather than checking the
+/// tag is genuinely showing — passes every other test in this file (none of
+/// their fixtures ever hit the row-tag width budget) and only breaks here.
+///
+/// Forces the drop deliberately: `LABEL_W` is a 208px budget and
+/// `tag_width` costs `len*6 + 8` per pill, `TAG_GAP` 4px between them. A
+/// 28-char filler branch costs 176px — comfortably under budget alone — but
+/// leaves only 28px free, and `→main`'s pill costs 38, so it is the one
+/// `half_scene::push` silently drops (its own doc: "a row missing its badge
+/// would read as nothing moved here").
+#[test]
+fn a_landed_ref_whose_mark_tag_is_dropped_for_width_keeps_its_floating_badge() {
+    let filler = "a".repeat(28);
+    let before = Half {
+        rows: vec![
+            row(0, 0, vec![head(0), branch("main", 0)]),
+            row(1, 0, Vec::new()),
+        ],
+        edges: vec![edge(0, 0, 1, 0)],
+        stubs: Vec::new(),
+        lane_count: 1,
+    };
+    let after = Half {
+        rows: vec![
+            row(0, 0, vec![head(0)]),
+            row(1, 0, vec![branch(&filler, 1), branch("main", 1)]),
+        ],
+        edges: vec![edge(0, 0, 1, 0)],
+        stubs: Vec::new(),
+        lane_count: 1,
+    };
+    let changes = vec![PreviewChange::RefMoved {
+        ref_name: "main".into(),
+        from: oid(0),
+        to: oid(1),
+    }];
+    let p = picture(before, after, changes);
+    let scene = tween_of(&p);
+
+    let at_1 = sample(&scene, 1.0);
+    let landing = at_1
+        .nodes
+        .iter()
+        .find(|n| n.commit_id == oid(1).0)
+        .expect("commit 1 is drawn in the after picture");
+    assert!(
+        !landing.tags.iter().any(|t| t.text == "→main"),
+        "the fixture's own premise: the mark tag must actually be dropped for \
+         width here, or this test proves nothing about the fallback path. \
+         Tags drawn: {:?}",
+        landing.tags.iter().map(|t| &t.text).collect::<Vec<_>>()
+    );
+    let b1 = main_badge_at(&at_1);
+    assert_eq!(
+        b1.opacity, 1.0,
+        "the floating badge must stay visible when its mark tag was dropped \
+         for width — hiding it too would silently lose the only indicator \
+         that this ref moved at all"
+    );
+}
+
 #[test]
 fn an_operation_with_no_ref_moves_produces_no_badges() {
     // A picture with only a lane shift and no ref move at all.
