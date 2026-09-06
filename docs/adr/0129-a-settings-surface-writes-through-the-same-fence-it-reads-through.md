@@ -1,10 +1,17 @@
 # ADR 0129 — A settings surface writes through the same fence it reads through
 
-- **Status:** Accepted — implemented, mutation-proved two ways failing differently
+- **Status:** Accepted — implemented, mutation-proved two ways failing differently · Amended 2026-09-06 (#693): decision 4 scopes uniqueness to the server response path that receives the resolved secret
 - **Date:** 2026-09-06
 - **Issue:** #584 (M13.03)
 - **Extends:** [ADR 0126](0126-absence-is-the-normal-answer-not-a-caught-error.md) (#583) — that ADR's own Consequences section names this exact gap: "A future settings surface (#584 territory) that lets an operator *write* a token still needs its own design — this ADR covers resolution (reading), not provisioning." · `docs/SECURITY_MODEL.md`'s token-storage row, which this adds a sibling row beside
-- **Supersedes / superseded by:** —
+- **Supersedes / superseded by:** Decision 3's live request-time keyring read is superseded by [ADR 0132](0132-a-settings-read-never-negotiates-with-a-locked-keyring.md) (#692); the write target, error posture, masking guarantee, and route boundary remain in force
+
+> **2026-09-06 amendment (#692):** Decision 3 originally required every
+> Settings GET and successful POST to call the live resolver. That made a
+> synchronous Secret Service unlock attempt part of an async request. ADR
+> 0132 replaces only that request-time read policy with one bounded startup
+> keyring observation plus a masked snapshot; the sections below state the
+> amended contract rather than preserving a known-false runtime claim.
 
 ## Context
 
@@ -76,19 +83,25 @@ failure, `502`, carrying the backend's own diagnostic text) — and the HTTP
 handler reports one or the other rather than a bare `200` regardless of
 outcome.
 
-### 3. The read side reports what is ACTUALLY live, not what this surface last wrote
+### 3. The read side follows the same precedence without a request-time keyring call
 
-`token_status()` calls `token_store::resolve_token()` — the exact same
-function the credential helper uses — rather than checking "does my
-keyring entry exist." This matters concretely: if a save succeeds and the
-keyring later becomes unreadable (a D-Bus outage, a locked session — the
-gap `codex-daybreak`'s #680 audit named independently the same morning,
-where a keyring failure resolves to `None` silently and a stale
-`GH_TOKEN` from months ago answers instead), `token_status` reflects
-whichever tier is *actually* winning right now, live, on every call — never
-a cached belief about the write that once succeeded.
+ADR 0132 supersedes this decision's original "resolve everything live on
+every request" mechanism. `RequestTokenResolver` retains only the masked
+status of a keyring value observed during one startup probe, bounded at two
+seconds and run on Tokio's blocking pool. A GET first uses that snapshot;
+when no usable keyring was observed, it evaluates
+`GIT_VISTA_GITHUB_TOKEN`, then `GH_TOKEN`, then the fallback file lazily
+and live. It never calls the synchronous keyring API.
 
-### 4. The only production constructor cannot put the value on the wire, and that is proved at the wire, not by inspecting the type
+A successful POST still establishes a real fact: `set_password` returned
+success for the highest-precedence tier. It updates the same masked snapshot
+from the submitted value and returns it without a D-Bus read-back. An
+external keyring change after startup is therefore not reflected until a
+successful Settings write or restart. That deliberate staleness replaces an
+unbounded, repeatable unlock interaction on the request path; ADR 0132 owns
+the trade-off and exact locked-keyring behavior.
+
+### 4. The only server response-construction path that receives the resolved secret cannot put it on the wire, and that is proved at the wire, not by inspecting the type
 
 `TokenStatus { configured: bool, masked: Option<String>, source:
 Option<String> }` is not itself sealed against carrying the value —
@@ -100,18 +113,21 @@ gets checked: *"The value is never returned by any read endpoint —
 asserted at the wire level, not by inspection."*
 
 ```mermaid
-flowchart TD
-    RT["resolve_token, returns the resolved token plus which tier answered"] --> TSO["token_status_of — pure, dependency-injected, the ONLY production constructor"]
-    TSO -->|builds only: configured, masked, source| TS["TokenStatus"]
-    TS -->|serde_json::to_string| WIRE["the actual HTTP response body"]
+flowchart LR
+    RT["resolve_token — resolved token plus source"] --> TSO["token_status_of — ONLY server response path given the secret"]
+    TSO -->|configured, masked, source| TS["TokenStatus"]
+    TS -->|serialize| WIRE["HTTP response body"]
 ```
 
-- **The constructor.** `token_status_of` is the only place production code
-  builds a `TokenStatus`. It always sets `masked` from `mask_token`'s
+- **The server response path.** `token_status_of` is the only server
+  production response-construction path that receives the resolved secret.
+  It always sets `masked` from `mask_token`'s
   output and `source` from `TokenSource::label()`'s fixed `&'static str` —
-  never the resolved `String` itself. A future caller that hand-built a
-  `TokenStatus` some other way would not be stopped by the type; it would
-  be a new, unaudited construction site.
+  never the resolved `String` itself. The shipped frontend separately builds
+  an unconfigured `TokenStatus` literal for initial dialog state; that site
+  receives no resolved secret and is outside this narrower invariant. A
+  future server response path that received the secret without using
+  `token_status_of` would be a new, unaudited construction site.
 - **The test.** `token_status_of`'s host tests do not merely construct a
   `TokenStatus` and inspect its fields — they call
   `serde_json::to_string(&status)` (the actual wire serialization a client
@@ -123,7 +139,8 @@ This is a constructor-and-wire-test guarantee, not a type-level seal — a
 narrower and more honest claim than "the type cannot carry it." A type-level
 seal would need a newtype with a private inner (`Masked(String)`, say,
 constructible only via `mask_token`); nothing here builds one, because the
-one production path is already covered and a newtype is a bigger change
+one server production response path that receives the resolved secret is
+already covered and a newtype is a bigger change
 than #584 asked for.
 
 ### 5. Both routes sit behind the full write posture, and never the LAN listener
@@ -147,17 +164,17 @@ decision 1. This is the alternative that most looks like completeness
 1 argues against: a save that appears to succeed while silently landing in
 a weaker store than the one the UI implies.
 
-**Report `token_status` from whether the settings surface's own last write
-succeeded, cached in server state.** Rejected — decision 3. This would
-answer "did I save something" rather than "is a token live right now,"
-and would have reported "configured" straight through the exact `#680`-
-shaped failure (a keyring gone unreadable after a successful save)
-`codex-daybreak`'s audit flagged. Calling the real resolver costs nothing
-extra — it is already a fast, local call — and answers the question users
-actually have.
+**Cache only whether the settings surface's own last write succeeded.** The
+original decision rejected this in favor of a fully live read. ADR 0132's
+replacement is narrower than that rejected design: startup first makes one
+bounded real keyring observation, stores only its masked status, and a later
+successful POST updates it. Environment/file tiers remain live. The change
+was necessary because the supposedly "fast, local" keyring call is a
+synchronous D-Bus operation that can attempt an unlock and wait indefinitely.
 
 **Mask by inspection only (read the struct definition, confirm the only
-production constructor masks the value) rather than a runtime wire-level
+server production response path with the resolved secret masks the value)
+rather than a runtime wire-level
 test.** Rejected — decision 4, and the issue's own wording ("asserted at
 the wire level, not by inspection") rules this out explicitly. Reading the
 code and running it are different claims; ADR 0115's own
@@ -175,20 +192,21 @@ or not.
 
 ## Consequences
 
-- `token_store.rs` gains its first write path since #582/#583 stood up the
-  read side — `store_token`, `StoreTokenError`, `token_status`,
-  `token_status_of` — all additive; `resolve_token`, `resolve_from`, and
-  `mask_token` are unchanged.
+- `token_store.rs` gained its first write path here — `store_token`,
+  `StoreTokenError`, and `token_status_of`. ADR 0132 later replaced
+  `token_status` with the request-scoped `RequestTokenResolver` and changed
+  `resolve_from` to accept lazy source functions; `resolve_token`'s public
+  precedence and provenance remain unchanged.
 - The credential chain now has two independent, non-overlapping efforts
   touching it the same day: this ADR (provisioning) and `#680`
   (containment — descendants inheriting the token from the environment,
   clone relaying raw child stderr). Neither modifies the other's surface;
   `git log` and each PR's own diff are the record of that, not this
   document's claim alone.
-- A future diagnostics surface (`gv doctor`, a CLI flag) that wants to
-  report token status now has `token_status()` ready rather than needing
-  to re-derive provenance from scratch — the same shape ADR 0126's own
-  Consequences section predicted for `provenance_line()`.
+- A future diagnostics surface (`gv doctor`, a CLI flag) must choose
+  explicitly between live credential resolution and ADR 0132's bounded
+  request policy; there is no longer one `token_status()` pretending those
+  have the same blocking contract.
 - The settings dialog (`dialogs::settings`, wasm-only) is deliberately
   thin: every decision it needs — the status sentence, whether Save is
   enabled, what the input field holds after a save settles — lives in
