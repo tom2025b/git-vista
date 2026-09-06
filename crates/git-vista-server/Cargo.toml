@@ -105,6 +105,14 @@ keyring = { version = "4.2.0", default-features = false, features = ["v1", "zbus
 # suites drive, built once in one place. Dev-only — no shipped code builds a
 # fixture, and the crate must never reach the release binary.
 git-vista-fixtures = { workspace = true }
+# #661's temporary component-breakdown measurement
+# (planner/sweep_component_measure.rs) isolates gix's own `open` cost from
+# its ref walk — a question `git-vista-git`'s public surface has no answer
+# for without adding a measurement-only export there. Dev-only and temporary:
+# delete this line together with that file once #661 closes. Same pin/feature
+# set as `git-vista-git/Cargo.toml`'s own gix dependency, for the reason
+# recorded there.
+gix = { version = "=0.84.0", default-features = false, features = ["sha1", "revision"] }
 # The exact crate axum's `Query` extractor parses with, so a test that says
 # "this is the query string the browser sends" is parsed by the same code the
 # handler will meet it with. Already in the lock as an axum dependency.
