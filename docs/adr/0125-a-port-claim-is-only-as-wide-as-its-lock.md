@@ -1,4 +1,4 @@
-# ADR 0124 — A port claim is only as wide as its lock
+# ADR 0125 — A port claim is only as wide as its lock
 
 - **Status:** Accepted — implemented, mutation-proved two ways failing differently
 - **Date:** 2026-09-06

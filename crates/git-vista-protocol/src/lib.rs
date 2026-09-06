@@ -81,6 +81,7 @@
 pub mod newtype;
 
 pub mod activity;
+pub mod blame;
 pub mod change_feed;
 pub mod effects;
 
