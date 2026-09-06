@@ -38,7 +38,7 @@ use crate::sandbox::NetworkNeed;
 
 use super::{
     couldnt_run, journal_app_event, rev_parse_ref_unpeeled, run_git, run_git_argv, short,
-    stderr_or, Obs, Observed,
+    stderr_or, Obs, Observed, RunFailure,
 };
 
 // `create_tag_argv` moved to `git_vista_protocol::plan_export` with M10
@@ -91,7 +91,7 @@ pub(super) async fn exec_create_tag(
     } else {
         match run_git(repo, need, &args).await {
             Ok(o) => o,
-            Err(e) => return couldnt_run("/api/tag", &e),
+            Err(e) => return couldnt_run("/api/tag", RunFailure::Spawn, &e),
         }
     };
 
@@ -224,7 +224,7 @@ async fn run_signed_tag(
     name: &TagName,
 ) -> Result<Output, (StatusCode, String)> {
     match crate::git_cmd::git_output_bounded(repo, args, need, SIGN_TIMEOUT).await {
-        Err(e) => Err(couldnt_run("/api/tag", &e)),
+        Err(e) => Err(couldnt_run("/api/tag", RunFailure::Spawn, &e)),
         Ok(crate::git_cmd::BoundedOutput::Completed(output)) => Ok(output),
         Ok(crate::git_cmd::BoundedOutput::TimedOut) => {
             eprintln!(
@@ -435,7 +435,7 @@ pub(super) async fn exec_delete_local_tag(
 ) -> (StatusCode, String) {
     let output = match run_git_argv(repo, need, &plan_export::delete_local_tag_argv(name)).await {
         Ok(o) => o,
-        Err(e) => return couldnt_run("/api/delete-tag", &e),
+        Err(e) => return couldnt_run("/api/delete-tag", RunFailure::Spawn, &e),
     };
     if !output.status.success() {
         let msg = stderr_or(&output, "git tag -d failed.");

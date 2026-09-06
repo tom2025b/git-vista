@@ -383,6 +383,7 @@ pub(super) async fn exec_push(
         Err(why) => {
             return couldnt_run(
                 ENDPOINT,
+                RunFailure::ReadRemoteRefs,
                 &format!("couldn't list refs/remotes/{}: {why}", remote.as_str()),
             )
         }
@@ -422,7 +423,7 @@ pub(super) async fn exec_push(
     .await;
     let run = match run {
         Ok(run) => run,
-        Err(e) => return couldnt_run(ENDPOINT, &e),
+        Err(e) => return couldnt_run(ENDPOINT, RunFailure::Spawn, &e),
     };
 
     // --- 5. what the repository says happened -------------------------------
@@ -432,6 +433,7 @@ pub(super) async fn exec_push(
             journal_unobserved(repo, branch, remote, &why).await;
             return couldnt_run(
                 ENDPOINT,
+                RunFailure::PushUnobserved,
                 &format!(
                     "the push ran but refs/remotes/{} could not be re-read, so what it \
                      did to the remote is unknown: {why}",
