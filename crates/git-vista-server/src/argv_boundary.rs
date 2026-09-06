@@ -111,6 +111,10 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // `routing_suite.rs` — the fourth split-out file, covering route
     // registration and the `?repo=` selector — constructs no `Command` and is
     // deliberately not listed here.
+    // #89: cfg(test)-only `git init` and `git config` build local fixtures
+    // for the stalled-provider and exact-origin composition regressions.
+    // The production forge handler constructs no subprocess Command.
+    "src/handlers/forge/tests.rs",
     "src/handlers/read/content_suite.rs",
     "src/handlers/read/graph_suite.rs",
     "src/handlers/read/status_suite.rs",

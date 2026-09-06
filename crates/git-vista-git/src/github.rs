@@ -4,6 +4,15 @@
 
 use std::path::Path;
 
+/// The exact configured origin URL, for adapters that must validate the whole
+/// destination before reducing it to a display link. No normalization or I/O
+/// against the remote is performed.
+pub fn origin_url(path: &Path) -> Option<String> {
+    let repo = gix::open_opts(path, gix::open::Options::isolated()).ok()?;
+    let url = repo.config_snapshot().string("remote.origin.url")?;
+    Some(url.to_string())
+}
+
 /// The GitHub web base URL for a repository's `origin` remote, e.g.
 /// `"https://github.com/owner/repo"`, or `None` when there's no `origin`, the URL
 /// can't be parsed, or the host isn't github.com. The UI turns this into per-commit

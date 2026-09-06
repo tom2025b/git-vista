@@ -54,6 +54,8 @@ notify = "8.2"
 # The durable operation journal (M1.09, #62): SQLite so operation results
 # survive a process restart. `bundled` compiles SQLite in rather than linking
 # the system library — one less thing this headless server depends on finding.
+# Read-only forge HTTP; native only, TLS and no ambient proxy/redirects.
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 # cBPF assembly for the M1.13b (#66) sandbox shim's terminal-action seccomp
 # filter. Reviewed kernel-ABI dependency — see docs/NATIVE_DEPENDENCIES.md.
