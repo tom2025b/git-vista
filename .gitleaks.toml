@@ -141,3 +141,34 @@ commits = [
 fingerprints = [
   "6f9ef5da0bce57709b1c075b8e9bd0112564e89d:docs/adr/0123-the-safety-lives-in-the-shape-not-a-list.md:generic-api-key:211",
 ]
+
+[[allowlists]]
+targetRules = ["github-pat"]
+description = """
+False positive, commit 62ef8a67 only. #584 (M13.03).
+
+A test fixture (store_token_error_messages_never_contain_the_attempted_
+value, token_store.rs) built a `ghp_`-prefixed, real-length string to
+exercise the write-failure path — the same shape `mask_token`'s own test
+fixtures use elsewhere in this file, but as a bare literal rather than
+built via format!() at runtime the way those are. It is not a credential:
+nothing was ever minted with this value, and it grants access to nothing.
+
+The literal was reworded to build at runtime in a LATER commit on this same
+branch, so no commit on the branch's current tip contains it — but this
+entry is still required. gitleaks' full-history scan reaches every commit
+reachable in the local clone, not only the branch tip's own ancestry filtered
+to what changed, and commit 62ef8a67 (the ORIGINAL commit containing the
+literal) was already pushed to origin before the reword landed. Editing
+that commit now would mean rewriting already-pushed history, which this
+file's header rules out for the same reason the gv-586-tripwire entry
+above does — a force-push to silence a scanner is a cure worse than the
+disease, whether or not the branch has reached main yet. The commit is
+history the moment it is pushed, not only once merged.
+"""
+commits = [
+  "62ef8a6745e063e102d2891dd725d4d2198ca002",
+]
+fingerprints = [
+  "62ef8a6745e063e102d2891dd725d4d2198ca002:crates/git-vista-server/src/token_store.rs:github-pat:337",
+]
