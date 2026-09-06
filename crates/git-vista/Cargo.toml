@@ -44,6 +44,7 @@ web-sys = { version = "0.3", features = [
     # Activity/Undo step 2: get_element_by_id, so "Show diff" can scroll the
     # detail panel's Changes section into view once it renders.
     "Document",
+    "HtmlAnchorElement",
     "DomRect",
     "Element",
     # M1.11 (#64): the operation progress stream. `EventSource` cannot set request

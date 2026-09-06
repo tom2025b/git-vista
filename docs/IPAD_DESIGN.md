@@ -213,37 +213,45 @@ Every release candidate should cover:
   loudly** — not a test of a cached or offline-readable view, which the ADR
   rejects outright.
 
-> **Note on #75's cache criteria.** #75's original acceptance criteria "Private
-> diffs are not cached by default" and "Cache clear and export controls exist"
-> are satisfied *vacuously* here: the frontend has no client-side cache of
-> `/api` data (diffs, commits, graph payloads) to clear or export in the first
-> place. Verified against `crates/git-vista/src` (2026-08-07, corrected count):
-> `grep -rn "localStorage\|sessionStorage" crates/git-vista/src` turns up
-> **three** `localStorage` entries plus `sessionStorage` use, not the two
-> booleans this note previously claimed:
-> - `prefs.rs` — two UI-preference booleans in `localStorage` (icon style,
->   per-node icons).
-> - `prefs.rs` `INFLIGHT_REMOTE_OP_KEY` — a third `localStorage` entry (#232,
->   M2.20f): a small JSON record (`remote`, `branch`, merge `strategy`) naming
->   the one Fetch/Pull in flight, so a reload can resume tracking it. Not `/api`
->   response data and not a diff, but it is more than a UI toggle, so it belongs
->   in this inventory.
-> - `features/dialogs/{signals,commit}.rs` and `core.rs` — commit-message
->   drafts in `sessionStorage` (#226), deliberately session-scoped rather than
->   `localStorage` so the draft dies with the tab.
->
-> None of these cache `/api` diff or commit data, so the "private diffs are not
-> cached" reading still holds. `grep -rn "IndexedDb\|caches\." crates/git-vista/src`
-> turns up nothing. ADR 0032 forbids adding a cache of `/api` data, so that part
-> is expected to stay true, not a gap to close.
->
-> This is the narrower, ADR-consistent reading: ADR 0032 rules out a service
-> worker and any "make offline look normal" outcome, but it does not
-> unambiguously rule out every possible non-service-worker, application-level
-> store. Whoever closes #75 (22d) should treat this as an explicit invitation to
-> override — if the original intent behind those two criteria was such a store,
-> say so and reopen the question rather than letting this reading stand by
-> default.
+### Browser persistence and #75 verification
+
+ADR 0032 still forbids a service worker and persisted API responses. The
+browser may retain static HTML, hashed JS/WASM/CSS, font, manifest and icons,
+but must revalidate them (`no-cache`). API responses are `no-store`; repository
+diffs, blobs, graph payloads and protocol negotiation have no offline cache.
+
+Current app-owned saved data (2026-09-06):
+
+- `localStorage`: icon style, per-node icons, checkpoint folding, Explain
+  section expansion; comparison selection; the identity of one already-started
+  Fetch/Pull (observation only); timestamped commit drafts per worktree.
+- Legacy `sessionStorage`: old `gv-commit-draft:*` entries can remain from an
+  older client. Current drafts use localStorage and survive tab closure.
+- Authentication remains in the session cookie; server credentials stay on
+  the server. These are not included in saved-data export or clear.
+
+Settings offers **Export preferences** (only three validated display toggles)
+and **Clear saved browser data…** (confirmation, remove app-owned entries from
+both stores, reload). Clear includes drafts, comparison choices and tracking;
+close other Git-Vista tabs first because they can save again. It does not cancel
+server operations. Browser settings own HTTP-cache eviction. These precise
+limits replace the earlier claim that cache controls were satisfied vacuously.
+See [ADR 0135](adr/0135-offline-refuses-writes-and-persistence-is-explicit.md).
+
+The browser suite exercises offline refusal before transport, no retry while
+offline, no replay on reconnect, and a loaded client against a v9–v9 server.
+A broken tunnel with `navigator.onLine == true` still surfaces ordinary network
+failure; the browser adapter's report cannot diagnose the tunnel.
+
+The physical iPad pass remains outstanding. In Safari, open the reachable
+Git-Vista URL, use Share → Add to Home Screen, then launch the new icon. Verify
+standalone display, correct icon and safe areas in portrait/landscape. Select a
+repository, open a write confirmation, disconnect, and verify refusal with no
+write after reconnect; a new explicit action is required. Check Settings export
+and clear with disposable drafts, then repeat with the Magic Keyboard and
+VoiceOver. With the tunnel down, a cold launch should show a connection failure.
+Run the remaining device matrix above before closing #75/#244. Chromium on
+titan does not establish that installed iPad launch works.
 
 ## Reference
 

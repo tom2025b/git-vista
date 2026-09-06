@@ -8,4 +8,7 @@
 //! question inline, the same split ADR 0115 already asks of every other
 //! feature here.
 
+#[cfg(target_arch = "wasm32")]
+pub mod browser_storage;
 pub mod core;
+pub mod storage;
