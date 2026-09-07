@@ -211,7 +211,7 @@ mod tests {
         assert!(view.contains("detail().actions.contains(&action)"));
         let signals = include_str!("../signals.rs");
         assert!(signals.contains("current_reading("));
-        assert!(signals.contains("fetch_status_for(Some(id))"));
+        assert!(signals.contains("fetch_status_for(id)"));
         assert!(include_str!("../../../app/mod.rs").contains("status_chip_view("));
     }
     fn status(ahead: u32, behind: u32) -> RepoStatus {
