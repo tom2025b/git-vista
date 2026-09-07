@@ -685,7 +685,9 @@ fn the_pre_session_exemption_is_method_qualified() {
         .find("let session_exempt =")
         .expect("security.rs still binds session_exempt");
     let rest = &src[start..];
-    let end = rest.find(';').expect("the session_exempt binding ends in ;");
+    let end = rest
+        .find(';')
+        .expect("the session_exempt binding ends in ;");
     let expr = &rest[..end];
 
     let clauses: Vec<&str> = expr.split("||").collect();

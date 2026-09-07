@@ -1,124 +1,330 @@
 # ADR 0134 — Two censuses that must agree are checked against each other
 
-- **Status:** Accepted — implemented, mutation-proved two ways failing differently
-- **Date:** 2026-09-06
-- **Issue:** #690
-- **Extends:** [ADR 0119](0119-a-guarantee-that-holds-only-on-the-success-arm-is-not-a-guarantee.md) — "a list of known sites is not a fix, because that list was already incomplete twice — the safety has to live in the value," applied one level up: not to a list of call sites, but to two independently hand-maintained *tables*, each individually complete, that must both change together
+- **Status:** Accepted — implemented, mutation-proved two ways per invariant, all five arms caught
+- **Date:** 2026-09-07
+- **Issues:** #690 (two route censuses), #705 (the pre-session allowlist and its runtime)
+- **Extends:** [ADR 0119](0119-a-guarantee-that-holds-only-on-the-success-arm-is-not-a-guarantee.md) — "a list of known sites is not a fix, because that list was already incomplete twice — the safety has to live in the value," applied one level up: not to a list of call sites, but to two independently hand-maintained *descriptions of the same thing*, each individually complete and individually well-guarded, that must both change together
+- **Builds on:** `route_authz.rs`'s existing route census and #703's `post_route_census`
 - **Supersedes / superseded by:** —
+
+## The shape, in one sentence
+
+When two artefacts describe the same underlying thing for different reasons,
+guarding each one against the *thing* is not enough — something must also
+check them against **each other**, or the first edit that satisfies one and
+forgets the other passes every test that exists.
+
+```mermaid
+flowchart TD
+    ROUTER["<b>main.rs api_router</b><br/>the thing itself"]
+    A["<b>Census A</b><br/>route_authz.rs<br/>authorization posture"]
+    B["<b>Census B</b><br/>contract_suite.rs<br/>planner-funnel membership"]
+
+    ROUTER -->|"guarded: every route classified"| A
+    ROUTER -->|"guarded: every POST classified"| B
+    A <-.->|"NOT guarded — the gap"| B
+
+    classDef thing fill:#1f3a5f,color:#ffffff,stroke:#0d1b2a,stroke-width:2px
+    classDef ok fill:#1b5e20,color:#ffffff,stroke:#0b2e10,stroke-width:2px
+    classDef gap fill:#8c1c13,color:#ffffff,stroke:#4a0e08,stroke-width:2px
+    class ROUTER thing
+    class A,B ok
+```
+
+Both censuses were always correct. Neither was ever wrong on its own. The
+defect lived in the *absence of an edge* between them.
 
 ## Context
 
-`crates/git-vista-server/src/route_authz.rs`'s `ROUTE_AUTHZ` table classifies
-every route `main.rs`'s `api_router` registers by the authorization it must
-sit behind. `crates/git-vista-server/src/planner/contract_suite.rs`'s POST
-table (`KNOWN_POST_ROUTES` after this change) classifies every POST route as
-either a git write that must reach the planner, or an explicitly-argued
-non-git write. Both tables are individually well-guarded: each has its own
-test proving it agrees with `main.rs`, in both directions (nothing registered
-is unclassified, nothing classified has been quietly deleted). Neither table
-was ever wrong on its own.
+### The two censuses
 
-The gap is that **adding a route requires updating both**, and nothing
-connects them. Building #584/PR#688's `POST /api/settings/token` proved this
-concretely: a `PostToolUse` hook (`.claude/hooks/route-census-check.sh`) fires
-on every edit to `route_authz.rs` or `main.rs` and runs
-`every_registered_route_is_classified` — so `ROUTE_AUTHZ` got the new route
-immediately, at edit time, loudly. The hook does not know
-`contract_suite.rs`'s table exists, so it never ran
-`every_git_write_route_reaches_the_planner`. That test's own failure only
-surfaced later, in CI's `M1.06 write contract +` job — a job the local
-`cargo test -p git-vista-server --bins` check that ran alongside the edit
-cannot even compile, since `#[cfg(test)] mod contract_suite` (like
-`route_authz` itself) does not exist in a `--bins`-only build.
+`crates/git-vista-server/src/route_authz.rs`'s `ROUTE_AUTHZ` classifies every
+route `main.rs`'s `api_router` registers by the authorization it must sit
+behind — `Unauthenticated`, `SessionRequired`, `SessionAndCsrf` — and pins a
+fixed `EXPECTED_ROUTE_COUNT`.
 
-Grok found the identical shape the same day, one level up again: #695's
-POST route table said "funnel rows below" for three bisect routes, and the
-funnel array named none of them — a table naming a row that does not exist,
-passing silently. Three instances of "a list of known things is not a fix, it
-is a promise nobody checks" in one day (ADR 0119's original finding,
-#666/#660's independently-discovered third call sites, and now this) is what
-turns a one-off oversight into a pattern worth a named decision.
+`crates/git-vista-server/src/planner/contract_suite.rs`'s `post_route_census`
+classifies every POST route as a git write that must reach the planner
+(`GitWrite(entry)`), a `NonGitWrite` (catalog, credential, auth, cancel), or a
+`ReadLike` POST — a read wearing a write's verb because the CSRF gate keys on
+the method.
+
+Each has its own test proving it agrees with `main.rs` in both directions:
+nothing registered is unclassified, nothing classified has been quietly
+deleted. Each is strong. Nothing pointed from either to the other.
+
+### How the gap was found — #584 / PR #688
+
+```mermaid
+sequenceDiagram
+    participant Dev as Author of #584
+    participant Hook as PostToolUse hook
+    participant A as route_authz.rs
+    participant B as contract_suite.rs
+    participant CI as CI (M1.06)
+
+    Dev->>A: add POST /api/settings/token to main.rs
+    Hook->>A: runs every_registered_route_is_classified
+    A-->>Dev: RED — classify the new route
+    Note over Dev,A: caught in seconds, at edit time
+    Dev->>A: classify it. Green.
+    Dev->>Dev: local check: cargo test --bins
+    Note over Dev,B: --bins never compiles<br/>#[cfg(test)] mod contract_suite
+    Dev->>CI: push
+    CI->>B: M1.06 write contract +
+    B-->>CI: RED — uncounted POST route
+    Note over B,CI: found 40 minutes later,<br/>in a different job, in a different file
+```
+
+The hook knew about one table. It fired, ran the one test it knew, went green,
+and said nothing about the second table's existence. The local verification
+that ran alongside the edit could not have caught it either: `--bins` does not
+compile the integration-test target set, and the failure surfaced only in CI.
+
+The author did nothing wrong. The process had no step at which the second
+table could have been discovered.
+
+### The same shape again, one layer down — #705
+
+`route_authz.rs`'s `EXPECTED_UNAUTHENTICATED` pins the pre-session allowlist
+as three `(path, method)` pairs and presents itself as *exact*. `security.rs`'s
+`require_auth` is what actually enforces it. The two were written
+independently, and drifted in **shape**, not in content:
+
+```mermaid
+flowchart TD
+    subgraph BEFORE["Before — the table and the runtime disagree in shape"]
+        T1["<b>EXPECTED_UNAUTHENTICATED</b><br/>(path, method) pairs<br/>GET /api/protocol<br/>GET /api/session<br/>POST /api/session"]
+        R1["<b>session_exempt</b><br/>path == NEGOTIATION_PATH<br/>— every method —<br/>|| (SESSION_PATH && GET|POST)"]
+        T1 -.->|"claims to describe"| R1
+    end
+
+    subgraph AFTER["After — both reason in pairs"]
+        T2["<b>EXPECTED_UNAUTHENTICATED</b><br/>(path, method) pairs<br/>unchanged"]
+        R2["<b>session_exempt</b><br/>(NEGOTIATION_PATH && GET)<br/>|| (SESSION_PATH && GET|POST)"]
+        T2 ==>|"checked by<br/>the_pre_session_exemption_is_method_qualified"| R2
+    end
+
+    %% Without this edge mermaid lays the two subgraphs out right-to-left, so
+    %% AFTER renders to the LEFT of BEFORE and the diagram reads as a
+    %% regression. The edge forces the order, the way ADR 0033 does.
+    BEFORE ==>|"#705"| AFTER
+
+    classDef bad fill:#8c1c13,color:#ffffff,stroke:#4a0e08,stroke-width:2px
+    classDef good fill:#1b5e20,color:#ffffff,stroke:#0b2e10,stroke-width:2px
+    class T1,R1 bad
+    class T2,R2 good
+```
+
+**No bypass existed, and this ADR does not claim one.** `main.rs` registers
+only `get(protocol_info)` on that path, so `POST /api/protocol` ended at
+`405 Method Not Allowed` — the router refused it because no handler was
+there. That is a safe *accident*, not a guarantee: it holds only while nobody
+registers a write handler on the negotiation path. What was actually broken
+was the **audit**. A future `POST /api/protocol` could have been classified
+`SessionAndCsrf` in `ROUTE_AUTHZ`, satisfied every structural test in that
+file, and run with neither session nor CSRF checked.
+
+The measured difference is exactly one status code, and it is the whole issue:
+
+| request, no session | before | after |
+|---|---|---|
+| `GET /api/protocol` | 200 — exempt | 200 — exempt (unchanged) |
+| `POST /api/protocol` | **405** — refused by the *router* | **401** — refused by the *session gate* |
+
+A `405` there means the gate is open and only the missing handler is hiding
+it. The wire test asserts `401` specifically, rather than merely "not 2xx",
+because that is the only assertion able to tell the accident from the
+guarantee.
 
 ## Decision
 
-### 1. A third test reads both tables directly and asserts their POST route sets are identical
+### 1. A third test reads both censuses directly and asserts their POST sets are identical
 
-`route_authz_and_write_contract_agree_on_every_post_route`
-(`planner/contract_suite.rs`) computes the set of POST-method routes from
-`route_authz::ROUTE_AUTHZ` and the set of routes named in `KNOWN_POST_ROUTES`
-(mapping `KNOWN_POST_ROUTES`'s one path-less exception, `create_session`, to
-its real route `POST /api/session` so both sets are keyed the same way), and
-panics naming the exact route and which table is missing it if the two sets
-disagree. This is a genuine cross-check, not a third independent re-scan of
-`main.rs`: a third scanner would just be a third hand-maintained thing that
-could itself drift, which is exactly the failure mode this ADR exists to
-close, one level further out.
+`route_authz_and_write_contract_agree_on_every_post_route`, in
+`planner/contract_suite.rs`, computes the POST-route set of
+`route_authz::ROUTE_AUTHZ` and the route set of `post_route_census()`, and
+panics naming the exact route *and which table is missing it*.
 
-Both tables' visibility changed from private to `pub(crate)` to make this
-possible: `ROUTE_AUTHZ`, its `Authz` enum (required because it appears in
-`ROUTE_AUTHZ`'s element type, even though the new test destructures it with
-`_` and never names it), and the `route_authz` module itself in `main.rs`;
-`KNOWN_POST_ROUTES`, hoisted out of `every_git_write_route_reaches_the_planner`
-into a module-level `const` in `contract_suite.rs` so a sibling test can read
-it without re-deriving it from a local binding.
+```mermaid
+flowchart TD
+    ROUTER["<b>main.rs api_router</b>"]
+    A["<b>ROUTE_AUTHZ</b><br/>route_authz.rs"]
+    B["<b>post_route_census()</b><br/>contract_suite.rs"]
+    M["<b>route_authz_and_write_contract</b><br/><b>_agree_on_every_post_route</b><br/>reads both tables directly"]
 
-### 2. The `PostToolUse` hook is extended, not replaced
+    ROUTER -->|"every_registered_route_is_classified"| A
+    ROUTER -->|"every_git_write_route_reaches_the_planner"| B
+    A --> M
+    B --> M
+    M -->|"names the route AND the table"| OUT["<b>RED, by name,<br/>in the same test binary</b>"]
 
-`route-census-check.sh` now also runs the new meta-census test whenever
-`route_authz.rs`, `main.rs`, or `contract_suite.rs` changes (the third path
-added because the hook's whole point is to catch a table drifting the moment
-*either side* is edited, not only when the router is). This is the fix for
-the actual failure mode #584 hit: the local, edit-time signal now covers both
-tables' relationship to each other, not just one table's relationship to
-`main.rs`.
+    classDef thing fill:#1f3a5f,color:#ffffff,stroke:#0d1b2a,stroke-width:2px
+    classDef tbl fill:#4a148c,color:#ffffff,stroke:#22063f,stroke-width:2px
+    classDef meta fill:#e65100,color:#ffffff,stroke:#7a2b00,stroke-width:3px
+    classDef out fill:#1b5e20,color:#ffffff,stroke:#0b2e10,stroke-width:2px
+    class ROUTER thing
+    class A,B tbl
+    class M meta
+    class OUT out
+```
 
-### 3. A single source-of-truth table (the issue's other proposed direction) was not built
+It reads the two tables **directly** rather than re-scanning `main.rs` a third
+way. A third scanner would be a third hand-maintained thing that could itself
+drift — the very failure this ADR exists to close, moved one step further out.
 
-The issue offered three directions: a single table both classifications
-derive from, this meta-census, or a doc-comment cross-reference. The
-single-source table was rejected for this change: `ROUTE_AUTHZ` and
-`KNOWN_POST_ROUTES` classify different things for different reasons (security
-posture vs. planner-funnel membership) and are read by tests with different
-shapes and different failure messages tuned to what a maintainer needs to do
-next; merging them into one row-per-route table with two classification
-columns would work, but is a larger, riskier refactor of two files with a
-combined 641 + 7500+ lines, undertaken to fix a discoverability gap that the
-meta-census closes just as completely at a fraction of the risk. Nothing here
-forecloses that direction later, the same posture ADR 0114 took toward its own
-declined alternative.
+`ROUTE_AUTHZ`, its `Authz` enum (named because it appears in the table's
+element type, even though the test destructures it with `_`), and the
+`route_authz` module in `main.rs` became `pub(crate)` for exactly this. All
+remain `#[cfg(test)]`-gated at their module root.
 
-The doc-comment-only direction (weakest of the three, per the issue's own
-framing) was rejected outright: a comment is exactly the kind of fix that
-"looks read" without being enforced, the same shape ADR 0119 already ruled
-out for a call-site list.
+One deliberate exception is mapped, not ignored: `post_route_census`'s first
+row names the *handler* `create_session`, not a path, because session
+bootstrap is registered with a bare `.post(create_session)`. Its real route is
+`POST /api/session`, which is how `ROUTE_AUTHZ` names it, so the test maps
+across. A second such exception would mean the tables had stopped describing
+the same thing, and the comment says so.
+
+### 2. The runtime pre-session exemption is method-qualified, and that shape is structural
+
+`session_exempt` now names the same three pairs the table does.
+`the_pre_session_exemption_is_method_qualified` (in `route_authz.rs`, beside
+the table it defends) reads `security.rs`, splits the `session_exempt`
+expression on `||`, and requires **every disjunct to test a method as well as
+a path** — plus that each pinned path appears in the expression by its runtime
+constant, so renaming one and not the other cannot pass.
+
+Checking the *shape* rather than the *count* is the point. Both sides counted
+three before the fix; a count check would have stayed green forever.
+
+### 3. The `PostToolUse` hook is extended, not replaced
+
+`route-census-check.sh` now fires on edits to `route_authz.rs`, `main.rs`,
+`contract_suite.rs` **and** `security.rs`, and runs four tests rather than one.
+
+```mermaid
+flowchart TD
+    E1["edit main.rs"]
+    E2["edit route_authz.rs"]
+    E3["edit contract_suite.rs"]
+    E4["edit security.rs"]
+    H["<b>route-census-check.sh</b><br/>PostToolUse"]
+    T1["every_registered_route_is_classified"]
+    T2["unauthenticated_routes_are_a_pinned_short_allowlist"]
+    T3["the_pre_session_exemption_is_method_qualified"]
+    T4["route_authz_and_write_contract_agree<br/>_on_every_post_route"]
+
+    E1 --> H
+    E2 --> H
+    E3 --> H
+    E4 --> H
+    H --> T1
+    H --> T2
+    H --> T3
+    H --> T4
+
+    classDef edit fill:#1f3a5f,color:#ffffff,stroke:#0d1b2a,stroke-width:2px
+    classDef hook fill:#e65100,color:#ffffff,stroke:#7a2b00,stroke-width:3px
+    classDef test fill:#1b5e20,color:#ffffff,stroke:#0b2e10,stroke-width:2px
+    class E1,E2,E3,E4 edit
+    class H hook
+    class T1,T2,T3,T4 test
+```
+
+`contract_suite.rs` and `security.rs` are on the trigger list because the
+hook's whole purpose is to catch drift the moment *either side* is edited, not
+only when the router is. This is the fix for the failure #584 actually hit:
+the edit-time signal now covers the relationship, not just one endpoint of it.
+
+### 4. A single source-of-truth table was considered and not built
+
+The issue offered three directions. The single-source table — one row per
+route carrying both classifications — would work, but `ROUTE_AUTHZ` and
+`post_route_census` classify different things for different reasons (security
+posture vs. planner-funnel membership), are read by tests with different
+shapes, and carry failure messages tuned to what a maintainer must do next.
+Merging them is a larger, riskier refactor of two files to close a
+*discoverability* gap that the meta-census closes just as completely at a
+fraction of the risk. Nothing here forecloses it later: if a third census ever
+needs the same route set, that is the trigger to revisit, and this paragraph
+is the standing argument for doing so.
+
+The doc-comment cross-reference (the issue's own weakest option) was rejected
+outright: a comment is exactly the fix that "looks read" without being
+enforced — the shape ADR 0119 already ruled out.
 
 ## Consequences
 
-- A route added to one table and not the other now fails in the same test
-  binary as both tables, by name, rather than only in whichever CI job
+- A route added to one census and not the other now fails **by name, in the
+  same test binary as both tables**, rather than only in whichever CI job
   happens to exercise the table nobody thought to check.
-- The hook now catches the exact failure #584/PR#688 hit, at edit time, not
-  merge time — closing the discoverability gap this issue was filed over.
-- `ROUTE_AUTHZ`, `Authz`, and `KNOWN_POST_ROUTES` are `pub(crate)` now, purely
-  so this cross-check test can read them; nothing outside
-  `crates/git-vista-server`'s own test code is expected to use the wider
-  visibility, and both are still `#[cfg(test)]`-gated at their module root.
-- The next hand-maintained pair with the same shape (two tables, one router,
-  no link) should get the same treatment rather than a bespoke fix — this
-  meta-census pattern, not a single-source refactor, is now this project's
-  default answer to "two lists must agree."
+- The hook catches the exact #584 failure at edit time, not merge time.
+- `GET /api/protocol` is unchanged. **`HEAD /api/protocol` is a deliberate
+  behaviour change**: Axum serves `HEAD` implicitly from a `get(...)` route,
+  so it was previously pre-session and now requires a session like any other
+  read. Nothing in this codebase issues one. Pinning a fourth pair instead
+  would need a `HEAD` row in `ROUTE_AUTHZ` that `main.rs` never registers and
+  the route census would then reject — stating the consequence is cheaper and
+  more honest than bending the census around it.
+- `ROUTE_AUTHZ`, `Authz` and the `route_authz` module are `pub(crate)` purely
+  so the cross-check can read them. Nothing outside this crate's test code is
+  expected to use the wider visibility.
+- **The next hand-maintained pair with this shape should get the same
+  treatment** rather than a bespoke fix. Two descriptions of one thing, each
+  guarded only against the thing, is now a recognised defect shape in this
+  project, and a cross-check between them is the default answer.
+
+### A note on how this landed
+
+This branch originally hoisted `contract_suite.rs`'s table into its own
+`KNOWN_POST_ROUTES` const. While it sat unmerged, #703 landed a strictly
+better structure on `main` — `post_route_census()` returning typed
+`(path, handler, PostKind)` rows, with the git-write distinction in the *type*
+rather than in a comment, and carrying #87's three new bisect routes. The
+merge was resolved by taking main's version of that file wholesale and
+rebuilding the meta-census on top of it, rather than stitching two tables
+together. The cross-check is the decision; which table it reads is not.
 
 ## Mutation proof
 
-Manual, two-way (`failure-atlas`'s `mutation_check` was globally unavailable
-at the time — a containment bug, "temp base /tmp is inside the git work
-tree," confirmed across two other lanes the same day, not fixable by
-retrying):
+Five arms through `failure-atlas`'s `mutation_check`, `run_key`
+`gv-lane-3-690-705`, every baseline green and the working tree clean
+(`source_working_tree_dirty: false`). Two arms per invariant, chosen to fail
+*differently* rather than to break the same thing twice.
 
-| arm | mutation | mutated result |
-|---|---|---|
-| a route present in `ROUTE_AUTHZ` but missing from `KNOWN_POST_ROUTES` | removed the `/api/rescan` entry from `KNOWN_POST_ROUTES` (still classified in `ROUTE_AUTHZ`) | caught: `route_authz_and_write_contract_agree_on_every_post_route` panics naming `/api/rescan` as present in `ROUTE_AUTHZ` but missing from `KNOWN_POST_ROUTES` |
-| a route present in `KNOWN_POST_ROUTES` but missing from `ROUTE_AUTHZ` | removed the `("/api/rescan", Method::POST, ...)` entry from `ROUTE_AUTHZ` (still classified in `KNOWN_POST_ROUTES`) | caught: the same test panics on the opposite branch, naming `/api/rescan` as present in `KNOWN_POST_ROUTES` but missing from `ROUTE_AUTHZ` — a genuinely different assertion path (`contract_posts.difference(&authz_posts)` rather than `authz_posts.difference(&contract_posts)`) |
+| # | invariant | mutation | verdict |
+|---|---|---|---|
+| 410 | #690 cross-check, A-not-B | remove `/api/rescan` from `post_route_census()`, leave it in `ROUTE_AUTHZ` — **the exact #584 shape** | **caught** — panics at `contract_suite.rs:3540` naming `/api/rescan` as present in `ROUTE_AUTHZ`, absent from `post_route_census()` |
+| 411 | #690 cross-check, B-not-A | remove `/api/rescan` from `ROUTE_AUTHZ`, leave it in `post_route_census()` | **caught** — panics at `contract_suite.rs:3550`, the *opposite* `difference()` branch, a genuinely disjoint assertion |
+| 414 | both censuses still bind to the router | add `POST /api/rescan-twice` to `main.rs`, update neither table | **caught** — `every_registered_route_is_classified` **and** `every_git_write_route_reaches_the_planner` both red (`left: 49, right: 48`) |
+| 412 | #705 shape guard | revert `session_exempt` to the path-only clause | **caught twice, differently** — the structural test fails on clause shape; the wire test fails `left: 405, right: 401` |
+| 413 | #705 value guard | keep it method-qualified but wrong: `Method::GET` → `Method::PATCH` | **caught** — the structural test correctly **passes** (still pair-shaped) while `the_negotiation_get_stays_pre_session` fails `left: 401, right: 200` |
 
-Both caught, both reverted; `git diff` shows no trace of either mutation
-afterward.
+Arms 412 and 413 are the pair that matters most: they prove the structural
+test and the wire test cover genuinely different properties. 413 is green on
+the structural test and red on the wire test, so neither is standing in for
+the other.
+
+Arms 410, 411 and 414 together prove the property the issue actually asked
+for, which a one-sided check cannot give:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Added: new POST route in main.rs
+    Added --> BothRed: arm 414 — both censuses fail
+    BothRed --> OnlyAuthz: author updates ROUTE_AUTHZ only
+    BothRed --> OnlyContract: author updates post_route_census only
+    OnlyAuthz --> StillRed: arm 410 — meta-census RED
+    OnlyContract --> StillRed2: arm 411 — meta-census RED
+    StillRed --> Green: both updated
+    StillRed2 --> Green: both updated
+    Green --> [*]
+```
+
+Satisfying one census leaves the build red until the other is updated too.
+That is the whole issue, and it is now a measured property rather than a
+claim.
+
+---
+
+**Signed:** max · 2026-09-07T18:05:00-04:00

@@ -30,13 +30,30 @@ case "$file" in
   *) exit 0 ;;
 esac
 repo=$(cd "$(dirname "$file")" && git rev-parse --show-toplevel 2>/dev/null) || exit 0
-if ! out=$(cd "$repo" && cargo test -q -p git-vista-server -- \
+out=$(cd "$repo" && cargo test -p git-vista-server -- \
     every_registered_route_is_classified \
     unauthenticated_routes_are_a_pinned_short_allowlist \
     the_pre_session_exemption_is_method_qualified \
-    route_authz_and_write_contract_agree_on_every_post_route 2>&1 | tail -8); then
+    route_authz_and_write_contract_agree_on_every_post_route 2>&1)
+rc=$?
+if [[ $rc -ne 0 ]]; then
   echo "route census FAILED after editing $file — a route is unclassified, a table is stale, the two censuses disagree, or the pre-session allowlist and its runtime enforcement have drifted:" >&2
-  printf '%s\n' "$out" >&2
+  printf '%s\n' "$out" | tail -20 >&2
+  exit 2
+fi
+
+# A libtest filter that matches nothing exits 0 with "0 passed". Rename or
+# delete any of the four tests above and an unguarded run here would print
+# nothing, exit 0, and leave this hook looking intact while checking nothing —
+# "structurally complete, semantically inert", the exact shape ADR 0134 is
+# about, occurring in the guard ADR 0134 installed. So count what actually ran
+# rather than reading the word "ok": the census is only checked if all four
+# tests executed.
+ran=$(printf '%s\n' "$out" | awk '/^test result:/ {
+  for (i = 2; i <= NF; i++) if ($i == "passed;") s += $(i - 1)
+} END { print s + 0 }')
+if [[ "$ran" -ne 4 ]]; then
+  echo "route census hook is INERT after editing $file — $ran of 4 census tests ran, so the census was NOT checked. A libtest filter matching nothing exits 0, which is why this counts instead of trusting the exit code. A test was renamed or deleted: fix the names in $0 (do not delete the check)." >&2
   exit 2
 fi
 exit 0
