@@ -10,6 +10,11 @@
   paragraph's two strongest claims are narrowed in place (search "Narrowed by
   review round 5"). The originals are left standing: what they got wrong is
   the useful part of the record.
+- **Amended:** 2026-09-07 by #661 — the 298 ms sweep below was measured in a
+  **debug** build, and the 3.0 s duty-cycle floor it implies follows it. Both
+  are re-measured in release, where finding 2's conclusion for git-vista itself
+  does not hold (search "Corrected by #661"). The originals are left standing,
+  for the reason given above.
 
 ## Context
 
@@ -469,6 +474,53 @@ Three things fall out, and the third is a finding rather than a result:
    298 ms is the app's own read path — four sandboxed `git` spawns and a `gix`
    ref read over 779 refs. Which of those dominates is **not measured**, and
    this milestone records the fact rather than fixing it.
+
+### Corrected by #661 — the table above is a debug build
+
+The invocation this test documents is `cargo test -p git-vista-server
+measure_one_sweep -- --ignored --nocapture`, which builds the **debug** profile.
+The server ships release. Re-measured through the same `planner::live_reading`
+on a quiet titan (load average 0.8, no other lane building), git-vista itself:
+
+| profile | refs | warm sweep | interval the duty rule sets | which constraint binds |
+|---|---|---|---|---|
+| debug, as measured above | 779 | 298 ms | 3.0 s | the duty rule |
+| debug, re-measured | 455 | 246 ms (one run) | 2.5 s | the duty rule |
+| **release, re-measured** | 455 | **92 ms** (99 / 92 / 63, three runs) | **0.92 s** | **the 2 s base interval** |
+| release, after #661's fix | 455 | **33 ms** (33 / 26 / 50, three runs) | 0.33 s | the 2 s base interval |
+
+**So finding 2 does not hold for git-vista itself.** In the profile the server
+actually runs, the duty-cycle floor sits below the 2 s base interval, and the
+base interval is what sets the cadence — not the self-calibrating rule. The
+finding's *shape* survives where it was aimed: on the two synthetic
+large-namespace repositories the duty rule will still bind by a wide margin,
+and **those two rows have not been re-measured in release**, so the 19.9 s and
+21.6 s figures above should be read as debug numbers too.
+
+**Finding 3's open question is now answered.** Of that cost, on the release
+baseline (median of three runs, 455 refs):
+
+| component | cost | share |
+|---|---|---|
+| `rev_parse(HEAD)`, sandboxed spawn | 18.0 ms | 18% |
+| `worktree_status`, sandboxed spawn | 29.4 ms | 30% |
+| `refs/stash`, sandboxed spawn | 21.0 ms | 21% |
+| `merge.ff`, sandboxed spawn | 19.9 ms | 20% |
+| the `gix` ref walk over all refs | 9.4 ms | **10%** |
+
+The four sandboxed spawns dominate at ~90%, and the `gix` ref read — the
+component the issue expected to find at fault — is the smallest of the five.
+The spawns are not slow because git is: raw unsandboxed `git status` costs
+4.6–8.5 ms against 21–31 ms sandboxed, a **2.7–6.9x sandbox tax** that is
+close to fixed per spawn. `refs_reading` at 9.4 ms is *faster* than a raw
+`git for-each-ref` at 9.4–13.3 ms, so the ref walk has no gap to close against
+git.
+
+#661's fix does not remove a read. It joins the five, which were independent
+and were being awaited in turn, so the sweep costs their maximum rather than
+their sum. What remains is bounded by the slowest single read — `git status`,
+sandboxed — and reducing that further means reducing the per-spawn sandbox tax,
+which lives in `sandbox/` and is a security boundary, not a sweep concern.
 
 ## Alternatives considered
 
