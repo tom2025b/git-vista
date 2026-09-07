@@ -32,8 +32,8 @@ type WorktreeItems = (
 /// here exactly where the original inline code read it, so the reactive
 /// tracking is unchanged.
 ///
-/// `staged_count` is a resolved count rather than the resource itself (#709).
-/// That read is now pinned to the accepted repository frame, and the decision
+/// `staged_count` is a resolved count rather than the resource itself.
+/// That read is pinned to the accepted repository frame, and the decision
 /// — is this reply current for the live epoch and repository, or a retained
 /// answer for one the user has left? — is made once in `menu_view`, where the
 /// live frame is, rather than re-derived per item here. It is read inside the

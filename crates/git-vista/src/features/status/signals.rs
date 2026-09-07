@@ -21,9 +21,9 @@ impl StatusResource {
     }
 }
 
-/// The accepted frame's opaque repository id this resource is scoped to
-/// (#709) — what a second caller (`menu.rs`'s own staged-file count) must
-/// pin its own fetch to, the same way [`create`]'s resource does.
+/// The accepted frame's opaque repository id this resource is scoped to —
+/// what a second caller (`menu.rs`'s own staged-file count) must pin its own
+/// fetch to, the same way [`create`]'s resource does.
 pub fn repo(status: StatusResource) -> Option<String> {
     status.repo.get()
 }

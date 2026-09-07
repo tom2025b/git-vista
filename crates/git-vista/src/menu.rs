@@ -108,8 +108,8 @@ pub fn menu_view(
     // builders below (`menu/commit_items.rs` and siblings), which each
     // destructure only the fields they need — so this binding only pulls out
     // what the resource setup and the final assembly use directly. `status` is
-    // pulled out here for its repository id alone (#709): the staged-file read
-    // below must be pinned to the same accepted frame the chip's read is.
+    // pulled out here for its repository id alone: the staged-file read below
+    // must be pinned to the same accepted frame the chip's read is.
     let Features {
         graph,
         shell,
@@ -168,15 +168,13 @@ pub fn menu_view(
     // graph. No current reading => 0 => the item is absent, which is what a
     // fetch failure already meant here.
     //
-    // #709: this used to call the **unscoped** `fetch_status()`, which named
-    // no repository — so a reply could describe the repo the user had just
-    // left and the menu would offer to unstage its index. #707 pinned the chip
-    // path against exactly that; this caller had none of it. It is now keyed
-    // and tagged the same way `features::status::signals::create` keys and
-    // tags the chip's read: `repo` is part of the key, so a repository switch
-    // refetches rather than retaining; and the reply carries the epoch and
-    // repository it was *requested for*, so `staged_now` below can refuse a
-    // retained answer instead of comparing a frame against itself.
+    // Keyed and tagged the same way `features::status::signals::create` keys
+    // and tags the chip's read: `repo` is part of the key, so a repository
+    // switch refetches rather than retaining; and the reply carries the epoch
+    // and repository it was *requested for*, so `staged_now` below can refuse
+    // a retained answer instead of comparing a frame against itself. An
+    // unpinned read here would let the menu offer to unstage the index of a
+    // repository the user had already left.
     let staged_count = create_local_resource(
         move || {
             (

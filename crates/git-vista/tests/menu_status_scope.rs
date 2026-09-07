@@ -57,11 +57,11 @@ fn no_unscoped_v1_status_read_survives_anywhere() {
     );
 
     let api = code_only(API_STATUS);
-    // Taken by value, not `Option<&str>`: there is no argument meaning
-    // "unscoped", so this cannot regress by omission the way it did before.
+    // Required, not `Option<&str>`: there is no argument meaning "unscoped",
+    // so this cannot regress by omission.
     assert!(
         api.contains("pub async fn fetch_status_for(repo: &str)"),
-        "fetch_status_for must take the repository by value"
+        "fetch_status_for must require a repository, not accept an optional one"
     );
     assert!(
         api.contains("\"/api/status?t={}&repo={}\""),

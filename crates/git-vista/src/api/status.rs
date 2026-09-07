@@ -20,16 +20,12 @@ use super::{
 ///
 /// Pin chip/commit/menu readings to the accepted frame's opaque repository id.
 ///
-/// **`repo` is taken by value, and that is the fix for #709.** It used to be
-/// an `Option<&str>` with a companion `fetch_status()` passing `None`, and
-/// `menu.rs` called that companion — so the one v1 status read still had an
-/// entry point asking the server "whatever repository you happen to be
-/// resolving right now". A reply to that question belongs to no frame in
-/// particular, which is the staleness class the epoch/repository pinning
-/// exists to refuse: #707 pinned the chip path (`features::status::signals`)
-/// and this was the remaining unpinned caller. With no `None` to pass, an
-/// unscoped request is now unrepresentable rather than merely uncalled — a
-/// later caller cannot forget to scope one.
+/// **`repo` is required, not optional, and that is deliberate.** An unscoped
+/// request — one asking the server for "whatever repository you happen to be
+/// resolving right now" — is unrepresentable here rather than merely uncalled,
+/// so a later caller cannot forget to scope one. A reply to an unscoped
+/// question belongs to no frame in particular, which is the staleness class
+/// the epoch/repository pinning exists to refuse.
 ///
 /// The reply is still only a *candidate* reading. Whether the frame it was
 /// requested for is still the accepted one is
