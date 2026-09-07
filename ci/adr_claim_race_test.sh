@@ -227,23 +227,32 @@ owners=$(git -C "$A" ls-remote origin 'refs/adr-claims/*' | wc -l)
 # lease is the only thing that refuses it.
 # ---------------------------------------------------------------------------
 echo "the steal guard"
+#
+# This drives the REAL try_claim. An earlier version of this assertion inlined
+# a copy of the push instead, and a mutation that deleted the lease from
+# `scripts/adr-claim.sh` SURVIVED it: the assertion was exercising git's
+# semantics and its own copy of the flag, never the script's. It read as a
+# test of the script and could not fail on the script being wrong.
 steal=$(
 	cd "$B"
+	# shellcheck disable=SC1090
+	source scripts/adr-claim.sh
+	set +e # sourcing re-armed errexit; try_claim is MEANT to return non-zero
+	REMOTE=origin
 	git fetch -q origin 'refs/adr-claims/0136:refs/steal' 2>/dev/null
 	empty=$(git hash-object -t tree /dev/null)
 	child=$(git commit-tree "$empty" -p refs/steal -m "steal 0136")
-	# Exactly the push the real script makes.
-	git push --quiet --force-with-lease=refs/adr-claims/0136: \
-		origin "$child:refs/adr-claims/0136" >/dev/null 2>&1
+	try_claim 0136 "$child" >/dev/null 2>&1
 	echo "$?"
 )
-[[ "$steal" != 0 ]] \
-	&& ok "(7) a descendant claim is rejected (exit $steal)" \
-	|| fail "(7) a descendant claim was ACCEPTED — the number was silently stolen"
+[[ "$steal" == 1 ]] \
+	&& ok "(7) try_claim refuses a descendant claim and reports a lost race (rc 1)" \
+	|| fail "(7) try_claim gave rc '$steal' for a descendant claim — rc 0 means the number was silently stolen"
 
-# The same push WITHOUT the lease, to prove assertion 7 is not vacuous: if this
-# is also rejected, the lease is not what is doing the work and (7) proves
-# nothing about it.
+# The same push WITHOUT the lease, run as raw git, to show WHY (7) is the
+# assertion it is: if a plain push were also rejected, the lease would not be
+# what does the work and (7) would prove nothing about it. This one is a fact
+# about git, deliberately not routed through the script.
 nolease=$(
 	cd "$B"
 	git fetch -q origin 'refs/adr-claims/0136:refs/steal2' --force 2>/dev/null
