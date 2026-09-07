@@ -925,11 +925,10 @@ fn every_guarded_function_consults_the_guard_before_it_sends() {
 
 /// [`TRANSPORT_HELPERS`] and [`EXEMPT_UNGUARDED`] each carry an implicit
 /// claim `every_write_reaching_function_is_classified` does not check on its
-/// own: a transport helper is supposed to sit *below* the guard (never call
-/// it), and an exemption is supposed to have an argued reason it never needs
-/// to. If either starts calling `refuse_if_offline()`, that claim is now
-/// false, and the entry needs to move — visibly, not silently keep working
-/// either way.
+/// own: a transport helper sits *below* the endpoint guard. The retrying
+/// helper additionally guards each attempt (#75), pinned separately below.
+/// Other helpers and exemptions must not silently start guarding themselves:
+/// their classification and the corresponding checks must change together.
 #[test]
 fn the_exempt_and_transport_tables_do_not_rot() {
     let bodies = bodies_map();
@@ -941,6 +940,9 @@ fn the_exempt_and_transport_tables_do_not_rot() {
                  longer defines it"
             )
         });
+        if *name == "send_write_with_key" {
+            continue; // Its nested attempt guard is verified below and in Playwright.
+        }
         assert!(
             !word_call(body, "refuse_if_offline"),
             "`{name}` is classified in TRANSPORT_HELPERS — the layer BELOW the offline \
@@ -971,6 +973,17 @@ fn the_exempt_and_transport_tables_do_not_rot() {
              after all. Move it to OFFLINE_GUARDED and delete the exemption argument."
         );
     }
+}
+
+/// Host coverage of the composition site only; Playwright cuts connectivity
+/// between the real first attempt and retry to prove runtime refusal.
+#[test]
+fn each_write_attempt_checks_offline_before_constructing_the_request() {
+    let bodies = bodies_map();
+    let body = bodies.get("send_write_with_key").unwrap();
+    let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains("letattempt=||async{refuse_if_offline()?;letbuilder=req_post("),
+        "the guard must be inside the attempt closure, before request construction, so it checks retries too");
 }
 
 // ── The guard itself ─────────────────────────────────────────────────────────

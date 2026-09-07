@@ -1,7 +1,6 @@
-//! The settings surface (M13.03, #584): one field to save the GitHub token
-//! the credential helper offers for private-repository operations.
+//! Settings: the GitHub token field (#584) and local browser-data controls (#75).
 //!
-//! Every decision lives in `features::settings::core` (framework-free,
+//! Decisions live in `features::settings::{core, storage}` (framework-free,
 //! host-tested); this file is the DOM shell around it — fetch the status on
 //! open, render `core::status_line`'s sentence, gate the Save button with
 //! `core::save_enabled`, and apply `core::input_after_save`'s answer once a
@@ -33,12 +32,16 @@ pub fn settings_view(settings_open: RwSignal<bool>, dialogs: Dialogs) -> impl In
     let error = create_rw_signal(None::<String>);
     let saving = create_rw_signal(false);
     let loading = create_rw_signal(false);
+    let storage_notice = create_rw_signal(None::<String>);
+    let confirm_clear = create_rw_signal(false);
 
     // Fetch the current status on every open — never cached across opens, so
     // a token saved from a second tab (or a keyring entry that has since
     // become unreadable) is reflected rather than shown stale.
     create_effect(move |_| {
         if settings_open.get() {
+            confirm_clear.set(false);
+            storage_notice.set(None);
             error.set(None);
             loading.set(true);
             spawn_local(async move {
@@ -91,7 +94,7 @@ pub fn settings_view(settings_open: RwSignal<bool>, dialogs: Dialogs) -> impl In
             }
         >
             <div
-                style="min-width:320px; max-width:90vw; padding:16px; \
+                style="min-width:280px; max-width:90vw; max-height:85dvh; overflow:auto; padding:16px; \
                        background:#161b22; border:1px solid #30363d; \
                        border-radius:10px; color:var(--fg); \
                        box-shadow:0 12px 32px rgba(0,0,0,0.6);"
@@ -128,6 +131,30 @@ pub fn settings_view(settings_open: RwSignal<bool>, dialogs: Dialogs) -> impl In
                 {move || error.get().map(|e| view! {
                     <div style="font-size:0.85em; color:#f85149; margin-top:8px;">{e}</div>
                 })}
+                <section aria-label="Browser data" style="margin-top:16px; max-width:440px;">
+                    <h2 style="font-size:1em;">"Browser data"</h2>
+                    <p>"Repository data and private diffs are not saved for offline use. To clear cached app files, use your browser settings."</p>
+                    <p>"Export includes only icon and checkpoint-folding preferences. Clear removes saved preferences, commit drafts, comparison choices, and operation tracking from this browser, then reloads. It does not cancel server operations or erase server credentials. Other open tabs can save data again."</p>
+                    <button style="min-height:44px; margin:4px;" on:click=move |_| {
+                        storage_notice.set(Some(match crate::features::settings::browser_storage::export_saved_preferences() {
+                            Ok(()) => "Preference download requested.".to_string(),
+                            Err(e) => e,
+                        }));
+                    }>"Export preferences"</button>
+                    <button style="min-height:44px; margin:4px;" on:click=move |_| confirm_clear.set(true)>"Clear saved browser data…"</button>
+                    {move || confirm_clear.get().then(|| view! {
+                        <div>
+                            <p>"Delete saved drafts and preferences? Close other Git-Vista tabs first. Reload needs a working connection."</p>
+                            <button style="min-height:44px; margin:4px;" on:click=move |_| {
+                                if let Err(e) = crate::features::settings::browser_storage::clear_saved_data() {
+                                    storage_notice.set(Some(e));
+                                }
+                            }>"Delete saved data and reload"</button>
+                            <button style="min-height:44px; margin:4px;" on:click=move |_| confirm_clear.set(false)>"Keep saved data"</button>
+                        </div>
+                    })}
+                    <p role="status">{move || storage_notice.get().unwrap_or_default()}</p>
+                </section>
                 <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:14px;">
                     <button
                         style="padding:6px 14px; font:inherit; color:var(--fg); \

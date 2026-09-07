@@ -935,13 +935,6 @@ fn build_app(
         // That is the live LAN failure shape: POST /api/select falls through
         // to the file service and receives an ordinary 405.  The response must
         // still say which listener profile produced it.
-        // Error-envelope rewriting can replace the auth layer's response.
-        // Stamp no-store outside it so private provider reads and refusals
-        // retain the same cache policy as successful local reads.
-        .layer(SetResponseHeaderLayer::overriding(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("no-store"),
-        ))
         .layer(SetResponseHeaderLayer::overriding(
             header::HeaderName::from_static(LISTENER_PROFILE_HEADER),
             HeaderValue::from_static(listener_profile.as_header_value()),
