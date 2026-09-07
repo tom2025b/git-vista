@@ -3,7 +3,7 @@
 - **Status:** Accepted — implemented, mutation-proved two ways failing differently
 - **Date:** 2026-09-06
 - **Issue:** #689
-- **Supersedes / superseded by:** —
+- **Supersedes / superseded by:** completed by [0136](0136-a-number-is-claimed-by-a-push-not-by-a-read.md), which ships the reservation scheme this ADR named and deferred
 
 ## Context
 
@@ -234,3 +234,12 @@ duplicate-number panic `files_by_number()` already had, so an `--exact`
 run of only the heading test cannot silently drop one of two same-numbered
 files and report a false pass — a gap a fresh review of this PR found
 before merge, alongside the collision-fixture finding decision 2 records.
+
+**Followed up, on this ADR's own trigger.** The recurrence condition set in
+Alternatives was met the same day this ADR merged: #694 and #695 both claimed
+0130 while #697 was being written, making six collisions in one day. ADR
+[0136](0136-a-number-is-claimed-by-a-push-not-by-a-read.md) ships the
+reservation-on-branch-creation alternative — as a create-only push to
+`refs/adr-claims/NNNN` rather than a commit on `main`, for reasons it sets out.
+Nothing in this ADR is retracted: the heading test and `scripts/adr-renumber.sh`
+remain the recovery path, and 0136 depends on the second of them.

@@ -10,6 +10,41 @@ One file per decision, numbered in order: `NNNN-short-slug.md`. ADRs are
 append-only history — supersede an old one with a new one rather than rewriting
 it, and note the link in both.
 
+## Claiming a number
+
+**Do not read this index to pick your number.** Reading it is a
+check-then-claim race: the read and the merge are 30-90 minutes apart, nothing
+holds the number in between, and that gap produced six collisions in one day
+(#689, #697). Claim it instead, before you write anything:
+
+```bash
+NNNN=$(scripts/adr-claim.sh --issue 697 --slug a-short-slug)
+```
+
+That is a single `git push` to `refs/adr-claims/$NNNN` on the remote, which
+either succeeds — the number is yours — or is rejected outright because another
+lane got there first, in which case the script takes the next one and tells you.
+There is no state in between. See
+[0136](0136-a-number-is-claimed-by-a-push-not-by-a-read.md) for why it is a ref
+rather than a commit on `main`, and why the claim commit has no parent.
+
+| You want to | Run |
+|---|---|
+| Claim the next free number | `scripts/adr-claim.sh --issue N --slug SLUG` |
+| See who holds what, and how long they have held it | `scripts/adr-claim.sh --list` |
+| Give a number back (merged, or abandoned) | `scripts/adr-claim.sh --release NNNN` |
+| Clean up landed and stale claims | `scripts/adr-claim.sh --sweep` (add `--yes` to release) |
+| Fix a collision that happened anyway | `scripts/adr-claim.sh --renumber OLD` |
+
+**A claim is not an index row.** The script writes nothing into this file: a row
+here means a decision has been *written* under that number, which is what
+`every_index_row_has_an_adr_file` enforces and what
+[0086](0086-a-number-left-deliberately-unused.md) is a tombstone for. Add your
+row when you add your file, as always.
+
+**After your ADR merges, release the claim** — the file on `main` holds the
+number from then on. `--sweep` catches the ones everyone forgets.
+
 | ADR | Title | Status |
 | --- | --- | --- |
 | [0001](0001-repository-generation.md) | Repository identity and the repository-generation algorithm | Accepted |
@@ -146,3 +181,4 @@ it, and note the link in both.
 | [0132](0132-a-settings-read-never-negotiates-with-a-locked-keyring.md) | A Settings read never negotiates with a locked keyring — `resolve_from` takes source functions and stops invoking them below the winner; startup performs one Secret Service read on Tokio's blocking pool with a two-second budget and retains only masked keyring status. GET uses that snapshot (or lazily evaluates the live env/file tiers) and can never call D-Bus; successful POST performs its one explicit write on the blocking pool, updates the snapshot from the persisted value, and does no read-back. A startup timeout/unavailable keyring stays unavailable to Settings until a successful POST or restart, so an autologin host gets a quick status response and at most one non-cancellable startup unlock attempt rather than one per dialog open. Clone containment/phases are untouched | Accepted — implemented, mutation-proved two ways failing at disjoint assertions (#373/#374) |
 | [0133](0133-forge-reads-have-their-own-credential-and-wait-boundary.md) | Forge reads have their own credential and wait boundary — neutral PR summaries, bounded server-only credentials and provider I/O, explicit unavailable details, no private cache | Accepted — first slice of #89 |
 | [0135](0135-offline-refuses-writes-and-persistence-is-explicit.md) | Offline refuses writes and persistence is explicit — preserve the no-worker policy, guard each write attempt, and expose scoped saved-data controls. | Proposed — implemented, two disjoint Atlas proofs and browser verification; iPad check outstanding |
+| [0136](0136-a-number-is-claimed-by-a-push-not-by-a-read.md) | A number is claimed by a push, not by a read — #697 completes the fix [0130](0130-a-claimed-number-is-provisional-until-it-merges.md) named and deferred, on the trigger 0130 itself set: six collisions in one day, the sixth on the pull request meant to fix the first five. `scripts/adr-claim.sh` claims a number with a single push of an orphan commit to `refs/adr-claims/NNNN` under `--force-with-lease=refs/adr-claims/NNNN:` — an empty expected value, which the remote applies as a create-only compare-and-swap, so two lanes racing produce one winner and one outright rejection with no window in between. Verified against this repository's own remote: GitHub accepts the namespace, refuses the second claim, and shows it to no clone or UI. The orphan parentage and the lease are two independent guards against the same measured steal (a descendant claim, plain-pushed, is ACCEPTED); the `Nonce:` line stops two lanes minting byte-identical claim commits and both believing they won. A claim writes nothing into this index — #578's `every_index_row_has_an_adr_file` and [0086](0086-a-number-left-deliberately-unused.md) both say a row means a file exists — and `--sweep` gives abandoned numbers back. `scripts/adr-renumber.sh` remains the recovery path and composes as `--renumber OLD`. A reservation commit on `main`, claim tags, a lock service and date-based filenames were all considered and rejected | Accepted — implemented, mutation-proved three ways failing differently |

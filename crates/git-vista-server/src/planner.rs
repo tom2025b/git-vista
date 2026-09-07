@@ -1391,14 +1391,29 @@ struct DigestInput {
 }
 
 async fn read_generation_parts(repo: &Path) -> GenerationParts {
-    let (head_branch, refs, named_refs, refs_read) = refs_reading(repo).await;
+    // #661: these three are independent *reads* of the same repository — one
+    // `spawn_blocking` gix walk and two sandboxed git spawns — and awaiting
+    // them one after another made the sweep's cost their sum. Joined, it is
+    // their maximum.
+    //
+    // Concurrency here is not merely allowed, it is the more correct shape.
+    // Sequential awaits spread the reading across a window as wide as the sum,
+    // during which the repository can move *between* two inputs of the same
+    // digest; joining narrows that window to the longest single read. A
+    // generation token folded from a narrower window is a better answer to the
+    // only question it is asked — "was this all true at one instant?".
+    let ((head_branch, refs, named_refs, refs_read), stash, merge_ff) = tokio::join!(
+        refs_reading(repo),
+        stash_digest_input(repo),
+        merge_ff_digest_input(repo),
+    );
     GenerationParts {
         head_branch,
         refs,
         named_refs,
         refs_read,
-        stash: stash_digest_input(repo).await,
-        merge_ff: merge_ff_digest_input(repo).await,
+        stash,
+        merge_ff,
     }
 }
 
@@ -1444,8 +1459,12 @@ pub(crate) async fn live_reading(repo: &Path) -> LiveReading {
     // The ref walk below also returns HEAD's symbolic branch. This feed-only
     // observation omits the standalone branch open that operation freshness
     // checks still need for their precondition diagnostics.
-    let mut observed = observe_live_for_feed(repo).await;
-    let parts = read_generation_parts(repo).await;
+    // #661: the feed observation and the generation parts share no data and
+    // neither writes, so the whole read path is one join of five independent
+    // reads rather than five sequential awaits. See [`read_generation_parts`]
+    // for why the narrower reading window is also the more correct one.
+    let (mut observed, parts) =
+        tokio::join!(observe_live_for_feed(repo), read_generation_parts(repo));
     observed.head_branch = parts.head_branch.clone();
     let blind = if !parts.refs_read {
         Some("the ref store could not be read".to_string())
@@ -1845,11 +1864,16 @@ async fn observe_live_for_generation(repo: &Path) -> Observed {
 /// small distinction explicit lets `enforce_fresh` retain its existing live
 /// `BranchCheckedOut` check while the sweep removes the redundant gix open.
 async fn observe_live_for_feed(repo: &Path) -> Observed {
+    // #661: two independent sandboxed spawns, joined rather than awaited in
+    // turn, for the reason [`read_generation_parts`] spells out — the sweep's
+    // cost becomes their maximum instead of their sum, and the two reads
+    // describe a narrower instant.
+    let (head_tip, status) = tokio::join!(rev_parse(repo, "HEAD"), worktree_status(repo));
     Observed {
         head_branch: None,
-        head_tip: Obs::from_read(rev_parse(repo, "HEAD").await),
+        head_tip: Obs::from_read(head_tip),
         branch_tip: Obs::Absent,
-        status: worktree_status(repo).await,
+        status,
         held_at_build: Vec::new(),
         census: no_census_taken(),
     }

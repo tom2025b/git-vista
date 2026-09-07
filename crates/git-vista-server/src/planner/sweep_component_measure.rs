@@ -122,6 +122,50 @@ async fn measure_sweep_components() {
     );
 
     println!();
+    println!("--- live_reading's own three steps, so the whole is fully accounted for ---");
+    // The five components above are the individual *reads*. `live_reading` is
+    // literally three awaited steps over them, and timing those three is what
+    // turns "the whole is bigger than the sum of its reads" from a puzzle into
+    // a number: anything left over after these three is runtime scheduling, not
+    // a read nobody measured.
+    let feed = timed("observe_live_for_feed    (2 of the 4 spawns)", N, || {
+        observe_live_for_feed(&repo)
+    })
+    .await;
+    let generation_parts = timed("read_generation_parts    (refs + 2 spawns)", N, || {
+        read_generation_parts(&repo)
+    })
+    .await;
+    // `fold_generation` is pure CPU over parts already in hand, so it is timed
+    // against one real reading rather than re-reading the repository per
+    // iteration — which would measure the reads again, not the fold.
+    let parts_once = read_generation_parts(&repo).await;
+    let mut observed_once = observe_live_for_feed(&repo).await;
+    observed_once.head_branch = parts_once.head_branch.clone();
+    let fold = {
+        let began = Instant::now();
+        for _ in 0..N {
+            let _ = fold_generation(&observed_once, &parts_once);
+        }
+        let mean = began.elapsed() / N;
+        println!(
+            "{:<45} {:>8.2} ms",
+            "fold_generation          (pure CPU, no IO)",
+            mean.as_secs_f64() * 1000.0
+        );
+        mean
+    };
+    let three_steps = feed + generation_parts + fold;
+    println!();
+    println!(
+        "the three steps sum to {:>8.2} ms against live_reading's {:.2} ms \
+         (unaccounted: {:+.2} ms)",
+        three_steps.as_secs_f64() * 1000.0,
+        whole.as_secs_f64() * 1000.0,
+        (whole.as_secs_f64() - three_steps.as_secs_f64()) * 1000.0
+    );
+
+    println!();
     println!("--- for comparison: git's own commands, unsandboxed, no server involved ---");
     let raw_status = timed("git status --porcelain=v2 (raw std::process)", N, || {
         raw_git(&repo, &["status", "--porcelain=v2"])

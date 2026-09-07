@@ -86,7 +86,7 @@ pub use stash::{
     fetch_stashes, push_stash_request,
 };
 pub use status::{
-    delete_untracked_paths_request, discard_tracked_paths_request, fetch_status, fetch_status_for,
+    delete_untracked_paths_request, discard_tracked_paths_request, fetch_status_for,
     fetch_worktree_status, remove_worktree_request,
 };
 pub use tags::{create_tag_request, delete_tag_request, fetch_tags};

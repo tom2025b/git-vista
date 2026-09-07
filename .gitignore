@@ -112,3 +112,6 @@ target-testbed-*/
 # one `git add -A` away from being published, and that is not a bet worth
 # taking on a file whose contents are decided by someone else's tool.
 /error.log
+
+# Lane handoff prompts — session scratch, never product
+FIRST-MESSAGE*.txt
