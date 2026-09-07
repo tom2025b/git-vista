@@ -347,19 +347,19 @@ export async function openMergePreviewRepo(page) {
 export async function openBranchMenu(page, branch) {
   const nodes = page.locator('circle.node-hit')
   // Zero nodes is not "no such branch" — it is "the graph has not painted yet".
-  try {
-    await expect(nodes.first()).toBeAttached({ timeout: 20_000 })
-  } catch {
-    // Preserve this helper's promise, stated in the JSDoc above: fail by NAMING
-    // the branch, never by timing out anonymously. Waiting for readiness would
-    // otherwise trade `walked 0 nodes for <branch>` for a bare Playwright
-    // timeout — a worse message than the one the wait was added to prevent.
-    throw new Error(
-      `no commit graph painted within 20s, so nothing could be walked for the ` +
-        `branch ${branch} — the canvas never mounted. That is a readiness ` +
-        `failure, not a missing branch.`
-    )
-  }
+  // Name the branch on failure without swallowing the cause. The JSDoc above
+  // promises this helper fails by NAMING the branch rather than timing out
+  // anonymously, so the readiness wait must not discard that. An earlier
+  // version wrapped this in try/catch and re-threw a fixed message, which
+  // relabelled EVERY matcher rejection -- a closed page, a disconnected
+  // browser -- as "the canvas never mounted". That is a different misleading
+  // message, not a fix. expect's own message argument keeps the branch name
+  // AND Playwright's real cause. (codex review of this PR, 2026-09-07.)
+  await expect(
+    nodes.first(),
+    `no commit graph painted for the branch ${branch}, so nothing could be ` +
+      `walked. A readiness failure is not the same as a missing branch.`
+  ).toBeAttached({ timeout: 20_000 })
   const count = await nodes.count()
   for (let i = 0; i < count; i++) {
     await nodes.nth(i).click()
