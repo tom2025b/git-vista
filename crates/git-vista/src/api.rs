@@ -25,6 +25,7 @@ use crate::features::shell::signals as shell_state;
 use crate::listener_policy::{capability_refusal, is_capability_refusal};
 
 mod activity;
+mod bisect;
 mod blame;
 mod branches;
 mod clone;
@@ -48,6 +49,7 @@ mod status;
 mod tags;
 
 pub use activity::{fetch_activity, fetch_undoables, undo_request};
+pub use bisect::{bisect_mark_request, bisect_reset_request, bisect_start_request};
 pub use blame::{fetch_blame, fetch_file_history};
 pub use branches::{
     branch_op_request, create_branch_request, fetch_head_branch, fetch_rebase_status,
@@ -192,12 +194,11 @@ fn refuse_if_visualize() -> Result<(), String> {
 /// knows is down.
 ///
 /// This is prevention layered *on top of* `send_write_with_key`'s existing
-/// single in-flight retry (#216/#218) — it does not change that retry, nor
-/// `with_deadline`, nor either per-endpoint timeout constant. A write that
-/// starts while online and then loses connectivity mid-flight is untouched by
-/// this guard and still relies on the timeout/retry machinery already in
-/// place; this only stops a write from being *attempted* when the browser
-/// already knows, at the moment of the call, that it has no network.
+/// single in-flight retry (#216/#218). It leaves `with_deadline` and both
+/// per-endpoint timeouts unchanged. An already-sent write still relies on
+/// that timeout machinery. Every transport attempt, including its immediate
+/// retry, checks this guard too; losing connectivity never schedules a write
+/// to run on reconnection.
 ///
 /// The message deliberately does not claim the server or tunnel is
 /// unreachable — see [`offline_refusal_text`]'s doc comment in
@@ -294,6 +295,7 @@ async fn send_write_with_key(
     timeout_ms: u64,
 ) -> Result<(gloo_net::http::Response, IdempotencyKey), String> {
     let attempt = || async {
+        refuse_if_offline()?;
         let builder = req_post(url).header(IDEMPOTENCY_HEADER, key.as_str());
         let sent = async {
             match &body {

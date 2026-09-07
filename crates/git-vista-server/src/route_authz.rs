@@ -164,6 +164,11 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     // Creates a branch, moves HEAD and consumes the entry — three writes in
     // one verb, so the full posture without argument.
     ("/api/stash/branch", Method::POST, Authz::SessionAndCsrf),
+    // M5.34 (#87, ADR 0131): each bisect step is a real checkout, the same
+    // write posture as checkout/reset — full session + CSRF, no exception.
+    ("/api/bisect/start", Method::POST, Authz::SessionAndCsrf),
+    ("/api/bisect/mark", Method::POST, Authz::SessionAndCsrf),
+    ("/api/bisect/reset", Method::POST, Authz::SessionAndCsrf),
     // Staging selections (M2.17b, #213). The diff read is GET (no CSRF
     // surface) but still full_routes-only — it feeds the write surface and
     // shows uncommitted worktree contents, so the LAN router never sees it.
@@ -367,12 +372,13 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// and `/api/remove-worktree` (M11.05, #550) are classified `SessionAndCsrf`
 /// above; `/api/repository/events` (M12.05, #555) is `SessionRequired`; the
 /// rename-aware history and blame routes (M5.33, #86) are classified above
-/// with the rest of the read surface.
+/// with the rest of the read surface; the three bisect writes (M5.34, #87)
+/// are classified above with the rest of the write surface.
 /// No branch could see the total — only the trunk can, which is exactly what
 /// this constant and its test are for. Derived by running
 /// `every_registered_route_is_classified`, never copied from either side of a
 /// merge.
-const EXPECTED_ROUTE_COUNT: usize = 79;
+const EXPECTED_ROUTE_COUNT: usize = 82;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in

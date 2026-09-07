@@ -242,6 +242,21 @@ pub(crate) fn exposure_of(op: &GitOperation) -> Exposure {
              and bound by the operation hash; an MCP tool could only take them as \
              a free-form patch string, which #248 forbids",
         ),
+        // M5.34 (#87): none of the plan_bisect_* tools are built yet;
+        // exposure is defensible (an agent can read a test's own exit code
+        // as well as a human can) and simply pending, not refused.
+        GitOperation::BisectStart { .. } => Excluded(
+            "the plan_bisect_start tool is not built yet; exposure is defensible \
+             and pending, not refused",
+        ),
+        GitOperation::BisectMark { .. } => Excluded(
+            "the plan_bisect_mark tool is not built yet; exposure is defensible \
+             and pending, not refused",
+        ),
+        GitOperation::BisectReset => Excluded(
+            "the plan_bisect_reset tool is not built yet; exposure is defensible \
+             and pending, not refused",
+        ),
     }
 }
 
@@ -889,6 +904,7 @@ fn recovery_name(recovery: &RecoveryStrategy) -> &'static str {
             "conflict_recreatable_while_in_progress"
         }
         RecoveryStrategy::Irrecoverable => "irrecoverable",
+        RecoveryStrategy::BisectReset => "bisect_reset",
     }
 }
 
@@ -949,6 +965,12 @@ fn recovery_meaning(recovery: &RecoveryStrategy) -> String {
         RecoveryStrategy::Irrecoverable => {
             "There is no undo, and none is possible: the effect either left this machine \
              or was never in git's object database."
+                .to_string()
+        }
+        RecoveryStrategy::BisectReset => {
+            "Undo by running git bisect reset, which restores the pre-bisect HEAD from \
+             git's own BISECT_START record; there is no oid for git-vista to pin, since \
+             the repository already knows what it was bisecting."
                 .to_string()
         }
     }
@@ -1265,6 +1287,11 @@ mod tests {
         // would be choosing blind against a rule git enforces by refusal.
         // Pending, not refused — see `exposure_of`'s arm.
         "add_worktree",
+        // M5.34 (#87). None of the plan_bisect_* tools are built yet.
+        // Pending, not refused — see `exposure_of`'s three arms.
+        "bisect_start",
+        "bisect_mark",
+        "bisect_reset",
     ];
 
     fn catalog_names() -> Vec<String> {
@@ -1525,6 +1552,18 @@ mod tests {
                 name: tag("v1"),
                 remote: remote(),
             },
+            // M5.34 (#87). Excluded from the tool surface — none of the
+            // plan_bisect_* tools are built yet — but present here for the
+            // same reason the stash/conflict samples above are: the census
+            // proves every protocol variant has a considered exposure.
+            GitOperation::BisectStart {
+                bad: oid(&zeros),
+                good: vec![oid(&zeros)],
+            },
+            GitOperation::BisectMark {
+                verdict: git_vista_protocol::plan::BisectVerdict::Good,
+            },
+            GitOperation::BisectReset,
         ]
     }
 

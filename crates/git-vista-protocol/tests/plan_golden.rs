@@ -788,6 +788,57 @@ fn golden_plans() -> Vec<Plan> {
                 message: Some(StashMessage::new("wip: half-done refactor").unwrap()),
             },
         ),
+        // M5.34 (#87, ADR 0131): no Precondition on any of the three — the
+        // real gate lives in the executor reading `.git/BISECT_START` itself
+        // (this crate is wasm-safe, no filesystem), the same posture
+        // RemoveWorktree takes. `after: Computed` on all three because which
+        // commit the step lands on depends on git's own candidate-range
+        // arithmetic, not on this operation's fields.
+        plan(
+            'd',
+            GitOperation::BisectStart {
+                bad: oid('9'),
+                good: vec![oid('1')],
+            },
+            RiskLevel::Reversible,
+            Vec::new(),
+            vec![RefChange {
+                ref_name: rname("HEAD"),
+                before: RefState::At(oid('9')),
+                after: RefState::Computed,
+            }],
+            RecoveryStrategy::BisectReset,
+        ),
+        plan(
+            'e',
+            GitOperation::BisectMark {
+                verdict: git_vista_protocol::plan::BisectVerdict::Bad,
+            },
+            RiskLevel::Reversible,
+            Vec::new(),
+            vec![RefChange {
+                ref_name: rname("HEAD"),
+                before: RefState::At(oid('5')),
+                after: RefState::Computed,
+            }],
+            RecoveryStrategy::BisectReset,
+        ),
+        // Nothing is destroyed — a bisect step only ever checks out a
+        // candidate that already exists — so reset's own recovery is
+        // NotNeeded, the same reasoning SequenceContinue/Skip's arm above
+        // takes for an operation with a real undo target elsewhere.
+        plan(
+            'f',
+            GitOperation::BisectReset,
+            RiskLevel::Reversible,
+            Vec::new(),
+            vec![RefChange {
+                ref_name: rname("HEAD"),
+                before: RefState::At(oid('5')),
+                after: RefState::Computed,
+            }],
+            RecoveryStrategy::NotNeeded,
+        ),
     ]
 }
 
