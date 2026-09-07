@@ -652,3 +652,92 @@ fn unauthenticated_routes_are_a_pinned_short_allowlist() {
         );
     }
 }
+
+/// #705: the runtime exemption and [`EXPECTED_UNAUTHENTICATED`] describe the
+/// same set, and both describe it as `(path, method)` pairs.
+///
+/// The table above presents itself as *the* pre-session allowlist, pinned
+/// exactly. `security.rs`'s `require_auth` is what actually enforces it, and
+/// the two were written independently: the table reasoned in pairs while the
+/// runtime's negotiation clause tested the path alone, exempting every method
+/// on `/api/protocol`. Nothing was bypassable — `main.rs` registers only
+/// `get(protocol_info)`, so a write method ended at 405 — but the *audit* was
+/// false: a future `POST /api/protocol` could have been classified
+/// `SessionAndCsrf` here, satisfied every test in this file, and run
+/// unauthenticated.
+///
+/// A count or a comment cross-reference would not have caught that; both sides
+/// counted three. What was missing is a check on the *shape* of the runtime
+/// clause, which is what this test makes structural: every disjunct of
+/// `session_exempt` must test a method as well as a path. Dropping the method
+/// test from any clause fails here, by name, in the same test binary as the
+/// table it would have falsified.
+#[test]
+fn the_pre_session_exemption_is_method_qualified() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/security.rs");
+    let src = std::fs::read_to_string(&path).expect("readable security.rs");
+
+    // The assignment's right-hand side: from `let session_exempt =` to the
+    // `;` that ends the statement. Comments above it are excluded by starting
+    // at the binding itself, and the expression contains no string literals
+    // or nested statements, so a plain scan to `;` is exact here.
+    let start = src
+        .find("let session_exempt =")
+        .expect("security.rs still binds session_exempt");
+    let rest = &src[start..];
+    let end = rest
+        .find(';')
+        .expect("the session_exempt binding ends in ;");
+    let expr = &rest[..end];
+
+    let clauses: Vec<&str> = expr.split("||").collect();
+    assert_eq!(
+        clauses.len(),
+        EXPECTED_UNAUTHENTICATED
+            .iter()
+            .map(|(p, _)| *p)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        "security.rs's session_exempt has {} clauses but EXPECTED_UNAUTHENTICATED covers {} \
+         distinct paths. The runtime pre-session allowlist and this file's pinned one have \
+         diverged — reconcile them, then update this test. Expression was: {expr}",
+        clauses.len(),
+        EXPECTED_UNAUTHENTICATED
+            .iter()
+            .map(|(p, _)| *p)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    );
+
+    for clause in &clauses {
+        assert!(
+            clause.contains("Method::"),
+            "a session_exempt clause exempts a path for EVERY method: `{}`. \
+             Every pre-session exemption must be method-qualified — \
+             EXPECTED_UNAUTHENTICATED above pins (path, method) pairs, and a \
+             path-only clause makes that table a false audit the moment someone \
+             registers a write handler on that path (#705). Full expression: {expr}",
+            clause.trim()
+        );
+    }
+
+    // Each pinned path must actually appear in the runtime expression, by the
+    // constant that names it — so renaming a path in one place and not the
+    // other cannot pass.
+    for (pinned_path, _) in EXPECTED_UNAUTHENTICATED {
+        let named = match *pinned_path {
+            "/api/protocol" => "NEGOTIATION_PATH",
+            "/api/session" => "SESSION_PATH",
+            other => panic!(
+                "EXPECTED_UNAUTHENTICATED gained the path {other}, which this test does not \
+                 know the runtime constant for. Add it to the mapping here so the pre-session \
+                 allowlist stays checked against security.rs, rather than deleting the check."
+            ),
+        };
+        assert!(
+            expr.contains(named),
+            "EXPECTED_UNAUTHENTICATED pins {pinned_path}, but security.rs's session_exempt \
+             never mentions {named}. The pinned allowlist and the runtime one have diverged."
+        );
+    }
+}
