@@ -16,6 +16,7 @@
 //! actual touch cards, wiring into a shell) is still to come.
 
 pub mod core;
+pub mod detail;
 
 #[cfg(target_arch = "wasm32")]
 pub mod signals;

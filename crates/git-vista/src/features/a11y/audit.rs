@@ -320,6 +320,7 @@ fn interactive_selectors(rules: &[Rule]) -> BTreeSet<String> {
 /// geometry, and zooming out shrinks every target below any fixed threshold no
 /// matter what number is written here.
 const INTERACTIVE_CENSUS: &[(&str, bool)] = &[
+    (".status-chip", true), // #141: explicit 44px minimum in both dimensions.
     (".refresh", true),
     // Commit-dot and stub hit circles. Sized in SVG user units by `render/`, not by
     // CSS at all — see `commit_dot_hit_target_is_thirty_pixels_at_default_zoom`.

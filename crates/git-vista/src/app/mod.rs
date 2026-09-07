@@ -32,7 +32,6 @@ use leptos::*;
 use git_vista_protocol::{check_compatibility, PROTOCOL_VERSION};
 
 use crate::api::{fetch_frame, fetch_page, fetch_protocol, HistoryFetchError};
-use crate::datetime;
 use crate::dialogs;
 use crate::features::a11y::core::GRAPH_REGION_LABEL;
 use crate::features::activity::signals::Activity;
@@ -56,7 +55,6 @@ use crate::features::session::signals as session_state;
 use crate::features::shell::signals::{
     install_connectivity_signal, install_mode_signal, SheetController, Shell,
 };
-use crate::features::status::core as status_core;
 use crate::features::status::signals as status_seam;
 use crate::head_notice::head_notice;
 use crate::hook_policy_banner::hook_policy_banner_view;
@@ -585,7 +583,16 @@ pub fn App() -> impl IntoView {
     // sections, accessible labels — `activity.rs`'s `worktree_status` resource),
     // so the panel's rendering no longer depends on this one. This resource's
     // job is now just the chip and the `.refetch()` calls, not panel rendering.
-    let status = status_seam::create(graph, activity);
+    let status_frame = Signal::derive(move || {
+        seed.map(|(epoch, result)| {
+            (*epoch == graph.get().epoch())
+                .then(|| result.as_ref().ok().map(|s| s.frame.clone()))
+                .flatten()
+        })
+        .flatten()
+    });
+    let status_repo = Signal::derive(move || status_frame.get().and_then(|f| f.worktree_id));
+    let status = status_seam::create(graph, activity, status_repo);
 
     // Icon style (icons.rs): Nerd Font glyphs vs the plain-text fallback. A
     // signal so every icon in the app switches live when toggled; persisted in
@@ -778,64 +785,7 @@ pub fn App() -> impl IntoView {
                     "git-vista"
                 </h1>
                 <span class="subtitle">"vertical git history — drag to pan, pinch or scroll to zoom"</span>
-                // The working-tree status chip: conflicts trump dirt trumps
-                // clean, so the chip always shows the most urgent truth about
-                // the tree. Ahead/behind use plain unicode arrows (not Nerd
-                // glyphs) so they render identically in both icon modes; the
-                // hover title carries the full breakdown.
-                {move || status.get().flatten().map(|s| {
-                    let ic = icon_set(nerd_icons.get());
-                    // The label's grouping is decided in one host-tested place
-                    // (`features::status::core::chip_label`), shared with the
-                    // Activity panel's status sections. Before #348 this arm
-                    // folded untracked into "unstaged" while the panel gave it
-                    // its own section, so the two disagreed on screen about the
-                    // same worktree.
-                    let label = status_core::chip_label(
-                        s.staged.len(),
-                        s.unstaged.len(),
-                        s.untracked.len(),
-                        s.conflicted.len(),
-                    );
-                    let (mut class, icon) = if !s.conflicted.is_empty() {
-                        ("status-chip conflict".to_string(), ic.conflict)
-                    } else if !s.is_clean() {
-                        ("status-chip dirty".to_string(), ic.dirty)
-                    } else {
-                        ("status-chip clean".to_string(), ic.clean)
-                    };
-                    // How old this reading is — #the-stale-worktree-status-bug:
-                    // a reading held in memory since the last fetch looked
-                    // pixel-identical whether it was 1 second or 19 hours old.
-                    // `scanned_at == 0` means an older server never stamped a
-                    // time; that reads as "age unknown", not as a bogus huge
-                    // age computed against the unix epoch.
-                    let now = (js_sys::Date::now() / 1000.0) as i64;
-                    let age = (s.scanned_at > 0).then(|| now - s.scanned_at);
-                    let freshness = datetime::freshness_label(age);
-                    if datetime::is_stale(age) {
-                        class.push_str(" stale");
-                    }
-                    let mut sync = String::new();
-                    if s.ahead > 0 { sync.push_str(&format!(" ↑{}", s.ahead)); }
-                    if s.behind > 0 { sync.push_str(&format!(" ↓{}", s.behind)); }
-                    let title = format!(
-                        "{} staged · {} unstaged · {} untracked · {} conflicted{} · {}",
-                        s.staged.len(), s.unstaged.len(), s.untracked.len(),
-                        s.conflicted.len(),
-                        s.upstream.as_deref()
-                            .map(|u| format!(" · vs {u}"))
-                            .unwrap_or_default(),
-                        freshness,
-                    );
-                    view! {
-                        <span class=class title=title>
-                            <span class="nf">{icon}</span>
-                            {format!(" {label}{sync}")}
-                            <span class="status-age">{format!(" · {freshness}")}</span>
-                        </span>
-                    }
-                })}
+                {crate::features::status::detail::view::status_chip_view(features, status_frame, online, nerd_icons)}
                 // #663 (ADR 0094 §7): the change feed's health, drawn
                 // permanently and quietly, beside the working-tree status
                 // chip it shares a "trust signal about repository state"
