@@ -28,20 +28,24 @@ type WorktreeItems = (
 ///
 /// `is_head`/`is_stub` are `MenuData::is_head`/`MenuData::is_branch`,
 /// computed once by the caller since `commit_items` needs the same pair.
-/// `staged_count`/`worktree` are what `menu_view` opens the menu with — read
-/// here exactly where the original inline code read them, so the reactive
+/// `worktree` is the live resource `menu_view` opens the menu with — read
+/// here exactly where the original inline code read it, so the reactive
 /// tracking is unchanged.
 ///
-/// `staged_count` is a derived `Signal`, not a resource of its own (#709): it
-/// resolves the app's one repository-pinned status read against the live
-/// frame, so an old-repository or old-epoch reply counts zero and the unstage
-/// items stay absent instead of acting on another repository's index.
+/// `staged_count` is a resolved count rather than the resource itself (#709).
+/// That read is now pinned to the accepted repository frame, and the decision
+/// — is this reply current for the live epoch and repository, or a retained
+/// answer for one the user has left? — is made once in `menu_view`, where the
+/// live frame is, rather than re-derived per item here. It is read inside the
+/// same reactive block that used to call `.get()` on the resource, so the
+/// tracking is unchanged; a reply that is loading, failed, or scoped to
+/// another frame arrives as `0` and the unstage items stay absent.
 pub(super) fn build_worktree_items(
     features: Features,
     ic: &'static GitIcons,
     is_head: bool,
     is_stub: bool,
-    staged_count: Signal<usize>,
+    staged_count: usize,
     worktree: Resource<(bool, u64), Option<WorktreeStatus>>,
 ) -> WorktreeItems {
     let Features {
@@ -114,14 +118,15 @@ pub(super) fn build_worktree_items(
     // "Unstage Changes" (git reset HEAD): the exact inverse of "Stage
     // Changes" — the index goes back to HEAD, the working tree keeps
     // every edit. Appears only while something is actually staged
-    // (the pinned `/api/status` reading, tracked so the item pops in
-    // when that read lands) and only on the HEAD commit, like staging.
+    // (the repository-pinned `/api/status` reading, tracked so the item
+    // pops in when that read lands) and only on the HEAD commit, like
+    // staging.
     //
     // #217: same reasoning as "Stage Changes" above — an index-only
     // change has no history to invalidate, so this refetches status
     // instead of bumping the graph epoch (which would also have reset
     // Print's `history_complete` for no reason).
-    let unstage_changes = (is_head && staged_count.get() > 0).then(|| {
+    let unstage_changes = (is_head && staged_count > 0).then(|| {
         let on_unstage = move |_| {
             shell.close_menu();
             spawn_local(async move {
@@ -170,7 +175,7 @@ pub(super) fn build_worktree_items(
         }
         .into_view()
     });
-    let select_unstage = (is_head && staged_count.get() > 0).then(|| {
+    let select_unstage = (is_head && staged_count > 0).then(|| {
         let on = move |_| {
             shell.close_menu();
             shell.open_viewer(crate::state::ViewerDoc::Staging {

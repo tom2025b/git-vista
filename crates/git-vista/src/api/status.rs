@@ -18,21 +18,23 @@ use super::{
 /// request and cache-busted like the other live reads, since it changes with
 /// every edit.
 ///
-/// **`repo` is required, and that is the point (#709).** This used to sit
-/// behind an `Option<&str>`, with a companion `fetch_status()` that passed
-/// `None` — and `menu.rs` called that companion, so the one v1 status read
-/// still had an entry point that asked the server "whatever repository you
-/// happen to be resolving right now". A reply to that question belongs to no
-/// frame in particular, which is exactly the class of staleness the epoch/
-/// repository pinning exists to refuse: #707 pinned the chip path
-/// (`features::status::signals`), and this caller was the remaining hole.
+/// Pin chip/commit/menu readings to the accepted frame's opaque repository id.
 ///
-/// Taking the accepted frame's opaque repository id by value rather than by
-/// `Option` makes the unscoped request **unrepresentable** instead of merely
-/// discouraged — a later caller cannot forget to scope one, because there is
-/// no argument it can pass that means "unscoped". The reply is still only a
-/// *candidate* reading: `detail::core::current_reading` decides whether the
-/// frame it was requested for is still the live one.
+/// **`repo` is taken by value, and that is the fix for #709.** It used to be
+/// an `Option<&str>` with a companion `fetch_status()` passing `None`, and
+/// `menu.rs` called that companion — so the one v1 status read still had an
+/// entry point asking the server "whatever repository you happen to be
+/// resolving right now". A reply to that question belongs to no frame in
+/// particular, which is the staleness class the epoch/repository pinning
+/// exists to refuse: #707 pinned the chip path (`features::status::signals`)
+/// and this was the remaining unpinned caller. With no `None` to pass, an
+/// unscoped request is now unrepresentable rather than merely uncalled — a
+/// later caller cannot forget to scope one.
+///
+/// The reply is still only a *candidate* reading. Whether the frame it was
+/// requested for is still the accepted one is
+/// [`reading_is_current`](crate::features::status::detail::core::reading_is_current)'s
+/// decision, at the call site, on values this function never sees.
 pub async fn fetch_status_for(repo: &str) -> Result<RepoStatus, String> {
     let url = format!(
         "/api/status?t={}&repo={}",
@@ -54,7 +56,7 @@ pub async fn fetch_status_for(repo: &str) -> Result<RepoStatus, String> {
 /// #68c) — the per-path [`WorktreeStatus`] the discard/delete menu items need
 /// to name exactly which files each operation would touch (M2.18b, #220).
 ///
-/// Additive alongside [`fetch_status_for`], which serves the topbar chip's
+/// Additive alongside [`fetch_status`], which serves the topbar chip's
 /// coarser v1 shape and is untouched — migrating that consumer is 68d's job,
 /// not this one's.
 ///

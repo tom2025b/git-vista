@@ -44,7 +44,7 @@ pub async fn unstage_request() -> Result<(), String> {
 /// Fetch the staging base diff (`GET /api/staging/diff?direction=stage|unstage`,
 /// M2.17d, #215) — the pinned diff a hunk/line selection is made against, and
 /// the `diff-v1:` generation token the resulting [`PatchPlan`] must carry
-/// back verbatim. A read, like [`fetch_status_for`]/[`fetch_rebase_status`], so no
+/// back verbatim. A read, like [`fetch_status`]/[`fetch_rebase_status`], so no
 /// offline/visualize guard here — those gate only the two writes below.
 pub async fn staging_diff_request(direction: StageDirection) -> Result<StagingDiff, String> {
     let dir = match direction {

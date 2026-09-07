@@ -5,15 +5,9 @@
 //! leaving a shaped hole (design spec D2).
 //!
 //! When #68 fills this in, it inherits ONE owner for the status read. Task 7 made that
-//! true: [`signals::create`] is now the only place `fetch_status_for()` is called for the
+//! true: [`signals::create`] is now the only place `fetch_status()` is called for the
 //! topbar chip and the Activity panel, which until then held two independently-fetched
 //! copies of the same data. No state machine came with it — that is still #68's to design.
-//!
-//! #709 finished that sentence. `menu.rs` was still opening a *second* v1 read of its
-//! own — unscoped, so it could describe a repository the user had already left — to
-//! decide whether "Unstage Changes" appears. It now reads [`signals::staged_count`],
-//! which resolves this module's one reply against the live frame exactly as the chip
-//! does; the unscoped entry point it used no longer exists.
 //!
 //! [`core`] starts filling that hole (M2.15, #68d's pure-logic slice): the
 //! grouping/sort/count/accessible-label data a future view will render. It
