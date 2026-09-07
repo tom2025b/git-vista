@@ -54,6 +54,7 @@ use crate::state::{Features, MenuData, Settings};
 
 use crate::api::{fetch_rebase_status, fetch_status, fetch_undoables, fetch_worktree_status};
 
+mod bisect_items;
 mod branch_items;
 mod commit_items;
 mod compare_items;
@@ -214,6 +215,14 @@ pub fn menu_view(
             let (compare_anchor_item, compare_direct, compare_since) =
                 compare_items::build_compare_items(features, ic, &m);
             let (
+                bisect_anchor_item,
+                bisect_start_item,
+                bisect_mark_good,
+                bisect_mark_bad,
+                bisect_mark_skip,
+                bisect_reset_item,
+            ) = bisect_items::build_bisect_items(features, ic, &m);
+            let (
                 stage_changes,
                 unstage_changes,
                 select_stage,
@@ -271,6 +280,12 @@ pub fn menu_view(
                     {rebase_item}
                     {fetch_item}
                     {pull_item}
+                    {bisect_anchor_item}
+                    {bisect_start_item}
+                    {bisect_mark_good}
+                    {bisect_mark_bad}
+                    {bisect_mark_skip}
+                    {bisect_reset_item}
                 }
             });
             // The one disabled row standing in for the whole write set while

@@ -732,6 +732,12 @@ fn api_router(
                 "/api/stash/branch",
                 post(handlers::stash::branch_from_stash),
             )
+            // M5.34 (#87, ADR 0131): start/mark/reset a bisect session. No
+            // `GET /api/bisect/status` yet — see handlers/bisect.rs's module
+            // doc for why that is deliberately its own, separable slice.
+            .route("/api/bisect/start", post(handlers::bisect::bisect_start))
+            .route("/api/bisect/mark", post(handlers::bisect::bisect_mark))
+            .route("/api/bisect/reset", post(handlers::bisect::bisect_reset))
             .route("/api/tag", post(handlers::tags::create_tag))
             .route("/api/delete-tag", post(handlers::tags::delete_tag))
             // M2.21f (#240): the two **remote** tag writes — each opens a

@@ -33,6 +33,7 @@ const RENDER_STUBS: &str = include_str!("../../render/stubs.rs");
 // that lives in exactly one of these files.
 const MENU: &str = concat!(
     include_str!("../../menu.rs"),
+    include_str!("../../menu/bisect_items.rs"),
     include_str!("../../menu/view_items.rs"),
     include_str!("../../menu/create_items.rs"),
     include_str!("../../menu/commit_items.rs"),
@@ -47,6 +48,7 @@ const MENU: &str = concat!(
 /// `menu.rs` itself — kept as a plain list (not derived from the `concat!`)
 /// so this test can compare it against what's actually on disk.
 const MENU_MODULE_FILES: &[&str] = &[
+    "bisect_items.rs",
     "view_items.rs",
     "create_items.rs",
     "commit_items.rs",
