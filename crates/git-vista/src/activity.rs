@@ -23,13 +23,15 @@ use leptos::*;
 
 use git_vista_core::activity::{ActivityEvent, ActivitySource};
 
-use crate::api::{fetch_activity, fetch_tags, fetch_worktree_status};
+use crate::api::{fetch_activity, fetch_tags, fetch_worktree_status_for};
 use crate::datetime::time_ago;
 use crate::features::activity::core::{event_commit, kind_glyph, kind_label};
 use crate::features::dialogs::core::Dialog;
 use crate::features::shell::signals as shell_state;
 use crate::features::stash::view::stash_section_view;
 use crate::features::status::core::{chip_label, StatusHeadline, StatusSection, StatusSections};
+use crate::features::status::detail::core::current_reading;
+use crate::features::status::signals as status_state;
 use crate::features::tags::core::{
     tag_list_view, tag_row_lines, TagListView, TagRow, LOADING_TAGS, NO_TAGS,
 };
@@ -55,6 +57,7 @@ pub fn activity_panel_view(
     let Features {
         graph,
         shell,
+        status,
         stash: stash_drawer,
         ..
     } = features;
@@ -75,33 +78,56 @@ pub fn activity_panel_view(
         },
     );
 
-    // The v2 working-tree status (M2.15, #68), keyed exactly like the feed
-    // above: open the panel and it is read fresh, and any operation that
-    // bumps the graph epoch refreshes it in place. This is the panel's own
-    // read now, not the shared v1 resource the topbar chip still uses —
-    // #68d's grouped `StatusSections` needs the entry-level detail
-    // (`WorktreeStatus::entries`) v1's `RepoStatus` never carried.
+    // The v2 working-tree status (M2.15, #68): open the panel and it is read
+    // fresh, and any operation that bumps the graph epoch refreshes it in
+    // place. This is the panel's own read, not the shared v1 resource the
+    // topbar chip still uses — #68d's grouped `StatusSections` needs the
+    // entry-level detail (`WorktreeStatus::entries`) v1's `RepoStatus` never
+    // carried.
+    //
+    // Keyed and tagged on the accepted repository as well as the epoch (#711),
+    // the same way the chip's read and the menu's two reads are: `repo` is part
+    // of the key, so a repository switch refetches rather than retaining, and
+    // the reply carries the epoch and repository it was *requested for* so the
+    // resolution below cannot compare the live frame against itself. An
+    // unpinned read here would render one repository's file list under another
+    // repository's panel.
     let worktree_status = create_local_resource(
-        move || (shell.activity_is_open(), graph.get().epoch()),
-        |(open, _)| async move {
-            if open {
-                fetch_worktree_status().await.ok()
-            } else {
-                None
-            }
+        move || {
+            (
+                shell.activity_is_open(),
+                graph.get().epoch(),
+                status_state::repo(status),
+            )
+        },
+        |(open, epoch, repo)| async move {
+            let reading = match (open, repo.as_deref()) {
+                (true, Some(id)) => fetch_worktree_status_for(id).await.ok(),
+                // Closed, or no accepted frame yet: no request can describe
+                // this panel, so nothing is fetched and nothing is claimed.
+                _ => None,
+            };
+            (epoch, repo, reading)
         },
     );
+    // Resolved once, here, through the same host-tested decision the chip and
+    // the menu use. Loading, failed, old-epoch and old-repository all resolve
+    // to `None`, which the sections below already render as "no reading yet".
+    let worktree_now = move || {
+        current_reading(
+            worktree_status.loading().get(),
+            worktree_status.get(),
+            graph.get().epoch(),
+            status_state::repo(status).as_deref(),
+        )
+    };
 
     // The push preview (M3.24 #77, A2) needs the staged/unstaged/untracked
     // counts, and it must read the SAME working-tree observation the status
     // section above renders — a second `/api/status/v2` resource would be a
     // second "is the panel open" to drift, which is the defect M1.11 removed.
-    let status_sections = Signal::derive(move || {
-        worktree_status
-            .get()
-            .flatten()
-            .map(|s| StatusSections::from_worktree_status(&s))
-    });
+    let status_sections =
+        Signal::derive(move || worktree_now().map(|s| StatusSections::from_worktree_status(&s)));
 
     // The tag list (M2.21b, #236), keyed exactly like the feed above: open the
     // panel and it is read fresh, and any operation that bumps the graph epoch
@@ -140,7 +166,7 @@ pub fn activity_panel_view(
             // criterion, satisfied by consuming the data #68d built for exactly
             // this rather than re-deriving labels here.
             let status_section = move || {
-                worktree_status.get().flatten().map(|s| {
+                worktree_now().map(|s| {
                     let ic = icon_set(nerd_icons.get());
                     let sections = StatusSections::from_worktree_status(&s);
                     // Same grouping rule as the topbar chip — one host-tested
