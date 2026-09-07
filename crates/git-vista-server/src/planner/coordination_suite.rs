@@ -559,10 +559,28 @@ fn the_planner_path_does_not_call_sync_filesystem_readers_directly() {
 fn the_sweeps_reads_stay_joined_rather_than_awaited_in_turn() {
     let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/planner.rs"))
         .expect("planner.rs is readable");
-    for func in [
-        "async fn live_reading(",
-        "async fn read_generation_parts(",
-        "async fn observe_live_for_feed(",
+    // Naming each read, rather than only looking for `tokio::join!`, is what
+    // makes this pin bite. A mutation that keeps the join and lifts a single
+    // read out of it — `merge_ff` awaited first, the other two still joined —
+    // restores a third of the cost while leaving `tokio::join!` in place, and
+    // survived an earlier version of this test that checked only for the macro.
+    for (func, reads) in [
+        (
+            "async fn live_reading(",
+            &["observe_live_for_feed(repo)", "read_generation_parts(repo)"][..],
+        ),
+        (
+            "async fn read_generation_parts(",
+            &[
+                "refs_reading(repo)",
+                "stash_digest_input(repo)",
+                "merge_ff_digest_input(repo)",
+            ][..],
+        ),
+        (
+            "async fn observe_live_for_feed(",
+            &["rev_parse(repo, \"HEAD\")", "worktree_status(repo)"][..],
+        ),
     ] {
         let start = src
             .find(func)
@@ -571,10 +589,28 @@ fn the_sweeps_reads_stay_joined_rather_than_awaited_in_turn() {
         let end = body
             .find("\n}\n")
             .unwrap_or_else(|| panic!("`{func}`'s body ends at a column-0 brace"));
+        let body = &body[..end];
         assert!(
-            body[..end].contains("tokio::join!"),
+            body.contains("tokio::join!"),
             "`{func}` no longer joins its reads — the sweep is back to paying the \
              sum of its reads rather than their maximum (#661)"
         );
+        for read in reads {
+            // Checking the read is still *there* keeps the `.await` assertion
+            // below from passing vacuously: renamed away, it would trivially
+            // satisfy "is not awaited on its own" while reading nothing.
+            assert!(
+                body.contains(read),
+                "`{func}` no longer performs `{read}` — this pin names the reads \
+                 it expects to find joined, and cannot vouch for a read it \
+                 cannot see (#661)"
+            );
+            assert!(
+                !body.contains(&format!("{read}.await")),
+                "`{func}` awaits `{read}` on its own rather than inside the join \
+                 — that read's cost is added to the sweep instead of overlapped \
+                 with the others (#661)"
+            );
+        }
     }
 }
