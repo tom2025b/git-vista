@@ -198,9 +198,14 @@ claim_message() {
 	local number="$1"
 	printf 'adr-claim: %s\n\n' "$number"
 	printf 'Number: %s\n' "$number"
+	# Same precedence git itself uses when it writes the commit, so the trace
+	# names whoever the commit object names. Reading git config alone would
+	# print a different person than the commit was authored by whenever a lane
+	# overrides its identity per-invocation, which is this repository's
+	# documented way of committing.
 	printf 'Claimed-by: %s <%s>\n' \
-		"$(git config user.name || echo unknown)" \
-		"$(git config user.email || echo unknown)"
+		"${GIT_AUTHOR_NAME:-$(git config user.name || echo unknown)}" \
+		"${GIT_AUTHOR_EMAIL:-$(git config user.email || echo unknown)}"
 	printf 'Claimed-at: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 	printf 'Host: %s\n' "${HOSTNAME:-unknown}"
 	printf 'Branch: %s\n' "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"

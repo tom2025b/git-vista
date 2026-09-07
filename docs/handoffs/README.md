@@ -25,6 +25,47 @@ same question at once, which is the tell.
   git fetch origin && git show origin/main:docs/handoffs/<file>.md
   ```
 
+## Every handoff says CLAIM the number, never "take the next free one"
+
+**This retires the practice the batch sections below describe.** Those sections
+assign ADR numbers up front, in the batch table, "because when four sessions run
+at once and each picks the next free number, they all pick the same one." That
+reasoning was right and the remedy was not enough: it only works when one person
+writes every handoff in one sitting, and it says nothing about a lane that starts
+outside a batch. Six collisions in one day (#689, #697) is what it cost.
+
+**A handoff prompt must tell its session to claim the number, as a step, before
+writing anything.** Put this line in the ADR section of every handoff:
+
+> **Claim your ADR number first — do not read `docs/adr/README.md` and take the
+> next free one.** Run `NNNN=$(scripts/adr-claim.sh --issue <N> --slug <slug>)`
+> from the repository root. It pushes a claim to the remote and prints the number
+> you own; if another lane beat you to it the push is rejected and the script
+> takes the next one. Write your ADR under that number. When your PR merges,
+> release it: `scripts/adr-claim.sh --release $NNNN`.
+
+Why this replaces assigning numbers in the batch table:
+
+- **It arbitrates between lanes nobody coordinated.** A number assigned in a
+  table only binds the sessions that read that table. A claim binds every lane
+  that pushes to the remote, including one started an hour later on another box.
+- **It cannot go stale.** A batch table is written once and read for days. A
+  claim is checked by the remote at the instant it is made.
+- **An unused number comes back.** The 26 August batch records that "a reserved
+  number that goes unused stays burned rather than reassigned" — 0086 is the
+  tombstone. `scripts/adr-claim.sh --release NNNN` and `--sweep` give it back,
+  so a session that never writes its ADR costs nothing.
+
+`scripts/adr-claim.sh --list` shows who holds what, which is the thing a batch
+table was really for. See
+[ADR 0136](../adr/0136-a-number-is-claimed-by-a-push-not-by-a-read.md) for the
+mechanism, and `docs/adr/README.md` for the full command table.
+
+**The batch sections below are left exactly as written.** They are the record of
+what each session was actually told — that is the point of tracking them, and
+rewriting a handed-out instruction to match current practice would destroy it.
+Read their ADR-number assignments as history, not as the process.
+
 ## Why these are tracked rather than pasted
 
 Pasting a 300-line prompt into four sessions is slow, error-prone, and painful
