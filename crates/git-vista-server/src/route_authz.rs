@@ -695,7 +695,8 @@ fn session_exempt_expression(code: &str) -> Option<&str> {
     let mut depth: i32 = 0;
     let mut in_string = false;
     let mut escaped = false;
-    for (i, ch) in rest.char_indices() {
+    let mut chars = rest.char_indices().peekable();
+    while let Some((i, ch)) = chars.next() {
         if in_string {
             if escaped {
                 escaped = false;
@@ -708,6 +709,41 @@ fn session_exempt_expression(code: &str) -> Option<&str> {
         }
         match ch {
             '"' => in_string = true,
+            // A `'` is a char literal or a lifetime/label, and only position
+            // tells them apart — which is why this decision lives here rather
+            // than in a whole-expression `contains('\'')` test, which refused
+            // `&'a T`, `'static` and `'label:` as if they were literals
+            // (grok's review of #724). `'x'` and `'\n'` are consumed whole so a
+            // `;` inside one cannot end the statement; `'a` is a lifetime and
+            // only the quote is skipped.
+            '\'' => {
+                let is_char_literal = match chars.peek() {
+                    // `'\n'`, `'\''`, `'\\'` — an escape always means a literal.
+                    Some((_, '\\')) => true,
+                    // `'x'` is a literal; `'x…` without the closing quote is a
+                    // lifetime. Look one past the candidate contents.
+                    Some(_) => {
+                        let mut lookahead = chars.clone();
+                        lookahead.next();
+                        matches!(lookahead.peek(), Some((_, '\'')))
+                    }
+                    None => false,
+                };
+                if is_char_literal {
+                    // Consume the contents and the closing quote, honouring a
+                    // backslash escape so `'\''` does not end early.
+                    let mut escaped_char = false;
+                    for (_, c) in chars.by_ref() {
+                        if escaped_char {
+                            escaped_char = false;
+                        } else if c == '\\' {
+                            escaped_char = true;
+                        } else if c == '\'' {
+                            break;
+                        }
+                    }
+                }
+            }
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth -= 1,
             ';' if depth == 0 => return Some(&rest[..i]),
@@ -715,6 +751,87 @@ fn session_exempt_expression(code: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// #724 review: [`session_exempt_expression`] is a pure function, so it is
+/// tested directly rather than only through mutations of `security.rs`.
+///
+/// This exists because of a distinction worth keeping: the first fix for
+/// grok's finding *refused* char literals rather than parsing them, and a
+/// mutation proving the refusal fires proves only that — not that the input is
+/// handled. Taking grok's second suggestion turned the refusal into real
+/// handling, so the honest follow-up is to prove the handling. Each case below
+/// is one input class that could silently truncate the scan.
+#[test]
+fn the_session_exempt_scanner_reads_whole_statements() {
+    // The shape in the file today: no literals, one nested `matches!`.
+    let plain = "let session_exempt = (a == B && m == M::GET)\n || (c == D);\nlet next = 1;";
+    assert_eq!(
+        session_exempt_expression(plain),
+        Some("let session_exempt = (a == B && m == M::GET)\n || (c == D)"),
+        "the plain expression must be returned whole, stopping at its own `;`"
+    );
+
+    // grok's finding: a `;` inside a string must not end the statement, or the
+    // trailing clause goes unread while every assertion still passes.
+    let stringly =
+        "let session_exempt = (a == B && p != \"x;y\")\n || p == \"/api/evil\";\nnext();";
+    let got = session_exempt_expression(stringly).expect("a `;` in a string is not a terminator");
+    assert!(
+        got.contains("/api/evil"),
+        "the clause after the `;`-bearing string was truncated away: {got}"
+    );
+
+    // A `;` inside a CHAR literal is the same trap one notch smaller.
+    let charly = "let session_exempt = (a == B && c != ';')\n || p == \"/api/evil\";\nnext();";
+    let got =
+        session_exempt_expression(charly).expect("a `;` in a char literal is not a terminator");
+    assert!(
+        got.contains("/api/evil"),
+        "the clause after the `;`-bearing char literal was truncated away: {got}"
+    );
+
+    // An escaped quote inside a char literal must not end the literal early.
+    let escaped = "let session_exempt = (c != '\\'' && d != ';')\n || p == \"/api/evil\";\nnext();";
+    let got =
+        session_exempt_expression(escaped).expect("an escaped quote does not end the literal");
+    assert!(
+        got.contains("/api/evil"),
+        "an escaped quote in a char literal truncated the scan: {got}"
+    );
+
+    // Lifetimes and labels are NOT char literals. The old whole-expression
+    // `contains('\'')` check refused these outright; the scanner must read
+    // straight through them.
+    let lifetimes =
+        "let session_exempt = f::<'a>(x) && g(&'static y)\n || p == \"/api/evil\";\nnext();";
+    let got = session_exempt_expression(lifetimes)
+        .expect("a lifetime is not a char literal and must not be refused");
+    assert!(
+        got.contains("/api/evil"),
+        "a lifetime annotation truncated the scan: {got}"
+    );
+
+    // A `;` nested inside a block belongs to that block, not to this statement.
+    let nested = "let session_exempt = { let t = 1; t == 1 }\n || p == \"/api/evil\";\nnext();";
+    let got = session_exempt_expression(nested).expect("a nested `;` is not the terminator");
+    assert!(
+        got.contains("/api/evil"),
+        "a `;` inside a nested block truncated the scan: {got}"
+    );
+
+    // An unterminated statement yields None rather than a truncated slice, so
+    // the caller fails loudly instead of reading half an expression.
+    assert_eq!(
+        session_exempt_expression("let session_exempt = (a == B"),
+        None,
+        "an unclosed statement must be None, never a partial read"
+    );
+    assert_eq!(
+        session_exempt_expression("let something_else = 1;"),
+        None,
+        "no binding means no expression"
+    );
 }
 
 #[test]
@@ -725,16 +842,18 @@ fn the_pre_session_exemption_is_method_qualified() {
     let expr = session_exempt_expression(&code)
         .expect("security.rs still binds session_exempt, and that statement closes");
 
-    // The scanner models string literals and bracket depth but not char
-    // literals or block comments. Rather than assume neither ever appears —
-    // the assumption that made the previous version of this test inert —
-    // refuse loudly if one does, so the next maintainer extends the scanner
-    // instead of inheriting a silently truncated read.
+    // Char literals and lifetimes the scanner now handles outright. Block
+    // comments it does not: `strip_line_comments` only strips `//`, so a
+    // `/* ... */` inside this expression would still be scanned as code. That
+    // is a narrower gap than the one grok found, but it is a gap, so it
+    // refuses loudly rather than being assumed away — assuming it away is what
+    // made the first version of this test inert.
     assert!(
-        !expr.contains('\'') && !expr.contains("/*"),
-        "the session_exempt expression now contains a char literal or a block comment, \
-         which session_exempt_expression() does not model. Extend that scanner before \
-         trusting this test again — do not delete the check. Expression was: {expr}"
+        !expr.contains("/*"),
+        "the session_exempt expression now contains a block comment, which \
+         session_exempt_expression() does not model — strip_line_comments only removes \
+         `//`. Extend the scanner before trusting this test again; do not delete the \
+         check. Expression was: {expr}"
     );
 
     let clauses: Vec<&str> = expr.split("||").collect();
