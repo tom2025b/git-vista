@@ -557,6 +557,7 @@ pub fn deletable_untracked_paths(status: &WorktreeStatus) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::features::status::detail::core::current_reading;
     use git_vista_protocol::GenerationToken;
 
     fn token() -> GenerationToken {
@@ -1138,5 +1139,189 @@ mod tests {
         // caller matching on the variant loses the staged file's presence
         // silently rather than seeing it once the conflict is resolved.
         assert_eq!(sections.headline(), StatusHeadline::Conflicted(1));
+    }
+
+    // -----------------------------------------------------------------
+    // #711: the frame gate in front of the destructive path lists
+    // -----------------------------------------------------------------
+    //
+    // `menu.rs` composes exactly two host-compiled steps to turn a
+    // `/api/status/v2` reply into the files a confirmation names: resolve the
+    // reply against the live frame with `current_reading`, then derive paths
+    // from what survives. Both steps are here, so this composition runs on the
+    // host even though the menu that performs it is `#[cfg(target_arch =
+    // "wasm32")]` and never compiled by `cargo test`.
+    //
+    // The reply carries the epoch and repository it was *requested for*, so
+    // these tests cannot accidentally compare the live frame against itself.
+
+    /// One v2 reply, tagged with the scope it was requested for — the shape
+    /// `menu.rs`'s worktree resource resolves to.
+    fn v2_reply(
+        epoch: u64,
+        repo: &str,
+        status: WorktreeStatus,
+    ) -> Option<(u64, Option<String>, Option<WorktreeStatus>)> {
+        Some((epoch, Some(repo.to_string()), Some(status)))
+    }
+
+    /// The defect #711 names, run rather than read: a reply belonging to a
+    /// repository the user has left names **no** files in either destructive
+    /// confirmation.
+    ///
+    /// Both halves are asserted. That the reading is refused is the mechanism;
+    /// that the path lists are consequently empty is the property the user
+    /// actually depends on, and asserting only the first would stay green if
+    /// the selectors were ever fed the raw reply instead of the resolved one.
+    #[test]
+    fn a_reply_from_another_repository_names_no_discardable_or_deletable_path() {
+        let reply = v2_reply(4, "other-repo", mixed_worktree());
+        let reading = current_reading(false, reply, 4, Some("this-repo"));
+        assert_eq!(
+            reading, None,
+            "a reply tagged for another repository is not a reading"
+        );
+        assert!(reading
+            .as_ref()
+            .map(discardable_tracked_paths)
+            .unwrap_or_default()
+            .is_empty());
+        assert!(reading
+            .as_ref()
+            .map(deletable_untracked_paths)
+            .unwrap_or_default()
+            .is_empty());
+    }
+
+    /// The same refusal for every other way a reply can fail to describe the
+    /// live frame — a stale epoch, a still-loading resource, no accepted frame
+    /// at all, and a request that was made but failed.
+    ///
+    /// `mixed_worktree()` has both a discardable and a deletable path, so each
+    /// case would produce a non-empty confirmation body if the gate let it
+    /// through; an all-clean fixture would pass this test with the gate gone.
+    #[test]
+    fn only_a_reply_matching_the_live_frame_can_name_files_to_destroy() {
+        let m = mixed_worktree;
+        let cases: Vec<(&str, Option<WorktreeStatus>)> = vec![
+            (
+                "stale epoch",
+                current_reading(false, v2_reply(3, "a", m()), 4, Some("a")),
+            ),
+            (
+                "stale repository",
+                current_reading(false, v2_reply(4, "b", m()), 4, Some("a")),
+            ),
+            (
+                "still loading",
+                current_reading(true, v2_reply(4, "a", m()), 4, Some("a")),
+            ),
+            (
+                "no accepted frame",
+                current_reading(false, v2_reply(4, "a", m()), 4, None),
+            ),
+            (
+                "fetch failed",
+                current_reading(false, Some((4, Some("a".to_string()), None)), 4, Some("a")),
+            ),
+            ("never fetched", current_reading(false, None, 4, Some("a"))),
+        ];
+        for (name, reading) in cases {
+            assert!(reading.is_none(), "{name} became a reading");
+            assert!(
+                reading
+                    .as_ref()
+                    .map(discardable_tracked_paths)
+                    .unwrap_or_default()
+                    .is_empty(),
+                "{name} named a file to discard"
+            );
+            assert!(
+                reading
+                    .as_ref()
+                    .map(deletable_untracked_paths)
+                    .unwrap_or_default()
+                    .is_empty(),
+                "{name} named a file to delete"
+            );
+        }
+
+        // The positive control. Without it every assertion above would still
+        // hold on a `current_reading` that refused everything unconditionally,
+        // and the menu would simply never offer either operation.
+        let live = current_reading(false, v2_reply(4, "a", m()), 4, Some("a"))
+            .expect("a reply matching the live frame is a reading");
+        assert_eq!(
+            discardable_tracked_paths(&live),
+            vec![
+                "src/edited.rs".to_string(),
+                "src/new_name.rs".to_string(),
+                "src/staged.rs".to_string(),
+            ]
+        );
+        assert_eq!(
+            deletable_untracked_paths(&live),
+            vec!["scratch.txt".to_string()]
+        );
+    }
+
+    /// The server cannot stand in for this gate, and the comment in
+    /// `menu.rs` that says so is load-bearing enough to pin.
+    ///
+    /// `verify_path_states` re-derives each path's tracked/untracked state
+    /// against the repository selected *now* and refuses the batch on any
+    /// mismatch — but the destructive POSTs carry no repository selector, so
+    /// "matches" is decided entirely by path name and state. Two repositories
+    /// dirty in the same file — the ordinary case for sibling worktrees of one
+    /// repository, which this app switches between by design — produce a list
+    /// that passes that re-check while having been derived somewhere else.
+    ///
+    /// This test does not run the server. It pins the client-side claim the
+    /// severity argument rests on: the paths a stale reply would have offered
+    /// are ordinary names with nothing about them a path-state filter could
+    /// reject, so the frame gate above is the only thing standing between the
+    /// user and a confirmed batch.
+    #[test]
+    fn a_colliding_path_name_is_indistinguishable_to_a_path_state_recheck() {
+        let elsewhere = status(vec![
+            changed(
+                "Cargo.lock",
+                ChangeSides::UnstagedOnly {
+                    unstaged: ChangeKind::Modified,
+                },
+            ),
+            StatusEntry::Untracked {
+                path: "notes.txt".to_string(),
+                binary: false,
+            },
+        ]);
+        // Derived from the other repository's reply, before any gate.
+        assert_eq!(
+            discardable_tracked_paths(&elsewhere),
+            vec!["Cargo.lock".to_string()]
+        );
+        assert_eq!(
+            deletable_untracked_paths(&elsewhere),
+            vec!["notes.txt".to_string()]
+        );
+        // The live repository, dirty in the very same files. A re-check that
+        // asks only "is this path tracked-dirty / untracked here?" answers yes
+        // to both, so it would admit the whole batch.
+        let here = elsewhere.clone();
+        assert_eq!(
+            discardable_tracked_paths(&here),
+            discardable_tracked_paths(&elsewhere)
+        );
+        assert_eq!(
+            deletable_untracked_paths(&here),
+            deletable_untracked_paths(&elsewhere)
+        );
+        // The frame gate is what tells them apart, and it does it on the tag
+        // rather than on the contents — which is why identical contents do not
+        // weaken it.
+        assert_eq!(
+            current_reading(false, v2_reply(4, "elsewhere", elsewhere), 4, Some("here")),
+            None
+        );
     }
 }
