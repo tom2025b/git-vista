@@ -47,14 +47,16 @@ use leptos::*;
 use crate::features::graph::collapse::WipRun;
 use crate::features::graph::core::disabled_menu_item_copy;
 use crate::features::shell::signals::{self as shell_state, Shell};
-use crate::features::status::detail::core::reading_is_current;
+use crate::features::status::detail::core::{current_reading, reading_is_current};
 use crate::features::status::signals as status_state;
 use crate::geometry::menu_placement;
 use crate::gestures::viewport_size;
 use crate::icons::icon_set;
 use crate::state::{Features, MenuData, Settings};
 
-use crate::api::{fetch_rebase_status, fetch_status_for, fetch_undoables, fetch_worktree_status};
+use crate::api::{
+    fetch_rebase_status, fetch_status_for, fetch_undoables, fetch_worktree_status_for,
+};
 
 mod bisect_items;
 mod branch_items;
@@ -216,31 +218,57 @@ pub fn menu_view(
             .unwrap_or(0)
     };
     // The per-path working-tree status (`GET /api/status/v2`, M2.18b/#220) —
-    // fetched when the menu opens on the HEAD commit, keyed on the same
-    // open/epoch pair. The v1 read above cannot serve this: the discard/delete
-    // confirmations must name the exact paths, and must classify each one the
-    // same way the server's own `verify_path_states` will (tracked-dirty vs
-    // untracked), which only the v2 per-entry shape carries.
+    // fetched when the menu opens on the HEAD commit. The v1 read above cannot
+    // serve this: the discard/delete confirmations must name the exact paths,
+    // and must classify each one the same way the server's own
+    // `verify_path_states` will (tracked-dirty vs untracked), which only the
+    // v2 per-entry shape carries.
     //
-    // A failed or still-in-flight read resolves to `None`, and both items then
-    // render *disabled with the reason* rather than vanishing — an item that
-    // silently disappears while a status probe is slow reads as "this repo
-    // can't do that", which would be a lie.
+    // Keyed and tagged exactly like the staged read above, and for a sharper
+    // reason. This reply is what "Discard Changes…" and "Delete Untracked
+    // Files…" name their files from, so an answer retained across a repository
+    // switch would put another repository's paths inside a confirmation for
+    // this one. The server cannot catch that for us: the write carries no
+    // repository selector and `verify_path_states` re-derives against whatever
+    // repository is selected *now*, so it refuses a path that is not dirty
+    // here — and passes one that happens to share a name, which is exactly
+    // what sibling worktrees of the same repository do.
+    //
+    // A failed, still-in-flight, or out-of-frame read resolves to `None`, and
+    // both items then render *disabled with the reason* rather than vanishing
+    // — an item that silently disappears while a status probe is slow reads as
+    // "this repo can't do that", which would be a lie.
     let worktree = create_local_resource(
         move || {
             (
                 shell.menu().is_some_and(|m| m.is_head && !m.is_branch),
                 graph.get().epoch(),
+                status_state::repo(status),
             )
         },
-        |(open, _)| async move {
-            if open {
-                fetch_worktree_status().await.ok()
-            } else {
-                None
-            }
+        |(open, epoch, repo)| async move {
+            let reading = match (open, repo.as_deref()) {
+                (true, Some(id)) => fetch_worktree_status_for(id).await.ok(),
+                // Closed, or no accepted frame yet: no request can describe
+                // this menu, so nothing is fetched and nothing is claimed.
+                _ => None,
+            };
+            (epoch, repo, reading)
         },
     );
+    // Resolve that reply against the live frame before any path in it can
+    // reach a confirmation, through the same host-tested decision the chip
+    // path uses. The requested epoch and repository travel *inside* the reply,
+    // so this cannot pair the live frame with some other request's scope.
+    // Loading, failed, old-epoch and old-repository all resolve to `None`.
+    let worktree_now = move || {
+        current_reading(
+            worktree.loading().get(),
+            worktree.get(),
+            graph.get().epoch(),
+            status_state::repo(status).as_deref(),
+        )
+    };
     move || {
         shell.menu().map(|m| {
             // Tracked read: the menu lives inside the overlay wrapper's reactive block,
@@ -278,7 +306,7 @@ pub fn menu_view(
                 is_head,
                 is_stub,
                 staged_now(),
-                worktree,
+                worktree_now(),
             );
             let branch_items = branch_items::build_branch_items(features, ic, &m, rebase_status);
             let tag_items = tag_items::build_tag_items(features, ic, &m);
