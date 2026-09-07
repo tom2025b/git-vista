@@ -457,18 +457,42 @@ baseline green at 56 passed; every mutation caught.
 
 | Run | Claim | Mutation | Kind | What went red, and why it is a *different* failure |
 |---|---|---|---|---|
-| 422 | #704 env | drop the `.filter(…)` from `untrusted_checkout_env` | remove | Three tests. The real spawned hook reported `unset\|unset\|unset\|/tmp/gv702-not-a-real-agent.sock\|a-credential-nobody-enumerated\|PATH-present\|HOME-present` — the socket and the canary arriving verbatim in attacker-selected code. The defect itself, reproduced. |
-| 423 | #702 env | add `"SSH_AUTH_SOCK"` to the allowlist | weaken | Two tests; the hook saw the socket back with the canary still correctly withheld. The policy/argv test stayed **green** — same issue, opposite layer from run 419. |
-| 421 | #704 list | **delete** `"XDG_CONFIG_HOME"` from the allowlist | weaken, in the other direction | Only the exact-constant assertion. This is the arm the first version of this ADR could not make at all: its test supplied three allowed names, so removing a name changed real behaviour — global config resolution — and stayed green. Added on review. |
-| 419 | #702 policy | make `policy_for_clone_checkout` keep the transfer's `ro_carveouts` and `net_ports` | remove | Only the three-way policy comparison, on `ro_carveouts`. A pure policy-shape failure; nothing spawned, no environment read. |
-| 420 | #702 wiring | give `execute_clone`'s checkout the **transfer** policy | weaken | Only the source-level routing tripwire, counting `checkout_policy` occurrences. Nothing else noticed — which is the entire reason that tripwire exists. |
+| 422 | #704 env | drop the `.filter(…)` from `untrusted_checkout_env` | remove | Three tests. The real spawned hook reported `unset\|unset\|unset\|/tmp/gv702-not-a-real-agent.sock\|a-credential-nobody-enumerated\|PATH-present\|HOME-present` — socket and canary arriving verbatim in attacker-selected code. The defect itself, reproduced. |
+| 423 | #702 env | add `"SSH_AUTH_SOCK"` to the allowlist | weaken | Two tests; the hook saw the socket back with the canary still withheld. The policy/argv test stayed **green** — same issue, opposite layer from 428. |
+| 421 | #704 list | **delete** `"XDG_CONFIG_HOME"` from the allowlist | weaken, other direction | Only the exact-constant assertion. The arm this ADR's first version could not make at all: its test supplied three allowed names, so removing one changed real behaviour and stayed green. |
+| 428 | #702 policy | `policy_for_clone_checkout` keeps the transfer's `ro_carveouts` and `net_ports` | remove | Only the three-way policy comparison, on `ro_carveouts`. A pure policy-shape failure; nothing spawned, no environment read. |
 
-Read 419/420 and 422/423 as two pairs that share no code. 419 and 420 are a
-`Policy` built in memory and a source-level count; 422 and 423 are a real
-`post-checkout` hook, spawned under the real shim, reporting what it actually
-inherited. Either half alone licenses a wrong conclusion — 419 alone would say
-the policy edit is the fix, which ADR 0033 §3's measurement contradicts; 422
-alone would leave the argv still advertising a grant the process must not have.
+**And one arm the compiler answers instead of a test.** Transposing
+`execute_clone`'s two policy arguments at the call site — codex-daybreak's
+demonstrated defeat of the earlier source-level guard — was submitted as run
+**430** and came back `build_failed`:
+
+```text
+error[E0308]: arguments to this function are incorrect
+845 |                 &checkout_policy,
+    |                 ---------------- expected `&sandbox::Policy`, found `&CheckoutPolicy`
+846 |                 &policy,
+    |                 ------- expected `&CheckoutPolicy`, found `&sandbox::Policy`
+```
+
+`failure-atlas` correctly **refuses a verdict** there: a mutation that does not
+compile says nothing about any assertion, and the tool declines rather than
+reporting a false `caught`. That refusal is right and this table does not
+launder it into one. But for *this* claim the build failure is the stronger
+evidence, because it is the property itself: the mistake is not caught, it is
+**unrepresentable**. A test proving the transposition is detected would be a
+weaker statement than rustc proving it cannot be written.
+
+Read 428 and 422/423 as halves that share no code: a `Policy` built in memory
+and never run, versus a real `post-checkout` hook spawned under the real shim
+reporting what it inherited. Either alone licenses a wrong conclusion — 428
+alone would say the policy edit is the fix, which ADR 0033 §3's measurement
+contradicts; 422 alone would leave the argv still advertising a grant the
+process must not have.
+
+Runs 419 and 420 belonged to the earlier, defeatable form of §2a and are
+superseded: the properties they tested are now carried by types, so there is
+nothing left for a mutation to survive.
 
 Run 421 is the arm this ADR earned in review. Every other mutation *adds*
 something dangerous, and a test that pins only the effect on a fixed sample
