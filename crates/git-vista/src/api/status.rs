@@ -13,19 +13,30 @@ use super::{
 };
 
 /// Fetch the live working-tree status (`GET /api/status`) — branch, ahead/
-/// behind, and the dirty-file lists — for the topbar chip and the Activity
-/// panel's status section. Resolved fresh server-side per request and cache-
-/// busted like the other live reads, since it changes with every edit.
-pub async fn fetch_status() -> Result<RepoStatus, String> {
-    fetch_status_for(None).await
-}
-
-/// Pin chip/commit readings to the accepted frame's opaque repository id.
-pub async fn fetch_status_for(repo: Option<&str>) -> Result<RepoStatus, String> {
-    let mut url = format!("/api/status?t={}", js_sys::Date::now());
-    if let Some(repo) = repo {
-        url.push_str(&format!("&repo={}", js_sys::encode_uri_component(repo)));
-    }
+/// behind, and the dirty-file lists — for the topbar chip, the commit review
+/// and the context menu's staging items. Resolved fresh server-side per
+/// request and cache-busted like the other live reads, since it changes with
+/// every edit.
+///
+/// Pin chip/commit/menu readings to the accepted frame's opaque repository id.
+///
+/// **`repo` is required, not optional, and that is deliberate.** An unscoped
+/// request — one asking the server for "whatever repository you happen to be
+/// resolving right now" — is unrepresentable here rather than merely uncalled,
+/// so a later caller cannot forget to scope one. A reply to an unscoped
+/// question belongs to no frame in particular, which is the staleness class
+/// the epoch/repository pinning exists to refuse.
+///
+/// The reply is still only a *candidate* reading. Whether the frame it was
+/// requested for is still the accepted one is
+/// [`reading_is_current`](crate::features::status::detail::core::reading_is_current)'s
+/// decision, at the call site, on values this function never sees.
+pub async fn fetch_status_for(repo: &str) -> Result<RepoStatus, String> {
+    let url = format!(
+        "/api/status?t={}&repo={}",
+        js_sys::Date::now(),
+        js_sys::encode_uri_component(repo)
+    );
     let resp = send_read(&url).await.map_err(|e| e.to_string())?;
     if resp.ok() {
         resp.json::<RepoStatus>().await.map_err(|e| e.to_string())

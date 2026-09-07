@@ -21,6 +21,13 @@ impl StatusResource {
     }
 }
 
+/// The accepted frame's opaque repository id this resource is scoped to —
+/// what a second caller (`menu.rs`'s own staged-file count) must pin its own
+/// fetch to, the same way [`create`]'s resource does.
+pub fn repo(status: StatusResource) -> Option<String> {
+    status.repo.get()
+}
+
 /// Opening Activity or changing the accepted frame refreshes the shared read.
 /// Until that frame arrives, no unscoped request can describe the previous repo.
 pub fn create(
@@ -32,7 +39,7 @@ pub fn create(
         move || (activity.is_open(), graph.get().epoch(), repo.get()),
         |(_, epoch, repo)| async move {
             let result = match repo.as_deref() {
-                Some(id) => fetch_status_for(Some(id)).await.ok(),
+                Some(id) => fetch_status_for(id).await.ok(),
                 None => None,
             };
             (epoch, repo, result)
