@@ -262,6 +262,10 @@ pub fn link_target(fact: &ExplanationFact) -> Option<LinkTarget> {
             | RecoveryStrategy::RecoverableIfStaged
             | RecoveryStrategy::ConflictRecreatableWhileInProgress
             | RecoveryStrategy::Irrecoverable => None,
+            // The way back is `git bisect reset`, not a move to one fixed
+            // ref or commit this static fact could name — the pre-bisect
+            // position lives in `.git/BISECT_START`, unknowable here.
+            RecoveryStrategy::BisectReset => None,
         },
         ExplanationFact::Advisory(a) => match a {
             Advisory::DefaultBranchPush { branch, .. }
@@ -483,6 +487,12 @@ fn recovery(r: &RecoveryStrategy) -> String {
         RecoveryStrategy::Irrecoverable => {
             "Git-Vista offers no undo for this — no ref moves back, and nothing in \
              its own record can replay it."
+                .to_string()
+        }
+        RecoveryStrategy::BisectReset => {
+            "To undo: end the bisect (`git bisect reset`). It returns to where the \
+             bisect started and clears its state — a plain ref move cannot do \
+             either, since the bisect may need to reattach a branch."
                 .to_string()
         }
     }

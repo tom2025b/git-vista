@@ -534,3 +534,83 @@ fn the_planner_path_does_not_call_sync_filesystem_readers_directly() {
         }
     }
 }
+
+/// #661: the sweep's five reads must stay **joined**, not awaited in turn.
+///
+/// Awaited one after another, a sweep cost the *sum* of its reads — measured
+/// at a ~92 ms median in release against this repository's 455 refs, of which
+/// roughly 90% was four sandboxed git spawns. Joined, it costs their *maximum*,
+/// measured at ~33 ms.
+///
+/// # Why this is a source-level pin and not a timing assertion
+///
+/// Nothing observable changes: the same five reads return the same values and
+/// fold to the same generation token, so no behavioural test can tell the two
+/// shapes apart. The difference is only ever wall clock — and a wall-clock
+/// assertion is exactly what #661's own measurement found untrustworthy here,
+/// having recorded a 3.6x spread on identical code depending on what else was
+/// running on the box. A test that flakes under load is worse than no test.
+///
+/// So this pins the shape, in the established style of
+/// [`the_planner_path_does_not_call_sync_filesystem_readers_directly`] above.
+/// It catches precisely the regression that would otherwise be silent: an edit
+/// that re-serialises these reads, costs 3x, and breaks nothing a test asserts.
+#[test]
+fn the_sweeps_reads_stay_joined_rather_than_awaited_in_turn() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/planner.rs"))
+        .expect("planner.rs is readable");
+    // Naming each read, rather than only looking for `tokio::join!`, is what
+    // makes this pin bite. A mutation that keeps the join and lifts a single
+    // read out of it — `merge_ff` awaited first, the other two still joined —
+    // restores a third of the cost while leaving `tokio::join!` in place, and
+    // survived an earlier version of this test that checked only for the macro.
+    for (func, reads) in [
+        (
+            "async fn live_reading(",
+            &["observe_live_for_feed(repo)", "read_generation_parts(repo)"][..],
+        ),
+        (
+            "async fn read_generation_parts(",
+            &[
+                "refs_reading(repo)",
+                "stash_digest_input(repo)",
+                "merge_ff_digest_input(repo)",
+            ][..],
+        ),
+        (
+            "async fn observe_live_for_feed(",
+            &["rev_parse(repo, \"HEAD\")", "worktree_status(repo)"][..],
+        ),
+    ] {
+        let start = src
+            .find(func)
+            .unwrap_or_else(|| panic!("planner.rs still defines `{func}`"));
+        let body = &src[start..];
+        let end = body
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("`{func}`'s body ends at a column-0 brace"));
+        let body = &body[..end];
+        assert!(
+            body.contains("tokio::join!"),
+            "`{func}` no longer joins its reads — the sweep is back to paying the \
+             sum of its reads rather than their maximum (#661)"
+        );
+        for read in reads {
+            // Checking the read is still *there* keeps the `.await` assertion
+            // below from passing vacuously: renamed away, it would trivially
+            // satisfy "is not awaited on its own" while reading nothing.
+            assert!(
+                body.contains(read),
+                "`{func}` no longer performs `{read}` — this pin names the reads \
+                 it expects to find joined, and cannot vouch for a read it \
+                 cannot see (#661)"
+            );
+            assert!(
+                !body.contains(&format!("{read}.await")),
+                "`{func}` awaits `{read}` on its own rather than inside the join \
+                 — that read's cost is added to the sweep instead of overlapped \
+                 with the others (#661)"
+            );
+        }
+    }
+}

@@ -1391,14 +1391,29 @@ struct DigestInput {
 }
 
 async fn read_generation_parts(repo: &Path) -> GenerationParts {
-    let (head_branch, refs, named_refs, refs_read) = refs_reading(repo).await;
+    // #661: these three are independent *reads* of the same repository — one
+    // `spawn_blocking` gix walk and two sandboxed git spawns — and awaiting
+    // them one after another made the sweep's cost their sum. Joined, it is
+    // their maximum.
+    //
+    // Concurrency here is not merely allowed, it is the more correct shape.
+    // Sequential awaits spread the reading across a window as wide as the sum,
+    // during which the repository can move *between* two inputs of the same
+    // digest; joining narrows that window to the longest single read. A
+    // generation token folded from a narrower window is a better answer to the
+    // only question it is asked — "was this all true at one instant?".
+    let ((head_branch, refs, named_refs, refs_read), stash, merge_ff) = tokio::join!(
+        refs_reading(repo),
+        stash_digest_input(repo),
+        merge_ff_digest_input(repo),
+    );
     GenerationParts {
         head_branch,
         refs,
         named_refs,
         refs_read,
-        stash: stash_digest_input(repo).await,
-        merge_ff: merge_ff_digest_input(repo).await,
+        stash,
+        merge_ff,
     }
 }
 
@@ -1444,8 +1459,12 @@ pub(crate) async fn live_reading(repo: &Path) -> LiveReading {
     // The ref walk below also returns HEAD's symbolic branch. This feed-only
     // observation omits the standalone branch open that operation freshness
     // checks still need for their precondition diagnostics.
-    let mut observed = observe_live_for_feed(repo).await;
-    let parts = read_generation_parts(repo).await;
+    // #661: the feed observation and the generation parts share no data and
+    // neither writes, so the whole read path is one join of five independent
+    // reads rather than five sequential awaits. See [`read_generation_parts`]
+    // for why the narrower reading window is also the more correct one.
+    let (mut observed, parts) =
+        tokio::join!(observe_live_for_feed(repo), read_generation_parts(repo));
     observed.head_branch = parts.head_branch.clone();
     let blind = if !parts.refs_read {
         Some("the ref store could not be read".to_string())
@@ -1845,11 +1864,16 @@ async fn observe_live_for_generation(repo: &Path) -> Observed {
 /// small distinction explicit lets `enforce_fresh` retain its existing live
 /// `BranchCheckedOut` check while the sweep removes the redundant gix open.
 async fn observe_live_for_feed(repo: &Path) -> Observed {
+    // #661: two independent sandboxed spawns, joined rather than awaited in
+    // turn, for the reason [`read_generation_parts`] spells out — the sweep's
+    // cost becomes their maximum instead of their sum, and the two reads
+    // describe a narrower instant.
+    let (head_tip, status) = tokio::join!(rev_parse(repo, "HEAD"), worktree_status(repo));
     Observed {
         head_branch: None,
-        head_tip: Obs::from_read(rev_parse(repo, "HEAD").await),
+        head_tip: Obs::from_read(head_tip),
         branch_tip: Obs::Absent,
-        status: worktree_status(repo).await,
+        status,
         held_at_build: Vec::new(),
         census: no_census_taken(),
     }
@@ -2981,6 +3005,90 @@ async fn shape(
             };
             (RiskLevel::Destructive, preconditions, changes, recovery)
         }
+        // M5.34 (#87, ADR 0131). No `Precondition` on `BisectStart`: the
+        // fields are bare commit oids (git itself refuses an unknown one,
+        // the same protection `CreateBranch`'s `at` field relies on), and
+        // starting while another bisect is already in progress is refused
+        // by the executor reading `.git/BISECT_START` itself — the same
+        // "the real gate lives in the executor, checked freshly" posture
+        // `RemoveWorktree` takes (ADR 0120 §3), rather than a build-time
+        // check `enforce_fresh` would have to re-verify against state this
+        // crate cannot read (it is wasm-safe, no filesystem).
+        //
+        // `before` mirrors `CheckoutBranch`'s own computation exactly: a
+        // checked-out branch's symbolic HEAD, or a detached commit's bare
+        // oid. `after` is `Computed` because which commit `git bisect
+        // start` checks out first depends on the good/bad range's midpoint
+        // — not knowable from this operation's own fields.
+        GitOperation::BisectStart { .. } => {
+            let before = match (&head_ref, &head_oid) {
+                (Some(r), _) => Some(RefState::Symbolic(r.clone())),
+                (None, Some(o)) => Some(RefState::At(o.clone())),
+                (None, None) => None,
+            };
+            let changes = match before {
+                Some(before) => vec![RefChange {
+                    ref_name: RefName::new("HEAD").expect("literal is valid"),
+                    before,
+                    after: RefState::Computed,
+                }],
+                None => Vec::new(),
+            };
+            (
+                RiskLevel::Reversible,
+                Vec::new(),
+                changes,
+                RecoveryStrategy::BisectReset,
+            )
+        }
+        // No `Precondition` here either — same reasoning as `BisectStart`
+        // just above, and the same shape `SequenceContinue` already takes:
+        // the executor reads `.git/BISECT_START` itself and refuses with
+        // `409` if no bisect is in progress, rather than a build-time check
+        // this crate has no filesystem access to perform.
+        GitOperation::BisectMark { .. } => {
+            let changes = head_oid
+                .as_ref()
+                .map(|o| {
+                    vec![RefChange {
+                        ref_name: RefName::new("HEAD").expect("literal is valid"),
+                        before: RefState::At(o.clone()),
+                        after: RefState::Computed,
+                    }]
+                })
+                .unwrap_or_default();
+            (
+                RiskLevel::Reversible,
+                Vec::new(),
+                changes,
+                RecoveryStrategy::BisectReset,
+            )
+        }
+        // Nothing is destroyed — a bisect step only ever checks out a
+        // candidate that already exists in history — so reset's own
+        // recovery is `NotNeeded`: it returns to exactly the state
+        // `BisectStart` found the repository in, and there is nothing
+        // further back to go. The pre-bisect position itself is not
+        // `RefState::At`-able here: it lives in `.git/BISECT_START`, which
+        // this wasm-safe crate cannot read, so `after` is `Computed`.
+        GitOperation::BisectReset => {
+            let changes = head_oid
+                .as_ref()
+                .map(|o| {
+                    vec![RefChange {
+                        ref_name: RefName::new("HEAD").expect("literal is valid"),
+                        before: RefState::At(o.clone()),
+                        after: RefState::Computed,
+                    }]
+                })
+                .unwrap_or_default();
+            (
+                RiskLevel::Reversible,
+                Vec::new(),
+                changes,
+                RecoveryStrategy::NotNeeded,
+            )
+        }
         // Continue and skip both move the sequence forward and may create a
         // commit; the undo is to move HEAD back, which head_moves supplies.
         GitOperation::SequenceContinue | GitOperation::SequenceSkip => {
@@ -3583,6 +3691,13 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
             entry,
             expected_oid,
         } => stash::exec_drop_stash(repo, need, &entry, &expected_oid).await,
+        GitOperation::BisectStart { bad, good } => {
+            bisect_exec::exec_start(repo, need, &bad, &good, &observed).await
+        }
+        GitOperation::BisectMark { verdict } => {
+            bisect_exec::exec_mark(repo, need, verdict, &observed).await
+        }
+        GitOperation::BisectReset => bisect_exec::exec_reset(repo, need, &observed).await,
     }
 }
 
@@ -4156,6 +4271,11 @@ mod sequence_exec;
 /// module doc.
 mod worktree_exec;
 
+/// The bisect executors — start/mark/reset, and `discover` — git's own
+/// on-disk bisect state read fresh, never mirrored; see the module doc and
+/// ADR 0131 (M5.34, #87).
+pub(crate) mod bisect_exec;
+
 /// `POST /api/amend-commit`'s one 400 constructor — the handler's own
 /// request-shape refusals and [`commit_exec`]'s classified git outcomes both
 /// build through it — re-exported so `handlers::commit`'s
@@ -4295,7 +4415,13 @@ pub(crate) fn honours_cancellation(op: &GitOperation) -> bool {
         | GitOperation::CreateTag { .. }
         | GitOperation::DeleteLocalTag { .. }
         | GitOperation::DeleteRemoteTag { .. }
-        | GitOperation::PushTag { .. } => false,
+        | GitOperation::PushTag { .. }
+        // M5.34 (#87): a bisect step/start/reset is local and
+        // millisecond-scale — it walks and checks out commits already in
+        // the object database, no transfer to interrupt.
+        | GitOperation::BisectStart { .. }
+        | GitOperation::BisectMark { .. }
+        | GitOperation::BisectReset => false,
     }
 }
 

@@ -67,6 +67,7 @@ use super::worktree_exec::{
 use super::*;
 use git_vista_fixtures::seeded as seeded_repo;
 use git_vista_fixtures::seeded_dated as seeded_repo_dated;
+use git_vista_protocol::plan::BisectVerdict;
 use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
@@ -254,6 +255,9 @@ fn covered_by(op: &GitOperation) -> &'static str {
         GitOperation::DeleteLocalTag { .. } => "delete_local_tag_executes_through_the_pipeline",
         GitOperation::DeleteRemoteTag { .. } => "delete_remote_tag_executes_through_the_pipeline",
         GitOperation::PushTag { .. } => "push_tag_executes_through_the_pipeline",
+        GitOperation::BisectStart { .. } => "bisect_start_executes_through_the_pipeline",
+        GitOperation::BisectMark { .. } => "bisect_mark_executes_through_the_pipeline",
+        GitOperation::BisectReset => "bisect_reset_executes_through_the_pipeline",
     }
 }
 
@@ -310,9 +314,10 @@ fn covered_on_split_path(op: &GitOperation) -> &'static str {
         | GitOperation::CreateTag { .. }
         | GitOperation::DeleteLocalTag { .. }
         | GitOperation::DeleteRemoteTag { .. }
-        | GitOperation::PushTag { .. } => {
-            "the_split_path_is_byte_identical_to_the_single_shot_path"
-        }
+        | GitOperation::PushTag { .. }
+        | GitOperation::BisectStart { .. }
+        | GitOperation::BisectMark { .. }
+        | GitOperation::BisectReset => "the_split_path_is_byte_identical_to_the_single_shot_path",
     }
 }
 
@@ -434,6 +439,14 @@ fn samples() -> Vec<GitOperation> {
             name: TagName::new("v1").unwrap(),
             remote: RemoteName::new("origin").unwrap(),
         },
+        GitOperation::BisectStart {
+            bad: oid(&zeros),
+            good: vec![oid(&zeros)],
+        },
+        GitOperation::BisectMark {
+            verdict: BisectVerdict::Good,
+        },
+        GitOperation::BisectReset,
     ]
 }
 
@@ -2727,204 +2740,516 @@ fn route_call_spans(src: &str) -> Vec<String> {
     out
 }
 
-/// Every POST route `main.rs`'s `api_router` registers, and the handler each
-/// one reaches — the write-surface half of the route census. Hoisted to a
-/// module-level `const` (rather than a local binding inside the test below,
-/// which is where this table used to live) so that
-/// [`route_authz_and_write_contract_agree_on_every_post_route`] (#690) can
-/// read it directly, the same way it reads `route_authz`'s `ROUTE_AUTHZ` —
-/// two independently hand-maintained tables checked against each other by
-/// one third test, instead of trusting a human (or an agent) to remember the
-/// second table exists at all.
-///
-/// `create_session` is this table's one exception: it names a handler, not a
-/// path, because it is routed with a bare `.post(…)` — see its own entry
-/// below.
-pub(crate) const KNOWN_POST_ROUTES: &[(&str, &str)] = &[
-    // Session bootstrap (`POST /session` behind the sign-in token) — an
-    // auth write, not a git write; routed with `.post(…)` directly.
-    ("create_session", "create_session"),
-    ("/api/clone", "clone_repo"),
-    ("/api/delete-clone", "delete_clone_repo"),
-    ("/api/select", "select_repo"),
-    // M11.03 (#548): switch to a linked worktree of the served repository.
-    // A **catalog write, not a git write** — it can admit a discovered
-    // sibling to the catalog and move the selection, but it constructs no
-    // argv, mints no plan and touches no ref, so it has no funnel row
-    // below. Classified here rather than allowed to slip past the tally,
-    // exactly as `/api/operations/{id}/cancel` is: the whole point of this
-    // table is that a new POST cannot appear without someone deciding
-    // which kind it is. The git it does run is the census's read-only
-    // `git worktree list --porcelain`.
-    (
-        "/api/select-worktree",
-        "handlers::select::select_discovered_worktree",
-    ),
-    // M11.05 (#550): close a linked sibling desk — a git write, funnel
-    // row below.
-    (
-        "/api/remove-worktree",
-        "handlers::worktrees::remove_worktree",
-    ),
-    ("/api/rescan", "rescan"),
-    // M13.03 (#584): save the GitHub token. A **credential write, not a
-    // git write** — it calls `keyring::Entry::set_password` and touches
-    // no repository, constructs no argv, and mints no plan. Classified
-    // here rather than allowed to slip past the tally, the same as
-    // `/api/select-worktree`'s catalog write above.
-    ("/api/settings/token", "handlers::settings::set_token"),
-    ("/api/branch", "create_branch"),
-    ("/api/commit", "create_commit"),
-    // M2.19b (#223): amend — a git write, funnel row below.
-    ("/api/amend-commit", "amend_commit"),
-    // M10.09 (#596): cherry-pick — a git write, funnel row below. The
-    // operation and its executor predate this route by a whole milestone
-    // (#576); what #596 added is the only way for a client to ask for it.
-    ("/api/cherry-pick", "cherry_pick"),
-    ("/api/stage", "stage_all"),
-    // Staging selections (M2.17b, #213): apply is a git write and MUST
-    // reach the planner (funnel row below). Preview is deliberately not
-    // one — it builds the same bytes but mutates nothing and never mints
-    // a plan; its refusals (400/409) happen before any operation exists.
-    ("/api/staging/preview", "staging_preview"),
-    ("/api/staging/apply", "staging_apply"),
-    // M2.16 (#69): the four explicit DiffSpec diff modes. A POST, and
-    // emphatically **not** a git write — it spawns a read-only `git diff`
-    // through `git_stdout_capped`, constructs no plan, and leaves the
-    // repository byte-for-byte unchanged. It has no funnel row below for
-    // the same reason `/api/staging/preview` does not.
-    //
-    // It is a POST only because `DiffSpec` is an internally-tagged enum
-    // whose variants carry different fields; a query string could carry it
-    // only by flattening it into loose optional parameters, which is the
-    // un-explicit shape the type exists to remove. `/api/plan` sits in this
-    // table for the same reason — a read wearing a write's verb because the
-    // CSRF gate keys on the method.
-    ("/api/diff/spec", "spec_diff"),
-    ("/api/unstage", "unstage_all"),
-    ("/api/undo", "activity::undo"),
-    ("/api/merge", "merge_branch"),
-    ("/api/push", "push_branch"),
-    // M2.20c (#229): fetch — a git write, funnel row below.
-    ("/api/fetch", "fetch_remote"),
-    // M2.20d (#230): pull — a git write, funnel row below.
-    ("/api/pull", "pull_branch"),
-    ("/api/delete-branch", "delete_branch"),
-    // The stash drawer (M3.24, #77). All three are git writes and all
-    // three go through the planner — push moves worktree state into
-    // refs/stash, apply moves it back, and drop destroys an entry. Listed
-    // here so the census sees three considered rows rather than three
-    // routes nothing checked.
-    ("/api/stash/push", "handlers::stash::push_stash"),
-    ("/api/stash/apply", "handlers::stash::apply_stash"),
-    ("/api/stash/drop", "handlers::stash::drop_stash"),
-    ("/api/stash/branch", "handlers::stash::branch_from_stash"),
-    // M2.21d (#238): the two local tag writes — git writes, funnel rows
-    // below. M2.21f (#240) added the two remote ones right after. The
-    // tag *listing* is a GET and so never reaches this table.
-    ("/api/tag", "handlers::tags::create_tag"),
-    ("/api/delete-tag", "handlers::tags::delete_tag"),
-    ("/api/push-tag", "handlers::tags::push_tag"),
-    (
-        "/api/delete-remote-tag",
-        "handlers::tags::delete_remote_tag",
-    ),
-    ("/api/checkout", "checkout_branch"),
-    // M11.04 (#549): a git write — it reaches the planner and runs
-    // `git worktree add` — so it is a funnel row below like every other
-    // mutation, not a catalog write.
-    ("/api/add-worktree", "handlers::branch::add_worktree"),
-    ("/api/force-delete-branch", "force_delete_branch"),
-    ("/api/rebase", "rebase"),
-    ("/api/reset-test-repo", "reset_test_repo"),
-    // #219 (M2.18a): discard/delete of working-tree paths.
-    ("/api/discard-tracked-paths", "discard_tracked_paths"),
-    ("/api/delete-untracked-paths", "delete_untracked_paths"),
-    // M4.31b (#429): resolving one conflicted path by taking a whole
-    // side, or removing the file. A git write — it runs `checkout --ours`
-    // / `--theirs` / `rm -f` — so it goes through the planner like every
-    // other mutation, and appears in the funnel below.
-    ("/api/resolve-conflict", "resolve_conflict"),
-    ("/api/resolve-conflict-content", "resolve_conflict_content"),
-    // M2.20c (#229): cancelling a running operation. A POST, and a write
-    // in the "changes what the server is doing" sense — it kills a child
-    // process — but **not** a git write: it constructs no argv and mints
-    // no plan, so it has no funnel row below. It is classified here, on
-    // purpose, rather than being allowed to slip past the tally.
-    (
-        "/api/operations/{id}/cancel",
-        "handlers::operations::cancel_operation",
-    ),
-    // M2.23d (#248, ADR 0046): build a reviewable Plan and hand it back.
-    // Deliberately NOT a funnel row below — it must never reach
-    // `plan_and_execute`. The `build_only` block after the funnel loop
-    // states the inverse requirement and checks it.
-    ("/api/plan", "plan_operation"),
-    // M2.23e (#249, ADR 0046 continued): submit a plan for execution. Not
-    // a funnel row either — it reaches the planner through
-    // `submit_plan_tracked`, the submit path's own tracked entry, never
-    // `plan_and_execute` (which would rebuild the operation instead of
-    // executing the plan that was actually approved). The
-    // `submit_execute` block right after the `build_only` one below
-    // checks this route's own chain.
-    ("/api/execute-plan", "execute_plan"),
-    // M10.08 (#576, ADR 0099): the graph a Plan would produce. A POST, and
-    // deliberately NOT a git write: it mints no plan, builds no mutating
-    // argv, and must never reach any execution entry point. Its git work
-    // is `merge-tree`/`commit-tree` run against a throwaway object store
-    // whose only writable target is itself, so the repository it names is
-    // byte-for-byte unchanged (asserted by `preview::suite`'s A2). No
-    // funnel row below, for the same reason `/api/plan` has none — and,
-    // like `/api/plan`, the inverse requirement is stated and checked, in
-    // the `preview_is_read_only` block after the `build_only` one.
-    ("/api/preview", "preview_plan"),
-    // M3.25 (#78): executing one past operation's recovery. A git write —
-    // it reaches the planner — but not a funnel row below, because it
-    // enters through `plan_and_execute_recovery` rather than
-    // `plan_and_execute` (it carries the `recovers` link the plain entry
-    // point has no parameter for). The `recovery_chain` block after the
-    // funnel loop checks its own chain, the same way `/api/execute-plan`
-    // gets `submit_execute`.
-    (
-        "/api/operations/{id}/recover",
-        "recovery_center::recover_operation",
-    ),
-];
+/// A POST's reviewed effect and, for git writes, its required planner entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PostKind {
+    NonGitWrite,
+    ReadLike,
+    GitWrite(PlannerEntry),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlannerEntry {
+    Ordinary,
+    Proving,
+    ExplicitTarget,
+    Recovery,
+    SubmittedPlan,
+}
+
+impl PlannerEntry {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Ordinary => "plan_and_execute",
+            Self::Proving => "plan_and_execute_proving",
+            Self::ExplicitTarget => "plan_and_execute_for_worktree",
+            Self::Recovery => "plan_and_execute_recovery",
+            Self::SubmittedPlan => "submit_plan_tracked",
+        }
+    }
+}
+
+type PostRoute = (&'static str, &'static str, PostKind);
+
+/// One proof per registered handler. Every listed path is required: `None`
+/// means a direct call, `Some(helper)` means handler → local helper → entry.
+/// Grouping paths keeps create_commit's two branches in one reviewed proof.
+#[derive(Clone, Copy)]
+struct FunnelProof {
+    handler: &'static str,
+    file: &'static str,
+    paths: &'static [Option<&'static str>],
+}
+
+fn post_route_census() -> &'static [PostRoute] {
+    use PlannerEntry::*;
+    use PostKind::*;
+
+    // Every POST must be classified. Catalog/auth/credential writes and
+    // read-like POSTs do not execute a plan against the served repository.
+    // Build-only and preview additionally have inverse execution checks below.
+    &[
+        // Session bootstrap uses a bare `.post(create_session)` registration.
+        ("create_session", "create_session", NonGitWrite),
+        ("/api/clone", "clone_repo", NonGitWrite),
+        ("/api/delete-clone", "delete_clone_repo", NonGitWrite),
+        ("/api/select", "select_repo", NonGitWrite),
+        // Admits/selects a discovered worktree in the catalog; git only lists.
+        (
+            "/api/select-worktree",
+            "handlers::select::select_discovered_worktree",
+            NonGitWrite,
+        ),
+        (
+            "/api/remove-worktree",
+            "handlers::worktrees::remove_worktree",
+            GitWrite(Ordinary),
+        ),
+        ("/api/rescan", "rescan", NonGitWrite),
+        (
+            "/api/settings/token",
+            "handlers::settings::set_token",
+            NonGitWrite,
+        ),
+        ("/api/branch", "create_branch", GitWrite(Ordinary)),
+        ("/api/commit", "create_commit", GitWrite(Ordinary)),
+        ("/api/amend-commit", "amend_commit", GitWrite(Ordinary)),
+        ("/api/cherry-pick", "cherry_pick", GitWrite(Ordinary)),
+        ("/api/stage", "stage_all", GitWrite(Ordinary)),
+        // Preview builds the selection bytes; only apply mutates the index.
+        ("/api/staging/preview", "staging_preview", ReadLike),
+        ("/api/staging/apply", "staging_apply", GitWrite(Ordinary)),
+        // Read-only diff uses POST to carry the structured DiffSpec body.
+        ("/api/diff/spec", "spec_diff", ReadLike),
+        ("/api/unstage", "unstage_all", GitWrite(Ordinary)),
+        ("/api/undo", "activity::undo", GitWrite(Ordinary)),
+        ("/api/merge", "merge_branch", GitWrite(Ordinary)),
+        ("/api/push", "push_branch", GitWrite(Ordinary)),
+        ("/api/fetch", "fetch_remote", GitWrite(Ordinary)),
+        ("/api/pull", "pull_branch", GitWrite(Ordinary)),
+        ("/api/delete-branch", "delete_branch", GitWrite(Ordinary)),
+        (
+            "/api/stash/push",
+            "handlers::stash::push_stash",
+            GitWrite(Ordinary),
+        ),
+        (
+            "/api/stash/apply",
+            "handlers::stash::apply_stash",
+            GitWrite(Ordinary),
+        ),
+        (
+            "/api/stash/drop",
+            "handlers::stash::drop_stash",
+            GitWrite(Proving),
+        ),
+        (
+            "/api/stash/branch",
+            "handlers::stash::branch_from_stash",
+            GitWrite(Ordinary),
+        ),
+        (
+            "/api/bisect/start",
+            "handlers::bisect::bisect_start",
+            GitWrite(Ordinary),
+        ),
+        (
+            "/api/bisect/mark",
+            "handlers::bisect::bisect_mark",
+            GitWrite(Ordinary),
+        ),
+        (
+            "/api/bisect/reset",
+            "handlers::bisect::bisect_reset",
+            GitWrite(Ordinary),
+        ),
+        ("/api/tag", "handlers::tags::create_tag", GitWrite(Ordinary)),
+        (
+            "/api/delete-tag",
+            "handlers::tags::delete_tag",
+            GitWrite(Ordinary),
+        ),
+        (
+            "/api/push-tag",
+            "handlers::tags::push_tag",
+            GitWrite(Ordinary),
+        ),
+        (
+            "/api/delete-remote-tag",
+            "handlers::tags::delete_remote_tag",
+            GitWrite(Ordinary),
+        ),
+        ("/api/checkout", "checkout_branch", GitWrite(Ordinary)),
+        (
+            "/api/add-worktree",
+            "handlers::branch::add_worktree",
+            GitWrite(Ordinary),
+        ),
+        (
+            "/api/force-delete-branch",
+            "force_delete_branch",
+            GitWrite(Ordinary),
+        ),
+        ("/api/rebase", "rebase", GitWrite(Ordinary)),
+        (
+            "/api/reset-test-repo",
+            "reset_test_repo",
+            GitWrite(Ordinary),
+        ),
+        (
+            "/api/discard-tracked-paths",
+            "discard_tracked_paths",
+            GitWrite(Ordinary),
+        ),
+        (
+            "/api/delete-untracked-paths",
+            "delete_untracked_paths",
+            GitWrite(Ordinary),
+        ),
+        (
+            "/api/resolve-conflict",
+            "resolve_conflict",
+            GitWrite(ExplicitTarget),
+        ),
+        (
+            "/api/resolve-conflict-content",
+            "resolve_conflict_content",
+            GitWrite(ExplicitTarget),
+        ),
+        // Cancelling kills an existing child, but constructs no argv or plan.
+        (
+            "/api/operations/{id}/cancel",
+            "handlers::operations::cancel_operation",
+            NonGitWrite,
+        ),
+        ("/api/plan", "plan_operation", ReadLike),
+        ("/api/execute-plan", "execute_plan", GitWrite(SubmittedPlan)),
+        // Preview's git writes target only a throwaway object store (#576).
+        ("/api/preview", "preview_plan", ReadLike),
+        (
+            "/api/operations/{id}/recover",
+            "recovery_center::recover_operation",
+            GitWrite(Recovery),
+        ),
+    ]
+}
+
+fn planner_funnel_census() -> &'static [FunnelProof] {
+    &[
+        FunnelProof {
+            handler: "create_branch",
+            file: "src/handlers/branch.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "checkout_branch",
+            file: "src/handlers/branch.rs",
+            paths: &[Some("branch_op")],
+        },
+        FunnelProof {
+            handler: "merge_branch",
+            file: "src/handlers/branch.rs",
+            paths: &[Some("branch_op")],
+        },
+        FunnelProof {
+            handler: "push_branch",
+            file: "src/handlers/branch.rs",
+            paths: &[Some("branch_op")],
+        },
+        FunnelProof {
+            handler: "delete_branch",
+            file: "src/handlers/branch.rs",
+            paths: &[Some("branch_op")],
+        },
+        FunnelProof {
+            handler: "force_delete_branch",
+            file: "src/handlers/branch.rs",
+            paths: &[Some("branch_op")],
+        },
+        FunnelProof {
+            handler: "create_commit",
+            file: "src/handlers/commit.rs",
+            paths: &[None, Some("commit_empty_on_branch")],
+        },
+        FunnelProof {
+            handler: "amend_commit",
+            file: "src/handlers/commit.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "cherry_pick",
+            file: "src/handlers/commit.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "stage_all",
+            file: "src/handlers/commit.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "unstage_all",
+            file: "src/handlers/commit.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "fetch_remote",
+            file: "src/handlers/fetch.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "pull_branch",
+            file: "src/handlers/pull.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "rebase",
+            file: "src/handlers/rebase.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "reset_test_repo",
+            file: "src/handlers/reset.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "activity::undo",
+            file: "src/activity.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "staging_apply",
+            file: "src/handlers/staging.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "discard_tracked_paths",
+            file: "src/handlers/discard.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "delete_untracked_paths",
+            file: "src/handlers/discard.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "handlers::worktrees::remove_worktree",
+            file: "src/handlers/worktrees.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "handlers::tags::create_tag",
+            file: "src/handlers/tags.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "handlers::tags::delete_tag",
+            file: "src/handlers/tags.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "handlers::tags::push_tag",
+            file: "src/handlers/tags.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "handlers::tags::delete_remote_tag",
+            file: "src/handlers/tags.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "handlers::bisect::bisect_start",
+            file: "src/handlers/bisect.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "handlers::bisect::bisect_mark",
+            file: "src/handlers/bisect.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "handlers::bisect::bisect_reset",
+            file: "src/handlers/bisect.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "handlers::stash::push_stash",
+            file: "src/handlers/stash.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "handlers::stash::apply_stash",
+            file: "src/handlers/stash.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "handlers::stash::drop_stash",
+            file: "src/handlers/stash.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "handlers::stash::branch_from_stash",
+            file: "src/handlers/stash.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "handlers::branch::add_worktree",
+            file: "src/handlers/branch.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "resolve_conflict",
+            file: "src/handlers/conflicts.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "resolve_conflict_content",
+            file: "src/handlers/conflicts.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "execute_plan",
+            file: "src/handlers/plan.rs",
+            paths: &[None],
+        },
+        FunnelProof {
+            handler: "recovery_center::recover_operation",
+            file: "src/recovery_center.rs",
+            paths: &[None],
+        },
+    ]
+}
+
+/// Cross-check both ways using the exact registered handler (including its
+/// module), before scanning bodies. A missing proof must name the route even
+/// when route registration/count checks would otherwise pass.
+fn assert_post_funnel_linkage(expected: &[PostRoute], funnel: &[FunnelProof]) {
+    for (route, handler, kind) in expected {
+        let proofs: Vec<_> = funnel.iter().filter(|p| p.handler == *handler).collect();
+        let required = usize::from(matches!(kind, PostKind::GitWrite(_)));
+        assert_eq!(
+            proofs.len(), required,
+            "POST {route} → {handler} ({kind:?}) must have exactly {required} planner funnel proof(s)"
+        );
+        for proof in proofs {
+            assert!(
+                !proof.paths.is_empty(),
+                "POST {route} → {handler} has an empty planner funnel proof"
+            );
+            for (i, path) in proof.paths.iter().enumerate() {
+                assert!(
+                    !proof.paths[..i].contains(path),
+                    "POST {route} → {handler} repeats planner funnel path {path:?}"
+                );
+            }
+        }
+    }
+    for proof in funnel {
+        assert_eq!(
+            expected
+                .iter()
+                .filter(|(_, handler, kind)| {
+                    *handler == proof.handler && matches!(kind, PostKind::GitWrite(_))
+                })
+                .count(),
+            1,
+            "funnel handler {} must match exactly one git-write POST census row",
+            proof.handler
+        );
+    }
+}
+
+#[test]
+#[should_panic(
+    expected = "POST /api/fake-git-write → handlers::fake::write (GitWrite(Ordinary)) must have exactly 1 planner funnel proof(s)"
+)]
+fn post_funnel_census_rejects_a_new_git_write_without_a_proof() {
+    let mut expected = post_route_census().to_vec();
+    expected.push((
+        "/api/fake-git-write",
+        "handlers::fake::write",
+        PostKind::GitWrite(PlannerEntry::Ordinary),
+    ));
+    assert_post_funnel_linkage(&expected, planner_funnel_census());
+}
+
+#[test]
+fn post_funnel_census_rejects_each_missing_handler_proof() {
+    // Mutate the real table, including proving, explicit-target, recovery and
+    // submitted-plan entries. None may escape through a special-case block.
+    for omitted in planner_funnel_census() {
+        let funnel: Vec<_> = planner_funnel_census()
+            .iter()
+            .copied()
+            .filter(|proof| proof.handler != omitted.handler)
+            .collect();
+        let error = std::panic::catch_unwind(|| {
+            assert_post_funnel_linkage(post_route_census(), &funnel);
+        })
+        .expect_err("removing any git-write proof must fail the census");
+        let message = error.downcast_ref::<String>().unwrap();
+        let (route, _, _) = post_route_census()
+            .iter()
+            .find(|(_, handler, _)| *handler == omitted.handler)
+            .unwrap();
+        assert!(message.contains(route) && message.contains(omitted.handler));
+    }
+}
+
+#[test]
+#[should_panic(
+    expected = "POST /api/branch → create_branch (GitWrite(Ordinary)) must have exactly 1 planner funnel proof(s)"
+)]
+fn post_funnel_census_rejects_duplicate_proofs() {
+    let mut funnel = planner_funnel_census().to_vec();
+    funnel.push(funnel[0]);
+    assert_post_funnel_linkage(post_route_census(), &funnel);
+}
+
+#[test]
+#[should_panic(expected = "POST /api/branch → create_branch has an empty planner funnel proof")]
+fn post_funnel_census_rejects_empty_proofs() {
+    let mut funnel = planner_funnel_census().to_vec();
+    funnel[0].paths = &[];
+    assert_post_funnel_linkage(post_route_census(), &funnel);
+}
+
+#[test]
+#[should_panic(
+    expected = "funnel handler handlers::fake::write must match exactly one git-write POST census row"
+)]
+fn post_funnel_census_rejects_unregistered_proofs() {
+    let mut funnel = planner_funnel_census().to_vec();
+    funnel.push(FunnelProof {
+        handler: "handlers::fake::write",
+        file: "src/handlers/fake.rs",
+        paths: &[None],
+    });
+    assert_post_funnel_linkage(post_route_census(), &funnel);
+}
 
 /// The single-funnel proof: the router's POST table is exactly the known
-/// write surface ([`KNOWN_POST_ROUTES`], above), and every **git-mutating**
-/// route's handler reaches [`plan_and_execute`] — directly or through the one
-/// named local helper it delegates to. A new POST route, a renamed handler,
-/// or a handler that stops calling the planner all fail here. (The other
-/// half — nothing *outside* the planner spawns a mutating process — is
-/// `argv_boundary`'s tripwire.)
+/// surface, and every git-mutating row has one proof covering all its reviewed
+/// paths into its classified planner entry. Special entries share this census;
+/// their additional semantic requirements are pinned below.
 #[test]
 fn every_git_write_route_reaches_the_planner() {
     let main_src = source("src/main.rs");
-
-    // Every POST route in the router. Repo-management writes
-    // (clone/select/rescan/delete-clone) manage the catalog rather than
-    // mutating the selected repository's git state; they are listed so a new
-    // route *must* be classified here, on purpose, not silently.
-    //
-    // Extracted as balanced-paren `.route(` **spans**, not lines. rustfmt
-    // wraps any call whose argument list exceeds `fn_call_width` (60 by
-    // default), which several registrations here do — a per-line scan sees
-    // only the `post(handler)` fragment of a wrapped one, never the route it
-    // belongs to, so a route could be added in wrapped form and satisfy
-    // nothing. `route_authz.rs` extracts the same way, for the same reason.
+    // Balanced route spans retain the path/handler association across rustfmt
+    // wrapping, as in route_authz's independent authorization census.
     let posts: Vec<String> = route_call_spans(&main_src)
         .into_iter()
         .filter(|span| span.contains("post("))
         .collect();
-    let expected = KNOWN_POST_ROUTES;
+    let expected = post_route_census();
+    let funnel = planner_funnel_census();
+    assert_post_funnel_linkage(expected, funnel);
     assert_eq!(
         posts.len(),
         expected.len(),
         "the POST route table changed — classify the new/removed route here \
          (git write → must call the planner; catalog write → say so): {posts:#?}"
     );
-    for (route, handler) in expected {
+    for (route, handler, _) in expected {
         // Exact-quoted route and `post(handler)` — substring drift like
         // `/api/branch` matching `/api/branch-x` can't satisfy a stale entry.
         let hit = posts.iter().any(|l| {
@@ -2960,94 +3285,28 @@ fn every_git_write_route_reaches_the_planner() {
         );
     }
 
-    // The git-mutating handlers: every planner path each one owns, as
-    // (file, handler, route-to-the-planner) rows. `None` requires the
-    // handler's own body to call `plan_and_execute`; `Some(helper)` requires
-    // the handler to call that named local helper AND the helper's body to
-    // call `plan_and_execute` — the requirements are exact per row, never an
-    // either/or (an OR would let a two-path handler like `create_commit`
-    // satisfy the check with one path while the other quietly left the
-    // planner). Handlers with two write paths appear twice.
-    let funnel: &[(&str, &str, Option<&str>)] = &[
-        ("src/handlers/branch.rs", "create_branch", None),
-        (
-            "src/handlers/branch.rs",
-            "checkout_branch",
-            Some("branch_op"),
-        ),
-        ("src/handlers/branch.rs", "merge_branch", Some("branch_op")),
-        ("src/handlers/branch.rs", "push_branch", Some("branch_op")),
-        ("src/handlers/branch.rs", "delete_branch", Some("branch_op")),
-        (
-            "src/handlers/branch.rs",
-            "force_delete_branch",
-            Some("branch_op"),
-        ),
-        // create_commit's CommitOnHead path calls the planner directly…
-        ("src/handlers/commit.rs", "create_commit", None),
-        // …and its EmptyCommitOnBranch path goes through the helper.
-        (
-            "src/handlers/commit.rs",
-            "create_commit",
-            Some("commit_empty_on_branch"),
-        ),
-        // M2.19b (#223): the amend handler builds `AmendCommit` and calls
-        // the planner directly.
-        ("src/handlers/commit.rs", "amend_commit", None),
-        // M10.09 (#596): the cherry-pick handler builds `CherryPick` and calls
-        // the planner directly, same shape as the amend row above.
-        ("src/handlers/commit.rs", "cherry_pick", None),
-        ("src/handlers/commit.rs", "stage_all", None),
-        ("src/handlers/commit.rs", "unstage_all", None),
-        // M2.20c (#229) and M2.20d (#230): the two remote-reaching writes.
-        // Fetch's row was missing until #230 added it — the POST table above
-        // has said "funnel row below" for it since #229, and there was none,
-        // so `fetch_remote` could have stopped calling the planner without
-        // this test noticing. A census that names a row it does not have is
-        // the same vacuity as a test that asserts nothing.
-        ("src/handlers/fetch.rs", "fetch_remote", None),
-        ("src/handlers/pull.rs", "pull_branch", None),
-        ("src/handlers/rebase.rs", "rebase", None),
-        ("src/handlers/reset.rs", "reset_test_repo", None),
-        ("src/activity.rs", "undo", None),
-        ("src/handlers/staging.rs", "staging_apply", None),
-        ("src/handlers/discard.rs", "discard_tracked_paths", None),
-        ("src/handlers/discard.rs", "delete_untracked_paths", None),
-        ("src/handlers/worktrees.rs", "remove_worktree", None),
-        // M2.21d (#238): both tag write handlers build their operation and
-        // call the planner directly — no `git tag` argv exists in that file.
-        ("src/handlers/tags.rs", "create_tag", None),
-        ("src/handlers/tags.rs", "delete_tag", None),
-        // M2.21f (#240): the two remote tag write handlers, same shape —
-        // build the operation, call the planner directly.
-        ("src/handlers/tags.rs", "push_tag", None),
-        ("src/handlers/tags.rs", "delete_remote_tag", None),
-    ];
-    for (file, handler, helper) in funnel {
-        let src = source(file);
-        let body = fn_body(&src, handler);
-        let reaches = match helper {
-            None => body.contains("plan_and_execute("),
-            Some(h) => {
-                body.contains(&format!("{h}(")) && fn_body(&src, h).contains("plan_and_execute(")
-            }
+    for (route, handler, kind) in expected {
+        let PostKind::GitWrite(entry) = kind else {
+            continue;
         };
-        assert!(
-            reaches,
-            "{file}::{handler} no longer reaches plan_and_execute (via {helper:?}) — \
-             every git write must flow through the shared planner (ADR 0016)"
-        );
-    }
-
-    // #621's conflict writes enter the same funnel through its explicit-target
-    // sibling. They cannot call `plan_and_execute`: that would deliberately
-    // discard the required body repository and resolve the session selection.
-    let conflicts_src = source("src/handlers/conflicts.rs");
-    for handler in ["resolve_conflict", "resolve_conflict_content"] {
-        assert!(
-            fn_body(&conflicts_src, handler).contains("plan_and_execute_for_worktree("),
-            "src/handlers/conflicts.rs::{handler} no longer reaches the explicit-target planner entry — the required repo could be parsed and ignored"
-        );
+        // Linkage above guarantees exactly one nonempty proof for this row.
+        let proof = funnel.iter().find(|p| p.handler == *handler).unwrap();
+        let src = crate::argv_boundary::code_only(&source(proof.file));
+        let body = fn_body(&src, handler.rsplit("::").next().unwrap());
+        let call = format!("{}(", entry.name());
+        for helper in proof.paths {
+            let reaches = match helper {
+                None => body.contains(&call),
+                Some(h) => body.contains(&format!("{h}(")) && fn_body(&src, h).contains(&call),
+            };
+            assert!(
+                reaches,
+                "POST {route} → {handler} in {} no longer reaches {} (via {helper:?}) — \
+                 every git write must flow through the shared planner (ADR 0016)",
+                proof.file,
+                entry.name()
+            );
+        }
     }
 
     // The recovery chain (M3.25, #78): `recover_operation` is the third way
@@ -3223,27 +3482,31 @@ fn every_git_write_route_reaches_the_planner() {
     );
 }
 
-/// #690: the meta-census. `route_authz::ROUTE_AUTHZ` (crates/git-vista-server/
-/// src/route_authz.rs) classifies every route's authorization;
-/// [`KNOWN_POST_ROUTES`] above classifies every POST route's relationship to
-/// the planner. Both are independently hand-maintained against the same
-/// `main.rs` router, and until this test nothing linked them: a route added
-/// to one table and not the other passed every test that existed — the
-/// missing entry only ever surfaced as a *different* test failing in a
-/// *different* file. That is exactly what happened building #584/PR#688:
-/// `route_authz.rs`'s own census (enforced locally by a PostToolUse hook the
-/// moment `main.rs` changes) passed, and `KNOWN_POST_ROUTES`'s table only
-/// failed in CI's `M1.06 write contract +` job, because the local check that
-/// ran alongside the edit was `cargo test -p git-vista-server --bins`, which
-/// never compiles `#[cfg(test)] mod contract_suite` at all.
+/// The production composition itself: [`plan_and_execute`]'s body must call
+/// `build_plan`, `validate`, `enforce_fresh` and `execute`, in that order.
+/// The pipeline tests above drive the same stages with injected tokens (the
+/// #690: the meta-census. Two independently hand-maintained tables classify
+/// the same routes for different reasons — `route_authz::ROUTE_AUTHZ`
+/// (crates/git-vista-server/src/route_authz.rs) says how each route is
+/// *authorized*, [`post_route_census`] above says how each POST route relates
+/// to the *planner* — and each is separately well-guarded against `main.rs`.
+/// Nothing linked the two to each other.
 ///
-/// This test reads both tables directly — not by re-scanning `main.rs` a
-/// third way, which would just be a third hand-maintained thing to keep in
-/// sync — and asserts their POST route sets are identical, naming exactly
-/// which route and which table is missing it. A route present in one but not
-/// the other now fails here, loudly, by name, in the same test binary as
-/// both tables — not silently, and not only in whichever CI job happens to
-/// exercise the table nobody thought to check.
+/// That gap is not hypothetical: building #584/PR#688, adding
+/// `POST /api/settings/token` surfaced `ROUTE_AUTHZ` immediately (a
+/// `PostToolUse` hook runs its census the moment `main.rs` is edited) and did
+/// not surface this file's table at all. It failed only later, in CI's
+/// `M1.06 write contract +` job, because the local check that ran alongside
+/// the edit was `cargo test -p git-vista-server --bins` — which never
+/// compiles `#[cfg(test)] mod contract_suite`, so the second table was not
+/// merely un-consulted, it was un-compiled.
+///
+/// This test asserts the two POST route sets are *identical*, naming the
+/// exact route and the exact table missing it. It reads both tables directly
+/// rather than re-scanning `main.rs` a third way, which would only add a
+/// third hand-maintained thing to keep in sync. The property that matters is
+/// the one the issue asks for and a one-sided check cannot give: satisfying
+/// **one** census leaves this one red until the **other** is updated too.
 #[test]
 fn route_authz_and_write_contract_agree_on_every_post_route() {
     use std::collections::BTreeSet;
@@ -3254,14 +3517,16 @@ fn route_authz_and_write_contract_agree_on_every_post_route() {
         .map(|(path, _, _)| *path)
         .collect();
 
-    // `create_session` is `KNOWN_POST_ROUTES`'s one exception: it names a
-    // handler, not a path (see its own doc comment above), because it is
-    // routed with a bare `.post(…)`. Its real route is `POST /api/session`,
-    // which is exactly how `route_authz.rs` names it — map across so both
-    // sets are keyed the same way.
-    let contract_posts: BTreeSet<&str> = KNOWN_POST_ROUTES
+    // `post_route_census`'s first row names a handler, not a path, because
+    // session bootstrap is registered with a bare `.post(create_session)`
+    // rather than a `.route("/api/session", ...)`. Its real route is
+    // `POST /api/session`, which is exactly how `route_authz.rs` names it —
+    // map across so both sets are keyed the same way. Keep this the only
+    // exception; a second one means the tables have stopped describing the
+    // same thing.
+    let contract_posts: BTreeSet<&str> = post_route_census()
         .iter()
-        .map(|(route, _)| {
+        .map(|(route, _, _)| {
             if *route == "create_session" {
                 "/api/session"
             } else {
@@ -3275,25 +3540,21 @@ fn route_authz_and_write_contract_agree_on_every_post_route() {
     assert!(
         missing_from_contract.is_empty(),
         "ROUTE CENSUS MISMATCH: POST {missing_from_contract:?} classified in ROUTE_AUTHZ \
-         (crates/git-vista-server/src/route_authz.rs) but has no entry in this file's \
-         KNOWN_POST_ROUTES table (used by every_git_write_route_reaches_the_planner). \
-         Classify it there too: a git write needs a funnel row below; a non-git write \
-         (a catalog write, a credential write, a cancel, ...) needs a row here saying so, \
-         the same as /api/select-worktree or /api/settings/token."
+         (crates/git-vista-server/src/route_authz.rs) but absent from this file's \
+         post_route_census(). Classify it there too: a git write needs GitWrite(entry) \
+         plus its funnel proof; a catalog/credential/auth write needs NonGitWrite; a \
+         read wearing POST needs ReadLike."
     );
 
     let missing_from_authz: Vec<&str> = contract_posts.difference(&authz_posts).copied().collect();
     assert!(
         missing_from_authz.is_empty(),
         "ROUTE CENSUS MISMATCH: POST {missing_from_authz:?} classified in this file's \
-         KNOWN_POST_ROUTES table but has no entry in ROUTE_AUTHZ \
+         post_route_census() but absent from ROUTE_AUTHZ \
          (crates/git-vista-server/src/route_authz.rs). Classify its authorization there."
     );
 }
 
-/// The production composition itself: [`plan_and_execute`]'s body must call
-/// `build_plan`, `validate`, `enforce_fresh` and `execute`, in that order.
-/// The pipeline tests above drive the same stages with injected tokens (the
 /// process-global selection is set-once per process, owned by `state`'s own
 /// test); this pin guarantees the entry point requests actually take composes
 /// exactly the stages those tests prove.
@@ -3420,6 +3681,7 @@ fn the_global_entry_point_delegates_through_the_lifecycle_to_the_pipeline() {
     for entry in [
         "plan_and_execute",
         "plan_and_execute_for_worktree",
+        "plan_and_execute_proving",
         "plan_and_execute_recovery",
     ] {
         assert!(
@@ -7594,5 +7856,113 @@ async fn aborting_unwinds_the_sequence() {
     assert!(
         body.contains("resolutions made during it are gone"),
         "the response must say what was discarded, not just that it worked: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M5.34 (#87, ADR 0131) — bisect
+// ---------------------------------------------------------------------------
+
+/// Three commits, so `good` (the seed) and `bad` (HEAD) have exactly one
+/// candidate strictly between them — enough for `git bisect start` to have
+/// something real to narrow to, rather than an empty range it would settle
+/// immediately.
+fn bisect_repo() -> (tempfile::TempDir, PathBuf, String, String, String) {
+    let (dir, repo) = seeded_repo();
+    let good = tip(&repo, "HEAD");
+    std::fs::write(repo.join("a.txt"), "a middle\n").unwrap();
+    run(&repo, &["commit", "-aqm", "middle"]);
+    let middle = tip(&repo, "HEAD");
+    std::fs::write(repo.join("a.txt"), "a bad\n").unwrap();
+    run(&repo, &["commit", "-aqm", "bad"]);
+    let bad = tip(&repo, "HEAD");
+    (dir, repo, good, middle, bad)
+}
+
+/// MUTATION: pass `good` as `bad` and `bad` as `good` in the argv builder —
+/// `git bisect start` refuses (good must be an ancestor of bad), the pipeline
+/// returns non-OK, and this goes red on `assert_ok`.
+#[tokio::test]
+async fn bisect_start_executes_through_the_pipeline() {
+    let (_dir, repo, good, middle, bad) = bisect_repo();
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::BisectStart {
+            bad: oid(&bad),
+            good: vec![oid(&good)],
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+
+    assert!(
+        repo.join(".git/BISECT_START").exists(),
+        "git bisect start must leave a real session behind"
+    );
+    assert_eq!(
+        tip(&repo, "HEAD"),
+        middle,
+        "with exactly one candidate between good and bad, bisect must check it out"
+    );
+}
+
+/// MUTATION: swap `bisect_mark_argv`'s `Good`/`Bad` strings — marking the
+/// sole candidate `good` would refuse to finish (there is nothing left bad
+/// to narrow to) instead of naming `middle` as the culprit, and this goes
+/// red on the `finished`/`bad` assertions.
+#[tokio::test]
+async fn bisect_mark_executes_through_the_pipeline() {
+    let (_dir, repo, good, middle, bad) = bisect_repo();
+    run(&repo, &["bisect", "start", &bad, &good]);
+    assert_eq!(
+        tip(&repo, "HEAD"),
+        middle,
+        "fixture precondition: git itself must land on the same midpoint"
+    );
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::BisectMark {
+            verdict: BisectVerdict::Bad,
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+
+    let status = super::bisect_exec::discover(&repo).await;
+    assert!(
+        status.finished,
+        "one candidate, marked bad: the range has collapsed to it, so the \
+         session must report finished"
+    );
+    assert_eq!(
+        status.bad.as_deref(),
+        Some(middle.as_str()),
+        "the culprit git bisect found must be the commit just marked, not the \
+         original bad HEAD"
+    );
+}
+
+/// MUTATION: make the executor return early before running `git bisect
+/// reset`'s argv — `BISECT_START` survives and this goes red on the first
+/// assertion; HEAD also never returns to `bad`, catching a mutation that ran
+/// some OTHER git command in reset's place.
+#[tokio::test]
+async fn bisect_reset_executes_through_the_pipeline() {
+    let (_dir, repo, good, _middle, bad) = bisect_repo();
+    run(&repo, &["bisect", "start", &bad, &good]);
+
+    let (status, body) = pipeline(&repo, GitOperation::BisectReset).await;
+    assert_ok(status, &body);
+
+    assert!(
+        !repo.join(".git/BISECT_START").exists(),
+        "reset must clear the bisect session"
+    );
+    assert_eq!(
+        tip(&repo, "HEAD"),
+        bad,
+        "reset returns to the branch bisect start was run from"
     );
 }

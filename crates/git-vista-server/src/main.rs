@@ -736,6 +736,12 @@ fn api_router(
                 "/api/stash/branch",
                 post(handlers::stash::branch_from_stash),
             )
+            // M5.34 (#87, ADR 0131): start/mark/reset a bisect session. No
+            // `GET /api/bisect/status` yet — see handlers/bisect.rs's module
+            // doc for why that is deliberately its own, separable slice.
+            .route("/api/bisect/start", post(handlers::bisect::bisect_start))
+            .route("/api/bisect/mark", post(handlers::bisect::bisect_mark))
+            .route("/api/bisect/reset", post(handlers::bisect::bisect_reset))
             .route("/api/tag", post(handlers::tags::create_tag))
             .route("/api/delete-tag", post(handlers::tags::delete_tag))
             // M2.21f (#240): the two **remote** tag writes — each opens a
@@ -933,13 +939,6 @@ fn build_app(
         // That is the live LAN failure shape: POST /api/select falls through
         // to the file service and receives an ordinary 405.  The response must
         // still say which listener profile produced it.
-        // Error-envelope rewriting can replace the auth layer's response.
-        // Stamp no-store outside it so private provider reads and refusals
-        // retain the same cache policy as successful local reads.
-        .layer(SetResponseHeaderLayer::overriding(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("no-store"),
-        ))
         .layer(SetResponseHeaderLayer::overriding(
             header::HeaderName::from_static(LISTENER_PROFILE_HEADER),
             HeaderValue::from_static(listener_profile.as_header_value()),

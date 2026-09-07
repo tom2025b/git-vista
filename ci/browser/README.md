@@ -47,9 +47,12 @@ the binary under test is the real one.
 **The cost of that choice, stated plainly:** a namespace with only loopback has
 no network, so Chromium reports `navigator.onLine === false` and the app's
 offline guard refuses to open a repository. `helpers.mjs` forges
-`navigator.onLine` to get past it — which means **this suite can never test the
-offline guard**, because it fabricates the exact signal that guard reads. That
-coverage has to come from a manual device pass.
+`navigator.onLine` to get past it. Ordinary specs therefore do not exercise the
+offline guard. `pwa-offline.spec.mjs` explicitly replaces that override, sends
+online/offline events, and cuts transport with `context.setOffline`: it verifies
+an open git confirmation is refused, a retry checks offline again, and reconnect
+does not replay either intent. Physical iPad installation and launch still need
+a device pass; Chromium cannot verify those criteria.
 
 ## Testing a candidate bundle
 

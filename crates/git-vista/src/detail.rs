@@ -781,7 +781,10 @@ pub fn detail_panel_view(
                                     let w = render_window(&heights, viewport, scroll, DIFF_OVERSCAN);
                                     view! {
                                         <div style=format!("height:{}px", w.pad_top)></div>
-                                        <pre class="detail-diff">
+                                        // The scroll offset consumed by this render, so
+                                        // readers can wait for the window to catch up
+                                        // with the scroll container (#387).
+                                        <pre class="detail-diff" data-rendered-scroll-top=scroll.to_string()>
                                             {accessible_rows_window(
                                                 &flat, hunk_focus, "detail",
                                                 Some(w.start..w.end), Some(reveal),

@@ -79,7 +79,7 @@ test.describe('#676 — selecting a repository closes an open confirmation', () 
     // A keyboard user reaches "Repos" without hitting the backdrop a mouse
     // click would land on first — `.focus()` skips Playwright's own
     // actionability/hit-test check, matching that.
-    const reposButton = page.getByRole('button', { name: 'Repos' })
+    const reposButton = page.getByRole('button', { name: 'Repos', exact: true })
     await reposButton.focus()
     await page.keyboard.press('Enter')
 
