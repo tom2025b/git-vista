@@ -782,6 +782,31 @@ fn the_session_exempt_scanner_reads_whole_statements() {
         "the clause after the `;`-bearing string was truncated away: {got}"
     );
 
+    // These next two are deliberately at bracket depth ZERO. An earlier
+    // version of this test wrapped every literal in parentheses, so `depth > 0`
+    // skipped the `;` and the literal handling was never exercised at all —
+    // `mutation_check` proved it by disabling char-literal consumption and
+    // watching this test stay green (`survived`, arm 429). A case that cannot
+    // fail on the mechanism it names is the exact defect this file exists to
+    // catch, so the isolating cases are the point, not decoration.
+    let string_at_depth_zero = "let session_exempt = a == \"x;y\" || p == \"/api/evil\";\nnext();";
+    let got = session_exempt_expression(string_at_depth_zero)
+        .expect("a `;` in a top-level string is not a terminator");
+    assert!(
+        got.contains("/api/evil"),
+        "string tracking is not doing the work — a top-level `;` in a string truncated \
+         the scan: {got}"
+    );
+
+    let char_at_depth_zero = "let session_exempt = a == ';' || p == \"/api/evil\";\nnext();";
+    let got = session_exempt_expression(char_at_depth_zero)
+        .expect("a `;` in a top-level char literal is not a terminator");
+    assert!(
+        got.contains("/api/evil"),
+        "char-literal consumption is not doing the work — a top-level `';'` truncated \
+         the scan: {got}"
+    );
+
     // A `;` inside a CHAR literal is the same trap one notch smaller.
     let charly = "let session_exempt = (a == B && c != ';')\n || p == \"/api/evil\";\nnext();";
     let got =
