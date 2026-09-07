@@ -174,7 +174,7 @@ fn clone_checkout_args() -> [&'static str; 2] {
 /// remembering `redact_output`.
 async fn execute_clone(
     policy: &crate::sandbox::Policy,
-    checkout_policy: &crate::sandbox::Policy,
+    checkout_policy: &crate::sandbox::CheckoutPolicy,
     root: &Path,
     dest: &Path,
     url: &str,
@@ -195,15 +195,27 @@ async fn execute_clone(
     // `git clone` succeeds for an empty repository. Its symbolic HEAD has no
     // target to check out, so preserve that behaviour instead of turning the
     // split phase into a failure for an otherwise-valid empty remote.
-    let head = crate::sandbox::network_exec::network_command_without_credential(
-        checkout_policy,
-        dest,
-        &["show-ref", "--verify", "--quiet", "HEAD"],
-    )
-    .kill_on_drop(true)
-    .output()
-    .await
-    .map_err(CloneExecutionError::CouldntRun)?;
+    // The two `UntrustedCheckoutCommand` annotations below are load-bearing,
+    // not decoration. codex-daybreak defeated an earlier source-level version
+    // of this guarantee by aliasing — `use network_exec::network_command as
+    // network_command_without_credential` — which satisfies any scan looking
+    // for the name while returning a runnable command carrying the server's
+    // whole inherited environment. Naming the type makes that a compile error:
+    // `network_command` returns `SandboxedCommand`, and only
+    // `network_command_without_credential` yields this type. Together with
+    // `checkout_policy`'s own type, both demonstrated defeats now fail to
+    // build rather than failing a string match.
+    let head_command: crate::sandbox::network_exec::UntrustedCheckoutCommand =
+        crate::sandbox::network_exec::network_command_without_credential(
+            checkout_policy,
+            dest,
+            &["show-ref", "--verify", "--quiet", "HEAD"],
+        );
+    let head = head_command
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(CloneExecutionError::CouldntRun)?;
     if head.status.code() == Some(1) {
         return Ok(());
     }
@@ -211,15 +223,17 @@ async fn execute_clone(
         return Err(CloneExecutionError::GitFailed(head));
     }
 
-    let checkout = crate::sandbox::network_exec::network_command_without_credential(
-        checkout_policy,
-        dest,
-        &clone_checkout_args(),
-    )
-    .kill_on_drop(true)
-    .output()
-    .await
-    .map_err(CloneExecutionError::CouldntRun)?;
+    let checkout_command: crate::sandbox::network_exec::UntrustedCheckoutCommand =
+        crate::sandbox::network_exec::network_command_without_credential(
+            checkout_policy,
+            dest,
+            &clone_checkout_args(),
+        );
+    let checkout = checkout_command
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(CloneExecutionError::CouldntRun)?;
     if !checkout.status.success() {
         return Err(CloneExecutionError::GitFailed(checkout));
     }
@@ -1255,6 +1269,13 @@ mod tests {
             .current_dir(&source));
 
         let policy = crate::sandbox::policy_for_clone(root).expect("clone policy");
+        // The checkout runs under its own policy, exactly as production does.
+        // Before `CheckoutPolicy` existed this test passed the transfer's
+        // policy to both halves and nothing objected — which is precisely the
+        // transposition codex-daybreak showed a source-level scan could not
+        // catch. It is a compile error now.
+        let checkout_policy =
+            crate::sandbox::policy_for_clone_checkout(root).expect("checkout policy");
         let source_str = source.to_string_lossy();
         let dest_str = dest.to_string_lossy();
         let transfer_env = [
@@ -1313,7 +1334,7 @@ mod tests {
                     "premise: SSH_AUTH_SOCK must really be set for the #702 leg to bite"
                 );
                 crate::sandbox::network_exec::network_command_without_credential(
-                    &policy,
+                    &checkout_policy,
                     &dest,
                     &clone_checkout_args(),
                 )
@@ -1338,36 +1359,32 @@ mod tests {
         );
     }
 
-    /// The wiring nobody was pinning (#720, codex-daybreak).
+    /// A cheap regression guard on `execute_clone`'s shape — **not** the proof
+    /// that its untrusted half is correctly wired. Read this before citing it.
     ///
-    /// Every other test in this file rebuilds clone's two phases by calling the
-    /// command builders directly, which proves the *builders* behave and says
-    /// nothing about what `execute_clone` actually calls. Switching its
-    /// post-transfer spawns to `network_exec::network_command` — still
-    /// `pub(crate)`, still returning a runnable command with a fully inherited
-    /// environment — would leave every one of them green. That is the same
-    /// green-over-absence shape #704 itself was, one layer up.
+    /// It began as that proof, and codex-daybreak defeated it twice on #720.
+    /// Transposing the two `&Policy` arguments at the *call site* handed the
+    /// checkout the transfer's SSH grants while this scan — which reads only
+    /// `execute_clone`'s own body — stayed green; and aliasing the raw builder
+    /// (`use network_exec::network_command as network_command_without_credential`)
+    /// satisfied both counts while the forbidden literal never appeared.
     ///
-    /// A behavioural test cannot reach this cheaply: driving the real
-    /// `execute_clone` end to end needs an operator-level `core.hooksPath`,
-    /// which means a `$HOME` set process-wide across an `.await` — precisely
-    /// what `sandbox::test_env` forbids. So this reads the source, the way
-    /// `documented_gaps` and `argv_boundary` already do for INV-16, and pins
-    /// the two facts that matter: the credentialless spawns are the sealed
-    /// builder, and the raw one appears nowhere in this file.
+    /// A text scan can be satisfied without the property holding. That is
+    /// #704's own shape and ADR 0123's rule, so both defeats are now **compile
+    /// errors**: `CheckoutPolicy` is a distinct type, so the transposition does
+    /// not typecheck, and `execute_clone` annotates both command bindings as
+    /// `UntrustedCheckoutCommand`, which no alias of `network_command` can
+    /// produce.
     ///
-    /// MUTATION 1 (remove): point `execute_clone`'s checkout at
-    ///   `network_command` — RED on the second assertion.
-    /// MUTATION 2 (weaken): give the checkout `policy` instead of
-    ///   `checkout_policy` — RED on the third, which is the #702 half.
+    /// What survives here is worth two lines and no more: a count that notices
+    /// if one of the two post-transfer spawns is deleted outright. Do not add
+    /// assertions to it that the type system already carries — a scan that
+    /// looks like a boundary invites someone to trust it as one.
     #[test]
     fn execute_clone_spawns_its_untrusted_half_through_the_sealed_builder() {
-        // Only the production half. Scanning the whole file matches this
-        // test's own assertion text — the literal it forbids appears in the
-        // message explaining why it is forbidden. A source-level tripwire that
-        // reads the module it lives in has to exclude itself, or it reports a
-        // violation that is nothing but its own reflection. (Measured: this
-        // test failed on exactly that before the split was added.)
+        // Only the production half: scanning the whole file matches this
+        // test's own text, and a source-level check that reads the module it
+        // lives in reports its own reflection as a violation.
         let whole = include_str!("clone.rs");
         let source = whole
             .split_once("\n#[cfg(test)]\nmod tests {")
@@ -1386,25 +1403,13 @@ mod tests {
         assert_eq!(
             body.matches("network_command_without_credential(").count(),
             2,
-            "both post-transfer spawns (HEAD check and checkout) must go through the \
-             sealed credentialless builder"
-        );
-        assert!(
-            !body.contains("network_exec::network_command(")
-                && !source.contains("network_exec::network_command("),
-            "clone must never reach the raw `network_command`: it returns a runnable \
-             command carrying this server's whole inherited environment, which is #704"
-        );
-        assert_eq!(
-            body.matches("checkout_policy,").count(),
-            2,
-            "#702: both post-transfer spawns must run under the checkout policy, not \
-             the transfer's — the transfer keeps #188's SSH grants because \
-             url.<base>.insteadOf can make a clone genuinely speak SSH"
+            "both post-transfer spawns (the HEAD check and the checkout) must still be \
+             here — this notices a deletion, not a substitution; the type system \
+             handles substitution"
         );
         assert!(
             body.contains("network_command_with_credential("),
-            "premise: the transfer half must still be here, or the counts above are \
+            "premise: the transfer half must still be here, or the count above is \
              measuring a function that no longer does what this test describes"
         );
     }

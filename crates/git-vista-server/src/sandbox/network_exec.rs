@@ -299,12 +299,17 @@ impl UntrustedCheckoutCommand {
 ///
 /// The allowlist is applied here rather than left to the caller: this function
 /// is the boundary, and a boundary a caller can decline to cross is not one.
+///
+/// It takes a [`crate::sandbox::CheckoutPolicy`], not a `Policy`, so the
+/// transfer's SSH-granted policy cannot reach an untrusted checkout even by a
+/// transposed argument — see that type's doc for the two ways a source-level
+/// check of the same property was defeated.
 pub(crate) fn network_command_without_credential(
-    policy: &Policy,
+    policy: &crate::sandbox::CheckoutPolicy,
     repo: &Path,
     args: &[&str],
 ) -> UntrustedCheckoutCommand {
-    UntrustedCheckoutCommand(network_command(policy, repo, args).with_untrusted_checkout_env())
+    UntrustedCheckoutCommand(network_command(&policy.0, repo, args).with_untrusted_checkout_env())
 }
 
 /// Strip `user[:pass]@` userinfo from every `<scheme>://…` URL substring

@@ -514,6 +514,7 @@ fn only_the_clone_checkout_phase_gives_up_the_188_grants() {
         // Leg 3 — the claim. The process that runs attacker code has none.
         let checkout =
             policy_for_clone_checkout(clones_root.path()).expect("checkout policy must build");
+        let checkout = &checkout.0;
         assert_eq!(
             checkout.tier,
             Tier::Network,
@@ -550,7 +551,7 @@ fn only_the_clone_checkout_phase_gives_up_the_188_grants() {
         );
 
         // The argv is where a reviewer sees a grant (ADR 0033's D5 Option B).
-        let argv = strs(&sandbox_argv(&checkout));
+        let argv = strs(&sandbox_argv(checkout));
         let w = pairs(&argv);
         assert!(
             !argv.iter().any(|a| a == "--ro-carveout")

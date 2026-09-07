@@ -275,12 +275,29 @@ pub(crate) const DEFAULT_GIT_PORTS: &[u16] = &[
 /// `https://host:22/…` is accepted and `url.<base>.insteadOf` can rewrite an
 /// accepted HTTPS URL into an SSH one. A clone genuinely can reach port 22.
 ///
-/// The surviving justification is about the *phase*. `git checkout -f` is
-/// local: the transfer has already exited, every object is on disk, and the
-/// only legitimate outbound traffic is a content filter's own (`git-lfs`
-/// smudge over HTTPS). Nothing this process does needs SSH, whatever the
-/// remote's transport was — so the one thing port 22 could serve here is a
-/// hostile hook reaching an SSH service.
+/// The surviving justification is about the *phase*, and it costs something
+/// real that is named here rather than glossed.
+///
+/// `git checkout -f` is local: the transfer has exited and every object is on
+/// disk. The legitimate outbound traffic left is a content filter's own — a
+/// `git-lfs` smudge fetching pointers' contents.
+///
+/// **That is not always HTTPS, and an earlier version of this comment claimed
+/// it was.** Git LFS authenticates against an SSH remote by running
+/// `git-lfs-authenticate` over SSH at smudge time, and supports pure-SSH
+/// transfer. So dropping port 22 here — together with the `known_hosts`
+/// carve-out and `$SSH_AUTH_SOCK` — **breaks SSH-backed LFS at checkout**. An
+/// ordinary SSH-rewritten clone still works, because the transfer keeps all
+/// three; an SSH-backed LFS clone gets its objects' pointers and not their
+/// contents. Found by codex-daybreak against Git LFS's own authentication
+/// documentation, not assumed from memory.
+///
+/// It is accepted rather than fixed, because the fix and the vulnerability are
+/// the same thing. Reaching SSH at smudge time means the agent socket, host
+/// keys and port 22 in the process that runs attacker-selected filters — the
+/// exposure #702 exists to remove. The sandbox cannot tell `git-lfs`'s `ssh`
+/// from a fetched smudge filter's: same process tree, same policy, no
+/// distinguishing signal. See ADR 0137 for the condition that would reopen it.
 ///
 /// Read [`DEFAULT_GIT_PORTS`]'s own doc before trusting this too far: a port
 /// grant is **not** an egress policy, because Landlock's port rules carry no
@@ -1341,10 +1358,12 @@ pub(crate) fn policy_for_clone(clones_root: &Path) -> Result<Policy, shim::ShimE
 /// behind an indirection the scanner cannot follow. Caught by the gate on the
 /// first version of this function, which did exactly that. The verbosity is
 /// the price of a check that cannot be defeated by convenience syntax.
-pub(crate) fn policy_for_clone_checkout(clones_root: &Path) -> Result<Policy, shim::ShimError> {
+pub(crate) fn policy_for_clone_checkout(
+    clones_root: &Path,
+) -> Result<CheckoutPolicy, shim::ShimError> {
     let transfer = policy_for_clone(clones_root)?;
     let agent_socket = ssh_agent_socket_grant(transfer.tier);
-    Ok(Policy {
+    Ok(CheckoutPolicy(Policy {
         tier: transfer.tier,
         shim: transfer.shim,
         bwrap: transfer.bwrap,
@@ -1365,8 +1384,53 @@ pub(crate) fn policy_for_clone_checkout(clones_root: &Path) -> Result<Policy, sh
         // hooks, and #702 is about what the hook is HANDED, never whether it
         // runs.
         hook_mode: HookMode::Run,
-    })
+    }))
 }
+
+/// A [`Policy`] that has been through [`policy_for_clone_checkout`] — the only
+/// kind an untrusted checkout may be launched under.
+///
+/// # Why a newtype and not a second `Policy` value
+///
+/// #720's first attempt at this boundary gave `execute_clone` two `&Policy`
+/// arguments and pinned the wiring with a test that read the function's source.
+/// codex-daybreak defeated that in two lines: **transposing the two arguments
+/// at the call site** silently hands the checkout the transfer's SSH grants —
+/// the exact outcome the split exists to prevent — and the scan, which only
+/// read `execute_clone`'s own body, stayed green. Aliasing the raw builder
+/// (`use network_command as network_command_without_credential`) defeated the
+/// other half the same way.
+///
+/// A text scan can be satisfied without the property holding. That is the
+/// failure this crate keeps rediscovering — it is #704's own shape, and ADR
+/// 0123's rule that the safety lives in the shape rather than in a list. So the
+/// two policies are now different **types**: the transposition does not
+/// typecheck, and `network_exec::network_command_without_credential` accepts
+/// nothing else, so an untrusted-checkout launcher cannot be built from a
+/// transfer policy at all. There is no assertion to keep in step, because there
+/// is no way to express the mistake.
+///
+/// # Construction and access are both deliberately narrow
+///
+/// The tuple field is **private to this module**, so
+/// `policy_for_clone_checkout` is the only way to make one. Rust makes a
+/// private field visible to a module's *descendants*, which is exactly the
+/// reach wanted here: `sandbox::network_exec` composes the launcher from
+/// `policy.0` and `sandbox::argv` reads it to pin the argv shape, while
+/// `handlers::clone` — the caller that must not be able to substitute one
+/// policy for the other — can only pass the value along.
+///
+/// There is deliberately **no `as_policy()` accessor**. Writing one means a
+/// `-> &Policy {` signature in `sandbox/mod.rs`, and R8's literal detector
+/// (`escape_contract::production_policy_literals`) looks through a `::` path
+/// prefix but not through a leading `&`, so it classifies that signature as a
+/// `Policy` struct literal missing its `hook_mode` field and hard-fails.
+/// Measured, not guessed: the accessor form failed R8 on this branch. Widening
+/// the detector to fix it would have to distinguish `-> &Policy {` from a
+/// genuine `&Policy { … }` reference-to-literal expression — a real
+/// improvement, but not one to make inside a change that needs it to pass.
+/// Reported for its own issue instead; a field access needs neither.
+pub(crate) struct CheckoutPolicy(Policy);
 
 /// The chokepoint. Returns the complete launcher argv **up to and including
 /// the program name `git`**; the caller appends `-C <repo> <args…>`.

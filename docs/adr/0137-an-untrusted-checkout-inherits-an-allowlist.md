@@ -187,6 +187,43 @@ deprecated — while a "remove these names" builder exists on that type, the nex
 credential-adjacent call site can reach for it and rebuild #704 one variable
 later.
 
+### 2a. The split is enforced by types, because a scan was not enough
+
+The first version of §3 gave `execute_clone` two `&Policy` arguments and pinned
+the wiring with a test that read the function's source. codex-daybreak defeated
+it in two lines:
+
+- **transposing the two arguments at the call site** hands the checkout the
+  transfer's SSH grants — the exact outcome the split exists to prevent — and
+  the scan, reading only `execute_clone`'s own body, stayed green;
+- **aliasing the raw builder**, `use network_exec::network_command as
+  network_command_without_credential`, satisfied every count while returning a
+  command carrying the server's whole inherited environment.
+
+This is #704's own shape a third time: a check that can be satisfied without the
+property holding. So both are compile errors now.
+
+`sandbox::CheckoutPolicy` is a newtype over `Policy` whose field is private to
+the `sandbox` module, constructible only by `policy_for_clone_checkout`.
+`network_command_without_credential` accepts nothing else, so an
+untrusted-checkout launcher cannot be built from a transfer policy at all, and
+the transposition does not typecheck. `execute_clone` then annotates both
+command bindings as `UntrustedCheckoutCommand`, which no alias of
+`network_command` can produce.
+
+```mermaid
+flowchart TD
+  A["policy_for_clone<br/>-> Policy"] --> B["execute_clone(policy: &Policy, ...)"]
+  C["policy_for_clone_checkout<br/>-> CheckoutPolicy"] --> D["execute_clone(checkout_policy: &CheckoutPolicy)"]
+  D --> E["network_command_without_credential<br/>takes &CheckoutPolicy ONLY"]
+  E --> F["UntrustedCheckoutCommand<br/>annotated at both bindings"]
+  B -.->|"transposing these<br/>no longer typechecks"| D
+```
+
+The source scan survives, demoted to what it still buys — noticing if one of the
+two spawns is deleted outright — with its doc saying plainly that it is not the
+proof. A scan that looks like a boundary invites someone to trust it as one.
+
 ### 3. The two phases get two policies, and the grants follow the split
 
 ADR 0128 split clone into two processes with a security boundary between them —
@@ -217,6 +254,18 @@ minus three things: the `$SSH_AUTH_SOCK` `rw_trees` grant, the
 Network access, `HookMode::Run` and filter execution are **unchanged in both**.
 ADR 0128 kept them deliberately and this narrows what the second process is
 handed, never what it may do.
+
+**"The transfer runs no attacker code" is narrower than it sounds, and the
+distinction the split rests on is authorship, not data.** `--no-checkout` stops
+remote-supplied hooks and filters, but the transfer is not callback-free: an
+operator-configured `reference-transaction` hook runs on **remote-controlled
+refs**, and configured transport and credential helpers execute — all with the
+transfer's full #188 grants live. Git documents that hook for any ref-updating
+command. The split still holds, because those programs are chosen by the
+operator rather than supplied by the remote, which is exactly the line being
+drawn. But the transfer runs *operator code over attacker-influenced data*, and
+a later reader should not take the shorter phrase for more than that. Raised by
+codex-daybreak; neither the lane nor the coordinator had asked about it.
 
 Port 22's justification is now about the phase, not the URL: `git checkout -f`
 is local, every object is already on disk, and the only legitimate outbound
@@ -338,6 +387,31 @@ flowchart TD
   S --> C["connect() — unmediated<br/>Landlock scopes ABSTRACT sockets only<br/>seccomp denies AF_UNIX in STRICT only"]
   C --> X["sign, exfiltrate over 443"]
 ```
+
+### SSH-backed Git LFS breaks at checkout, deliberately
+
+Git LFS authenticates against an SSH remote by running `git-lfs-authenticate`
+over SSH **at smudge time**, and supports pure-SSH transfer. The checkout policy
+has no port 22, no `known_hosts` and no `$SSH_AUTH_SOCK`, so an SSH-backed LFS
+clone now retrieves pointers and not contents. An ordinary SSH-rewritten clone
+is unaffected — the transfer keeps all three. Found by codex-daybreak against
+Git LFS's own authentication documentation; an earlier version of
+`CLONE_CHECKOUT_PORTS`'s doc asserted that legitimate checkout traffic needed
+only HTTPS, and that was false.
+
+**Accepted rather than fixed, because the fix and the vulnerability are the same
+thing.** Reaching SSH at smudge time means the agent socket, host keys and port
+22 present in the process that runs attacker-selected filters — precisely the
+exposure #702 exists to remove. The sandbox cannot distinguish `git-lfs`'s own
+`ssh` from a fetched smudge filter's: same process tree, same policy, no
+signal to separate them. Restoring the grants would undo the change rather than
+complete it.
+
+**What would reopen it:** a broker — the server performing `git-lfs-authenticate`
+itself before checkout and handing the filter the resulting short-lived HTTPS
+token — so the capability stays outside the untrusted process. That is a design,
+not a tweak, and it is the same shape as the proxy answer above: pass the
+*result* of using a credential, never the credential.
 
 Closing it needs a checkout-specific seccomp mode denying pathname `AF_UNIX`
 while keeping TCP for LFS — `bin/gv-sandbox/seccomp_filter.rs`, tracked as
