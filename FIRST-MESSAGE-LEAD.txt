@@ -1,0 +1,29 @@
+Working #661 in this worktree (fix/661-sweep-read-path, base fd42d9c5). You are the
+LEAD - sole writer here. Full issue: gh issue view 661.
+
+Problem: reconciliation sweep costs 298ms on this repo's own 779 refs; git's own
+status/for-each-ref cost ~10ms each, so our own read path is ~95% of the cost. That sets
+the sweep interval floor per #556's duty-cycle rule (interval >= 10x measured cost).
+
+Scope - allowed paths: whatever module actually runs the sweep (locate it first: the
+watcher/planner code doing the 4 sandboxed git spawns + the gix ref read over all refs -
+do not guess the file, find it). Do not touch anything in status/menu/api areas (that is
+gv1/gv3/gv4's territory) or roving-row/keyboard code (gv4).
+
+Acceptance:
+- the 298ms broken down by component, MEASURED not estimated (spawn setup vs git exec vs
+  gix read)
+- whatever dominates is reduced, or documented as irreducible with the reason
+- duty-cycle floor re-measured after, #556's cadence numbers updated if it moves
+
+Your bridged partner (Codex) is read-only, and will get its own message once you have a
+first diff or measurement worth reviewing - not before. Don't wait on it to start; if it
+raises something before then, treat it as unsolicited and use your judgment same as any
+other input, but keep working.
+
+If the fix genuinely needs a file outside the sweep module itself, STOP and report why
+before touching it - don't widen scope on your own call.
+
+Lane report when done: ~/projects/git-vista-reports/gv2-<timestamp>.md
+Commit identity every commit:
+git -c user.name=Claude_Max -c user.email=262510778+tom2025b@users.noreply.github.com commit -m "..."
