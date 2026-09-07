@@ -128,6 +128,106 @@ const SCRUBBED_GIT_GEOMETRY_ENV: &[&str] = &[
     "GIT_SHALLOW_FILE",
 ];
 
+/// The **complete** set of environment variable names an untrusted checkout
+/// child may inherit (#704). Everything not named here is absent from that
+/// child by construction, not by having been remembered.
+///
+/// # Why this is an allowlist and #680's removal list was not enough
+///
+/// ADR 0128 closed clone's credential leak by *removing* three names from the
+/// checkout child: `GIT_VISTA_CREDENTIAL_TOKEN`, `GIT_VISTA_GITHUB_TOKEN` and
+/// `GH_TOKEN`. That is a denylist, and a denylist over an inherited
+/// environment is only ever as complete as the last person to think about it.
+/// Everything else the operator happened to export — `AWS_SECRET_ACCESS_KEY`,
+/// `NPM_TOKEN`, a CI job's injected secret, `SSH_AUTH_SOCK` (#702) — reached
+/// attacker-selected `post-checkout` hooks and `.gitattributes`-selected
+/// filters untouched. Adding a fourth name rebuilds the same defect one
+/// variable later.
+///
+/// So the child's environment is **built**, not filtered: start from nothing,
+/// copy across only the names below. A credential nobody enumerated is absent
+/// because it was never added, which is a property of the shape rather than of
+/// anyone's diligence.
+///
+/// # Every entry, and why it survives the cut
+///
+/// * `PATH` — load-bearing twice over. `gv-sandbox` reaches git through
+///   `Command::new("git").exec()`, which is a `PATH` lookup, so an empty
+///   `PATH` does not run a reduced checkout, it runs none at all. Hooks and
+///   filters are `#!/bin/sh` scripts that then need it themselves.
+/// * `HOME` — git resolves `~/.gitconfig` through it. ADR 0128's decision is
+///   explicit that the split "changes when checkout happens, not whether it
+///   happens": operator-level `core.hooksPath` and filter configuration are
+///   *deliberate product behaviour* and must keep applying. Dropping `HOME`
+///   would silently stop them. It is a path, not a secret, and the paths
+///   underneath it that *are* secrets (`~/.ssh`, `~/.config/gh`, …) stay
+///   withheld by `secret_excludes` regardless of what this variable says.
+/// * `XDG_CONFIG_HOME` — the other root git consults for global config
+///   (`$XDG_CONFIG_HOME/git/config`). Same justification as `HOME`, and
+///   omitting it would make config resolution differ between the credentialed
+///   transfer and the checkout for exactly the operators who use it.
+/// * `LANG`, `LC_ALL`, `LC_CTYPE`, `LC_MESSAGES` — locale. They select message
+///   text and character handling; they name no resource and grant no access.
+///
+/// # What was deliberately left out, and why each is a decision
+///
+/// * `SSH_AUTH_SOCK` — the whole of #702. See `sandbox::policy_for_clone`.
+/// * `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`,
+///   `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` — these would buy the same
+///   config parity `HOME` and `XDG_CONFIG_HOME` buy, and they can *carry a
+///   credential in the value itself* (`credential.helper=!echo password=…`).
+///   A config channel whose payload is an arbitrary string is not something
+///   to forward into attacker-selected code. An operator who configures
+///   Git-Vista's server this way loses that configuration at checkout, and
+///   that is the trade this list makes on purpose.
+/// * `TMPDIR`, `TERM`, `TZ` — nothing in `git checkout -f` needs them, and
+///   `/tmp` is not a grant this policy gives out in any case.
+/// * The [`SCRUBBED_GIT_GEOMETRY_ENV`] family — already removed for every
+///   spawn in the crate, and absent here for the stronger reason that they
+///   were never added.
+///
+/// Adding a name here is a security decision. It must come with the sentence
+/// saying what breaks without it, in this comment, in the same edit.
+pub(crate) const UNTRUSTED_CHECKOUT_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+];
+
+/// Build an untrusted checkout child's complete environment from `source` by
+/// keeping only [`UNTRUSTED_CHECKOUT_ENV_ALLOWLIST`] names.
+///
+/// Free, pure and taking its source as a parameter rather than reading
+/// `std::env` itself — so the decision ("which names survive") is host-testable
+/// with an arbitrary synthetic environment, including canaries that no test may
+/// safely set process-wide. `with_untrusted_checkout_env` is the one production
+/// caller and supplies `std::env::vars_os()`.
+///
+/// A name that is allowlisted but absent from `source` stays absent: this
+/// copies, it never fabricates a value git would then read as meaningful.
+pub(crate) fn untrusted_checkout_env<I, K, V>(
+    source: I,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: Into<std::ffi::OsString>,
+    V: Into<std::ffi::OsString>,
+{
+    source
+        .into_iter()
+        .map(|(k, v)| (k.into(), v.into()))
+        .filter(|(k, _)| {
+            UNTRUSTED_CHECKOUT_ENV_ALLOWLIST
+                .iter()
+                .any(|allowed| k == std::ffi::OsStr::new(allowed))
+        })
+        .collect()
+}
+
 /// A composed launcher whose argv is **final**.
 ///
 /// This is Task 5's half of C10 hazard #1. `command_async` used to hand back a
@@ -222,14 +322,26 @@ impl SandboxedCommand {
         self
     }
 
-    /// Remove every credential value Git-Vista knows how to place in its own
-    /// environment. Used by the checkout half of clone: hooks and filters run
-    /// there deliberately, but the credentialed transfer has already exited.
-    pub(crate) fn without_credential_env(mut self) -> Self {
-        for var in crate::token_store::TOKEN_SOURCE_ENV_VARS {
-            self.0.env_remove(var);
+    /// Replace this command's environment with the allowlisted one an
+    /// untrusted checkout child may have (#702, #704).
+    ///
+    /// This *supersedes* `without_credential_env`, which removed exactly the
+    /// three names ADR 0128 enumerated and let everything else through. The
+    /// method is gone rather than deprecated: while a "remove these names"
+    /// builder exists on this type, the next credential-adjacent call site can
+    /// reach for it and rebuild the same defect one variable later. See
+    /// [`UNTRUSTED_CHECKOUT_ENV_ALLOWLIST`] for what survives and why.
+    ///
+    /// `env_clear()` first, then the allowlist: the child's environment is the
+    /// returned set and nothing else. The three ADR 0128 names are absent here
+    /// because they were never copied in — a strictly stronger statement than
+    /// the removals this replaces, and one that holds for every name nobody
+    /// has thought of yet.
+    pub(crate) fn with_untrusted_checkout_env(mut self) -> Self {
+        self.0.env_clear();
+        for (key, value) in untrusted_checkout_env(std::env::vars_os()) {
+            self.0.env(key, value);
         }
-        self.0.env_remove(CREDENTIAL_TOKEN_VAR);
         self
     }
 
@@ -351,28 +463,115 @@ mod tests {
     use super::super::shim_cli::{fixture, production_policy};
     use super::*;
 
+    /// #704's decision, tested where it is made: on an arbitrary synthetic
+    /// environment rather than the process's own.
+    ///
+    /// The canary here is the point. A denylist can only be tested against
+    /// the names its author already listed — a test that checks the three ADR
+    /// 0128 variables are gone passes identically whether the mechanism is an
+    /// allowlist or the three `env_remove` calls it replaced, so it cannot
+    /// tell the two apart and cannot fail on the defect #704 reported. A name
+    /// this crate has never heard of is the assertion that separates them.
+    ///
+    /// MUTATION 1 (remove the mechanism): drop the `.filter(…)` from
+    ///   `untrusted_checkout_env` so it copies `source` wholesale. RED here —
+    ///   every one of the four withheld names comes back.
+    /// MUTATION 2 (weaken the mechanism): add `"SSH_AUTH_SOCK"` to
+    ///   `UNTRUSTED_CHECKOUT_ENV_ALLOWLIST`. RED here on the `SSH_AUTH_SOCK`
+    ///   leg alone, with the canary and the tokens still correctly withheld —
+    ///   a different failure, from a list that still looks deliberate.
     #[test]
-    fn credentialless_command_records_removal_of_every_token_environment_variable() {
+    fn an_untrusted_checkout_environment_is_built_by_allowlist_not_by_removal() {
+        let source = [
+            ("PATH", "/usr/bin:/bin"),
+            ("HOME", "/home/operator"),
+            ("LANG", "en_US.UTF-8"),
+            // Withheld: the three ADR 0128 removals, the #702 agent socket,
+            // and a name no list in this crate mentions anywhere.
+            (CREDENTIAL_TOKEN_VAR, "internal-helper-token"),
+            ("GIT_VISTA_GITHUB_TOKEN", "gv-source-token"),
+            ("GH_TOKEN", "gh-source-token"),
+            ("SSH_AUTH_SOCK", "/tmp/ssh-XXXX/agent.1"),
+            ("AWS_SECRET_ACCESS_KEY", "a-credential-nobody-enumerated"),
+        ];
+
+        let built = untrusted_checkout_env(source);
+        let names: Vec<String> = built
+            .iter()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+
+        // The paired positive: the child is not simply empty. An allowlist
+        // that returned nothing would satisfy every "must be absent" leg
+        // below while producing a checkout that cannot even find git.
+        assert_eq!(
+            names,
+            vec!["PATH", "HOME", "LANG"],
+            "exactly the allowlisted names present in the source, in source order"
+        );
+        for withheld in [
+            CREDENTIAL_TOKEN_VAR,
+            "GIT_VISTA_GITHUB_TOKEN",
+            "GH_TOKEN",
+            "SSH_AUTH_SOCK",
+            "AWS_SECRET_ACCESS_KEY",
+        ] {
+            assert!(
+                !names.iter().any(|n| n == withheld),
+                "{withheld} reached an untrusted checkout child; the environment is being \
+                 filtered by name rather than built by allowlist"
+            );
+        }
+    }
+
+    /// An allowlisted name that the source does not have must not be
+    /// fabricated. Without this, an implementation that wrote every
+    /// allowlisted name with an empty value would pass the test above while
+    /// handing git `HOME=""` — which it reads as a real, and wrong, answer.
+    #[test]
+    fn an_allowlisted_name_absent_from_the_source_stays_absent() {
+        let built = untrusted_checkout_env([("PATH", "/usr/bin")]);
+        assert_eq!(built.len(), 1, "got {built:?}");
+        assert_eq!(built[0].0, std::ffi::OsStr::new("PATH"));
+    }
+
+    /// The wiring half: the production builder really applies the allowlist to
+    /// the composed command, and really clears first. Read off the composed
+    /// `Command` for the reason `credential_env_for_test` documents — a
+    /// spawned child cannot testify about a step a pinned test profile would
+    /// overwrite.
+    #[test]
+    fn the_production_builder_clears_the_environment_before_applying_the_allowlist() {
         let repo = std::path::PathBuf::from("/srv/repo");
         let policy = production_policy(&repo);
-        let command = command_async(&policy, &repo, &["checkout", "-f"]).without_credential_env();
+        let command =
+            command_async(&policy, &repo, &["checkout", "-f"]).with_untrusted_checkout_env();
 
-        for name in crate::token_store::TOKEN_SOURCE_ENV_VARS
-            .iter()
-            .copied()
-            .chain(std::iter::once(CREDENTIAL_TOKEN_VAR))
-        {
-            let override_value = command
+        assert!(
+            command.0.as_std().get_envs().all(|(key, value)| {
+                value.is_some()
+                    && UNTRUSTED_CHECKOUT_ENV_ALLOWLIST
+                        .iter()
+                        .any(|allowed| key == std::ffi::OsStr::new(allowed))
+            }),
+            "every override on an untrusted checkout command must be an allowlisted \
+             name carrying a value; a `None` here would mean the builder is still \
+             removing names from an inherited environment"
+        );
+        // `env_clear()` itself has no accessor on `Command`, so this test
+        // deliberately stops short of claiming it. The half it cannot see is
+        // proved by a real spawn instead:
+        // `handlers::clone`'s `clone_checkout_runs_the_hook_with_only_an_allowlisted_environment`
+        // reads the child's whole environment back out of a running hook.
+        assert!(
+            command
                 .0
                 .as_std()
                 .get_envs()
-                .find_map(|(key, value)| (key == std::ffi::OsStr::new(name)).then_some(value));
-            assert_eq!(
-                override_value,
-                Some(None),
-                "{name} must be explicitly removed rather than inherited"
-            );
-        }
+                .any(|(key, _)| key == std::ffi::OsStr::new("PATH")),
+            "PATH must be supplied explicitly, not left to inheritance — after \
+             env_clear() an unsupplied PATH means the shim cannot exec git at all"
+        );
     }
 
     /// The wrapper's argv is exactly the sandbox argv with `-C <repo> <args>`

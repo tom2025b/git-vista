@@ -5,46 +5,29 @@
 use super::*;
 use std::path::PathBuf;
 
-/// The one owner of the `SSH_AUTH_SOCK` environment variable across this
-/// file's tests.
-///
-/// `std::env::set_var`/`remove_var` mutate process-wide state, and `cargo
-/// test` runs every test in this binary on separate threads of one process
-/// by default. Three tests in this file set this same key — without a
-/// rendezvous, two running concurrently silently clobber each other, and one
-/// reads back the *other's* socket path instead of its own. Measured: this
-/// is not hypothetical, it is exactly what happened the first time these
-/// tests ran without this guard (`production_policy_for_wires_the_agent_socket_grant_into_the_network_argv`
-/// observed `policy_for_clone_carries_both_188_grants`'s socket path).
-///
-/// Scoped to this file, not shared crate-wide the way `test_ports::PortClaim`
-/// covers TCP port 9418: nothing outside this file's tests touches
-/// `SSH_AUTH_SOCK` (checked by grep when these tests were written), so a
-/// claim covering only this file's own three callers is sufficient — a
-/// wider one would just be unused generality.
-static SSH_AUTH_SOCK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Set `SSH_AUTH_SOCK` to `value` (or clear it, for `None`), run `f`, then
-/// restore whatever the variable held before `f` ran — all inside one
-/// `SSH_AUTH_SOCK_LOCK` critical section, so no other test in this file can
-/// observe or clobber the value while `f` depends on it.
+/// restore whatever the variable held before `f` ran.
+///
+/// # This file used to own the lock, and no longer may
+///
+/// The rendezvous is real and was earned: `std::env::set_var`/`remove_var`
+/// mutate process-wide state, `cargo test` runs this binary's tests on
+/// separate threads of one process, and the first time these tests ran
+/// without a guard `production_policy_for_wires_the_agent_socket_grant_into_the_network_argv`
+/// read back `policy_for_clone_carries_both_188_grants`'s socket path instead
+/// of its own. Measured, not hypothetical.
+///
+/// What changed with #704 is the *scope* claim. The old lock's doc said a
+/// file-scoped mutex was sufficient because "nothing outside this file's tests
+/// touches `SSH_AUTH_SOCK`". `spawn::with_untrusted_checkout_env` now reads
+/// the entire environment via `std::env::vars_os()`, and `handlers::clone`'s
+/// spawn proof sets this same key, so the readership left this file and the
+/// lock had to follow it. It lives in `sandbox::test_env` now, and this is a
+/// thin adapter onto it rather than a second, weaker mutex beside it — two
+/// locks over one key is the same defect the original guard fixed, wearing a
+/// different hat.
 fn with_ssh_auth_sock<T>(value: Option<&std::path::Path>, f: impl FnOnce() -> T) -> T {
-    let _guard = SSH_AUTH_SOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let prior = std::env::var_os("SSH_AUTH_SOCK");
-    // SAFETY: `SSH_AUTH_SOCK_LOCK`, held for this whole function, is the only
-    // synchronization this key needs — it is this file's one writer of it
-    // (see the lock's own doc comment), so nothing outside this critical
-    // section can observe a torn read or a lost write.
-    match value {
-        Some(p) => unsafe { std::env::set_var("SSH_AUTH_SOCK", p) },
-        None => unsafe { std::env::remove_var("SSH_AUTH_SOCK") },
-    }
-    let result = f();
-    match prior {
-        Some(v) => unsafe { std::env::set_var("SSH_AUTH_SOCK", v) },
-        None => unsafe { std::env::remove_var("SSH_AUTH_SOCK") },
-    }
-    result
+    super::test_env::with_env(&[("SSH_AUTH_SOCK", value.map(|p| p.as_os_str()))], f)
 }
 
 /// A fixed, fake bwrap path. Fake on purpose: these tests pin the *shape* of
@@ -465,43 +448,100 @@ fn ssh_agent_socket_grant_is_network_tier_only_and_only_when_set() {
     });
 }
 
-/// `policy_for_clone` is an **independent** `Policy` constructor (it does not
-/// call `policy_for`) and is hard-coded to `Tier::Network` — the one
-/// production site the issue text never names, and therefore the one a
-/// build could easily fix for push/fetch/ls-remote while leaving
-/// `git clone git@host:…` broken outright. Both #188 grants must land here
-/// too.
+/// #702: `policy_for_clone` must carry **neither** #188 grant.
+///
+/// This test is the inversion of `policy_for_clone_carries_both_188_grants`,
+/// which asserted the opposite and was correct when it was written. What
+/// changed is not the grants but who runs under them: #680 made clone's
+/// second process (`git checkout -f`) execute attacker-selected hooks and
+/// filters inside this very policy, so ADR 0033's safety argument — "neither
+/// grant reaches the Strict tier, which is where hostile repository content
+/// actually runs" — no longer describes reality. And `validate_clone_url`
+/// accepts only `https://`, `http://` and `git://`, so this constructor could
+/// never serve the `git clone git@host:…` the old test's doc named as the
+/// thing that would break.
+///
+/// # The paired positive is the whole point
+///
+/// Asserting only that clone's policy lacks the grants would pass just as well
+/// if `ssh_agent_socket_grant` returned `None` for every tier, or if
+/// `ssh_known_hosts_carveout` started returning an empty `Vec` — i.e. if #188
+/// were broken outright for fetch, push and `ls-remote`, which still need it.
+/// So the same socket, in the same critical section, is asserted **present**
+/// in `policy_for`'s Network policy and **absent** from `policy_for_clone`'s.
+/// The claim is a difference between two constructors, and it is tested as one.
 #[test]
-fn policy_for_clone_carries_both_188_grants() {
+fn policy_for_clone_carries_neither_188_grant_while_policy_for_still_does() {
     let clones_root = tempfile::tempdir().expect("tempdir");
-    let sock = PathBuf::from("/tmp/gv188-policy-for-clone-test-agent.sock");
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    let sock = PathBuf::from("/tmp/gv702-policy-for-clone-test-agent.sock");
+    let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
+    let known_hosts = home.join(".ssh/known_hosts");
+
     with_ssh_auth_sock(Some(&sock), || {
+        // The paired positive, first: #188 is intact where it belongs.
+        let remote = policy_for(repo.path(), false, NetworkNeed::Remote)
+            .expect("policy_for must build a Network policy");
+        assert_eq!(remote.tier, Tier::Network, "premise for the comparison");
+        assert!(
+            remote.rw_trees.contains(&sock),
+            "#188 must still grant the agent socket for fetch/push/ls-remote — \
+             without this leg the assertions below would also pass if the grant \
+             helpers were simply broken, got {:?}",
+            remote.rw_trees
+        );
+        assert_eq!(
+            remote.ro_carveouts,
+            vec![known_hosts.clone()],
+            "#188's known_hosts carve-out must still reach policy_for"
+        );
+
+        // The claim: clone's independent constructor has neither.
         let policy = policy_for_clone(clones_root.path()).expect("policy_for_clone must build");
         assert_eq!(
             policy.tier,
             Tier::Network,
-            "clone is always NetworkNeed::Remote"
-        );
-
-        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
-        assert_eq!(
-            policy.ro_carveouts,
-            vec![home.join(".ssh/known_hosts")],
-            "policy_for_clone must carry the same known_hosts carve-out as policy_for"
+            "clone is always NetworkNeed::Remote — this change narrows grants, not the tier"
         );
         assert!(
-            policy.rw_trees.contains(&sock),
-            "policy_for_clone must carry the same agent-socket grant as policy_for, got {:?}",
+            !policy.rw_trees.contains(&sock),
+            "#702: the operator's ssh-agent socket must not be granted to the process \
+             that runs attacker-selected post-checkout hooks, got {:?}",
             policy.rw_trees
         );
+        assert_eq!(
+            policy.ro_carveouts,
+            Vec::<PathBuf>::new(),
+            "#702: clone cannot perform an SSH clone, so it has no use for a \
+             known_hosts carve-out out of the ~/.ssh exclude"
+        );
+        assert!(
+            !policy.net_ports.contains(&22),
+            "#702: port 22 is unreachable through validate_clone_url's accepted \
+             schemes and must not be granted, got {:?}",
+            policy.net_ports
+        );
+        assert!(
+            policy.net_ports.contains(&443),
+            "paired positive: https must still be reachable or every clone breaks"
+        );
 
+        // The argv is where a reviewer actually sees a grant (ADR 0033's D5
+        // Option B property), so the same claim is made against it.
         let argv = strs(&sandbox_argv(&policy));
         let w = pairs(&argv);
-        assert!(w.contains(&(
-            "--ro-carveout",
-            home.join(".ssh/known_hosts").to_str().expect("utf8 path")
-        )));
-        assert!(w.contains(&("--rw", sock.to_str().expect("utf8 path"))));
+        assert!(
+            !argv.iter().any(|a| a == "--ro-carveout"),
+            "no carve-out may appear in clone's launcher argv at all, got {argv:?}"
+        );
+        assert!(
+            !w.contains(&("--rw", sock.to_str().expect("utf8 path"))),
+            "clone's launcher argv must not name the agent socket, got {argv:?}"
+        );
+        assert!(
+            !w.contains(&("--net-port", "22")),
+            "clone's launcher argv must not grant port 22, got {argv:?}"
+        );
     });
 }
 

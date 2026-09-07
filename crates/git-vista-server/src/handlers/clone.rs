@@ -155,8 +155,12 @@ fn clone_checkout_args() -> [&'static str; 2] {
 
 /// Fetch objects and refs while the credential exists, then let that process
 /// exit before materialising attacker-chosen files. The second phase keeps the
-/// clone policy's network access, hooks, and filters, but explicitly removes
-/// every credential-bearing environment variable.
+/// clone policy's network access, hooks, and filters, but receives an
+/// environment **built by allowlist** rather than one with credential names
+/// removed from it (#704) — so a secret nobody enumerated is absent by
+/// construction. Its redaction is carried by
+/// `network_exec::UntrustedCheckoutCommand` rather than by each call site here
+/// remembering `redact_output`.
 async fn execute_clone(
     policy: &crate::sandbox::Policy,
     root: &Path,
@@ -187,7 +191,6 @@ async fn execute_clone(
     .kill_on_drop(true)
     .output()
     .await
-    .map(crate::sandbox::network_exec::redact_output)
     .map_err(CloneExecutionError::CouldntRun)?;
     if head.status.code() == Some(1) {
         return Ok(());
@@ -204,7 +207,6 @@ async fn execute_clone(
     .kill_on_drop(true)
     .output()
     .await
-    .map(crate::sandbox::network_exec::redact_output)
     .map_err(CloneExecutionError::CouldntRun)?;
     if !checkout.status.success() {
         return Err(CloneExecutionError::GitFailed(checkout));
@@ -1127,8 +1129,40 @@ mod tests {
     /// transfer leaves the worktree empty; the later checkout still runs the
     /// attacker-selected hook, but only after the token-bearing process has
     /// exited and every credential environment name has been removed.
+    /// #680's canary, widened to #702 and #704's claim: the untrusted checkout
+    /// child's environment is **built**, not filtered.
+    ///
+    /// # Why the old assertion could not have caught #704
+    ///
+    /// This test used to read `"unset|unset|unset"` — the three names ADR 0128
+    /// enumerated. A denylist and an allowlist are indistinguishable on those
+    /// three, so the assertion passed identically whether every other secret
+    /// in the operator's environment reached the hook or not. It did. The two
+    /// new legs are what separate the mechanisms: `SSH_AUTH_SOCK` (#702, the
+    /// operator's live agent socket) and a canary under a name this crate
+    /// mentions nowhere except here (#704, "a credential nobody enumerated").
+    ///
+    /// # The paired positives, and why there are two kinds
+    ///
+    /// An environment that is simply *empty* would satisfy every "must be
+    /// absent" leg and produce a checkout that cannot run at all. So the hook
+    /// also reports `PATH` and `HOME`, and the pre-existing legs — that the
+    /// hook ran at all, and that the credentialed phase did not run it —
+    /// remain. And the premise is asserted rather than assumed: the canary and
+    /// the socket are checked *present in this process* at the moment the
+    /// command is composed, so "the hook saw `unset`" cannot be satisfied by
+    /// the test having failed to set them.
+    ///
+    /// # Why the variables are set around composition, not around the spawn
+    ///
+    /// `spawn::with_untrusted_checkout_env` reads `std::env::vars_os()` when
+    /// the command is *built*; the composed `Command` carries its own
+    /// environment overrides from then on. So the process-wide mutation is
+    /// held for microseconds inside `sandbox::test_env::with_env`'s guard and
+    /// never across an `.await` — see that module's doc for the whole
+    /// discipline.
     #[tokio::test]
-    async fn clone_checkout_runs_the_hook_without_any_credential_environment() {
+    async fn clone_checkout_runs_the_hook_with_only_an_allowlisted_environment() {
         use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
 
@@ -1142,6 +1176,14 @@ mod tests {
         }
 
         const CANARY: &str = "clone-hook-canary";
+        // A name this crate mentions in exactly one place — here. If it
+        // reaches the hook, the child's environment is being filtered by a
+        // list of known names rather than built from one.
+        const CANARY_VAR: &str = "GV_CLONE_ENVIRONMENT_CANARY";
+        const CANARY_VALUE: &str = "a-credential-nobody-enumerated";
+        // Never the operator's real agent. This path is a value to observe,
+        // not a socket to connect to; nothing here starts an ssh-agent.
+        const FAKE_AGENT_SOCK: &str = "/tmp/gv702-not-a-real-agent.sock";
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let source = root.join("source");
@@ -1162,10 +1204,16 @@ mod tests {
         let hook = hooks.join("post-checkout");
         std::fs::write(
             &hook,
-            "#!/bin/sh\nprintf '%s|%s|%s' \
-             \"${GIT_VISTA_CREDENTIAL_TOKEN-unset}\" \
-             \"${GIT_VISTA_GITHUB_TOKEN-unset}\" \
-             \"${GH_TOKEN-unset}\" > hook-observed\n",
+            format!(
+                "#!/bin/sh\nprintf '%s|%s|%s|%s|%s|%s|%s' \
+                 \"${{GIT_VISTA_CREDENTIAL_TOKEN-unset}}\" \
+                 \"${{GIT_VISTA_GITHUB_TOKEN-unset}}\" \
+                 \"${{GH_TOKEN-unset}}\" \
+                 \"${{SSH_AUTH_SOCK-unset}}\" \
+                 \"${{{CANARY_VAR}-unset}}\" \
+                 \"${{PATH:+PATH-present}}\" \
+                 \"${{HOME:+HOME-present}}\" > hook-observed\n"
+            ),
         )
         .unwrap();
         let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
@@ -1217,14 +1265,35 @@ mod tests {
         git(Command::new("git")
             .args(["config", "core.hooksPath", "hooks"])
             .current_dir(&dest));
-        let checkout = crate::sandbox::network_exec::network_command_without_credential(
-            &policy,
-            &dest,
-            &clone_checkout_args(),
-        )
-        .output()
-        .await
-        .expect("credentialless checkout starts");
+        // Compose under the guard; run outside it. See this test's doc.
+        let checkout_command = crate::sandbox::test_env::with_env(
+            &[
+                (CANARY_VAR, Some(std::ffi::OsStr::new(CANARY_VALUE))),
+                ("SSH_AUTH_SOCK", Some(std::ffi::OsStr::new(FAKE_AGENT_SOCK))),
+            ],
+            || {
+                assert_eq!(
+                    std::env::var(CANARY_VAR).ok().as_deref(),
+                    Some(CANARY_VALUE),
+                    "premise: the canary must really be in this process's environment, \
+                     or the hook observing it as unset proves nothing"
+                );
+                assert_eq!(
+                    std::env::var("SSH_AUTH_SOCK").ok().as_deref(),
+                    Some(FAKE_AGENT_SOCK),
+                    "premise: SSH_AUTH_SOCK must really be set for the #702 leg to bite"
+                );
+                crate::sandbox::network_exec::network_command_without_credential(
+                    &policy,
+                    &dest,
+                    &clone_checkout_args(),
+                )
+            },
+        );
+        let checkout = checkout_command
+            .output()
+            .await
+            .expect("credentialless checkout starts");
         assert!(
             checkout.status.success(),
             "credentialless checkout failed: {}",
@@ -1232,8 +1301,11 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(dest.join("hook-observed")).unwrap(),
-            "unset|unset|unset",
-            "the hook must still run, but it must inherit no credential source"
+            "unset|unset|unset|unset|unset|PATH-present|HOME-present",
+            "fields are: the three ADR 0128 credential names, then SSH_AUTH_SOCK \
+             (#702) and an unenumerated canary (#704) — all five withheld — then \
+             PATH and HOME, which must be PRESENT: an empty environment would \
+             satisfy the first five legs while producing a checkout that cannot run"
         );
     }
 

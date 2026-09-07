@@ -132,6 +132,11 @@ mod shim_cli;
 #[cfg(test)]
 mod ssh_remote;
 
+/// The crate's one test-side writer of process environment state. Shared
+/// rather than file-scoped since #704 — see the module doc.
+#[cfg(test)]
+pub(crate) mod test_env;
+
 /// Absolute paths the strict tier's outer launcher is looked for at, in order.
 ///
 /// # Why this is not the bare name `bwrap`
@@ -260,6 +265,32 @@ pub(crate) const DEFAULT_GIT_PORTS: &[u16] = &[
     443,  // https:// — the only one every remote on this host actually uses
     80,   // http://  — plaintext, but still a real remote scheme
     9418, // git://   — the native protocol
+];
+
+/// The TCP ports `policy_for_clone` may `connect()` to — [`DEFAULT_GIT_PORTS`]
+/// without 22 (#702).
+///
+/// This list is the exact image of `validate_clone_url`'s accepted schemes
+/// (`https://`, `http://`, `git://`), and that correspondence is the point: a
+/// pasted `ssh://` or `git@host:` URL is refused at the wire boundary, so no
+/// clone this server performs can legitimately reach port 22. Granting it
+/// anyway gave the untrusted-checkout child — which runs attacker-selected
+/// `post-checkout` hooks and filters by design — a permitted route to every
+/// SSH server reachable from this host, on a route that can never use one.
+///
+/// Read [`DEFAULT_GIT_PORTS`]'s own doc first: a port grant is **not** an
+/// egress policy, because Landlock's port rules carry no address. Dropping 22
+/// therefore does not confine anything to the operator's own remote; it
+/// removes one destination *service class* from what a hostile hook can
+/// speak to at all. That is worth having and is worth not overstating.
+///
+/// `policy_for` keeps the full [`DEFAULT_GIT_PORTS`] set: fetch, push and
+/// `ls-remote` run against an already-cloned repository whose remote may
+/// genuinely be `ssh://`, which is the case #188 exists for.
+pub(crate) const CLONE_GIT_PORTS: &[u16] = &[
+    443,  // https:// — validate_clone_url's first accepted scheme
+    80,   // http://
+    9418, // git://
 ];
 
 /// Absolute paths for `Policy::secret_excludes`, given a home directory.
@@ -1184,6 +1215,62 @@ pub(crate) fn policy_for_repo(repo: &Path) -> Result<Policy, shim::ShimError> {
 /// look a trust flag up *for*, so this function neither takes nor derives one
 /// and the tier below is a constant. That is a property of the signature, not a
 /// runtime check some future edit could remove.
+///
+/// # Why neither #188 grant is built here any more (#702)
+///
+/// This function used to copy `policy_for`'s Network branch verbatim: the
+/// `~/.ssh/known_hosts` `ro_carveouts` entry and the `$SSH_AUTH_SOCK`
+/// `rw_trees` grant. [ADR 0033](../../../docs/adr/0033-ssh-remote-carveout.md)
+/// argued both were safe because "neither grant reaches the Strict tier, which
+/// is where hostile repository content actually runs." That sentence was true
+/// when it was written and is not true now. #680 split clone into a
+/// credentialed `--no-checkout` transfer and a separate `git checkout -f`
+/// (ADR 0128), and that second process runs attacker-selected `post-checkout`
+/// hooks and `.gitattributes`-selected filters **in this very policy**, at the
+/// Network tier. Hostile repository content now runs in the tier ADR 0033
+/// reasoned it never would.
+///
+/// The grants are not merely unsafe here, they are unusable here.
+/// `validate_clone_url` accepts `https://`, `http://` and `git://` and nothing
+/// else, so this constructor cannot ever serve an SSH clone. The old comment
+/// on the grant line said skipping it "would leave `git clone git@host:…`
+/// broken" — that URL is a 400 at the wire boundary and has been since Phase
+/// 12. A capability no code path on this route can legitimately reach is not a
+/// trade-off to weigh; it is dead capability handed to the one process in the
+/// system that runs code chosen by an attacker.
+///
+/// So: `ro_carveouts` is empty, the agent-socket grant is not extended, and
+/// `net_ports` is [`CLONE_GIT_PORTS`] rather than [`DEFAULT_GIT_PORTS`].
+/// `policy_for` is untouched — fetch, push and `ls-remote` against an
+/// already-cloned SSH remote are what #188 was for, and they keep all three.
+///
+/// # What actually closes #702, and what this function contributes
+///
+/// Honest ordering, because ADR 0033 §3 measured it and the measurement still
+/// holds: on this kernel the `rw_trees` agent-socket grant is **inert**.
+/// Landlock ABI 8 does not mediate pathname `AF_UNIX` sockets at all, so
+/// removing the Landlock rule removes nothing the kernel was consulting. What
+/// made the operator's agent reachable from a hostile `post-checkout` hook was
+/// the inherited `$SSH_AUTH_SOCK` telling it where to connect, and the
+/// load-bearing half of #702's fix is therefore
+/// [`spawn::UNTRUSTED_CHECKOUT_ENV_ALLOWLIST`], which does not carry that name.
+///
+/// This function contributes the other three things, and they are not
+/// decoration: the argv no longer *claims* a grant the process should not have
+/// (ADR 0033's D5 Option B property — what the sandbox permits is auditable
+/// from the launcher command line alone); the grant does not silently become
+/// load-bearing again if a future Landlock ABI starts mediating pathname
+/// sockets; and port 22 is gone, so even a hook that recovered a socket path
+/// by other means cannot reach an SSH service.
+///
+/// The residual is recorded rather than hidden: `seccomp_filter::af_unix_rule`
+/// still permits `socket(AF_UNIX, …)` in the Network tier, because the tier is
+/// shared with `policy_for`'s legitimate SSH remotes. A hook that could *guess*
+/// an agent socket path could still connect to it. It has no way to find one —
+/// `/tmp` is in no grant this policy gives out, so the directory holding
+/// `ssh-XXXXXXXXXX/agent.<pid>` cannot be read — but "cannot enumerate" is a
+/// weaker statement than "cannot connect", and this comment says so rather
+/// than rounding it up.
 pub(crate) fn policy_for_clone(clones_root: &Path) -> Result<Policy, shim::ShimError> {
     let home = PathBuf::from(std::env::var_os("HOME").ok_or(shim::ShimError::NoHome)?);
     let shim = shim::shim_path().map_err(Clone::clone)?.to_path_buf();
@@ -1191,13 +1278,12 @@ pub(crate) fn policy_for_clone(clones_root: &Path) -> Result<Policy, shim::ShimE
     let (mut rw, mut ro) = default_system_trees(tier);
     rw.push(clones_root.to_path_buf());
     ro.push(home.clone());
-    // #188: identical carve-out and agent-socket grant to `policy_for`'s
-    // Network branch. This function is an **independent** `Policy`
-    // constructor, not a call into `policy_for` — skipping either grant here
-    // would leave `git clone git@host:…` broken while push/fetch on an
-    // already-cloned repository worked, since clone is the one operation
-    // that never reaches `policy_for` at all (see the doc comment above).
-    rw.extend(ssh_agent_socket_grant(tier));
+    // #702: neither #188 grant is built here any more, and the comment that
+    // used to sit on this line justified them with a URL shape this route
+    // cannot accept. See the doc comment above for the whole argument; the
+    // short version is that `git clone git@host:…` is refused by
+    // `validate_clone_url` before a policy is ever built, so both grants were
+    // dead capability handed to the one process that runs attacker content.
     Ok(Policy {
         tier,
         shim,
@@ -1213,8 +1299,9 @@ pub(crate) fn policy_for_clone(clones_root: &Path) -> Result<Policy, shim::ShimE
             excludes.push(crate::state::sandbox_trust_dir());
             excludes
         },
-        ro_carveouts: ssh_known_hosts_carveout(&home),
-        net_ports: DEFAULT_GIT_PORTS.to_vec(),
+        // #702: empty, not `ssh_known_hosts_carveout(&home)`. See above.
+        ro_carveouts: Vec::new(),
+        net_ports: CLONE_GIT_PORTS.to_vec(),
         hook_mode: HookMode::Run,
     })
 }
