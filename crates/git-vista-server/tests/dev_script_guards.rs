@@ -19,10 +19,12 @@
 //! trade this file argues against. If a script is ever added to `ci/` and
 //! deliberately left out, say which and why right here.
 //!
-//! Each is hermetic — shims every tool it reaches, or sources `dev` and calls
-//! one function against temporary directories — so all three are safe under
-//! `cargo test --workspace` and in CI. None builds anything real, none writes
-//! to the evidence store, and none touches the operator's checkout.
+//! Each is hermetic — shims every tool it reaches, or sources the real script
+//! and calls one function against temporary directories — so all of them are
+//! safe under `cargo test --workspace` and in CI. None builds anything real,
+//! none writes to the evidence store, and none touches the operator's
+//! checkout, and none reaches the network: `adr_claim_race_test.sh` pushes to
+//! a bare repository it creates in a temp dir, never to `origin`.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -91,4 +93,20 @@ fn the_doctor_measures_the_clones_root_and_refuses_to_guess() {
 #[test]
 fn the_testbed_target_never_falls_back_into_the_callers_directory() {
     run_guard("testbed_target_test.sh");
+}
+
+/// #697: `scripts/adr-claim.sh` must let exactly one lane claim an ADR number,
+/// with a single push that fails outright for the loser. The process it
+/// replaces — read the index, take the next free number — produced six
+/// collisions in one day, including one on the pull request meant to fix the
+/// first five.
+///
+/// The guard drives four concurrent claims against a real bare repository and
+/// asserts they return four distinct numbers, and it pins the two failures
+/// that look like successes: a descendant claim commit (which a plain push
+/// accepts, silently stealing the number) and a non-contention push failure
+/// (which, misreported as a lost race, burns a number on every network blip).
+#[test]
+fn an_adr_number_can_be_claimed_by_exactly_one_lane() {
+    run_guard("adr_claim_race_test.sh");
 }
