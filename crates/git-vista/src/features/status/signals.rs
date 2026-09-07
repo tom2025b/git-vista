@@ -1,5 +1,5 @@
 //! One repository-pinned status read for the chip and commit review (#141).
-use super::detail::core::reading_is_current;
+use super::detail::core::current_reading;
 use crate::api::fetch_status_for;
 use crate::features::activity::signals::Activity;
 use crate::features::graph::core::GraphCore;
@@ -46,15 +46,14 @@ pub fn create(
 }
 
 /// Failed, loading, old-epoch and old-repository readings are all unknown.
+/// This is a signal adapter only: every decision lives in `current_reading`,
+/// which is host-tested. The retained reply carries its own requested scope,
+/// so nothing here can mismatch requested against current.
 pub fn read(status: StatusResource) -> Option<RepoStatus> {
-    let (epoch, repo, result) = status.resource.get()?;
-    reading_is_current(
+    current_reading(
         status.resource.loading().get(),
-        epoch,
+        status.resource.get(),
         status.graph.get().epoch(),
-        repo.as_deref(),
         status.repo.get().as_deref(),
     )
-    .then_some(result)
-    .flatten()
 }

@@ -97,8 +97,11 @@ test('clean zero counts describe a local reading and Escape returns focus', asyn
   await openApp(page)
   const detail = await panel(page)
   await expect(detail).toContainText('Your working tree is clean. There are no uncommitted changes.')
-  await expect(detail).toContainText('The latest local reading reports main up to date with origin/main: no commits ahead or behind.')
-  await expect(detail).toContainText('Zero can also mean Git could not calculate the comparison.')
+  await expect(detail).toContainText('The latest local reading reports no commits ahead of or behind origin/main for main. Git reports these same zeros when it could not compare them, so this reading cannot tell those two cases apart.')
+  await expect(detail).toContainText('These counts use the latest local tracking refs, not a fresh check of the remote.')
+  // Zero-zero is a disclosure, not a distinction — the panel must not claim
+  // to have established that the branch really matches its upstream.
+  await expect(detail).not.toContainText('up to date')
   await page.keyboard.press('Escape')
   await expect(detail).toHaveCount(0)
   await expect(page.getByRole('button', { name: /^Repository status:/ })).toBeFocused()

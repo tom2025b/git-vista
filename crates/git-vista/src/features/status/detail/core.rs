@@ -56,6 +56,32 @@ pub fn reading_is_current(
         && requested_repo == current_repo
 }
 
+/// The reply a status resource retained, resolved against the live frame.
+///
+/// The requested epoch and repository travel *inside* `reply`, because that is
+/// what the fetch tagged them with. A call site therefore cannot pair the live
+/// frame with some other request's scope, or pass the same value for both
+/// sides of the comparison — the shape that a wasm-only call site made
+/// possible and a source census could never see. All the view supplies is
+/// live values; the decision itself is here, on the host.
+pub fn current_reading(
+    loading: bool,
+    reply: Option<(u64, Option<String>, Option<RepoStatus>)>,
+    current_epoch: u64,
+    current_repo: Option<&str>,
+) -> Option<RepoStatus> {
+    let (requested_epoch, requested_repo, result) = reply?;
+    reading_is_current(
+        loading,
+        requested_epoch,
+        current_epoch,
+        requested_repo.as_deref(),
+        current_repo,
+    )
+    .then_some(result)
+    .flatten()
+}
+
 fn files(n: usize) -> String {
     format!("{n} {}", if n == 1 { "file" } else { "files" })
 }
@@ -111,13 +137,17 @@ pub fn status_detail(status: Option<&RepoStatus>, writable: bool) -> Detail {
         (Some(branch), None) => sentences.push(format!("No upstream is configured for {branch}, so I can’t tell which commits need pulling or pushing.")),
         (Some(branch), Some(upstream)) => {
             if s.ahead == 0 && s.behind == 0 {
-                sentences.push(format!("The latest local reading reports {branch} up to date with {upstream}: no commits ahead or behind."));
+                // Porcelain omits `# branch.ab` when it cannot compute the
+                // comparison, and both counts then default to 0 — the same
+                // bits as a genuine match. Disclose that; do not assert a
+                // distinction the wire format cannot carry.
+                sentences.push(format!("The latest local reading reports no commits ahead of or behind {upstream} for {branch}. Git reports these same zeros when it could not compare them, so this reading cannot tell those two cases apart."));
             } else {
                 if s.behind > 0 { sentences.push(format!("{} on {upstream} {} missing from {branch}.", commits(s.behind), if s.behind == 1 { "is" } else { "are" })); }
                 if s.ahead > 0 { sentences.push(format!("{} on {branch} {} not on {upstream} yet.", commits(s.ahead), if s.ahead == 1 { "is" } else { "are" })); }
                 if s.ahead > 0 && s.behind > 0 { sentences.push("The branches have diverged: each has commits the other does not. Integrate the upstream changes before pushing.".into()); }
             }
-            sentences.push("These counts use the latest local tracking refs, not a fresh check of the remote. Zero can also mean Git could not calculate the comparison.".into());
+            sentences.push("These counts use the latest local tracking refs, not a fresh check of the remote.".into());
             // Existing push targets origin/<local branch>. Do not silently send
             // to that destination when this reading names a different upstream.
             if s.conflicted.is_empty() {
@@ -164,9 +194,13 @@ mod tests {
         }
     }
 
-    /// This census detects removal of the core-to-view calls/rendering and the
-    /// scope guard. It cannot execute DOM behavior or detect arbitrary altered
-    /// arguments; real browser assertions cover opening, copy and read-only DOM.
+    /// A STRING census, and no more than that. It detects removal of the
+    /// core-to-view calls and rendering. It does NOT verify behaviour: extra
+    /// ungated buttons, or `writable` ignoring what `can_write` returned,
+    /// still match these substrings. Real browser assertions cover opening,
+    /// copy and the read-only DOM; the scope decision is pinned by
+    /// `only_a_reply_matching_the_live_frame_becomes_a_reading`, which runs
+    /// the code rather than reading it.
     #[test]
     fn wasm_view_renders_the_core_sentences_and_offers() {
         let view = include_str!("view.rs");
@@ -176,7 +210,7 @@ mod tests {
         assert!(view.contains("detail().actions.into_iter()"));
         assert!(view.contains("detail().actions.contains(&action)"));
         let signals = include_str!("../signals.rs");
-        assert!(signals.contains("reading_is_current("));
+        assert!(signals.contains("current_reading("));
         assert!(signals.contains("fetch_status_for(Some(id))"));
         assert!(include_str!("../../../app/mod.rs").contains("status_chip_view("));
     }
@@ -200,8 +234,15 @@ mod tests {
             d.sentences[0],
             "Your working tree is clean. There are no uncommitted changes."
         );
-        assert_eq!(d.sentences[1], "The latest local reading reports main up to date with origin/main: no commits ahead or behind.");
-        assert!(d.sentences[2].contains("Zero can also mean Git could not calculate"));
+        // Zero-zero is a disclosure, not a distinction: porcelain omits
+        // `# branch.ab` when it cannot compare, and both counts default to 0.
+        // The lead sentence must not claim to tell those cases apart.
+        assert_eq!(d.sentences[1], "The latest local reading reports no commits ahead of or behind origin/main for main. Git reports these same zeros when it could not compare them, so this reading cannot tell those two cases apart.");
+        assert!(!d.sentences[1].contains("up to date"));
+        assert_eq!(
+            d.sentences[2],
+            "These counts use the latest local tracking refs, not a fresh check of the remote."
+        );
         assert!(d.actions.is_empty());
     }
     #[test]
@@ -282,7 +323,34 @@ mod tests {
     fn unsupported_push_destination_is_not_silently_replaced() {
         let mut s = status(2, 0);
         s.upstream = Some("other/trunk".into());
-        assert!(status_detail(Some(&s), true).actions.is_empty());
+        let d = status_detail(Some(&s), true);
+        // Both halves of the claim: no retargeted push offer, AND the guidance
+        // that replaces it. Asserting only the empty vec would stay green if
+        // the guidance were deleted and the user left with no explanation.
+        assert!(d.actions.is_empty());
+        assert_eq!(d.sentences.last().unwrap(), "The existing push flow targets origin with the same branch name. Choose the correct destination in your Git client for this upstream.");
+    }
+    /// The wiring, not just the predicate. `current_reading` is what the wasm
+    /// adapter calls, and the requested scope arrives inside the reply — so
+    /// duplicating or swapping the two sides of the comparison is a change
+    /// this host test can go red on, which the source census never could.
+    #[test]
+    fn only_a_reply_matching_the_live_frame_becomes_a_reading() {
+        let s = status(0, 0);
+        let reply = |epoch: u64, repo: &str| Some((epoch, Some(repo.to_string()), Some(s.clone())));
+        assert_eq!(
+            current_reading(false, reply(4, "a"), 4, Some("a")),
+            Some(s.clone())
+        );
+        assert_eq!(current_reading(true, reply(4, "a"), 4, Some("a")), None);
+        assert_eq!(current_reading(false, reply(3, "a"), 4, Some("a")), None);
+        assert_eq!(current_reading(false, reply(4, "b"), 4, Some("a")), None);
+        assert_eq!(current_reading(false, reply(4, "a"), 4, None), None);
+        assert_eq!(current_reading(false, None, 4, Some("a")), None);
+        assert_eq!(
+            current_reading(false, Some((4, Some("a".into()), None)), 4, Some("a")),
+            None
+        );
     }
     #[test]
     fn retained_readings_must_match_epoch_and_repository() {
