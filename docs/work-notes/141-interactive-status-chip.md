@@ -32,3 +32,16 @@ Final stage-to-commit and keyboard focus checks passed. After merging main
 3379 host tests passed (21 ignored), 120 browser tests passed. The finish
 report records the PR and quotes each state’s actual English.
 Refs #141.
+
+Review checkpoint (three independent readers: Codex gpt-5.6-sol, Claude Fable
+5.1, grok 4.6). The implementation held; the proofs did not. Three fixes:
+zero ahead/behind now discloses that Git reports the same zeros when it could
+not compare, instead of asserting a distinction the wire format cannot carry
+(no wire change); the unsupported-push test now asserts the guidance sentence,
+not only an empty action list; and the retained-reading decision moved from the
+wasm-only call site into host-compiled `current_reading`, whose reply carries
+its own requested scope, so a duplicated or swapped comparison argument now
+goes red on the host. The source census is a STRING census and its comment now
+says only that. Failure Atlas mutations 390-395: six mutations, two disjoint
+per tightened test, all caught on clean baselines.
+Refs #141.
