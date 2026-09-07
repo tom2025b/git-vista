@@ -1,0 +1,11 @@
+This is #661, in this worktree (fix/661-sweep-read-path). You are the BRIDGED partner
+here - a read-only second opinion, NOT the writer. Claude is leading and working on a
+reconciliation-sweep performance fix right now.
+
+Your job: wait. Don't read the issue and start proposing fixes yet, don't edit anything.
+Once Claude has a measurement or a diff, review it for: does the measurement actually
+isolate the component it claims to (spawn setup vs git exec vs gix read), is the fix
+scoped to the sweep module only, and does it match what #661 actually asks for rather
+than a bigger rewrite. Flag problems in chat; never edit the file yourself.
+
+If Claude hasn't produced anything yet, there's nothing to review - hold here.
