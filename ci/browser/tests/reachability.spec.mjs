@@ -14,6 +14,33 @@ import { DIFF_SCROLLER, openApp, openDiff, runtime } from './helpers.mjs'
  *  when the fixture gained a commit, making a test unfalsifiable. */
 const LONG_PATCH = 1
 
+/** Wait for the virtualizer to render the scroll offset the browser accepted.
+ *  scrollTop changes before the scroll event and reactive render run. A sleep
+ *  (formerly 300/350 ms) only guessed when those two steps had finished.
+ *  The marker is emitted with the rendered rows, not by the scroll handler.
+ *  Keep content/bounds assertions below: an acknowledged offset alone cannot
+ *  prove that a renderer preserved the patch or actually virtualized it. */
+async function readRenderedWindow(page, fraction, { timeout } = {}) {
+  const scroller = page.locator(DIFF_SCROLLER)
+  const top = await scroller.evaluate((el, fraction) => {
+    el.scrollTop = Math.floor(el.scrollHeight * fraction)
+    return el.scrollTop
+  }, fraction)
+  // web-sys currently exposes scroll_top() as i32; browser zoom can
+  // leave JS scrollTop fractional. Compare the same integer the renderer
+  // consumed, rather than waiting forever for an unrepresentable fraction.
+  // Omitted timeout keeps Playwright's configured budget; negative tests can
+  // supply a shorter one without replacing the helper's expect instance.
+  await expect(scroller.locator('pre.detail-diff'), 'the patch window has rendered this scroll offset')
+    .toHaveAttribute('data-rendered-scroll-top', String(Math.trunc(top)), { timeout })
+  return scroller.evaluate((el) => ({
+    top: el.scrollTop,
+    rows: el.querySelectorAll('span').length,
+    hunks: el.querySelectorAll('span.diff-hunk').length,
+    text: el.textContent,
+  }))
+}
+
 test.describe('status surfaces', () => {
   // #68d: `StatusSections` shipped with 20+ tests and zero consumers, so #68's
   // "touch cards and accessible list semantics" was false for weeks while the
@@ -22,8 +49,25 @@ test.describe('status surfaces', () => {
     await openApp(page)
     await page.getByRole('button', { name: 'Activity' }).click()
 
-    const items = page.getByRole('listitem')
-    await expect(items.first()).toBeAttached({ timeout: 15_000 })
+    // Activity has no busy/error signal for this resource: a failed fetch
+    // and a pending fetch both omit the status sections. For this non-empty
+    // fixture, every expected list rendering is the positive readiness signal.
+    // A page-wide listitem could instead belong to tags, stashes, or worktrees.
+    const panel = page.locator('.activity-panel')
+    const { staged, unstaged, untracked } = runtime().fixture.expected
+    const sections = [
+      ['Staged changes', staged],
+      ['Unstaged changes', unstaged],
+      ['Untracked files', untracked],
+    ]
+    for (const [name, count] of sections) {
+      const list = panel.getByRole('list', { name, exact: true })
+      // Preserve this test's existing 15-second assertion budget; the
+      // readiness condition changes, not its allowance for a loaded host.
+      await expect(list.getByRole('listitem'), `${name} status data has rendered`)
+        .toHaveCount(count, { timeout: 15_000 })
+    }
+    const items = panel.locator('.act-status-section').getByRole('listitem')
 
     const labels = await items.evaluateAll((els) =>
       els.map((e) => e.getAttribute('aria-label')),
@@ -96,22 +140,13 @@ test.describe('diff rendering', () => {
     // written and became wrong when the fixture gained a commit.
     await openDiff(page, LONG_PATCH)
 
-    const observed = await page.evaluate(async (sel) => {
-      const scroller = document.querySelector(sel)
-      const at = async (top) => {
-        scroller.scrollTop = top
-        await new Promise((r) => setTimeout(r, 350))
-        const rows = document.querySelectorAll(`${sel} span`).length
-        return { top: scroller.scrollTop, rows, text: scroller.textContent }
-      }
-      const total = scroller.scrollHeight
-      return {
-        total,
-        top: await at(0),
-        middle: await at(Math.floor(total / 2)),
-        bottom: await at(total),
-      }
-    }, DIFF_SCROLLER)
+    const total = await page.locator(DIFF_SCROLLER).evaluate((el) => el.scrollHeight)
+    const observed = {
+      total,
+      top: await readRenderedWindow(page, 0),
+      middle: await readRenderedWindow(page, 0.5),
+      bottom: await readRenderedWindow(page, 1),
+    }
 
     // 1. PRECONDITION: this really is a long patch. Without this the bound
     //    below is unfalsifiable -- the whole failure the old version had.
@@ -147,6 +182,33 @@ test.describe('diff rendering', () => {
     )
   })
 
+  test('the readiness wait honors an explicit timeout for a missing signal', async ({ page }) => {
+    await openApp(page)
+    await openDiff(page, LONG_PATCH)
+    await readRenderedWindow(page, 0)
+    await page.locator(`${DIFF_SCROLLER} pre.detail-diff`).evaluate((el) => {
+      el.removeAttribute('data-rendered-scroll-top')
+    })
+    // No scroll at zero means no subsequent render can restore the marker.
+    // Assert on the configured deadline in the error, not elapsed wall time.
+    await expect(readRenderedWindow(page, 0, { timeout: 250 }))
+      .rejects.toThrow(/Timeout:\s+250ms/)
+  })
+
+  test('fractional browser scroll offsets acknowledge the rendered window', async ({ page }) => {
+    await openApp(page)
+    await openDiff(page, LONG_PATCH)
+    // Real browser layout can produce subpixel scrollTop values. Zoom the
+    // scroller so this test exercises that case rather than an integer offset
+    // which would also pass with the old exact string comparison.
+    await page.locator(DIFF_SCROLLER).evaluate((el) => { el.style.zoom = '1.25' })
+    const observed = await readRenderedWindow(page, 0.5)
+    expect(observed.top, 'precondition: the browser returned a fractional offset')
+      .not.toBe(Math.trunc(observed.top))
+    expect(observed.rows).toBeGreaterThan(10)
+    expect(observed.text).not.toContain('bulk line 0')
+  })
+
   // #350: `scroll_to_reveal` was built and mutation-proven, then never called
   // from the focus path. The observable consequence is here: a hunk header can
   // be scrolled entirely out of the DOM, which is what breaks keyboard
@@ -157,17 +219,10 @@ test.describe('diff rendering', () => {
     // mounted and would make this test pass for the wrong reason.
     await openDiff(page, 1)
 
-    const observed = await page.evaluate(async (sel) => {
-      const scroller = document.querySelector(sel)
-      const seen = []
-      const stops = [0, 0.25, 0.5, 0.75].map((f) => Math.floor(scroller.scrollHeight * f))
-      for (const top of stops) {
-        scroller.scrollTop = top
-        await new Promise((r) => setTimeout(r, 300))
-        seen.push({ top: scroller.scrollTop, hunks: document.querySelectorAll('span.diff-hunk').length })
-      }
-      return seen
-    }, DIFF_SCROLLER)
+    const observed = []
+    for (const fraction of [0, 0.25, 0.5, 0.75]) {
+      observed.push(await readRenderedWindow(page, fraction))
+    }
 
     // This documents CURRENT behaviour so the fix has something to flip. When
     // #210 is fixed by revealing before focusing, a focused header should never
