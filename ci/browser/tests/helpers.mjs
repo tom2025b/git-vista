@@ -346,6 +346,20 @@ export async function openMergePreviewRepo(page) {
  */
 export async function openBranchMenu(page, branch) {
   const nodes = page.locator('circle.node-hit')
+  // Zero nodes is not "no such branch" — it is "the graph has not painted yet".
+  // Name the branch on failure without swallowing the cause. The JSDoc above
+  // promises this helper fails by NAMING the branch rather than timing out
+  // anonymously, so the readiness wait must not discard that. An earlier
+  // version wrapped this in try/catch and re-threw a fixed message, which
+  // relabelled EVERY matcher rejection -- a closed page, a disconnected
+  // browser -- as "the canvas never mounted". That is a different misleading
+  // message, not a fix. expect's own message argument keeps the branch name
+  // AND Playwright's real cause. (codex review of this PR, 2026-09-07.)
+  await expect(
+    nodes.first(),
+    `no commit graph painted for the branch ${branch}, so nothing could be ` +
+      `walked. A readiness failure is not the same as a missing branch.`
+  ).toBeAttached({ timeout: 20_000 })
   const count = await nodes.count()
   for (let i = 0; i < count; i++) {
     await nodes.nth(i).click()

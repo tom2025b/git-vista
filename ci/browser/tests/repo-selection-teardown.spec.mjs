@@ -45,6 +45,7 @@
 import { expect, test } from '@playwright/test'
 
 import {
+  openBranchMenu,
   openMergePreviewRepo,
   openWorktreeDrawer,
   openWorktreeRepo,
@@ -58,20 +59,11 @@ test.describe('#676 — selecting a repository closes an open confirmation', () 
   }) => {
     await openMergePreviewRepo(page)
 
-    // Open the merge confirmation and leave it open.
-    const nodes = page.locator('circle.node-hit')
-    const count = await nodes.count()
-    let mergeItem = null
-    for (let i = 0; i < count; i++) {
-      await nodes.nth(i).click()
-      const item = page.getByRole('button', { name: new RegExp(`Merge ‘${PREVIEW_BRANCH}’`) })
-      if (await item.isVisible().catch(() => false)) {
-        mergeItem = item
-        break
-      }
-      await page.keyboard.press('Escape')
-    }
-    expect(mergeItem, `no commit offered a merge item for ${PREVIEW_BRANCH}`).not.toBeNull()
+    // Open the merge confirmation and leave it open. This walked the nodes
+    // inline until #633's second pass: it was a sixth copy of the same
+    // count-then-walk, with the same unguarded `count()` and none of the
+    // helper's readiness wait or named throw. The helper does both.
+    const mergeItem = await openBranchMenu(page, PREVIEW_BRANCH)
     await mergeItem.click()
     const confirmText = page.getByText(`Merge ‘${PREVIEW_BRANCH}’ into ‘${PREVIEW_INTO}’?`)
     await expect(confirmText, 'the merge confirmation must be open before this spec means anything').toBeVisible()
