@@ -672,6 +672,44 @@ fn unauthenticated_routes_are_a_pinned_short_allowlist() {
 /// `session_exempt` must test a method as well as a path. Dropping the method
 /// test from any clause fails here, by name, in the same test binary as the
 /// table it would have falsified.
+/// Byte length of the Rust char literal starting at the `'` that begins `s`,
+/// including both quotes — or `None` when `s` starts a lifetime or label
+/// (`'a`, `'static`, `'outer:`) rather than a literal.
+///
+/// Split out of [`session_exempt_expression`] so the escape rule is pinnable.
+/// Folded into the scanner it was not: mis-consuming `'\''` left a stray quote
+/// that the lifetime path skipped harmlessly, so no input could make the defect
+/// visible in the scanner's output (`mutation_check` arm 434, `survived`). A
+/// branch that cannot be observed cannot be proved, which is the whole
+/// complaint of ADR 0134 — so the fix is to move the boundary, not to write
+/// the branch off as untestable.
+///
+/// Known limit, stated rather than assumed away: a unicode escape
+/// (`'\u{3b}'`) is not recognised and reads as a lifetime, so the scanner
+/// skips only its quote. Harmless here because such a literal contains no
+/// literal `;` to expose, and `session_exempt` has never held one.
+fn char_literal_len(s: &str) -> Option<usize> {
+    let mut chars = s.chars();
+    if chars.next()? != '\'' {
+        return None;
+    }
+    let first = chars.next()?;
+    if first == '\\' {
+        // `'\n'`, `'\''`, `'\\'`: escape, one payload char, closing quote.
+        let payload = chars.next()?;
+        if chars.next()? != '\'' {
+            return None;
+        }
+        return Some(1 + 1 + payload.len_utf8() + 1);
+    }
+    // `'x'` is a literal; `'x` without a closing quote is a lifetime. This is
+    // how Rust itself lexes the ambiguity.
+    if chars.next()? != '\'' {
+        return None;
+    }
+    Some(1 + first.len_utf8() + 1)
+}
+
 /// The right-hand side of `security.rs`'s `let session_exempt = ...;`, ending
 /// at the `;` that actually terminates the statement.
 ///
@@ -717,28 +755,22 @@ fn session_exempt_expression(code: &str) -> Option<&str> {
             // `;` inside one cannot end the statement; `'a` is a lifetime and
             // only the quote is skipped.
             '\'' => {
-                let is_char_literal = match chars.peek() {
-                    // `'\n'`, `'\''`, `'\\'` — an escape always means a literal.
-                    Some((_, '\\')) => true,
-                    // `'x'` is a literal; `'x…` without the closing quote is a
-                    // lifetime. Look one past the candidate contents.
-                    Some(_) => {
-                        let mut lookahead = chars.clone();
-                        lookahead.next();
-                        matches!(lookahead.peek(), Some((_, '\'')))
-                    }
-                    None => false,
-                };
-                if is_char_literal {
-                    // Consume the contents and the closing quote, honouring a
-                    // backslash escape so `'\''` does not end early.
-                    let mut escaped_char = false;
-                    for (_, c) in chars.by_ref() {
-                        if escaped_char {
-                            escaped_char = false;
-                        } else if c == '\\' {
-                            escaped_char = true;
-                        } else if c == '\'' {
+                // Delegated to a pure function so the escape rule is pinnable
+                // on its own. Inline, `'\''` mis-consumed only ever left a
+                // stray quote that the lifetime path then skipped, so the
+                // escape branch could not be observed through this function's
+                // output at all — `mutation_check` arm 434 returned `survived`
+                // against it. Moving the boundary is what made it testable;
+                // documenting it as untestable would have left exactly the kind
+                // of unprovable guard this file exists to reject.
+                if let Some(len) = char_literal_len(&rest[i..]) {
+                    // Skip the literal's remaining bytes; `i` is already past
+                    // the opening quote's own byte.
+                    let end = i + len;
+                    while let Some(&(j, _)) = chars.peek() {
+                        if j < end {
+                            chars.next();
+                        } else {
                             break;
                         }
                     }
@@ -751,6 +783,52 @@ fn session_exempt_expression(code: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// [`char_literal_len`]'s own pins, including the escape rule that could not
+/// be observed through [`session_exempt_expression`]'s output at all
+/// (`mutation_check` arm 434, `survived`). This is the boundary move that made
+/// it provable: the same rule, tested where its result is visible.
+#[test]
+fn a_char_literal_is_measured_and_a_lifetime_is_not() {
+    // Plain literals: quote, one char, quote.
+    assert_eq!(char_literal_len("'x'"), Some(3));
+    assert_eq!(
+        char_literal_len("';'"),
+        Some(3),
+        "a `;` is an ordinary payload"
+    );
+    assert_eq!(char_literal_len("'\"'"), Some(3), "a double quote is too");
+
+    // The escape rule. Without it `'\''` measures 3 and leaves a stray quote —
+    // the defect arm 434 could not see.
+    assert_eq!(
+        char_literal_len(r"'\''"),
+        Some(4),
+        "an escaped quote is part of the literal, not its terminator"
+    );
+    assert_eq!(char_literal_len(r"'\\'"), Some(4), "an escaped backslash");
+    assert_eq!(char_literal_len(r"'\n'"), Some(4), "an ordinary escape");
+
+    // Lifetimes and labels are not literals and must measure as None, so the
+    // scanner skips only the quote and keeps reading.
+    assert_eq!(char_literal_len("'a"), None, "a lifetime");
+    assert_eq!(char_literal_len("'static"), None, "a named lifetime");
+    assert_eq!(char_literal_len("'outer:"), None, "a loop label");
+    assert_eq!(
+        char_literal_len("'a>"),
+        None,
+        "a lifetime in a generic list"
+    );
+
+    // Not a candidate at all.
+    assert_eq!(char_literal_len("x"), None);
+    assert_eq!(char_literal_len("'"), None, "a bare quote closes nothing");
+    assert_eq!(char_literal_len(""), None);
+
+    // Multi-byte payloads are measured in BYTES, since the caller slices with
+    // the result. A char count would slice mid-character and panic.
+    assert_eq!(char_literal_len("'é'"), Some(4), "é is two bytes");
 }
 
 /// #724 review: [`session_exempt_expression`] is a pure function, so it is
