@@ -14,6 +14,28 @@ import { DIFF_SCROLLER, openApp, openDiff, runtime } from './helpers.mjs'
  *  when the fixture gained a commit, making a test unfalsifiable. */
 const LONG_PATCH = 1
 
+/** Wait for the virtualizer to render the scroll offset the browser accepted.
+ *  scrollTop changes before the scroll event and reactive render run. A sleep
+ *  (formerly 300/350 ms) only guessed when those two steps had finished.
+ *  The marker is emitted with the rendered rows, not by the scroll handler.
+ *  Keep content/bounds assertions below: an acknowledged offset alone cannot
+ *  prove that a renderer preserved the patch or actually virtualized it. */
+async function readRenderedWindow(page, fraction) {
+  const scroller = page.locator(DIFF_SCROLLER)
+  const top = await scroller.evaluate((el, fraction) => {
+    el.scrollTop = Math.floor(el.scrollHeight * fraction)
+    return el.scrollTop
+  }, fraction)
+  await expect(scroller.locator('pre.detail-diff'), 'the patch window has rendered this scroll offset')
+    .toHaveAttribute('data-rendered-scroll-top', String(top))
+  return scroller.evaluate((el) => ({
+    top: el.scrollTop,
+    rows: el.querySelectorAll('span').length,
+    hunks: el.querySelectorAll('span.diff-hunk').length,
+    text: el.textContent,
+  }))
+}
+
 test.describe('status surfaces', () => {
   // #68d: `StatusSections` shipped with 20+ tests and zero consumers, so #68's
   // "touch cards and accessible list semantics" was false for weeks while the
@@ -22,8 +44,22 @@ test.describe('status surfaces', () => {
     await openApp(page)
     await page.getByRole('button', { name: 'Activity' }).click()
 
-    const items = page.getByRole('listitem')
-    await expect(items.first()).toBeAttached({ timeout: 15_000 })
+    // Activity has no busy/error signal for this resource: a failed fetch
+    // and a pending fetch both omit the status sections. For this non-empty
+    // fixture, every expected list rendering is the positive readiness signal.
+    // A page-wide listitem could instead belong to tags, stashes, or worktrees.
+    const panel = page.locator('.activity-panel')
+    const { staged, unstaged, untracked } = runtime().fixture.expected
+    const sections = [
+      ['Staged changes', staged],
+      ['Unstaged changes', unstaged],
+      ['Untracked files', untracked],
+    ]
+    for (const [name, count] of sections) {
+      const list = panel.getByRole('list', { name, exact: true })
+      await expect(list.getByRole('listitem'), `${name} status data has rendered`).toHaveCount(count)
+    }
+    const items = panel.locator('.act-status-section').getByRole('listitem')
 
     const labels = await items.evaluateAll((els) =>
       els.map((e) => e.getAttribute('aria-label')),
@@ -96,22 +132,13 @@ test.describe('diff rendering', () => {
     // written and became wrong when the fixture gained a commit.
     await openDiff(page, LONG_PATCH)
 
-    const observed = await page.evaluate(async (sel) => {
-      const scroller = document.querySelector(sel)
-      const at = async (top) => {
-        scroller.scrollTop = top
-        await new Promise((r) => setTimeout(r, 350))
-        const rows = document.querySelectorAll(`${sel} span`).length
-        return { top: scroller.scrollTop, rows, text: scroller.textContent }
-      }
-      const total = scroller.scrollHeight
-      return {
-        total,
-        top: await at(0),
-        middle: await at(Math.floor(total / 2)),
-        bottom: await at(total),
-      }
-    }, DIFF_SCROLLER)
+    const total = await page.locator(DIFF_SCROLLER).evaluate((el) => el.scrollHeight)
+    const observed = {
+      total,
+      top: await readRenderedWindow(page, 0),
+      middle: await readRenderedWindow(page, 0.5),
+      bottom: await readRenderedWindow(page, 1),
+    }
 
     // 1. PRECONDITION: this really is a long patch. Without this the bound
     //    below is unfalsifiable -- the whole failure the old version had.
@@ -157,17 +184,10 @@ test.describe('diff rendering', () => {
     // mounted and would make this test pass for the wrong reason.
     await openDiff(page, 1)
 
-    const observed = await page.evaluate(async (sel) => {
-      const scroller = document.querySelector(sel)
-      const seen = []
-      const stops = [0, 0.25, 0.5, 0.75].map((f) => Math.floor(scroller.scrollHeight * f))
-      for (const top of stops) {
-        scroller.scrollTop = top
-        await new Promise((r) => setTimeout(r, 300))
-        seen.push({ top: scroller.scrollTop, hunks: document.querySelectorAll('span.diff-hunk').length })
-      }
-      return seen
-    }, DIFF_SCROLLER)
+    const observed = []
+    for (const fraction of [0, 0.25, 0.5, 0.75]) {
+      observed.push(await readRenderedWindow(page, fraction))
+    }
 
     // This documents CURRENT behaviour so the fix has something to flip. When
     // #210 is fixed by revealing before focusing, a focused header should never
