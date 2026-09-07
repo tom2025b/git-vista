@@ -35,7 +35,7 @@ use std::path::Path;
 /// entirely; `SessionRequired` reads need a live session; `SessionAndCsrf`
 /// writes need a live session *and* a matching CSRF header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Authz {
+pub(crate) enum Authz {
     Unauthenticated,
     SessionRequired,
     SessionAndCsrf,
@@ -48,7 +48,13 @@ enum Authz {
 ///
 /// Ordered to match `main.rs`'s own registration order, so a diff between
 /// the two reads the same way top to bottom.
-const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
+///
+/// `pub(crate)`, not private: #690's
+/// `route_authz_and_write_contract_agree_on_every_post_route` (in
+/// `planner::contract_suite`) reads this table directly to cross-check it
+/// against that file's own independently hand-maintained POST-route table —
+/// see that test's doc comment for why the cross-check exists at all.
+pub(crate) const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     // -- always registered (both the loopback and LAN routers build these) --
     ("/api/frame", Method::GET, Authz::SessionRequired),
     ("/api/commits", Method::GET, Authz::SessionRequired),

@@ -93,8 +93,12 @@ mod ratelimit;
 // after re-deriving and matching it server-side. See
 // docs/superpowers/specs/2026-08-18-m3-recovery-center.md.
 mod recovery_center;
+// #690: `pub(crate)`, not private — `planner::contract_suite`'s
+// `route_authz_and_write_contract_agree_on_every_post_route` reads
+// `route_authz::ROUTE_AUTHZ` directly to cross-check it against that file's
+// own independently hand-maintained POST-route table.
 #[cfg(test)]
-mod route_authz;
+pub(crate) mod route_authz;
 // M1.13b (#66): the git-process sandbox — the pure argv chokepoint, the tier
 // enum, the gitdir validation, and the spawn wrappers every production spawn
 // site goes through. The fused shim it launches is `src/bin/gv-sandbox.rs`.
