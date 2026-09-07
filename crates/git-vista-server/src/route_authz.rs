@@ -807,6 +807,20 @@ fn the_session_exempt_scanner_reads_whole_statements() {
          the scan: {got}"
     );
 
+    // The string branch's ESCAPE flag, pinned. grok's review of this delta:
+    // deleting `escaped` left the whole suite green, because no fixture
+    // contained a `\"`. That is arm 429's shape one level finer — a branch
+    // green because the fixture lacks the thing it handles, not because it
+    // works. A raw string keeps the `\"` intact for the scanner to meet.
+    let escaped_quote_in_string = r#"let session_exempt = a == "x\";y" || p == "/api/evil";"#;
+    let got = session_exempt_expression(escaped_quote_in_string)
+        .expect("an escaped quote does not end the string");
+    assert!(
+        got.contains("/api/evil"),
+        "the string escape flag is not doing the work — an escaped quote closed the \
+         string early and the interior `;` truncated the scan: {got}"
+    );
+
     // A `;` inside a CHAR literal is the same trap one notch smaller.
     let charly = "let session_exempt = (a == B && c != ';')\n || p == \"/api/evil\";\nnext();";
     let got =
