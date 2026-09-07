@@ -1331,18 +1331,40 @@ pub(crate) fn policy_for_clone(clones_root: &Path) -> Result<Policy, shim::ShimE
 /// `connect()`, because `seccomp_filter::af_unix_rule` denies `AF_UNIX` in the
 /// **Strict** tier only. Closing that needs a checkout-specific seccomp mode
 /// and is tracked separately; do not read this constructor as having done it.
+///
+/// # Why every field is written out rather than `..transfer`
+///
+/// R8 (`escape_contract.rs`) refuses a functional update in any production
+/// `Policy` construction, and refuses it loudly rather than skipping what it
+/// cannot read. Its job is to verify from source that no production
+/// constructor can yield `HookMode::Blocked`, and `..base` hides that field
+/// behind an indirection the scanner cannot follow. Caught by the gate on the
+/// first version of this function, which did exactly that. The verbosity is
+/// the price of a check that cannot be defeated by convenience syntax.
 pub(crate) fn policy_for_clone_checkout(clones_root: &Path) -> Result<Policy, shim::ShimError> {
     let transfer = policy_for_clone(clones_root)?;
     let agent_socket = ssh_agent_socket_grant(transfer.tier);
     Ok(Policy {
+        tier: transfer.tier,
+        shim: transfer.shim,
+        bwrap: transfer.bwrap,
+        // #702: the operator's agent socket, and only it, comes out.
         rw_trees: transfer
             .rw_trees
             .into_iter()
             .filter(|p| Some(p) != agent_socket.as_ref())
             .collect(),
+        ro_trees: transfer.ro_trees,
+        secret_excludes: transfer.secret_excludes,
+        // #702: no `known_hosts` exception — the `~/.ssh` exclude is
+        // exceptionless again for the process that runs attacker code.
         ro_carveouts: Vec::new(),
+        // #702: no port 22.
         net_ports: CLONE_CHECKOUT_PORTS.to_vec(),
-        ..transfer
+        // Unchanged, and spelled literally for R8: ADR 0029 rejects blocking
+        // hooks, and #702 is about what the hook is HANDED, never whether it
+        // runs.
+        hook_mode: HookMode::Run,
     })
 }
 
