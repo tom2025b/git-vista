@@ -1,4 +1,4 @@
-# ADR 0137 — An untrusted checkout inherits an allowlist, and a capability it cannot use
+# ADR 0137 — An untrusted checkout inherits an allowlist, and the phase that runs attacker code gives up what it does not need
 
 - **Status:** Accepted — implemented, mutation-proved two ways per issue, all four failing differently
 - **Date:** 2026-09-07
@@ -79,14 +79,52 @@ flowchart LR
   before -.->|"#680 splits clone;<br/>the premise stops holding"| after
 ```
 
-### The grants were not merely unsafe here. They were unusable here.
+### A premise that was false, and how it survived two readers
 
-`validate_clone_url` accepts `https://`, `http://` and `git://` and rejects
-everything else, including a leading `-`. This route **cannot perform an SSH
-clone**. The comment sitting on the grant line said skipping it "would leave
-`git clone git@host:…` broken" — that URL has been a 400 at the wire boundary
-since Phase 12. A capability no code path on this route can legitimately reach
-is not a trade-off to weigh.
+The first version of this change removed both #188 grants and port 22 from
+`policy_for_clone` outright, on this argument:
+
+> `validate_clone_url` accepts `https://`, `http://` and `git://` and rejects
+> everything else. This route **cannot perform an SSH clone**. A capability no
+> code path on this route can legitimately reach is not a trade-off to weigh.
+
+**That is false, and the change was a regression.** `validate_clone_url` is a
+scheme-prefix check with no port or transport constraint. Two paths reach SSH
+without ever failing it:
+
+- `https://host:22/repo.git` is accepted — the validator never looks at the port;
+- `url.<base>.insteadOf` in the operator's own `~/.gitconfig` rewrites an
+  accepted `https://` URL into a real SSH clone — using the very global config
+  this ADR's own allowlist deliberately preserves, two sections below.
+
+So operators with `insteadOf` configured had **working clones broken** by the
+removal: no `known_hosts` carve-out means host-key verification fails, and no
+port 22 means the connection is denied outright. Caught in review by
+codex-daybreak on #720, traced to source, before it merged.
+
+```mermaid
+flowchart TD
+  U["pasted URL<br/>https://github.com/x/y"] --> V["validate_clone_url<br/>checks the SCHEME PREFIX only"]
+  V -->|"accepted"| G["git clone"]
+  G --> C{"~/.gitconfig<br/>url.git@github.com:.insteadOf<br/>https://github.com/ ?"}
+  C -->|"no"| H["HTTPS transfer<br/>port 443"]
+  C -->|"yes"| S["SSH transfer<br/>port 22, known_hosts, agent"]
+  S --> B["broken by the first<br/>version of this change"]
+```
+
+**The transferable lesson is that the failure was a premise, not an
+implementation.** "A capability no code path can reach" was checked against the
+URL *scheme* — the one path that names the capability — and never against
+ports, config rewriting, or `insteadOf`. It began in the lane handoff, survived
+the lane's own verification pass, and was refuted only by a fresh reader who
+went to `dto.rs` instead of accepting the sentence. A capability argument has to
+be checked against **every** path that can reach the capability, not the one
+that names it.
+
+The correct statement is narrower, and no counter-example touches it: **the
+process that runs attacker-chosen code does not need these.** That is a claim
+about a *phase*, not about a route — which is why the fix below splits the
+policy instead of narrowing a shared one.
 
 ## Decision
 
@@ -149,32 +187,54 @@ deprecated — while a "remove these names" builder exists on that type, the nex
 credential-adjacent call site can reach for it and rebuild #704 one variable
 later.
 
-### 3. `policy_for_clone` gives up three capabilities it cannot use
+### 3. The two phases get two policies, and the grants follow the split
 
-- `rw_trees` no longer extends with `ssh_agent_socket_grant(tier)`.
-- `ro_carveouts` is empty, not `ssh_known_hosts_carveout(&home)`.
-- `net_ports` is a new `CLONE_GIT_PORTS` (443, 80, 9418) — `DEFAULT_GIT_PORTS`
-  without 22. That list is the exact image of `validate_clone_url`'s accepted
-  schemes, and the correspondence is the point.
+ADR 0128 split clone into two processes with a security boundary between them —
+and then handed both of them the same `Policy`. The credential stopped crossing
+that boundary; every capability kept crossing it. This is that split finally
+reaching the grants.
 
-`policy_for` is untouched. Fetch, push and `ls-remote` against an already-cloned
-SSH remote are what #188 exists for, and they keep all three.
+```mermaid
+flowchart TD
+  R["policy_for_clone<br/>the TRANSFER"] --> R1["agent socket ✓"]
+  R --> R2["known_hosts carve-out ✓"]
+  R --> R3["port 22 ✓"]
+  R --> R4["credential ✓"]
+  R --> R5["runs NO attacker code"]
+  K["policy_for_clone_checkout<br/>the CHECKOUT"] --> K1["agent socket ✗"]
+  K --> K2["known_hosts carve-out ✗"]
+  K --> K3["port 22 ✗"]
+  K --> K4["credential ✗ · env allowlist"]
+  K --> K5["RUNS attacker code"]
+  R -.->|"process exits;<br/>ADR 0128's boundary"| K
+```
 
-**The honest ordering of what actually closes #702.** ADR 0033 §3 measured, and
-this change re-read rather than assumed, that the `rw_trees` agent-socket grant
-is **inert on this kernel**: Landlock ABI 8 does not mediate pathname `AF_UNIX`
-sockets at all. Removing that Landlock rule therefore removes nothing the kernel
-was consulting. What made the agent reachable from a hostile hook was the
-inherited `$SSH_AUTH_SOCK` telling it where to connect — so §1's allowlist is
-the load-bearing half, and §3 is the other three things:
+`policy_for_clone` keeps all of #188, because the transfer genuinely may need it
+and the section above shows why. `policy_for_clone_checkout` is that policy
+minus three things: the `$SSH_AUTH_SOCK` `rw_trees` grant, the
+`~/.ssh/known_hosts` carve-out, and port 22 (`CLONE_CHECKOUT_PORTS`).
 
-1. the argv no longer *claims* a grant the process should not have, restoring
-   ADR 0033's own D5 Option B property (what the sandbox permits is auditable
-   from the launcher command line alone);
-2. the grant cannot silently become load-bearing again if a future Landlock ABI
-   starts mediating pathname sockets;
-3. port 22 is gone, so a hook that recovered a socket path by some other means
-   still cannot reach an SSH service.
+Network access, `HookMode::Run` and filter execution are **unchanged in both**.
+ADR 0128 kept them deliberately and this narrows what the second process is
+handed, never what it may do.
+
+Port 22's justification is now about the phase, not the URL: `git checkout -f`
+is local, every object is already on disk, and the only legitimate outbound
+traffic is a content filter's own (`git-lfs` smudge over HTTPS). Whatever the
+remote's transport was, nothing this process does needs SSH.
+
+Dropping the carve-out also removes a real failure mode: a `stow`/`chezmoi`
+user whose `~/.ssh/known_hosts` is a symlink had checkout refused outright by
+`add_carveout_rule`'s deliberate `Symlinked` guard (ADR 0033 §1a).
+
+**Honest ordering of what closes what.** ADR 0033 §3 measured — and this change
+re-read rather than assumed — that the `rw_trees` agent-socket grant is **inert
+on this kernel**: Landlock ABI 8 does not mediate pathname `AF_UNIX` sockets,
+and `ssh_remote.rs`'s own live test still proves it. So §1's allowlist is the
+load-bearing half of #702. §3 contributes three other things: the argv stops
+advertising a grant the process must not have (ADR 0033's D5 Option B
+auditability), the grant cannot silently become load-bearing again under a
+future ABI, and port 22 is no longer reachable.
 
 ## Rejected alternatives
 
@@ -187,23 +247,29 @@ the fifth omission the next issue. Rejected on shape, not on cost — this is AD
 ### Run the checkout at the Strict tier instead
 
 Genuinely stronger: Strict denies `AF_UNIX` at the seccomp layer outright, so
-the residual in §"Consequences" would be gone. Rejected because Strict has no
-network, and ADR 0128 kept network access for the checkout deliberately — a
-`git-lfs` smudge filter is a legitimate checkout-time network consumer. Trading
-a working product feature for a residual that is already unreachable is the
-wrong direction, and it can be revisited on its own terms if LFS-at-checkout is
-ever dropped.
+the residual below would be gone. Rejected because Strict has no network, and
+ADR 0128 kept network access for the checkout deliberately — a `git-lfs` smudge
+filter is a legitimate checkout-time network consumer.
+
+An earlier draft of this paragraph called that residual "already unreachable",
+which contradicted this ADR's own limits section three pages later and was the
+weaker of the two statements. It is struck. The residual is **reachable** — see
+"What this does not close" — and the reason not to move checkout to Strict is
+that it costs a working product feature, not that there is nothing left to gain.
+#723 buys the same ground without that cost.
 
 ### Keep `known_hosts` because it is only public key material
 
 True as far as it goes — ADR 0033 is right that `known_hosts` reveals which
-hosts the operator connects to rather than a secret that grants access. But that
-argument justifies a *cost*, and here there is no matching benefit: this route
-cannot verify an SSH host key because it cannot speak SSH. A carve-out out of
-the `~/.ssh` exclude with no caller is a bypass mechanism left armed for
-nothing. Dropping it also removes a real failure mode — a `stow`/`chezmoi` user
-whose `known_hosts` is a symlink had every clone refused by
-`add_carveout_rule`'s deliberate `Symlinked` guard.
+hosts the operator connects to rather than a secret that grants access.
+
+The first version of this ADR rejected keeping it with "this route cannot verify
+an SSH host key because it cannot speak SSH" — exactly the false premise
+recorded above, and the reason the *transfer* keeps the carve-out today. The
+surviving reason applies to the checkout only: that process verifies no host
+keys because it opens no connections to hosts, so for it the carve-out is a
+`~/.ssh` exclude bypass left armed with no caller. The list of hosts an operator
+connects to is also not nothing to hand a hostile hook.
 
 ### Leave the environment inherited and sandbox harder instead
 
@@ -219,13 +285,18 @@ that builds the environment.
   rather than the server's whole environment. This is a real behaviour change
   and the intended one: the boundary cannot distinguish the operator's hook from
   the remote's, because at checkout time the remote chose which file runs.
-- **The seccomp `AF_UNIX` exemption remains Network-tier-wide**, because the
-  tier is shared with `policy_for`'s legitimate SSH remotes. A hook that could
-  *guess* an agent socket path could still `connect()` to it. It has no way to
-  find one — `/tmp` is in no grant this policy gives out, so the directory
-  holding `ssh-XXXXXXXXXX/agent.<pid>` cannot be read — but "cannot enumerate"
-  is weaker than "cannot connect", and this ADR says so rather than rounding it
-  up.
+- **#702 stays open — see "What this does not close" below.**
+- **A proxied or custom-CA `git-lfs` smudge filter fails at checkout.**
+  `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`, `SSL_CERT_FILE` and `SSL_CERT_DIR`
+  are **not** allowlisted, and networked filters commonly need them — which sits
+  awkwardly beside LFS being the stated reason checkout keeps network at all.
+  The trade is deliberate: a proxy URL carries credentials in its userinfo
+  (`https://user:pass@proxy:3128`), which is precisely the class of value this
+  boundary exists to withhold from attacker-selected code, and it is the
+  commonest secret-bearing variable in CI. **What would reopen this:** a way to
+  pass proxy configuration without its userinfo — a sanitised value the server
+  writes into the child, or `http.proxy` as a `-c` flag the server authors — at
+  which point the names can be dropped for good rather than added.
 - **Dropping port 22 confines nothing to the operator's own remote.** ADR 0028's
   limitation is unchanged: a port grant carries no address. It removes one
   destination service class, and that is all it should ever be described as.
@@ -238,6 +309,44 @@ that builds the environment.
 - **A future `ro_carveouts` caller inherits an empty precedent here.** ADR 0033
   said nothing about its shape recommends a second caller; there is now one
   fewer, not one more.
+
+## What this does not close
+
+**#702 is not closed by this ADR.** The allowlist withholds the agent socket's
+*locator*; it does not deny the *capability*.
+
+`seccomp_filter::af_unix_rule` denies `AF_UNIX` in the **Strict** tier only, and
+Landlock does not mediate pathname `AF_UNIX` `connect()` at all (ADR 0033 §3).
+So a hook that recovers a socket path can set `SSH_AUTH_SOCK` itself and
+connect. Recovery does not need enumeration, which is where this ADR's first
+draft went wrong:
+
+- `$HOME` is both read-granted and allowlisted, and `~/.keychain/<host>-sh` — an
+  ordinary, common tool — contains the literal line
+  `SSH_AUTH_SOCK=/tmp/ssh-XXXX/agent.NNN; export SSH_AUTH_SOCK;`;
+- shell rc files and desktop-agent conventions give further derivable paths;
+- signatures then leave over port **443**, which is allowed and must stay allowed.
+
+Dropping port 22 does not prevent this: the agent protocol is spoken over the
+local socket, not over TCP 22.
+
+```mermaid
+flowchart TD
+  H["post-checkout hook<br/>attacker-chosen"] --> R["read ~/.keychain/host-sh<br/>HOME is granted AND allowlisted"]
+  R --> P["a literal socket path"]
+  P --> S["set SSH_AUTH_SOCK itself"]
+  S --> C["connect() — unmediated<br/>Landlock scopes ABSTRACT sockets only<br/>seccomp denies AF_UNIX in STRICT only"]
+  C --> X["sign, exfiltrate over 443"]
+```
+
+Closing it needs a checkout-specific seccomp mode denying pathname `AF_UNIX`
+while keeping TCP for LFS — `bin/gv-sandbox/seccomp_filter.rs`, tracked as
+**#723**. It does *not* require moving checkout to the Strict tier.
+
+What this ADR buys against that path is real but partial: the common case, where
+the variable is simply inherited, is closed; the argv no longer advertises a
+grant the process must not have; and the grant cannot become load-bearing again
+under a future Landlock ABI.
 
 ## Proof
 

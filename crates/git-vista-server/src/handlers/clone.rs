@@ -154,15 +154,27 @@ fn clone_checkout_args() -> [&'static str; 2] {
 }
 
 /// Fetch objects and refs while the credential exists, then let that process
-/// exit before materialising attacker-chosen files. The second phase keeps the
-/// clone policy's network access, hooks, and filters, but receives an
-/// environment **built by allowlist** rather than one with credential names
-/// removed from it (#704) — so a secret nobody enumerated is absent by
-/// construction. Its redaction is carried by
+/// exit before materialising attacker-chosen files.
+///
+/// **Two policies, not one.** ADR 0128 split clone into two processes and gave
+/// both the same `Policy`; #702 finishes that split. `policy` is the transfer's
+/// — credentialed, running no attacker code, and keeping #188's SSH grants
+/// because `url.<base>.insteadOf` can legitimately turn an accepted HTTPS URL
+/// into an SSH clone. `checkout_policy` is
+/// `sandbox::policy_for_clone_checkout`: the same policy without the agent
+/// socket, the `known_hosts` carve-out, or port 22, for the process that runs
+/// attacker-selected hooks and filters. Network, `HookMode::Run` and filters
+/// are unchanged in both — this narrows what the second process is handed,
+/// never what it may do.
+///
+/// The second phase also receives an environment **built by allowlist** rather
+/// than one with credential names removed from it (#704), so a secret nobody
+/// enumerated is absent by construction. Its redaction is carried by
 /// `network_exec::UntrustedCheckoutCommand` rather than by each call site here
 /// remembering `redact_output`.
 async fn execute_clone(
     policy: &crate::sandbox::Policy,
+    checkout_policy: &crate::sandbox::Policy,
     root: &Path,
     dest: &Path,
     url: &str,
@@ -184,7 +196,7 @@ async fn execute_clone(
     // target to check out, so preserve that behaviour instead of turning the
     // split phase into a failure for an otherwise-valid empty remote.
     let head = crate::sandbox::network_exec::network_command_without_credential(
-        policy,
+        checkout_policy,
         dest,
         &["show-ref", "--verify", "--quiet", "HEAD"],
     )
@@ -200,7 +212,7 @@ async fn execute_clone(
     }
 
     let checkout = crate::sandbox::network_exec::network_command_without_credential(
-        policy,
+        checkout_policy,
         dest,
         &clone_checkout_args(),
     )
@@ -805,7 +817,24 @@ async fn run_clone(req: CloneRequest) -> Result<Json<RepositoryDescriptor>, (Sta
             // below has already removed. The orphan outlives the request that
             // authorised it, which is precisely what this milestone's process
             // lifecycle work (INV-8) exists to prevent.
-            let execution = execute_clone(&policy, &root, &dest, &url, token.as_deref());
+            let checkout_policy = match crate::sandbox::policy_for_clone_checkout(&root) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("git-vista: /api/clone couldn't build a checkout policy: {e}");
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Couldn't prepare the sandbox for checkout: {e}"),
+                    ));
+                }
+            };
+            let execution = execute_clone(
+                &policy,
+                &checkout_policy,
+                &root,
+                &dest,
+                &url,
+                token.as_deref(),
+            );
             match run_guarded(&dest, CLONE_TIMEOUT, execution).await {
                 Ok(()) => {}
                 Err(GuardedOutcome::Failed(error)) => {
@@ -1306,6 +1335,77 @@ mod tests {
              (#702) and an unenumerated canary (#704) — all five withheld — then \
              PATH and HOME, which must be PRESENT: an empty environment would \
              satisfy the first five legs while producing a checkout that cannot run"
+        );
+    }
+
+    /// The wiring nobody was pinning (#720, codex-daybreak).
+    ///
+    /// Every other test in this file rebuilds clone's two phases by calling the
+    /// command builders directly, which proves the *builders* behave and says
+    /// nothing about what `execute_clone` actually calls. Switching its
+    /// post-transfer spawns to `network_exec::network_command` — still
+    /// `pub(crate)`, still returning a runnable command with a fully inherited
+    /// environment — would leave every one of them green. That is the same
+    /// green-over-absence shape #704 itself was, one layer up.
+    ///
+    /// A behavioural test cannot reach this cheaply: driving the real
+    /// `execute_clone` end to end needs an operator-level `core.hooksPath`,
+    /// which means a `$HOME` set process-wide across an `.await` — precisely
+    /// what `sandbox::test_env` forbids. So this reads the source, the way
+    /// `documented_gaps` and `argv_boundary` already do for INV-16, and pins
+    /// the two facts that matter: the credentialless spawns are the sealed
+    /// builder, and the raw one appears nowhere in this file.
+    ///
+    /// MUTATION 1 (remove): point `execute_clone`'s checkout at
+    ///   `network_command` — RED on the second assertion.
+    /// MUTATION 2 (weaken): give the checkout `policy` instead of
+    ///   `checkout_policy` — RED on the third, which is the #702 half.
+    #[test]
+    fn execute_clone_spawns_its_untrusted_half_through_the_sealed_builder() {
+        // Only the production half. Scanning the whole file matches this
+        // test's own assertion text — the literal it forbids appears in the
+        // message explaining why it is forbidden. A source-level tripwire that
+        // reads the module it lives in has to exclude itself, or it reports a
+        // violation that is nothing but its own reflection. (Measured: this
+        // test failed on exactly that before the split was added.)
+        let whole = include_str!("clone.rs");
+        let source = whole
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("clone.rs must have exactly one test module marker")
+            .0;
+        let body = {
+            let start = source
+                .find("async fn execute_clone(")
+                .expect("execute_clone must exist");
+            let end = source[start..]
+                .find("\n/// Await `fut` under `timeout`")
+                .expect("execute_clone's following item must exist");
+            &source[start..start + end]
+        };
+
+        assert_eq!(
+            body.matches("network_command_without_credential(").count(),
+            2,
+            "both post-transfer spawns (HEAD check and checkout) must go through the \
+             sealed credentialless builder"
+        );
+        assert!(
+            !body.contains("network_exec::network_command(")
+                && !source.contains("network_exec::network_command("),
+            "clone must never reach the raw `network_command`: it returns a runnable \
+             command carrying this server's whole inherited environment, which is #704"
+        );
+        assert_eq!(
+            body.matches("checkout_policy,").count(),
+            2,
+            "#702: both post-transfer spawns must run under the checkout policy, not \
+             the transfer's — the transfer keeps #188's SSH grants because \
+             url.<base>.insteadOf can make a clone genuinely speak SSH"
+        );
+        assert!(
+            body.contains("network_command_with_credential("),
+            "premise: the transfer half must still be here, or the counts above are \
+             measuring a function that no longer does what this test describes"
         );
     }
 

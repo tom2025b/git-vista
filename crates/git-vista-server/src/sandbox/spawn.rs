@@ -509,6 +509,28 @@ mod tests {
             vec!["PATH", "HOME", "LANG"],
             "exactly the allowlisted names present in the source, in source order"
         );
+
+        // And pin the constant itself, not just its effect on this source.
+        // Reviewed on #720: the assertion above supplies only three allowed
+        // names, so DELETING `XDG_CONFIG_HOME` or a locale variable changes
+        // real behaviour — config resolution and message encoding — while
+        // every leg here stays green. A list is a security decision; its
+        // contents are pinned, in full, and a change to it has to be a
+        // deliberate edit in two places.
+        assert_eq!(
+            UNTRUSTED_CHECKOUT_ENV_ALLOWLIST,
+            [
+                "PATH",
+                "HOME",
+                "XDG_CONFIG_HOME",
+                "LANG",
+                "LC_ALL",
+                "LC_CTYPE",
+                "LC_MESSAGES",
+            ],
+            "the allowlist is the boundary; adding a name is a security decision and \
+             removing one is a behaviour change, so neither may happen silently"
+        );
         for withheld in [
             CREDENTIAL_TOKEN_VAR,
             "GIT_VISTA_GITHUB_TOKEN",

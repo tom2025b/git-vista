@@ -448,30 +448,31 @@ fn ssh_agent_socket_grant_is_network_tier_only_and_only_when_set() {
     });
 }
 
-/// #702: `policy_for_clone` must carry **neither** #188 grant.
+/// #702: the two clone phases get **different** grants, and the difference is
+/// the whole claim.
 ///
-/// This test is the inversion of `policy_for_clone_carries_both_188_grants`,
-/// which asserted the opposite and was correct when it was written. What
-/// changed is not the grants but who runs under them: #680 made clone's
-/// second process (`git checkout -f`) execute attacker-selected hooks and
-/// filters inside this very policy, so ADR 0033's safety argument — "neither
-/// grant reaches the Strict tier, which is where hostile repository content
-/// actually runs" — no longer describes reality. And `validate_clone_url`
-/// accepts only `https://`, `http://` and `git://`, so this constructor could
-/// never serve the `git clone git@host:…` the old test's doc named as the
-/// thing that would break.
+/// # This test was wrong once, in the other direction
 ///
-/// # The paired positive is the whole point
+/// Its first version asserted `policy_for_clone` carried neither #188 grant,
+/// on the argument that `validate_clone_url` accepts only `https://`,
+/// `http://` and `git://` so clone can never speak SSH. codex-daybreak refuted
+/// that on #720 before it merged: the validator is a scheme-prefix check, so
+/// `https://host:22/…` passes, and `url.<base>.insteadOf` in the operator's
+/// own `~/.gitconfig` rewrites an accepted HTTPS URL into a real SSH clone.
+/// Removing the grants from the transfer broke those operators.
 ///
-/// Asserting only that clone's policy lacks the grants would pass just as well
-/// if `ssh_agent_socket_grant` returned `None` for every tier, or if
-/// `ssh_known_hosts_carveout` started returning an empty `Vec` — i.e. if #188
-/// were broken outright for fetch, push and `ls-remote`, which still need it.
-/// So the same socket, in the same critical section, is asserted **present**
-/// in `policy_for`'s Network policy and **absent** from `policy_for_clone`'s.
-/// The claim is a difference between two constructors, and it is tested as one.
+/// So the claim is no longer "clone cannot use these". It is "**the phase that
+/// runs attacker-chosen code** does not need these", and that is a difference
+/// between two policies rather than a property of one.
+///
+/// # Three legs, and each of the first two is load-bearing
+///
+/// `policy_for` and `policy_for_clone` must both still *carry* the grants —
+/// without those legs, this test passes equally well if `ssh_agent_socket_grant`
+/// were broken outright, or if the transfer had been left narrowed and SSH
+/// clones still refused. Only `policy_for_clone_checkout` gives them up.
 #[test]
-fn policy_for_clone_carries_neither_188_grant_while_policy_for_still_does() {
+fn only_the_clone_checkout_phase_gives_up_the_188_grants() {
     let clones_root = tempfile::tempdir().expect("tempdir");
     let repo = tempfile::tempdir().expect("repo tempdir");
     let sock = PathBuf::from("/tmp/gv702-policy-for-clone-test-agent.sock");
@@ -479,68 +480,83 @@ fn policy_for_clone_carries_neither_188_grant_while_policy_for_still_does() {
     let known_hosts = home.join(".ssh/known_hosts");
 
     with_ssh_auth_sock(Some(&sock), || {
-        // The paired positive, first: #188 is intact where it belongs.
+        // Leg 1 — #188 intact for fetch/push/ls-remote.
         let remote = policy_for(repo.path(), false, NetworkNeed::Remote)
             .expect("policy_for must build a Network policy");
-        assert_eq!(remote.tier, Tier::Network, "premise for the comparison");
         assert!(
-            remote.rw_trees.contains(&sock),
-            "#188 must still grant the agent socket for fetch/push/ls-remote — \
-             without this leg the assertions below would also pass if the grant \
-             helpers were simply broken, got {:?}",
-            remote.rw_trees
+            remote.rw_trees.contains(&sock) && remote.ro_carveouts == vec![known_hosts.clone()],
+            "#188 must still reach policy_for, or every assertion below could be \
+             satisfied by the grant helpers simply being broken"
+        );
+
+        // Leg 2 — and intact for clone's TRANSFER, which really can speak SSH
+        // through url.<base>.insteadOf. This leg is the regression guard.
+        let transfer = policy_for_clone(clones_root.path()).expect("transfer policy must build");
+        assert!(
+            transfer.rw_trees.contains(&sock),
+            "the credentialed transfer must keep the agent socket: insteadOf can make \
+             an accepted https:// URL a real SSH clone, and #720's first attempt broke \
+             exactly that. Got {:?}",
+            transfer.rw_trees
         );
         assert_eq!(
-            remote.ro_carveouts,
+            transfer.ro_carveouts,
             vec![known_hosts.clone()],
-            "#188's known_hosts carve-out must still reach policy_for"
+            "the transfer must keep known_hosts, or an insteadOf SSH clone fails host-key \
+             verification"
+        );
+        assert!(
+            transfer.net_ports.contains(&22),
+            "the transfer must keep port 22 for the same reason, got {:?}",
+            transfer.net_ports
         );
 
-        // The claim: clone's independent constructor has neither.
-        let policy = policy_for_clone(clones_root.path()).expect("policy_for_clone must build");
+        // Leg 3 — the claim. The process that runs attacker code has none.
+        let checkout =
+            policy_for_clone_checkout(clones_root.path()).expect("checkout policy must build");
         assert_eq!(
-            policy.tier,
+            checkout.tier,
             Tier::Network,
-            "clone is always NetworkNeed::Remote — this change narrows grants, not the tier"
+            "this narrows grants, never the tier: ADR 0128 keeps network for git-lfs"
         );
         assert!(
-            !policy.rw_trees.contains(&sock),
-            "#702: the operator's ssh-agent socket must not be granted to the process \
-             that runs attacker-selected post-checkout hooks, got {:?}",
-            policy.rw_trees
+            matches!(checkout.hook_mode, HookMode::Run),
+            "and never hook execution — ADR 0029 rejects blocking them, and #702 is \
+             about what the hook is HANDED, not whether it runs"
+        );
+        assert!(
+            !checkout.rw_trees.contains(&sock),
+            "#702: the operator's agent socket must not reach the checkout, got {:?}",
+            checkout.rw_trees
         );
         assert_eq!(
-            policy.ro_carveouts,
+            checkout.ro_carveouts,
             Vec::<PathBuf>::new(),
-            "#702: clone cannot perform an SSH clone, so it has no use for a \
-             known_hosts carve-out out of the ~/.ssh exclude"
+            "#702: the ~/.ssh exclude is exceptionless again for the untrusted phase"
         );
         assert!(
-            !policy.net_ports.contains(&22),
-            "#702: port 22 is unreachable through validate_clone_url's accepted \
-             schemes and must not be granted, got {:?}",
-            policy.net_ports
+            !checkout.net_ports.contains(&22),
+            "#702: no SSH service for a hostile hook, got {:?}",
+            checkout.net_ports
         );
         assert!(
-            policy.net_ports.contains(&443),
-            "paired positive: https must still be reachable or every clone breaks"
+            checkout.net_ports.contains(&443),
+            "paired positive: HTTPS must survive or a git-lfs smudge filter breaks"
+        );
+        assert!(
+            checkout.rw_trees.iter().any(|p| p == clones_root.path()),
+            "paired positive: the checkout must still be able to write the worktree — \
+             a policy that granted nothing would satisfy every negative leg above"
         );
 
-        // The argv is where a reviewer actually sees a grant (ADR 0033's D5
-        // Option B property), so the same claim is made against it.
-        let argv = strs(&sandbox_argv(&policy));
+        // The argv is where a reviewer sees a grant (ADR 0033's D5 Option B).
+        let argv = strs(&sandbox_argv(&checkout));
         let w = pairs(&argv);
         assert!(
-            !argv.iter().any(|a| a == "--ro-carveout"),
-            "no carve-out may appear in clone's launcher argv at all, got {argv:?}"
-        );
-        assert!(
-            !w.contains(&("--rw", sock.to_str().expect("utf8 path"))),
-            "clone's launcher argv must not name the agent socket, got {argv:?}"
-        );
-        assert!(
-            !w.contains(&("--net-port", "22")),
-            "clone's launcher argv must not grant port 22, got {argv:?}"
+            !argv.iter().any(|a| a == "--ro-carveout")
+                && !w.contains(&("--rw", sock.to_str().expect("utf8 path")))
+                && !w.contains(&("--net-port", "22")),
+            "the checkout launcher argv must advertise none of the three, got {argv:?}"
         );
     });
 }
