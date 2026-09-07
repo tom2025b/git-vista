@@ -45,9 +45,11 @@ const API: &str = include_str!("../src/api.rs");
 /// The regression #709 names, in the bytes that ship: no unscoped v1 status
 /// read is reachable from the menu, or from anywhere else.
 ///
-/// `fetch_status(` is deliberately checked as a substring — it is not one of
-/// `fetch_worktree_status(`, which the menu does and should still call (that
-/// is the v2 per-path read the discard/delete confirmations need).
+/// `fetch_status()` is deliberately checked with its empty argument list: the
+/// scoped `fetch_status_for(id)` the menu should call must not trip it, and
+/// neither should the v2 per-path read the discard/delete confirmations need
+/// (`fetch_worktree_status_for`, scoped by #711 and censused separately in
+/// `menu_worktree_scope.rs`).
 #[test]
 fn no_unscoped_v1_status_read_survives_anywhere() {
     let menu = code_only(MENU);

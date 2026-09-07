@@ -52,15 +52,38 @@ pub async fn fetch_status_for(repo: &str) -> Result<RepoStatus, String> {
 /// #68c) — the per-path [`WorktreeStatus`] the discard/delete menu items need
 /// to name exactly which files each operation would touch (M2.18b, #220).
 ///
-/// Additive alongside [`fetch_status`], which serves the topbar chip's
-/// coarser v1 shape and is untouched — migrating that consumer is 68d's job,
-/// not this one's.
+/// Additive alongside [`fetch_status_for`], which serves the topbar chip's
+/// coarser v1 shape.
+///
+/// **`repo` is required, not optional, and that is deliberate** — the same
+/// reason [`fetch_status_for`] requires one. An unscoped request asks the
+/// server for "whatever repository you happen to be resolving right now", and
+/// a reply to that question belongs to no frame in particular. Making it
+/// unrepresentable, rather than merely uncalled, is what stops a later caller
+/// forgetting to scope one.
+///
+/// The stakes here are higher than the v1 read's. This reply builds the path
+/// lists for "Discard Changes…" and "Delete Untracked Files…", so an answer
+/// belonging to a repository the user has left would name *that* repository's
+/// files inside a confirmation for *this* one. The server's own
+/// `verify_path_states` re-check is a path-state filter, not a repository
+/// check: it cannot tell a colliding path name in the live repository from
+/// the one the user was actually shown.
+///
+/// The reply is still only a *candidate* reading. Whether the frame it was
+/// requested for is still the accepted one is
+/// [`current_reading`](crate::features::status::detail::core::current_reading)'s
+/// decision, at the call site, on values this function never sees.
 ///
 /// Routed through [`send_read`] (#218) rather than a bare `req_get`, for the
 /// reason that function documents: a read with no timeout over a dropped SSH
 /// tunnel never settles, and this one gates a destructive confirmation.
-pub async fn fetch_worktree_status() -> Result<WorktreeStatus, String> {
-    let url = format!("/api/status/v2?t={}", js_sys::Date::now());
+pub async fn fetch_worktree_status_for(repo: &str) -> Result<WorktreeStatus, String> {
+    let url = format!(
+        "/api/status/v2?t={}&repo={}",
+        js_sys::Date::now(),
+        js_sys::encode_uri_component(repo)
+    );
     let resp = send_read(&url).await.map_err(|e| e.to_string())?;
     if resp.ok() {
         resp.json::<WorktreeStatus>()

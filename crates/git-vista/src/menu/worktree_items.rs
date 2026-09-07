@@ -28,25 +28,28 @@ type WorktreeItems = (
 ///
 /// `is_head`/`is_stub` are `MenuData::is_head`/`MenuData::is_branch`,
 /// computed once by the caller since `commit_items` needs the same pair.
-/// `worktree` is the live resource `menu_view` opens the menu with — read
-/// here exactly where the original inline code read it, so the reactive
-/// tracking is unchanged.
 ///
-/// `staged_count` is a resolved count rather than the resource itself.
-/// That read is pinned to the accepted repository frame, and the decision
-/// — is this reply current for the live epoch and repository, or a retained
-/// answer for one the user has left? — is made once in `menu_view`, where the
-/// live frame is, rather than re-derived per item here. It is read inside the
-/// same reactive block that used to call `.get()` on the resource, so the
-/// tracking is unchanged; a reply that is loading, failed, or scoped to
-/// another frame arrives as `0` and the unstage items stay absent.
+/// `staged_count` and `live_status` are both *resolved readings* rather than the
+/// resources behind them. Each is pinned to the accepted repository frame, and
+/// the decision — is this reply current for the live epoch and repository, or a
+/// retained answer for one the user has left? — is made once in `menu_view`,
+/// where the live frame is, rather than re-derived per item here. Both are read
+/// inside the same reactive block that used to call `.get()` on the resources,
+/// so the tracking is unchanged; a reply that is loading, failed, or scoped to
+/// another frame arrives as `0` and `None`, and the items it would have fed
+/// stay absent or disabled.
+///
+/// Taking the resolved `Option<WorktreeStatus>` rather than the resource is
+/// what keeps that decision unskippable *here*: this function has no reply left
+/// to read, so there is no way to derive a discard or delete path list from one
+/// that was never resolved against the live frame.
 pub(super) fn build_worktree_items(
     features: Features,
     ic: &'static GitIcons,
     is_head: bool,
     is_stub: bool,
     staged_count: usize,
-    worktree: Resource<(bool, u64), Option<WorktreeStatus>>,
+    live_status: Option<WorktreeStatus>,
 ) -> WorktreeItems {
     let Features {
         dialogs,
@@ -205,7 +208,9 @@ pub(super) fn build_worktree_items(
     // `features::status::core`, which mirror the server's own
     // classification. Building them here by hand would mean a
     // confirmation the user completes and the server then 409s.
-    let live_status = worktree.get().flatten();
+    //
+    // `live_status` arrived already resolved against the live frame (#711), so
+    // every path below belongs to the repository this menu is open on.
     let discard_changes = is_head.then(|| {
         let paths = live_status
             .as_ref()

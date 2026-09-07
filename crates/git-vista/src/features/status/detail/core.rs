@@ -64,12 +64,19 @@ pub fn reading_is_current(
 /// sides of the comparison — the shape that a wasm-only call site made
 /// possible and a source census could never see. All the view supplies is
 /// live values; the decision itself is here, on the host.
-pub fn current_reading(
+///
+/// Generic in the payload so the one decision serves every status read rather
+/// than being retyped per endpoint: the chip's v1 [`RepoStatus`] and the
+/// menu's v2 `WorktreeStatus`, whose resolved value is what the discard and
+/// delete confirmations draw their path lists from. A second copy of this
+/// function is a second place for the comparison to be got wrong; there is
+/// deliberately only one.
+pub fn current_reading<T>(
     loading: bool,
-    reply: Option<(u64, Option<String>, Option<RepoStatus>)>,
+    reply: Option<(u64, Option<String>, Option<T>)>,
     current_epoch: u64,
     current_repo: Option<&str>,
-) -> Option<RepoStatus> {
+) -> Option<T> {
     let (requested_epoch, requested_repo, result) = reply?;
     reading_is_current(
         loading,
@@ -346,9 +353,14 @@ mod tests {
         assert_eq!(current_reading(false, reply(3, "a"), 4, Some("a")), None);
         assert_eq!(current_reading(false, reply(4, "b"), 4, Some("a")), None);
         assert_eq!(current_reading(false, reply(4, "a"), 4, None), None);
-        assert_eq!(current_reading(false, None, 4, Some("a")), None);
+        // Explicit `T`: with no reply to infer from, "there was no reply at
+        // all" has to name the payload type it is refusing to produce.
         assert_eq!(
-            current_reading(false, Some((4, Some("a".into()), None)), 4, Some("a")),
+            current_reading::<RepoStatus>(false, None, 4, Some("a")),
+            None
+        );
+        assert_eq!(
+            current_reading::<RepoStatus>(false, Some((4, Some("a".into()), None)), 4, Some("a")),
             None
         );
     }
