@@ -1,6 +1,6 @@
 # ADR 0134 — Two censuses that must agree are checked against each other
 
-- **Status:** Accepted — implemented, mutation-proved two ways per invariant, all five arms caught
+- **Status:** Accepted — implemented, mutation-proved two ways per invariant, nine arms caught (five for the decision, four for the two inert guards grok found reviewing PR #724)
 - **Date:** 2026-09-07
 - **Issues:** #690 (two route censuses), #705 (the pre-session allowlist and its runtime)
 - **Extends:** [ADR 0119](0119-a-guarantee-that-holds-only-on-the-success-arm-is-not-a-guarantee.md) — "a list of known sites is not a fix, because that list was already incomplete twice — the safety has to live in the value," applied one level up: not to a list of call sites, but to two independently hand-maintained *descriptions of the same thing*, each individually complete and individually well-guarded, that must both change together
@@ -324,6 +324,66 @@ stateDiagram-v2
 Satisfying one census leaves the build red until the other is updated too.
 That is the whole issue, and it is now a measured property rather than a
 claim.
+
+## The review found this same shape inside the fix — twice
+
+PR #724's cross-family review (grok) found two guards **in this change** that
+could pass while checking nothing. Recording them here rather than quietly
+fixing them, because the recurrence is the lesson: the defect this ADR names is
+easy to reintroduce *while writing the fix for it*.
+
+```mermaid
+flowchart TD
+    D["<b>The defect shape</b><br/>a guard that cannot fail"]
+    G1["<b>Found in the code</b><br/>two censuses, no edge"]
+    G2["<b>Found in the census hook</b><br/>libtest filter matching<br/>nothing exits 0"]
+    G3["<b>Found in the shape guard</b><br/>naive scan to first ;<br/>truncates silently"]
+    G4["<b>Found in the remap</b><br/>'only one exception'<br/>said in a comment"]
+
+    D --> G1
+    D --> G2
+    D --> G3
+    D --> G4
+
+    classDef shape fill:#4a148c,color:#ffffff,stroke:#22063f,stroke-width:3px
+    classDef inst fill:#8c1c13,color:#ffffff,stroke:#4a0e08,stroke-width:2px
+    class D shape
+    class G1,G2,G3,G4 inst
+```
+
+**1. The shape guard read the expression with a naive scan to the first `;`.**
+Its own comment asserted the expression "contains no string literals or nested
+statements" — a claim about code nobody has written yet, not a check on it. A
+`;` inside a string literal in a later clause truncates the slice, and the
+truncated head still contains both `||` arms, both `Method::` tests and both
+path constants, so **every assertion passes while a trailing
+`|| path == "/api/x"` goes entirely unread**. `session_exempt_expression()` now
+tracks string literals and bracket depth the way `strip_line_comments` already
+did — the sturdier tool was in the same file all along — and returns `None`
+rather than a truncated slice. It also *refuses loudly* on the two constructs it
+does not model (char literals, block comments) instead of assuming they will
+never appear, which is the assumption that made the first version inert.
+
+**2. The `create_session` remap's "keep this the only exception" was a comment.**
+An *unmapped* extra handler-named row already failed the set difference; a
+second *mapped* exception would have stayed green. The exception set is now
+asserted — every row names a path except exactly one known handler-named row.
+
+**3. Still unproved, and named rather than hidden:** the census hook's own
+hardening is verified by inspection, not by a test that can go red, because
+nothing in this repository tests `.claude/hooks/*.sh` at all. That is the one
+guard in this change whose correctness does not rest on a mutation proof.
+
+### The four review arms
+
+| # | invariant | mutation | verdict |
+|---|---|---|---|
+| 424 | the shape guard reads the *whole* expression | add a `;`-bearing string literal to a clause, then append `\|\| path == "/api/evil"` — the exact silent-truncation case | **caught** — and the panic prints the full expression *including* the trailing clause, proving the scan passed the string |
+| 425 | it refuses what it cannot model | introduce a char literal (`path.starts_with('/')`) | **caught** — the refusal fires, at a different assertion and message than 424 |
+| 426 | a second handler-named row cannot slip in | rename `/api/rescan` to `rescan` in `post_route_census()` | **caught** — by the *new* assertion, which fires before the set difference, so it is live rather than shadowed |
+| 427 | the exception filter is the right way round | invert `!route.starts_with('/')` | **caught** — a different failure mode again |
+
+`run_key` `gv-lane-3-724-review`, every baseline green, working tree clean.
 
 ---
 
