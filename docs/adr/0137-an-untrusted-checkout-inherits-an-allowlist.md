@@ -377,38 +377,38 @@ code — no `cfg`-gated arm, so nothing here reports green over its own absence.
   `policy_for_clone`'s. Without that paired positive the test would pass just as
   well if `ssh_agent_socket_grant` were broken outright for fetch and push.
 
-`failure-atlas mutation_check` ran under run key ``gv-702-704-untrusted-checkout-allowlist`` against
-committed HEAD ``2e9c2f97` (run 415 ran at `f737f8c5`, whose only difference is this untracked file; the code under test is byte-identical, and the tool's dirty-tree warning is recorded here rather than suppressed)`. Every baseline was green; every mutation was
-caught.
+`failure-atlas mutation_check`, run key
+`gv-702-704-untrusted-checkout-allowlist`, HEAD `740acc1b`, clean tree. Every
+baseline green at 56 passed; every mutation caught.
 
-| Run | Issue | Mutation | Kind | What went red, and why it is a *different* failure |
+| Run | Claim | Mutation | Kind | What went red, and why it is a *different* failure |
 |---|---|---|---|---|
-| 415 | #704 | Drop the `.filter(…)` from `untrusted_checkout_env` so it copies `source` wholesale | remove the mechanism | Three tests. The real spawned hook reported `unset\|unset\|unset\|/tmp/gv702-not-a-real-agent.sock\|a-credential-nobody-enumerated\|PATH-present\|HOME-present` — the socket and the canary arriving verbatim in attacker-selected code. This is the defect itself, reproduced. |
-| 416 | #704 | Add `"AWS_SECRET_ACCESS_KEY"` to `UNTRUSTED_CHECKOUT_ENV_ALLOWLIST` | weaken the mechanism | One test, one leg: the built name list came back `["PATH","HOME","LANG","AWS_SECRET_ACCESS_KEY"]`. The spawn proof stayed **green**, because its canary is a different name — which is exactly the point. A list that still looks deliberate fails only where the decision is made. |
-| 417 | #702 | Re-add `rw.extend(ssh_agent_socket_grant(tier))` to `policy_for_clone` | remove the mechanism | Only `policy_for_clone_carries_neither_188_grant_while_policy_for_still_does`, on `rw_trees` — `["/dev", "/tmp/.tmpQQf8rO", "/tmp/gv702-policy-for-clone-test-agent.sock"]`. A pure policy-shape failure; nothing was spawned and no environment was read. |
-| 418 | #702 | Add `"SSH_AUTH_SOCK"` to `UNTRUSTED_CHECKOUT_ENV_ALLOWLIST` | weaken the mechanism | Two tests, and the hook reported `unset\|unset\|unset\|/tmp/gv702-not-a-real-agent.sock\|unset\|…` — the socket back, the canary still correctly withheld. The policy/argv test stayed **green**: same issue, opposite layer. |
+| 422 | #704 env | drop the `.filter(…)` from `untrusted_checkout_env` | remove | Three tests. The real spawned hook reported `unset\|unset\|unset\|/tmp/gv702-not-a-real-agent.sock\|a-credential-nobody-enumerated\|PATH-present\|HOME-present` — the socket and the canary arriving verbatim in attacker-selected code. The defect itself, reproduced. |
+| 423 | #702 env | add `"SSH_AUTH_SOCK"` to the allowlist | weaken | Two tests; the hook saw the socket back with the canary still correctly withheld. The policy/argv test stayed **green** — same issue, opposite layer from run 419. |
+| 421 | #704 list | **delete** `"XDG_CONFIG_HOME"` from the allowlist | weaken, in the other direction | Only the exact-constant assertion. This is the arm the first version of this ADR could not make at all: its test supplied three allowed names, so removing a name changed real behaviour — global config resolution — and stayed green. Added on review. |
+| 419 | #702 policy | make `policy_for_clone_checkout` keep the transfer's `ro_carveouts` and `net_ports` | remove | Only the three-way policy comparison, on `ro_carveouts`. A pure policy-shape failure; nothing spawned, no environment read. |
+| 420 | #702 wiring | give `execute_clone`'s checkout the **transfer** policy | weaken | Only the source-level routing tripwire, counting `checkout_policy` occurrences. Nothing else noticed — which is the entire reason that tripwire exists. |
 
-Read 417 and 418 together: they are the two halves of #702 and they fail in
-places that share no code. 417 is a `Policy` struct built in memory and never
-run; 418 is a real `post-checkout` hook, spawned under the real shim, reporting
-what it actually inherited. Either alone would license the wrong conclusion —
-417 alone would say the fix is the policy edit, which ADR 0033 §3's measurement
-says is inert on this kernel; 418 alone would leave the argv still advertising
-a grant the process must not have. The pairing is the claim.
+Read 419/420 and 422/423 as two pairs that share no code. 419 and 420 are a
+`Policy` built in memory and a source-level count; 422 and 423 are a real
+`post-checkout` hook, spawned under the real shim, reporting what it actually
+inherited. Either half alone licenses a wrong conclusion — 419 alone would say
+the policy edit is the fix, which ADR 0033 §3's measurement contradicts; 422
+alone would leave the argv still advertising a grant the process must not have.
 
-Likewise 415 and 416 differ in *blast radius*, not just in message: removing the
-filter fails three tests including the spawn proof, while adding one plausible
-name to the list fails exactly one. A weakened allowlist is the realistic future
-regression, and it is caught by the one assertion — an unenumerated canary —
-that a denylist-shaped test could never have made.
+Run 421 is the arm this ADR earned in review. Every other mutation *adds*
+something dangerous, and a test that pins only the effect on a fixed sample
+catches those while missing the removal of a name that changes behaviour. Both
+directions are now pinned by asserting the constant in full.
 
-Both baselines of every run were green at 10 passed. One caution earned the same
-day and recorded for the next lane: `cargo test -p <crate> --bins` does **not**
-build `target/debug/gv-sandbox` (`dev` says so at its own line 234), so every
-test that builds a real production `Policy` fails on a missing shim in a fresh
-worktree, and `mutation_check` — which reuses the source worktree's target dir —
-reports that as `baseline_failed` rather than as a readable test failure. Run
-`cargo build -p git-vista-server --bins` once first.
+Two cautions recorded for the next lane. `cargo test -p <crate> --bins` does
+**not** build `target/debug/gv-sandbox` (`dev` says so at its own line 234), so
+every test that builds a real production `Policy` fails on a missing shim in a
+fresh worktree; and `mutation_check` — which compiles in its own clone but
+**runs from the source worktree's target dir** — reports that as
+`baseline_failed` rather than a readable failure. Run `cargo build -p
+git-vista-server --bins` once in the worktree first; it cannot go inside
+`test_commands`, which accepts only test runners.
 
 ## Where this is implemented
 
