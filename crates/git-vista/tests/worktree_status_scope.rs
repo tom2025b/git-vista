@@ -233,3 +233,33 @@ fn the_item_builder_takes_a_resolved_reading_not_a_resource() {
         "the destructive path lists must come from the host-tested selectors"
     );
 }
+
+/// A refused reading must read as *waiting*, never as *nothing to do* — #711
+/// asks for this by name, because the two disabled-item wordings make very
+/// different promises.
+///
+/// "No tracked file has uncommitted changes" is a claim about the repository.
+/// Saying it because a reply was refused for belonging to another frame would
+/// state, confidently and wrongly, that this working tree is clean — the same
+/// class of lie as the item silently vanishing. `current_reading` resolves a
+/// refusal to `None`, and `None` is exactly what selects the waiting arm, so
+/// this holds by construction; it is pinned because it is a stated criterion
+/// and a one-word edit away from being wrong.
+#[test]
+fn a_refused_reading_reads_as_waiting_not_as_nothing_to_do() {
+    let items = code_only(WORKTREE_ITEMS);
+    assert_eq!(
+        items
+            .matches("let reason = if live_status.is_none() {")
+            .count(),
+        2,
+        "both destructive items must branch their copy on the resolved reading"
+    );
+    assert_eq!(
+        items
+            .matches("\"Waiting for a working-tree status read\"")
+            .count(),
+        2,
+        "both destructive items must have the waiting wording to fall back to"
+    );
+}
