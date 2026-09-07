@@ -20,14 +20,19 @@ const LONG_PATCH = 1
  *  The marker is emitted with the rendered rows, not by the scroll handler.
  *  Keep content/bounds assertions below: an acknowledged offset alone cannot
  *  prove that a renderer preserved the patch or actually virtualized it. */
-async function readRenderedWindow(page, fraction) {
+async function readRenderedWindow(page, fraction, { timeout } = {}) {
   const scroller = page.locator(DIFF_SCROLLER)
   const top = await scroller.evaluate((el, fraction) => {
     el.scrollTop = Math.floor(el.scrollHeight * fraction)
     return el.scrollTop
   }, fraction)
+  // web-sys currently exposes scroll_top() as i32; browser zoom can
+  // leave JS scrollTop fractional. Compare the same integer the renderer
+  // consumed, rather than waiting forever for an unrepresentable fraction.
+  // Omitted timeout keeps Playwright's configured budget; negative tests can
+  // supply a shorter one without replacing the helper's expect instance.
   await expect(scroller.locator('pre.detail-diff'), 'the patch window has rendered this scroll offset')
-    .toHaveAttribute('data-rendered-scroll-top', String(top))
+    .toHaveAttribute('data-rendered-scroll-top', String(Math.trunc(top)), { timeout })
   return scroller.evaluate((el) => ({
     top: el.scrollTop,
     rows: el.querySelectorAll('span').length,
@@ -57,7 +62,10 @@ test.describe('status surfaces', () => {
     ]
     for (const [name, count] of sections) {
       const list = panel.getByRole('list', { name, exact: true })
-      await expect(list.getByRole('listitem'), `${name} status data has rendered`).toHaveCount(count)
+      // Preserve this test's existing 15-second assertion budget; the
+      // readiness condition changes, not its allowance for a loaded host.
+      await expect(list.getByRole('listitem'), `${name} status data has rendered`)
+        .toHaveCount(count, { timeout: 15_000 })
     }
     const items = panel.locator('.act-status-section').getByRole('listitem')
 
@@ -172,6 +180,33 @@ test.describe('diff rendering', () => {
     expect(observed.middle.text, 'the middle of the patch should be rendered').not.toContain(
       'bulk line 0',
     )
+  })
+
+  test('the readiness wait honors an explicit timeout for a missing signal', async ({ page }) => {
+    await openApp(page)
+    await openDiff(page, LONG_PATCH)
+    await readRenderedWindow(page, 0)
+    await page.locator(`${DIFF_SCROLLER} pre.detail-diff`).evaluate((el) => {
+      el.removeAttribute('data-rendered-scroll-top')
+    })
+    // No scroll at zero means no subsequent render can restore the marker.
+    // Assert on the configured deadline in the error, not elapsed wall time.
+    await expect(readRenderedWindow(page, 0, { timeout: 250 }))
+      .rejects.toThrow(/Timeout:\s+250ms/)
+  })
+
+  test('fractional browser scroll offsets acknowledge the rendered window', async ({ page }) => {
+    await openApp(page)
+    await openDiff(page, LONG_PATCH)
+    // Real browser layout can produce subpixel scrollTop values. Zoom the
+    // scroller so this test exercises that case rather than an integer offset
+    // which would also pass with the old exact string comparison.
+    await page.locator(DIFF_SCROLLER).evaluate((el) => { el.style.zoom = '1.25' })
+    const observed = await readRenderedWindow(page, 0.5)
+    expect(observed.top, 'precondition: the browser returned a fractional offset')
+      .not.toBe(Math.trunc(observed.top))
+    expect(observed.rows).toBeGreaterThan(10)
+    expect(observed.text).not.toContain('bulk line 0')
   })
 
   // #350: `scroll_to_reveal` was built and mutation-proven, then never called
