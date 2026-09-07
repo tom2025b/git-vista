@@ -76,6 +76,7 @@ flowchart LR
     A1["Strict tier<br/>runs hostile content"] --- A2["Network tier<br/>ALSO runs hostile content<br/>(clone checkout)"]
     A2 --> A3["agent socket + known_hosts<br/>granted to the hook"]
   end
+  before -.->|"#680 splits clone;<br/>the premise stops holding"| after
 ```
 
 ### The grants were not merely unsafe here. They were unusable here.
@@ -105,6 +106,7 @@ flowchart TD
     N1["env_clear()<br/>start from nothing"] --> N2["copy 7 named,<br/>justified variables"]
     N2 --> N3["child sees<br/>only those"]
   end
+  old -.->|"#704"| new
 ```
 
 | Name | Why it survives the cut |
