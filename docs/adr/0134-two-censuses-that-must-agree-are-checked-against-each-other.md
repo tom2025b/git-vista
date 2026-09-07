@@ -1,6 +1,6 @@
 # ADR 0134 — Two censuses that must agree are checked against each other
 
-- **Status:** Accepted — implemented, mutation-proved two ways per invariant, nine arms caught (five for the decision, four for the two inert guards grok found reviewing PR #724)
+- **Status:** Accepted — implemented, mutation-proved two ways per invariant. Eleven arms caught and **one survived** (arm 429, in this change's own test — kept in the record below, because it is the fifth instance of this ADR's defect shape and the only one caught by a machine rather than a reader)
 - **Date:** 2026-09-07
 - **Issues:** #690 (two route censuses), #705 (the pre-session allowlist and its runtime)
 - **Extends:** [ADR 0119](0119-a-guarantee-that-holds-only-on-the-success-arm-is-not-a-guarantee.md) — "a list of known sites is not a fix, because that list was already incomplete twice — the safety has to live in the value," applied one level up: not to a list of call sites, but to two independently hand-maintained *descriptions of the same thing*, each individually complete and individually well-guarded, that must both change together
@@ -384,6 +384,56 @@ guard in this change whose correctness does not rest on a mutation proof.
 | 427 | the exception filter is the right way round | invert `!route.starts_with('/')` | **caught** — a different failure mode again |
 
 `run_key` `gv-lane-3-724-review`, every baseline green, working tree clean.
+
+### A fifth instance — and the only one a reader did not catch
+
+grok's second, non-blocking suggestion was to move the char-literal decision
+into the scanner rather than refuse on a whole-expression `contains('\'')`,
+which could not tell `&'a T` or `'static` from `';'`. Taken. That converted a
+*refusal* into real *handling* — and since this ADR had just finished insisting
+that refusing is not handling, the honest follow-up was to prove the handling,
+not to re-prove a refusal that no longer existed. Hence
+`the_session_exempt_scanner_reads_whole_statements`, testing
+`session_exempt_expression` directly as a pure function.
+
+**That test was itself inert, and `mutation_check` said so.**
+
+```mermaid
+stateDiagram-v2
+    [*] --> Written: scanner tests added
+    Written --> Survived: arm 429 — disable char consumption, tests STAY GREEN
+    Survived --> Diagnosed: every literal sat inside parentheses
+    Diagnosed --> Fixed: two cases moved to bracket depth ZERO
+    Fixed --> Caught431: arm 431 — same mutation, now RED
+    Fixed --> Caught432: arm 432 — break string tracking, RED at a different assertion
+    Caught431 --> [*]
+    Caught432 --> [*]
+```
+
+Every literal in those cases was wrapped in parentheses, so `depth > 0` skipped
+the `;` before the string or char branch was ever consulted. **Bracket depth was
+doing all the work**; both literal branches could have been deleted with the
+suite still green. The test named a property it could not fail on — this ADR's
+defect shape, committed inside the test written to prove that shape was fixed.
+
+It also forced a correction to arm 424's reading. That arm proved the new
+scanner reads *further* than the old one; it did **not** isolate string
+tracking, because the real `session_exempt` clauses are parenthesised too, so
+depth alone would have carried the same input. The claim was true and the
+evidence was weaker than claimed — a distinction easy to miss when the verdict
+says `caught`.
+
+| # | mutation | verdict |
+|---|---|---|
+| 429 | disable char-literal consumption | **survived** — the defect, recorded |
+| 431 | the same mutation, after the cases moved to depth zero | **caught** — truncates to `let session_exempt = a == '` |
+| 432 | break string tracking (`in_string = true` → `false`) | **caught** — a different assertion, truncates to `a == "x` |
+
+**The lesson, and it is the whole ADR restated:** four humans-or-models read
+this change and none of them saw that the test could not fail. A machine that
+breaks the mechanism and re-runs did, in thirty seconds. Reading proves a guard
+is *present*; only breaking the thing it guards proves it is *live*. Every arm
+in this document exists for that reason, and arm 429 is the one that earned it.
 
 ---
 
