@@ -346,6 +346,13 @@ export async function openMergePreviewRepo(page) {
  */
 export async function openBranchMenu(page, branch) {
   const nodes = page.locator('circle.node-hit')
+  // Zero nodes is not "no such branch" — it is "the graph has not painted yet".
+  // `count()` resolves immediately against whatever is attached at that instant,
+  // so taken before the first paint it returns 0, the loop below never runs, and
+  // this throws `walked 0 nodes` naming a branch that is in fact present. #637
+  // gave openMergePreviewRepo a readiness wait and left this caller bare; that
+  // is #633. Poll for a painted graph first, then walk it.
+  await expect.poll(() => nodes.count(), { timeout: 20_000 }).toBeGreaterThan(0)
   const count = await nodes.count()
   for (let i = 0; i < count; i++) {
     await nodes.nth(i).click()
