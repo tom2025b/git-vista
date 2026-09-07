@@ -479,20 +479,32 @@ Three things fall out, and the third is a finding rather than a result:
 
 The invocation this test documents is `cargo test -p git-vista-server
 measure_one_sweep -- --ignored --nocapture`, which builds the **debug** profile.
-The server ships release. Re-measured through the same `planner::live_reading`
-on a quiet titan (load average 0.8, no other lane building), git-vista itself:
+The server ships release.
+
+Re-measured on a quiet titan (load average 0.8, no other lane building), with
+**the same instrument as the 298 ms above** — `measure_one_sweep_and_the_watch_set`
+— so the rows compare like with like. Three runs each; the figure is the median
+of the three warm means. The ref count has drifted from 779 to 457 since the
+original measurement; the ref-dependent component is ~10% of the sweep (below),
+so it does not account for the gap.
 
 | profile | refs | warm sweep | interval the duty rule sets | which constraint binds |
 |---|---|---|---|---|
 | debug, as measured above | 779 | 298 ms | 3.0 s | the duty rule |
-| debug, re-measured | 455 | 246 ms (one run) | 2.5 s | the duty rule |
-| **release, re-measured** | 455 | **92 ms** (99 / 92 / 63, three runs) | **0.92 s** | **the 2 s base interval** |
-| release, after #661's fix | 455 | **33 ms** (33 / 26 / 50, three runs) | 0.33 s | the 2 s base interval |
+| **release, before #661's fix** | 457 | **148.8 ms** (149 / 134 / 151) | **1.49 s** | **the 2 s base interval** |
+| release, after #661's fix | 457 | **47.4 ms** (49 / 47 / 45) | 0.47 s | the 2 s base interval |
+
+The test prints that verdict itself — `the binding constraint is the base
+interval` — on every one of those release runs, before the fix as well as after.
 
 **So finding 2 does not hold for git-vista itself.** In the profile the server
 actually runs, the duty-cycle floor sits below the 2 s base interval, and the
-base interval is what sets the cadence — not the self-calibrating rule. The
-finding's *shape* survives where it was aimed: on the two synthetic
+base interval is what sets the cadence — not the self-calibrating rule. Note
+this was already true *before* #661's fix: at 148.8 ms the floor was 1.49 s,
+still under 2 s. The fix widens the margin; it is not what makes the base
+interval bind.
+
+The finding's *shape* survives where it was aimed: on the two synthetic
 large-namespace repositories the duty rule will still bind by a wide margin,
 and **those two rows have not been re-measured in release**, so the 19.9 s and
 21.6 s figures above should be read as debug numbers too.
@@ -507,6 +519,12 @@ baseline (median of three runs, 455 refs):
 | `refs/stash`, sandboxed spawn | 21.0 ms | 21% |
 | `merge.ff`, sandboxed spawn | 19.9 ms | 20% |
 | the `gix` ref walk over all refs | 9.4 ms | **10%** |
+
+Those component figures come from a second, narrower harness
+(`planner::sweep_component_measure`), which times `live_reading` alone rather
+than the whole sweep; on that harness the same fix moves `live_reading` from a
+92 ms median to 33 ms. The two instruments measure different scopes and are not
+interchangeable — the table above is the one to quote for cadence.
 
 The four sandboxed spawns dominate at ~90%, and the `gix` ref read — the
 component the issue expected to find at fault — is the smallest of the five.
