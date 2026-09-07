@@ -47,12 +47,13 @@ use leptos::*;
 use crate::features::graph::collapse::WipRun;
 use crate::features::graph::core::disabled_menu_item_copy;
 use crate::features::shell::signals::{self as shell_state, Shell};
+use crate::features::status::signals as status_state;
 use crate::geometry::menu_placement;
 use crate::gestures::viewport_size;
 use crate::icons::icon_set;
 use crate::state::{Features, MenuData, Settings};
 
-use crate::api::{fetch_rebase_status, fetch_status, fetch_undoables, fetch_worktree_status};
+use crate::api::{fetch_rebase_status, fetch_undoables, fetch_worktree_status};
 
 mod bisect_items;
 mod branch_items;
@@ -102,11 +103,18 @@ pub fn menu_view(
     read_only: bool,
     on_fold_wip: Callback<WipRun>,
 ) -> impl IntoView {
-    // `dialogs`/`operations`/`status` are read via `features` itself inside
-    // the section builders below (`menu/commit_items.rs` and siblings), which
-    // each destructure only the fields they need — so this binding only
-    // pulls out what the resource setup and the final assembly use directly.
-    let Features { graph, shell, .. } = features;
+    // `dialogs`/`operations` are read via `features` itself inside the section
+    // builders below (`menu/commit_items.rs` and siblings), which each
+    // destructure only the fields they need — so this binding only pulls out
+    // what the resource setup and the final assembly use directly. `status` is
+    // pulled out here too since #709: the staged count is read from the app's
+    // one pinned status resource rather than fetched again on this side.
+    let Features {
+        graph,
+        shell,
+        status,
+        ..
+    } = features;
     let nerd_icons = settings.nerd_icons;
     // The undo actions for the menu's commit (step 5), fetched the moment the
     // menu opens — computed live server-side, so the section reflects the repo
@@ -152,29 +160,38 @@ pub fn menu_view(
             }
         },
     );
-    // How many files are currently staged — fetched live when the menu opens
-    // on the HEAD commit (the only place staging items appear), keyed like
-    // `rebase_status`. Drives the "Unstage Changes" item: it appears only
-    // while something is actually staged, so the menu reflects the repo *now*,
-    // not the possibly-stale graph. Fetch failure => 0 => the item is absent.
-    let staged_count = create_local_resource(
-        move || {
-            (
-                shell.menu().is_some_and(|m| m.is_head && !m.is_branch),
-                graph.get().epoch(),
-            )
-        },
-        |(open, _)| async move {
-            if open {
-                fetch_status().await.map(|s| s.staged.len()).unwrap_or(0)
-            } else {
-                0
-            }
-        },
-    );
+    // Whether a menu is open on the HEAD commit — the only place the staging
+    // items appear, and the key both the staged count below and the `worktree`
+    // resource are gated on.
+    let on_head = move || shell.menu().is_some_and(|m| m.is_head && !m.is_branch);
+    // How many files are currently staged. Drives the "Unstage Changes" item:
+    // it appears only while something is actually staged, so the menu reflects
+    // the repo *now*, not the possibly-stale graph. No reading => 0 => the
+    // item is absent, which is what a failed fetch already meant here.
+    //
+    // #709: this used to be a `create_local_resource` of its own calling the
+    // **unscoped** `fetch_status()` — a second v1 read that named no
+    // repository, so a reply could describe the repo the user just left and
+    // the menu would offer to unstage its index. #707 had already pinned the
+    // chip path against exactly that; this caller had none of it. It now reads
+    // the app's one pinned status resource (`features::status::signals`, the
+    // single owner that module's doc comment describes), so the count the menu
+    // acts on and the count the chip shows are the same reading, resolved
+    // against the same accepted frame.
+    let staged_count = Signal::derive(move || status_state::staged_count(status));
+    // Opening a menu on HEAD refreshes that shared read. This is the freshness
+    // the removed per-menu fetch used to buy — an index staged from a terminal
+    // moves no ref, so nothing bumps the graph epoch and no key here would
+    // change on its own. Refreshing the shared resource rather than opening a
+    // private one keeps the single-owner property while keeping the behaviour.
+    create_effect(move |_| {
+        if on_head() {
+            status.refetch();
+        }
+    });
     // The per-path working-tree status (`GET /api/status/v2`, M2.18b/#220) —
-    // fetched when the menu opens on the HEAD commit, keyed exactly like
-    // `staged_count`. The v1 read above cannot serve this: the discard/delete
+    // fetched when the menu opens on the HEAD commit, gated on the same
+    // `on_head` the staged count is. The v1 read cannot serve this: the discard/delete
     // confirmations must name the exact paths, and must classify each one the
     // same way the server's own `verify_path_states` will (tracked-dirty vs
     // untracked), which only the v2 per-entry shape carries.
@@ -184,12 +201,7 @@ pub fn menu_view(
     // silently disappears while a status probe is slow reads as "this repo
     // can't do that", which would be a lie.
     let worktree = create_local_resource(
-        move || {
-            (
-                shell.menu().is_some_and(|m| m.is_head && !m.is_branch),
-                graph.get().epoch(),
-            )
-        },
+        move || (on_head(), graph.get().epoch()),
         |(open, _)| async move {
             if open {
                 fetch_worktree_status().await.ok()

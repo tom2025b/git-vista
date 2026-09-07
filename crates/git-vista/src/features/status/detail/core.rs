@@ -82,6 +82,28 @@ pub fn current_reading(
     .flatten()
 }
 
+/// How many staged files the context menu may offer to act on (#709).
+///
+/// Takes the retained reply in the same shape [`current_reading`] does, and
+/// for the same reason: the requested epoch and repository travel *inside*
+/// `reply`, so the menu cannot pair the live frame with some other request's
+/// scope. Routing the count through `current_reading` rather than reading
+/// `reply`'s payload directly is the whole point — a loading, failed,
+/// old-epoch or old-repository reply counts **zero**, so "Unstage Changes"
+/// and "Select Changes to Unstage…" stay absent rather than offering to
+/// unstage an index belonging to a repository the user has already left.
+///
+/// Zero is also what the menu showed when its own fetch failed, so the
+/// unknown arm is not a new state for that view — only a correct one.
+pub fn actionable_staged_count(
+    loading: bool,
+    reply: Option<(u64, Option<String>, Option<RepoStatus>)>,
+    current_epoch: u64,
+    current_repo: Option<&str>,
+) -> usize {
+    current_reading(loading, reply, current_epoch, current_repo).map_or(0, |s| s.staged.len())
+}
+
 fn files(n: usize) -> String {
     format!("{n} {}", if n == 1 { "file" } else { "files" })
 }
@@ -211,7 +233,7 @@ mod tests {
         assert!(view.contains("detail().actions.contains(&action)"));
         let signals = include_str!("../signals.rs");
         assert!(signals.contains("current_reading("));
-        assert!(signals.contains("fetch_status_for(Some(id))"));
+        assert!(signals.contains("fetch_status_for(id)"));
         assert!(include_str!("../../../app/mod.rs").contains("status_chip_view("));
     }
     fn status(ahead: u32, behind: u32) -> RepoStatus {
@@ -352,6 +374,109 @@ mod tests {
             None
         );
     }
+    /// #709: the menu path, decided here so it can go red on the host.
+    ///
+    /// `menu.rs` used to count staged files from its own **unscoped**
+    /// `fetch_status()`. That reply named no repository, so switching
+    /// repositories left the previous one's index describing the new one's
+    /// menu — "Unstage Changes" offered on a tree with nothing staged, and
+    /// (the direction that costs something) *withheld* on one that has. The
+    /// old code is what the first assertion below reproduces: `reply`'s
+    /// payload taken at face value would answer 3 for every case in this
+    /// test. Routing it through `current_reading` answers 3 exactly once.
+    #[test]
+    fn only_a_reply_matching_the_live_frame_can_offer_an_unstage() {
+        let mut s = status(0, 0);
+        s.staged = vec![
+            FileChange {
+                path: "a".into(),
+                kind: ChangeKind::Modified,
+            },
+            FileChange {
+                path: "b".into(),
+                kind: ChangeKind::Modified,
+            },
+            FileChange {
+                path: "c".into(),
+                kind: ChangeKind::Modified,
+            },
+        ];
+        let reply = |epoch: u64, repo: &str| Some((epoch, Some(repo.to_string()), Some(s.clone())));
+        assert_eq!(
+            actionable_staged_count(false, reply(4, "a"), 4, Some("a")),
+            3
+        );
+        // Still in flight: a retained reply is not a reading for this key.
+        assert_eq!(
+            actionable_staged_count(true, reply(4, "a"), 4, Some("a")),
+            0
+        );
+        // Stale epoch — the repository moved under this reply.
+        assert_eq!(
+            actionable_staged_count(false, reply(3, "a"), 4, Some("a")),
+            0
+        );
+        // Stale repository — the exact leak #709 names.
+        assert_eq!(
+            actionable_staged_count(false, reply(4, "b"), 4, Some("a")),
+            0
+        );
+        // No accepted frame yet: nothing vouches for any reading.
+        assert_eq!(actionable_staged_count(false, reply(4, "a"), 4, None), 0);
+        // Never fetched, and fetched-but-failed, are both unknown, not zero
+        // staged files that happen to read the same — the item is absent
+        // either way, which is what the old fetch-failure arm already did.
+        assert_eq!(actionable_staged_count(false, None, 4, Some("a")), 0);
+        assert_eq!(
+            actionable_staged_count(false, Some((4, Some("a".into()), None)), 4, Some("a")),
+            0
+        );
+    }
+
+    /// The wiring for the same claim, in the bytes that ship (#709).
+    ///
+    /// `menu.rs` and `api/status.rs` are both `#[cfg(target_arch = "wasm32")]`
+    /// in `main.rs`, so `cargo test` compiles neither — the blind spot
+    /// `offline_guard_audit` exists for. The test above proves the *decision*;
+    /// this proves the menu reaches it, and that the unscoped entry point it
+    /// used to reach instead is gone rather than merely unused.
+    /// Whole-line `//` comments dropped, so a census asserting the *absence*
+    /// of a call cannot be defeated — or, as happened while writing this, be
+    /// tripped — by prose naming the call it forbids. A trailing comment on a
+    /// line of code is left alone: that line still ships code.
+    fn code_only(src: &str) -> String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_menu_counts_staged_files_from_the_pinned_read_only() {
+        let menu = code_only(&format!(
+            "{}{}",
+            include_str!("../../../menu.rs"),
+            include_str!("../../../menu/worktree_items.rs")
+        ));
+        assert!(menu.contains("status_state::staged_count(status)"));
+        // No v1 status fetch of the menu's own, scoped or not. `fetch_status(`
+        // is not a substring of `fetch_worktree_status(`, which the menu does
+        // and should still call — that is the v2 per-path read.
+        assert!(!menu.contains("fetch_status("));
+        assert!(!menu.contains("fetch_status_for("));
+        let api = code_only(&format!(
+            "{}{}",
+            include_str!("../../../api.rs"),
+            include_str!("../../../api/status.rs")
+        ));
+        // The v1 read takes the repository by value: "unscoped" is not a
+        // value any caller can pass, so this cannot regress by omission.
+        assert!(api.contains("pub async fn fetch_status_for(repo: &str)"));
+        assert!(api.contains("\"/api/status?t={}&repo={}\""));
+        assert!(!api.contains("fn fetch_status()"));
+        assert!(!api.contains("fetch_status,"));
+    }
+
     #[test]
     fn retained_readings_must_match_epoch_and_repository() {
         assert!(reading_is_current(false, 4, 4, Some("a"), Some("a")));

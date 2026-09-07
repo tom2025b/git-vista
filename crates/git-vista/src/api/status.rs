@@ -13,19 +13,32 @@ use super::{
 };
 
 /// Fetch the live working-tree status (`GET /api/status`) — branch, ahead/
-/// behind, and the dirty-file lists — for the topbar chip and the Activity
-/// panel's status section. Resolved fresh server-side per request and cache-
-/// busted like the other live reads, since it changes with every edit.
-pub async fn fetch_status() -> Result<RepoStatus, String> {
-    fetch_status_for(None).await
-}
-
-/// Pin chip/commit readings to the accepted frame's opaque repository id.
-pub async fn fetch_status_for(repo: Option<&str>) -> Result<RepoStatus, String> {
-    let mut url = format!("/api/status?t={}", js_sys::Date::now());
-    if let Some(repo) = repo {
-        url.push_str(&format!("&repo={}", js_sys::encode_uri_component(repo)));
-    }
+/// behind, and the dirty-file lists — for the topbar chip, the commit review
+/// and the context menu's staging items. Resolved fresh server-side per
+/// request and cache-busted like the other live reads, since it changes with
+/// every edit.
+///
+/// **`repo` is required, and that is the point (#709).** This used to sit
+/// behind an `Option<&str>`, with a companion `fetch_status()` that passed
+/// `None` — and `menu.rs` called that companion, so the one v1 status read
+/// still had an entry point that asked the server "whatever repository you
+/// happen to be resolving right now". A reply to that question belongs to no
+/// frame in particular, which is exactly the class of staleness the epoch/
+/// repository pinning exists to refuse: #707 pinned the chip path
+/// (`features::status::signals`), and this caller was the remaining hole.
+///
+/// Taking the accepted frame's opaque repository id by value rather than by
+/// `Option` makes the unscoped request **unrepresentable** instead of merely
+/// discouraged — a later caller cannot forget to scope one, because there is
+/// no argument it can pass that means "unscoped". The reply is still only a
+/// *candidate* reading: `detail::core::current_reading` decides whether the
+/// frame it was requested for is still the live one.
+pub async fn fetch_status_for(repo: &str) -> Result<RepoStatus, String> {
+    let url = format!(
+        "/api/status?t={}&repo={}",
+        js_sys::Date::now(),
+        js_sys::encode_uri_component(repo)
+    );
     let resp = send_read(&url).await.map_err(|e| e.to_string())?;
     if resp.ok() {
         resp.json::<RepoStatus>().await.map_err(|e| e.to_string())
@@ -41,7 +54,7 @@ pub async fn fetch_status_for(repo: Option<&str>) -> Result<RepoStatus, String> 
 /// #68c) — the per-path [`WorktreeStatus`] the discard/delete menu items need
 /// to name exactly which files each operation would touch (M2.18b, #220).
 ///
-/// Additive alongside [`fetch_status`], which serves the topbar chip's
+/// Additive alongside [`fetch_status_for`], which serves the topbar chip's
 /// coarser v1 shape and is untouched — migrating that consumer is 68d's job,
 /// not this one's.
 ///
