@@ -672,23 +672,70 @@ fn unauthenticated_routes_are_a_pinned_short_allowlist() {
 /// `session_exempt` must test a method as well as a path. Dropping the method
 /// test from any clause fails here, by name, in the same test binary as the
 /// table it would have falsified.
+/// The right-hand side of `security.rs`'s `let session_exempt = ...;`, ending
+/// at the `;` that actually terminates the statement.
+///
+/// #724 review (grok): the first version of this test scanned to the first `;`
+/// after the binding with no string awareness, justified by a comment asserting
+/// the expression "contains no string literals or nested statements". That is a
+/// claim about code nobody has written yet, not a check on it. A `;` inside a
+/// string literal in any clause truncates the slice, and the truncated head can
+/// still contain both `||` arms, both `Method::` tests and both path constants
+/// — so every assertion below passes while a trailing `|| path == "/api/x"`
+/// goes entirely unread. An inert guard, inside the guard, in the change whose
+/// whole subject is inert guards.
+///
+/// So this tracks string literals the same way [`strip_line_comments`] does,
+/// tracks bracket depth, and returns `None` rather than a truncated slice when
+/// the statement never closes at depth zero — a caller that unwraps it fails
+/// loudly instead of silently reading half an expression.
+fn session_exempt_expression(code: &str) -> Option<&str> {
+    let start = code.find("let session_exempt =")?;
+    let rest = &code[start..];
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, ch) in rest.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ';' if depth == 0 => return Some(&rest[..i]),
+            _ => {}
+        }
+    }
+    None
+}
+
 #[test]
 fn the_pre_session_exemption_is_method_qualified() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/security.rs");
     let src = std::fs::read_to_string(&path).expect("readable security.rs");
+    let code = strip_line_comments(&src);
+    let expr = session_exempt_expression(&code)
+        .expect("security.rs still binds session_exempt, and that statement closes");
 
-    // The assignment's right-hand side: from `let session_exempt =` to the
-    // `;` that ends the statement. Comments above it are excluded by starting
-    // at the binding itself, and the expression contains no string literals
-    // or nested statements, so a plain scan to `;` is exact here.
-    let start = src
-        .find("let session_exempt =")
-        .expect("security.rs still binds session_exempt");
-    let rest = &src[start..];
-    let end = rest
-        .find(';')
-        .expect("the session_exempt binding ends in ;");
-    let expr = &rest[..end];
+    // The scanner models string literals and bracket depth but not char
+    // literals or block comments. Rather than assume neither ever appears —
+    // the assumption that made the previous version of this test inert —
+    // refuse loudly if one does, so the next maintainer extends the scanner
+    // instead of inheriting a silently truncated read.
+    assert!(
+        !expr.contains('\'') && !expr.contains("/*"),
+        "the session_exempt expression now contains a char literal or a block comment, \
+         which session_exempt_expression() does not model. Extend that scanner before \
+         trusting this test again — do not delete the check. Expression was: {expr}"
+    );
 
     let clauses: Vec<&str> = expr.split("||").collect();
     assert_eq!(

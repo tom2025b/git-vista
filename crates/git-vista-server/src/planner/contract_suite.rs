@@ -3521,9 +3521,31 @@ fn route_authz_and_write_contract_agree_on_every_post_route() {
     // session bootstrap is registered with a bare `.post(create_session)`
     // rather than a `.route("/api/session", ...)`. Its real route is
     // `POST /api/session`, which is exactly how `route_authz.rs` names it —
-    // map across so both sets are keyed the same way. Keep this the only
-    // exception; a second one means the tables have stopped describing the
-    // same thing.
+    // map across so both sets are keyed the same way.
+    //
+    // #724 review (grok): "keep this the only exception" used to live only in
+    // that comment, guarding an open `if`. An *unmapped* extra handler-named
+    // row does fail the set difference below, but a second *mapped* exception
+    // would sail straight through — comment-only discipline, which is the exact
+    // class this test exists to close. So the exception set is asserted rather
+    // than described: every row names a path, except exactly the one known
+    // handler-named row.
+    let handler_named: Vec<&str> = post_route_census()
+        .iter()
+        .map(|(route, _, _)| *route)
+        .filter(|route| !route.starts_with('/'))
+        .collect();
+    assert_eq!(
+        handler_named,
+        ["create_session"],
+        "post_route_census() rows must name a route path. Exactly one names a handler \
+         instead — `create_session`, because session bootstrap is registered with a bare \
+         `.post(create_session)` rather than a `.route(\"/api/session\", ...)`. Found \
+         {handler_named:?}. A second handler-named row means the two censuses have stopped \
+         describing the same thing: give it a real path, or extend the mapping below AND \
+         this assertion together — never the mapping alone."
+    );
+
     let contract_posts: BTreeSet<&str> = post_route_census()
         .iter()
         .map(|(route, _, _)| {
