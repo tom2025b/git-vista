@@ -23,10 +23,10 @@ product behaviour, not an oversight — ADR 0128 rejected disabling them by name
 flowchart TD
   U["Operator pastes a URL"] --> V["validate_clone_url<br/>https / http / git only"]
   V --> P["policy_for_clone<br/>Tier::Network, HookMode::Run"]
-  P --> T["Phase 1: git clone --no-checkout<br/>HAS the credential<br/>runs NO attacker code"]
+  P --> T["Phase 1: git clone --no-checkout<br/>HAS the credential<br/>no REMOTE-supplied code<br/>(operator hooks still run)"]
   T --> X["process exits"]
   X --> C["Phase 2: git checkout -f<br/>has NO credential<br/>RUNS attacker code"]
-  C --> H["post-checkout hook<br/>.gitattributes filter"]
+  C --> H["post-checkout hook<br/>.gitattributes filter<br/>REMOTE-supplied"]
 ```
 
 The boundary between those phases was `SandboxedCommand::without_credential_env`,
@@ -121,10 +121,18 @@ went to `dto.rs` instead of accepting the sentence. A capability argument has to
 be checked against **every** path that can reach the capability, not the one
 that names it.
 
-The correct statement is narrower, and no counter-example touches it: **the
-process that runs attacker-chosen code does not need these.** That is a claim
-about a *phase*, not about a route — which is why the fix below splits the
-policy instead of narrowing a shared one.
+The correct statement is narrower: **whatever the process that runs
+remote-supplied code needs, it may not safely have.** That is a claim about a
+*phase* rather than a route, which is why the fix below splits the policy
+instead of narrowing a shared one.
+
+Note the wording carefully. An earlier draft said the phase "does not need
+these", and that is also false — SSH-backed Git LFS needs exactly these, at
+checkout time. The withholding is not justified by the phase having no use for
+the capability; it is justified by the phase being the one that runs
+attacker-selected code, which makes the capability unsafe to grant *whether or
+not something legitimate wants it*. The cost of that is real and is accounted
+for under "What this does not close".
 
 ## Decision
 
@@ -157,8 +165,10 @@ flowchart TD
 Three exclusions are decisions rather than omissions, and are recorded as such
 in the constant's own doc comment:
 
-- **`SSH_AUTH_SOCK`** — the whole of #702, and the load-bearing half of its fix
-  (see §3).
+- **`SSH_AUTH_SOCK`** — #702's *mechanism*: the variable is how the operator's
+  agent becomes reachable in practice, so withholding it is the highest-value
+  single line here. It is **not** a fix for #702, which stays open — the
+  capability survives without the locator. See "What this does not close".
 - **`GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n`,
   `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`** — these would buy the same config
   parity `HOME` buys, but their payload is an arbitrary string and
@@ -237,12 +247,12 @@ flowchart TD
   R --> R2["known_hosts carve-out ✓"]
   R --> R3["port 22 ✓"]
   R --> R4["credential ✓"]
-  R --> R5["runs NO attacker code"]
+  R --> R5["no remote-supplied code<br/>operator hooks still run"]
   K["policy_for_clone_checkout<br/>the CHECKOUT"] --> K1["agent socket ✗"]
   K --> K2["known_hosts carve-out ✗"]
   K --> K3["port 22 ✗"]
   K --> K4["credential ✗ · env allowlist"]
-  K --> K5["RUNS attacker code"]
+  K --> K5["RUNS remote-supplied code"]
   R -.->|"process exits;<br/>ADR 0128's boundary"| K
 ```
 
@@ -388,30 +398,63 @@ flowchart TD
   C --> X["sign, exfiltrate over 443"]
 ```
 
-### SSH-backed Git LFS breaks at checkout, deliberately
+### An SSH-resolving Git LFS endpoint fails the clone outright, deliberately
 
-Git LFS authenticates against an SSH remote by running `git-lfs-authenticate`
-over SSH **at smudge time**, and supports pure-SSH transfer. The checkout policy
-has no port 22, no `known_hosts` and no `$SSH_AUTH_SOCK`, so an SSH-backed LFS
-clone now retrieves pointers and not contents. An ordinary SSH-rewritten clone
-is unaffected — the transfer keeps all three. Found by codex-daybreak against
-Git LFS's own authentication documentation; an earlier version of
-`CLONE_CHECKOUT_PORTS`'s doc asserted that legitimate checkout traffic needed
-only HTTPS, and that was false.
+**Scope: the axis is the resolved LFS endpoint, not the git transport.** Git LFS
+picks its endpoint from `lfs.url`, then `remote.<name>.lfsurl`, then the remote
+URL. Affected configurations are the ones whose *resolved endpoint* invokes SSH
+— hybrid `git-lfs-authenticate` over SSH, or the pure-SSH transfer adapter. Both
+directions of the obvious guess are wrong: an SSH git remote with an explicit
+HTTPS `lfs.url` is **unaffected**, and an **HTTPS** git remote whose config
+selects an SSH LFS endpoint **is** affected. An earlier draft said "SSH-backed
+clones", which was overbroad in one direction and blind in the other.
+
+**Severity: the clone fails and its destination is removed.** An earlier draft
+said such a clone would retrieve pointers and not contents. That is wrong and
+understates it. A failing smudge filter makes `git checkout -f` exit nonzero;
+`execute_clone` returns `CloneExecutionError::GitFailed`; `run_guarded`'s
+`DestGuard` is still armed on that path and deletes the destination directory.
+The operator gets a failed clone and no repository, not a degraded one. Traced
+by codex-daybreak through `handlers/clone.rs`.
 
 **Accepted rather than fixed, because the fix and the vulnerability are the same
 thing.** Reaching SSH at smudge time means the agent socket, host keys and port
 22 present in the process that runs attacker-selected filters — precisely the
 exposure #702 exists to remove. The sandbox cannot distinguish `git-lfs`'s own
-`ssh` from a fetched smudge filter's: same process tree, same policy, no
-signal to separate them. Restoring the grants would undo the change rather than
+`ssh` from a fetched smudge filter's: same process tree, same policy, no signal
+to separate them. Restoring the grants would undo the change rather than
 complete it.
 
-**What would reopen it:** a broker — the server performing `git-lfs-authenticate`
-itself before checkout and handing the filter the resulting short-lived HTTPS
-token — so the capability stays outside the untrusted process. That is a design,
-not a tweak, and it is the same shape as the proxy answer above: pass the
-*result* of using a credential, never the credential.
+**What would reopen it — and what would not.** An earlier draft proposed that the
+server run `git-lfs-authenticate` itself and hand the filter the resulting
+token, under the slogan "pass the *result* of using a credential, never the
+credential". **That slogan is wrong here and the proposal does not have the
+property it claims.** What `git-lfs-authenticate` returns *is* a bearer
+credential — an `Authorization` header good for the repository's LFS objects —
+so handing it to the filter puts a credential inside the untrusted process
+after all. It also does nothing for a pure-SSH transfer adapter, which produces
+no HTTPS token to pass. The coordinator endorsed that framing and I wrote it;
+codex-daybreak refuted it. It is recorded here rather than quietly replaced,
+because "we already solved that" is how a hole gets inherited.
+
+Two conditions would genuinely reopen it, and they differ in kind:
+
+1. **Keep every credential out of the untrusted process.** The server resolves
+   LFS objects itself — prefetching them between the transfer and the checkout,
+   or proxying the filter's requests through a local endpoint that holds the
+   credential — so the child needs no token and no socket. This is the only
+   option that preserves the property #702 is about, and it also covers
+   pure-SSH, since the server can speak whatever transport the endpoint wants.
+2. **Accept a bounded exposure, explicitly.** Hand the filter a
+   repository-scoped, short-lived download credential and say plainly that a
+   hostile filter can use it for its lifetime and its scope. That is a smaller
+   exposure than the agent socket by a wide margin — one repository's objects
+   versus signing for every host the operator can reach — but it is not zero,
+   and it must be argued as a trade rather than described as a fix.
+
+Option 1 is the better answer and the larger piece of work. Neither is in scope
+here; both are named so the next person starts from an accurate statement of
+what is left.
 
 Closing it needs a checkout-specific seccomp mode denying pathname `AF_UNIX`
 while keeping TCP for LFS — `bin/gv-sandbox/seccomp_filter.rs`, tracked as
@@ -445,11 +488,13 @@ code — no `cfg`-gated arm, so nothing here reports green over its own absence.
   enumerated". A test that checks only the three ADR 0128 names passes
   identically under a denylist and an allowlist and therefore cannot fail on
   #704 at all; an unknown name is what separates the two mechanisms.
-- **`sandbox::argv::policy_for_clone_carries_neither_188_grant_while_policy_for_still_does`**
-  asserts a *difference between two constructors* in one critical section: the
-  same socket path present in `policy_for`'s Network policy and absent from
-  `policy_for_clone`'s. Without that paired positive the test would pass just as
-  well if `ssh_agent_socket_grant` were broken outright for fetch and push.
+- **`sandbox::argv::only_the_clone_checkout_phase_gives_up_the_188_grants`**
+  asserts a *difference between three constructors* in one critical section: the
+  same socket path present in `policy_for`'s Network policy **and** in clone's
+  transfer policy, absent only from the checkout's. Without the first two legs
+  the test would pass just as well if `ssh_agent_socket_grant` were broken
+  outright, or if the transfer had been left narrowed and SSH clones still
+  refused — which is the regression this PR had to undo.
 
 `failure-atlas mutation_check`, run key
 `gv-702-704-untrusted-checkout-allowlist`, HEAD `740acc1b`, clean tree. Every
@@ -515,9 +560,10 @@ git-vista-server --bins` once in the worktree first; it cannot go inside
   `with_untrusted_checkout_env`; `without_credential_env` deleted.
 - `crates/git-vista-server/src/sandbox/network_exec.rs` —
   `UntrustedCheckoutCommand`; `network_command_without_credential` retyped.
-- `crates/git-vista-server/src/sandbox/mod.rs` — `CLONE_GIT_PORTS`;
-  `policy_for_clone`'s two dropped grants, its narrowed ports, and the doc
-  comment recording why.
+- `crates/git-vista-server/src/sandbox/mod.rs` — `CLONE_CHECKOUT_PORTS`;
+  `policy_for_clone_checkout` and the `CheckoutPolicy` newtype;
+  `policy_for_clone` left carrying all of #188, with the doc comment recording
+  why the first attempt to narrow it was a regression.
 - `crates/git-vista-server/src/sandbox/test_env.rs` — new: the crate's one
   test-side environment writer.
 - `crates/git-vista-server/src/sandbox/argv.rs` — `with_ssh_auth_sock` retargeted

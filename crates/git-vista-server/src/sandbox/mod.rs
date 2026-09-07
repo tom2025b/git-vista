@@ -283,21 +283,29 @@ pub(crate) const DEFAULT_GIT_PORTS: &[u16] = &[
 /// `git-lfs` smudge fetching pointers' contents.
 ///
 /// **That is not always HTTPS, and an earlier version of this comment claimed
-/// it was.** Git LFS authenticates against an SSH remote by running
-/// `git-lfs-authenticate` over SSH at smudge time, and supports pure-SSH
-/// transfer. So dropping port 22 here — together with the `known_hosts`
-/// carve-out and `$SSH_AUTH_SOCK` — **breaks SSH-backed LFS at checkout**. An
-/// ordinary SSH-rewritten clone still works, because the transfer keeps all
-/// three; an SSH-backed LFS clone gets its objects' pointers and not their
-/// contents. Found by codex-daybreak against Git LFS's own authentication
-/// documentation, not assumed from memory.
+/// it was.** Git LFS resolves its endpoint from `lfs.url`, then
+/// `remote.<name>.lfsurl`, then the remote URL; where that endpoint invokes SSH
+/// — hybrid `git-lfs-authenticate` over SSH, or the pure-SSH transfer adapter —
+/// the smudge filter needs SSH *at checkout time*, which this policy withholds.
+///
+/// The axis is the **LFS endpoint, not the git transport**: an SSH git remote
+/// with an explicit HTTPS `lfs.url` is unaffected, and an HTTPS remote whose
+/// config selects an SSH LFS endpoint is affected. And the outcome is a **failed
+/// clone, not a degraded one** — a failing smudge makes `git checkout -f` exit
+/// nonzero, `execute_clone` returns `GitFailed`, and `run_guarded`'s still-armed
+/// `DestGuard` removes the destination. Both corrections from codex-daybreak,
+/// against Git LFS's own documentation and this crate's own control flow; the
+/// first version of this comment was overbroad about scope and wrong about
+/// severity.
 ///
 /// It is accepted rather than fixed, because the fix and the vulnerability are
 /// the same thing. Reaching SSH at smudge time means the agent socket, host
 /// keys and port 22 in the process that runs attacker-selected filters — the
 /// exposure #702 exists to remove. The sandbox cannot tell `git-lfs`'s `ssh`
 /// from a fetched smudge filter's: same process tree, same policy, no
-/// distinguishing signal. See ADR 0137 for the condition that would reopen it.
+/// distinguishing signal. ADR 0137 records the two conditions that would reopen
+/// it — and why the obvious one (hand the filter an HTTPS token instead) does
+/// not work, since that token is itself a bearer credential.
 ///
 /// Read [`DEFAULT_GIT_PORTS`]'s own doc before trusting this too far: a port
 /// grant is **not** an egress policy, because Landlock's port rules carry no
