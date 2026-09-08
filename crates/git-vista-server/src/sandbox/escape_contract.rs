@@ -2790,7 +2790,7 @@ fn job_uses_local_action(body: &str, action_dir: &str) -> bool {
 ///  - **The set of jobs permitted to weaken the runner grew by one class.**
 ///    That is the point of the change, not an accident of it — but it is
 ///    strictly more than before, and the argument for the new class lives in
-///    ADR 0141 rather than in the code.
+///    ADR 0142 rather than in the code.
 ///
 /// What is *not* given up: the premise is asserted rather than assumed. The
 /// entrypoint must still contain `unshare`, so a `run.sh` rewritten to need no

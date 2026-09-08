@@ -710,7 +710,7 @@ jobs:
       #
       # `escape_contract.rs` permits this `uses:` only because the job actually
       # invokes ci/browser/run.sh, and only while that script still needs a
-      # namespace (#754, ADR 0141). It is not a general licence for workflow
+      # namespace (#754, ADR 0142). It is not a general licence for workflow
       # jobs to provision the host.
       - uses: ./.github/actions/host-sandbox-setup
 
@@ -751,6 +751,26 @@ jobs:
             echo "unprivileged user namespace: REFUSED by this runner" >&2
             echo "The browser suite cannot run here without weakening its isolation," >&2
             echo "which is not an acceptable trade — see #754." >&2
+            exit 1
+          fi
+
+          # The namespace is necessary but not sufficient. The server refuses to
+          # start unless it can construct the Strict tier (ADR 0029 / INV-13 —
+          # there is no degraded mode), and that tier is a real `bwrap` launch
+          # made from INSIDE the namespace above. On run 34276280085 every named
+          # knob read true (`landlock_abi=7 seccomp_available=true userns=true
+          # bwrap_present=true`) and the launch still failed, which the probe can
+          # only report as the residual `strict_launch`. Asking the question here
+          # turns that into bwrap's own error message, eight minutes earlier.
+          echo "--- probe: bwrap inside that namespace (the Strict tier's launch) ---"
+          if unshare --user --map-root-user --net --mount -- \
+               bash -c 'ip link set lo up && bwrap --ro-bind / / --proc /proc --dev /dev -- /bin/true && echo BWRAP_OK'; then
+            echo "nested bwrap launch: AVAILABLE"
+          else
+            echo "nested bwrap launch: REFUSED by this runner (see bwrap's error above)" >&2
+            echo "The namespace exists but the Strict tier cannot be built inside it, so" >&2
+            echo "git-vista-server refuses to start (INV-13) and no spec can run. This is" >&2
+            echo "the app's designed refusal, not a suite defect — see #754." >&2
             exit 1
           fi
 
