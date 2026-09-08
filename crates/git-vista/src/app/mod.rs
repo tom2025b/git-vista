@@ -791,6 +791,7 @@ pub fn App() -> impl IntoView {
                 // chip it shares a "trust signal about repository state"
                 // role with — present in every state, including watching.
                 {crate::feed_health_badge::feed_health_badge_view(freshness)}
+                {crate::features::bisect::signals::indicator_view(graph, status_repo, online)}
                 <button
                     class="refresh"
                     on:click=toggle_icons
