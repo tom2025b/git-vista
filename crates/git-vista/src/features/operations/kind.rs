@@ -15,6 +15,7 @@
 //! a *different* operation, and needs `Debug` for the assertions that prove it.
 
 use git_vista_core::activity::Undoable;
+use git_vista_core::identity::WorktreeId;
 use git_vista_protocol::plan::Advisory;
 use git_vista_protocol::{
     branch_holder, BranchHolder, BranchName, CommitOid, Explanation, MergeStrategy, Plan,
@@ -134,7 +135,12 @@ pub enum OperationKind {
     /// Named for the server's own `GitOperation::DiscardTrackedPaths` rather
     /// than #220's shorter suggestion, so the two halves of one operation
     /// are greppable as one thing.
-    DiscardTrackedPaths { paths: Vec<String> },
+    /// `repo` is captured with the status read, and survives confirmation.
+    /// Never substitute the live selection at dispatch (ADR 0140).
+    DiscardTrackedPaths {
+        repo: WorktreeId,
+        paths: Vec<String>,
+    },
     /// `git clean -f -- <paths>` (`POST /api/delete-untracked-paths`).
     ///
     /// **The one operation in this vocabulary with no way back.** The content
@@ -143,7 +149,10 @@ pub enum OperationKind {
     /// `dialogs/core.rs`'s confirmation for this demands a second deliberate
     /// tap, and why nothing in its user-facing copy — or in `describe`
     /// below — says "undo", "restore" or "recover".
-    DeleteUntrackedPaths { paths: Vec<String> },
+    DeleteUntrackedPaths {
+        repo: WorktreeId,
+        paths: Vec<String>,
+    },
     /// Cherry-pick `commit` onto the checked-out branch (`git cherry-pick
     /// <commit>`, M10.09/#596, `POST /api/cherry-pick`).
     ///
@@ -420,13 +429,13 @@ impl OperationKind {
                 format!("Cherry-picking {}", short_oid(commit))
             }
             Self::Undo(u) => format!("Undoing: {}", u.label),
-            Self::DiscardTrackedPaths { paths } => {
+            Self::DiscardTrackedPaths { paths, .. } => {
                 format!("Discarding changes to {}", file_count(paths.len()))
             }
             // "permanently" carries the same load here as it does in the
             // server's own journal line: this strip is the only trace of the
             // operation the user sees once the modal closes.
-            Self::DeleteUntrackedPaths { paths } => {
+            Self::DeleteUntrackedPaths { paths, .. } => {
                 format!("Deleting {} permanently", file_count(paths.len()))
             }
             // Mirrors the branch `Delete`/`ForceDelete` arms' wording —
@@ -586,9 +595,11 @@ mod tests {
                 strategy: MergeStrategy::Merge,
             },
             OperationKind::DiscardTrackedPaths {
+                repo: WorktreeId::from_git_dir("/fixture/.git"),
                 paths: vec!["src/a.rs".into()],
             },
             OperationKind::DeleteUntrackedPaths {
+                repo: WorktreeId::from_git_dir("/fixture/.git"),
                 paths: vec!["scratch.txt".into(), "note.md".into()],
             },
             OperationKind::DeleteLocalTag { tag: "v1.0".into() },
@@ -650,6 +661,7 @@ mod tests {
     #[test]
     fn the_delete_never_describes_itself_as_reversible() {
         let delete = OperationKind::DeleteUntrackedPaths {
+            repo: WorktreeId::from_git_dir("/fixture/.git"),
             paths: vec!["scratch.txt".into()],
         }
         .describe();
@@ -660,6 +672,7 @@ mod tests {
         assert!(lower.contains("permanently"), "{delete}");
 
         let discard = OperationKind::DiscardTrackedPaths {
+            repo: WorktreeId::from_git_dir("/fixture/.git"),
             paths: vec!["scratch.txt".into()],
         }
         .describe();
@@ -673,11 +686,13 @@ mod tests {
     #[test]
     fn a_single_file_is_not_described_as_files() {
         let one = OperationKind::DeleteUntrackedPaths {
+            repo: WorktreeId::from_git_dir("/fixture/.git"),
             paths: vec!["a.txt".into()],
         }
         .describe();
         assert!(one.contains("1 file") && !one.contains("1 files"), "{one}");
         let two = OperationKind::DeleteUntrackedPaths {
+            repo: WorktreeId::from_git_dir("/fixture/.git"),
             paths: vec!["a.txt".into(), "b.txt".into()],
         }
         .describe();
@@ -799,9 +814,11 @@ mod fetch_pull_tests {
                 base: "origin/main".into(),
             },
             OperationKind::DiscardTrackedPaths {
+                repo: WorktreeId::from_git_dir("/fixture/.git"),
                 paths: vec!["src/a.rs".into()],
             },
             OperationKind::DeleteUntrackedPaths {
+                repo: WorktreeId::from_git_dir("/fixture/.git"),
                 paths: vec!["scratch.txt".into()],
             },
             OperationKind::DeleteLocalTag { tag: "v1.0".into() },

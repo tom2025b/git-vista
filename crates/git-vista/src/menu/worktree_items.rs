@@ -7,10 +7,11 @@ use leptos::*;
 use crate::api::{stage_request, unstage_request};
 use crate::features::dialogs::core::{Dialog, ErrorNotice};
 use crate::features::graph::core::disabled_menu_item_copy;
-use crate::features::status::core::{deletable_untracked_paths, discardable_tracked_paths};
+use crate::features::status::core::{
+    deletable_untracked_paths, discardable_tracked_paths, ScopedWorktreeStatus,
+};
 use crate::icons::GitIcons;
 use crate::state::{Features, PendingOp};
-use git_vista_protocol::WorktreeStatus;
 
 /// `(stage_changes, unstage_changes, select_stage, select_unstage,
 /// discard_changes, delete_untracked)` — named so [`build_worktree_items`]'s
@@ -39,17 +40,18 @@ type WorktreeItems = (
 /// another frame arrives as `0` and `None`, and the items it would have fed
 /// stay absent or disabled.
 ///
-/// Taking the resolved `Option<WorktreeStatus>` rather than the resource is
-/// what keeps that decision unskippable *here*: this function has no reply left
-/// to read, so there is no way to derive a discard or delete path list from one
-/// that was never resolved against the live frame.
+/// Taking the resolved [`ScopedWorktreeStatus`] rather than the resource keeps
+/// two decisions unskippable here: no path can come from a reading outside the
+/// live frame, and the opaque worktree id carried into the operation is the id
+/// that reading was requested with. This function has no live selector to
+/// substitute later.
 pub(super) fn build_worktree_items(
     features: Features,
     ic: &'static GitIcons,
     is_head: bool,
     is_stub: bool,
     staged_count: usize,
-    live_status: Option<WorktreeStatus>,
+    live_status: Option<ScopedWorktreeStatus>,
 ) -> WorktreeItems {
     let Features {
         dialogs,
@@ -209,13 +211,16 @@ pub(super) fn build_worktree_items(
     // classification. Building them here by hand would mean a
     // confirmation the user completes and the server then 409s.
     //
-    // `live_status` arrived already resolved against the live frame (#711), so
-    // every path below belongs to the repository this menu is open on.
+    // `live_status` arrived already resolved against the live frame (#711), and
+    // still carries the WorktreeId used for that read (#733). Copy both the
+    // derived paths and that captured id into PendingOp. Confirm/dispatch must
+    // never resolve the live selection to manufacture a selector.
     let discard_changes = is_head.then(|| {
-        let paths = live_status
-            .as_ref()
-            .map(discardable_tracked_paths)
+        let scoped = live_status.as_ref();
+        let paths = scoped
+            .map(|reading| discardable_tracked_paths(&reading.status))
             .unwrap_or_default();
+        let repo = scoped.map(|reading| reading.repo);
         if paths.is_empty() {
             let reason = if live_status.is_none() {
                 "Waiting for a working-tree status read"
@@ -237,12 +242,14 @@ pub(super) fn build_worktree_items(
             }
             .into_view()
         } else {
+            let repo = repo.expect("a non-empty path list came from a scoped status read");
             let on = move |_| {
                 // Raise the modal *before* `close_menu` disposes this
                 // handler's reactive owner — the ordering rule this
                 // module's doc comment opens with.
                 dialogs.open(Dialog::Confirm);
                 shell.open_confirm(PendingOp::DiscardTrackedPaths {
+                    repo,
                     paths: paths.clone(),
                 });
                 shell.close_menu();
@@ -257,10 +264,11 @@ pub(super) fn build_worktree_items(
         }
     });
     let delete_untracked = is_head.then(|| {
-        let paths = live_status
-            .as_ref()
-            .map(deletable_untracked_paths)
+        let scoped = live_status.as_ref();
+        let paths = scoped
+            .map(|reading| deletable_untracked_paths(&reading.status))
             .unwrap_or_default();
+        let repo = scoped.map(|reading| reading.repo);
         if paths.is_empty() {
             let reason = if live_status.is_none() {
                 "Waiting for a working-tree status read"
@@ -283,9 +291,11 @@ pub(super) fn build_worktree_items(
             }
             .into_view()
         } else {
+            let repo = repo.expect("a non-empty path list came from a scoped status read");
             let on = move |_| {
                 dialogs.open(Dialog::Confirm);
                 shell.open_confirm(PendingOp::DeleteUntrackedPaths {
+                    repo,
                     paths: paths.clone(),
                 });
                 shell.close_menu();

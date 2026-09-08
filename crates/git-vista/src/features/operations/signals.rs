@@ -287,7 +287,7 @@ impl Operations {
                     // only option was to guess `Failed`.
                     if write_binding.get() == DispatchBinding::Pending {
                         write_binding.set(DispatchBinding::Closed);
-                        settle_locally(core, graph, &write_key, reason, false);
+                        settle_locally(core, graph, &write_key, local_settlement(false, reason));
                     }
                 }
                 Ok(receipt) => match receipt.operation.clone() {
@@ -308,7 +308,13 @@ impl Operations {
                     None => {
                         if write_binding.get() == DispatchBinding::Pending {
                             write_binding.set(DispatchBinding::Closed);
-                            settle_locally(core, graph, &write_key, receipt.message, receipt.ok);
+                            settle_locally(
+                                core,
+                                graph,
+                                &write_key,
+                                local_settlement(receipt.ok, receipt.message)
+                                    .with_response(receipt.status, receipt.error_code),
+                            );
                         }
                     }
                 },
@@ -614,11 +620,11 @@ async fn send(kind: &OperationKind, key: IdempotencyKey) -> Result<WriteReceipt,
         // Two arms, not one parameterised by a bool — mirroring the two
         // separate `GitOperation` variants and the two separate endpoints
         // behind them (#71, M2.18a/#219, wired by M2.18b/#220).
-        OperationKind::DiscardTrackedPaths { paths } => {
-            api::discard_tracked_paths_request(paths.clone(), key).await
+        OperationKind::DiscardTrackedPaths { repo, paths } => {
+            api::discard_tracked_paths_request(*repo, paths.clone(), key).await
         }
-        OperationKind::DeleteUntrackedPaths { paths } => {
-            api::delete_untracked_paths_request(paths.clone(), key).await
+        OperationKind::DeleteUntrackedPaths { repo, paths } => {
+            api::delete_untracked_paths_request(*repo, paths.clone(), key).await
         }
         OperationKind::DeleteLocalTag { tag } => api::delete_tag_request(tag, key).await,
         // M11.05 (#550). `name` plays no part in the request — the server
@@ -652,8 +658,7 @@ fn settle_locally(
     core: RwSignal<OperationsCore>,
     graph: RwSignal<GraphCore>,
     key: &IdempotencyKey,
-    message: String,
-    ok: bool,
+    outcome: Settlement,
 ) {
     // `settle` is keyed by operation id, so an operation that never got one needs a
     // client-side handle. The idempotency key is already unique per user action.
@@ -666,7 +671,7 @@ fn settle_locally(
     {
         return;
     }
-    commit_settlement(core, graph, &id, local_settlement(ok, message));
+    commit_settlement(core, graph, &id, outcome);
 }
 
 /// Apply a settlement and act on the invalidation it publishes.
@@ -753,6 +758,7 @@ fn reattach_after_stream_loss(
                         status.state,
                         status.message.clone(),
                         status.generation,
+                        status.status,
                     ) {
                         commit_settlement(core, graph, &id, outcome);
                     }
@@ -819,9 +825,12 @@ fn subscribe(
             let Ok(record) = serde_json::from_str::<OperationStatus>(&text) else {
                 return;
             };
-            let Some(outcome) =
-                Settlement::from_terminal(record.state, record.message.clone(), record.generation)
-            else {
+            let Some(outcome) = Settlement::from_terminal(
+                record.state,
+                record.message.clone(),
+                record.generation,
+                record.status,
+            ) else {
                 return;
             };
             commit_settlement(core, graph, &record.id, outcome);
@@ -925,6 +934,7 @@ fn resume_inflight_remote_op(core: RwSignal<OperationsCore>, graph: RwSignal<Gra
                     status.state,
                     status.message.clone(),
                     status.generation,
+                    status.status,
                 ) {
                     commit_settlement(core, graph, &id, outcome);
                 }
