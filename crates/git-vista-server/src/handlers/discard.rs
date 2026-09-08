@@ -16,6 +16,7 @@
 use axum::http::StatusCode;
 use axum::Json;
 
+use git_vista_core::identity::WorktreeId;
 use git_vista_protocol::{GitOperation, WorktreePath, WorktreePathsRequest};
 
 use crate::planner;
@@ -68,6 +69,37 @@ pub(crate) fn validate_paths(
     Ok(paths)
 }
 
+/// Validate the whole body: the repository selector the list was derived
+/// from, and the paths themselves (#721).
+///
+/// **One function, called by both handlers, rather than two steps each
+/// handler remembers to take.** The lesson is `ResolveConflictRequest`'s,
+/// learned by mutation on #429: a validation step that sits beside a handler
+/// is a step someone can delete, and a test written against the validator
+/// will not notice. Neither endpoint here can reach the planner without
+/// having produced an `Option<WorktreeId>` first, because that value is what
+/// decides which entry point it calls.
+///
+/// A malformed selector is a `400`, worded exactly as the read endpoints'
+/// `?repo=` selector words it (`handlers::read::resolve_repo`) — the id space
+/// is one id space, and a client that got it wrong should not have to learn
+/// two vocabularies for the same mistake. An **absent** selector is not an
+/// error: see [`WorktreePathsRequest`]'s doc comment for why it still cannot
+/// be required, and what that costs.
+fn validate_body(
+    req: WorktreePathsRequest,
+) -> Result<(Option<WorktreeId>, Vec<WorktreePath>), (StatusCode, String)> {
+    let expected = req
+        .repo
+        .as_deref()
+        .map(|id| {
+            id.parse::<WorktreeId>()
+                .map_err(|_| (StatusCode::BAD_REQUEST, "Not a repository id.".to_string()))
+        })
+        .transpose()?;
+    Ok((expected, validate_paths(req)?))
+}
+
 /// `git checkout -- <paths>` (#219): discard uncommitted changes to
 /// already-tracked paths, restoring each to its checked-out (index, else
 /// HEAD) version via [`GitOperation::DiscardTrackedPaths`]. Destructive, and
@@ -79,11 +111,26 @@ pub(crate) async fn discard_tracked_paths(
     if let Some(rejected) = reject_if_read_only() {
         return rejected;
     }
-    let paths = match validate_paths(req) {
-        Ok(paths) => paths,
+    let (expected, paths) = match validate_body(req) {
+        Ok(validated) => validated,
         Err(rejected) => return rejected,
     };
-    planner::plan_and_execute(GitOperation::DiscardTrackedPaths { paths }).await
+    // Two arms, spelled out here rather than behind a shared dispatch helper
+    // — the same reason this endpoint has a twin below instead of one
+    // function taking a bool (#71), plus one this file did not have before:
+    // `planner_funnel_census` proves every git-write handler reaches
+    // `plan_and_execute` in its own body, and a helper would move that proof
+    // one call away from the route.
+    match expected {
+        Some(worktree) => {
+            planner::plan_and_execute_matching(
+                GitOperation::DiscardTrackedPaths { paths },
+                worktree,
+            )
+            .await
+        }
+        None => planner::plan_and_execute(GitOperation::DiscardTrackedPaths { paths }).await,
+    }
 }
 
 /// `git clean -f -- <paths>` (#219): delete untracked paths from the working
@@ -95,11 +142,21 @@ pub(crate) async fn delete_untracked_paths(
     if let Some(rejected) = reject_if_read_only() {
         return rejected;
     }
-    let paths = match validate_paths(req) {
-        Ok(paths) => paths,
+    let (expected, paths) = match validate_body(req) {
+        Ok(validated) => validated,
         Err(rejected) => return rejected,
     };
-    planner::plan_and_execute(GitOperation::DeleteUntrackedPaths { paths }).await
+    // Its own spelling of the same two arms — see the twin above.
+    match expected {
+        Some(worktree) => {
+            planner::plan_and_execute_matching(
+                GitOperation::DeleteUntrackedPaths { paths },
+                worktree,
+            )
+            .await
+        }
+        None => planner::plan_and_execute(GitOperation::DeleteUntrackedPaths { paths }).await,
+    }
 }
 
 #[cfg(test)]
@@ -107,7 +164,12 @@ mod tests {
     use super::*;
 
     fn req(paths: &[&str]) -> WorktreePathsRequest {
+        scoped_req(None, paths)
+    }
+
+    fn scoped_req(repo: Option<&str>, paths: &[&str]) -> WorktreePathsRequest {
         WorktreePathsRequest {
+            repo: repo.map(str::to_string),
             paths: paths.iter().map(|p| p.to_string()).collect(),
         }
     }
@@ -167,5 +229,258 @@ mod tests {
             strs(&validate_paths(req(&["a.txt", "a.txt"])).unwrap()),
             ["a.txt"]
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #721: the repository selector
+    // -----------------------------------------------------------------------
+
+    /// The wire lets `repo` be any string (it is a `String` on the DTO, like
+    /// [`ResolveConflictRequest`](git_vista_protocol::ResolveConflictRequest)'s),
+    /// so the endpoint is where "this is not an id" gets decided — and a
+    /// *path* is the spelling that matters, because the whole identity scheme
+    /// exists so a request can never name the server's filesystem.
+    #[test]
+    fn a_repository_selector_that_is_a_path_is_a_wire_error() {
+        for bad in ["/etc", "..", "../../elsewhere", "", "not-a-uuid"] {
+            let (status, why) = validate_body(scoped_req(Some(bad), &["a.txt"]))
+                .expect_err("{bad:?} must not be accepted as a repository id");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?}: {why}");
+            assert!(why.contains("repository id"), "{bad:?}: {why}");
+        }
+        // The positive control, without which every assertion above would
+        // hold on a `validate_body` that refused every selector outright.
+        let (expected, paths) = validate_body(scoped_req(
+            Some(&WorktreeId::from_git_dir("/x/.git").to_string()),
+            &["a.txt"],
+        ))
+        .expect("a real worktree id is accepted");
+        assert_eq!(expected, Some(WorktreeId::from_git_dir("/x/.git")));
+        assert_eq!(strs(&paths), ["a.txt"]);
+        // And an absent selector is not an error — see the DTO's doc comment.
+        assert_eq!(validate_body(req(&["a.txt"])).unwrap().0, None);
+    }
+
+    /// A repository whose `a.txt` is tracked-and-dirty and whose
+    /// `scratch.txt` is untracked — the two shapes the two endpoints act on,
+    /// deliberately spelled the same way in every fixture below so a path
+    /// name carried from one to another is *valid* in the other.
+    fn dirty_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let (dir, repo) = git_vista_fixtures::seeded_files(&[("a.txt", "a\n")], "seed");
+        dirty_worktree(&repo);
+        (dir, repo)
+    }
+
+    fn dirty_worktree(worktree: &std::path::Path) {
+        std::fs::write(worktree.join("a.txt"), "edited\n").unwrap();
+        std::fs::write(worktree.join("scratch.txt"), "junk\n").unwrap();
+    }
+
+    /// A repository plus a **linked worktree of the same repository**, both
+    /// dirty in the same two paths.
+    ///
+    /// Two sibling worktrees rather than two unrelated repositories, on
+    /// purpose. They share a [`RepositoryId`](git_vista_core::identity::RepositoryId)
+    /// and differ only in [`WorktreeId`] — which is the case this app creates
+    /// by design and switches between, and the one a coarser check (compare
+    /// the *repository*, not the *worktree*) would wave straight through. A
+    /// fixture built from two unrelated repositories cannot express that
+    /// difference at all, so it would call a broken check correct.
+    fn repo_with_a_dirty_sibling() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let (dir, repo) = dirty_repo();
+        git_vista_fixtures::git::run(&repo, &["branch", "desk-branch"]);
+        let desks = tempfile::tempdir().unwrap();
+        let desk = desks.path().join("desk");
+        git_vista_fixtures::git::run(
+            &repo,
+            &["worktree", "add", desk.to_str().unwrap(), "desk-branch"],
+        );
+        dirty_worktree(&desk);
+        (dir, desks, repo, desk)
+    }
+
+    fn porcelain(worktree: &std::path::Path) -> String {
+        git_vista_fixtures::git::out(worktree, &["status", "--porcelain"])
+    }
+
+    async fn keyed(
+        name: &str,
+        future: impl std::future::Future<Output = (StatusCode, String)>,
+    ) -> (StatusCode, String) {
+        crate::operations::with_key(
+            git_vista_protocol::IdempotencyKey::new(name).unwrap(),
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+            future,
+        )
+        .await
+    }
+
+    /// **The test #721 exists for.** A path list built against one worktree,
+    /// sent while a *sibling* worktree of the same repository is selected,
+    /// naming a file that is dirty in both.
+    ///
+    /// This is the case `planner::verify_path_states` structurally cannot
+    /// refuse: it asks "is `a.txt` tracked-dirty here?", the answer is yes,
+    /// and the batch runs. So a test that let the second worktree be clean —
+    /// or that used two unrelated repositories with different files — would
+    /// pass on the *path-state* recheck alone and prove nothing about the
+    /// selector. The fixture makes both worktrees dirty in the same two
+    /// names, which is why the only thing that can refuse this is identity.
+    ///
+    /// Drives the real handler, so the whole chain is under test: the body's
+    /// `repo`, `validate_body`'s parse, the entry point the handler chooses,
+    /// and the planner's comparison against the selection it will act on.
+    #[tokio::test]
+    async fn a_colliding_path_name_from_a_sibling_worktree_is_refused() {
+        crate::state::with_isolated_test_current(async {
+            let (_dir, _desks, repo, desk) = repo_with_a_dirty_sibling();
+            let main = crate::state::set_current(&repo, git_vista_protocol::RepoMode::Active)
+                .expect("the main worktree registers");
+            let sibling = crate::state::set_current(&desk, git_vista_protocol::RepoMode::Active)
+                .expect("the linked worktree registers and becomes the selection");
+
+            // The premise, asserted rather than assumed: one repository, two
+            // worktrees. If these ever stopped holding, the test below would
+            // be measuring something else entirely.
+            assert_eq!(
+                main.repository, sibling.repository,
+                "the fixture must be two worktrees of ONE repository"
+            );
+            assert_ne!(main.worktree, sibling.worktree);
+
+            // And the collision itself: the same two path names are dirty in
+            // both, so the path-state recheck cannot tell them apart.
+            assert_eq!(porcelain(&repo), porcelain(&desk));
+            assert!(porcelain(&repo).contains("a.txt"));
+
+            let before_main = std::fs::read_to_string(repo.join("a.txt")).unwrap();
+            let before_desk = std::fs::read_to_string(desk.join("a.txt")).unwrap();
+
+            let (status, body) = keyed(
+                "issue-721-discard-from-a-sibling",
+                discard_tracked_paths(Json(scoped_req(
+                    Some(&main.worktree.to_string()),
+                    &["a.txt"],
+                ))),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::PRECONDITION_FAILED,
+                "a batch aimed at another worktree must be refused: {body}"
+            );
+            assert_ne!(
+                status,
+                StatusCode::CONFLICT,
+                "and not as the path-state 409 — that code means the file moved"
+            );
+            assert!(
+                body.contains("different repository"),
+                "the refusal must say which kind of wrong this is: {body}"
+            );
+
+            // Nothing ran, in either worktree. The refusal is the point, but
+            // a refusal that had already destroyed something would be worse
+            // than no refusal at all.
+            assert_eq!(
+                std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+                before_main
+            );
+            assert_eq!(
+                std::fs::read_to_string(desk.join("a.txt")).unwrap(),
+                before_desk
+            );
+
+            // The delete twin, on the untracked name that also collides.
+            let (status, body) = keyed(
+                "issue-721-delete-from-a-sibling",
+                delete_untracked_paths(Json(scoped_req(
+                    Some(&main.worktree.to_string()),
+                    &["scratch.txt"],
+                ))),
+            )
+            .await;
+            assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+            assert!(
+                repo.join("scratch.txt").exists(),
+                "the named worktree lost a file"
+            );
+            assert!(
+                desk.join("scratch.txt").exists(),
+                "the selected worktree lost a file"
+            );
+        })
+        .await;
+    }
+
+    /// The positive control for the test above, and it is not optional: every
+    /// assertion there would still hold on a server that refused these two
+    /// endpoints unconditionally, which would be a worse bug than the one
+    /// #721 fixes.
+    ///
+    /// The *matching* selector — the one naming the worktree that really is
+    /// selected — must run the operation, on that worktree and no other.
+    #[tokio::test]
+    async fn a_matching_selector_runs_and_touches_only_the_selected_worktree() {
+        crate::state::with_isolated_test_current(async {
+            let (_dir, _desks, repo, desk) = repo_with_a_dirty_sibling();
+            let _main = crate::state::set_current(&repo, git_vista_protocol::RepoMode::Active)
+                .expect("the main worktree registers");
+            let sibling = crate::state::set_current(&desk, git_vista_protocol::RepoMode::Active)
+                .expect("the linked worktree becomes the selection");
+
+            let (status, body) = keyed(
+                "issue-721-discard-matching",
+                discard_tracked_paths(Json(scoped_req(
+                    Some(&sibling.worktree.to_string()),
+                    &["a.txt"],
+                ))),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(
+                std::fs::read_to_string(desk.join("a.txt")).unwrap(),
+                "a\n",
+                "the selected worktree's file must have been discarded"
+            );
+            assert_eq!(
+                std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+                "edited\n",
+                "the sibling must be untouched — the selector is a precondition, not an address"
+            );
+        })
+        .await;
+    }
+
+    /// The honest record of what #721 did **not** close, pinned so it cannot
+    /// be quietly believed to be closed.
+    ///
+    /// An omitted selector still acts on the current selection, because the
+    /// shipped browser client cannot yet send one (see
+    /// [`WorktreePathsRequest`]'s doc comment). When that changes and the
+    /// field becomes required, this test is the one that must be *deleted and
+    /// replaced* by its opposite — which is exactly why it is written down
+    /// rather than left as an assumption.
+    #[tokio::test]
+    async fn an_omitted_selector_still_acts_on_the_selection_and_that_is_the_open_half() {
+        crate::state::with_isolated_test_current(async {
+            let (_dir, repo) = dirty_repo();
+            crate::state::set_current(&repo, git_vista_protocol::RepoMode::Active)
+                .expect("the repository registers");
+
+            let (status, body) = keyed(
+                "issue-721-unscoped-still-runs",
+                discard_tracked_paths(Json(req(&["a.txt"]))),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "a\n");
+        })
+        .await;
     }
 }

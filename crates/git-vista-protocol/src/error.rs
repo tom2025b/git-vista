@@ -76,6 +76,10 @@ pub enum ErrorCode {
     /// matches the freshly re-read one. The frontend restarts its history
     /// aggregate at page 1 — rows from two different histories never splice.
     Conflict,
+    /// A request precondition does not hold against the server's current
+    /// state (for example, a repository selector no longer matches the
+    /// session selection).
+    PreconditionFailed,
     /// The operation is not permitted in the current state.
     Forbidden,
     /// A write was attempted against a read-only clone.
@@ -101,6 +105,7 @@ impl ErrorCode {
             ErrorCode::Unauthenticated => 401,
             ErrorCode::NotFound => 404,
             ErrorCode::Conflict => 409,
+            ErrorCode::PreconditionFailed => 412,
             ErrorCode::Forbidden | ErrorCode::ReadOnly => 403,
             ErrorCode::GitFailed | ErrorCode::Internal => 500,
         }
@@ -118,6 +123,9 @@ impl ErrorCode {
             // Before the 4xx catch-all below, or a handler's 409 would come
             // back as a generic `bad_request` instead of `conflict`.
             409 => ErrorCode::Conflict,
+            // Likewise, preserve a failed request precondition rather than
+            // flattening it into the generic unrecognised-4xx classification.
+            412 => ErrorCode::PreconditionFailed,
             426 => ErrorCode::ProtocolIncompatible,
             // Every other 4xx — including the 422 an unprocessable body produces
             // (e.g. a rejected unknown field) — is a client error, not a server one.
@@ -258,6 +266,19 @@ mod tests {
         // Drift drives inline "history moved, restarting" UI, never the
         // Update-Required screen.
         assert!(!ErrorCode::Conflict.is_protocol_mismatch());
+    }
+
+    #[test]
+    fn precondition_failed_wire_and_status_mappings_are_stable() {
+        // #721 / ADR 0140: a repository-selector mismatch is not path-state
+        // drift (409) and must survive the server's envelope layer distinctly.
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::PreconditionFailed).unwrap(),
+            "\"precondition_failed\""
+        );
+        assert_eq!(ErrorCode::PreconditionFailed.http_status(), 412);
+        assert_eq!(ErrorCode::from_status(412), ErrorCode::PreconditionFailed);
+        assert!(!ErrorCode::PreconditionFailed.is_protocol_mismatch());
     }
 
     #[test]

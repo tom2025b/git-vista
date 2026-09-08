@@ -1072,6 +1072,15 @@ mod tests {
                 "/api/boom",
                 get(|| async { (StatusCode::NOT_FOUND, "No such commit.") }),
             )
+            .route(
+                "/api/precondition",
+                get(|| async {
+                    (
+                        StatusCode::PRECONDITION_FAILED,
+                        "Repository selection no longer matches.",
+                    )
+                }),
+            )
             // Mimics `planner::amend_refusal`'s exact shape (#323): a handler
             // returning `(StatusCode, String)` where the `String` is already a
             // pre-serialized JSON DTO, produced the same way
@@ -1400,6 +1409,21 @@ mod tests {
         let err: ApiError = serde_json::from_str(&body_string(resp).await).unwrap();
         assert_eq!(err.error.code, ErrorCode::NotFound);
         assert_eq!(err.error.message, "No such commit.");
+    }
+
+    #[tokio::test]
+    async fn a_precondition_failure_keeps_its_distinct_envelope_code() {
+        let resp = app()
+            .oneshot(get_req(
+                "/api/precondition",
+                Some(&PROTOCOL_VERSION.to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+        let err: ApiError = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(err.error.code, ErrorCode::PreconditionFailed);
+        assert_eq!(err.error.message, "Repository selection no longer matches.");
     }
 
     /// #323 regression: a handler's own typed error DTO — the exact shape

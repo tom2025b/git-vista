@@ -2611,6 +2611,10 @@ async fn a_duplicated_delete_request_reports_the_count_that_really_happened() {
 
     let paths =
         crate::handlers::discard::validate_paths(git_vista_protocol::WorktreePathsRequest {
+            // #721 added the field; this test is about the dedupe, and drives
+            // the executor directly rather than the handler, so no selector
+            // is in play here.
+            repo: None,
             paths: vec![
                 "scratch.txt".to_string(),
                 "other.txt".to_string(),
@@ -2651,6 +2655,8 @@ async fn a_duplicated_discard_request_reports_the_count_that_really_happened() {
 
     let paths =
         crate::handlers::discard::validate_paths(git_vista_protocol::WorktreePathsRequest {
+            // #721 added the field; see the delete-side twin above.
+            repo: None,
             paths: vec!["a.txt".to_string(), "a.txt".to_string()],
         })
         .expect("a repeated path is client sloppiness, not a wire error");
