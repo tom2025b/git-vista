@@ -68,14 +68,13 @@ pub(crate) struct BisectLogStep {
 }
 
 /// Git's own bisect state, read fresh — never cached, never mirrored
-/// (ADR 0131 §1). Every field comes from `.git/BISECT_START`,
-/// `.git/BISECT_LOG` or `refs/bisect/*`; there is no field here this app
-/// invented state for.
+/// (ADR 0131 §1). Reads `.git/BISECT_START`, `.git/BISECT_LOG`,
+/// `refs/bisect/*` and HEAD; `finished` is computed from git's candidate range.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct BisectStatus {
     pub in_progress: bool,
     /// What `HEAD` resolves to right now — the current candidate while a
-    /// bisect is in progress. `None` when git could not be read.
+    /// bisect is in progress. `None` when inactive or HEAD could not be read.
     pub current: Option<String>,
     /// `.git/BISECT_START`'s content: the branch or commit `BisectReset`
     /// returns to.
@@ -196,8 +195,8 @@ async fn is_finished(repo: &Path, bad: &str, good: &[String]) -> bool {
 }
 
 /// Read git's own bisect state fresh. Called by `GET /api/bisect/status`
-/// and by every executor in this module after it runs, to decide what
-/// happened — never cached, never mirrored (ADR 0131 §1).
+/// and by the executors to check preconditions and interpret start/mark
+/// outcomes — never cached, never mirrored (ADR 0131 §1).
 pub(crate) async fn discover(repo: &Path) -> BisectStatus {
     let started_from = read_git_file(repo, "BISECT_START")
         .await
@@ -236,7 +235,7 @@ pub(crate) async fn discover(repo: &Path) -> BisectStatus {
 /// A free-text note never moves a ref or touches the index, so it does not
 /// go through the planner — see `GitOperation`'s doc comment on why every
 /// *mutation* does, and ADR 0131 §5 on why a note is not one. Stored at the
-/// per-worktree private path `git rev-path --git-path
+/// per-worktree private path `git rev-parse --git-path
 /// git-vista-bisect-notes.json` — the same worktree-correct resolution
 /// [`discover`] uses, since notes are scoped to the bisect session running
 /// in THIS worktree, not shared with the repository's other worktrees.
@@ -244,9 +243,8 @@ const NOTES_FILE: &str = "git-vista-bisect-notes.json";
 
 // #87: no HTTP route calls either of these yet — `discover`'s `BisectStatus`
 // carries no notes field, and there is no `/api/bisect/note` endpoint to
-// write one. Both are real, host-tested (see the suite below) and awaiting
-// their wiring, the same status `exec_start`/`exec_mark`/`exec_reset` were
-// in before this branch's merge with current main.
+// write one. These helpers are awaiting HTTP wiring and dedicated tests;
+// the planner contract suite currently exercises start/mark/reset.
 #[allow(dead_code)]
 pub(crate) async fn read_notes(repo: &Path) -> std::collections::BTreeMap<String, String> {
     let Some(text) = read_git_file(repo, NOTES_FILE).await else {
