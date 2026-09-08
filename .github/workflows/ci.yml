@@ -701,7 +701,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # THE QUESTION THIS JOB TURNS ON, ASKED FIRST AND CHEAPLY.
+      # The suite needs an unprivileged user namespace, and ubuntu-24.04 ships
+      # the AppArmor clamp that refuses one — measured on run 34268833753, where
+      # `unshare --user` died with "write failed /proc/self/uid_map: Operation
+      # not permitted". This is the same `user_namespaces` capability the Strict
+      # tier needs, provided by the same shared action, so this job is a second
+      # consumer of an existing grant rather than a new one.
+      #
+      # `escape_contract.rs` permits this `uses:` only because the job actually
+      # invokes ci/browser/run.sh, and only while that script still needs a
+      # namespace (#754, ADR 0141). It is not a general licence for workflow
+      # jobs to provision the host.
+      - uses: ./.github/actions/host-sandbox-setup
+
+      # THE QUESTION THIS JOB TURNS ON, ASKED FIRST AND CHEAPLY -- NOW A
+      # VERIFICATION THAT THE PROVISIONING ABOVE ACTUALLY TOOK.
       #
       # ci/browser/run.sh runs the whole tree — server, Chromium, Playwright —
       # inside `unshare --user --map-root-user --net --mount`. It needs its own

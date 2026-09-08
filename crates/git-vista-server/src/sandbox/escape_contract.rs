@@ -2420,6 +2420,30 @@ const WORKFLOW_REL: &str = ".github/workflows/ci.yml";
 /// passing while the action it names had been deleted.
 const HOST_SETUP_ACTION_DIR: &str = ".github/actions/host-sandbox-setup";
 
+/// The browser suite's entrypoint — the **second** reason a job may reference
+/// [`HOST_SETUP_ACTION_DIR`], added by #754.
+///
+/// Until #754 the rule was binary: a job provisions the host **iff** it runs
+/// this crate's Rust tests. The browser suite broke that model honestly rather
+/// than by drift. `ci/browser/run.sh` runs the whole tree inside
+/// `unshare --user --map-root-user --net --mount`, because the server's port is
+/// a compile-time constant and `parse_bind_addr` refuses any other address, so
+/// a test server cannot pick a free port. GitHub's ubuntu-24.04 ships
+/// `kernel.apparmor_restrict_unprivileged_userns=1`, under which that `unshare`
+/// dies with `write failed /proc/self/uid_map: Operation not permitted`
+/// (measured, CI run 34268833753). The capability it needs — `user_namespaces`
+/// — is one the shared action *already* provides for the Strict tier. So this
+/// is a second consumer of an existing capability, not a new grant.
+///
+/// **Why an entrypoint and not a job name.** A job name is cosmetic: renaming
+/// a job to `browser` would otherwise buy it the right to weaken the runner. A
+/// job qualifies here only by actually invoking the suite, and the invocation
+/// is resolved against the tree by [`referenced_repo_scripts`] — so a mention
+/// in prose, or a `.sh` token naming no real file, cannot qualify. Same
+/// reasoning as [`job_uses_local_action`] being value-exact rather than a
+/// substring search.
+const BROWSER_SUITE_ENTRYPOINT: &str = "ci/browser/run.sh";
+
 /// The three host capabilities the composite action exists to provide, each
 /// named by a token that must appear **in the action** and — deliberately, in
 /// the same test — **nowhere in ci.yml itself**.
@@ -2742,6 +2766,36 @@ fn job_uses_local_action(body: &str, action_dir: &str) -> bool {
 ///     script can do better; proving a script *provisions* something requires
 ///     running it.
 ///
+/// # The #754 widening, and what it cost
+///
+/// This rule was binary until #754: a job provisions the host **iff** it runs
+/// this crate's Rust tests. The browser suite needs the same `user_namespaces`
+/// capability for a different reason — `ci/browser/run.sh` runs inside
+/// `unshare --user --map-root-user --net --mount` — so a second qualifying
+/// route was added, keyed on [`BROWSER_SUITE_ENTRYPOINT`]. `has_setup` did not
+/// change, the equality did not change, and ci.yml still may not spell any
+/// `HOST_SETUP_TOKENS` in a step of its own.
+///
+/// **What this test can no longer catch, stated plainly, because every
+/// widening of a guard costs something:**
+///
+///  - **A degenerate invocation still qualifies.** A job running
+///    `ci/browser/run.sh --grep nothing` reads exactly like one running the
+///    whole suite. This test sees an invocation, not an execution. What
+///    covers that is ci.yml's own `EXPECTED_MIN_SPECS` floor — a *different*
+///    guard, in a *different* file, which a later edit could weaken without
+///    this test noticing. Before #754 the qualifying set was one this test
+///    could verify end to end; now one of its two routes leans on a guard it
+///    does not own.
+///  - **The set of jobs permitted to weaken the runner grew by one class.**
+///    That is the point of the change, not an accident of it — but it is
+///    strictly more than before, and the argument for the new class lives in
+///    ADR 0141 rather than in the code.
+///
+/// What is *not* given up: the premise is asserted rather than assumed. The
+/// entrypoint must still contain `unshare`, so a `run.sh` rewritten to need no
+/// namespace takes the privilege down with it instead of inheriting it.
+///
 /// The hole knowingly left open, and the mechanism that actually closes it: this
 /// test cannot prove the action's steps *succeed* on the runner — or that they do
 /// anything at all — only that they are declared. That is
@@ -2766,6 +2820,7 @@ fn every_ci_job_that_runs_this_crates_tests_provisions_the_host_capabilities_the
     let mut needs_setup: BTreeSet<String> = BTreeSet::new();
     let mut has_setup: BTreeSet<String> = BTreeSet::new();
     let mut invocations = 0usize;
+    let mut browser_suite_jobs = 0usize;
 
     for (name, raw_body) in &jobs {
         let body = without_full_line_comments(raw_body);
@@ -2773,10 +2828,11 @@ fn every_ci_job_that_runs_this_crates_tests_provisions_the_host_capabilities_the
         // The job's own steps, plus any repo script those steps run: a job can
         // reach this crate's tests either way, and only one of them is visible
         // in ci.yml.
+        let scripts = referenced_repo_scripts(&body);
         let mut sources: Vec<(String, String)> =
             vec![(format!("{WORKFLOW_REL} job `{name}`"), body.clone())];
-        for script in referenced_repo_scripts(&body) {
-            let text = without_full_line_comments(&read_repo_text(&script));
+        for script in &scripts {
+            let text = without_full_line_comments(&read_repo_text(script));
             sources.push((format!("{script} (run by job `{name}`)"), text));
         }
 
@@ -2790,6 +2846,17 @@ fn every_ci_job_that_runs_this_crates_tests_provisions_the_host_capabilities_the
                     needs_setup.insert(name.clone());
                 }
             }
+        }
+
+        // The second qualifying route (#754). Narrow on purpose: not "a job
+        // that mentions the browser suite" and not "a job named browser", but
+        // one whose steps actually invoke BROWSER_SUITE_ENTRYPOINT, resolved
+        // against the tree. Everything else about the rule is unchanged — this
+        // widens who may provision, never what provisioning is or where it
+        // lives.
+        if scripts.contains(BROWSER_SUITE_ENTRYPOINT) {
+            needs_setup.insert(name.clone());
+            browser_suite_jobs += 1;
         }
 
         if job_uses_local_action(&body, HOST_SETUP_ACTION_DIR) {
@@ -2807,24 +2874,59 @@ fn every_ci_job_that_runs_this_crates_tests_provisions_the_host_capabilities_the
     );
     assert!(
         needs_setup.len() >= 3,
-        "only {} job(s) classified as running git-vista-server's tests ({needs_setup:?}). \
-         `core`, `contract` and `sandbox` all do, so fewer than three means the \
-         classification broke; with an empty set the equality below would be satisfied by \
-         a workflow that provisions nothing at all.",
+        "only {} job(s) classified as needing the host setup ({needs_setup:?}). \
+         `core`, `contract` and `sandbox` all run this crate's tests, so fewer than three \
+         means the classification broke; with an empty set the equality below would be \
+         satisfied by a workflow that provisions nothing at all.",
         needs_setup.len()
+    );
+
+    // #754's route, asserted by name rather than left to the equality below.
+    // If the recognition silently stops matching, the equality does go red —
+    // but it goes red saying "provisions the host without running this crate's
+    // tests", which sends the reader hunting the wrong defect entirely.
+    assert!(
+        browser_suite_jobs >= 1,
+        "no job in {WORKFLOW_REL} was classified as running the browser suite, yet \
+         {BROWSER_SUITE_ENTRYPOINT} is a qualifying route. Either the recognition broke \
+         (the script was renamed, or its invocation stopped resolving against the tree — \
+         teach it deliberately, do not let it degrade into matching nothing), or the \
+         browser job was removed. If it was removed, remove this route with it: a \
+         qualifying route that qualifies nobody is a hole standing open for the next job \
+         that happens to name the script."
+    );
+
+    // WHY the browser suite is allowed to provision, asserted rather than
+    // assumed. The grant exists solely because `run.sh` builds a user
+    // namespace that ubuntu-24.04's AppArmor clamp would otherwise refuse. If
+    // that stops being true — the script is rewritten to bind a free port, say
+    // — the privilege has outlived its reason and must be re-argued rather
+    // than inherited. Without this, #754's widening would be permanent
+    // regardless of whether it stayed justified.
+    let suite_runner = without_full_line_comments(&read_repo_text(BROWSER_SUITE_ENTRYPOINT));
+    assert!(
+        suite_runner.contains("unshare"),
+        "{BROWSER_SUITE_ENTRYPOINT} no longer runs `unshare`, so the browser job's claim on \
+         {HOST_SETUP_ACTION_DIR} has lost the reason #754 granted it: the action weakens the \
+         runner, and it is permitted here only because this script needs a user namespace \
+         the host would otherwise refuse. If the suite genuinely no longer needs one, drop \
+         the `uses:` from the browser job and BROWSER_SUITE_ENTRYPOINT from this test \
+         together."
     );
 
     assert_eq!(
         needs_setup,
         has_setup,
-        "every {WORKFLOW_REL} job that runs git-vista-server's tests must reference the \
-         shared host-setup action `{HOST_SETUP_ACTION_DIR}`, and only those jobs may. \
-         Runs this crate's tests without provisioning the host: {:?} — those jobs \
-         construct the Strict tier, so every git spawn in them is refused rather than \
-         downgraded (ADR 0029) and their failures look like product bugs. Provisions the \
-         host without running this crate's tests: {:?} — the action weakens the runner \
-         (it clears kernel.apparmor_restrict_unprivileged_userns), so a job with no reason \
-         to need it should not carry it. Equality rather than a subset is deliberate: the \
+        "every {WORKFLOW_REL} job that runs git-vista-server's tests **or the browser \
+         suite** must reference the shared host-setup action `{HOST_SETUP_ACTION_DIR}`, and \
+         only those jobs may. Needs the host provisioned but does not reference it: {:?} — \
+         a Rust-test job there constructs the Strict tier, so every git spawn in it is \
+         refused rather than downgraded (ADR 0029) and its failures read as product bugs; \
+         a browser job there would die inside `unshare` under the runner's clamp. \
+         Provisions the host while running neither this crate's tests nor the browser \
+         suite: {:?} — the action weakens the runner, so a job with no reason to need it \
+         must not carry it, and this half of the equality is the original defect class \
+         #754 had to widen without breaking. Equality rather than a subset is deliberate: the \
          defect being fixed was two hand-maintained sides of one relationship drifting, \
          and a subset check only ever sees one direction of that.",
         needs_setup.difference(&has_setup).collect::<Vec<_>>(),
