@@ -1,6 +1,6 @@
 # ADR 0134 — Two censuses that must agree are checked against each other
 
-- **Status:** Accepted — implemented, mutation-proved two ways per invariant. Eleven arms caught and **one survived** (arm 429, in this change's own test — kept in the record below, because it is the fifth instance of this ADR's defect shape and the only one caught by a machine rather than a reader)
+- **Status:** Accepted — implemented, mutation-proved two ways per invariant. Fifteen arms caught and **two survived** (429 and 434, both kept in the record and both closed) — the fifth and sixth instances of this ADR's defect shape, both inside the fix for it, and the only ones no reader caught
 - **Date:** 2026-09-07
 - **Issues:** #690 (two route censuses), #705 (the pre-session allowlist and its runtime)
 - **Extends:** [ADR 0119](0119-a-guarantee-that-holds-only-on-the-success-arm-is-not-a-guarantee.md) — "a list of known sites is not a fix, because that list was already incomplete twice — the safety has to live in the value," applied one level up: not to a list of call sites, but to two independently hand-maintained *descriptions of the same thing*, each individually complete and individually well-guarded, that must both change together
@@ -434,6 +434,72 @@ this change and none of them saw that the test could not fail. A machine that
 breaks the mechanism and re-runs did, in thirty seconds. Reading proves a guard
 is *present*; only breaking the thing it guards proves it is *live*. Every arm
 in this document exists for that reason, and arm 429 is the one that earned it.
+
+### A sixth instance, and the difference between *correct* and *provable*
+
+Reviewing the fix for the fifth, grok found the same shape again one level
+finer: the scanner's **escape flags** were green only because no fixture
+contained the thing they handle.
+
+**The string half was pinnable.** Deleting `escaped` left the suite green
+because no case held a `\"`. A depth-zero case carrying `"x\";y"` closes it —
+arm 433, which truncates to `a == "x\"` when the flag is removed.
+
+**The char half was not pinnable at all, and that is the interesting one.**
+Arm 434 deleted the char branch's `escaped_char` and **survived**. Not because
+the fixture was weak — because *no input could have caught it*. Mis-consuming
+`'\''` leaves a stray quote, which the lifetime path then skips harmlessly, so
+the defect never reaches the function's output. The branch was **correct but
+unobservable**.
+
+That is a genuinely different situation from arm 429, and it has a genuinely
+different fix. A weak fixture is repaired with a better input. An unobservable
+branch cannot be repaired with any input at all: the only honest options are to
+record it as unprovable, or to **move the boundary until it can be seen**.
+
+```mermaid
+flowchart TD
+    F["<b>A branch you cannot prove</b>"]
+    Q{"Can ANY input<br/>make the defect visible<br/>at this boundary?"}
+    W["<b>Weak fixture</b><br/>arm 429<br/>a neighbouring guard<br/>was taking the credit"]
+    U["<b>Unobservable branch</b><br/>arm 434<br/>the defect never reaches<br/>the output at all"]
+    FIX1["<b>Fix: better input</b><br/>remove the neighbour<br/>(depth zero)"]
+    FIX2["<b>Fix: move the boundary</b><br/>extract char_literal_len<br/>and pin it there"]
+    BAD["<b>Not a fix:</b><br/>call it untestable<br/>and move on"]
+
+    F --> Q
+    Q -->|yes| W
+    Q -->|no| U
+    W --> FIX1
+    U --> FIX2
+    U -.->|the tempting wrong turn| BAD
+
+    classDef q fill:#4a148c,color:#ffffff,stroke:#22063f,stroke-width:3px
+    classDef diag fill:#8c1c13,color:#ffffff,stroke:#4a0e08,stroke-width:2px
+    classDef fix fill:#1b5e20,color:#ffffff,stroke:#0b2e10,stroke-width:2px
+    classDef bad fill:#4a4a4a,color:#ffffff,stroke:#222222,stroke-width:2px,stroke-dasharray: 4 3
+    class F,Q q
+    class W,U diag
+    class FIX1,FIX2 fix
+    class BAD bad
+```
+
+`char_literal_len` is now a pure function with its own pins. Recording it as
+"named, not pinned" was the available shortcut, and it was the wrong one: an
+unprovable guard, left in place, inside the change whose entire subject is
+unprovable guards.
+
+| # | mutation | verdict |
+|---|---|---|
+| 433 | delete the string `escaped` flag | **caught** — truncates to `a == "x\"` |
+| 434 | delete the char `escaped_char` flag, folded in the scanner | **survived** — unobservable, not merely untested |
+| 435 | the same escape rule, after extraction | **caught** — `'\''` measures `Some(3)`, want `Some(4)` |
+| 436 | measure the payload in chars rather than bytes | **caught** — `'é'` measures `Some(3)`, want `Some(4)`; this is the bug that would slice mid-character and panic |
+
+**The rule this leaves behind**, and it is the sharper version of the one arm
+429 produced: *for each mechanism you claim to prove, construct the input where
+every other guard is absent — and if no such input exists, the boundary is
+wrong, not the test.*
 
 ---
 
