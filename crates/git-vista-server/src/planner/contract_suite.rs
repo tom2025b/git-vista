@@ -3485,6 +3485,98 @@ fn every_git_write_route_reaches_the_planner() {
 /// The production composition itself: [`plan_and_execute`]'s body must call
 /// `build_plan`, `validate`, `enforce_fresh` and `execute`, in that order.
 /// The pipeline tests above drive the same stages with injected tokens (the
+/// #690: the meta-census. Two independently hand-maintained tables classify
+/// the same routes for different reasons — `route_authz::ROUTE_AUTHZ`
+/// (crates/git-vista-server/src/route_authz.rs) says how each route is
+/// *authorized*, [`post_route_census`] above says how each POST route relates
+/// to the *planner* — and each is separately well-guarded against `main.rs`.
+/// Nothing linked the two to each other.
+///
+/// That gap is not hypothetical: building #584/PR#688, adding
+/// `POST /api/settings/token` surfaced `ROUTE_AUTHZ` immediately (a
+/// `PostToolUse` hook runs its census the moment `main.rs` is edited) and did
+/// not surface this file's table at all. It failed only later, in CI's
+/// `M1.06 write contract +` job, because the local check that ran alongside
+/// the edit was `cargo test -p git-vista-server --bins` — which never
+/// compiles `#[cfg(test)] mod contract_suite`, so the second table was not
+/// merely un-consulted, it was un-compiled.
+///
+/// This test asserts the two POST route sets are *identical*, naming the
+/// exact route and the exact table missing it. It reads both tables directly
+/// rather than re-scanning `main.rs` a third way, which would only add a
+/// third hand-maintained thing to keep in sync. The property that matters is
+/// the one the issue asks for and a one-sided check cannot give: satisfying
+/// **one** census leaves this one red until the **other** is updated too.
+#[test]
+fn route_authz_and_write_contract_agree_on_every_post_route() {
+    use std::collections::BTreeSet;
+
+    let authz_posts: BTreeSet<&str> = crate::route_authz::ROUTE_AUTHZ
+        .iter()
+        .filter(|(_, method, _)| *method == axum::http::Method::POST)
+        .map(|(path, _, _)| *path)
+        .collect();
+
+    // `post_route_census`'s first row names a handler, not a path, because
+    // session bootstrap is registered with a bare `.post(create_session)`
+    // rather than a `.route("/api/session", ...)`. Its real route is
+    // `POST /api/session`, which is exactly how `route_authz.rs` names it —
+    // map across so both sets are keyed the same way.
+    //
+    // #724 review (grok): "keep this the only exception" used to live only in
+    // that comment, guarding an open `if`. An *unmapped* extra handler-named
+    // row does fail the set difference below, but a second *mapped* exception
+    // would sail straight through — comment-only discipline, which is the exact
+    // class this test exists to close. So the exception set is asserted rather
+    // than described: every row names a path, except exactly the one known
+    // handler-named row.
+    let handler_named: Vec<&str> = post_route_census()
+        .iter()
+        .map(|(route, _, _)| *route)
+        .filter(|route| !route.starts_with('/'))
+        .collect();
+    assert_eq!(
+        handler_named,
+        ["create_session"],
+        "post_route_census() rows must name a route path. Exactly one names a handler \
+         instead — `create_session`, because session bootstrap is registered with a bare \
+         `.post(create_session)` rather than a `.route(\"/api/session\", ...)`. Found \
+         {handler_named:?}. A second handler-named row means the two censuses have stopped \
+         describing the same thing: give it a real path, or extend the mapping below AND \
+         this assertion together — never the mapping alone."
+    );
+
+    let contract_posts: BTreeSet<&str> = post_route_census()
+        .iter()
+        .map(|(route, _, _)| {
+            if *route == "create_session" {
+                "/api/session"
+            } else {
+                route
+            }
+        })
+        .collect();
+
+    let missing_from_contract: Vec<&str> =
+        authz_posts.difference(&contract_posts).copied().collect();
+    assert!(
+        missing_from_contract.is_empty(),
+        "ROUTE CENSUS MISMATCH: POST {missing_from_contract:?} classified in ROUTE_AUTHZ \
+         (crates/git-vista-server/src/route_authz.rs) but absent from this file's \
+         post_route_census(). Classify it there too: a git write needs GitWrite(entry) \
+         plus its funnel proof; a catalog/credential/auth write needs NonGitWrite; a \
+         read wearing POST needs ReadLike."
+    );
+
+    let missing_from_authz: Vec<&str> = contract_posts.difference(&authz_posts).copied().collect();
+    assert!(
+        missing_from_authz.is_empty(),
+        "ROUTE CENSUS MISMATCH: POST {missing_from_authz:?} classified in this file's \
+         post_route_census() but absent from ROUTE_AUTHZ \
+         (crates/git-vista-server/src/route_authz.rs). Classify its authorization there."
+    );
+}
+
 /// process-global selection is set-once per process, owned by `state`'s own
 /// test); this pin guarantees the entry point requests actually take composes
 /// exactly the stages those tests prove.

@@ -49,7 +49,9 @@ mod status;
 mod tags;
 
 pub use activity::{fetch_activity, fetch_undoables, undo_request};
-pub use bisect::{bisect_mark_request, bisect_reset_request, bisect_start_request};
+pub use bisect::{
+    bisect_mark_request, bisect_reset_request, bisect_start_request, fetch_bisect_status_for,
+};
 pub use blame::{fetch_blame, fetch_file_history};
 pub use branches::{
     branch_op_request, create_branch_request, fetch_head_branch, fetch_rebase_status,

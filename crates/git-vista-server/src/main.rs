@@ -93,8 +93,12 @@ mod ratelimit;
 // after re-deriving and matching it server-side. See
 // docs/superpowers/specs/2026-08-18-m3-recovery-center.md.
 mod recovery_center;
+// #690: `pub(crate)`, not private — `planner::contract_suite`'s
+// `route_authz_and_write_contract_agree_on_every_post_route` reads
+// `route_authz::ROUTE_AUTHZ` directly to cross-check it against that file's
+// own independently hand-maintained POST-route table.
 #[cfg(test)]
-mod route_authz;
+pub(crate) mod route_authz;
 // M1.13b (#66): the git-process sandbox — the pure argv chokepoint, the tier
 // enum, the gitdir validation, and the spawn wrappers every production spawn
 // site goes through. The fused shim it launches is `src/bin/gv-sandbox.rs`.
@@ -535,6 +539,8 @@ fn api_router(
         // behind, and the staged/unstaged/untracked/conflicted file lists —
         // resolved fresh per request, like `head_branch`.
         .route("/api/status", get(worktree_status))
+        // #708 (ADR 0138): observe git's bisect session on both read profiles.
+        .route("/api/bisect/status", get(handlers::bisect::bisect_status))
         // #68c: the generation-tagged WorktreeStatus DTO (#68a/#68b), additive
         // alongside the v1 shape above — not a replacement. See handlers::read
         // for why both exist side by side.
@@ -732,9 +738,7 @@ fn api_router(
                 "/api/stash/branch",
                 post(handlers::stash::branch_from_stash),
             )
-            // M5.34 (#87, ADR 0131): start/mark/reset a bisect session. No
-            // `GET /api/bisect/status` yet — see handlers/bisect.rs's module
-            // doc for why that is deliberately its own, separable slice.
+            // M5.34 (#87, ADR 0131): start/mark/reset a bisect session.
             .route("/api/bisect/start", post(handlers::bisect::bisect_start))
             .route("/api/bisect/mark", post(handlers::bisect::bisect_mark))
             .route("/api/bisect/reset", post(handlers::bisect::bisect_reset))

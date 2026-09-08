@@ -35,7 +35,7 @@ use std::path::Path;
 /// entirely; `SessionRequired` reads need a live session; `SessionAndCsrf`
 /// writes need a live session *and* a matching CSRF header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Authz {
+pub(crate) enum Authz {
     Unauthenticated,
     SessionRequired,
     SessionAndCsrf,
@@ -48,7 +48,13 @@ enum Authz {
 ///
 /// Ordered to match `main.rs`'s own registration order, so a diff between
 /// the two reads the same way top to bottom.
-const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
+///
+/// `pub(crate)`, not private: #690's
+/// `route_authz_and_write_contract_agree_on_every_post_route` (in
+/// `planner::contract_suite`) reads this table directly to cross-check it
+/// against that file's own independently hand-maintained POST-route table —
+/// see that test's doc comment for why the cross-check exists at all.
+pub(crate) const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     // -- always registered (both the loopback and LAN routers build these) --
     ("/api/frame", Method::GET, Authz::SessionRequired),
     ("/api/commits", Method::GET, Authz::SessionRequired),
@@ -80,6 +86,11 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     ("/api/blame", Method::GET, Authz::SessionRequired),
     ("/api/head-branch", Method::GET, Authz::SessionRequired),
     ("/api/status", Method::GET, Authz::SessionRequired),
+    // #708 (ADR 0138): git's current bisect state is a repository read.
+    // It is available on both listener profiles and requires a live session,
+    // like the working-tree status beside it. GET has no CSRF surface: unlike
+    // the start/mark/reset routes, discovery never mutates the repository.
+    ("/api/bisect/status", Method::GET, Authz::SessionRequired),
     // #68c: the generation-tagged WorktreeStatus DTO — same read posture as
     // the v1 endpoint immediately above.
     ("/api/status/v2", Method::GET, Authz::SessionRequired),
@@ -378,7 +389,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// this constant and its test are for. Derived by running
 /// `every_registered_route_is_classified`, never copied from either side of a
 /// merge.
-const EXPECTED_ROUTE_COUNT: usize = 82;
+const EXPECTED_ROUTE_COUNT: usize = 83;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in
@@ -643,6 +654,378 @@ fn unauthenticated_routes_are_a_pinned_short_allowlist() {
              (or was reclassified without updating EXPECTED_UNAUTHENTICATED)",
             expected.1,
             expected.0
+        );
+    }
+}
+
+/// #705: the runtime exemption and [`EXPECTED_UNAUTHENTICATED`] describe the
+/// same set, and both describe it as `(path, method)` pairs.
+///
+/// The table above presents itself as *the* pre-session allowlist, pinned
+/// exactly. `security.rs`'s `require_auth` is what actually enforces it, and
+/// the two were written independently: the table reasoned in pairs while the
+/// runtime's negotiation clause tested the path alone, exempting every method
+/// on `/api/protocol`. Nothing was bypassable — `main.rs` registers only
+/// `get(protocol_info)`, so a write method ended at 405 — but the *audit* was
+/// false: a future `POST /api/protocol` could have been classified
+/// `SessionAndCsrf` here, satisfied every test in this file, and run
+/// unauthenticated.
+///
+/// A count or a comment cross-reference would not have caught that; both sides
+/// counted three. What was missing is a check on the *shape* of the runtime
+/// clause, which is what this test makes structural: every disjunct of
+/// `session_exempt` must test a method as well as a path. Dropping the method
+/// test from any clause fails here, by name, in the same test binary as the
+/// table it would have falsified.
+/// Byte length of the Rust char literal starting at the `'` that begins `s`,
+/// including both quotes — or `None` when `s` starts a lifetime or label
+/// (`'a`, `'static`, `'outer:`) rather than a literal.
+///
+/// Split out of [`session_exempt_expression`] so the escape rule is pinnable.
+/// Folded into the scanner it was not: mis-consuming `'\''` left a stray quote
+/// that the lifetime path skipped harmlessly, so no input could make the defect
+/// visible in the scanner's output (`mutation_check` arm 434, `survived`). A
+/// branch that cannot be observed cannot be proved, which is the whole
+/// complaint of ADR 0134 — so the fix is to move the boundary, not to write
+/// the branch off as untestable.
+///
+/// Known limit, stated rather than assumed away: a unicode escape
+/// (`'\u{3b}'`) is not recognised and reads as a lifetime, so the scanner
+/// skips only its quote. Harmless here because such a literal contains no
+/// literal `;` to expose, and `session_exempt` has never held one.
+fn char_literal_len(s: &str) -> Option<usize> {
+    let mut chars = s.chars();
+    if chars.next()? != '\'' {
+        return None;
+    }
+    let first = chars.next()?;
+    if first == '\\' {
+        // `'\n'`, `'\''`, `'\\'`: escape, one payload char, closing quote.
+        let payload = chars.next()?;
+        if chars.next()? != '\'' {
+            return None;
+        }
+        return Some(1 + 1 + payload.len_utf8() + 1);
+    }
+    // `'x'` is a literal; `'x` without a closing quote is a lifetime. This is
+    // how Rust itself lexes the ambiguity.
+    if chars.next()? != '\'' {
+        return None;
+    }
+    Some(1 + first.len_utf8() + 1)
+}
+
+/// The right-hand side of `security.rs`'s `let session_exempt = ...;`, ending
+/// at the `;` that actually terminates the statement.
+///
+/// #724 review (grok): the first version of this test scanned to the first `;`
+/// after the binding with no string awareness, justified by a comment asserting
+/// the expression "contains no string literals or nested statements". That is a
+/// claim about code nobody has written yet, not a check on it. A `;` inside a
+/// string literal in any clause truncates the slice, and the truncated head can
+/// still contain both `||` arms, both `Method::` tests and both path constants
+/// — so every assertion below passes while a trailing `|| path == "/api/x"`
+/// goes entirely unread. An inert guard, inside the guard, in the change whose
+/// whole subject is inert guards.
+///
+/// So this tracks string literals the same way [`strip_line_comments`] does,
+/// tracks bracket depth, and returns `None` rather than a truncated slice when
+/// the statement never closes at depth zero — a caller that unwraps it fails
+/// loudly instead of silently reading half an expression.
+fn session_exempt_expression(code: &str) -> Option<&str> {
+    let start = code.find("let session_exempt =")?;
+    let rest = &code[start..];
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut chars = rest.char_indices().peekable();
+    while let Some((i, ch)) = chars.next() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            // A `'` is a char literal or a lifetime/label, and only position
+            // tells them apart — which is why this decision lives here rather
+            // than in a whole-expression `contains('\'')` test, which refused
+            // `&'a T`, `'static` and `'label:` as if they were literals
+            // (grok's review of #724). `'x'` and `'\n'` are consumed whole so a
+            // `;` inside one cannot end the statement; `'a` is a lifetime and
+            // only the quote is skipped.
+            '\'' => {
+                // Delegated to a pure function so the escape rule is pinnable
+                // on its own. Inline, `'\''` mis-consumed only ever left a
+                // stray quote that the lifetime path then skipped, so the
+                // escape branch could not be observed through this function's
+                // output at all — `mutation_check` arm 434 returned `survived`
+                // against it. Moving the boundary is what made it testable;
+                // documenting it as untestable would have left exactly the kind
+                // of unprovable guard this file exists to reject.
+                if let Some(len) = char_literal_len(&rest[i..]) {
+                    // Skip the literal's remaining bytes; `i` is already past
+                    // the opening quote's own byte.
+                    let end = i + len;
+                    while let Some(&(j, _)) = chars.peek() {
+                        if j < end {
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ';' if depth == 0 => return Some(&rest[..i]),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// [`char_literal_len`]'s own pins, including the escape rule that could not
+/// be observed through [`session_exempt_expression`]'s output at all
+/// (`mutation_check` arm 434, `survived`). This is the boundary move that made
+/// it provable: the same rule, tested where its result is visible.
+#[test]
+fn a_char_literal_is_measured_and_a_lifetime_is_not() {
+    // Plain literals: quote, one char, quote.
+    assert_eq!(char_literal_len("'x'"), Some(3));
+    assert_eq!(
+        char_literal_len("';'"),
+        Some(3),
+        "a `;` is an ordinary payload"
+    );
+    assert_eq!(char_literal_len("'\"'"), Some(3), "a double quote is too");
+
+    // The escape rule. Without it `'\''` measures 3 and leaves a stray quote —
+    // the defect arm 434 could not see.
+    assert_eq!(
+        char_literal_len(r"'\''"),
+        Some(4),
+        "an escaped quote is part of the literal, not its terminator"
+    );
+    assert_eq!(char_literal_len(r"'\\'"), Some(4), "an escaped backslash");
+    assert_eq!(char_literal_len(r"'\n'"), Some(4), "an ordinary escape");
+
+    // Lifetimes and labels are not literals and must measure as None, so the
+    // scanner skips only the quote and keeps reading.
+    assert_eq!(char_literal_len("'a"), None, "a lifetime");
+    assert_eq!(char_literal_len("'static"), None, "a named lifetime");
+    assert_eq!(char_literal_len("'outer:"), None, "a loop label");
+    assert_eq!(
+        char_literal_len("'a>"),
+        None,
+        "a lifetime in a generic list"
+    );
+
+    // Not a candidate at all.
+    assert_eq!(char_literal_len("x"), None);
+    assert_eq!(char_literal_len("'"), None, "a bare quote closes nothing");
+    assert_eq!(char_literal_len(""), None);
+
+    // Multi-byte payloads are measured in BYTES, since the caller slices with
+    // the result. A char count would slice mid-character and panic.
+    assert_eq!(char_literal_len("'é'"), Some(4), "é is two bytes");
+}
+
+/// #724 review: [`session_exempt_expression`] is a pure function, so it is
+/// tested directly rather than only through mutations of `security.rs`.
+///
+/// This exists because of a distinction worth keeping: the first fix for
+/// grok's finding *refused* char literals rather than parsing them, and a
+/// mutation proving the refusal fires proves only that — not that the input is
+/// handled. Taking grok's second suggestion turned the refusal into real
+/// handling, so the honest follow-up is to prove the handling. Each case below
+/// is one input class that could silently truncate the scan.
+#[test]
+fn the_session_exempt_scanner_reads_whole_statements() {
+    // The shape in the file today: no literals, one nested `matches!`.
+    let plain = "let session_exempt = (a == B && m == M::GET)\n || (c == D);\nlet next = 1;";
+    assert_eq!(
+        session_exempt_expression(plain),
+        Some("let session_exempt = (a == B && m == M::GET)\n || (c == D)"),
+        "the plain expression must be returned whole, stopping at its own `;`"
+    );
+
+    // grok's finding: a `;` inside a string must not end the statement, or the
+    // trailing clause goes unread while every assertion still passes.
+    let stringly =
+        "let session_exempt = (a == B && p != \"x;y\")\n || p == \"/api/evil\";\nnext();";
+    let got = session_exempt_expression(stringly).expect("a `;` in a string is not a terminator");
+    assert!(
+        got.contains("/api/evil"),
+        "the clause after the `;`-bearing string was truncated away: {got}"
+    );
+
+    // These next two are deliberately at bracket depth ZERO. An earlier
+    // version of this test wrapped every literal in parentheses, so `depth > 0`
+    // skipped the `;` and the literal handling was never exercised at all —
+    // `mutation_check` proved it by disabling char-literal consumption and
+    // watching this test stay green (`survived`, arm 429). A case that cannot
+    // fail on the mechanism it names is the exact defect this file exists to
+    // catch, so the isolating cases are the point, not decoration.
+    let string_at_depth_zero = "let session_exempt = a == \"x;y\" || p == \"/api/evil\";\nnext();";
+    let got = session_exempt_expression(string_at_depth_zero)
+        .expect("a `;` in a top-level string is not a terminator");
+    assert!(
+        got.contains("/api/evil"),
+        "string tracking is not doing the work — a top-level `;` in a string truncated \
+         the scan: {got}"
+    );
+
+    let char_at_depth_zero = "let session_exempt = a == ';' || p == \"/api/evil\";\nnext();";
+    let got = session_exempt_expression(char_at_depth_zero)
+        .expect("a `;` in a top-level char literal is not a terminator");
+    assert!(
+        got.contains("/api/evil"),
+        "char-literal consumption is not doing the work — a top-level `';'` truncated \
+         the scan: {got}"
+    );
+
+    // The string branch's ESCAPE flag, pinned. grok's review of this delta:
+    // deleting `escaped` left the whole suite green, because no fixture
+    // contained a `\"`. That is arm 429's shape one level finer — a branch
+    // green because the fixture lacks the thing it handles, not because it
+    // works. A raw string keeps the `\"` intact for the scanner to meet.
+    let escaped_quote_in_string = r#"let session_exempt = a == "x\";y" || p == "/api/evil";"#;
+    let got = session_exempt_expression(escaped_quote_in_string)
+        .expect("an escaped quote does not end the string");
+    assert!(
+        got.contains("/api/evil"),
+        "the string escape flag is not doing the work — an escaped quote closed the \
+         string early and the interior `;` truncated the scan: {got}"
+    );
+
+    // A `;` inside a CHAR literal is the same trap one notch smaller.
+    let charly = "let session_exempt = (a == B && c != ';')\n || p == \"/api/evil\";\nnext();";
+    let got =
+        session_exempt_expression(charly).expect("a `;` in a char literal is not a terminator");
+    assert!(
+        got.contains("/api/evil"),
+        "the clause after the `;`-bearing char literal was truncated away: {got}"
+    );
+
+    // An escaped quote inside a char literal must not end the literal early.
+    let escaped = "let session_exempt = (c != '\\'' && d != ';')\n || p == \"/api/evil\";\nnext();";
+    let got =
+        session_exempt_expression(escaped).expect("an escaped quote does not end the literal");
+    assert!(
+        got.contains("/api/evil"),
+        "an escaped quote in a char literal truncated the scan: {got}"
+    );
+
+    // Lifetimes and labels are NOT char literals. The old whole-expression
+    // `contains('\'')` check refused these outright; the scanner must read
+    // straight through them.
+    let lifetimes =
+        "let session_exempt = f::<'a>(x) && g(&'static y)\n || p == \"/api/evil\";\nnext();";
+    let got = session_exempt_expression(lifetimes)
+        .expect("a lifetime is not a char literal and must not be refused");
+    assert!(
+        got.contains("/api/evil"),
+        "a lifetime annotation truncated the scan: {got}"
+    );
+
+    // A `;` nested inside a block belongs to that block, not to this statement.
+    let nested = "let session_exempt = { let t = 1; t == 1 }\n || p == \"/api/evil\";\nnext();";
+    let got = session_exempt_expression(nested).expect("a nested `;` is not the terminator");
+    assert!(
+        got.contains("/api/evil"),
+        "a `;` inside a nested block truncated the scan: {got}"
+    );
+
+    // An unterminated statement yields None rather than a truncated slice, so
+    // the caller fails loudly instead of reading half an expression.
+    assert_eq!(
+        session_exempt_expression("let session_exempt = (a == B"),
+        None,
+        "an unclosed statement must be None, never a partial read"
+    );
+    assert_eq!(
+        session_exempt_expression("let something_else = 1;"),
+        None,
+        "no binding means no expression"
+    );
+}
+
+#[test]
+fn the_pre_session_exemption_is_method_qualified() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/security.rs");
+    let src = std::fs::read_to_string(&path).expect("readable security.rs");
+    let code = strip_line_comments(&src);
+    let expr = session_exempt_expression(&code)
+        .expect("security.rs still binds session_exempt, and that statement closes");
+
+    // Char literals and lifetimes the scanner now handles outright. Block
+    // comments it does not: `strip_line_comments` only strips `//`, so a
+    // `/* ... */` inside this expression would still be scanned as code. That
+    // is a narrower gap than the one grok found, but it is a gap, so it
+    // refuses loudly rather than being assumed away — assuming it away is what
+    // made the first version of this test inert.
+    assert!(
+        !expr.contains("/*"),
+        "the session_exempt expression now contains a block comment, which \
+         session_exempt_expression() does not model — strip_line_comments only removes \
+         `//`. Extend the scanner before trusting this test again; do not delete the \
+         check. Expression was: {expr}"
+    );
+
+    let clauses: Vec<&str> = expr.split("||").collect();
+    assert_eq!(
+        clauses.len(),
+        EXPECTED_UNAUTHENTICATED
+            .iter()
+            .map(|(p, _)| *p)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        "security.rs's session_exempt has {} clauses but EXPECTED_UNAUTHENTICATED covers {} \
+         distinct paths. The runtime pre-session allowlist and this file's pinned one have \
+         diverged — reconcile them, then update this test. Expression was: {expr}",
+        clauses.len(),
+        EXPECTED_UNAUTHENTICATED
+            .iter()
+            .map(|(p, _)| *p)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    );
+
+    for clause in &clauses {
+        assert!(
+            clause.contains("Method::"),
+            "a session_exempt clause exempts a path for EVERY method: `{}`. \
+             Every pre-session exemption must be method-qualified — \
+             EXPECTED_UNAUTHENTICATED above pins (path, method) pairs, and a \
+             path-only clause makes that table a false audit the moment someone \
+             registers a write handler on that path (#705). Full expression: {expr}",
+            clause.trim()
+        );
+    }
+
+    // Each pinned path must actually appear in the runtime expression, by the
+    // constant that names it — so renaming a path in one place and not the
+    // other cannot pass.
+    for (pinned_path, _) in EXPECTED_UNAUTHENTICATED {
+        let named = match *pinned_path {
+            "/api/protocol" => "NEGOTIATION_PATH",
+            "/api/session" => "SESSION_PATH",
+            other => panic!(
+                "EXPECTED_UNAUTHENTICATED gained the path {other}, which this test does not \
+                 know the runtime constant for. Add it to the mapping here so the pre-session \
+                 allowlist stays checked against security.rs, rather than deleting the check."
+            ),
+        };
+        assert!(
+            expr.contains(named),
+            "EXPECTED_UNAUTHENTICATED pins {pinned_path}, but security.rs's session_exempt \
+             never mentions {named}. The pinned allowlist and the runtime one have diverged."
         );
     }
 }
