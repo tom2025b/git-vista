@@ -782,8 +782,16 @@ jobs:
       # Both are prerequisites run.sh checks for by hand before it starts, so a
       # missing one reads as a build step that did not happen rather than as a
       # spec failing against an empty directory (#448 / ADR 0076).
+      # `gv-sandbox` is an auto-discovered bin (`src/bin/gv-sandbox/main.rs`,
+      # no `[[bin]]` section), so an explicit `--bin` list silently excludes
+      # it. `shim_path()` looks for the shim *beside* the server binary, and
+      # without it `boot_probe_policy` fails, the boot probe reports the
+      # residual `missing=["strict_launch"]`, and the server refuses to start
+      # under INV-13 — the suite then executes zero specs. Under `cargo test`
+      # `tests/forces_shim_build.rs` pulls the shim into the build plan; a
+      # `cargo build --bin` has no such backstop and must name it (#754).
       - name: Build the binaries the harness requires
-        run: cargo build -p git-vista-server -p git-vista-fixtures --bin git-vista-server --bin gv-fixture
+        run: cargo build -p git-vista-server -p git-vista-fixtures --bin git-vista-server --bin gv-sandbox --bin gv-fixture
 
       - name: Take the bundle `frontend` built
         uses: actions/download-artifact@v4
