@@ -631,32 +631,50 @@ diff --git a/bar.txt b/bar.txt
     /// countdown desync eating the rest of the patch) must not be mistaken
     /// for a fast correct one.
     fn time_diff_walks(num_hunks: usize) -> (std::time::Duration, std::time::Duration, usize) {
+        time_diff_walks_repeated(num_hunks, 1)
+    }
+
+    /// The same measurement accumulated over `repetitions` walks of one
+    /// generated patch. Repeating the small walk gives the scaling test a
+    /// baseline above the scheduler's few-millisecond noise floor without
+    /// making its already-large fixture any larger. Every repetition keeps
+    /// the fast-wrong-answer checks: accumulated time is evidence only when
+    /// every walk traversed the whole input.
+    fn time_diff_walks_repeated(
+        num_hunks: usize,
+        repetitions: usize,
+    ) -> (std::time::Duration, std::time::Duration, usize) {
+        assert!(repetitions > 0, "a timing batch must contain a walk");
         let patch = generate_patch(num_hunks, 3);
         let bytes = patch.len();
+        let mut sel_elapsed = std::time::Duration::ZERO;
+        let mut flat_elapsed = std::time::Duration::ZERO;
 
-        let start = std::time::Instant::now();
-        let sel = selectable_hunks(&patch);
-        let sel_elapsed = start.elapsed();
-        assert_eq!(
-            sel.len(),
-            num_hunks,
-            "selectable_hunks found {} of {num_hunks} synthetic hunks — a \
-             fast wrong answer, not a fast correct one; the measurement is \
-             not trustworthy if this fails",
-            sel.len()
-        );
+        for _ in 0..repetitions {
+            let start = std::time::Instant::now();
+            let sel = selectable_hunks(&patch);
+            sel_elapsed += start.elapsed();
+            assert_eq!(
+                sel.len(),
+                num_hunks,
+                "selectable_hunks found {} of {num_hunks} synthetic hunks — a \
+                 fast wrong answer, not a fast correct one; the measurement is \
+                 not trustworthy if this fails",
+                sel.len()
+            );
 
-        let start = std::time::Instant::now();
-        let flat = crate::features::diff::rows::flatten(
-            &git_vista_protocol::diff::parse_unified_diff(&patch),
-        );
-        let flat_elapsed = start.elapsed();
-        assert_eq!(
-            flat.hunk_count, num_hunks,
-            "flatten found {} of {num_hunks} synthetic hunks — same \
-             fast-wrong-answer guard as above",
-            flat.hunk_count
-        );
+            let start = std::time::Instant::now();
+            let flat = crate::features::diff::rows::flatten(
+                &git_vista_protocol::diff::parse_unified_diff(&patch),
+            );
+            flat_elapsed += start.elapsed();
+            assert_eq!(
+                flat.hunk_count, num_hunks,
+                "flatten found {} of {num_hunks} synthetic hunks — same \
+                 fast-wrong-answer guard as above",
+                flat.hunk_count
+            );
+        }
 
         (sel_elapsed, flat_elapsed, bytes)
     }
@@ -687,33 +705,50 @@ diff --git a/bar.txt b/bar.txt
         }
     }
 
-    /// A scaling check, not just a wall-clock one: 10x the hunk count must
-    /// not cost anywhere near 10x-squared the time. Both walks are O(n) by
-    /// construction (linear passes over lines), so time should scale roughly
-    /// linearly; this asserts a generous *upper* bound on the ratio (25x for
-    /// a 10x size increase) loose enough to absorb real per-call overhead
-    /// and a loaded CI runner, but tight enough that an accidental quadratic
-    /// reintroduction — which would show roughly a 10x *further* slowdown on
-    /// top of the expected 10x, i.e. close to 100x — still fails it. This is
-    /// the check that would actually catch a "rescan-per-hunk" regression;
-    /// the wall-clock budget test below would not reliably catch it until it
-    /// got much worse.
+    /// A scaling check, not just a wall-clock one. The two sides process the
+    /// same total number of hunks: ten 2,000-hunk walks versus one 20,000-hunk
+    /// walk. Linear work should therefore take roughly the same total time;
+    /// quadratic work makes the single large walk roughly 10x slower.
+    ///
+    /// The ten-walk batch is the important noise-floor control. It raises the
+    /// small side from one ~3.7ms scheduling slice to ~37ms of measured work,
+    /// while retaining the 10x input-size contrast and without growing the
+    /// 2.9 MB large fixture. The 5x boundary sits between the linear (1x) and
+    /// quadratic (10x) models; the configuration assertion pins that property
+    /// so loosening the boundary cannot silently admit the regression this
+    /// test exists to catch.
     #[test]
     fn diff_walks_scale_roughly_linearly_not_quadratically() {
-        let (sel_small, flat_small, _) = time_diff_walks(2_000);
-        let (sel_large, flat_large, _) = time_diff_walks(20_000);
+        const SMALL_HUNKS: usize = 2_000;
+        const LARGE_HUNKS: usize = 20_000;
+        const SMALL_REPETITIONS: usize = LARGE_HUNKS / SMALL_HUNKS;
+        const MAX_EQUAL_WORK_SLOWDOWN: f64 = 5.0;
+
+        let quadratic_slowdown = LARGE_HUNKS as f64 / SMALL_HUNKS as f64;
+        assert!(
+            MAX_EQUAL_WORK_SLOWDOWN < quadratic_slowdown,
+            "the {MAX_EQUAL_WORK_SLOWDOWN:.1}x scaling boundary admits the \
+             {quadratic_slowdown:.1}x equal-work slowdown expected from a \
+             quadratic walk; tighten the boundary or increase the size contrast"
+        );
+
+        let (sel_small, flat_small, _) = time_diff_walks_repeated(SMALL_HUNKS, SMALL_REPETITIONS);
+        let (sel_large, flat_large, _) = time_diff_walks(LARGE_HUNKS);
         for (name, small, large) in [
             ("selectable_hunks", sel_small, sel_large),
             ("parse_unified_diff+flatten", flat_small, flat_large),
         ] {
             let ratio = large.as_nanos() as f64 / small.as_nanos().max(1) as f64;
             assert!(
-                ratio < 25.0,
-                "{name} took {large:?} at 20,000 hunks vs {small:?} at 2,000 \
-                 hunks — a {ratio:.1}x slowdown for a 10x size increase. Both \
-                 walks are meant to be O(n); this ratio is only consistent \
-                 with an accidental quadratic (or worse) regression, not \
-                 measurement noise."
+                ratio < MAX_EQUAL_WORK_SLOWDOWN,
+                "{name} took {large:?} for one {LARGE_HUNKS}-hunk walk vs \
+                 {small:?} for {SMALL_REPETITIONS} {SMALL_HUNKS}-hunk walks \
+                 ({LARGE_HUNKS} total hunks on each side) — a {ratio:.1}x \
+                 equal-work slowdown. Linear work should be near 1x and \
+                 quadratic work near {quadratic_slowdown:.1}x; the boundary is \
+                 {MAX_EQUAL_WORK_SLOWDOWN:.1}x. Scheduler contention can still \
+                 affect wall-clock timings; rerun under comparable load before \
+                 diagnosing a regression."
             );
         }
     }
