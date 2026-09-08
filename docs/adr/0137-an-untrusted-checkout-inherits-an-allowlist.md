@@ -1,6 +1,6 @@
 # ADR 0137 — An untrusted checkout inherits an allowlist, and the phase that runs attacker code gives up what it does not need
 
-- **Status:** Accepted — #720 implemented the allowlist and phase-specific grants; #723 adds the checkout-only AF_UNIX denial while retaining TCP, mutation-proved in both directions
+- **Status:** Accepted — #720 implemented the allowlist and phase-specific grants; #723 adds the checkout-only AF_UNIX denial while retaining TCP, with both removal mutations caught
 - **Date:** 2026-09-07
 - **Issues:** #702, #704, #723 — locator removal and capability denial are separate halves
 - **Extends:** [ADR 0128](0128-a-credential-exists-only-before-untrusted-checkout.md) (the credential boundary this widens from three names to a built environment)
@@ -167,9 +167,9 @@ in the constant's own doc comment:
 
 - **`SSH_AUTH_SOCK`** — #702's *mechanism*: the variable is how the operator's
   agent becomes reachable in practice, so withholding it is the highest-value
-  single line here. It is **not** a fix for #702, which stays open — the
-  capability survives without the locator. See "The residual #720 left, and
-  #723 closes".
+  single line here. By itself, #720 was **not** a fix for #702: the capability
+  survived without the locator until #723 closed it. See "The residual #720
+  left, and #723 closes".
 - **`GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n`,
   `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`** — these would buy the same config
   parity `HOME` buys, but their payload is an arbitrary string and
@@ -306,17 +306,19 @@ the fifth omission the next issue. Rejected on shape, not on cost — this is AD
 
 ### Run the checkout at the Strict tier instead
 
-Genuinely stronger: Strict denies `AF_UNIX` at the seccomp layer outright, so
-the residual below would be gone. Rejected because Strict has no network, and
-ADR 0128 kept network access for the checkout deliberately — a `git-lfs` smudge
-filter is a legitimate checkout-time network consumer.
+Before #723, Strict was stronger on this axis: it denied `AF_UNIX` at the
+seccomp layer outright, so it would also have removed the residual below. The
+checkout profile now applies that same denial. Moving checkout to Strict remains
+rejected because Strict has no network, and ADR 0128 kept network access for the
+checkout deliberately — a `git-lfs` smudge filter is a legitimate checkout-time
+network consumer.
 
 An earlier draft of this paragraph called that residual "already unreachable",
 which contradicted this ADR's own limits section three pages later and was the
-weaker of the two statements. It is struck. The residual is **reachable** — see
-"The residual #720 left, and #723 closes" — and the reason not to move checkout
-to Strict is that it costs a working product feature, not that there is nothing
-left to gain. #723 now buys the same ground without that cost.
+weaker of the two statements. Before #723, the residual was **reachable**; #723
+closed it, as "The residual #720 left, and #723 closes" records. The reason not
+to move checkout to Strict is that it costs a working product feature, not that
+there was nothing left to gain. #723 buys the same ground without that cost.
 
 ### Keep `known_hosts` because it is only public key material
 
@@ -347,6 +349,12 @@ that builds the environment.
   the remote's, because at checkout time the remote chose which file runs.
 - **#723 supplies the remaining technical half of #702.** The coordinator, not
   this change, decides when to close the parent issue.
+- **Checkout retains TCP, but Git LFS under the new filter is unmeasured.**
+  Keeping TCP preserves the capability HTTPS and Git LFS need. No `git-lfs` run
+  exists under the new filter anywhere in this repository, however: the only
+  positive evidence is a raw `AF_INET` connection to `127.0.0.1:9418` by IP,
+  with no DNS and no real LFS exchange. "LFS still works" is therefore true of
+  the retained TCP capability and unmeasured for LFS itself.
 - **A proxied or custom-CA `git-lfs` smudge filter fails at checkout.**
   `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`, `SSL_CERT_FILE` and `SSL_CERT_DIR`
   are **not** allowlisted, and networked filters commonly need them — which sits
@@ -376,9 +384,9 @@ that builds the environment.
 The allowlist withholds the agent socket's *locator*; by itself it does not deny
 the *capability*. That was the residual #720 deliberately left for #723.
 
-Before #723, `seccomp_filter::af_unix_rule` denied `AF_UNIX` in the **Strict**
-tier only, and Landlock did not mediate pathname `AF_UNIX` `connect()` at all
-(ADR 0033 §3). So a hook that recovered a socket path could set
+Before #723, `seccomp_filter::af_unix_rule` denied `AF_UNIX` exclusively in the
+**Strict** tier, and Landlock did not mediate pathname `AF_UNIX` `connect()` at
+all (ADR 0033 §3). So a hook that recovered a socket path could set
 `SSH_AUTH_SOCK` itself and connect. Recovery does not need enumeration, which is
 where this ADR's first draft went wrong:
 
@@ -396,7 +404,7 @@ flowchart TD
   H["post-checkout hook<br/>attacker-chosen"] --> R["read ~/.keychain/host-sh<br/>HOME is granted AND allowlisted"]
   R --> P["a literal socket path"]
   P --> S["set SSH_AUTH_SOCK itself"]
-  S --> C["connect() — EPERM<br/>checkout seccomp denies AF_UNIX"]
+  S --> C["socket(AF_UNIX) — EPERM<br/>checkout seccomp denies socket creation"]
   C -.-> X["agent protocol never reached<br/>TCP 443 remains for HTTPS LFS"]
 ```
 

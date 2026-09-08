@@ -328,10 +328,13 @@ below.
   all.** Only the strict tier's network namespace blocks UDP egress, by
   removing network access entirely; the network tier's Landlock port rules
   pass UDP and Unix-domain traffic through unmediated, in either direction.
-- **`AF_UNIX` in the strict tier is denied by seccomp, and by nothing else.**
-  *Implemented* (2026-07-29) in `seccomp_filter::af_unix_rule` as an
+- **In both the strict tier and clone's post-transfer checkout, `AF_UNIX` is
+  denied by seccomp, and by nothing else.** *Implemented* for Strict
+  (2026-07-29) and the checkout profile (2026-09-08) in
+  `seccomp_filter::af_unix_rule` as an
   argument-scoped `EPERM` on `socket(2)`/`socketpair(2)` when the address family
-  is `AF_UNIX`, installed for `--net-deny` (strict) only. It is worth being
+  is `AF_UNIX`, installed for `--net-deny` (strict) and `--seccomp-checkout`
+  (clone checkout). It is worth being
   explicit about why every other layer misses this, because for a period the
   design claimed the denial while the build did not have it (measured: both
   entry points succeeded inside the full strict stack, identical to the bare
@@ -341,20 +344,22 @@ below.
   8 does not mediate **pathname** sockets at all; the IPC and network namespaces
   do not cover `AF_UNIX` either. Without the seccomp rule a hostile hook in the
   strict tier reached `/run/docker.sock`, `ssh-agent`, `gpg-agent` and the D-Bus
-  session bus. The **network tier deliberately still permits `AF_UNIX`**: git
-  over SSH wants an agent socket. *Implemented* (2026-07-31, ADR 0033, #188 —
-  ordinary Network policies, including clone's transfer policy, grant the path
-  named by `$SSH_AUTH_SOCK` read-write, alongside a narrow `known_hosts`
-  carve-out through `secret_excludes`, described below). Clone's post-transfer
-  checkout policy is the exception (ADR 0137): it has neither grant and its
-  environment allowlist does not admit the socket locator. Measured while
-  building the original carve-out:
-  the Landlock filesystem grant on the socket is not actually what makes it
-  reachable on this kernel — Landlock does not mediate `connect()` to a
-  **pathname** `AF_UNIX` socket at all (only the abstract-namespace scope
-  above), so this tier's filter being otherwise unchanged is what genuinely
-  leaves the socket reachable; the grant is added anyway for auditability and
-  in case a future Landlock ABI starts mediating it (ADR 0033 §3). Proven by `af_unix_socket_denied` and
+  session bus. The **ordinary Network profile deliberately still permits
+  `AF_UNIX`**: git over SSH wants an agent socket. *Implemented* (2026-07-31,
+  ADR 0033, #188 — ordinary Network policies, including clone's transfer
+  policy, grant the path named by `$SSH_AUTH_SOCK` read-write, alongside a
+  narrow `known_hosts` carve-out through `secret_excludes`, described below).
+  Clone's post-transfer checkout policy is the exception (ADR 0137): it has
+  neither grant, its environment allowlist does not admit the socket locator,
+  and its seccomp profile denies `socket(2)`/`socketpair(2)` with `AF_UNIX`.
+  Measured while building the original carve-out, the Landlock filesystem grant
+  on the socket is not actually what makes it reachable on this kernel —
+  Landlock does not mediate `connect()` to a **pathname** `AF_UNIX` socket at all
+  (only the abstract-namespace scope above), so the ordinary Network profile's
+  lack of an AF_UNIX seccomp rule is what leaves the socket reachable there;
+  clone checkout no longer shares that posture. The grant is added anyway for
+  auditability and in case a future Landlock ABI starts mediating it (ADR 0033
+  §3). Proven by `af_unix_socket_denied` and
   `af_unix_socketpair_denied` in the escape battery, which die under
   `ci/mutants/M8-remove-af-unix-socket-rule.patch`. The rule's `Dword`
   comparison width carries its own guard: `high_bit_af_unix_denied` issues a raw
