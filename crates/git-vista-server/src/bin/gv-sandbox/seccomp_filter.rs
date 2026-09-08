@@ -289,15 +289,23 @@ fn af_unix_rule() -> Result<SeccompRule, seccompiler::BackendError> {
 fn rules_for(net: NetScope) -> Result<BTreeMap<i64, Vec<SeccompRule>>, seccompiler::BackendError> {
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
+    // Checkout is the second strong profile. Kept as a distinct arm so the
+    // repository's existing M8 mutant can still remove Strict's mechanism and
+    // be caught independently of #723's checkout-only rule.
+    if net == NetScope::Checkout {
+        rules.insert(libc::SYS_socket, vec![af_unix_rule()?]);
+        rules.insert(libc::SYS_socketpair, vec![af_unix_rule()?]);
+    }
+
     // An empty rule vector means "every invocation of this syscall matches".
     for (nr, _why) in denied_outright() {
         rules.insert(nr, vec![]);
     }
     rules.insert(libc::SYS_prctl, vec![prctl_rule()?]);
 
-    // Strict and untrusted checkout only — see `af_unix_rule` for why ordinary
-    // Network remains exempt for authenticated SSH remotes (#188).
-    if matches!(net, NetScope::Denied | NetScope::Checkout) {
+    // Strict only — see `af_unix_rule` for the measurement that motivates the
+    // rule and for why the Network tier is deliberately left alone (#188).
+    if net == NetScope::Denied {
         rules.insert(libc::SYS_socket, vec![af_unix_rule()?]);
         rules.insert(libc::SYS_socketpair, vec![af_unix_rule()?]);
     }

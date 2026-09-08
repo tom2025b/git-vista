@@ -1547,13 +1547,6 @@ fn shim_argv(policy: &Policy, seccomp_profile: SeccompProfile) -> Vec<OsString> 
         argv.push(OsString::from("--ro-carveout"));
         argv.push(p.clone().into_os_string());
     }
-    match &policy.hook_mode {
-        HookMode::Run => argv.push(OsString::from("--hooks-run")),
-        HookMode::Blocked { empty_dir } => {
-            argv.push(OsString::from("--hooks-blocked"));
-            argv.push(empty_dir.clone().into_os_string());
-        }
-    }
     if seccomp_profile == SeccompProfile::Checkout {
         assert_eq!(
             policy.tier,
@@ -1561,6 +1554,13 @@ fn shim_argv(policy: &Policy, seccomp_profile: SeccompProfile) -> Vec<OsString> 
             "checkout keeps TCP and must remain a Network-tier policy"
         );
         argv.push(OsString::from("--seccomp-checkout"));
+    }
+    match &policy.hook_mode {
+        HookMode::Run => argv.push(OsString::from("--hooks-run")),
+        HookMode::Blocked { empty_dir } => {
+            argv.push(OsString::from("--hooks-blocked"));
+            argv.push(empty_dir.clone().into_os_string());
+        }
     }
     argv.push(OsString::from(match policy.tier {
         Tier::Strict => "--net-deny",
