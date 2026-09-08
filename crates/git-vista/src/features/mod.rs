@@ -33,6 +33,7 @@ pub mod core_traits;
 
 pub mod a11y;
 pub mod activity;
+pub mod bisect;
 // M5.33 (#86): rename-aware file history and blame.
 pub mod blame;
 // No `conflicts` module here any more. M4.31's four-pane view model and its

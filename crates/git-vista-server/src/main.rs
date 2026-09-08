@@ -539,6 +539,8 @@ fn api_router(
         // behind, and the staged/unstaged/untracked/conflicted file lists —
         // resolved fresh per request, like `head_branch`.
         .route("/api/status", get(worktree_status))
+        // #708 (ADR 0138): observe git's bisect session on both read profiles.
+        .route("/api/bisect/status", get(handlers::bisect::bisect_status))
         // #68c: the generation-tagged WorktreeStatus DTO (#68a/#68b), additive
         // alongside the v1 shape above — not a replacement. See handlers::read
         // for why both exist side by side.
@@ -736,9 +738,7 @@ fn api_router(
                 "/api/stash/branch",
                 post(handlers::stash::branch_from_stash),
             )
-            // M5.34 (#87, ADR 0131): start/mark/reset a bisect session. No
-            // `GET /api/bisect/status` yet — see handlers/bisect.rs's module
-            // doc for why that is deliberately its own, separable slice.
+            // M5.34 (#87, ADR 0131): start/mark/reset a bisect session.
             .route("/api/bisect/start", post(handlers::bisect::bisect_start))
             .route("/api/bisect/mark", post(handlers::bisect::bisect_mark))
             .route("/api/bisect/reset", post(handlers::bisect::bisect_reset))
