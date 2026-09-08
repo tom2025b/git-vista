@@ -434,10 +434,10 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                 // wording, which ceremony, what is enabled — come from the pure
                 // core, so the asymmetry between them is decided somewhere a host
                 // test can read it rather than inside this wasm-only view.
-                PendingOp::DiscardTrackedPaths { paths } => {
+                PendingOp::DiscardTrackedPaths { paths, .. } => {
                     worktree_confirm(WorktreeAction::DiscardTracked, paths, armed)
                 }
-                PendingOp::DeleteUntrackedPaths { paths } => {
+                PendingOp::DeleteUntrackedPaths { paths, .. } => {
                     worktree_confirm(WorktreeAction::DeleteUntracked, paths, armed)
                 }
                 // M11.05 (#550): its own function, not a third `WorktreeAction`

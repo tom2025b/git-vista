@@ -77,26 +77,16 @@ pub(crate) fn validate_paths(
 /// learned by mutation on #429: a validation step that sits beside a handler
 /// is a step someone can delete, and a test written against the validator
 /// will not notice. Neither endpoint here can reach the planner without
-/// having produced an `Option<WorktreeId>` first, because that value is what
-/// decides which entry point it calls.
-///
-/// A malformed selector is a `400`, worded exactly as the read endpoints'
-/// `?repo=` selector words it (`handlers::read::resolve_repo`) — the id space
-/// is one id space, and a client that got it wrong should not have to learn
-/// two vocabularies for the same mistake. An **absent** selector is not an
-/// error: see [`WorktreePathsRequest`]'s doc comment for why it still cannot
-/// be required, and what that costs.
+/// having produced a `WorktreeId` first, because the planner requires it.
+/// A malformed selector is a `400`, using the read endpoints' vocabulary.
+/// Omission is rejected by JSON extraction before either handler runs.
 fn validate_body(
     req: WorktreePathsRequest,
-) -> Result<(Option<WorktreeId>, Vec<WorktreePath>), (StatusCode, String)> {
+) -> Result<(WorktreeId, Vec<WorktreePath>), (StatusCode, String)> {
     let expected = req
         .repo
-        .as_deref()
-        .map(|id| {
-            id.parse::<WorktreeId>()
-                .map_err(|_| (StatusCode::BAD_REQUEST, "Not a repository id.".to_string()))
-        })
-        .transpose()?;
+        .parse::<WorktreeId>()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Not a repository id.".to_string()))?;
     Ok((expected, validate_paths(req)?))
 }
 
@@ -115,22 +105,7 @@ pub(crate) async fn discard_tracked_paths(
         Ok(validated) => validated,
         Err(rejected) => return rejected,
     };
-    // Two arms, spelled out here rather than behind a shared dispatch helper
-    // — the same reason this endpoint has a twin below instead of one
-    // function taking a bool (#71), plus one this file did not have before:
-    // `planner_funnel_census` proves every git-write handler reaches
-    // `plan_and_execute` in its own body, and a helper would move that proof
-    // one call away from the route.
-    match expected {
-        Some(worktree) => {
-            planner::plan_and_execute_matching(
-                GitOperation::DiscardTrackedPaths { paths },
-                worktree,
-            )
-            .await
-        }
-        None => planner::plan_and_execute(GitOperation::DiscardTrackedPaths { paths }).await,
-    }
+    planner::plan_and_execute_matching(GitOperation::DiscardTrackedPaths { paths }, expected).await
 }
 
 /// `git clean -f -- <paths>` (#219): delete untracked paths from the working
@@ -146,17 +121,7 @@ pub(crate) async fn delete_untracked_paths(
         Ok(validated) => validated,
         Err(rejected) => return rejected,
     };
-    // Its own spelling of the same two arms — see the twin above.
-    match expected {
-        Some(worktree) => {
-            planner::plan_and_execute_matching(
-                GitOperation::DeleteUntrackedPaths { paths },
-                worktree,
-            )
-            .await
-        }
-        None => planner::plan_and_execute(GitOperation::DeleteUntrackedPaths { paths }).await,
-    }
+    planner::plan_and_execute_matching(GitOperation::DeleteUntrackedPaths { paths }, expected).await
 }
 
 #[cfg(test)]
@@ -164,12 +129,12 @@ mod tests {
     use super::*;
 
     fn req(paths: &[&str]) -> WorktreePathsRequest {
-        scoped_req(None, paths)
+        scoped_req(&WorktreeId::from_git_dir("/x/.git").to_string(), paths)
     }
 
-    fn scoped_req(repo: Option<&str>, paths: &[&str]) -> WorktreePathsRequest {
+    fn scoped_req(repo: &str, paths: &[&str]) -> WorktreePathsRequest {
         WorktreePathsRequest {
-            repo: repo.map(str::to_string),
+            repo: repo.to_string(),
             paths: paths.iter().map(|p| p.to_string()).collect(),
         }
     }
@@ -243,7 +208,7 @@ mod tests {
     #[test]
     fn a_repository_selector_that_is_a_path_is_a_wire_error() {
         for bad in ["/etc", "..", "../../elsewhere", "", "not-a-uuid"] {
-            let (status, why) = validate_body(scoped_req(Some(bad), &["a.txt"]))
+            let (status, why) = validate_body(scoped_req(bad, &["a.txt"]))
                 .expect_err("{bad:?} must not be accepted as a repository id");
             assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?}: {why}");
             assert!(why.contains("repository id"), "{bad:?}: {why}");
@@ -251,14 +216,12 @@ mod tests {
         // The positive control, without which every assertion above would
         // hold on a `validate_body` that refused every selector outright.
         let (expected, paths) = validate_body(scoped_req(
-            Some(&WorktreeId::from_git_dir("/x/.git").to_string()),
+            &WorktreeId::from_git_dir("/x/.git").to_string(),
             &["a.txt"],
         ))
         .expect("a real worktree id is accepted");
-        assert_eq!(expected, Some(WorktreeId::from_git_dir("/x/.git")));
+        assert_eq!(expected, WorktreeId::from_git_dir("/x/.git"));
         assert_eq!(strs(&paths), ["a.txt"]);
-        // And an absent selector is not an error — see the DTO's doc comment.
-        assert_eq!(validate_body(req(&["a.txt"])).unwrap().0, None);
     }
 
     /// A repository whose `a.txt` is tracked-and-dirty and whose
@@ -363,10 +326,7 @@ mod tests {
 
             let (status, body) = keyed(
                 "issue-721-discard-from-a-sibling",
-                discard_tracked_paths(Json(scoped_req(
-                    Some(&main.worktree.to_string()),
-                    &["a.txt"],
-                ))),
+                discard_tracked_paths(Json(scoped_req(&main.worktree.to_string(), &["a.txt"]))),
             )
             .await;
             assert_eq!(
@@ -400,7 +360,7 @@ mod tests {
             let (status, body) = keyed(
                 "issue-721-delete-from-a-sibling",
                 delete_untracked_paths(Json(scoped_req(
-                    Some(&main.worktree.to_string()),
+                    &main.worktree.to_string(),
                     &["scratch.txt"],
                 ))),
             )
@@ -436,10 +396,7 @@ mod tests {
 
             let (status, body) = keyed(
                 "issue-721-discard-matching",
-                discard_tracked_paths(Json(scoped_req(
-                    Some(&sibling.worktree.to_string()),
-                    &["a.txt"],
-                ))),
+                discard_tracked_paths(Json(scoped_req(&sibling.worktree.to_string(), &["a.txt"]))),
             )
             .await;
             assert_eq!(status, StatusCode::OK, "{body}");
@@ -457,29 +414,36 @@ mod tests {
         .await;
     }
 
-    /// The honest record of what #721 did **not** close, pinned so it cannot
-    /// be quietly believed to be closed.
-    ///
-    /// An omitted selector still acts on the current selection, because the
-    /// shipped browser client cannot yet send one (see
-    /// [`WorktreePathsRequest`]'s doc comment). When that changes and the
-    /// field becomes required, this test is the one that must be *deleted and
-    /// replaced* by its opposite — which is exactly why it is written down
-    /// rather than left as an assumption.
+    /// Opposite of the old gap-pinning test: extraction refuses omission for
+    /// BOTH real endpoints, before any path can reach git.
     #[tokio::test]
-    async fn an_omitted_selector_still_acts_on_the_selection_and_that_is_the_open_half() {
+    async fn an_omitted_selector_is_refused_without_touching_the_selection() {
+        use axum::{body::Body, http::Request, routing::post, Router};
+        use tower::ServiceExt;
         crate::state::with_isolated_test_current(async {
             let (_dir, repo) = dirty_repo();
-            crate::state::set_current(&repo, git_vista_protocol::RepoMode::Active)
-                .expect("the repository registers");
-
-            let (status, body) = keyed(
-                "issue-721-unscoped-still-runs",
-                discard_tracked_paths(Json(req(&["a.txt"]))),
-            )
-            .await;
-            assert_eq!(status, StatusCode::OK, "{body}");
-            assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "a\n");
+            crate::state::set_current(&repo, git_vista_protocol::RepoMode::Active).unwrap();
+            let app = Router::new()
+                .route("/api/discard-tracked-paths", post(discard_tracked_paths))
+                .route("/api/delete-untracked-paths", post(delete_untracked_paths));
+            let before = porcelain(&repo);
+            for (route, path) in [
+                ("discard-tracked-paths", "a.txt"),
+                ("delete-untracked-paths", "scratch.txt"),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::post(format!("/api/{route}"))
+                            .header("content-type", "application/json")
+                            .body(Body::from(serde_json::json!({"paths": [path]}).to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+                assert_eq!(porcelain(&repo), before);
+            }
         })
         .await;
     }

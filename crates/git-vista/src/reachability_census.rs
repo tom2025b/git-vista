@@ -828,14 +828,6 @@ const EXEMPT: &[(&str, &str)] = &[
     // here so the census is green against today's tree; each is a real,
     // reportable finding for a human to either wire up or remove — NOT an
     // argued-dead decision the way every entry above this line is. ────────
-    (
-        "git-vista/src/features/status/core.rs",
-        "discardable_tracked_paths",
-    ),
-    (
-        "git-vista/src/features/status/core.rs",
-        "deletable_untracked_paths",
-    ),
     ("git-vista/src/features/tags/core.rs", "tag_row"),
     ("git-vista/src/features/dialogs/commit.rs", "staged_breadth"),
     // `git-vista-core/src/request_generation.rs`'s `issue` used to sit here.

@@ -68,6 +68,15 @@ use git_vista_protocol::{
     ChangeKind, ChangeSides, ConflictKind, StatusEntry, SubmoduleState, WorktreeStatus,
 };
 
+/// A status response and the opaque worktree id used to request it. Callers
+/// keep the public fields paired by convention until both are copied into the
+/// pending destructive operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedWorktreeStatus {
+    pub repo: git_vista_core::identity::WorktreeId,
+    pub status: WorktreeStatus,
+}
+
 /// Which section of the status list an entry contributes a row to. Ordered
 /// (via `ALL`) by urgency: a conflict needs resolving before anything else
 /// is actionable, staged/unstaged changes are the everyday case, untracked
@@ -1276,17 +1285,9 @@ mod tests {
     /// which this app switches between by design — produce a list that passes
     /// that re-check while having been derived somewhere else.
     ///
-    /// **#721 changed what the server *can* be told, not what this client
-    /// sends.** `WorktreePathsRequest` now carries an optional `repo`, and a
-    /// selector naming a worktree other than the selected one is refused with
-    /// its own `412` (ADR 0140). The browser client cannot supply it yet: the
-    /// path list travels through an `OperationKind` that carries `paths`
-    /// alone, so `api::discard_tracked_paths_request` sends `repo: None` and
-    /// the endpoint behaves exactly as this test describes. Until that second
-    /// half lands, the frame gate below is still the only thing standing
-    /// between the user and a confirmed batch — which is why this test stays
-    /// as written rather than being softened to describe a protection the
-    /// shipped path does not yet get.
+    /// #733 carries the status read's worktree id through `OperationKind`
+    /// into the required wire selector. Identity now supplies the separate
+    /// 412 backstop; it does not strengthen this path-state filter itself.
     ///
     /// This test does not run the server. It pins the client-side claim the
     /// severity argument rests on: the paths a stale reply would have offered
