@@ -651,6 +651,31 @@ mod wire_tests {
         }
     }
 
+    /// #736: ending a session is deliberately absent from the pre-session
+    /// allowlist. Without a cookie, DELETE must stop at the session gate; a
+    /// successful handler response would mean the existing session-path
+    /// `matches!` arm had been widened beyond its pinned GET/POST pair set.
+    #[tokio::test]
+    async fn an_unauthenticated_session_delete_is_stopped_by_the_session_gate() {
+        let (router, _) = app();
+        let resp = router
+            .oneshot(
+                req("DELETE", "/api/session")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "DELETE /api/session without a session must be refused by the session gate \
+             (401). A success means session_exempt admitted a state-changing method \
+             outside the pinned pre-session (path, method) pairs."
+        );
+    }
+
     #[tokio::test]
     async fn a_read_without_a_session_is_401_and_no_store() {
         let (router, _) = app();
