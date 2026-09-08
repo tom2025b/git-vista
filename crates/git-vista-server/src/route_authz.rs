@@ -672,11 +672,12 @@ fn unauthenticated_routes_are_a_pinned_short_allowlist() {
 /// unauthenticated.
 ///
 /// A count or a comment cross-reference would not have caught that; both sides
-/// counted three. What was missing is a check on the *shape* of the runtime
-/// clause, which is what this test makes structural: every disjunct of
-/// `session_exempt` must test a method as well as a path. Dropping the method
-/// test from any clause fails here, by name, in the same test binary as the
-/// table it would have falsified.
+/// counted three. What was missing is a comparison with the *values* tested by
+/// the runtime clause. This test extracts every `Method::...` named alongside
+/// each path constant and compares those `(path, method)` pairs exactly with
+/// [`EXPECTED_UNAUTHENTICATED`]. Dropping a method test or widening an existing
+/// `matches!` arm fails here, in the same test binary as the table it would
+/// have falsified.
 /// Byte length of the Rust char literal starting at the `'` that begins `s`,
 /// including both quotes — or `None` when `s` starts a lifetime or label
 /// (`'a`, `'static`, `'outer:`) rather than a literal.
@@ -1009,23 +1010,49 @@ fn the_pre_session_exemption_is_method_qualified() {
         );
     }
 
-    // Each pinned path must actually appear in the runtime expression, by the
-    // constant that names it — so renaming a path in one place and not the
-    // other cannot pass.
-    for (pinned_path, _) in EXPECTED_UNAUTHENTICATED {
-        let named = match *pinned_path {
-            "/api/protocol" => "NEGOTIATION_PATH",
-            "/api/session" => "SESSION_PATH",
-            other => panic!(
-                "EXPECTED_UNAUTHENTICATED gained the path {other}, which this test does not \
-                 know the runtime constant for. Add it to the mapping here so the pre-session \
-                 allowlist stays checked against security.rs, rather than deleting the check."
-            ),
-        };
-        assert!(
-            expr.contains(named),
-            "EXPECTED_UNAUTHENTICATED pins {pinned_path}, but security.rs's session_exempt \
-             never mentions {named}. The pinned allowlist and the runtime one have diverged."
+    let path_constants = [
+        ("/api/protocol", "NEGOTIATION_PATH"),
+        ("/api/session", "SESSION_PATH"),
+    ];
+    let mut runtime_pairs = std::collections::BTreeSet::new();
+    for clause in &clauses {
+        let paths: Vec<&str> = path_constants
+            .iter()
+            .filter_map(|(path, named)| clause.contains(named).then_some(*path))
+            .collect();
+        assert_eq!(
+            paths.len(),
+            1,
+            "each session_exempt clause must name exactly one known pre-session path \
+             constant, but `{}` names {paths:?}. Keep the mapping in this test in sync \
+             with EXPECTED_UNAUTHENTICATED rather than weakening the pair comparison. \
+             Full expression: {expr}",
+            clause.trim()
         );
+
+        for (at, _) in clause.match_indices("Method::") {
+            let method = clause[at + "Method::".len()..]
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                .collect::<String>();
+            assert!(
+                !method.is_empty(),
+                "a bare `Method::` in session_exempt cannot identify an allowed method. \
+                 Clause was: `{}`",
+                clause.trim()
+            );
+            runtime_pairs.insert((paths[0].to_string(), method));
+        }
     }
+
+    let expected_pairs = EXPECTED_UNAUTHENTICATED
+        .iter()
+        .map(|(path, method)| ((*path).to_string(), method.as_str().to_string()))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        runtime_pairs, expected_pairs,
+        "security.rs's session_exempt and EXPECTED_UNAUTHENTICATED have diverged as \
+         (path, method) pairs. Reconcile the runtime clause and the pinned allowlist. \
+         Full expression: {expr}"
+    );
 }
