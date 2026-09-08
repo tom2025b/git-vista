@@ -8,7 +8,8 @@
 #   - git-vista-server   native axum backend: serves the SPA + /api/commits
 #   - git-vista          Leptos frontend, built to WASM by Trunk (crates/git-vista)
 #
-# Seven jobs run in parallel, each mapped to a concrete check:
+# Eight jobs run in parallel, each mapped to a concrete check. SEVEN are required;
+# the eighth (browser) is deliberately not — see its own block for why:
 #   1. lint      format + strict native/WASM Clippy + shell syntax
 #   2. core      test + check the pure-logic, git-reading, protocol, server, and
 #                UI crates, plus (#67 M1.14) the runner's git version against
@@ -34,6 +35,13 @@
 #                battery itself, then three shell-level assertions over the
 #                report file it writes, none of which the tests decide for
 #                themselves
+#   8. browser   the #355 Playwright suite — the ONLY thing in this pipeline
+#                that RUNS wasm. `cargo test` never compiles a line behind
+#                `#[cfg(target_arch = "wasm32")]`, `clippy --target wasm32`
+#                type-checks it without executing it, and `trunk build` builds
+#                it without running it. NON-REQUIRED for a one-week trial to
+#                measure flake rate and duration on GitHub's hardware before it
+#                is promoted (#754).
 #
 # core, contract and sandbox share ONE host-provisioning step,
 # .github/actions/host-sandbox-setup. M1.13b (#66) routed every production git
@@ -606,6 +614,10 @@ jobs:
   frontend:
     name: Frontend (Trunk / WASM)
     runs-on: ubuntu-latest
+    # The `browser` job runs this exact bundle rather than building a second
+    # one. `dist_digest` is what lets it prove that: see its provenance step.
+    outputs:
+      dist_digest: ${{ steps.bundle.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
 
@@ -631,6 +643,229 @@ jobs:
       # fetches the matching wasm-bindgen automatically.
       - name: Build frontend
         run: cd crates/git-vista && trunk build
+
+      # A content digest over the whole bundle, published as a job output so
+      # the `browser` job can prove the artifact it downloads is this one.
+      # An artifact name alone proves nothing about its contents.
+      #
+      # This command must stay byte-identical to the one in `browser`'s
+      # provenance step; they are a matched pair, and a mismatch between them
+      # would read as a corrupted bundle.
+      - name: Digest the bundle
+        id: bundle
+        run: |
+          digest="$(cd crates/git-vista/dist && find . -type f -exec sha256sum {} + | sort -k 2 | sha256sum | cut -d' ' -f1)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "bundle digest: $digest"
+
+      - name: Publish the bundle for the browser suite
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: crates/git-vista/dist
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 8. Browser suite (#355, #754): the only job that RUNS wasm.
+  #
+  # Why this job has to exist. `cargo test --workspace` never compiles a line
+  # behind `#[cfg(target_arch = "wasm32")]` — code under a platform cfg compiles
+  # to nothing on the host target, and the run reports green over its absence.
+  # `lint`'s `clippy --target wasm32` type-checks that code without executing
+  # it; `frontend`'s `trunk build` builds it without running it. Two mechanisms
+  # already on main were merged on a green CI that never exercised them: #745's
+  # central mechanism, and ADR 0006's implementation. "Lanes gate locally" is a
+  # policy, not a mechanism.
+  #
+  # WHY IT IS NOT REQUIRED, AND MUST NOT BE MADE REQUIRED YET. A flaky required
+  # check blocks every landing in the repository, and #726 was a load-sensitive
+  # test in this very suite. GitHub runners are slower and noisier than the box
+  # this suite was tuned on. It runs non-required for one week so the real flake
+  # rate and duration on this hardware are measured rather than guessed;
+  # promotion is then a branch-protection change made on numbers. Do not add it
+  # to branch protection as part of this change.
+  #
+  # WHAT WOULD MAKE IT WORTHLESS. A check that is green because it ran nothing
+  # is worse than no check: it buys confidence and delivers nothing, and this
+  # repository has shipped that shape before. So the job reads the COUNT, never
+  # the word "ok" — it fails if zero specs executed, and it proves the bundle it
+  # tested is the one `frontend` built rather than a stale or empty artifact.
+  # ---------------------------------------------------------------------------
+  browser:
+    name: Browser suite (#355, non-required)
+    runs-on: ubuntu-latest
+    # Not parallel with `frontend`, on purpose: this job runs that job's bundle
+    # instead of spending a second Trunk build on an identical one.
+    needs: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      # THE QUESTION THIS JOB TURNS ON, ASKED FIRST AND CHEAPLY.
+      #
+      # ci/browser/run.sh runs the whole tree — server, Chromium, Playwright —
+      # inside `unshare --user --map-root-user --net --mount`. It needs its own
+      # netns because the server's port is a COMPILE-TIME constant (`PORT: u16 =
+      # 8080`) and `parse_bind_addr` refuses any other address on purpose; a
+      # test server cannot just pick a free port. The namespace is unprivileged
+      # (no root, no sudo), so it depends on unprivileged user namespaces being
+      # permitted — which Ubuntu 24.04 restricts by default via AppArmor.
+      #
+      # If this fails, the job fails HERE with the reason, before spending ten
+      # minutes on builds. The fix is NOT to drop `--net`: a suite without its
+      # network namespace is not the same suite, and CI and local runs would
+      # stop testing the same thing.
+      - name: Unprivileged user namespace is permitted (the suite requires one)
+        run: |
+          echo "kernel: $(uname -r)"
+          for k in kernel.unprivileged_userns_clone \
+                   kernel.apparmor_restrict_unprivileged_userns \
+                   user.max_user_namespaces; do
+            echo "$k = $(sysctl -n "$k" 2>&1 || true)"
+          done
+          echo "--- probe: the exact namespace flags run.sh uses ---"
+          if unshare --user --map-root-user --net --mount -- \
+               bash -c 'ip link set lo up && ip -o addr show lo && echo PROBE_OK'; then
+            echo "unprivileged user namespace: AVAILABLE"
+          else
+            echo "unprivileged user namespace: REFUSED by this runner" >&2
+            echo "The browser suite cannot run here without weakening its isolation," >&2
+            echo "which is not an acceptable trade — see #754." >&2
+            exit 1
+          fi
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Both are prerequisites run.sh checks for by hand before it starts, so a
+      # missing one reads as a build step that did not happen rather than as a
+      # spec failing against an empty directory (#448 / ADR 0076).
+      - name: Build the binaries the harness requires
+        run: cargo build -p git-vista-server -p git-vista-fixtures --bin git-vista-server --bin gv-fixture
+
+      - name: Take the bundle `frontend` built
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: crates/git-vista/dist
+
+      # An artifact NAME proves nothing about its contents. The digest is the
+      # one `frontend` published as a job output in this same run, so a stale,
+      # truncated or empty download cannot pass as the bundle under test.
+      #
+      # The digest command is byte-identical to `frontend`'s "Digest the
+      # bundle" step; they are a matched pair.
+      - name: The bundle is provably the one `frontend` built
+        run: |
+          expected='${{ needs.frontend.outputs.dist_digest }}'
+          if [ -z "$expected" ]; then
+            echo "the frontend job published no digest — nothing to verify against" >&2
+            exit 1
+          fi
+          if [ ! -f crates/git-vista/dist/index.html ]; then
+            echo "the downloaded bundle has no index.html" >&2
+            ls -la crates/git-vista/dist || true
+            exit 1
+          fi
+          actual="$(cd crates/git-vista/dist && find . -type f -exec sha256sum {} + | sort -k 2 | sha256sum | cut -d' ' -f1)"
+          echo "expected: $expected"
+          echo "actual:   $actual"
+          if [ "$actual" != "$expected" ]; then
+            echo "bundle digest mismatch — this is NOT the bundle frontend built" >&2
+            exit 1
+          fi
+          # A bundle with no wasm in it would still have an index.html, and the
+          # suite would then be testing a shell with nothing behind it.
+          if [ -z "$(find crates/git-vista/dist -name '*.wasm' -size +0c -print -quit)" ]; then
+            echo "the bundle contains no non-empty .wasm — nothing wasm would be exercised" >&2
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # `npm ci` from the committed lockfile rather than run.sh's fallback
+      # `npm install`, so a dependency resolution failure is attributed to its
+      # own step instead of surfacing inside the suite.
+      - name: Install Playwright and Chromium
+        working-directory: ci/browser
+        run: |
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps chromium
+
+      # Nothing inside the namespace has network access, so everything the run
+      # needs is installed above. The JSON report is written to an absolute path
+      # OUTSIDE ci/browser's own directory handling, because run.sh cds into
+      # ci/browser before invoking playwright.
+      #
+      # The suite's exit status is captured rather than allowed to end the job,
+      # so the "did it actually run anything" assertion below always gets to
+      # speak — a suite that fails and a suite that runs nothing must not look
+      # the same in the log.
+      - name: Run the browser suite
+        id: suite
+        env:
+          PLAYWRIGHT_JSON_OUTPUT_NAME: ${{ github.workspace }}/ci/browser/results.json
+          PW_TEST_HTML_REPORT_OPEN: never
+        run: |
+          started=$(date +%s)
+          set +e
+          ci/browser/run.sh --reporter=list,json,html
+          status=$?
+          set -e
+          elapsed=$(( $(date +%s) - started ))
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "elapsed=$elapsed" >> "$GITHUB_OUTPUT"
+          echo "browser suite exit status: $status"
+          echo "browser suite wall clock: ${elapsed}s"
+
+      # THE ANTI-VACUITY ASSERTION. Read the count, never the word "ok".
+      #
+      # `skipped` is deliberately excluded from the total: a run in which every
+      # spec was skipped executed nothing, and must not be able to report a
+      # pass. This is the assertion that makes the check worth having.
+      - name: The suite actually executed specs, and passed
+        run: |
+          report="${{ github.workspace }}/ci/browser/results.json"
+          if [ ! -f "$report" ]; then
+            echo "no JSON report at $report — the suite did not run at all" >&2
+            exit 1
+          fi
+          ran=$(jq '(.stats.expected // 0) + (.stats.unexpected // 0) + (.stats.flaky // 0)' "$report")
+          skipped=$(jq '.stats.skipped // 0' "$report")
+          duration=$(jq -r '((.stats.duration // 0) / 1000 | floor)' "$report")
+          echo "specs executed: $ran   (skipped: $skipped)"
+          echo "suite duration: ${duration}s   (job wall clock: ${{ steps.suite.outputs.elapsed }}s)"
+          {
+            echo "### Browser suite (#355, non-required)"
+            echo ""
+            echo "- specs executed: **$ran** (skipped: $skipped)"
+            echo "- suite duration: **${duration}s**"
+            echo "- job wall clock: **${{ steps.suite.outputs.elapsed }}s**"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$ran" -eq 0 ]; then
+            echo "ZERO specs executed — a green check here would be vacuous" >&2
+            exit 1
+          fi
+          if [ "${{ steps.suite.outputs.status }}" != "0" ]; then
+            echo "the suite reported failures (exit ${{ steps.suite.outputs.status }})" >&2
+            exit 1
+          fi
+
+      - name: Keep the report when something went wrong
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-suite-report
+          path: |
+            ci/browser/playwright-report
+            ci/browser/test-results
+            ci/browser/results.json
+          if-no-files-found: ignore
+          retention-days: 7
 
   # ---------------------------------------------------------------------------
   # 5. Security advisory scan (#67 M1.14): cargo-audit over Cargo.lock.
