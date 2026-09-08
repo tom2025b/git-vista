@@ -1,19 +1,19 @@
 # ADR 0140 — A destructive write carries the repository it was built against
 
-- **Status:** Proposed — server half implemented and mutation-proved three ways failing differently; the wire field is optional until the browser client can supply it, which is tracked by #733 and is not in this change
+- **Status:** Implemented — #732 supplied the server comparison; #733 carries the captured client selector and makes it required.
 - **Date:** 2026-09-07
 - **Issue:** #721; refs #711, #709, #707
 - **Extends:** [ADR 0038](0038-worktree-destructive-operations.md) — its §3 introduced `verify_path_states` as a deliberately redundant *per-path* re-verification, which is accurate; what this ADR corrects is the reading that grew around it. Nothing in 0038 is retracted.
-- **Related:** [ADR 0109](0109-a-conflict-write-names-the-repository-it-mutates.md) (the required-`repo` precedent this deliberately diverges from in one respect), [ADR 0016](0016-shared-write-planner.md) (every git write flows through one funnel), [ADR 0119](0119-a-guarantee-that-holds-only-on-the-success-arm-is-not-a-guarantee.md) (why the open half is written down rather than assumed)
+- **Related:** [ADR 0109](0109-a-conflict-write-names-the-repository-it-mutates.md) (the required-`repo` precedent; this decision uses the same wire requirement but different execution semantics), [ADR 0016](0016-shared-write-planner.md) (every git write flows through one funnel), [ADR 0119](0119-a-guarantee-that-holds-only-on-the-success-arm-is-not-a-guarantee.md) (why the comparison must survive every outcome path)
 
 ## Context
 
-`POST /api/discard-tracked-paths` (`git checkout -- <paths>`) and
-`POST /api/delete-untracked-paths` (`git clean -f -- <paths>`) carried a body of
-`paths` and nothing else. Both resolve their repository from the session's
-current selection, and both are re-checked immediately before git runs by
-`planner::verify_path_states`, which asks one question of the repository
-selected **now**:
+Before #732/#733, `POST /api/discard-tracked-paths` (`git checkout -- <paths>`)
+and `POST /api/delete-untracked-paths` (`git clean -f -- <paths>`) carried a
+body of paths without a selector. Both resolved their repository from the
+session's current selection, and both were re-checked immediately before git
+ran by `planner::verify_path_states`, which asked one question of the repository
+selected **then**:
 
 > is this path tracked-dirty / untracked **here**?
 
@@ -26,7 +26,7 @@ It is a **conditional path-state recheck**, and the condition is the path's
 flowchart TD
   R["<b>GET /api/status/v2?repo=A</b><br/>the list is read WITH a repository id"] --> L["paths: Cargo.lock, notes.txt"]
   L --> C["confirmation dialog"]
-  C --> P["<b>POST /api/discard-tracked-paths</b><br/>body carried paths ONLY —<br/>the id was dropped here"]
+  C --> P["<b>BEFORE #732/#733</b><br/>POST body omitted the id"]
   P --> S["server resolves the CURRENT selection: B"]
   S --> V["verify_path_states<br/>is Cargo.lock tracked-dirty in B?"]
   V --> Y["<b>yes</b> — B is dirty in the same file"]
@@ -76,8 +76,8 @@ posture, unchanged).
 flowchart TD
   B["request body: repo = A, paths"] --> Q["validate_body<br/>parse A as a WorktreeId"]
   Q -->|"not an id"| E400["<b>400</b> Not a repository id."]
-  Q -->|"Some(A)"| M["plan_and_execute_matching"]
-  Q -->|"None"| U["plan_and_execute<br/><i>the open half</i>"]
+  Q -->|"A"| M["plan_and_execute_matching"]
+  Q -->|"omitted or null"| E422["<b>422</b> Invalid JSON body"]
   M --> T["resolve_target() → selection B"]
   T -->|"A != B"| E412["<b>412 Precondition Failed</b><br/>aimed at a different repository"]
   T -->|"A == B"| G["plan, guard, execute"]
@@ -86,11 +86,9 @@ flowchart TD
   VP -->|"all match"| RUN["git runs"]
 
   classDef refuse fill:#7f1d1d,color:#ffffff,stroke:#ef4444,stroke-width:2px
-  classDef open fill:#78350f,color:#ffffff,stroke:#f59e0b,stroke-width:2px
   classDef ok fill:#14532d,color:#ffffff,stroke:#4ade80,stroke-width:1px
   classDef step fill:#1e3a5f,color:#ffffff,stroke:#60a5fa,stroke-width:1px
-  class E400,E412,E409 refuse
-  class U open
+  class E400,E412,E409,E422 refuse
   class RUN,G ok
   class B,Q,M,T,VP step
 ```
@@ -109,9 +107,11 @@ the HTTP status line. `ErrorCode::PreconditionFailed` serializes as
 `precondition_failed`, maps to and from `412`, and the server's response layer
 therefore preserves it when wrapping a handler's plain-text refusal. Before
 this correction, `ErrorCode::from_status` flattened `412` into `bad_request`
-through its unrecognized-4xx fallback. The browser still drops both the typed
-code and terminal status while building `WriteReceipt` and `Settlement`; #733
-tracks carrying the distinction through that client half and branching on it.
+through its unrecognized-4xx fallback. `WriteReceipt` retains HTTP status and
+the typed error code. `Settlement` retains these for immediate refusals and
+derives the code from terminal-record status for SSE and reconnection. Both
+paths give a 412 its own review-first message; a 409 keeps the path-drift
+message.
 
 The refusal text names neither repository. The client already knows which one it
 asked for, and a refusal must not become a way to learn what else this server
@@ -168,44 +168,47 @@ path-state recheck** it is, with both outcomes spelled out and the collision
 named. No test catches a false documentation claim; only a reader does, so the
 correction is part of the change rather than a follow-up.
 
-## What this does NOT close
+## Completing the client half (#733)
 
-`repo` is **optional**, and an omitted selector still acts on the current
-selection exactly as before.
+The menu's resource captures the opaque `WorktreeId` from its request key at
+`GET /api/status/v2?repo=` read time. `ScopedWorktreeStatus` stores that id
+beside the response; because its fields are public, preserving the pair is a
+caller convention, not a type-enforced invariant. The existing current-reading
+gate still refuses retained answers. After that gate, the menu copies the
+captured id and selected paths into `OperationKind`; confirmation retains that
+operation, and dispatch passes its id into the separate discard/delete request
+builders.
 
-The browser client cannot supply it yet. The path list travels from the pinned
-status reading through an `OperationKind::DiscardTrackedPaths { paths }` carrier
-that has no room for a scope, so `api::discard_tracked_paths_request` sends
-`repo: None`. Reading a *live* repository id at send time was considered and
-rejected outright: it would always match the selection and therefore prove
-nothing, which is worse than no check because it reads like one. The scope that
-matters is the one captured when the list was built.
+There is no live-selection lookup at send time. Such a lookup would always
+match the newly selected worktree and prove nothing. The selector remains a
+precondition, never an address for an offscreen destruction.
 
-The browser client also does not yet retain the new `precondition_failed` code:
-`WriteReceipt` and `Settlement` discard it before the UI can react. That is the
-separate client half tracked by #733; this change stops at the protocol and
-server envelope boundary.
+`WorktreePathsRequest.repo` is now a required `String`, parsed as `WorktreeId`
+by both handlers. Omission and null fail JSON extraction (422); malformed ids
+fail validation (400). Both handlers call only `plan_and_execute_matching`.
+The old omitted-selector success test is replaced with an HTTP extraction test
+that refuses omission on both routes and verifies that the selected files stay
+unchanged.
 
-Making the field required means widening `OperationKind` and the confirmation
-that constructs it, in client files outside this change's scope. Until then:
+A 412 is terminal and invites a fresh review: “Repository selection changed.
+Reopen the repository you intended and review its files before trying again.”
+No automatic retry changes the pending selector. A 409 remains ordinary path
+drift and retains the path-specific refusal. The HTTP receipt, terminal SSE
+record, and reconnect reads all preserve the distinction in `Settlement`.
 
-- the gap is stated on the DTO, on both client request builders, and in the
-  planner;
-- `an_omitted_selector_still_acts_on_the_selection_and_that_is_the_open_half`
-  pins it as a live, failing-if-changed fact rather than an assumption — the
-  test that must be **deleted and replaced by its opposite** when the field
-  becomes required;
-- `planner_funnel_census` still proves both handlers reach `plan_and_execute` in
-  their own bodies. When the `None` arm goes, that census row wants widening to
-  require `plan_and_execute_matching` instead, or it will keep passing for the
-  wrong reason.
+This PR widens `post_route_census` in
+`crates/git-vista-server/src/planner/contract_suite.rs`: it adds
+`PlannerEntry::Matching`, maps that classification to
+`plan_and_execute_matching`, and reclassifies both destructive routes. The
+census now structurally rejects a regression to ordinary `plan_and_execute`.
 
 ## Alternatives considered
 
-**Make `repo` required now, matching ADR 0109 exactly.** The right end state,
-and rejected only on timing: the shipped UI sends no selector, so every discard
-and delete would answer `400` the moment this merged. A protocol change that
-breaks the only client is not a protocol change, it is an outage.
+**Make `repo` required in the server-only #732, matching ADR 0109 exactly.**
+Rejected then only on timing (and completed in #733): the shipped UI sent no
+selector, so every discard and delete would have answered `400` the moment
+that server-only change merged. A protocol change that breaks the only client
+is not a protocol change, it is an outage.
 
 **Refuse with `409`, reusing the drift code.** One fewer status code, and it
 erases the distinction. A client cannot then tell "look again, the file moved"
@@ -234,21 +237,18 @@ it impossible to say which half the mutation proofs covered.
 
 ## Consequences
 
-- The wire grows one optional field. Old bodies remain valid; `deny_unknown_fields`
-  still refuses anything else.
+- The wire requires the selector. Old unscoped bodies are refused;
+  `deny_unknown_fields` still refuses anything else.
 - A third `MutationTarget` variant, and a third public planner entry point. All
   three delegate into the one gated block, so the read-only gate, the
   idempotency-key requirement, admission, the staleness gate and the durable
   terminal record are unchanged for every path.
 - `412` joins this server's vocabulary as the wire code
   `precondition_failed`. It is the first use.
-- The two handlers each spell their own two arms rather than sharing a dispatch
-  helper — matching #71's standing rule that these two operations are never one
-  function parameterised by a difference, and keeping each route's
-  `plan_and_execute` call in its own body where `planner_funnel_census` reads it.
-- Until the client half lands, the protection is available and unused. That is
-  stated in three places in the code and pinned by a test, because an
-  unadvertised gap is how a guard gets believed.
+- The two handlers each call `plan_and_execute_matching` directly, preserving
+  #71's separate operations and keeping the planner call visible to the census.
+- The client and required DTO ship together; no production caller omits the
+  selector between a pinned status read and its destructive write.
 
 ## How it was proved
 
@@ -299,3 +299,18 @@ green was established first, each mutation was applied with a unique-match edit
 that fails loudly if it does not apply, and the files were restored from
 byte-exact backups with `git diff` confirming an empty result. The standing
 exception ADR 0130 used for the same reason applies.
+
+### Client capture and dispatch
+
+The end-to-end browser contract has two `failure-atlas mutation_check` arms
+with green baselines and different failures:
+
+| Run | Mutation | Distinct failure | Verdict |
+|---|---|---|---|
+| 462 | Replace the captured selector at dispatch with a live `fetch_frame().worktree_id` read | The confirmation still opened and sent a request, but no 412 response arrived; the browser timed out waiting for the repository-mismatch refusal. | caught |
+| 464 | Drop `repo` from the captured reading in `menu/worktree_items.rs` | “Discard Changes…” became disabled before confirmation and no destructive POST was sent; the browser failed its enabled-item assertion. | caught |
+
+`captured_selector_browser_contract_for_mutation_check` is an ignored,
+committed entry point in `worktree_status_scope.rs`. It builds the wasm client
+and runs only `destructive-selector.spec.mjs`, so both experiments remain
+reproducible from a clean clone instead of depending on a deleted local harness.

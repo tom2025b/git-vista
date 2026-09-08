@@ -62,6 +62,8 @@ pub struct InFlight {
 /// generation observed *after* execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settlement {
+    pub status: Option<u16>,
+    pub error_code: Option<git_vista_protocol::ErrorCode>,
     pub state: OperationState,
     pub message: Option<String>,
     pub generation: Option<GenerationToken>,
@@ -75,12 +77,38 @@ impl Settlement {
         state: OperationState,
         message: Option<String>,
         generation: Option<GenerationToken>,
+        status: Option<u16>,
     ) -> Option<Self> {
-        state.is_terminal().then_some(Self {
-            state,
-            message,
-            generation,
+        state.is_terminal().then(|| {
+            let outcome = Self {
+                state,
+                message,
+                generation,
+                status: None,
+                error_code: None,
+            };
+            match status {
+                Some(status) => outcome.with_response(status, None),
+                None => outcome,
+            }
         })
+    }
+
+    /// Preserve both HTTP and terminal-record failures. A 412 is not path
+    /// drift: the user must review the intended repository, never silently
+    /// rebase the pending operation onto the current selection and retry it.
+    pub fn with_response(
+        mut self,
+        status: u16,
+        code: Option<git_vista_protocol::ErrorCode>,
+    ) -> Self {
+        use git_vista_protocol::ErrorCode;
+        self.status = Some(status);
+        self.error_code = code.or_else(|| (status >= 400).then(|| ErrorCode::from_status(status)));
+        if self.error_code == Some(ErrorCode::PreconditionFailed) {
+            self.message = Some("Repository selection changed. Reopen the repository you intended and review its files before trying again.".into());
+        }
+        self
     }
 }
 
@@ -652,7 +680,7 @@ pub fn write_route(kind: &OperationKind) -> WriteRoute {
         // Two routes, not one parameterised by a bool — mirroring the two
         // separate `GitOperation` variants and the two separate endpoints
         // behind them (#71, M2.18a/#219). These two are the second
-        // identical-shape pair: both carry only `paths`.
+        // identical-shape pair: both carry the captured `repo` and `paths`.
         OperationKind::DiscardTrackedPaths { .. } => {
             WriteRoute::dedicated("discard_tracked_paths_request")
         }
@@ -733,6 +761,8 @@ pub const STREAM_LOST_MESSAGE: &str = "Lost contact with the server while this w
 /// this value is written inline in `signals.rs` again.
 pub fn lost_contact_settlement() -> Settlement {
     Settlement {
+        status: None,
+        error_code: None,
         state: OperationState::Failed,
         message: Some(STREAM_LOST_MESSAGE.to_string()),
         generation: None,
@@ -770,6 +800,8 @@ pub fn reattach_step(budget: u32) -> ReattachStep {
 /// alone, on the paths that have no server-side record to read.
 pub fn local_settlement(ok: bool, message: String) -> Settlement {
     Settlement {
+        status: None,
+        error_code: None,
         state: if ok {
             OperationState::Succeeded
         } else {
@@ -816,6 +848,8 @@ mod core_tests {
 
     fn succeeded(generation: &str) -> Settlement {
         Settlement {
+            status: None,
+            error_code: None,
             state: OperationState::Succeeded,
             message: None,
             generation: Some(GenerationToken::new(generation).expect("valid generation")),
@@ -958,6 +992,8 @@ mod core_tests {
         c.settle(
             &id("op-1"),
             Settlement {
+                status: None,
+                error_code: None,
                 state: OperationState::Failed,
                 message: Some("not fully merged".into()),
                 generation: None,
@@ -1061,15 +1097,37 @@ mod core_tests {
     }
 
     #[test]
+    fn repository_precondition_and_path_drift_remain_distinct_in_both_outcome_paths() {
+        use git_vista_protocol::ErrorCode;
+        let local = local_settlement(false, "raw refusal".into())
+            .with_response(412, Some(ErrorCode::PreconditionFailed));
+        let terminal = Settlement::from_terminal(
+            OperationState::Failed,
+            Some("raw refusal".into()),
+            None,
+            Some(412),
+        )
+        .unwrap();
+        assert_eq!(local, terminal);
+        assert_eq!(terminal.status, Some(412));
+        assert_eq!(terminal.error_code, Some(ErrorCode::PreconditionFailed));
+        assert!(terminal.message.unwrap().contains("review its files"));
+        let drift = local_settlement(false, "a.txt changed".into()).with_response(409, None);
+        assert_eq!(drift.error_code, Some(ErrorCode::Conflict));
+        assert_eq!(drift.message.as_deref(), Some("a.txt changed"));
+    }
+
+    #[test]
     fn a_settlement_is_built_only_from_a_terminal_record() {
         // `GET /api/operations/{id}` answers with a full record whether or not it has
         // finished. Reconciling from a non-terminal one would record an outcome that has
         // not happened.
-        assert!(Settlement::from_terminal(OperationState::Running, None, None).is_none());
+        assert!(Settlement::from_terminal(OperationState::Running, None, None, None).is_none());
         let s = Settlement::from_terminal(
             OperationState::Succeeded,
             Some("Fast-forward".into()),
             GenerationToken::new("9").ok(),
+            Some(200),
         )
         .expect("a terminal record settles");
         assert_eq!(s.state, OperationState::Succeeded);
@@ -1833,9 +1891,11 @@ mod write_route_tests {
                 warn_pushed: false,
             }),
             OperationKind::DiscardTrackedPaths {
+                repo: git_vista_core::identity::WorktreeId::from_git_dir("/fixture/.git"),
                 paths: vec!["src/main.rs".into()],
             },
             OperationKind::DeleteUntrackedPaths {
+                repo: git_vista_core::identity::WorktreeId::from_git_dir("/fixture/.git"),
                 paths: vec!["scratch.txt".into()],
             },
             OperationKind::CherryPick {

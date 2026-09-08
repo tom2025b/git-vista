@@ -228,11 +228,9 @@ pub fn menu_view(
     // reason. This reply is what "Discard Changes…" and "Delete Untracked
     // Files…" name their files from, so an answer retained across a repository
     // switch would put another repository's paths inside a confirmation for
-    // this one. The server cannot catch that for us: the write carries no
-    // repository selector and `verify_path_states` re-derives against whatever
-    // repository is selected *now*, so it refuses a path that is not dirty
-    // here — and passes one that happens to share a name, which is exactly
-    // what sibling worktrees of the same repository do.
+    // this one. Preserve the read's id beside its status: the server's 412
+    // precondition can then catch a selection moved by another request from
+    // this session, even when a sibling has the same dirty path names.
     //
     // A failed, still-in-flight, or out-of-frame read resolves to `None`, and
     // both items then render *disabled with the reason* rather than vanishing
@@ -248,7 +246,12 @@ pub fn menu_view(
         },
         |(open, epoch, repo)| async move {
             let reading = match (open, repo.as_deref()) {
-                (true, Some(id)) => fetch_worktree_status_for(id).await.ok(),
+                (true, Some(id)) => match id.parse() {
+                    Ok(repo) => fetch_worktree_status_for(id).await.ok().map(|status| {
+                        crate::features::status::core::ScopedWorktreeStatus { repo, status }
+                    }),
+                    Err(_) => None,
+                },
                 // Closed, or no accepted frame yet: no request can describe
                 // this menu, so nothing is fetched and nothing is claimed.
                 _ => None,

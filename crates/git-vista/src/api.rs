@@ -392,6 +392,8 @@ async fn send_read(url: &str) -> Result<gloo_net::http::Response, HistoryFetchEr
 /// not operation-tracked (`select`, `rescan`, `clone`, `delete-clone`), which is a normal
 /// answer, not a failure: those settle from this response alone.
 pub struct WriteReceipt {
+    pub status: u16,
+    pub error_code: Option<git_vista_protocol::ErrorCode>,
     pub operation: Option<OperationId>,
     /// Whether the HTTP status was 2xx.
     pub ok: bool,
@@ -411,7 +413,12 @@ async fn receipt(resp: gloo_net::http::Response) -> WriteReceipt {
         .text()
         .await
         .unwrap_or_else(|_| format!("HTTP {status}"));
+    let error_code = serde_json::from_str::<git_vista_protocol::ApiError>(&message)
+        .ok()
+        .map(|envelope| envelope.error.code);
     WriteReceipt {
+        status,
+        error_code,
         operation,
         ok,
         message,
