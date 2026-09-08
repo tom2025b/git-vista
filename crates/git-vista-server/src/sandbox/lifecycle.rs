@@ -104,6 +104,7 @@ use std::time::{Duration, Instant};
 
 use super::escape_contract::production_env_profile;
 use super::escape_suite::hostile_hook_repo;
+use super::spawn;
 use super::spawn::command_async;
 use super::*;
 
@@ -666,5 +667,186 @@ async fn strict_gets_a_private_dev_shm_tmpfs_that_the_network_tier_does_not() {
         shm.host.is_file(),
         "C4: the host marker must still exist after the run; if the sandbox could \
          delete it, `ABSENT` would be self-inflicted rather than observed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #728 — the reaper survives its own parent's death, not just the launcher's
+// ---------------------------------------------------------------------------
+
+/// `to_cstrings`/`spawn_helper_owning_the_launcher` below exist because of a
+/// gap Codex's review of #728 named precisely: every SIGKILL test above this
+/// point (including `strict_reaps_a_double_forked_setsid_orphan…`) calls
+/// `child.start_kill()` on the composed launcher **the test itself spawned**.
+/// That proves the launcher's own pid-namespace teardown reaps a
+/// double-forked orphan when the launcher is killed directly. It says nothing
+/// about #728's actual defect, which is one hop further out: whatever process
+/// *spawned* the launcher dying, before the launcher itself is ever signalled.
+///
+/// This builds that missing hop for real, through the exact production seam:
+/// a **helper** process — standing in for whatever real process calls
+/// `command_async` in production (the server, or a test harness) — is made,
+/// via raw `fork`+`execvp`, the actual OS parent of the composed launcher,
+/// built with the same two calls production code makes
+/// (`spawn::full_argv` then `spawn::wrap_with_reaper`). SIGKILLing the
+/// **helper** — never the launcher, never the reaper — is the scenario #728
+/// names and the one no test here reached before it.
+fn to_cstrings(argv: &[std::ffi::OsString]) -> Vec<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    argv.iter()
+        .map(|a| std::ffi::CString::new(a.as_os_str().as_bytes()).expect("argv has no NUL"))
+        .collect()
+}
+
+/// Fork a **helper** that itself spawns the composed launcher and then idles,
+/// deliberately never `wait()`-ing on it — standing in for a real caller that
+/// is simply busy elsewhere when it dies, which is exactly the shape #728's
+/// own evidence showed (the two found orphans' real parent was gone, not
+/// gracefully shut down). Returns the helper's pid: this is what the test
+/// SIGKILLs, never the launcher or the reaper.
+///
+/// # Why two forks, not one
+///
+/// `fork()` inside a multithreaded program — this `#[tokio::test]`'s runtime
+/// — is safe only if the forked child does nothing before `exec`/`_exit` but
+/// read data already built in the parent: no allocation, no locking, nothing
+/// that could touch a mutex some other, non-forked thread held at the moment
+/// of the fork. The **helper**'s own body needs to fork *again* and then
+/// sleep — more than that bare minimum — so it is done from inside a
+/// **second**, by-then single-threaded process (this first fork's child),
+/// where none of those restrictions apply, rather than from the tokio runtime
+/// directly. Neither forked branch below calls back into Rust's panic
+/// machinery (`assert!`, `unwrap`, …) for the same reason: unwinding or
+/// printing through possibly-inconsistent inherited state is exactly what the
+/// restriction above rules out. `libc::_exit`, not `std::process::exit`, is
+/// the only safe way out of either child branch — it skips at-exit handlers
+/// and Rust's own global destructors, which the same inherited-state hazard
+/// applies to.
+async fn spawn_helper_owning_the_launcher(
+    policy: &Policy,
+    repo: &Path,
+    args: &[&str],
+) -> libc::pid_t {
+    let argv = spawn::wrap_with_reaper(spawn::full_argv(policy, repo, args));
+    let cargv = to_cstrings(&argv);
+    let mut raw: Vec<*const libc::c_char> = cargv.iter().map(|c| c.as_ptr()).collect();
+    raw.push(std::ptr::null());
+
+    // SAFETY: see the doc comment above — the child branch touches only the
+    // already-built `cargv`/`raw` buffers before forking again or exiting.
+    let helper_pid = unsafe { libc::fork() };
+    if helper_pid == 0 {
+        // Now single-threaded and answerable to nothing but this test: the
+        // multithreaded-fork restriction applied to the fork above, not to
+        // this one.
+        let launcher_pid = unsafe { libc::fork() };
+        if launcher_pid < 0 {
+            unsafe { libc::_exit(126) };
+        }
+        if launcher_pid == 0 {
+            unsafe {
+                libc::execvp(cargv[0].as_ptr(), raw.as_ptr());
+                // execvp only returns on failure.
+                libc::_exit(127);
+            }
+        }
+        loop {
+            unsafe {
+                libc::sleep(60);
+            }
+        }
+    }
+    assert!(
+        helper_pid > 0,
+        "fork() (helper) failed: {}",
+        std::io::Error::last_os_error()
+    );
+    helper_pid
+}
+
+/// #728's acceptance criterion, built from the fixture above: "a sandboxed
+/// process whose parent dies abruptly (SIGKILL, not SIGTERM) is reaped rather
+/// than reparented and left running." The paired positive that makes this
+/// mean anything is every other test in this file — `orphan_hook`'s detached
+/// `setsid` ticker/marker is the identical hook `strict_reaps_a_double_forked…`
+/// already showed *does* survive a direct SIGKILL of the composed launcher
+/// under `Tier::Network` (no namespace, no reaper needed to explain it) and
+/// *does not* survive one under `Tier::Strict` via pid-namespace teardown
+/// alone. This test's subject is a third, harder case neither of those
+/// covers: the launcher is never touched directly at all.
+#[tokio::test]
+async fn a_reaper_process_reaps_the_launcher_when_only_its_own_parent_is_sigkilled() {
+    let case = "lifecycle-reaper-728";
+
+    assert!(
+        super::reaper::reaper_path().is_some(),
+        "{case}: gv-sandbox-reaper must be built and resolvable, or this test \
+         proves nothing about the mechanism under test — see \
+         tests/forces_reaper_build.rs. If this fails, the build plan is missing \
+         the binary, not the mechanism."
+    );
+
+    let repo = hostile_hook_repo(&orphan_hook());
+    let policy = strict_baseline(repo.path(), case).await;
+
+    let helper_pid = spawn_helper_owning_the_launcher(
+        &policy,
+        repo.path(),
+        &["commit", "--allow-empty", "-m", "orphan-728"],
+    )
+    .await;
+
+    // Wait for evidence the detached grandchild is actually running — the same
+    // discipline `observe_orphan` uses, and for the same reason: a fixed delay
+    // landing before the hook fires would make this whole test vacuous.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if tick_count(repo.path()) >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{case}: the hook's detached ticker never wrote two ticks within 30s \
+             — nothing about reaping can be observed from a run whose hook never \
+             ran"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // SIGKILL the HELPER — never the launcher, never the reaper, never bwrap.
+    // This is the one hop #728 says no earlier test in this file reached.
+    let killed = unsafe { libc::kill(helper_pid, libc::SIGKILL) };
+    assert_eq!(
+        killed, 0,
+        "{case}: SIGKILL of the helper must be deliverable"
+    );
+    let mut status: i32 = 0;
+    unsafe {
+        libc::waitpid(helper_pid, &mut status, 0);
+    }
+
+    // POLL_INTERVAL (gv-sandbox-reaper) is 100ms; this settle window is well
+    // past it, so a failure below is the mechanism's, not the timing's.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let ticks_at_kill = tick_count(repo.path());
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+
+    assert!(
+        ticks_at_kill >= 2,
+        "{case}: the detached ticker must have been running before the helper \
+         was killed, got {ticks_at_kill} ticks — otherwise the comparison below \
+         is zero versus zero"
+    );
+    assert_eq!(
+        tick_count(repo.path()),
+        ticks_at_kill,
+        "{case}: #728 — a descendant kept running after only its GRANDPARENT \
+         (never the launcher itself) was killed. The reaper did not notice it \
+         had been reparented, or did not tear the sandbox down when it did."
+    );
+    assert!(
+        !repo.path().join(ORPHAN_MARKER).exists(),
+        "{case}: the delayed marker was written after the helper's death — the \
+         detached setsid grandchild survived reparenting"
     );
 }

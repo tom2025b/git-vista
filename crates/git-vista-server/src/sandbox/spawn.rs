@@ -42,7 +42,7 @@ use super::{checkout_sandbox_argv, sandbox_argv, CheckoutPolicy, Policy};
 /// Split out from both wrappers so the argv they will run is testable without
 /// spawning anything, and so the two wrappers cannot drift apart in how they
 /// assemble it.
-fn full_argv(policy: &Policy, repo: &Path, args: &[&str]) -> Vec<std::ffi::OsString> {
+pub(crate) fn full_argv(policy: &Policy, repo: &Path, args: &[&str]) -> Vec<std::ffi::OsString> {
     let mut argv = sandbox_argv(policy);
     argv.push(std::ffi::OsString::from("-C"));
     argv.push(repo.as_os_str().to_os_string());
@@ -485,6 +485,7 @@ pub(crate) fn checkout_command_async(
 }
 
 fn command_from_argv(argv: Vec<std::ffi::OsString>) -> SandboxedCommand {
+    let argv = wrap_with_reaper(argv);
     let (program, rest) = split(&argv);
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(rest);
@@ -492,6 +493,44 @@ fn command_from_argv(argv: Vec<std::ffi::OsString>) -> SandboxedCommand {
         cmd.env_remove(var);
     }
     SandboxedCommand(cmd)
+}
+
+/// #728: an abrupt death of whatever spawned a sandboxed launcher (bwrap, or
+/// the shim directly in `Tier::Network`) must not leave it reparented and
+/// running forever — see `sandbox::reaper`'s module doc for the full account
+/// and ADR TODO for the design. Layered here, at the one place pure argv
+/// becomes a real process, rather than inside `sandbox_argv` itself: INV-16's
+/// reviewed argv shapes stay exactly what they were before #728, because the
+/// reaper decides how that argv is *launched*, not what it is.
+///
+/// Never applied to the `Unsandboxed` tier's bare `git` (INV-16 shapes 1/2):
+/// that operation is already explicit, persisted, operator-trusted content
+/// flying a permanent banner (INV-15), and wrapping it in more process-
+/// lifetime machinery is scope neither #728 nor its ADR asked for. Detected
+/// structurally — program is literally `"git"` — rather than by threading a
+/// `Tier` through this function, so this stays correct for `CheckoutPolicy`
+/// too without needing to see through its private field.
+///
+/// A host missing `gv-sandbox-reaper` gets `argv` back unwrapped: exactly the
+/// sandbox it had before #728, no capability lost — see `reaper::reaper_path`
+/// for why that absence is a soft condition, not a policy-construction
+/// failure.
+pub(crate) fn wrap_with_reaper(argv: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let is_bare_git = argv
+        .first()
+        .is_some_and(|p| p.as_os_str() == std::ffi::OsStr::new("git"));
+    if is_bare_git {
+        return argv;
+    }
+    match super::reaper::reaper_path() {
+        Some(reaper) => {
+            let mut wrapped = Vec::with_capacity(argv.len() + 1);
+            wrapped.push(reaper.as_os_str().to_os_string());
+            wrapped.extend(argv);
+            wrapped
+        }
+        None => argv,
+    }
 }
 
 #[cfg(test)]
