@@ -33,6 +33,10 @@ pub const BADGE_GAP: i32 = 5;
 // Per-character advance and inner horizontal padding, in px (monospace @ ~11px).
 const BADGE_CHAR_W: i32 = 7;
 const BADGE_PAD_X: i32 = 6;
+// The meta line is 11px. Round its roughly 0.75em ascender up, then keep a
+// separate whole-pixel cushion so font-specific metrics cannot meet the pill.
+const META_TEXT_ASCENT_CEIL: i32 = 9;
+const BADGE_META_CLEARANCE: i32 = 4;
 
 /// Pointer travel (CSS px) past which a press becomes a pan/drag rather than a
 /// tap. Touch gets a wider allowance: a natural finger tap wobbles 5-10 px on
@@ -160,15 +164,16 @@ pub fn badge_text_dx() -> i32 {
     BADGE_PAD_X
 }
 
-/// Top y of a row's badge pills — they sit on the message (top) label line,
-/// clear of the hash·author line below.
+/// Top y of a row's badge pills — they sit on the message (top) label line and
+/// leave at least [`BADGE_META_CLEARANCE`] px below the pill before the rounded
+/// upper bound of the hash·author line's ascender.
 pub fn badge_top_y(row: usize) -> i32 {
-    node_cy(row) - 12
+    label_bottom_y(row) - META_TEXT_ASCENT_CEIL - BADGE_META_CLEARANCE - BADGE_HEIGHT
 }
 
 /// Baseline y of a badge's text, vertically centred in the pill.
 pub fn badge_text_y(row: usize) -> i32 {
-    node_cy(row) - 1
+    badge_top_y(row) + 11
 }
 
 /// SVG path data for a commit->parent edge. Same-lane links are a straight
@@ -486,6 +491,23 @@ mod tests {
         // Pills sit on the top label line, above the hash·author line.
         assert!(badge_top_y(2) < label_top_y(2));
         assert!(badge_text_y(2) < label_bottom_y(2));
+    }
+
+    #[test]
+    fn badge_pill_keeps_rounding_safe_clearance_above_meta_text() {
+        let row = 2;
+        let badge_bottom = badge_top_y(row) + BADGE_HEIGHT;
+        let meta_text_top = label_bottom_y(row) - META_TEXT_ASCENT_CEIL;
+
+        assert!(
+            badge_bottom + BADGE_META_CLEARANCE <= meta_text_top,
+            "badge bottom {badge_bottom} must leave {BADGE_META_CLEARANCE}px before meta text top {meta_text_top}"
+        );
+        let actual_clearance = meta_text_top - badge_bottom;
+        assert!(
+            actual_clearance >= 4,
+            "badge/meta clearance {actual_clearance}px must absorb whole-pixel font-metric rounding"
+        );
     }
 
     #[test]
