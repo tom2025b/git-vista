@@ -475,7 +475,7 @@ pub struct PushRequest {
 /// never option-shaped. Shared by both endpoints because the request shape
 /// is identical; the two `GitOperation` variants it builds into are not (#71).
 ///
-/// # `repo` — the repository this path list was derived from (#721, ADR 0139)
+/// # `repo` — the repository this path list was derived from (#721, ADR 0140)
 ///
 /// A path list is only meaningful against the repository it was read out of.
 /// Without `repo` the server can re-derive each path's tracked/untracked

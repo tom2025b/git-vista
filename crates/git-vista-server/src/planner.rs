@@ -104,7 +104,7 @@ pub(crate) async fn plan_and_execute_for_worktree(
 
 /// Build → validate → execute one operation against the current selection —
 /// **refusing outright** if that selection is not the worktree the request
-/// says it was built against (#721, ADR 0139).
+/// says it was built against (#721, ADR 0140).
 ///
 /// # Why refuse, rather than act on the named worktree
 ///
@@ -209,8 +209,9 @@ pub(crate) async fn plan_and_execute_recovery(
 /// Where a composed write resolves its repository. All established writes use
 /// the session selection; the two conflict writes carry an explicit worktree
 /// id because their reads are independently addressable (#621, ADR 0109); the
-/// two destructive path writes carry one as a *precondition* on the selection
-/// rather than as an address (#721, ADR 0139 — see
+/// two destructive path writes can carry one as a *precondition* on the
+/// selection rather than as an address, though production callers do not send
+/// one yet (#721, #733, ADR 0140 — see
 /// [`plan_and_execute_matching`] for why the difference is deliberate).
 enum MutationTarget {
     Selection,
@@ -4126,7 +4127,7 @@ fn classify_path_states(parsed: &git_vista_protocol::ParsedStatus) -> HashMap<St
 ///   filename.
 ///
 /// It cannot do better, because until #721 nothing in the request said where
-/// the list came from. `MutationTarget::SelectionMatching` (ADR 0139) is the
+/// the list came from. `MutationTarget::SelectionMatching` (ADR 0140) is the
 /// answer to *that* question and is checked far earlier, at target
 /// resolution, with its own distinct `412` — deliberately not folded into the
 /// `409` below, which means "the thing you were shown has changed", not "you

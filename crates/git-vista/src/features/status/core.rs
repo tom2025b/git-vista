@@ -1279,7 +1279,7 @@ mod tests {
     /// **#721 changed what the server *can* be told, not what this client
     /// sends.** `WorktreePathsRequest` now carries an optional `repo`, and a
     /// selector naming a worktree other than the selected one is refused with
-    /// its own `412` (ADR 0139). The browser client cannot supply it yet: the
+    /// its own `412` (ADR 0140). The browser client cannot supply it yet: the
     /// path list travels through an `OperationKind` that carries `paths`
     /// alone, so `api::discard_tracked_paths_request` sends `repo: None` and
     /// the endpoint behaves exactly as this test describes. Until that second

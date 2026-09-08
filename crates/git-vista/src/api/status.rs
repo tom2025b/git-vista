@@ -69,7 +69,7 @@ pub async fn fetch_status_for(repo: &str) -> Result<RepoStatus, String> {
 /// `verify_path_states` re-check is a **conditional path-state recheck**, not
 /// a repository check: it cannot tell a colliding path name in the live
 /// repository from the one the user was actually shown. #721 gave the
-/// destructive POSTs a repository selector that *can* answer that (ADR 0139),
+/// destructive POSTs a repository selector that *can* answer that (ADR 0140),
 /// but this client cannot fill it in yet — see
 /// [`discard_tracked_paths_request`] — so for the shipped path this paragraph
 /// still describes the whole of the server's contribution.

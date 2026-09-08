@@ -1,6 +1,6 @@
-# ADR 0139 — A destructive write carries the repository it was built against
+# ADR 0140 — A destructive write carries the repository it was built against
 
-- **Status:** Proposed — server half implemented and mutation-proved three ways failing differently; the wire field is optional until the browser client can supply it, which is the second half of #721 and is not in this change
+- **Status:** Proposed — server half implemented and mutation-proved three ways failing differently; the wire field is optional until the browser client can supply it, which is tracked by #733 and is not in this change
 - **Date:** 2026-09-07
 - **Issue:** #721; refs #711, #709, #707
 - **Extends:** [ADR 0038](0038-worktree-destructive-operations.md) — its §3 introduced `verify_path_states` as a deliberately redundant *per-path* re-verification, which is accurate; what this ADR corrects is the reading that grew around it. Nothing in 0038 is retracted.
@@ -104,6 +104,15 @@ destroy the distinction this whole change exists to draw:
 - **409 — "the thing you were shown has changed."** Ordinary, self-healing, and
   it names the path. Look again and try.
 
+That distinction is part of the typed error-envelope wire contract, not only
+the HTTP status line. `ErrorCode::PreconditionFailed` serializes as
+`precondition_failed`, maps to and from `412`, and the server's response layer
+therefore preserves it when wrapping a handler's plain-text refusal. Before
+this correction, `ErrorCode::from_status` flattened `412` into `bad_request`
+through its unrecognized-4xx fallback. The browser still drops both the typed
+code and terminal status while building `WriteReceipt` and `Settlement`; #733
+tracks carrying the distinction through that client half and branching on it.
+
 The refusal text names neither repository. The client already knows which one it
 asked for, and a refusal must not become a way to learn what else this server
 serves.
@@ -119,7 +128,7 @@ flowchart TD
     C1["body names worktree A"] --> C2["plan_and_execute_for_worktree"]
     C2 --> C3["<b>acts on A</b><br/>whatever is selected"]
   end
-  subgraph DESTRUCTIVE["ADR 0139 — the two path writes"]
+  subgraph DESTRUCTIVE["ADR 0140 — the two path writes"]
     D1["body names worktree A"] --> D2["plan_and_execute_matching"]
     D2 --> D3{"is A selected?"}
     D3 -->|"yes"| D4["<b>acts on A</b>"]
@@ -171,6 +180,11 @@ that has no room for a scope, so `api::discard_tracked_paths_request` sends
 rejected outright: it would always match the selection and therefore prove
 nothing, which is worse than no check because it reads like one. The scope that
 matters is the one captured when the list was built.
+
+The browser client also does not yet retain the new `precondition_failed` code:
+`WriteReceipt` and `Settlement` discard it before the UI can react. That is the
+separate client half tracked by #733; this change stops at the protocol and
+server envelope boundary.
 
 Making the field required means widening `OperationKind` and the confirmation
 that constructs it, in client files outside this change's scope. Until then:
@@ -226,7 +240,8 @@ it impossible to say which half the mutation proofs covered.
   three delegate into the one gated block, so the read-only gate, the
   idempotency-key requirement, admission, the staleness gate and the durable
   terminal record are unchanged for every path.
-- `412` joins this server's vocabulary. It is the first use.
+- `412` joins this server's vocabulary as the wire code
+  `precondition_failed`. It is the first use.
 - The two handlers each spell their own two arms rather than sharing a dispatch
   helper — matching #71's standing rule that these two operations are never one
   function parameterised by a difference, and keeping each route's
