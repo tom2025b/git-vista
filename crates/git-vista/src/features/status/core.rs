@@ -72,6 +72,15 @@ use git_vista_protocol::{
 /// A status response and the opaque worktree id used to request it. Callers
 /// keep the public fields paired by convention until both are copied into the
 /// pending destructive operation.
+///
+/// #745 recorded that pairing as "a convention rather than an invariant
+/// enforced by private fields", and #746 asked whether a second consumer was
+/// the moment to enforce it. It was not, because no second consumer appeared:
+/// the Activity panel needs its reading *resolved against the live frame*, not
+/// a repository id to dispatch a write with, so it takes the pair
+/// [`panel_worktree_reading`] returns and never constructs this type. The menu
+/// is still the only holder, and the case for a constructor and accessors is
+/// still waiting on a second one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopedWorktreeStatus {
     pub repo: git_vista_core::identity::WorktreeId,
