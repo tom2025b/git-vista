@@ -1289,15 +1289,16 @@ mod tests {
     /// into the required wire selector. Identity now supplies the separate
     /// 412 backstop; it does not strengthen this path-state filter itself.
     ///
-    /// This test does not run the server. It pins the client-side claim the
-    /// severity argument rests on: the paths a stale reply would have offered
-    /// are ordinary names with nothing about them a path-state filter could
-    /// reject. The server-side twin, which does run the handler and the
-    /// planner, is
+    /// This test does not run the server's path-state recheck, so it does not
+    /// prove that matching names are indistinguishable to that recheck. It
+    /// pins the narrower client-side claim: an elsewhere-tagged reply can
+    /// contain ordinary discardable and deletable paths, but the frame gate
+    /// still rejects it by repository identity. The server-side collision
+    /// test, which does run the handler and planner, is
     /// `git-vista-server`'s
     /// `handlers::discard::tests::a_colliding_path_name_from_a_sibling_worktree_is_refused`.
     #[test]
-    fn a_colliding_path_name_is_indistinguishable_to_a_path_state_recheck() {
+    fn an_elsewhere_reply_with_ordinary_paths_is_rejected_by_the_frame_gate() {
         let elsewhere = status(vec![
             changed(
                 "Cargo.lock",
@@ -1319,21 +1320,8 @@ mod tests {
             deletable_untracked_paths(&elsewhere),
             vec!["notes.txt".to_string()]
         );
-        // The live repository, dirty in the very same files. A re-check that
-        // asks only "is this path tracked-dirty / untracked here?" answers yes
-        // to both, so it would admit the whole batch.
-        let here = elsewhere.clone();
-        assert_eq!(
-            discardable_tracked_paths(&here),
-            discardable_tracked_paths(&elsewhere)
-        );
-        assert_eq!(
-            deletable_untracked_paths(&here),
-            deletable_untracked_paths(&elsewhere)
-        );
-        // The frame gate is what tells them apart, and it does it on the tag
-        // rather than on the contents — which is why identical contents do not
-        // weaken it.
+        // The frame gate rejects the reply on its tag, independently of the
+        // plausible destructive paths established above.
         assert_eq!(
             current_reading(false, v2_reply(4, "elsewhere", elsewhere), 4, Some("here")),
             None
