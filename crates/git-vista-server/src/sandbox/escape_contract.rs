@@ -1762,9 +1762,12 @@ fn matching_brace(code: &str, open: usize) -> usize {
 /// Nothing is skipped on a guess. Only contexts where `Policy {` provably is not
 /// a construction are passed over — a `struct`/`enum`/`union`/`trait`
 /// declaration, `impl … Policy {`, `… for Policy {`, and a `-> Policy {` return
-/// type (optionally path-qualified, e.g. `-> super::Policy {`) — and skipping a
-/// *signature* loses no coverage, because that function's body is ordinary code
-/// scanned like any other. Everything else is returned for the caller to judge;
+/// type (optionally borrowed or path-qualified, e.g. `-> &Policy {` or
+/// `-> super::Policy {`) — and skipping a *signature* loses no coverage,
+/// because that function's body is ordinary code scanned like any other.
+/// A leading `&` is skipped only while finding that `->`; `&Policy { … }` in
+/// an expression remains a construction. Everything else is returned for the
+/// caller to judge;
 /// R8 must never silently skip something it cannot verify.
 fn production_policy_literals(prod: &str) -> Vec<&str> {
     let needle = ["Policy", " {"].concat();
@@ -1787,13 +1790,19 @@ fn production_policy_literals(prod: &str) -> Vec<&str> {
             continue;
         }
         // The token that introduces it, looking through a `::` path prefix so
-        // `impl super::Policy {` is classified by `impl`, not by `super::`.
+        // `impl super::Policy {` is classified by `impl`, not by `super::`,
+        // and through a borrow so `-> &Policy {` is classified by `->`. The
+        // borrow is not itself grounds to skip: an expression `&Policy { … }`
+        // remains a construction unless the token before `&` is `->`.
         let mut tokens = before
             .trim_end()
             .rsplit(char::is_whitespace)
             .filter(|t| !t.is_empty());
         let mut lead = tokens.next().unwrap_or("");
         if lead.ends_with("::") {
+            lead = tokens.next().unwrap_or("");
+        }
+        if lead.starts_with('&') {
             lead = tokens.next().unwrap_or("");
         }
         if matches!(
@@ -1948,9 +1957,9 @@ fn r8_exemptions_expire_when_their_named_blocker_disappears() {
                     "R8: a `Policy` construction in {stem}.rs spells no `hook_mode` field \
                      inside its own braces. R8 does not skip what it cannot verify, so \
                      this is a hard failure rather than a silent pass: write the field \
-                     out literally. A `Policy {{ .., ..base }}` functional update hits \
-                     this on purpose — its hook mode comes from `base`, which is exactly \
-                     the indirection this check exists to refuse. Body was: `{body}`"
+                     out literally. This also rejects functional update syntax, because \
+                     an inherited hook mode is exactly the indirection this check exists \
+                     to refuse. Body was: `{body}`"
                 )
             });
             let value = body[f + field.len()..].trim_start();
@@ -2010,6 +2019,29 @@ fn the_r8_policy_scan_is_token_exact_and_brace_scoped() {
             "not a construction, but the scan claimed one: {src}"
         );
     }
+
+    // A borrowed return type is still a signature, not a construction. The
+    // leading `&` must not hide the `->` that classifies it.
+    assert!(
+        production_policy_literals("fn as_policy(&self) -> &Policy { &self.policy }").is_empty(),
+        "`-> &Policy {{` is a return type, not a `Policy` construction"
+    );
+
+    // The same leading `&` in an expression is materially different: this is
+    // a real construction, and R8 must inspect its own braces just as it does a
+    // bare literal. In particular, this missing `hook_mode` must remain visible
+    // to the caller's hard-failure arm.
+    let borrowed = production_policy_literals("let policy = &Policy { tier, ..base };");
+    assert_eq!(
+        borrowed.len(),
+        1,
+        "a reference-to-literal expression must still be inspected: {borrowed:?}"
+    );
+    assert!(
+        !borrowed[0].contains("hook_mode"),
+        "the borrowed literal's missing field must remain visible: {:?}",
+        borrowed[0]
+    );
 
     // A real construction inside a function whose return type is also `Policy`:
     // exactly one body, and it is the literal's, not the function's.
