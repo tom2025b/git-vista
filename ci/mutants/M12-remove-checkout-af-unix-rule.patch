@@ -1,0 +1,16 @@
+--- a/crates/git-vista-server/src/bin/gv-sandbox/seccomp_filter.rs
++++ b/crates/git-vista-server/src/bin/gv-sandbox/seccomp_filter.rs
+@@ -289,13 +289,6 @@
+ fn rules_for(net: NetScope) -> Result<BTreeMap<i64, Vec<SeccompRule>>, seccompiler::BackendError> {
+     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+ 
+-    // Checkout is the second strong profile. Kept as a distinct arm so M8 and
+-    // M12 can remove Strict's and checkout's mechanisms independently.
+-    if net == NetScope::Checkout {
+-        rules.insert(libc::SYS_socket, vec![af_unix_rule()?]);
+-        rules.insert(libc::SYS_socketpair, vec![af_unix_rule()?]);
+-    }
+-
+     // An empty rule vector means "every invocation of this syscall matches".
+     for (nr, _why) in denied_outright() {
+         rules.insert(nr, vec![]);

@@ -96,15 +96,13 @@ const TARGET_ARCH: TargetArch = TargetArch::aarch64;
 #[cfg(target_arch = "x86_64")]
 const X32_SYSCALL_BIT: i64 = 0x4000_0000;
 
-/// Whether the tier this filter is being built for has network access — the one
-/// axis on which the filter differs between tiers.
+/// Which network-facing seccomp profile this process needs.
 ///
 /// Named rather than a bare `bool` because `build(true)` at the call site would
 /// not say *which* tier got the weaker filter, and the only rule that varies
 /// (AF_UNIX, below) is the one a reviewer most needs to attribute to a tier.
-/// The shim learns this from the `--net-deny` / `--net-allow` flag that
-/// `sandbox::shim_argv` already emits per tier, so nothing new travels in the
-/// argv: `--net-deny` is `Strict`, `--net-allow` is `Network`, and
+/// The shim learns this from the `--net-deny` / `--net-allow` flag and the
+/// checkout-only `--seccomp-checkout` marker that `sandbox::shim_argv` emits.
 /// `Unsandboxed` never launches the shim at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetScope {
@@ -114,6 +112,10 @@ pub enum NetScope {
     /// `--net-allow`: the Network tier, the only one in which `git
     /// push`/`fetch`/`clone` can work (F3).
     Allowed,
+    /// `--net-allow --seccomp-checkout`: TCP remains available for HTTPS Git
+    /// LFS smudge filters, but AF_UNIX is denied because this is the clone
+    /// phase that executes remote-supplied hooks and filters (#723).
+    Checkout,
 }
 
 /// Syscalls denied outright, with the reason each one is here.
@@ -213,7 +215,7 @@ fn prctl_rule() -> Result<SeccompRule, seccompiler::BackendError> {
 }
 
 /// `socket(2)` and `socketpair(2)` with `AF_UNIX` (== `AF_LOCAL` == 1) as the
-/// address family, denied in the **Strict** tier only. Every other family —
+/// address family, denied in the **Strict and checkout** profiles. Every other family —
 /// `AF_INET`, `AF_INET6`, `AF_NETLINK` — is untouched, because a blanket denial
 /// of `socket` would break the Network tier's TCP and anything in git that opens
 /// a socket for a reason this design never objected to.
@@ -241,17 +243,17 @@ fn prctl_rule() -> Result<SeccompRule, seccompiler::BackendError> {
 /// `/run/docker.sock`, `ssh-agent`, `gpg-agent` and the D-Bus session bus — every
 /// one of them a full escape — with nothing in the stack objecting.
 ///
-/// # Why Strict only, and not the Network tier
+/// # Why ordinary Network is exempt, and checkout is not
 ///
 /// The Network tier is where `git push`/`fetch` over SSH lives, and SSH
 /// legitimately wants an `ssh-agent` socket, which is a pathname `AF_UNIX`
 /// socket. Issue #188 defers that carve-out deliberately, so denying AF_UNIX in
-/// the Network tier here would either break authenticated remotes or force a
-/// carve-out this task is not allowed to build. The Network tier therefore keeps
-/// exactly the filter it had before this rule existed: a tier whose whole purpose
-/// is reaching the network does not gain much from losing its local sockets, and
-/// a denial nobody has measured git against is how a filter gets widened until it
-/// means nothing (see the module comment).
+/// the ordinary Network profile would break authenticated remotes. That profile
+/// therefore keeps exactly the filter it had before this rule existed. Clone
+/// checkout is the narrower exception: it keeps TCP because an HTTPS Git LFS
+/// smudge filter needs it, while denying AF_UNIX so a fetched hook cannot recover
+/// an agent pathname from `$HOME` and connect after setting `SSH_AUTH_SOCK`
+/// itself (#723).
 ///
 /// # C2 — register width
 ///
@@ -286,6 +288,13 @@ fn af_unix_rule() -> Result<SeccompRule, seccompiler::BackendError> {
 /// compiled `BpfProgram` no longer exposes.
 fn rules_for(net: NetScope) -> Result<BTreeMap<i64, Vec<SeccompRule>>, seccompiler::BackendError> {
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+
+    // Checkout is the second strong profile. Kept as a distinct arm so M8 and
+    // M12 can remove Strict's and checkout's mechanisms independently.
+    if net == NetScope::Checkout {
+        rules.insert(libc::SYS_socket, vec![af_unix_rule()?]);
+        rules.insert(libc::SYS_socketpair, vec![af_unix_rule()?]);
+    }
 
     // An empty rule vector means "every invocation of this syscall matches".
     for (nr, _why) in denied_outright() {
@@ -362,7 +371,7 @@ mod tests {
     /// syscall this one meant to stop.
     #[test]
     fn the_filter_builds_and_denies_terminally() {
-        for net in [NetScope::Denied, NetScope::Allowed] {
+        for net in [NetScope::Denied, NetScope::Allowed, NetScope::Checkout] {
             let program = build(net).expect("filter builds");
             assert!(
                 !program.is_empty(),
@@ -378,23 +387,25 @@ mod tests {
     /// would mean "every invocation matches" — a blanket denial that would take
     /// the Network tier's TCP down with it.
     ///
-    /// Scoped to the **tier**: the Network tier must carry no socket rule at all
-    /// while #188 defers the `ssh-agent` carve-out. If this half starts failing
-    /// because someone widened the rule to both tiers, that is not a test to
-    /// relax — it is a git-over-SSH regression that has not been measured.
+    /// Scoped to the **profile**: ordinary Network must carry no socket rule
+    /// because authenticated SSH remotes need an agent; checkout must carry the
+    /// same denial as Strict because it executes remote-supplied code.
     #[test]
-    fn af_unix_is_denied_in_strict_and_left_alone_in_the_network_tier() {
-        let strict = rules_for(NetScope::Denied).expect("strict rules build");
-        for nr in [libc::SYS_socket, libc::SYS_socketpair] {
-            let scoped = strict
-                .get(&nr)
-                .unwrap_or_else(|| panic!("syscall {nr} must carry an AF_UNIX rule in Strict"));
-            assert_eq!(
-                scoped.len(),
-                1,
-                "syscall {nr}'s denial must be argument-scoped to AF_UNIX; an empty rule \
-                 vector is a blanket denial and would break AF_INET too"
-            );
+    fn af_unix_is_denied_in_strict_and_checkout_but_left_alone_in_network() {
+        for profile in [NetScope::Denied, NetScope::Checkout] {
+            let rules = rules_for(profile).expect("rules build");
+            for nr in [libc::SYS_socket, libc::SYS_socketpair] {
+                let scoped = rules.get(&nr).unwrap_or_else(|| {
+                    panic!("syscall {nr} must carry an AF_UNIX rule in {profile:?}")
+                });
+                assert_eq!(
+                    scoped.len(),
+                    1,
+                    "syscall {nr}'s denial must be argument-scoped to AF_UNIX in \
+                     {profile:?}; an empty rule vector is a blanket denial and would \
+                     break AF_INET too"
+                );
+            }
         }
 
         let network = rules_for(NetScope::Allowed).expect("network rules build");
@@ -407,11 +418,10 @@ mod tests {
         }
     }
 
-    /// Both tiers' filters must still be terminal denylists that leave the
-    /// unnamed syscalls alone — the AF_UNIX rule adds exactly two keys to Strict
-    /// and nothing to Network.
+    /// All profiles remain the same terminal denylist except for the two
+    /// AF_UNIX keys shared by Strict and checkout.
     #[test]
-    fn the_af_unix_rule_is_the_only_difference_between_the_two_tiers() {
+    fn the_af_unix_rule_is_the_only_profile_difference() {
         let strict: Vec<i64> = rules_for(NetScope::Denied)
             .expect("strict rules build")
             .keys()
@@ -422,6 +432,16 @@ mod tests {
             .keys()
             .copied()
             .collect();
+        let checkout: Vec<i64> = rules_for(NetScope::Checkout)
+            .expect("checkout rules build")
+            .keys()
+            .copied()
+            .collect();
+        assert_eq!(
+            checkout, strict,
+            "checkout keeps TCP at the Landlock layer, but its seccomp AF_UNIX \
+             posture must be byte-for-byte the Strict profile"
+        );
         let extra: Vec<i64> = strict
             .iter()
             .copied()
@@ -473,7 +493,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn every_key_is_also_denied_under_the_x32_syscall_bit() {
-        for net in [NetScope::Denied, NetScope::Allowed] {
+        for net in [NetScope::Denied, NetScope::Allowed, NetScope::Checkout] {
             let bare = rules_for(net).expect("bare rules build");
             let all = rules_with_x32_aliases(net).expect("aliased rules build");
             assert_eq!(
@@ -503,8 +523,8 @@ mod tests {
     /// `apply_seccomp`'s `die`, so this is not a silent failure — but it would be
     /// a launch that refuses on every host, and it is cheaper to know here.
     #[test]
-    fn both_tiers_still_fit_the_bpf_program_budget_with_the_aliases() {
-        for net in [NetScope::Denied, NetScope::Allowed] {
+    fn all_profiles_still_fit_the_bpf_program_budget_with_the_aliases() {
+        for net in [NetScope::Denied, NetScope::Allowed, NetScope::Checkout] {
             let program = build(net).unwrap_or_else(|e| {
                 panic!("{net:?} filter must still compile with the x32 aliases: {e}")
             });

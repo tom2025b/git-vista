@@ -8,7 +8,7 @@
 //! spawn sites onto [`command_async`] so that proof means "every git the server
 //! runs is sandboxed."
 //!
-//! # Why one function and not two
+//! # Why two typed entry points still have one execution chokepoint
 //!
 //! This module shipped with a `command_sync` beside `command_async`, for
 //! "blocking helpers" — and Task 6 then found there are none. Every production
@@ -27,10 +27,15 @@
 //! Neither call style needs a `pre_exec` closure or a `block_on`, because the
 //! sandbox is *argv*: the shim applies Landlock and seccomp in its own process,
 //! after this one has already exec'd it.
+//!
+//! #723 adds `checkout_command_async`, but it is not a second general-purpose
+//! wrapper: its argument is the sealed `CheckoutPolicy`, and its sole purpose is
+//! selecting the checkout-only seccomp profile. Both typed entry points still
+//! converge on `command_from_argv`, the one place argv becomes a `Command`.
 
 use std::path::Path;
 
-use super::{sandbox_argv, Policy};
+use super::{checkout_sandbox_argv, sandbox_argv, CheckoutPolicy, Policy};
 
 /// Build the full argv for `git -C <repo> <args…>` under `policy`.
 ///
@@ -39,6 +44,23 @@ use super::{sandbox_argv, Policy};
 /// assemble it.
 fn full_argv(policy: &Policy, repo: &Path, args: &[&str]) -> Vec<std::ffi::OsString> {
     let mut argv = sandbox_argv(policy);
+    argv.push(std::ffi::OsString::from("-C"));
+    argv.push(repo.as_os_str().to_os_string());
+    for a in args {
+        argv.push(std::ffi::OsString::from(*a));
+    }
+    argv
+}
+
+/// The same sealed argv assembly for clone's untrusted checkout, whose type
+/// selects the checkout-specific seccomp profile before any Git arguments are
+/// appended (#723).
+fn full_checkout_argv(
+    policy: &CheckoutPolicy,
+    repo: &Path,
+    args: &[&str],
+) -> Vec<std::ffi::OsString> {
+    let mut argv = checkout_sandbox_argv(policy);
     argv.push(std::ffi::OsString::from("-C"));
     argv.push(repo.as_os_str().to_os_string());
     for a in args {
@@ -443,12 +465,26 @@ impl SandboxedCommand {
     }
 }
 
-/// The one wrapper: a [`SandboxedCommand`] whose argv is already complete.
+/// The general policy wrapper: a [`SandboxedCommand`] whose argv is complete.
 /// Pipes and `kill_on_drop` are left to the caller, because the call sites want
 /// different shapes (a capped stream vs a simple output) and both are
 /// legitimate — but none of them may touch the argv.
 pub(crate) fn command_async(policy: &Policy, repo: &Path, args: &[&str]) -> SandboxedCommand {
-    let argv = full_argv(policy, repo, args);
+    command_from_argv(full_argv(policy, repo, args))
+}
+
+/// The only spawn seam for [`CheckoutPolicy`]. Its distinct argument type is
+/// what makes `--seccomp-checkout` mandatory for the phase that runs fetched
+/// hooks and filters.
+pub(crate) fn checkout_command_async(
+    policy: &CheckoutPolicy,
+    repo: &Path,
+    args: &[&str],
+) -> SandboxedCommand {
+    command_from_argv(full_checkout_argv(policy, repo, args))
+}
+
+fn command_from_argv(argv: Vec<std::ffi::OsString>) -> SandboxedCommand {
     let (program, rest) = split(&argv);
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(rest);

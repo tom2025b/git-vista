@@ -270,9 +270,10 @@ pub(crate) fn network_command_with_credential(
 /// an untrusted-checkout launcher carrying a full environment, because that
 /// value is not constructible.
 ///
-/// What it deliberately keeps is the *policy*: network access, `HookMode::Run`
-/// and filter execution are ADR 0128's deliberate product behaviour and are
-/// unchanged here. This narrows what the child is handed, never what it may do.
+/// What it deliberately keeps is TCP network access, `HookMode::Run` and filter
+/// execution — ADR 0128's product behaviour. #723 now narrows one capability
+/// as well: this sealed path selects the checkout seccomp profile that denies
+/// AF_UNIX while leaving HTTPS available for Git LFS.
 pub(crate) struct UntrustedCheckoutCommand(spawn::SandboxedCommand);
 
 impl UntrustedCheckoutCommand {
@@ -293,9 +294,9 @@ impl UntrustedCheckoutCommand {
 }
 
 /// A Network-tier command for the phase after credential use has ended.
-/// It preserves the normal network, hook, and filter policy while replacing
-/// the child's environment with the allowlisted one
-/// ([`spawn::UNTRUSTED_CHECKOUT_ENV_ALLOWLIST`]).
+/// It preserves TCP, hooks and filters while replacing the child's environment
+/// with the allowlisted one ([`spawn::UNTRUSTED_CHECKOUT_ENV_ALLOWLIST`]) and
+/// selecting the checkout-only AF_UNIX denial.
 ///
 /// The allowlist is applied here rather than left to the caller: this function
 /// is the boundary, and a boundary a caller can decline to cross is not one.
@@ -309,7 +310,11 @@ pub(crate) fn network_command_without_credential(
     repo: &Path,
     args: &[&str],
 ) -> UntrustedCheckoutCommand {
-    UntrustedCheckoutCommand(network_command(&policy.0, repo, args).with_untrusted_checkout_env())
+    let mut full: Vec<&str> = FORCED_NETWORK_ARGS.to_vec();
+    full.extend_from_slice(args);
+    UntrustedCheckoutCommand(
+        spawn::checkout_command_async(policy, repo, &full).with_untrusted_checkout_env(),
+    )
 }
 
 /// Strip `user[:pass]@` userinfo from every `<scheme>://…` URL substring
@@ -1003,6 +1008,29 @@ mod tests {
             .windows(REDACTED_CREDENTIAL.len())
             .any(|w| w == REDACTED_CREDENTIAL));
     }
+}
+
+/// Run a direct git command for sandbox test-fixture construction.
+///
+/// Keeping the spawn here preserves the crate's reviewed process boundary:
+/// `argv_boundary` already audits this test-only file, while the composed
+/// checkout proof remains free of new spawn sites.
+#[cfg(test)]
+pub(super) fn run_fixture_git<I, S>(cwd: &Path, args: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .expect("git starts");
+    assert!(
+        output.status.success(),
+        "git command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// Real-git tests that need a Network-tier `Policy` pointed at a loopback

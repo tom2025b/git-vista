@@ -70,6 +70,10 @@ pub(crate) mod worktree;
 
 #[cfg(test)]
 mod argv;
+/// #723: the clone checkout's distinct seccomp profile, exercised by a real
+/// tracked post-checkout hook rather than a primitive-only filter test.
+#[cfg(test)]
+mod checkout_security;
 /// A real HTTPS clone through the production `policy_for_clone`. Separate from
 /// `documented_gaps` on purpose: that module records what is *not* proven,
 /// this one proves the most basic thing the clone path's missing coverage left
@@ -395,9 +399,9 @@ pub(crate) fn ssh_known_hosts_carveout(home: &std::path::Path) -> Vec<PathBuf> {
 /// which `ssh-agent`'s filesystem socket is not.
 ///
 /// So, today, on this kernel, what actually makes the agent socket reachable
-/// in the Network tier is the pre-existing **seccomp** exemption
-/// (`seccomp_filter::af_unix_rule` is Strict-only, landed already anticipating
-/// this issue) plus the automatic env inheritance above — **not** this
+/// in the ordinary Network profile is the pre-existing **seccomp** exemption
+/// (`seccomp_filter::af_unix_rule` is absent there because SSH remotes need the
+/// agent) plus the automatic env inheritance above — **not** this
 /// Landlock grant. This function still adds one, for three reasons that all
 /// survive that fact: it costs nothing (the kernel accepts the rule
 /// regardless of whether it is presently consulted); it keeps the property
@@ -1336,26 +1340,21 @@ pub(crate) fn policy_for_clone(clones_root: &Path) -> Result<Policy, shim::ShimE
 ///   a symlink no longer has checkout refused by `add_carveout_rule`'s guard;
 /// * [`CLONE_CHECKOUT_PORTS`] rather than [`DEFAULT_GIT_PORTS`] — no port 22.
 ///
-/// Network access, `HookMode::Run` and filter execution are **unchanged**: ADR
-/// 0128 kept them deliberately (a `git-lfs` smudge filter is a legitimate
-/// checkout-time network consumer), and this narrows what the process is
-/// handed, never what it may do.
+/// TCP access, `HookMode::Run` and filter execution remain: ADR 0128 kept them
+/// deliberately (a `git-lfs` smudge filter is a legitimate checkout-time
+/// network consumer). The sealed [`CheckoutPolicy`] spawn path now also selects
+/// #723's AF_UNIX-denying seccomp profile without moving this policy to Strict.
 ///
-/// # What this does NOT close, stated because it would be easy to imply
+/// # Why the constructor alone is not the #723 boundary
 ///
-/// The load-bearing half of #702 is not here — it is
-/// [`spawn::UNTRUSTED_CHECKOUT_ENV_ALLOWLIST`], which withholds
-/// `$SSH_AUTH_SOCK`. ADR 0033 §3 measured that the Landlock socket grant is
-/// **inert** on this kernel (ABI 8 does not mediate pathname `AF_UNIX`
-/// sockets), and `ssh_remote.rs`'s own live test still proves it.
-///
-/// And withholding the locator is not the same as denying the capability. A
-/// hook can recover a socket path without enumerating anything — `$HOME` is
-/// read-granted and `~/.keychain/<host>-sh` literally contains
-/// `SSH_AUTH_SOCK=/tmp/ssh-…/agent.N` — then set the variable itself and
-/// `connect()`, because `seccomp_filter::af_unix_rule` denies `AF_UNIX` in the
-/// **Strict** tier only. Closing that needs a checkout-specific seccomp mode
-/// and is tracked separately; do not read this constructor as having done it.
+/// ADR 0033 §3 measured that the removed Landlock socket grant is inert on
+/// pathname `AF_UNIX`. A hook can still recover a socket path from readable
+/// `$HOME` — `~/.keychain/<host>-sh` contains `SSH_AUTH_SOCK=/tmp/ssh-…/agent.N`
+/// — and set the variable itself. The denial therefore cannot be represented by
+/// this filesystem/network-port `Policy` value. It lives in the only consumer
+/// of [`CheckoutPolicy`]: `network_command_without_credential` routes the type
+/// through `checkout_command_async`, which emits `--seccomp-checkout`. The shim
+/// then applies the AF_UNIX rule while leaving this policy's TCP ports intact.
 ///
 /// # Why every field is written out rather than `..transfer`
 ///
@@ -1423,8 +1422,8 @@ pub(crate) fn policy_for_clone_checkout(
 /// The tuple field is **private to this module**, so
 /// `policy_for_clone_checkout` is the only way to make one. Rust makes a
 /// private field visible to a module's *descendants*, which is exactly the
-/// reach wanted here: `sandbox::network_exec` composes the launcher from
-/// `policy.0` and `sandbox::argv` reads it to pin the argv shape, while
+/// reach wanted here: `sandbox::spawn` composes the checkout launcher from the
+/// whole newtype and `sandbox::argv` reads `policy.0` to pin the policy shape, while
 /// `handlers::clone` — the caller that must not be able to substitute one
 /// policy for the other — can only pass the value along.
 ///
@@ -1461,7 +1460,36 @@ pub(crate) struct CheckoutPolicy(Policy);
 /// `-c core.hooksPath=<empty dir>` is the same suppression the shim applies,
 /// expressed in the only mechanism available when there is no shim in the argv.
 pub(crate) fn sandbox_argv(policy: &Policy) -> Vec<OsString> {
+    sandbox_argv_with_seccomp_profile(policy, SeccompProfile::TierDefault)
+}
+
+/// The launcher prefix for the only phase that combines Network-tier TCP with
+/// Strict-tier AF_UNIX denial (#723).
+///
+/// Taking [`CheckoutPolicy`] rather than `&Policy` makes the stronger seccomp
+/// profile inseparable from the existing phase boundary: transfer callers
+/// cannot select it accidentally, and checkout callers cannot omit it while
+/// using the sealed checkout command path.
+pub(crate) fn checkout_sandbox_argv(policy: &CheckoutPolicy) -> Vec<OsString> {
+    sandbox_argv_with_seccomp_profile(&policy.0, SeccompProfile::Checkout)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeccompProfile {
+    TierDefault,
+    Checkout,
+}
+
+fn sandbox_argv_with_seccomp_profile(
+    policy: &Policy,
+    seccomp_profile: SeccompProfile,
+) -> Vec<OsString> {
     if policy.tier == Tier::Unsandboxed {
+        assert_eq!(
+            seccomp_profile,
+            SeccompProfile::TierDefault,
+            "an untrusted checkout is always sandboxed"
+        );
         let mut argv = vec![OsString::from("git")];
         if let HookMode::Blocked { empty_dir } = &policy.hook_mode {
             argv.push(OsString::from("-c"));
@@ -1471,7 +1499,7 @@ pub(crate) fn sandbox_argv(policy: &Policy) -> Vec<OsString> {
         }
         return argv;
     }
-    let mut argv = shim_argv(policy);
+    let mut argv = shim_argv(policy, seccomp_profile);
     argv.push(OsString::from("--"));
     argv.push(OsString::from("git"));
     argv
@@ -1483,7 +1511,7 @@ pub(crate) fn sandbox_argv(policy: &Policy) -> Vec<OsString> {
 /// Panics if a `Strict` policy carries no `bwrap` path; `Policy` construction
 /// is responsible for degrading to `Network` or reporting INV-13 instead of
 /// building a strict policy that cannot launch its own namespace boundary.
-fn shim_argv(policy: &Policy) -> Vec<OsString> {
+fn shim_argv(policy: &Policy, seccomp_profile: SeccompProfile) -> Vec<OsString> {
     let mut argv: Vec<OsString> = Vec::new();
     if policy.tier == Tier::Strict {
         let bwrap = policy.bwrap.as_ref().expect(
@@ -1518,6 +1546,14 @@ fn shim_argv(policy: &Policy) -> Vec<OsString> {
     for p in &policy.ro_carveouts {
         argv.push(OsString::from("--ro-carveout"));
         argv.push(p.clone().into_os_string());
+    }
+    if seccomp_profile == SeccompProfile::Checkout {
+        assert_eq!(
+            policy.tier,
+            Tier::Network,
+            "checkout keeps TCP and must remain a Network-tier policy"
+        );
+        argv.push(OsString::from("--seccomp-checkout"));
     }
     match &policy.hook_mode {
         HookMode::Run => argv.push(OsString::from("--hooks-run")),
