@@ -498,29 +498,23 @@ mod tests {
             .into_owned()
     }
 
-    /// A `PATH` containing nothing but a fake `git` that prints its own
-    /// network namespace, dressed as one valid `for-each-ref --format=%(refname)
-    /// %(objectname))` output line so [`remote_tracking_refs`]'s own parser
-    /// keeps it rather than discarding it.
+    /// A `PATH` containing nothing but a fake `git` that reports its own
+    /// network namespace and exits 0.
     ///
-    /// `for-each-ref` dispatches no hook — that is #753's whole finding — so
-    /// there is no user-code seam a probe can ride the way `pull_suite`'s
-    /// installed hooks do for `merge`/`rebase`. Standing in for the real
-    /// binary is the only way to observe this spawn's confinement at all.
-    /// Same technique `git_cmd.rs`'s `fake_git_dumper` uses, duplicated for
-    /// the same reason that one gives: private to its own test module.
-    /// Written inside `repo` (already rw-granted by the policy under test, at
-    /// every tier) since a path outside every grant a policy makes cannot be
-    /// exec'd at all under Landlock.
+    /// `for-each-ref` dispatches no hook — that is #753's whole finding —
+    /// so there is no user-code seam a probe can ride the way
+    /// `pull_suite`'s installed hooks do for `merge`/`rebase`. Standing in
+    /// for the real binary is the only way to observe this spawn's
+    /// confinement at all. Same technique `git_cmd.rs`'s `fake_git_dumper`
+    /// uses, duplicated for the same reason that one gives: private to its
+    /// own test module. Written inside `repo` (already rw-granted by the
+    /// policy under test, at every tier) since a path outside every grant a
+    /// policy makes cannot be exec'd at all under Landlock.
     fn fake_git_netns_probe(repo: &Path) -> String {
         let dir = repo.join("fake-bin");
         std::fs::create_dir_all(&dir).expect("mkdir fake-bin");
         let bin = dir.join("git");
-        std::fs::write(
-            &bin,
-            "#!/bin/sh\necho \"refs/remotes/origin/probe $(readlink /proc/self/ns/net)\"\n",
-        )
-        .expect("write fake git");
+        std::fs::write(&bin, "#!/bin/sh\nreadlink /proc/self/ns/net\n").expect("write fake git");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -534,155 +528,94 @@ mod tests {
         format!("{}:/usr/bin:/bin", dir.display())
     }
 
-    const PROBE_MODE: &str = "GV753_PROBE_MODE";
-    const PROBE_REPO: &str = "GV753_PROBE_REPO";
-
-    /// **The child half of the netns proof.** Gated behind `PROBE_MODE` so it
-    /// is a no-op under an ordinary `cargo test` run — it only does anything
-    /// when [`observed_netns_in_subprocess`] re-execs this same test binary
-    /// with that variable set.
-    ///
-    /// Runs in an isolated *process*, not a thread, specifically so its `PATH`
-    /// override cannot race any other test's real `git` spawn — the same
-    /// reasoning `couldnt_run_suite`'s `subprocess_probe` gives for its own
-    /// process-global env mutation (#666).
-    ///
-    /// Two modes, both driving a **real, unmodified production entry point**
-    /// rather than reimplementing `git_cmd::sandboxed`'s three calls by hand:
-    /// * `"remote_tracking_refs"` calls [`remote_tracking_refs`] itself — the
-    ///   exact function `run_fetch`/`push.rs` call, unmodified — so this
-    ///   exercises `remote_tracking_refs -> run_git -> git_output_for ->
-    ///   sandboxed` end to end. A mutation to `remote_tracking_refs`'s own
-    ///   call site (reverting it to a caller-supplied or `Remote` need) is
-    ///   caught here, not merely by the source-scan test below.
-    /// * `"git_output_for_remote"` calls the *same* `git_output_for` that
-    ///   `run_git` is a one-line wrapper around, with the identical argv
-    ///   declared `Remote` — the operation-level need `for-each-ref`
-    ///   inherited before this fix. This is the paired negative: it reaches
-    ///   the same `sandboxed` chokepoint the first mode does, so it proves
-    ///   the probe technique discriminates tiers rather than measuring
-    ///   nothing (a test runner already inside a netns, a fake binary that
-    ///   silently never ran).
-    #[test]
-    fn subprocess_probe() {
-        let Ok(mode) = std::env::var(PROBE_MODE) else {
-            return;
-        };
-        let repo = std::path::PathBuf::from(
-            std::env::var_os(PROBE_REPO).expect("GV753_PROBE_REPO set by the parent"),
-        );
-        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-        let netns = rt.block_on(async {
-            match mode.as_str() {
-                "remote_tracking_refs" => {
-                    let remote = RemoteName::new("origin").expect("valid remote name");
-                    let map = remote_tracking_refs(&repo, &remote)
-                        .await
-                        .expect("remote_tracking_refs must succeed against the fake-git probe");
-                    map.into_values()
-                        .next()
-                        .expect("fake git's synthetic ref line must have parsed into the map")
-                }
-                "git_output_for_remote" => {
-                    let out = crate::git_cmd::git_output_for(
-                        &repo,
-                        &[
-                            "for-each-ref",
-                            "--format=%(refname) %(objectname)",
-                            "refs/remotes/origin/",
-                        ],
-                        NetworkNeed::Remote,
-                    )
-                    .await
-                    .expect("git_output_for must succeed against the fake-git probe");
-                    assert!(
-                        out.status.success(),
-                        "fake git exited nonzero: stderr={}",
-                        String::from_utf8_lossy(&out.stderr)
-                    );
-                    String::from_utf8_lossy(&out.stdout)
-                        .trim()
-                        .rsplit(' ')
-                        .next()
-                        .expect("fake git's synthetic line must carry a namespace field")
-                        .to_string()
-                }
-                other => panic!("unknown {PROBE_MODE} {other:?}"),
-            }
-        });
-        println!("\nGV753_NETNS={netns}");
-    }
-
-    /// Re-exec this test binary (same technique `couldnt_run_suite::probe`
-    /// uses for #666, and for the identical reason: an env override must not
-    /// race another test's real `git` spawn in the same process) with only
-    /// [`subprocess_probe`] selected, `PATH` pointed at the fake-git probe,
-    /// and `mode` chosen. Returns the network namespace the probe reported.
-    fn observed_netns_in_subprocess(mode: &str) -> String {
-        let (_dir, repo) = seeded_repo();
-        let dumper = fake_git_netns_probe(&repo);
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "planner::transfer::tests::subprocess_probe",
-                "--nocapture",
-            ])
-            .env(PROBE_MODE, mode)
-            .env(PROBE_REPO, &repo)
-            .env("PATH", dumper)
-            .env("HOME", std::env::var("HOME").unwrap())
+    /// Build the real `SandboxedCommand` a `for-each-ref` spawn would run
+    /// under `declared`, exactly the way `git_cmd::sandboxed` builds it
+    /// (that function is private to its own module, so this repeats its
+    /// three calls — `reconcile_need`, `policy_for`, `command_async` —
+    /// rather than reaching in; none of the three constructs a `Command` of
+    /// its own — `command_async` is the crate's one sealed launcher
+    /// chokepoint, already reviewed and allowlisted in `argv_boundary.rs`,
+    /// so this test opens no new process-spawn site), then substitutes the
+    /// fake probe binary in place of git and runs it, returning the
+    /// namespace it reported.
+    async fn observed_netns_for(repo: &Path, declared: NetworkNeed) -> String {
+        let dumper = fake_git_netns_probe(repo);
+        let argv = [
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/remotes/origin/",
+        ];
+        let read_only = crate::state::read_only_for_path(repo);
+        let need = crate::sandbox::reconcile_need(declared, &argv);
+        let policy = crate::sandbox::policy_for(repo, read_only, need)
+            .expect("policy builds for a fixture repo");
+        let cmd = crate::sandbox::spawn::command_async(&policy, repo, &argv);
+        let out = cmd
+            .pinned_env_for_test(&[("PATH", dumper), ("HOME", std::env::var("HOME").unwrap())])
             .output()
-            .expect("spawn self as subprocess");
+            .await
+            .expect("fake git runs");
         assert!(
-            output.status.success(),
-            "subprocess probe (mode={mode}) failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            out.status.success(),
+            "fake git probe must exit 0: stderr={}",
+            String::from_utf8_lossy(&out.stderr)
         );
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        stdout
-            .lines()
-            .find_map(|l| l.strip_prefix("GV753_NETNS="))
-            .expect("the child must call the real helper and print GV753_NETNS=...")
-            .to_string()
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     /// **The need `remote_tracking_refs` actually declares confines
     /// `for-each-ref`** — its spawn's network namespace differs from the
     /// host's, i.e. it runs `Tier::Strict` (bwrap `--unshare-net`), not the
     /// `Tier::Network` the surrounding fetch/pull/push operation's own
-    /// `Remote` need would give it. Drives the real, unmodified
-    /// `remote_tracking_refs` — see `subprocess_probe`'s doc for why that
-    /// matters and how.
-    #[test]
-    fn for_each_ref_runs_confined_from_the_hosts_network_namespace() {
+    /// `Remote` need would give it.
+    ///
+    /// Uses [`REF_READ_NEED`] itself, not a re-typed `NetworkNeed::Local` —
+    /// so if a future edit ever changes what `remote_tracking_refs` passes
+    /// to `run_git`, this test's premise changes with it rather than
+    /// silently testing a value production no longer uses. This test proves
+    /// the *mechanism* (declaring `REF_READ_NEED` really confines the
+    /// spawn); `remote_tracking_refs_takes_no_need_from_its_caller` and
+    /// `every_call_site_uses_the_two_argument_shape` below prove the
+    /// *wiring* (that `remote_tracking_refs` really passes `REF_READ_NEED`,
+    /// at exactly this call site, and that all four fetch/push call sites
+    /// can supply no other value) — together, not by reimplementing
+    /// `remote_tracking_refs` in a subprocess. An earlier version of this
+    /// test drove `remote_tracking_refs` itself end to end via a re-exec'd
+    /// child process; it was reverted because it opened a new, unreviewed
+    /// `Command::new` spawn site outside this fix's allowed paths (a
+    /// forbidden-path change per this lane's brief) — see the #753 report
+    /// for the full account.
+    #[tokio::test]
+    async fn for_each_ref_runs_confined_from_the_hosts_network_namespace() {
+        let (_dir, repo) = seeded_repo();
         let host = host_netns();
-        let observed = observed_netns_in_subprocess("remote_tracking_refs");
+        let observed = observed_netns_for(&repo, REF_READ_NEED).await;
         assert_ne!(
             observed, host,
-            "for-each-ref, run through the real remote_tracking_refs, must NOT \
-             share the host's network namespace — seeing {host} here means it is \
-             running Tier::Network (or unsandboxed), and #753's excess AF_UNIX \
-             authority is back."
+            "for-each-ref declared under REF_READ_NEED must NOT share the host's \
+             network namespace — seeing {host} here means it is running \
+             Tier::Network (or unsandboxed), and #753's excess AF_UNIX authority \
+             is back."
         );
     }
 
-    /// The paired negative: the identical argv, declared `Remote` through the
-    /// same `sandboxed` chokepoint — the operation-level need `for-each-ref`
-    /// inherited before this fix — DOES share the host's namespace.
+    /// The paired negative: the identical argv, declared `Remote` — the
+    /// operation-level need `for-each-ref` inherited before this fix — DOES
+    /// share the host's namespace.
     ///
-    /// Without this leg, the assertion above could pass for a reason that has
-    /// nothing to do with the tier: a test runner already inside a netns, or
-    /// a fake binary that silently never ran. With it, the same probe
-    /// mechanism is shown reporting both answers, so the first leg's
-    /// "confined" reading is real. This is also the `declared` mutation arm
-    /// by construction: reverting `REF_READ_NEED` to `NetworkNeed::Remote`
+    /// Without this leg, the assertion above could pass for a reason that
+    /// has nothing to do with the tier: a test runner already inside a
+    /// netns, or a fake binary that silently never ran. With it, the same
+    /// probe is shown reporting both answers, so the first leg's "confined"
+    /// reading is real. This is also the `declared` mutation arm by
+    /// construction: reverting `REF_READ_NEED` to `NetworkNeed::Remote`
     /// makes the positive test above assert exactly what this one already
     /// does, and it would then fail.
-    #[test]
-    fn the_same_spawn_declared_remote_would_share_the_hosts_namespace() {
+    #[tokio::test]
+    async fn the_same_spawn_declared_remote_would_share_the_hosts_namespace() {
+        let (_dir, repo) = seeded_repo();
         let host = host_netns();
-        let observed = observed_netns_in_subprocess("git_output_for_remote");
+        let observed = observed_netns_for(&repo, NetworkNeed::Remote).await;
         assert_eq!(
             observed, host,
             "sanity leg: the same for-each-ref argv declared Remote must run \
