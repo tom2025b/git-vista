@@ -64,6 +64,7 @@
 //! by heading) should get a self-sufficient description without having to
 //! recall which section they scrolled into.
 
+use super::detail::core::current_reading;
 use git_vista_protocol::{
     ChangeKind, ChangeSides, ConflictKind, StatusEntry, SubmoduleState, WorktreeStatus,
 };
@@ -71,6 +72,15 @@ use git_vista_protocol::{
 /// A status response and the opaque worktree id used to request it. Callers
 /// keep the public fields paired by convention until both are copied into the
 /// pending destructive operation.
+///
+/// #745 recorded that pairing as "a convention rather than an invariant
+/// enforced by private fields", and #746 asked whether a second consumer was
+/// the moment to enforce it. It was not, because no second consumer appeared:
+/// the Activity panel needs its reading *resolved against the live frame*, not
+/// a repository id to dispatch a write with, so it takes the pair
+/// [`panel_worktree_reading`] returns and never constructs this type. The menu
+/// is still the only holder, and the case for a constructor and accessors is
+/// still waiting on a second one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopedWorktreeStatus {
     pub repo: git_vista_core::identity::WorktreeId,
@@ -100,7 +110,7 @@ impl StatusSection {
         StatusSection::Ignored,
     ];
 
-    /// The section header text a future view would show.
+    /// The section header text shown by the Activity overlay.
     pub fn heading(self) -> &'static str {
         match self {
             StatusSection::Conflicted => "Conflicted",
@@ -112,9 +122,9 @@ impl StatusSection {
     }
 }
 
-/// One renderable row: the data a future touch-card view attaches to one
-/// list item, key included so a `<For each=... key=...>` (or #69c's
-/// virtualization primitive) has something stable to key on. `key` is
+/// One renderable row: the data the Activity overlay attaches to one
+/// list item. `key` gives keyed or virtualized rendering something stable
+/// to identify. It is
 /// unique **within one section's row list**, not globally — the same path
 /// can legitimately produce a row in two different sections (see the module
 /// doc's `ChangeSides::Both` decision), and those two rows are never
@@ -563,9 +573,59 @@ pub fn deletable_untracked_paths(status: &WorktreeStatus) -> Vec<String> {
     paths
 }
 
+/// What the Activity panel draws for the working tree: the reading that
+/// survives resolution against the live frame, and the sections derived from
+/// it — or `None` when no reply describes the frame on screen.
+///
+/// # The panel is not a read-only display (#746)
+///
+/// #711 pinned this read to the accepted frame at the same time as the menu's.
+/// #746 asked the question that fix had skipped: whether a stale reading *here*
+/// mattered, on the stated assumption that the panel only renders touch cards.
+/// It does not. Three consumers hang off this one reading, and two of them
+/// reach a write:
+///
+/// - **The stash push preview.** `stash_section_view` is handed these sections
+///   and passes them to [`push_preview`](crate::features::stash::core::push_preview),
+///   which writes the "this will capture … this will be left behind" copy, and
+///   whose `may_push` decides whether the push is offered at all. A reading
+///   belonging to another repository would describe *that* repository's
+///   changes inside the confirmation for a `git stash push` in this one.
+/// - **The conflicted cards.** Every other section renders inert text, but a
+///   `Conflicted` row is a `<button>` opening `ViewerDoc::Conflict`, and the
+///   conflict view resolves against the repository selected *now* — so a path
+///   carried over from elsewhere is addressed to the live worktree, where
+///   resolving it writes the file.
+/// - The file list itself, which is the read-only part the issue took to be
+///   all of it.
+///
+/// So this is the menu's defect class rather than a milder one, and it is
+/// gated the same way.
+///
+/// # Why the two steps are composed here and not inline in the panel
+///
+/// `activity.rs` is `#[cfg(target_arch = "wasm32")]`, so `cargo test` never
+/// compiles a line of it: a decision written there cannot go red on the host
+/// however it is written, and `tests/worktree_status_scope.rs` can only census
+/// its bytes. Composing the resolution and the derivation here puts the
+/// decision in code the host run does compile, and makes the sections
+/// reachable *only through* the resolution — there is no longer a way to build
+/// cards from a reply that was never checked against the live frame.
+pub fn panel_worktree_reading(
+    loading: bool,
+    reply: Option<(u64, Option<String>, Option<WorktreeStatus>)>,
+    current_epoch: u64,
+    current_repo: Option<&str>,
+) -> Option<(WorktreeStatus, StatusSections)> {
+    let status = current_reading(loading, reply, current_epoch, current_repo)?;
+    let sections = StatusSections::from_worktree_status(&status);
+    Some((status, sections))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::features::stash::core::push_preview;
     use crate::features::status::detail::core::current_reading;
     use git_vista_protocol::GenerationToken;
 
@@ -1274,6 +1334,109 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // #746: the same frame gate in front of the Activity panel
+    // -----------------------------------------------------------------
+    //
+    // `activity.rs` composes exactly the two host-compiled steps
+    // `panel_worktree_reading` now holds, for the same reason the menu's
+    // composition is tested here: the panel performing it is
+    // `#[cfg(target_arch = "wasm32")]` and never compiled by `cargo test`.
+
+    /// The defect #746 asks about, run rather than read: the selection moves
+    /// **between the read and the render**, and the panel draws nothing.
+    ///
+    /// That sequence is the whole point. The reply is requested and tagged
+    /// while `"a"` is the accepted frame, and resolved while `"b"` is — which
+    /// is the order the stale render needs and the order a test that merely
+    /// called the scoping function would never exercise.
+    #[test]
+    fn moving_the_selection_between_read_and_render_empties_the_activity_panel() {
+        // The read: answered, and tagged with the frame it was asked for.
+        let reply = v2_reply(4, "a", mixed_worktree());
+
+        // The positive control comes first. Without it every assertion below
+        // would hold just as well on a panel that drew nothing ever.
+        let (status, sections) = panel_worktree_reading(false, reply.clone(), 4, Some("a"))
+            .expect("a reply matching the live frame is what the panel draws");
+        assert_eq!(sections.headline(), StatusHeadline::Conflicted(1));
+        assert_eq!(sections.rows(StatusSection::Conflicted)[0].path, "clash.rs");
+        assert_eq!(
+            sections.rows(StatusSection::Untracked)[0].path,
+            "scratch.txt"
+        );
+        assert!(
+            push_preview(&sections, false, true).may_push(),
+            "the control must reach a stash push, or its absence below proves nothing"
+        );
+        assert_eq!(status.branch.as_deref(), Some("main"));
+
+        // The render: the accepted frame has moved on since that reply was
+        // tagged. Nothing of `"a"`'s working tree may appear under `"b"`.
+        assert!(
+            panel_worktree_reading(false, reply, 4, Some("b")).is_none(),
+            "the panel drew another repository's working tree after a switch"
+        );
+    }
+
+    /// Every other way the panel's reply can fail to describe the live frame.
+    ///
+    /// The loop asserts only the refusal. Asking a refused reading for its
+    /// conflicted count or its push preview would assert nothing about this
+    /// function — `None` answers both by construction, which is the inert
+    /// shape #741 has just finished clearing out of this file. The claim that
+    /// those two consumers really do go quiet is carried where it is not
+    /// free: the positive control below, and
+    /// `moving_the_selection_between_read_and_render_empties_the_activity_panel`.
+    ///
+    /// `mixed_worktree()` carries a conflicted path — the one card that opens
+    /// something — as well as staged, unstaged and untracked changes, so every
+    /// case here would put an openable card on screen and offer a stash push
+    /// if the gate let it through. An all-clean fixture would pass this test
+    /// with the gate deleted.
+    #[test]
+    fn only_a_reply_matching_the_live_frame_reaches_the_activity_panel() {
+        let m = mixed_worktree;
+        type Reply = Option<(u64, Option<String>, Option<WorktreeStatus>)>;
+        let cases: Vec<(&str, bool, Reply, u64, Option<&str>)> = vec![
+            ("stale epoch", false, v2_reply(3, "a", m()), 4, Some("a")),
+            (
+                "stale repository",
+                false,
+                v2_reply(4, "b", m()),
+                4,
+                Some("a"),
+            ),
+            ("still loading", true, v2_reply(4, "a", m()), 4, Some("a")),
+            ("no accepted frame", false, v2_reply(4, "a", m()), 4, None),
+            (
+                "fetch failed",
+                false,
+                Some((4, Some("a".to_string()), None)),
+                4,
+                Some("a"),
+            ),
+            ("never fetched", false, None, 4, Some("a")),
+        ];
+        for (name, loading, reply, epoch, repo) in cases {
+            assert!(
+                panel_worktree_reading(loading, reply, epoch, repo).is_none(),
+                "{name} reached the panel"
+            );
+        }
+
+        // The positive control, and the only place the two write-reaching
+        // consumers can be asserted without asserting them of `None`: the same
+        // fixture, resolved against the frame it was read for, really does put
+        // an openable conflicted card on screen and really does offer a push.
+        // Without this every refusal above would hold on a gate that refused
+        // everything, and the panel would simply never render.
+        let (_, sections) = panel_worktree_reading(false, v2_reply(4, "a", m()), 4, Some("a"))
+            .expect("a reply matching the live frame is what the panel draws");
+        assert_eq!(sections.count(StatusSection::Conflicted), 1);
+        assert!(push_preview(&sections, false, true).may_push());
+    }
+
     /// The server cannot stand in for this gate, and the comment in
     /// `menu.rs` that says so is load-bearing enough to pin.
     ///
@@ -1289,15 +1452,16 @@ mod tests {
     /// into the required wire selector. Identity now supplies the separate
     /// 412 backstop; it does not strengthen this path-state filter itself.
     ///
-    /// This test does not run the server. It pins the client-side claim the
-    /// severity argument rests on: the paths a stale reply would have offered
-    /// are ordinary names with nothing about them a path-state filter could
-    /// reject. The server-side twin, which does run the handler and the
-    /// planner, is
+    /// This test does not run the server's path-state recheck, so it does not
+    /// prove that matching names are indistinguishable to that recheck. It
+    /// pins the narrower client-side claim: an elsewhere-tagged reply can
+    /// contain ordinary discardable and deletable paths, but the frame gate
+    /// still rejects it by repository identity. The server-side collision
+    /// test, which does run the handler and planner, is
     /// `git-vista-server`'s
     /// `handlers::discard::tests::a_colliding_path_name_from_a_sibling_worktree_is_refused`.
     #[test]
-    fn a_colliding_path_name_is_indistinguishable_to_a_path_state_recheck() {
+    fn an_elsewhere_reply_with_ordinary_paths_is_rejected_by_the_frame_gate() {
         let elsewhere = status(vec![
             changed(
                 "Cargo.lock",
@@ -1319,21 +1483,8 @@ mod tests {
             deletable_untracked_paths(&elsewhere),
             vec!["notes.txt".to_string()]
         );
-        // The live repository, dirty in the very same files. A re-check that
-        // asks only "is this path tracked-dirty / untracked here?" answers yes
-        // to both, so it would admit the whole batch.
-        let here = elsewhere.clone();
-        assert_eq!(
-            discardable_tracked_paths(&here),
-            discardable_tracked_paths(&elsewhere)
-        );
-        assert_eq!(
-            deletable_untracked_paths(&here),
-            deletable_untracked_paths(&elsewhere)
-        );
-        // The frame gate is what tells them apart, and it does it on the tag
-        // rather than on the contents — which is why identical contents do not
-        // weaken it.
+        // The frame gate rejects the reply on its tag, independently of the
+        // plausible destructive paths established above.
         assert_eq!(
             current_reading(false, v2_reply(4, "elsewhere", elsewhere), 4, Some("here")),
             None
