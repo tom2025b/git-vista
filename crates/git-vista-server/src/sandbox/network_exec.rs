@@ -250,15 +250,66 @@ pub(crate) fn network_command_with_credential(
     }
 }
 
+/// A sealed command for the phase after credential use has ended: clone's
+/// untrusted checkout half (#702, #704).
+///
+/// # Why this is its own type, like [`CredentialedCommand`]
+///
+/// This used to return a bare [`spawn::SandboxedCommand`] whose environment had
+/// three names removed, and clone's handler then had to remember
+/// `.map(redact_output)` on every one of its completion paths. Both halves were
+/// "correct if the next caller remembers", which is the structure ADR 0128
+/// rejected for credentials and is exactly how #704 stayed open: the removal
+/// list was complete for the names someone had listed.
+///
+/// So the guarantee lives in the value. The only way to obtain one of these is
+/// [`network_command_without_credential`], which applies
+/// [`spawn::UNTRUSTED_CHECKOUT_ENV_ALLOWLIST`] unconditionally; the only way to
+/// run one is [`Self::output`], which redacts. There is no `spawn`, no `env`,
+/// and no way to recover the inner command — a future call site cannot obtain
+/// an untrusted-checkout launcher carrying a full environment, because that
+/// value is not constructible.
+///
+/// What it deliberately keeps is the *policy*: network access, `HookMode::Run`
+/// and filter execution are ADR 0128's deliberate product behaviour and are
+/// unchanged here. This narrows what the child is handed, never what it may do.
+pub(crate) struct UntrustedCheckoutCommand(spawn::SandboxedCommand);
+
+impl UntrustedCheckoutCommand {
+    pub(crate) fn kill_on_drop(mut self, kill: bool) -> Self {
+        self.0 = self.0.kill_on_drop(kill);
+        self
+    }
+
+    /// Run the command and return output with URL userinfo already removed.
+    ///
+    /// No Git-Vista credential can appear here — this child never received one
+    /// — but the *remote URL* git echoes into its own diagnostics can still
+    /// carry operator-supplied userinfo, and this output reaches both the
+    /// server log and the HTTP error body.
+    pub(crate) async fn output(self) -> std::io::Result<Output> {
+        self.0.output().await.map(redact_output)
+    }
+}
+
 /// A Network-tier command for the phase after credential use has ended.
-/// It preserves the normal network, hook, and filter policy while removing
-/// every token-bearing environment variable known to the resolver.
+/// It preserves the normal network, hook, and filter policy while replacing
+/// the child's environment with the allowlisted one
+/// ([`spawn::UNTRUSTED_CHECKOUT_ENV_ALLOWLIST`]).
+///
+/// The allowlist is applied here rather than left to the caller: this function
+/// is the boundary, and a boundary a caller can decline to cross is not one.
+///
+/// It takes a [`crate::sandbox::CheckoutPolicy`], not a `Policy`, so the
+/// transfer's SSH-granted policy cannot reach an untrusted checkout even by a
+/// transposed argument — see that type's doc for the two ways a source-level
+/// check of the same property was defeated.
 pub(crate) fn network_command_without_credential(
-    policy: &Policy,
+    policy: &crate::sandbox::CheckoutPolicy,
     repo: &Path,
     args: &[&str],
-) -> spawn::SandboxedCommand {
-    network_command(policy, repo, args).without_credential_env()
+) -> UntrustedCheckoutCommand {
+    UntrustedCheckoutCommand(network_command(&policy.0, repo, args).with_untrusted_checkout_env())
 }
 
 /// Strip `user[:pass]@` userinfo from every `<scheme>://…` URL substring
