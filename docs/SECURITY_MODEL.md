@@ -366,6 +366,66 @@ below.
   `syscall(SYS_socket, AF_UNIX | 1<<32, …)` — libc's `int`-typed wrapper would
   truncate the hostile bits before the seccomp-visible register held them — and
   dies under `ci/mutants/M9-widen-af-unix-comparison.patch`.
+
+### Network-tier spawns with hooks enabled — #744 census
+
+`HookMode::Run` means Git is allowed to dispatch a hook; it does not mean every
+Git subcommand actually does. The table below enumerates the **production static
+spawn sites** that can combine `Tier::Network` with `HookMode::Run`, rather than
+counting each loop or before/after invocation as a separate site. The shared
+`for-each-ref` site therefore runs twice on an ordinary completed fetch, pull,
+or branch push. Tests, the sandbox probe, and escape-battery fixture spawns are
+not production routes and are outside this census.
+
+Here, “attacker-authored” has the precondition already accepted by #680 and
+#702: operator configuration selects a hook directory inside a tracked
+worktree, so content obtained from a remote can provide the executable hook.
+Git does not clone `.git/hooks` or repository-local config. A pre-existing
+absolute/global hook path or an init template can still provide an
+operator-selected hook where the table says fetched content cannot.
+
+| Static spawn and routes | Can a fetched hook run? | `AF_UNIX` and agent reachability | Recommendation |
+|---|---|---|---|
+| Clone transfer: `git clone --no-checkout` from `POST /api/clone` ([argv and spawn](../crates/git-vista-server/src/handlers/clone.rs#L148-L193)) | **No hook supplied by this clone.** Git can invoke an already-present operator `reference-transaction` hook, but `--no-checkout` leaves the fetched tracked hook path absent until this process has exited. | **Reachable, deliberately.** This is the [ordinary Network profile, which installs no AF_UNIX rule](../crates/git-vista-server/src/bin/gv-sandbox/seccomp_filter.rs#L285-L310); it inherits the server environment and keeps the `$SSH_AUTH_SOCK` grant because operator `insteadOf` configuration can turn the accepted URL into SSH ([transfer policy](../crates/git-vista-server/src/sandbox/mod.rs#L1277-L1311)). An agent exists only when the host is running one, but when `$SSH_AUTH_SOCK` is set this policy intentionally exposes the named socket. | **Argued safe for fetched code; keep ordinary Network.** The transfer may need SSH, while content from this remote cannot occupy the selected tracked hook path yet. An operator-selected pre-existing hook is inside the operator configuration trust boundary, not authority supplied by the clone response. |
+| Clone empty-repository probe: `git show-ref --verify --quiet HEAD` from `POST /api/clone` ([spawn](../crates/git-vista-server/src/handlers/clone.rs#L195-L223)) | **No.** `show-ref` is a read and dispatches no repository hook. | **Denied.** The sealed `CheckoutPolicy` path selects `--seccomp-checkout` and the checkout environment allowlist; it has neither the agent grant nor `SSH_AUTH_SOCK` ([policy](../crates/git-vista-server/src/sandbox/mod.rs#L1368-L1394), [launcher](../crates/git-vista-server/src/sandbox/network_exec.rs#L296-L317), [AF_UNIX rule](../crates/git-vista-server/src/bin/gv-sandbox/seccomp_filter.rs#L289-L297)). | **Keep the checkout profile.** Moving this read to Strict would also be sound but buys no capability reduction: the current profile already denies `AF_UNIX`. |
+| Clone materialisation: `git checkout -f` from `POST /api/clone` ([spawn](../crates/git-vista-server/src/handlers/clone.rs#L226-L239)) | **Yes.** Fetched `post-checkout`, `post-index-change`, and `reference-transaction` hooks can run, as can fetched filters selected by `.gitattributes`. | **Denied.** The [checkout profile installs the AF_UNIX rule](../crates/git-vista-server/src/bin/gv-sandbox/seccomp_filter.rs#L289-L297). `socket(AF_UNIX, …)` and `socketpair(AF_UNIX, …)` receive `EPERM`, even if a hook recovers a live socket pathname independently of the environment. | **Keep the checkout profile.** This is the #723 implementation and closes #702 for clone's attacker-code phase without breaking HTTPS-backed checkout filters. |
+| Remote-ref observation: `git for-each-ref` in `transfer::remote_tracking_refs` ([single spawn site](../crates/git-vista-server/src/planner/transfer.rs#L132-L144)); before/after `POST /api/fetch`, the fetch half of `POST /api/pull`, and `POST /api/push` ([fetch calls](../crates/git-vista-server/src/planner/fetch.rs#L250-L300), [push calls](../crates/git-vista-server/src/planner/push.rs#L380-L431)) | **No.** `for-each-ref` only reads refs and dispatches no hook. | **Reachable but unused.** The operation-level `Remote` declaration gives this local read the [ordinary profile with no AF_UNIX rule](../crates/git-vista-server/src/bin/gv-sandbox/seccomp_filter.rs#L285-L310), so a live agent is reachable even though this Git command neither opens it nor runs repository code. | **Move this helper to `NetworkNeed::Local`/Strict.** It needs no transport. This is least-authority cleanup, not a #702 blocker, because the command dispatches no hook today. |
+| Fetch: `git fetch --progress <remote>` from `POST /api/fetch` and the first half of `POST /api/pull` ([spawn](../crates/git-vista-server/src/planner/fetch.rs#L271-L292), [pull route](../crates/git-vista-server/src/planner/pull.rs#L251-L269)) | **Yes.** Ref updates invoke `reference-transaction`; the selected tracked hook may be content materialised by an earlier checkout. There is no `pre-fetch` hook, but that does not make fetch hook-free. Pull's later merge/rebase is not in this row: it explicitly uses `NetworkNeed::Local` and Strict ([split](../crates/git-vista-server/src/planner/pull.rs#L70-L108)). | **Reachable.** [Ordinary Network has no AF_UNIX seccomp rule](../crates/git-vista-server/src/bin/gv-sandbox/seccomp_filter.rs#L285-L310). If the server inherited a live agent locator, `policy_for` also grants that socket ([grant wiring](../crates/git-vista-server/src/sandbox/mod.rs#L1090-L1095)); absence of the variable is not a capability boundary because another readable file may disclose a live pathname. | **Deliberately permissive pending a phase-split design; not argued safe.** Applying the checkout profile or moving the whole command to Strict would break SSH fetch because the transport and ref-update hook share one process tree. A complete fix must separate the agent-using transport from the hook-bearing local ref transaction (or provide a narrower agent mediation primitive), then run the hook-bearing phase with AF_UNIX denied. |
+| Branch push: `git push --progress …` from `POST /api/push` ([spawn](../crates/git-vista-server/src/planner/push.rs#L406-L423)) | **Yes.** `pre-push` runs for every actual branch push; a successful push that updates a local remote-tracking ref can also invoke `reference-transaction`. | **Reachable.** The [ordinary Network profile installs no AF_UNIX rule](../crates/git-vista-server/src/bin/gv-sandbox/seccomp_filter.rs#L285-L310), with the same conditional live-agent exposure as fetch. | **Deliberately permissive pending a phase-split design; not argued safe.** The hook phases need AF_UNIX denial, but the SSH transport in the same process tree needs the agent. A split must preserve Git's pre-push input/remote-state semantics and must also cover the later local reference transaction; merely re-running `pre-push` under Strict and adding `--no-verify` does not close the second hook. |
+| Tag push: `git push --progress <remote> refs/tags/<name>` from `POST /api/push-tag` ([spawn](../crates/git-vista-server/src/planner/remote_tags.rs#L176-L224)) | **Yes.** `pre-push` runs with the tag ref update on stdin. | **Reachable.** The [ordinary Network profile installs no AF_UNIX rule](../crates/git-vista-server/src/bin/gv-sandbox/seccomp_filter.rs#L285-L310), with the same conditional live-agent exposure as fetch. | **Deliberately permissive pending the push phase-split.** Do not apply the checkout profile to the whole command: SSH tag pushes need the agent too. |
+| Remote-tag delete: `git push --progress <remote> --delete refs/tags/<name>` from `POST /api/delete-remote-tag` ([spawn](../crates/git-vista-server/src/planner/remote_tags.rs#L289-L331)) | **Yes.** `pre-push` runs with the deletion on stdin. | **Reachable.** The [ordinary Network profile installs no AF_UNIX rule](../crates/git-vista-server/src/bin/gv-sandbox/seccomp_filter.rs#L285-L310), with the same conditional live-agent exposure as fetch. | **Deliberately permissive pending the push phase-split.** It has the same inseparable hook/SSH-transport shape as tag push. |
+
+The capability statement in the table comes directly from the seccomp dispatch,
+not from the port policy: only `NetScope::Denied` (Strict) and
+`NetScope::Checkout` install the AF_UNIX rules; ordinary `NetScope::Allowed`
+does not ([profile selection](../crates/git-vista-server/src/bin/gv-sandbox/main.rs#L1047-L1060),
+[rule construction](../crates/git-vista-server/src/bin/gv-sandbox/seccomp_filter.rs#L285-L310)).
+The agent-existence statement is conditional rather than hypothetical:
+`ssh_agent_socket_grant` returns the path named by `$SSH_AUTH_SOCK` exactly when
+the Network tier has one to grant ([constructor](../crates/git-vista-server/src/sandbox/mod.rs#L367-L387)),
+and general spawns inherit that locator because they scrub only Git geometry
+variables ([environment boundary](../crates/git-vista-server/src/sandbox/spawn.rs#L77-L151)).
+Issue #735 separately decides whether that ambient environment remains the
+intended policy.
+
+The hook mapping was checked both against Git's
+[hook contract](https://git-scm.com/docs/githooks) and with real Git 2.53.0:
+fetch produced `reference-transaction`; branch push produced `pre-push` and
+`reference-transaction`; both tag push shapes produced `pre-push`;
+`for-each-ref` and `show-ref` produced none; and checkout produced
+`post-index-change`, `reference-transaction`, and `post-checkout`. The clone
+transfer produced no relative tracked hook under `--no-checkout`, while an
+absolute pre-existing operator hook path could receive `reference-transaction`.
+
+**#702 closure check.** Its required clone property is implemented: the process
+that materialises and executes fetched content has neither the agent locator nor
+the socket grant, and seccomp denies AF_UNIX even when a pathname is discovered
+another way. It must nevertheless remain open under #744's closure rule. The
+fetch and push rows above are real capability residuals on already-served
+repositories, and #735's environment decision is still open. Closing #702 is
+sound only after those deliberately permissive rows have a resolved design and
+#735 has resolved the independent socket-discovery/environment half.
+
 - **A seccomp denylist keyed on bare syscall numbers does not cover the x32
   ABI, and the filter's arch check does not catch it either.** x32 has no
   `AUDIT_ARCH` of its own: it reports `AUDIT_ARCH_X86_64` and marks itself by
