@@ -1,6 +1,6 @@
 # ADR 0137 — An untrusted checkout inherits an allowlist, and the phase that runs attacker code gives up what it does not need
 
-- **Status:** Accepted — #720 implemented the allowlist and phase-specific grants; #723 adds the checkout-only AF_UNIX denial while retaining TCP
+- **Status:** Accepted — #720 implemented the allowlist and phase-specific grants; #723 adds the checkout-only AF_UNIX denial while retaining TCP, mutation-proved in both directions
 - **Date:** 2026-09-07
 - **Issues:** #702, #704, #723 — locator removal and capability denial are separate halves
 - **Extends:** [ADR 0128](0128-a-credential-exists-only-before-untrusted-checkout.md) (the credential boundary this widens from three names to a built environment)
@@ -490,6 +490,16 @@ code — no `cfg`-gated arm, so nothing here reports green over its own absence.
   neither. `sandbox::argv::only_the_clone_checkout_phase_gives_up_the_188_grants`
   separately proves only checkout emits `--seccomp-checkout`, retains port 443,
   and leaves the transfer marker-free.
+
+`failure-atlas mutation_check`, run key `gv-723-checkout-af-unix`, HEAD
+`d8798726`, clean tree. Both baselines ran the two narrow targets and were green;
+both mutations were `caught`, and they failed in different compiled targets.
+
+| Run | Mutation | Kind | Verdict and distinct failure |
+|---|---|---|---|
+| 437 | Route `network_command_without_credential` back through the ordinary Network launcher, removing checkout-profile selection | remove | **caught** by the composed hook test: TCP still connected, but pathname AF_UNIX also connected instead of returning `EPERM`. The seccomp rule-map test stayed green, showing the rule still existed but the phase no longer selected it. |
+| 438 | Change the rule gate from `Denied \| Checkout` to `Denied`, leaving checkout out | weaken | **caught** by the compiled `gv-sandbox` rule-map test: `SYS_socket` had no AF_UNIX rule in `Checkout`. The composed target stayed green because `cargo test --bin git-vista-server` deliberately runs the already-built production shim; the other command in the same mutation run compiled the changed shim code and caught it, so this is not an invisible or cfg-gated arm. |
+
 - **`handlers::clone::clone_checkout_runs_the_hook_with_only_an_allowlisted_environment`**
   is #680's canary widened. It builds a source repository with a tracked
   executable `hooks/post-checkout`, performs the credentialed `--no-checkout`
