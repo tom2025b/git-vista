@@ -496,18 +496,25 @@ mod tests {
     #[test]
     fn badge_pill_keeps_rounding_safe_clearance_above_meta_text() {
         let row = 2;
-        let badge_bottom = badge_top_y(row) + BADGE_HEIGHT;
-        let meta_text_top = label_bottom_y(row) - META_TEXT_ASCENT_CEIL;
 
+        // Fixed-row pixel oracle, independent of `badge_top_y`: row 2 centres
+        // at 28 + 2*56 = 140, the meta baseline is 152, and its conservatively
+        // rounded ascender reaches y=143.
+        let expected_cy = PAD_Y + row as i32 * ROW_HEIGHT;
+        assert_eq!(expected_cy, 140);
+        assert_eq!(node_cy(row), 140);
+        assert_eq!(label_bottom_y(row), 152);
+        let meta_text_top = label_bottom_y(row) - META_TEXT_ASCENT_CEIL;
+        assert_eq!(meta_text_top, 143);
+
+        let badge_top = badge_top_y(row);
+        let badge_bottom = badge_top + BADGE_HEIGHT;
         assert!(
-            badge_bottom + BADGE_META_CLEARANCE <= meta_text_top,
-            "badge bottom {badge_bottom} must leave {BADGE_META_CLEARANCE}px before meta text top {meta_text_top}"
+            badge_bottom <= meta_text_top - 4,
+            "badge bottom {badge_bottom} must leave 4px before independently pinned meta text top {meta_text_top}"
         );
-        let actual_clearance = meta_text_top - badge_bottom;
-        assert!(
-            actual_clearance >= 4,
-            "badge/meta clearance {actual_clearance}px must absorb whole-pixel font-metric rounding"
-        );
+        assert_eq!(badge_top, 123, "row 2 badge top moved unexpectedly");
+        assert_eq!(badge_bottom, 139, "row 2 badge bottom moved unexpectedly");
     }
 
     #[test]
