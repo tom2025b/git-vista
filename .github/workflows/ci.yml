@@ -832,8 +832,22 @@ jobs:
       #
       # `skipped` is deliberately excluded from the total: a run in which every
       # spec was skipped executed nothing, and must not be able to report a
-      # pass. This is the assertion that makes the check worth having.
+      # pass.
+      #
+      # A floor rather than merely `> 0`, on a Codex reader's point: a run that
+      # executes 3 of 129 specs and exits 0 — a stray filter argument, a spec
+      # directory that failed to load — passes a `> 0` gate while testing
+      # almost nothing. EXPECTED_MIN_SPECS is the floor that catches it.
+      #
+      # It is a floor and not an equality because four specs in
+      # blame-touch.spec.mjs call `test.skip(...)` conditionally on the fixture
+      # they find, so the exact count is legitimately allowed to move a little.
+      # The local baseline on titan is 129 executed / 0 skipped. RAISE THIS
+      # NUMBER as specs are added — a floor left far below the real count
+      # slowly stops meaning anything.
       - name: The suite actually executed specs, and passed
+        env:
+          EXPECTED_MIN_SPECS: "120"
         run: |
           report="${{ github.workspace }}/ci/browser/results.json"
           if [ ! -f "$report" ]; then
@@ -854,6 +868,12 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "$ran" -eq 0 ]; then
             echo "ZERO specs executed — a green check here would be vacuous" >&2
+            exit 1
+          fi
+          if [ "$ran" -lt "$EXPECTED_MIN_SPECS" ]; then
+            echo "only $ran specs executed, below the floor of $EXPECTED_MIN_SPECS." >&2
+            echo "A partial run that exits 0 is the vacuous case this floor exists to catch." >&2
+            echo "If the suite legitimately shrank, lower the floor in ci.yml deliberately." >&2
             exit 1
           fi
           if [ "${{ steps.suite.outputs.status }}" != "0" ]; then
