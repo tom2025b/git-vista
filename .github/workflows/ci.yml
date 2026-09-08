@@ -715,14 +715,20 @@ jobs:
       # minutes on builds. The fix is NOT to drop `--net`: a suite without its
       # network namespace is not the same suite, and CI and local runs would
       # stop testing the same thing.
+      #
+      # This step deliberately does NOT read or write
+      # kernel.apparmor_restrict_unprivileged_userns. That sysctl is named in
+      # exactly one place in this repository — .github/actions/host-sandbox-setup
+      # (D6 Option A) — and `escape_contract.rs`'s
+      # `every_ci_job_that_runs_this_crates_tests_provisions_the_host_capabilities_they_need`
+      # fails the build if any ci.yml STEP spells it, because a per-job copy of
+      # that unclamp is the exact drift that action exists to prevent. Prose is
+      # fine; code is not. Measured on run 34268833753: ubuntu-latest ships the
+      # clamp at 1 and `unshare --user` dies with
+      # "write failed /proc/self/uid_map: Operation not permitted".
       - name: Unprivileged user namespace is permitted (the suite requires one)
         run: |
           echo "kernel: $(uname -r)"
-          for k in kernel.unprivileged_userns_clone \
-                   kernel.apparmor_restrict_unprivileged_userns \
-                   user.max_user_namespaces; do
-            echo "$k = $(sysctl -n "$k" 2>&1 || true)"
-          done
           echo "--- probe: the exact namespace flags run.sh uses ---"
           if unshare --user --map-root-user --net --mount -- \
                bash -c 'ip link set lo up && ip -o addr show lo && echo PROBE_OK'; then
