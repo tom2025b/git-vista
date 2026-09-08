@@ -1010,6 +1010,29 @@ mod tests {
     }
 }
 
+/// Run a direct git command for sandbox test-fixture construction.
+///
+/// Keeping the spawn here preserves the crate's reviewed process boundary:
+/// `argv_boundary` already audits this test-only file, while the composed
+/// checkout proof remains free of new spawn sites.
+#[cfg(test)]
+pub(super) fn run_fixture_git<I, S>(cwd: &Path, args: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .expect("git starts");
+    assert!(
+        output.status.success(),
+        "git command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Real-git tests that need a Network-tier `Policy` pointed at a loopback
 /// fixture on an ephemeral port rather than `policy_for`'s fixed
 /// `DEFAULT_GIT_PORTS` (22/443/80/9418 — none of which this process can bind

@@ -8,16 +8,6 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::Command;
-
-fn git(command: &mut Command) {
-    let output = command.output().expect("git starts");
-    assert!(
-        output.status.success(),
-        "git command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
 
 /// A fetched hook reads an ssh-agent pathname from `$HOME`, exports
 /// `SSH_AUTH_SOCK` itself, and makes the actual connection attempt. The parent
@@ -57,15 +47,9 @@ async fn a_fetched_hook_that_self_sets_ssh_auth_sock_cannot_connect_but_tcp_surv
     let source = clones.path().join("source");
     let dest = clones.path().join("checkout");
     std::fs::create_dir(&source).expect("create source repository");
-    git(Command::new("git")
-        .args(["init", "-q"])
-        .current_dir(&source));
-    git(Command::new("git")
-        .args(["config", "user.name", "git-vista-test"])
-        .current_dir(&source));
-    git(Command::new("git")
-        .args(["config", "user.email", "test@example.invalid"])
-        .current_dir(&source));
+    super::network_exec::run_fixture_git(&source, ["init", "-q"]);
+    super::network_exec::run_fixture_git(&source, ["config", "user.name", "git-vista-test"]);
+    super::network_exec::run_fixture_git(&source, ["config", "user.email", "test@example.invalid"]);
 
     let hooks = source.join("hooks");
     std::fs::create_dir(&hooks).expect("create tracked hooks directory");
@@ -111,22 +95,24 @@ print(f"tcp={{tcp_result}}|unix={{unix_result}}|sock={{os.environ['SSH_AUTH_SOCK
     std::fs::set_permissions(&hook, permissions).expect("make hook executable");
     std::fs::write(source.join("tracked"), "attacker-chosen content\n")
         .expect("write tracked content");
-    git(Command::new("git").args(["add", "."]).current_dir(&source));
-    git(Command::new("git")
-        .args(["commit", "-qm", "fixture"])
-        .current_dir(&source));
+    super::network_exec::run_fixture_git(&source, ["add", "."]);
+    super::network_exec::run_fixture_git(&source, ["commit", "-qm", "fixture"]);
 
     // Materialise no remote-controlled files yet: this mirrors clone's first
     // phase closely enough that the hook itself arrives only at checkout.
-    git(Command::new("git")
-        .args(["clone", "-q", "--no-checkout", "--"])
-        .arg(&source)
-        .arg(&dest)
-        .current_dir(clones.path()));
+    super::network_exec::run_fixture_git(
+        clones.path(),
+        [
+            std::ffi::OsString::from("clone"),
+            std::ffi::OsString::from("-q"),
+            std::ffi::OsString::from("--no-checkout"),
+            std::ffi::OsString::from("--"),
+            source.as_os_str().to_owned(),
+            dest.as_os_str().to_owned(),
+        ],
+    );
     assert!(!dest.join("hooks/post-checkout").exists(), "premise");
-    git(Command::new("git")
-        .args(["config", "core.hooksPath", "hooks"])
-        .current_dir(&dest));
+    super::network_exec::run_fixture_git(&dest, ["config", "core.hooksPath", "hooks"]);
 
     let home_path: &Path = home.path();
     let checkout = super::test_env::with_env(
