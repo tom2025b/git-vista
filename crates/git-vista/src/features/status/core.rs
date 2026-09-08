@@ -100,7 +100,7 @@ impl StatusSection {
         StatusSection::Ignored,
     ];
 
-    /// The section header text a future view would show.
+    /// The section header text shown by the Activity overlay.
     pub fn heading(self) -> &'static str {
         match self {
             StatusSection::Conflicted => "Conflicted",
@@ -112,9 +112,9 @@ impl StatusSection {
     }
 }
 
-/// One renderable row: the data a future touch-card view attaches to one
-/// list item, key included so a `<For each=... key=...>` (or #69c's
-/// virtualization primitive) has something stable to key on. `key` is
+/// One renderable row: the data the Activity overlay attaches to one
+/// list item. `key` gives keyed or virtualized rendering something stable
+/// to identify. It is
 /// unique **within one section's row list**, not globally — the same path
 /// can legitimately produce a row in two different sections (see the module
 /// doc's `ChangeSides::Both` decision), and those two rows are never
