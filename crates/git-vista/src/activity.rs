@@ -29,8 +29,9 @@ use crate::features::activity::core::{event_commit, kind_glyph, kind_label};
 use crate::features::dialogs::core::Dialog;
 use crate::features::shell::signals as shell_state;
 use crate::features::stash::view::stash_section_view;
-use crate::features::status::core::{chip_label, StatusHeadline, StatusSection, StatusSections};
-use crate::features::status::detail::core::current_reading;
+use crate::features::status::core::{
+    chip_label, panel_worktree_reading, StatusHeadline, StatusSection,
+};
 use crate::features::status::signals as status_state;
 use crate::features::tags::core::{
     tag_list_view, tag_row_lines, TagListView, TagRow, LOADING_TAGS, NO_TAGS,
@@ -113,8 +114,19 @@ pub fn activity_panel_view(
     // Resolved once, here, through the same host-tested decision the chip and
     // the menu use. Loading, failed, old-epoch and old-repository all resolve
     // to `None`, which the sections below already render as "no reading yet".
+    //
+    // #746: the resolution and the section derivation are ONE host-tested
+    // function rather than two steps written out here, so the cards below are
+    // reachable only through the gate. That matters more than it looks: this
+    // panel is not the read-only display it resembles — its sections write the
+    // stash push preview and decide whether that push is offered, and a
+    // conflicted card is a button into a view that resolves against the
+    // repository selected now. `panel_worktree_reading`'s own doc carries the
+    // full account, and its tests move the selection between the read and the
+    // render, which nothing in this file could ever do: `cargo test` does not
+    // compile a line of it.
     let worktree_now = move || {
-        current_reading(
+        panel_worktree_reading(
             worktree_status.loading().get(),
             worktree_status.get(),
             graph.get().epoch(),
@@ -126,8 +138,7 @@ pub fn activity_panel_view(
     // counts, and it must read the SAME working-tree observation the status
     // section above renders — a second `/api/status/v2` resource would be a
     // second "is the panel open" to drift, which is the defect M1.11 removed.
-    let status_sections =
-        Signal::derive(move || worktree_now().map(|s| StatusSections::from_worktree_status(&s)));
+    let status_sections = Signal::derive(move || worktree_now().map(|(_, sections)| sections));
 
     // The tag list (M2.21b, #236), keyed exactly like the feed above: open the
     // panel and it is read fresh, and any operation that bumps the graph epoch
@@ -166,9 +177,8 @@ pub fn activity_panel_view(
             // criterion, satisfied by consuming the data #68d built for exactly
             // this rather than re-deriving labels here.
             let status_section = move || {
-                worktree_now().map(|s| {
+                worktree_now().map(|(s, sections)| {
                     let ic = icon_set(nerd_icons.get());
-                    let sections = StatusSections::from_worktree_status(&s);
                     // Same grouping rule as the topbar chip — one host-tested
                     // function, so the two can no longer disagree about the
                     // same worktree the way #348 caught them doing.

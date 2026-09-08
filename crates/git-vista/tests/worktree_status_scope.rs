@@ -18,13 +18,30 @@
 //! name and state alone. See `features/status/core.rs`'s
 //! `a_colliding_path_name_is_indistinguishable_to_a_path_state_recheck`.
 //!
-//! The menu is not the only reader. The Activity panel has the same v2 read,
+//! The menu was not the only reader. The Activity panel had the same v2 read,
 //! unscoped in exactly the same way — the issue named only the menu, and the
 //! required `repo` argument is what found the second call site: making the
 //! unscoped question unrepresentable turned a silent third instance of this
-//! defect into a compile error. Its consequence is milder (it renders a file
-//! list rather than feeding a destructive confirmation), so it is fixed the
-//! same way and censused here beside the menu rather than deferred.
+//! defect into a compile error. It is fixed the same way and censused here
+//! beside the menu rather than deferred.
+//!
+//! **#746 closed the question this note used to leave open**, and reversed its
+//! answer. The panel's consequence was called milder, on the reading that it
+//! renders a file list rather than feeding a destructive confirmation. That is
+//! wrong: the same sections are handed to `stash::core::push_preview`, which
+//! writes the "this will capture … this will be left behind" copy for a
+//! `git stash push` and whose `may_push` gates the offer, and a `Conflicted`
+//! row is a `<button>` opening `ViewerDoc::Conflict` — a view that resolves
+//! against the repository selected *now*, writing the file. A retained reading
+//! would have described another repository's changes inside this one's stash
+//! confirmation. The panel is the menu's defect class, at one more hop.
+//!
+//! The gate itself is no longer only censused here. `features::status::core`'s
+//! `panel_worktree_reading` composes the resolution and the section derivation
+//! into one host-compiled function the panel calls, so the cards are reachable
+//! only through the gate, and its tests move the selection between the read and
+//! the render rather than asserting the mapping by calling the function that
+//! defines it.
 //!
 //! **Why this is a source census and not an executed test.** `menu.rs`,
 //! `menu/worktree_items.rs`, `activity.rs` and `api/status.rs` are all
@@ -114,10 +131,16 @@ fn no_unscoped_v2_worktree_read_survives_anywhere() {
 
 /// The Activity panel's copy of the same read, pinned the same way.
 ///
-/// It is a display rather than a destructive confirmation, so the consequence
-/// is milder — but it is the same reply, retained across the same repository
-/// switch, and leaving one of the two unpinned is how this class keeps
-/// reappearing one reader at a time.
+/// #746 asked whether a stale reading here was the milder, read-only case this
+/// file once called it. It is not: these sections write the stash push preview
+/// and decide whether that push is offered, and a conflicted card is a button
+/// into a view that resolves against the repository selected now. The panel is
+/// the menu's defect class, and is gated identically.
+///
+/// What this census pins is only the wiring. The *decision* is
+/// `features::status::core::panel_worktree_reading`, whose host tests move the
+/// selection between the read and the render — the sequence no census over
+/// bytes can execute.
 #[test]
 fn the_activity_panel_keys_and_resolves_its_worktree_read_the_same_way() {
     let activity = code_only(ACTIVITY);
@@ -134,8 +157,16 @@ fn the_activity_panel_keys_and_resolves_its_worktree_read_the_same_way() {
         "the reply must be tagged with the epoch and repository it was requested for"
     );
     assert!(
-        activity.contains("current_reading("),
+        activity.contains("panel_worktree_reading("),
         "the panel must resolve its reply against the live frame"
+    );
+    // The sections must be reachable only *through* that resolution. Deriving
+    // them here again from a `WorktreeStatus` would let a later edit build
+    // cards straight from the raw reply — the #746 defect rewritten by hand,
+    // in a file `cargo test` never compiles.
+    assert!(
+        !activity.contains("StatusSections::from_worktree_status("),
+        "the panel derives its sections outside the frame gate"
     );
     // Both consumers must go through the resolved reading. A single remaining
     // `.get().flatten()` would put an unresolved reply back on screen.
