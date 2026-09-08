@@ -153,19 +153,23 @@ fn the_activity_panel_keys_and_resolves_its_worktree_read_the_same_way() {
 
 /// The menu asks a *scoped* question: `repo` is part of the resource key, so a
 /// repository switch refetches instead of retaining the previous repo's answer,
-/// and the reply is tagged with the scope it was requested for.
+/// and the reply keeps the parsed request-key repository inseparable from the
+/// status it returned.
 #[test]
 fn the_menu_keys_its_worktree_read_on_the_accepted_repository() {
     let menu = code_only(MENU);
     assert!(
-        menu.contains("(true, Some(id)) => fetch_worktree_status_for(id)"),
+        menu.contains("(true, Some(id)) => match id.parse()")
+            && menu.contains("fetch_worktree_status_for(id).await.ok().map(|status|"),
         "the menu must fetch only once a repository is accepted, and scope the fetch to it"
     );
-    // The reply carries the scope it was requested for. Without this the
-    // resolution below could only compare the live frame against itself.
+    // The reply carries the parsed request-key id beside the status and the
+    // outer frame scope. Without both, resolution could compare the live frame
+    // against itself or dispatch a selector unrelated to the path reading.
     assert!(
-        menu.contains("(epoch, repo, reading)"),
-        "the v2 reply must be tagged with the epoch and repository it was requested for"
+        menu.contains("ScopedWorktreeStatus { repo, status }")
+            && menu.contains("(epoch, repo, reading)"),
+        "the v2 reply must carry its parsed repository id and outer frame scope"
     );
 }
 
@@ -205,7 +209,9 @@ fn a_worktree_reply_tagged_for_another_frame_cannot_reach_the_menu() {
 }
 
 /// The item builder cannot skip that resolution, because it never sees a reply
-/// to skip it on: it takes the resolved `Option<WorktreeStatus>`.
+/// to skip it on: it takes the resolved `Option<ScopedWorktreeStatus>`. That
+/// stronger type also keeps the status inseparable from the `WorktreeId` it was
+/// read with, so dispatch cannot substitute a live selector.
 ///
 /// This is the structural half of the fix. Everything above can be re-broken by
 /// an edit to `menu.rs`; this makes the unresolved reply unreachable from the
@@ -214,8 +220,8 @@ fn a_worktree_reply_tagged_for_another_frame_cannot_reach_the_menu() {
 fn the_item_builder_takes_a_resolved_reading_not_a_resource() {
     let items = code_only(WORKTREE_ITEMS);
     assert!(
-        items.contains("live_status: Option<WorktreeStatus>,"),
-        "build_worktree_items must take a resolved reading"
+        items.contains("live_status: Option<ScopedWorktreeStatus>,"),
+        "build_worktree_items must take a resolved reading with its captured repository scope"
     );
     assert!(
         !items.contains("Resource<"),

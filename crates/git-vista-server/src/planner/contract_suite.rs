@@ -2757,6 +2757,7 @@ enum PostKind {
 enum PlannerEntry {
     Ordinary,
     Proving,
+    Matching,
     ExplicitTarget,
     Recovery,
     SubmittedPlan,
@@ -2767,6 +2768,7 @@ impl PlannerEntry {
         match self {
             Self::Ordinary => "plan_and_execute",
             Self::Proving => "plan_and_execute_proving",
+            Self::Matching => "plan_and_execute_matching",
             Self::ExplicitTarget => "plan_and_execute_for_worktree",
             Self::Recovery => "plan_and_execute_recovery",
             Self::SubmittedPlan => "submit_plan_tracked",
@@ -2904,12 +2906,12 @@ fn post_route_census() -> &'static [PostRoute] {
         (
             "/api/discard-tracked-paths",
             "discard_tracked_paths",
-            GitWrite(Ordinary),
+            GitWrite(Matching),
         ),
         (
             "/api/delete-untracked-paths",
             "delete_untracked_paths",
-            GitWrite(Ordinary),
+            GitWrite(Matching),
         ),
         (
             "/api/resolve-conflict",

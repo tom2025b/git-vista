@@ -447,38 +447,4 @@ mod tests {
         })
         .await;
     }
-
-    /// Entry point for `failure-atlas mutation_check` over the wasm client.
-    ///
-    /// The ordinary host suite cannot compile the menu/confirmation/dispatch
-    /// path. This ignored harness builds that path and runs only #733's browser
-    /// spec, so mutations in the code under test are compiled rather than
-    /// judged by a source census. `mutation_check` already owns a separate
-    /// atlas lock; removing its inherited lock name lets these nested buildlock
-    /// calls use the normal build slot instead of waiting on their parent.
-    #[test]
-    #[ignore = "failure-atlas compiles and drives the browser client through this harness"]
-    fn captured_selector_browser_contract_for_mutation_check() {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let target = root.join("target");
-        let run = |args: &[&str]| {
-            std::process::Command::new("buildlock")
-                .args(args)
-                .current_dir(&root)
-                .env_remove("BUILDLOCK_FILE")
-                .env_remove("NO_COLOR")
-                .env("CARGO_TARGET_DIR", &target)
-                .status()
-                .unwrap_or_else(|e| panic!("could not run buildlock {args:?}: {e}"))
-        };
-
-        assert!(
-            run(&["trunk", "build", "--config", "crates/git-vista/Trunk.toml"]).success(),
-            "the mutated wasm client must compile before its browser test runs"
-        );
-        assert!(
-            run(&["./dev", "browser", "destructive-selector.spec.mjs"]).success(),
-            "the captured-selector browser contract failed"
-        );
-    }
 }
