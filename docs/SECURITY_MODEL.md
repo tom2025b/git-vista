@@ -402,11 +402,12 @@ does not ([profile selection](../crates/git-vista-server/src/bin/gv-sandbox/main
 [rule construction](../crates/git-vista-server/src/bin/gv-sandbox/seccomp_filter.rs#L285-L310)).
 The agent-existence statement is conditional rather than hypothetical:
 `ssh_agent_socket_grant` returns the path named by `$SSH_AUTH_SOCK` exactly when
-the Network tier has one to grant ([constructor](../crates/git-vista-server/src/sandbox/mod.rs#L367-L387)),
+the Network tier has one to grant ([function body](../crates/git-vista-server/src/sandbox/mod.rs#L419-L424),
+[why it exists](../crates/git-vista-server/src/sandbox/mod.rs#L367-L387)),
 and general spawns inherit that locator because they scrub only Git geometry
 variables ([environment boundary](../crates/git-vista-server/src/sandbox/spawn.rs#L77-L151)).
-Issue #735 separately decides whether that ambient environment remains the
-intended policy.
+Issue #735 has since decided that ambient environment is a deliberate boundary
+rather than an unreviewed default; see Known Non-Goals.
 
 The hook mapping was checked both against Git's
 [hook contract](https://git-scm.com/docs/githooks) and with real Git 2.53.0:
@@ -417,14 +418,47 @@ fetch produced `reference-transaction`; branch push produced `pre-push` and
 transfer produced no relative tracked hook under `--no-checkout`, while an
 absolute pre-existing operator hook path could receive `reference-transaction`.
 
+**What this census does not establish.** The eight rows are established; "these
+are the only routes" is not. The measurement exercised four of the five `Remote`
+arms in `network_need_for_operation`
+([classifier](../crates/git-vista-protocol/src/effects.rs#L386-L428)) — fetch,
+branch push, tag push and remote-tag delete — but **not `PullBranch`** as a
+whole operation. Pull is not therefore unaccounted for: its fetch half is the
+same spawn as the fetch row and is traced statically through `exec_pull`'s
+`run_fetch(repo, need, …)` call
+([pull route](../crates/git-vista-server/src/planner/pull.rs#L251-L269)), and its
+integration half declares `INTEGRATION_NEED = NetworkNeed::Local` and so runs in
+`Tier::Strict`, where the `AF_UNIX` rule *is* installed
+([split](../crates/git-vista-server/src/planner/pull.rs#L70-L108)). What is
+missing is an end-to-end measurement confirming that no *further* hook fires
+under `git pull`. Clone's own routes were measured and carry three rows of their
+own.
+
+**Verification.** The census was authored by codex (`gpt-daybreak-blue-latest`)
+and independently verified against `453f9e11` by Claude (max), reading source
+rather than accepting the table: all **eight rows confirmed**, and **every source
+citation in this section opened** against that commit — 23 distinct line ranges,
+32 citations — none miscited, none describing superseded behaviour, none
+untraced. `git diff --check` is clean, and all **seven hook-behaviour claims
+reproduced** on a second run of real Git 2.53.0. The verifier separately
+re-derived the completeness claim: seven struct-literal `hook_mode:
+HookMode::Run` sites exist, three are `#[cfg(test)]`-gated and one
+(`sandbox/probe.rs:335`, `boot_probe_policy`) is `Tier::Strict`, leaving exactly
+three production constructors that can be `Tier::Network` — `policy_for`,
+`policy_for_clone` and `policy_for_clone_checkout` — onto which all eight rows
+map. `ls-remote` was checked as a candidate missing route and exists only in
+test code.
+
 **#702 closure check.** Its required clone property is implemented: the process
 that materialises and executes fetched content has neither the agent locator nor
 the socket grant, and seccomp denies AF_UNIX even when a pathname is discovered
 another way. It must nevertheless remain open under #744's closure rule. The
 fetch and push rows above are real capability residuals on already-served
-repositories, and #735's environment decision is still open. Closing #702 is
-sound only after those deliberately permissive rows have a resolved design and
-#735 has resolved the independent socket-discovery/environment half.
+repositories: #735 has since resolved the environment half by recording the
+ambient inheritance as a deliberate, argued boundary, which settles *what the
+policy is* without removing the capability those four rows describe. Closing
+#702 is sound only once those deliberately permissive rows have a resolved
+design, and #755 is also outstanding.
 
 - **A seccomp denylist keyed on bare syscall numbers does not cover the x32
   ABI, and the filter's arch check does not catch it either.** x32 has no
@@ -1010,8 +1044,10 @@ contents.
   these are the only routes: the census exercised four of the five Remote arms
   in `network_need_for_operation`
   (`crates/git-vista-protocol/src/effects.rs:386-428`),
-  but not `PullBranch`; verification remains in progress. Clone's own routes
-  were measured and carry their own census rows.
+  but not `PullBranch`. Clone's own routes were measured and carry their own
+  census rows. The census has since been verified row by row against source by
+  a second reader; see the #744 census section above for what that verification
+  did and did not establish.
 
   A hook-only phase split is not the missing control. With
   `core.hooksPath` pointed at an empty directory, a Git 2.53.0 experiment still
