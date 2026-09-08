@@ -215,6 +215,26 @@ Every release candidate should cover:
 
 ### Browser persistence and #75 verification
 
+#### Headless close-out pass (2026-09-08, #244)
+
+| #75 close-out check | Result | Evidence |
+| --- | --- | --- |
+| Installed app launches on iPad | **NOT TESTED** | The Chromium browser suite fetched the served manifest and 180 px PNG icon, checked `no-cache`, and found the root-absolute `apple-touch-icon` link. `index.html` still carries `viewport-fit=cover` and the three standalone-launch metas. No iPad was available, so home-screen installation, launch, icon selection and safe-area rendering remain unverified. |
+| Frontend/server protocol mismatch is handled safely | **PASSES** | The existing protocol unit tests passed. A loaded client was then exercised against a v9--v9 advertised window in Chromium: the non-dismissable Update Required overlay appeared, named the mismatch and left the application behind it inert. |
+| 22a guard and 22b UI wiring together, offline | **PASSES** | Playwright cut the browser transport, changed the browser-reported connectivity state and observed the real `/api/merge` request stream. The banner appeared; an already-open confirmation was refused with zero POSTs; reconnect sent nothing; and a request that lost transport was attempted once, not retried or replayed. |
+| Full validation matrix, including 22c offline case | **NOT TESTED** | The offline case passed in Chromium. The physical-device rows (iPad sizes and Split View, Stage Manager, Pencil, Magic Keyboard/trackpad, external display, VoiceOver and installed-mode launch) were not run. A headless Chromium pass cannot establish them. |
+
+These browser checks are local-gate-only coverage. None of the seven required
+GitHub checks runs the browser suite, and `cargo test` does not compile the
+`#[cfg(target_arch = "wasm32")]` UI path. Issue #396 does **not** gate #75: it
+is the real-iPad Safari suspension check split from #72 and parked in M7. The
+untested physical iPad rows above independently keep #75 and #244 open.
+
+The dependency note in #244 is also stale. Issue #65 is **CLOSED**, not open,
+as of this pass. Its PWA-relevant subset (manifest, icons and safe-area use) is
+present, so #75 does not wait on #65; the close-out record must state the live
+issue state rather than repeat the old “#65 remains open” wording.
+
 ADR 0032 still forbids a service worker and persisted API responses. The
 browser may retain static HTML, hashed JS/WASM/CSS, font, manifest and icons,
 but must revalidate them (`no-cache`). API responses are `no-store`; repository
@@ -257,4 +277,3 @@ titan does not establish that installed iPad launch works.
 
 Pointer Events provide the cross-device pointer model, including touch, pen,
 mouse, pressure, and tilt: <https://www.w3.org/TR/pointerevents3/>.
-

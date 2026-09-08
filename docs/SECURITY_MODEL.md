@@ -999,6 +999,38 @@ contents.
   hosts; and a same-uid adversary with access to a root-owned daemon socket,
   or to a writable file some outside process treats as instructions, is out
   of scope regardless of tier.
+- **Hook-running spawns outside clone inherit the full server environment.**
+  What has landed is narrower: clone's post-transfer checkout alone receives
+  ADR 0137's built environment allowlist and checkout-specific `AF_UNIX` denial.
+  Every other hook-running Git spawn keeps the server's ambient environment;
+  #735 records that as a deliberate boundary, not as an assertion that the
+  residual is safe. Git 2.53.0 measurements establish that `git fetch`, branch
+  push, tag push, and remote-tag delete can run attacker-authorable hooks at
+  `Tier::Network` with the agent socket reachable. They do not establish that
+  these are the only routes: the census exercised four of the five Remote arms
+  in `network_need_for_operation`
+  (`crates/git-vista-protocol/src/effects.rs:386-428`),
+  but not `PullBranch`; verification remains in progress. Clone's own routes
+  were measured and carry their own census rows.
+
+  A hook-only phase split is not the missing control. With
+  `core.hooksPath` pointed at an empty directory, a Git 2.53.0 experiment still
+  observed `remote.origin.uploadpack` and `core.sshCommand` execute during fetch
+  in the network-capable phase. That experiment used local paths and a
+  throwaway repository and measured Git's behaviour, not the sandbox's
+  mediation. The config is writable under the served-repository and commondir
+  grants (`sandbox/mod.rs:1083-1087`), neither the fixed secret exclusions nor
+  the trust-store exclusion names `.git/config`
+  (`sandbox/mod.rs:226-246, 1134-1138`), and the Network harness pins only
+  `core.askpass=` (`sandbox/network_exec.rs:101-112`). Splitting hooks from
+  transport would therefore impose the compatibility and process costs without
+  closing this repository-configured executable path; #755 tracks the part that
+  can be fixed. OpenSSH destination constraints (`ssh-add -h <host>`) and
+  confirm-per-use (`ssh-add -c`) are the operator mitigation. #702 remains open:
+  its clone half is closed, while these residuals remain. The design that would
+  close the whole boundary is a server-held SSH broker, so fetch and push run
+  with the agent unreachable without any phase split; that is a reopening
+  condition, not a current plan.
 - Providing tenant isolation in V2.
 - Making remote force-push universally undoable.
 - Securing plain HTTP LAN mode; it should not exist as a supported write mode.
