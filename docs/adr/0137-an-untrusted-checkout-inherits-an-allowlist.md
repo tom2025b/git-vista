@@ -361,8 +361,10 @@ that builds the environment.
   the census exercised four of the five Remote operations in
   `network_need_for_operation`
   (`crates/git-vista-protocol/src/effects.rs:386-428`),
-  but did not measure `PullBranch`, and it did not measure clone; a verification
-  pass remains in progress. #702 therefore stays open: its clone half is closed,
+  but did not measure `PullBranch`; a verification pass remains in progress.
+  Clone's own routes were measured and appear in the census as three separate
+  rows (the `--no-checkout` transfer, the empty-repository probe, and
+  `checkout -f`). #702 therefore stays open: its clone half is closed,
   while these residuals and this decision remain.
 
   The obvious repair was to split the agent-using transport from the local,

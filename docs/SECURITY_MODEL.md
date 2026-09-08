@@ -950,8 +950,8 @@ contents.
   these are the only routes: the census exercised four of the five Remote arms
   in `network_need_for_operation`
   (`crates/git-vista-protocol/src/effects.rs:386-428`),
-  but not `PullBranch`, and clone was not measured; verification remains in
-  progress.
+  but not `PullBranch`; verification remains in progress. Clone's own routes
+  were measured and carry their own census rows.
 
   A hook-only phase split is not the missing control. With
   `core.hooksPath` pointed at an empty directory, a Git 2.53.0 experiment still
