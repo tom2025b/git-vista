@@ -347,6 +347,53 @@ that builds the environment.
   rather than the server's whole environment. This is a real behaviour change
   and the intended one: the boundary cannot distinguish the operator's hook from
   the remote's, because at checkout time the remote chose which file runs.
+- **Hook-running spawns outside clone inherit the full server environment.** The
+  allowlist in this ADR is scoped to clone's post-transfer checkout; every other
+  hook-running Git spawn inherits the ambient environment after only the fixed
+  Git repository-geometry variables are removed (`sandbox/spawn.rs:141-151,
+  472-494`). As of #735, retaining that posture is deliberate, but it is a
+  documented boundary rather than an argument that the hooks are safe. The Git
+  2.53.0 census established four routes where attacker-authorable hooks run at
+  `Tier::Network` while the ordinary Network profile leaves the agent socket
+  reachable: `git fetch`, branch push, tag push, and remote-tag delete. The
+  census's own verdict for those rows was “deliberately permissive pending a
+  phase-split design; not argued safe.” That list is established, not complete:
+  the census exercised four of the five Remote operations in
+  `network_need_for_operation`
+  (`crates/git-vista-protocol/src/effects.rs:386-428`),
+  but did not measure `PullBranch`, and it did not measure clone; a verification
+  pass remains in progress. #702 therefore stays open: its clone half is closed,
+  while these residuals and this decision remain.
+
+  The obvious repair was to split the agent-using transport from the local,
+  hook-bearing ref transaction and deny `AF_UNIX` in the latter. That does not
+  close the boundary. With Git 2.53.0 and `core.hooksPath` set to an empty
+  directory, `fetch origin` still ran the program named by
+  `remote.origin.uploadpack`, and an SSH fetch still ran the program named by
+  `core.sshCommand`, both in the network-capable phase and with no hook involved.
+  This experiment measured Git's behaviour against local paths and a throwaway
+  repository, not the sandbox's mediation of those executions. The repository
+  config that names the programs is inside the write grant: `policy_for` grants
+  the served repository and separate commondir read-write
+  (`sandbox/mod.rs:1083-1087`); its exclusions are the `$HOME`-relative secret
+  set and trust store (`sandbox/mod.rs:226-246, 1134-1138`), not `.git/config`;
+  and the Network harness pins only `core.askpass=`
+  (`sandbox/network_exec.rs:101-112`). A process that already runs can therefore
+  name an executable for the later network-capable phase even if that phase
+  blocks every hook. #755 tracks that separately fixable config-executable path
+  and requires its operator-compatibility cost to be decided before values are
+  pinned.
+
+  Paying for the hook-only split would thus leave the measured path open while
+  making fetch two processes and push four, rewriting three production
+  tripwires and ADR 0029, raising the Git floor from 2.32 to at least 2.36, and
+  changing operator-hook semantics: a network-using `pre-push` would fail and a
+  `reference-transaction` hook could no longer veto a remote-tracking update.
+  The operator-layer mitigation available now is OpenSSH's
+  `ssh-add -h <host>` for destination-constrained keys or `ssh-add -c` for
+  confirm-per-use. **What would reopen this:** a server-held SSH broker that
+  lets the entire fetch or push run with the agent unreachable, without a phase
+  split. That is the design that would close the boundary, not a committed plan.
 - **#723 supplies the remaining technical half of #702.** The coordinator, not
   this change, decides when to close the parent issue.
 - **Checkout retains TCP, but Git LFS under the new filter is unmeasured.**
