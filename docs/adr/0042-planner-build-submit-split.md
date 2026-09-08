@@ -1,9 +1,6 @@
 # ADR 0042 — The planner's build / submit seam: two stages, one set of stage functions
 
-- **Status:** Accepted — implemented and tested. The two stages are deliberately **not
-  routed yet**: no HTTP endpoint calls them until #248 (MCP plan tools) and #249
-  (`execute_plan`); until then the contract suite is their only caller and the split's
-  exhaustive-match censuses are what hold the seam closed.
+- **Status:** Accepted — implemented and tested; routed by #248/#249.
 - **Date:** 2026-08-02.
 - **Milestone / issue:** M2.23c, issue #247 ("Split the planner into build-only and
   submit-approved-plan stages"), sub-issue of #153. Branch

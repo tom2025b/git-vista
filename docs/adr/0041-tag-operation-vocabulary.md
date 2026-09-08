@@ -1,8 +1,8 @@
 # ADR 0041 — The typed tag vocabulary: four variants, and an undo that restores the exact tag object
 
-- **Status:** Accepted — typed contract implemented and tested. Execution is explicitly
-  **not** wired: create, delete (local and remote), and push are later M2.21 slices under
-  #74, staged exactly as ADR 0039 staged fetch/pull.
+- **Status:** Accepted — typed contract implemented and tested; local execution wired by
+  [0048](0048-local-tag-execution.md), signed attempts run and fail fast with a typed reason
+  by #239 but no signed tag can be created here, and the remote pair is wired by #240.
 - **Date:** 2026-08-02.
 - **Milestone / issue:** M2.21a, issue #235 ("Typed tag operation vocabulary + tag detail
   DTO"), child of #74 (M2.21, "Add Annotated and Signed Tag Management"). Branch

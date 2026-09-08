@@ -1,6 +1,6 @@
 # ADR 0006 — Visualize / Active is chosen per open, every time
 
-- **Status:** Accepted — implementation pending (`feature/repo-picker-modes`)
+- **Status:** Accepted — implemented; picker flow browser-verified, topbar mode badge untested
 - **Date:** 2026-07-19
 - **Milestone / issue:** Post-M1.05 feature set; design spec
   `docs/superpowers/specs/2026-07-19-repo-modes-lan-visualizer-design.md`

@@ -1,8 +1,8 @@
 # ADR 0048 — Local tag execution: the annotation that cannot be empty, and the pin that outlives the tag
 
-- **Status:** Accepted — implemented and tested. The two **local** tag operations execute;
-  the two remote-reaching ones (`DeleteRemoteTag`, `PushTag`) stay `501`, and signing stays
-  `501`, each for its own reason recorded below.
+- **Status:** Accepted — implemented and tested; unsigned local creation and local deletion
+  execute, signed attempts run and fail fast with a typed reason by #239 but no signed tag
+  can be created here, and the two remote-reaching tag operations are wired by #240.
 - **Date:** 2026-08-02.
 - **Milestone / issue:** M2.21d, issue #238 ("Local tag create/delete (lightweight &
   annotated) through the shared planner"), child of #74 (M2.21, "Add Annotated and Signed

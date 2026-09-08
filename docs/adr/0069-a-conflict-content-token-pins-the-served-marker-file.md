@@ -2,8 +2,7 @@
 
 Date: 2026-08-23
 
-Status: Accepted — design only, no code. Third and final slice of M4.31 (#84),
-building on ADR 0063 (the read model) and ADR 0064 (whole-side resolution).
+Status: Accepted — implemented and tested by #432.
 
 ## Context
 
