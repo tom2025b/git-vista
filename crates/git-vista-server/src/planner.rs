@@ -102,6 +102,71 @@ pub(crate) async fn plan_and_execute_for_worktree(
     .await
 }
 
+/// Build → validate → execute one operation against the current selection —
+/// **refusing outright** if that selection is not the worktree the request
+/// says it was built against (#721, ADR 0140).
+///
+/// # Why refuse, rather than act on the named worktree
+///
+/// [`plan_and_execute_for_worktree`] above answers the same wire fact a
+/// different way: it *goes where the id points*, independent of the
+/// selection. That is right for the conflict writes, whose reads are
+/// independently addressable and whose user is working a list of files rather
+/// than looking at a repository.
+///
+/// It is wrong for the two destructive path operations. They are driven from
+/// a context menu on the repository the user is looking at, one of them has no
+/// undo of any kind, and "quietly destroy files in a repository that is not on
+/// screen" is a worse failure than "refuse and make the user look again". So
+/// the id is used as a **precondition** on the selection, not as an address.
+///
+/// # Why the comparison lives here and not in the handler
+///
+/// The selection is a per-session cell another request from the same session
+/// can move (#588). A handler that compared before calling into the planner
+/// would be comparing against a value the planner then re-reads — a window,
+/// however small, in exactly the shape this whole issue is about. The
+/// comparison is therefore made against the *same* `resolve_target()` result
+/// the operation is then planned and executed against, which is the only
+/// reading of the selection that can be said to be the one that acted.
+pub(crate) async fn plan_and_execute_matching(
+    op: GitOperation,
+    expected: WorktreeId,
+) -> (StatusCode, String) {
+    plan_and_execute_maybe_recovery(
+        op,
+        None,
+        DropProof::Nothing,
+        MutationTarget::SelectionMatching(expected),
+    )
+    .await
+}
+
+/// The refusal a [`MutationTarget::SelectionMatching`] mismatch earns, and it
+/// is deliberately **not** the `409` [`verify_path_states`] returns (#721).
+///
+/// `412 Precondition Failed` is the accurate code and the accurate meaning:
+/// the request stated a condition about the world ("this was built against
+/// worktree X"), and the world does not satisfy it. A `409` here would
+/// collapse the two events this issue exists to separate — a path that
+/// drifted under a request aimed at the right repository, and a request aimed
+/// at the wrong repository altogether. The first is ordinary and self-healing
+/// (look again, the file moved); the second means the list on screen and the
+/// repository under it have come apart, and re-sending would not help.
+///
+/// The text names neither repository. The client already knows which one it
+/// asked for, and the server's answer must not become a way to learn what
+/// else this server is serving.
+fn repository_selector_mismatch() -> (StatusCode, String) {
+    (
+        StatusCode::PRECONDITION_FAILED,
+        "This was prepared against a different repository than the one selected \
+         now — refusing rather than acting on files you were not looking at. \
+         Check the repository, then try again."
+            .to_string(),
+    )
+}
+
 /// [`plan_and_execute`], for a drop that must first prove the working tree
 /// still holds what an apply restored (M3, #514; ADR 0090).
 ///
@@ -143,10 +208,15 @@ pub(crate) async fn plan_and_execute_recovery(
 
 /// Where a composed write resolves its repository. All established writes use
 /// the session selection; the two conflict writes carry an explicit worktree
-/// id because their reads are independently addressable (#621, ADR 0109).
+/// id because their reads are independently addressable (#621, ADR 0109); the
+/// two destructive path writes can carry one as a *precondition* on the
+/// selection rather than as an address, though production callers do not send
+/// one yet (#721, #733, ADR 0140 — see
+/// [`plan_and_execute_matching`] for why the difference is deliberate).
 enum MutationTarget {
     Selection,
     Worktree(WorktreeId),
+    SelectionMatching(WorktreeId),
 }
 
 /// The shared body of [`plan_and_execute`] and [`plan_and_execute_recovery`]:
@@ -193,6 +263,19 @@ async fn plan_and_execute_maybe_recovery(
         },
         MutationTarget::Worktree(worktree) => match resolve_explicit_target(worktree) {
             Ok(target) => target,
+            Err(rejected) => return rejected,
+        },
+        // #721: the same resolution the plain selection path takes, plus one
+        // question it cannot ask — is this the repository the request was
+        // built against? Compared here, against this very resolution, so no
+        // reselection can slip between the check and the act.
+        MutationTarget::SelectionMatching(expected) => match crate::state::resolve_target() {
+            Ok((repo, entry)) => {
+                if entry.handle.worktree != expected {
+                    return repository_selector_mismatch();
+                }
+                (repo, entry.handle)
+            }
             Err(rejected) => return rejected,
         },
     };
@@ -4024,11 +4107,37 @@ fn classify_path_states(parsed: &git_vista_protocol::ParsedStatus) -> HashMap<St
     out
 }
 
-/// The race guard (#219): re-resolve every requested path against a **fresh**
-/// `git status --porcelain=v2 -z`, immediately before running the destructive
-/// git command, and refuse — the whole batch, not just the drifted path — if
-/// any path's live classification no longer matches what this operation
-/// requires.
+/// The **conditional path-state recheck** (#219): re-resolve every requested
+/// path against a **fresh** `git status --porcelain=v2 -z`, immediately before
+/// running the destructive git command, and refuse — the whole batch, not just
+/// the drifted path — if any path's live classification no longer matches what
+/// this operation requires.
+///
+/// # What this is NOT, and the name is the correction (#721)
+///
+/// It is not general stale-reply protection, and it was described that way in
+/// several places before #721. It asks exactly one question, of the repository
+/// selected **now**: *is this path tracked-dirty / untracked here?* So:
+///
+/// - a path the live repository does not classify that way is refused — the
+///   common case, and the one this guard genuinely covers;
+/// - a path whose **name collides** and is dirty here too **passes**. A
+///   `Cargo.lock` carried from a sibling worktree verifies fine, because
+///   `Cargo.lock` is tracked-dirty in both. Same for any matching untracked
+///   filename.
+///
+/// It cannot do better, because until #721 nothing in the request said where
+/// the list came from. `MutationTarget::SelectionMatching` (ADR 0140) is the
+/// answer to *that* question and is checked far earlier, at target
+/// resolution, with its own distinct `412` — deliberately not folded into the
+/// `409` below, which means "the thing you were shown has changed", not "you
+/// are aiming somewhere else".
+///
+/// Note what remains true: #711 closed the client-side route that *produced*
+/// a stale list (readings now resolve through `reading_is_current` before
+/// their paths reach a confirmation), so there is no known live path to a
+/// mismatched batch today. The correction here is to the description of the
+/// guard, which was being relied on as a backstop it structurally cannot be.
 ///
 /// This is deliberate redundancy on top of the generic staleness gate
 /// (`enforce_fresh`, which already refuses on *any* worktree drift via the
