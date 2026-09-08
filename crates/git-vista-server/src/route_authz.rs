@@ -86,6 +86,11 @@ pub(crate) const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     ("/api/blame", Method::GET, Authz::SessionRequired),
     ("/api/head-branch", Method::GET, Authz::SessionRequired),
     ("/api/status", Method::GET, Authz::SessionRequired),
+    // #708 (ADR 0138): git's current bisect state is a repository read.
+    // It is available on both listener profiles and requires a live session,
+    // like the working-tree status beside it. GET has no CSRF surface: unlike
+    // the start/mark/reset routes, discovery never mutates the repository.
+    ("/api/bisect/status", Method::GET, Authz::SessionRequired),
     // #68c: the generation-tagged WorktreeStatus DTO — same read posture as
     // the v1 endpoint immediately above.
     ("/api/status/v2", Method::GET, Authz::SessionRequired),
@@ -384,7 +389,7 @@ pub(crate) const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// this constant and its test are for. Derived by running
 /// `every_registered_route_is_classified`, never copied from either side of a
 /// merge.
-const EXPECTED_ROUTE_COUNT: usize = 82;
+const EXPECTED_ROUTE_COUNT: usize = 83;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in

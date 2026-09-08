@@ -1781,6 +1781,32 @@ pub fn validate_clone_url(url: &str) -> Result<String, String> {
     Ok(url.to_string())
 }
 
+/// One command from git's bisect log, in execution order (#708, ADR 0138).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BisectLogStep {
+    pub verb: String,
+    pub args: Vec<String>,
+}
+
+/// `GET /api/bisect/status`: git's current session, read afresh (#708, ADR 0138).
+/// An inactive session has false flags, null optional values and empty lists.
+/// A finished search remains in progress until `git bisect reset`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BisectStatus {
+    pub in_progress: bool,
+    /// HEAD while bisecting; null when inactive or HEAD could not be read.
+    pub current: Option<String>,
+    /// The branch or commit that reset returns to.
+    pub started_from: Option<String>,
+    pub bad: Option<String>,
+    pub good: Vec<String>,
+    pub skipped: Vec<String>,
+    pub history: Vec<BisectLogStep>,
+    pub finished: bool,
+}
+
 /// Body of `POST /api/bisect/start` (M5.34, #87, ADR 0131).
 ///
 /// `good` is a `Vec` — see [`crate::plan::GitOperation::BisectStart`]'s own
@@ -1808,6 +1834,26 @@ pub struct BisectMarkRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bisect_status_pins_the_wire_fields_and_types() {
+        let wire = serde_json::json!({
+            "in_progress": true, "current": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "started_from": "main", "bad": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "good": ["cccccccccccccccccccccccccccccccccccccccc"],
+            "skipped": ["dddddddddddddddddddddddddddddddddddddddd"],
+            "history": [{"verb": "skip", "args": ["dddddddddddddddddddddddddddddddddddddddd"]}],
+            "finished": false
+        });
+        let status: BisectStatus = serde_json::from_value(wire.clone()).unwrap();
+        assert!(status.in_progress && !status.finished);
+        assert_eq!(status.started_from.as_deref(), Some("main"));
+        assert_eq!(status.history[0].verb, "skip");
+        assert_eq!(serde_json::to_value(&status).unwrap(), wire);
+        let mut unknown = wire;
+        unknown["notes"] = serde_json::json!({});
+        assert!(serde_json::from_value::<BisectStatus>(unknown).is_err());
+    }
 
     // -----------------------------------------------------------------------
     // The stash drawer's wire contract (#495, ADR 0079)
