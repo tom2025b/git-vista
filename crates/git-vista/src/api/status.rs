@@ -66,9 +66,13 @@ pub async fn fetch_status_for(repo: &str) -> Result<RepoStatus, String> {
 /// lists for "Discard Changes…" and "Delete Untracked Files…", so an answer
 /// belonging to a repository the user has left would name *that* repository's
 /// files inside a confirmation for *this* one. The server's own
-/// `verify_path_states` re-check is a path-state filter, not a repository
-/// check: it cannot tell a colliding path name in the live repository from
-/// the one the user was actually shown.
+/// `verify_path_states` re-check is a **conditional path-state recheck**, not
+/// a repository check: it cannot tell a colliding path name in the live
+/// repository from the one the user was actually shown. #721 gave the
+/// destructive POSTs a repository selector that *can* answer that (ADR 0139),
+/// but this client cannot fill it in yet — see
+/// [`discard_tracked_paths_request`] — so for the shipped path this paragraph
+/// still describes the whole of the server's contribution.
 ///
 /// The reply is still only a *candidate* reading. Whether the frame it was
 /// requested for is still the accepted one is
@@ -106,13 +110,35 @@ pub async fn fetch_worktree_status_for(repo: &str) -> Result<WorktreeStatus, Str
 /// The body is [`WorktreePathsRequest`], the server's own DTO, so the
 /// `#[serde(deny_unknown_fields)]` on it cannot be violated by a stray field
 /// invented on this side.
+///
+/// # `repo: None`, and it is not an oversight (#721)
+///
+/// That DTO now carries an optional repository selector: the worktree id the
+/// path list was read out of. Sending it is what lets the server refuse a
+/// batch aimed at a repository other than the selected one, with its own
+/// `412` — see [`WorktreePathsRequest`]'s doc comment for the whole contract.
+///
+/// This function cannot supply it yet, and no value it could reach for would
+/// be the right one. The scope that matters is the one captured **when the
+/// list was built** — `features::status::signals`' pinned repository, the
+/// same id `fetch_worktree_status_for` was called with. By the time the
+/// request reaches here that reading has travelled through an
+/// `OperationKind`, which carries `paths` and nothing else. Reading a *live*
+/// repository id at this point would produce a selector that always matches
+/// the selection and therefore proves nothing — a check that cannot fail is
+/// worse than no check, because it reads like one.
+///
+/// Threading it properly means widening `OperationKind::DiscardTrackedPaths`
+/// and the confirmation that constructs it. That is #721's second half and
+/// lands with those callers, not here.
 pub async fn discard_tracked_paths_request(
     paths: Vec<String>,
     key: IdempotencyKey,
 ) -> Result<WriteReceipt, String> {
     refuse_if_offline()?;
     refuse_if_visualize()?;
-    let json = serde_json::to_string(&WorktreePathsRequest { paths }).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string(&WorktreePathsRequest { repo: None, paths })
+        .map_err(|e| e.to_string())?;
     let (resp, _key) = send_write_with_key(
         "/api/discard-tracked-paths",
         Some(json),
@@ -134,13 +160,18 @@ pub async fn discard_tracked_paths_request(
 ///
 /// Retries are safe for the same reason every other write's are: the
 /// idempotency key is minted by the caller and replayed rather than re-run.
+///
+/// `repo: None` for the reason [`discard_tracked_paths_request`] records —
+/// and this is the endpoint where it costs the most, since a deletion has no
+/// undo anywhere in this repository.
 pub async fn delete_untracked_paths_request(
     paths: Vec<String>,
     key: IdempotencyKey,
 ) -> Result<WriteReceipt, String> {
     refuse_if_offline()?;
     refuse_if_visualize()?;
-    let json = serde_json::to_string(&WorktreePathsRequest { paths }).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string(&WorktreePathsRequest { repo: None, paths })
+        .map_err(|e| e.to_string())?;
     let (resp, _key) = send_write_with_key(
         "/api/delete-untracked-paths",
         Some(json),

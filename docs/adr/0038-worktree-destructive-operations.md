@@ -5,6 +5,13 @@
 - **Milestone / issue:** M2.18a/M2.18b, issues [#219](https://github.com/tom2025b/Git-Vista/issues/219)
   (typed operations, server) and [#220](https://github.com/tom2025b/Git-Vista/issues/220)
   (confirmation UI, client). Commits `5793def` (#219) and `c6d9bde` (#220).
+- **Extended by:** [0139](0139-a-destructive-write-carries-the-repository-it-was-built-against.md) —
+  §3 below describes `verify_path_states` accurately as a *per-path* re-verification, but
+  the guard was widely read afterwards as general stale-reply protection. It is not: it is a
+  **conditional path-state recheck**, and a path name that collides and is dirty in the live
+  repository too passes it unchanged. 0139 adds the repository selector that answers the
+  question this one structurally cannot ask — *where did this list come from* — with its own
+  distinct `412`. Nothing in this ADR is retracted.
 - **Implements:** the **Worktree destructive** row of `docs/SECURITY_MODEL.md`'s
   "Operation Risk Classes" table — the last risk class in that table with no
   implemented-annotation. This ADR is what the annotation now points at.

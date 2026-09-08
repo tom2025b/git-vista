@@ -1270,17 +1270,31 @@ mod tests {
     ///
     /// `verify_path_states` re-derives each path's tracked/untracked state
     /// against the repository selected *now* and refuses the batch on any
-    /// mismatch — but the destructive POSTs carry no repository selector, so
-    /// "matches" is decided entirely by path name and state. Two repositories
-    /// dirty in the same file — the ordinary case for sibling worktrees of one
-    /// repository, which this app switches between by design — produce a list
-    /// that passes that re-check while having been derived somewhere else.
+    /// mismatch — a **conditional path-state recheck**, so "matches" is
+    /// decided entirely by path name and state. Two repositories dirty in the
+    /// same file — the ordinary case for sibling worktrees of one repository,
+    /// which this app switches between by design — produce a list that passes
+    /// that re-check while having been derived somewhere else.
+    ///
+    /// **#721 changed what the server *can* be told, not what this client
+    /// sends.** `WorktreePathsRequest` now carries an optional `repo`, and a
+    /// selector naming a worktree other than the selected one is refused with
+    /// its own `412` (ADR 0139). The browser client cannot supply it yet: the
+    /// path list travels through an `OperationKind` that carries `paths`
+    /// alone, so `api::discard_tracked_paths_request` sends `repo: None` and
+    /// the endpoint behaves exactly as this test describes. Until that second
+    /// half lands, the frame gate below is still the only thing standing
+    /// between the user and a confirmed batch — which is why this test stays
+    /// as written rather than being softened to describe a protection the
+    /// shipped path does not yet get.
     ///
     /// This test does not run the server. It pins the client-side claim the
     /// severity argument rests on: the paths a stale reply would have offered
     /// are ordinary names with nothing about them a path-state filter could
-    /// reject, so the frame gate above is the only thing standing between the
-    /// user and a confirmed batch.
+    /// reject. The server-side twin, which does run the handler and the
+    /// planner, is
+    /// `git-vista-server`'s
+    /// `handlers::discard::tests::a_colliding_path_name_from_a_sibling_worktree_is_refused`.
     #[test]
     fn a_colliding_path_name_is_indistinguishable_to_a_path_state_recheck() {
         let elsewhere = status(vec![
