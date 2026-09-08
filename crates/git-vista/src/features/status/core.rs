@@ -68,8 +68,9 @@ use git_vista_protocol::{
     ChangeKind, ChangeSides, ConflictKind, StatusEntry, SubmoduleState, WorktreeStatus,
 };
 
-/// A status response and the opaque worktree id used to request it. Keep the
-/// pair intact until paths are copied into the pending destructive operation.
+/// A status response and the opaque worktree id used to request it. Callers
+/// keep the public fields paired by convention until both are copied into the
+/// pending destructive operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopedWorktreeStatus {
     pub repo: git_vista_core::identity::WorktreeId,

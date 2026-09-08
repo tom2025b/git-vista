@@ -4,16 +4,16 @@
 - **Date:** 2026-09-07
 - **Issue:** #721; refs #711, #709, #707
 - **Extends:** [ADR 0038](0038-worktree-destructive-operations.md) — its §3 introduced `verify_path_states` as a deliberately redundant *per-path* re-verification, which is accurate; what this ADR corrects is the reading that grew around it. Nothing in 0038 is retracted.
-- **Related:** [ADR 0109](0109-a-conflict-write-names-the-repository-it-mutates.md) (the required-`repo` precedent this deliberately diverges from in one respect), [ADR 0016](0016-shared-write-planner.md) (every git write flows through one funnel), [ADR 0119](0119-a-guarantee-that-holds-only-on-the-success-arm-is-not-a-guarantee.md) (why the open half is written down rather than assumed)
+- **Related:** [ADR 0109](0109-a-conflict-write-names-the-repository-it-mutates.md) (the required-`repo` precedent; this decision uses the same wire requirement but different execution semantics), [ADR 0016](0016-shared-write-planner.md) (every git write flows through one funnel), [ADR 0119](0119-a-guarantee-that-holds-only-on-the-success-arm-is-not-a-guarantee.md) (why the comparison must survive every outcome path)
 
 ## Context
 
-`POST /api/discard-tracked-paths` (`git checkout -- <paths>`) and
-`POST /api/delete-untracked-paths` (`git clean -f -- <paths>`) carried a body of
-`paths` and nothing else. Both resolve their repository from the session's
-current selection, and both are re-checked immediately before git runs by
-`planner::verify_path_states`, which asks one question of the repository
-selected **now**:
+Before #732/#733, `POST /api/discard-tracked-paths` (`git checkout -- <paths>`)
+and `POST /api/delete-untracked-paths` (`git clean -f -- <paths>`) carried a
+body of paths without a selector. Both resolved their repository from the
+session's current selection, and both were re-checked immediately before git
+ran by `planner::verify_path_states`, which asked one question of the repository
+selected **then**:
 
 > is this path tracked-dirty / untracked **here**?
 
@@ -26,7 +26,7 @@ It is a **conditional path-state recheck**, and the condition is the path's
 flowchart TD
   R["<b>GET /api/status/v2?repo=A</b><br/>the list is read WITH a repository id"] --> L["paths: Cargo.lock, notes.txt"]
   L --> C["confirmation dialog"]
-  C --> P["<b>POST /api/discard-tracked-paths</b><br/>body carried paths ONLY —<br/>the id was dropped here"]
+  C --> P["<b>BEFORE #732/#733</b><br/>POST body omitted the id"]
   P --> S["server resolves the CURRENT selection: B"]
   S --> V["verify_path_states<br/>is Cargo.lock tracked-dirty in B?"]
   V --> Y["<b>yes</b> — B is dirty in the same file"]
@@ -171,11 +171,13 @@ correction is part of the change rather than a follow-up.
 ## Completing the client half (#733)
 
 The menu's resource captures the opaque `WorktreeId` from its request key at
-`GET /api/status/v2?repo=` read time. `ScopedWorktreeStatus` keeps that id and
-response together. The existing current-reading gate still refuses retained
-answers. After that gate, the menu copies the captured id and selected paths
-into `OperationKind`; confirmation retains that operation, and dispatch passes
-its id into the separate discard/delete request builders.
+`GET /api/status/v2?repo=` read time. `ScopedWorktreeStatus` stores that id
+beside the response; because its fields are public, preserving the pair is a
+caller convention, not a type-enforced invariant. The existing current-reading
+gate still refuses retained answers. After that gate, the menu copies the
+captured id and selected paths into `OperationKind`; confirmation retains that
+operation, and dispatch passes its id into the separate discard/delete request
+builders.
 
 There is no live-selection lookup at send time. Such a lookup would always
 match the newly selected worktree and prove nothing. The selector remains a
@@ -194,9 +196,11 @@ No automatic retry changes the pending selector. A 409 remains ordinary path
 drift and retains the path-specific refusal. The HTTP receipt, terminal SSE
 record, and reconnect reads all preserve the distinction in `Settlement`.
 
-The planner-funnel census in `route_authz.rs` is owned by a separate lane and
-is not widened here. Its existing substring assertion accepts the matching
-entry point; handler and browser behavior tests carry the stronger claim.
+This PR widens `post_route_census` in
+`crates/git-vista-server/src/planner/contract_suite.rs`: it adds
+`PlannerEntry::Matching`, maps that classification to
+`plan_and_execute_matching`, and reclassifies both destructive routes. The
+census now structurally rejects a regression to ordinary `plan_and_execute`.
 
 ## Alternatives considered
 
@@ -295,3 +299,18 @@ green was established first, each mutation was applied with a unique-match edit
 that fails loudly if it does not apply, and the files were restored from
 byte-exact backups with `git diff` confirming an empty result. The standing
 exception ADR 0130 used for the same reason applies.
+
+### Client capture and dispatch
+
+The end-to-end browser contract has two `failure-atlas mutation_check` arms
+with green baselines and different failures:
+
+| Run | Mutation | Distinct failure | Verdict |
+|---|---|---|---|
+| 462 | Replace the captured selector at dispatch with a live `fetch_frame().worktree_id` read | The confirmation still opened and sent a request, but no 412 response arrived; the browser timed out waiting for the repository-mismatch refusal. | caught |
+| 464 | Drop `repo` from the captured reading in `menu/worktree_items.rs` | “Discard Changes…” became disabled before confirmation and no destructive POST was sent; the browser failed its enabled-item assertion. | caught |
+
+`captured_selector_browser_contract_for_mutation_check` is an ignored,
+committed entry point in `worktree_status_scope.rs`. It builds the wasm client
+and runs only `destructive-selector.spec.mjs`, so both experiments remain
+reproducible from a clean clone instead of depending on a deleted local harness.

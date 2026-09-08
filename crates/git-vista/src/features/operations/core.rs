@@ -680,7 +680,7 @@ pub fn write_route(kind: &OperationKind) -> WriteRoute {
         // Two routes, not one parameterised by a bool — mirroring the two
         // separate `GitOperation` variants and the two separate endpoints
         // behind them (#71, M2.18a/#219). These two are the second
-        // identical-shape pair: both carry only `paths`.
+        // identical-shape pair: both carry the captured `repo` and `paths`.
         OperationKind::DiscardTrackedPaths { .. } => {
             WriteRoute::dedicated("discard_tracked_paths_request")
         }
