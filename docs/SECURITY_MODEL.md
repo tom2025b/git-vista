@@ -437,8 +437,8 @@ own.
 **Verification.** The census was authored by codex (`gpt-daybreak-blue-latest`)
 and independently verified against `453f9e11` by Claude (max), reading source
 rather than accepting the table: all **eight rows confirmed**, and **every source
-citation in this section opened** against that commit — 23 distinct line ranges,
-32 citations — none miscited, none describing superseded behaviour, none
+citation in this section opened** against that commit — 24 distinct line ranges,
+33 citations — none miscited, none describing superseded behaviour, none
 untraced. `git diff --check` is clean, and all **seven hook-behaviour claims
 reproduced** on a second run of real Git 2.53.0. The verifier separately
 re-derived the completeness claim: seven struct-literal `hook_mode:
@@ -446,8 +446,13 @@ HookMode::Run` sites exist, three are `#[cfg(test)]`-gated and one
 (`sandbox/probe.rs:335`, `boot_probe_policy`) is `Tier::Strict`, leaving exactly
 three production constructors that can be `Tier::Network` — `policy_for`,
 `policy_for_clone` and `policy_for_clone_checkout` — onto which all eight rows
-map. `ls-remote` was checked as a candidate missing route and exists only in
-test code.
+map. `ls-remote` was checked as a candidate missing route: **no production route
+constructs an `ls-remote` argv** and no `GitOperation` variant spawns one, so it
+contributes no row. The string does appear in production — as an entry in the
+fail-closed `REMOTE_SUBCOMMANDS` argv classifier
+([list](../crates/git-vista-server/src/sandbox/mod.rs#L686-L697)), which
+`reconcile_need` consults on every real spawn — but that is a classifier
+guarding argvs, not a route that reaches one.
 
 **#702 closure check.** Its required clone property is implemented: the process
 that materialises and executes fetched content has neither the agent locator nor
