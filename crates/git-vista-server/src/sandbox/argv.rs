@@ -514,50 +514,59 @@ fn only_the_clone_checkout_phase_gives_up_the_188_grants() {
         // Leg 3 — the claim. The process that runs attacker code has none.
         let checkout =
             policy_for_clone_checkout(clones_root.path()).expect("checkout policy must build");
-        let checkout = &checkout.0;
+        let checkout_policy = &checkout.0;
         assert_eq!(
-            checkout.tier,
+            checkout_policy.tier,
             Tier::Network,
             "this narrows grants, never the tier: ADR 0128 keeps network for git-lfs"
         );
         assert!(
-            matches!(checkout.hook_mode, HookMode::Run),
+            matches!(checkout_policy.hook_mode, HookMode::Run),
             "and never hook execution — ADR 0029 rejects blocking them, and #702 is \
              about what the hook is HANDED, not whether it runs"
         );
         assert!(
-            !checkout.rw_trees.contains(&sock),
+            !checkout_policy.rw_trees.contains(&sock),
             "#702: the operator's agent socket must not reach the checkout, got {:?}",
-            checkout.rw_trees
+            checkout_policy.rw_trees
         );
         assert_eq!(
-            checkout.ro_carveouts,
+            checkout_policy.ro_carveouts,
             Vec::<PathBuf>::new(),
             "#702: the ~/.ssh exclude is exceptionless again for the untrusted phase"
         );
         assert!(
-            !checkout.net_ports.contains(&22),
+            !checkout_policy.net_ports.contains(&22),
             "#702: no SSH service for a hostile hook, got {:?}",
-            checkout.net_ports
+            checkout_policy.net_ports
         );
         assert!(
-            checkout.net_ports.contains(&443),
+            checkout_policy.net_ports.contains(&443),
             "paired positive: HTTPS must survive or a git-lfs smudge filter breaks"
         );
         assert!(
-            checkout.rw_trees.iter().any(|p| p == clones_root.path()),
+            checkout_policy
+                .rw_trees
+                .iter()
+                .any(|p| p == clones_root.path()),
             "paired positive: the checkout must still be able to write the worktree — \
              a policy that granted nothing would satisfy every negative leg above"
         );
 
         // The argv is where a reviewer sees a grant (ADR 0033's D5 Option B).
-        let argv = strs(&sandbox_argv(checkout));
+        let argv = strs(&checkout_sandbox_argv(&checkout));
         let w = pairs(&argv);
         assert!(
             !argv.iter().any(|a| a == "--ro-carveout")
                 && !w.contains(&("--rw", sock.to_str().expect("utf8 path")))
-                && !w.contains(&("--net-port", "22")),
+                && !w.contains(&("--net-port", "22"))
+                && argv.iter().any(|a| a == "--seccomp-checkout"),
             "the checkout launcher argv must advertise none of the three, got {argv:?}"
+        );
+        let transfer_argv = strs(&sandbox_argv(&transfer));
+        assert!(
+            !transfer_argv.iter().any(|a| a == "--seccomp-checkout"),
+            "the transfer must retain pathname AF_UNIX for authenticated SSH remotes"
         );
     });
 }

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# R9: prove each declarative escape-battery claim notices the mechanism it names.
+# R9: prove each registered sandbox claim notices the mechanism it names.
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 work_root=$(mktemp -d "${TMPDIR:-/tmp}/git-vista-mutation-matrix.XXXXXX")
 trap 'rm -rf -- "$work_root"' EXIT
 
-readonly -a mutants=(M1 M2 M3 M4 M5 M6 M7 M8 M9 M10 M11)
+readonly -a mutants=(M1 M2 M3 M4 M5 M6 M7 M8 M9 M10 M11 M12)
 declare -Ar mutant_patch=(
   [M1]="ci/mutants/M1-apply-seccomp-empty.patch"
   [M2]="ci/mutants/M2-skip-landlock-restrict-self.patch"
@@ -19,6 +19,7 @@ declare -Ar mutant_patch=(
   [M9]="ci/mutants/M9-widen-af-unix-comparison.patch"
   [M10]="ci/mutants/M10-allow-io-uring.patch"
   [M11]="ci/mutants/M11-empty-ssh-known-hosts-carveout.patch"
+  [M12]="ci/mutants/M12-remove-checkout-af-unix-rule.patch"
 )
 
 failures=0
@@ -56,12 +57,12 @@ import pathlib
 import re
 import sys
 
-# Upper bound is exclusive: range(1, 12) == M1..M11. This set is the third and
+# Upper bound is exclusive: range(1, 13) == M1..M12. This set is the third and
 # most-missed registration site for a new mutant (the `mutants` array and the
 # `mutant_patch` map above are the other two) — an unlisted id makes the parser
 # reject the case that names it, with a message about an *unknown mutant* rather
 # than about this line.
-known = {f"M{i}" for i in range(1, 12)}
+known = {f"M{i}" for i in range(1, 13)}
 case_re = re.compile(
     r"const\s+CASE_[A-Z0-9_]+:\s*EscapeCase\s*=\s*EscapeCase\s*\{(.*?)\n\};",
     re.DOTALL,
@@ -84,22 +85,36 @@ for name in sys.argv[1:]:
         unknown = sorted(set(mutants) - known)
         if unknown:
             raise SystemExit(f"{path}: {case_id} names unknown mutants: {unknown}")
-        print(module, case_id, ",".join(mutants), sep="\t")
+        print(module, case_id, ",".join(mutants), "report", sep="\t")
 
 if not seen:
     raise SystemExit("no EscapeCase declarations found")
 PY
 
+# #723's strongest proof is deliberately not an EscapeCase: it exercises the
+# clone checkout phase's sealed CheckoutPolicy, whereas the declarative battery
+# has only production Strict and Network cases. Make that exact composed test a
+# first-class matrix row instead of weakening the claim into another rule-map
+# assertion. M12 removes only Checkout's AF_UNIX rules; this test must then fail
+# because its fetched hook reaches the pathname socket while its TCP leg lives.
+printf '%s\t%s\t%s\t%s\n' \
+  checkout_security \
+  a_fetched_hook_that_self_sets_ssh_auth_sock_cannot_connect_but_tcp_survives \
+  M12 \
+  exact >> "$declarations"
+
 mapfile -t case_rows < "$declarations"
 declare -a case_ids=()
 declare -a case_modules=()
 declare -A case_mutants=()
+declare -A case_modes=()
 declare -A mutant_named=()
 for row in "${case_rows[@]}"; do
-  IFS=$'\t' read -r module case_id declared_mutants <<< "$row"
+  IFS=$'\t' read -r module case_id declared_mutants mode <<< "$row"
   case_modules+=("$module")
   case_ids+=("$case_id")
   case_mutants["$case_id"]=$declared_mutants
+  case_modes["$case_id"]=$mode
   if [[ -z $declared_mutants ]]; then
     error "case $case_id declares an empty dies_under list"
     continue
@@ -191,22 +206,36 @@ run_one_tree() {
       status=$?
     fi
 
-    local records
-    records=$(grep -c "^GV-ESCAPE case=${case_id} " "$report" || true)
-    if [[ $status -eq 0 && $records -eq 1 ]] && \
-      grep -q "^GV-ESCAPE case=${case_id} result=contained " "$report"; then
-      outcome["$label|$case_id"]=PASS
+    if [[ ${case_modes[$case_id]} == exact ]]; then
+      if [[ $status -eq 0 ]]; then
+        outcome["$label|$case_id"]=PASS
+      else
+        outcome["$label|$case_id"]=FAIL
+      fi
     else
-      outcome["$label|$case_id"]=FAIL
-      if [[ $records -ne 1 ]]; then
-        printf 'mutation-matrix: %s/%s wrote %s report records (expected 1)\n' \
-          "$label" "$case_id" "$records" >&2
-        tail -40 "$test_log" >&2
+      local records
+      records=$(grep -c "^GV-ESCAPE case=${case_id} " "$report" || true)
+      if [[ $status -eq 0 && $records -eq 1 ]] && \
+        grep -q "^GV-ESCAPE case=${case_id} result=contained " "$report"; then
+        outcome["$label|$case_id"]=PASS
+      else
+        outcome["$label|$case_id"]=FAIL
+        if [[ $records -ne 1 ]]; then
+          printf 'mutation-matrix: %s/%s wrote %s report records (expected 1)\n' \
+            "$label" "$case_id" "$records" >&2
+          tail -40 "$test_log" >&2
+        fi
       fi
     fi
     printf 'mutation-matrix: %-2s / %-28s %s\n' \
       "$label" "$case_id" "${outcome["$label|$case_id"]}"
   done
+
+  # The outcomes and diagnostics now live in shell state and $work_root logs;
+  # retaining a complete target directory per mutant only multiplies disk use.
+  # M12 adds another compiled tree, so release this explicit temporary path as
+  # soon as its row is complete instead of relying solely on the exit trap.
+  rm -rf -- "$tree"
 }
 
 run_one_tree M0
