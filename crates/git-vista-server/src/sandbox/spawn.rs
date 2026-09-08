@@ -42,7 +42,7 @@ use super::{checkout_sandbox_argv, sandbox_argv, CheckoutPolicy, Policy};
 /// Split out from both wrappers so the argv they will run is testable without
 /// spawning anything, and so the two wrappers cannot drift apart in how they
 /// assemble it.
-fn full_argv(policy: &Policy, repo: &Path, args: &[&str]) -> Vec<std::ffi::OsString> {
+pub(crate) fn full_argv(policy: &Policy, repo: &Path, args: &[&str]) -> Vec<std::ffi::OsString> {
     let mut argv = sandbox_argv(policy);
     argv.push(std::ffi::OsString::from("-C"));
     argv.push(repo.as_os_str().to_os_string());
@@ -485,6 +485,7 @@ pub(crate) fn checkout_command_async(
 }
 
 fn command_from_argv(argv: Vec<std::ffi::OsString>) -> SandboxedCommand {
+    let argv = wrap_with_reaper(argv);
     let (program, rest) = split(&argv);
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(rest);
@@ -492,6 +493,62 @@ fn command_from_argv(argv: Vec<std::ffi::OsString>) -> SandboxedCommand {
         cmd.env_remove(var);
     }
     SandboxedCommand(cmd)
+}
+
+/// #728: an abrupt death of the process that spawns `bwrap` must not leave it
+/// reparented and running forever — see `sandbox::reaper`'s module doc for the
+/// full account and ADR 0141 for the design. Layered here, at the one place
+/// pure argv becomes a real process, rather than inside `sandbox_argv` itself:
+/// INV-16's reviewed argv shapes stay exactly what they were before #728,
+/// because the reaper decides how that argv is *launched*, not what it is.
+///
+/// **Scoped to `Tier::Strict` only** — detected structurally, by comparing the
+/// composed program against the resolved `bwrap` path, rather than by
+/// threading a `Tier` through this function (which would need to see through
+/// `CheckoutPolicy`'s private field). `Tier::Network`'s bare shim is
+/// deliberately left unwrapped by this change: it has no pid namespace, so a
+/// `killpg` there is load-bearing for the shim's own descendants in a way this
+/// PR has not built a Network-tier acceptance test for — #757 owns extending
+/// this wrapper there, with that test written first. Never applied to
+/// `Tier::Unsandboxed`'s bare `git` either (INV-16 shapes 1/2): that operation
+/// is already explicit, persisted, operator-trusted content flying a
+/// permanent banner (INV-15).
+///
+/// The caller's own pid is prepended as an explicit argument, **not** left for
+/// the reaper to discover via its own `getppid()` at some uncertain later
+/// time. A self-observed baseline is racy: the OS-level fork that creates the
+/// reaper process happens *before* a single line of the reaper's own code can
+/// run, so if the real caller dies inside that window, the reaper's first
+/// `getppid()` read already reflects the post-reparenting value, and the
+/// reaper would treat an already-orphaned state as normal from the start,
+/// never detecting anything wrong. `std::process::id()`, read here — in the
+/// caller, before the reaper is even spawned — has no such window: this
+/// process trivially knows its own pid before it exists to race against.
+/// `sandbox::lifecycle::a_reaper_process_reaps_a_launcher_orphaned_before_it_ever_ran`
+/// proves this deterministically (a SIGSTOP/SIGCONT fixture that forces the
+/// exact ordering: caller dies, reparenting completes, *then* the reaper's
+/// own code runs for the first time).
+///
+/// A host missing `gv-sandbox-reaper` gets `argv` back unwrapped: exactly the
+/// sandbox it had before #728, no capability lost — see `reaper::reaper_path`
+/// for why that absence is a soft condition, not a policy-construction
+/// failure.
+pub(crate) fn wrap_with_reaper(argv: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let is_strict_bwrap_launch = super::bwrap::bwrap_path()
+        .is_some_and(|bwrap| argv.first().map(|p| p.as_os_str()) == Some(bwrap.as_os_str()));
+    if !is_strict_bwrap_launch {
+        return argv;
+    }
+    match super::reaper::reaper_path() {
+        Some(reaper) => {
+            let mut wrapped = Vec::with_capacity(argv.len() + 2);
+            wrapped.push(reaper.as_os_str().to_os_string());
+            wrapped.push(std::ffi::OsString::from(std::process::id().to_string()));
+            wrapped.extend(argv);
+            wrapped
+        }
+        None => argv,
+    }
 }
 
 #[cfg(test)]
