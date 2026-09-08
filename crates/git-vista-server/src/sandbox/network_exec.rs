@@ -270,9 +270,10 @@ pub(crate) fn network_command_with_credential(
 /// an untrusted-checkout launcher carrying a full environment, because that
 /// value is not constructible.
 ///
-/// What it deliberately keeps is the *policy*: network access, `HookMode::Run`
-/// and filter execution are ADR 0128's deliberate product behaviour and are
-/// unchanged here. This narrows what the child is handed, never what it may do.
+/// What it deliberately keeps is TCP network access, `HookMode::Run` and filter
+/// execution — ADR 0128's product behaviour. #723 now narrows one capability
+/// as well: this sealed path selects the checkout seccomp profile that denies
+/// AF_UNIX while leaving HTTPS available for Git LFS.
 pub(crate) struct UntrustedCheckoutCommand(spawn::SandboxedCommand);
 
 impl UntrustedCheckoutCommand {
@@ -293,9 +294,9 @@ impl UntrustedCheckoutCommand {
 }
 
 /// A Network-tier command for the phase after credential use has ended.
-/// It preserves the normal network, hook, and filter policy while replacing
-/// the child's environment with the allowlisted one
-/// ([`spawn::UNTRUSTED_CHECKOUT_ENV_ALLOWLIST`]).
+/// It preserves TCP, hooks and filters while replacing the child's environment
+/// with the allowlisted one ([`spawn::UNTRUSTED_CHECKOUT_ENV_ALLOWLIST`]) and
+/// selecting the checkout-only AF_UNIX denial.
 ///
 /// The allowlist is applied here rather than left to the caller: this function
 /// is the boundary, and a boundary a caller can decline to cross is not one.
@@ -309,7 +310,11 @@ pub(crate) fn network_command_without_credential(
     repo: &Path,
     args: &[&str],
 ) -> UntrustedCheckoutCommand {
-    UntrustedCheckoutCommand(network_command(&policy.0, repo, args).with_untrusted_checkout_env())
+    let mut full: Vec<&str> = FORCED_NETWORK_ARGS.to_vec();
+    full.extend_from_slice(args);
+    UntrustedCheckoutCommand(
+        spawn::checkout_command_async(policy, repo, &full).with_untrusted_checkout_env(),
+    )
 }
 
 /// Strip `user[:pass]@` userinfo from every `<scheme>://…` URL substring

@@ -203,6 +203,9 @@ struct Args {
     ro_carveouts: Vec<PathBuf>,
     net_ports: Vec<u16>,
     net_allow: Option<bool>,
+    /// Select the checkout-specific seccomp profile: TCP remains governed by
+    /// `net_ports`, while AF_UNIX socket creation is denied (#723).
+    seccomp_checkout: bool,
     hooks_blocked_dir: Option<PathBuf>,
     hooks_seen: bool,
     /// Everything after `--`. Must begin with exactly `git`.
@@ -250,6 +253,7 @@ fn parse() -> Args {
             }
             "--net-allow" => a.net_allow = Some(true),
             "--net-deny" => a.net_allow = Some(false),
+            "--seccomp-checkout" => a.seccomp_checkout = true,
             "--hooks-run" => a.hooks_seen = true,
             "--hooks-blocked" => {
                 a.hooks_seen = true;
@@ -297,6 +301,12 @@ fn validate(a: &Args) {
     };
     if !net_allow && !a.net_ports.is_empty() {
         die(EXIT_ARGV, "--net-port is meaningless with --net-deny");
+    }
+    if !net_allow && a.seccomp_checkout {
+        die(
+            EXIT_ARGV,
+            "--seccomp-checkout requires --net-allow; Strict already denies AF_UNIX",
+        );
     }
     if a.program_args.first().map(String::as_str) != Some("git") {
         die(EXIT_ARGV, "this launcher execs only `git`");
@@ -1019,9 +1029,9 @@ mod seccomp_filter;
 /// image is replaced — and both survive the `execve` because
 /// `PR_SET_NO_NEW_PRIVS` is already set.
 ///
-/// `net` is the tier, derived in `main` from the `--net-deny`/`--net-allow` flag
-/// the launcher already emits. One rule varies with it (AF_UNIX socket creation,
-/// denied in Strict only); everything else is identical in both tiers. See
+/// `net` is the profile derived in `main` from `--net-deny`/`--net-allow` plus
+/// the checkout marker. One rule varies with it (AF_UNIX socket creation,
+/// denied in Strict and checkout); everything else is identical. See
 /// `seccomp_filter::af_unix_rule`.
 fn apply_seccomp(net: seccomp_filter::NetScope) {
     let program = match seccomp_filter::build(net) {
@@ -1042,8 +1052,9 @@ fn main() {
     // catch-all arm is unreachable — and it resolves to the *stronger* filter, so
     // if that ever stops being true the failure is a compatibility complaint and
     // not a silently weaker sandbox.
-    apply_seccomp(match a.net_allow {
-        Some(true) => seccomp_filter::NetScope::Allowed,
+    apply_seccomp(match (a.net_allow, a.seccomp_checkout) {
+        (Some(true), true) => seccomp_filter::NetScope::Checkout,
+        (Some(true), false) => seccomp_filter::NetScope::Allowed,
         _ => seccomp_filter::NetScope::Denied,
     });
 

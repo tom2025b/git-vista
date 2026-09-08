@@ -1,8 +1,8 @@
 # ADR 0137 — An untrusted checkout inherits an allowlist, and the phase that runs attacker code gives up what it does not need
 
-- **Status:** Accepted — implemented, mutation-proved two ways per issue, all four failing differently
+- **Status:** Accepted — #720 implemented the allowlist and phase-specific grants; #723 adds the checkout-only AF_UNIX denial while retaining TCP
 - **Date:** 2026-09-07
-- **Issues:** #702, #704 — one root cause seen from two sides
+- **Issues:** #702, #704, #723 — locator removal and capability denial are separate halves
 - **Extends:** [ADR 0128](0128-a-credential-exists-only-before-untrusted-checkout.md) (the credential boundary this widens from three names to a built environment)
 - **Supersedes in part:** [ADR 0033](0033-ssh-remote-carveout.md) — its safety argument for granting the SSH agent socket and `known_hosts` to `policy_for_clone`. ADR 0033 stands unchanged for `policy_for`.
 - **Related:** [ADR 0028](0028-network-tier-ports-not-hosts.md) (a port grant is not an egress policy — read before believing the port half buys more than it does), [ADR 0122](0122-the-token-is-a-credential-not-a-header.md), [ADR 0123](0123-the-safety-lives-in-the-shape-not-a-list.md)
@@ -132,7 +132,7 @@ checkout time. The withholding is not justified by the phase having no use for
 the capability; it is justified by the phase being the one that runs
 attacker-selected code, which makes the capability unsafe to grant *whether or
 not something legitimate wants it*. The cost of that is real and is accounted
-for under "What this does not close".
+for under "The residual #720 left, and #723 closes".
 
 ## Decision
 
@@ -168,7 +168,8 @@ in the constant's own doc comment:
 - **`SSH_AUTH_SOCK`** — #702's *mechanism*: the variable is how the operator's
   agent becomes reachable in practice, so withholding it is the highest-value
   single line here. It is **not** a fix for #702, which stays open — the
-  capability survives without the locator. See "What this does not close".
+  capability survives without the locator. See "The residual #720 left, and
+  #723 closes".
 - **`GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n`,
   `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`** — these would buy the same config
   parity `HOME` buys, but their payload is an arbitrary string and
@@ -253,6 +254,7 @@ flowchart TD
   K --> K3["port 22 ✗"]
   K --> K4["credential ✗ · env allowlist"]
   K --> K5["RUNS remote-supplied code"]
+  K --> K6["AF_UNIX ✗ · TCP ✓<br/>checkout seccomp profile"]
   R -.->|"process exits;<br/>ADR 0128's boundary"| K
 ```
 
@@ -261,9 +263,9 @@ and the section above shows why. `policy_for_clone_checkout` is that policy
 minus three things: the `$SSH_AUTH_SOCK` `rw_trees` grant, the
 `~/.ssh/known_hosts` carve-out, and port 22 (`CLONE_CHECKOUT_PORTS`).
 
-Network access, `HookMode::Run` and filter execution are **unchanged in both**.
-ADR 0128 kept them deliberately and this narrows what the second process is
-handed, never what it may do.
+TCP access, `HookMode::Run` and filter execution remain in both. ADR 0128 kept
+them deliberately. The checkout now differs at seccomp too: AF_UNIX is denied
+without taking away the TCP used by HTTPS Git LFS.
 
 **"The transfer runs no attacker code" is narrower than it sounds, and the
 distinction the split rests on is authorship, not data.** `--no-checkout` stops
@@ -289,11 +291,10 @@ user whose `~/.ssh/known_hosts` is a symlink had checkout refused outright by
 **Honest ordering of what closes what.** ADR 0033 §3 measured — and this change
 re-read rather than assumed — that the `rw_trees` agent-socket grant is **inert
 on this kernel**: Landlock ABI 8 does not mediate pathname `AF_UNIX` sockets,
-and `ssh_remote.rs`'s own live test still proves it. So §1's allowlist is the
-load-bearing half of #702. §3 contributes three other things: the argv stops
-advertising a grant the process must not have (ADR 0033's D5 Option B
-auditability), the grant cannot silently become load-bearing again under a
-future ABI, and port 22 is no longer reachable.
+and `ssh_remote.rs`'s own live test still proves it. #720's allowlist removed the
+usual locator; #723 removes the capability even when a hook recovers that
+locator itself. The grant changes still make the argv honest, prevent a future
+Landlock ABI from silently re-arming the checkout, and remove port 22.
 
 ## Rejected alternatives
 
@@ -313,9 +314,9 @@ filter is a legitimate checkout-time network consumer.
 An earlier draft of this paragraph called that residual "already unreachable",
 which contradicted this ADR's own limits section three pages later and was the
 weaker of the two statements. It is struck. The residual is **reachable** — see
-"What this does not close" — and the reason not to move checkout to Strict is
-that it costs a working product feature, not that there is nothing left to gain.
-#723 buys the same ground without that cost.
+"The residual #720 left, and #723 closes" — and the reason not to move checkout
+to Strict is that it costs a working product feature, not that there is nothing
+left to gain. #723 now buys the same ground without that cost.
 
 ### Keep `known_hosts` because it is only public key material
 
@@ -344,7 +345,8 @@ that builds the environment.
   rather than the server's whole environment. This is a real behaviour change
   and the intended one: the boundary cannot distinguish the operator's hook from
   the remote's, because at checkout time the remote chose which file runs.
-- **#702 stays open — see "What this does not close" below.**
+- **#723 supplies the remaining technical half of #702.** The coordinator, not
+  this change, decides when to close the parent issue.
 - **A proxied or custom-CA `git-lfs` smudge filter fails at checkout.**
   `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`, `SSL_CERT_FILE` and `SSL_CERT_DIR`
   are **not** allowlisted, and networked filters commonly need them — which sits
@@ -369,16 +371,16 @@ that builds the environment.
   said nothing about its shape recommends a second caller; there is now one
   fewer, not one more.
 
-## What this does not close
+## The residual #720 left, and #723 closes
 
-**#702 is not closed by this ADR.** The allowlist withholds the agent socket's
-*locator*; it does not deny the *capability*.
+The allowlist withholds the agent socket's *locator*; by itself it does not deny
+the *capability*. That was the residual #720 deliberately left for #723.
 
-`seccomp_filter::af_unix_rule` denies `AF_UNIX` in the **Strict** tier only, and
-Landlock does not mediate pathname `AF_UNIX` `connect()` at all (ADR 0033 §3).
-So a hook that recovers a socket path can set `SSH_AUTH_SOCK` itself and
-connect. Recovery does not need enumeration, which is where this ADR's first
-draft went wrong:
+Before #723, `seccomp_filter::af_unix_rule` denied `AF_UNIX` in the **Strict**
+tier only, and Landlock did not mediate pathname `AF_UNIX` `connect()` at all
+(ADR 0033 §3). So a hook that recovered a socket path could set
+`SSH_AUTH_SOCK` itself and connect. Recovery does not need enumeration, which is
+where this ADR's first draft went wrong:
 
 - `$HOME` is both read-granted and allowlisted, and `~/.keychain/<host>-sh` — an
   ordinary, common tool — contains the literal line
@@ -394,9 +396,17 @@ flowchart TD
   H["post-checkout hook<br/>attacker-chosen"] --> R["read ~/.keychain/host-sh<br/>HOME is granted AND allowlisted"]
   R --> P["a literal socket path"]
   P --> S["set SSH_AUTH_SOCK itself"]
-  S --> C["connect() — unmediated<br/>Landlock scopes ABSTRACT sockets only<br/>seccomp denies AF_UNIX in STRICT only"]
-  C --> X["sign, exfiltrate over 443"]
+  S --> C["connect() — EPERM<br/>checkout seccomp denies AF_UNIX"]
+  C -.-> X["agent protocol never reached<br/>TCP 443 remains for HTTPS LFS"]
 ```
+
+#723 adds a third seccomp profile selected only by `CheckoutPolicy`'s sealed
+spawn path. The launcher emits `--net-allow --seccomp-checkout`; the shim keeps
+Landlock's checkout TCP port rules, but installs the same argument-scoped
+`socket(AF_UNIX)` / `socketpair(AF_UNIX)` denial Strict uses. The ordinary
+Network profile is unchanged, so the credentialed transfer can still use an
+SSH agent. Moving checkout to Strict remains rejected: it would also remove TCP
+and break HTTPS LFS.
 
 ### An SSH-resolving Git LFS endpoint fails the clone outright, deliberately
 
@@ -456,20 +466,30 @@ Option 1 is the better answer and the larger piece of work. Neither is in scope
 here; both are named so the next person starts from an accurate statement of
 what is left.
 
-Closing it needs a checkout-specific seccomp mode denying pathname `AF_UNIX`
-while keeping TCP for LFS — `bin/gv-sandbox/seccomp_filter.rs`, tracked as
-**#723**. It does *not* require moving checkout to the Strict tier.
-
-What this ADR buys against that path is real but partial: the common case, where
-the variable is simply inherited, is closed; the argv no longer advertises a
-grant the process must not have; and the grant cannot become load-bearing again
-under a future Landlock ABI.
+The checkout-specific seccomp mode is the #723 change. It closes the recovered
+pathname route while preserving the earlier gains: the common inherited-variable
+case remains closed, the argv advertises no agent grant, and ordinary transfer
+still retains its SSH support.
 
 ## Proof
 
 Both acceptance criteria are dynamic and both run against compiled, host-native
 code — no `cfg`-gated arm, so nothing here reports green over its own absence.
 
+- **`sandbox::checkout_security::a_fetched_hook_that_self_sets_ssh_auth_sock_cannot_connect_but_tcp_survives`**
+  performs a real no-checkout clone of a repository containing a tracked
+  `post-checkout` hook. The parent has no `SSH_AUTH_SOCK`; the hook sources the
+  literal pathname from `$HOME/.keychain/fixture-sh`, exports the variable
+  itself, then attempts both connections under the real composed launcher. TCP
+  reaches a listener on the production-granted port 9418, while AF_UNIX returns
+  `EPERM`. The assertion includes the exact pathname read from `$HOME`, so an
+  absent environment variable cannot satisfy it.
+- **`seccomp_filter::tests::af_unix_is_denied_in_strict_and_checkout_but_left_alone_in_network`**
+  pins all three compiled profiles: Strict and checkout carry one
+  argument-scoped rule on each socket syscall, while ordinary Network carries
+  neither. `sandbox::argv::only_the_clone_checkout_phase_gives_up_the_188_grants`
+  separately proves only checkout emits `--seccomp-checkout`, retains port 443,
+  and leaves the transfer marker-free.
 - **`handlers::clone::clone_checkout_runs_the_hook_with_only_an_allowlisted_environment`**
   is #680's canary widened. It builds a source repository with a tracked
   executable `hooks/post-checkout`, performs the credentialed `--no-checkout`
@@ -559,9 +579,11 @@ git-vista-server --bins` once in the worktree first; it cannot go inside
   `UNTRUSTED_CHECKOUT_ENV_ALLOWLIST`, `untrusted_checkout_env`,
   `with_untrusted_checkout_env`; `without_credential_env` deleted.
 - `crates/git-vista-server/src/sandbox/network_exec.rs` —
-  `UntrustedCheckoutCommand`; `network_command_without_credential` retyped.
+  `UntrustedCheckoutCommand`; `network_command_without_credential` retyped and
+  routed through the checkout spawn seam.
 - `crates/git-vista-server/src/sandbox/mod.rs` — `CLONE_CHECKOUT_PORTS`;
-  `policy_for_clone_checkout` and the `CheckoutPolicy` newtype;
+  `policy_for_clone_checkout`, the `CheckoutPolicy` newtype, and its distinct
+  launcher argv;
   `policy_for_clone` left carrying all of #188, with the doc comment recording
   why the first attempt to narrow it was a regression.
 - `crates/git-vista-server/src/sandbox/test_env.rs` — new: the crate's one
@@ -569,6 +591,10 @@ git-vista-server --bins` once in the worktree first; it cannot go inside
 - `crates/git-vista-server/src/sandbox/argv.rs` — `with_ssh_auth_sock` retargeted
   onto `test_env`; `policy_for_clone_carries_both_188_grants` replaced by its
   inversion.
+- `crates/git-vista-server/src/sandbox/checkout_security.rs` — the composed
+  fetched-hook AF_UNIX denial and TCP-positive proof.
+- `crates/git-vista-server/src/bin/gv-sandbox/{main.rs,seccomp_filter.rs}` — the
+  checkout flag, profile selection, and argument-scoped AF_UNIX rules.
 - `crates/git-vista-server/src/handlers/clone.rs` — the widened spawn proof; the
   two `.map(redact_output)` call sites removed as now-carried by the type.
 - `docs/adr/0137-*.md` and its rendered PDF in `docs/adr/pdf/`.
