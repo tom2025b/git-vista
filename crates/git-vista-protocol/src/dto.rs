@@ -474,9 +474,48 @@ pub struct PushRequest {
 /// ever reaches an argv — never absolute, never carrying a `..` component,
 /// never option-shaped. Shared by both endpoints because the request shape
 /// is identical; the two `GitOperation` variants it builds into are not (#71).
+///
+/// # `repo` — the repository this path list was derived from (#721, ADR 0140)
+///
+/// A path list is only meaningful against the repository it was read out of.
+/// Without `repo` the server can re-derive each path's tracked/untracked
+/// state against whatever repository is selected *now* — which is what
+/// `planner::verify_path_states` does — but it cannot ask the one question
+/// that matters: *is this the repository the list came from?* That recheck is
+/// a **conditional path-state recheck**, not general stale-reply protection:
+/// a path name that collides and is dirty in the live repository too passes
+/// it unchanged. `Cargo.lock` carried from a sibling worktree is the ordinary
+/// case, not a contrived one.
+///
+/// Carrying the id closes that by identity instead of by coincidence. When it
+/// is present and names a worktree other than the one this request will act
+/// on, the server refuses with `412 Precondition Failed` — deliberately a
+/// different answer from the `409 Conflict` a drifted path earns, because
+/// "you are aiming at a different repository" and "the thing you were shown
+/// has changed" are different events.
+///
+/// # Why it is `Option`, and what has to happen before it stops being one
+///
+/// [`ResolveConflictRequest`] below makes its own `repo` **required** (#621,
+/// ADR 0109), and that is the right end state here too. This field is
+/// optional only because the browser client cannot yet supply it: the path
+/// list travels from the status reading through a pending-operation carrier
+/// that has no room for the scope, so making the field required today would
+/// refuse every discard the shipped UI sends. Absent therefore still means
+/// "act on the current selection", exactly as before this field existed.
+///
+/// That is a documented gap, not a design: an omitted selector buys none of
+/// the protection above. Making it required is the second half of #721 and is
+/// tracked as its own change, because it lands with the client callers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorktreePathsRequest {
+    /// Opaque worktree id — the same id the `?repo=` selector on
+    /// `GET /api/status/v2` was read with. Never a filesystem path: the
+    /// server resolves it against its own catalog and refuses anything that
+    /// is not a registered id.
+    #[serde(default)]
+    pub repo: Option<String>,
     pub paths: Vec<String>,
 }
 
@@ -2139,6 +2178,7 @@ mod tests {
     #[test]
     fn worktree_paths_request_roundtrips_and_rejects_unknown_fields() {
         let req = WorktreePathsRequest {
+            repo: Some("11111111-1111-5111-8111-111111111111".into()),
             paths: vec!["a.txt".into(), "dir/b.txt".into()],
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -2146,10 +2186,37 @@ mod tests {
             serde_json::from_str::<WorktreePathsRequest>(&json).unwrap(),
             req
         );
+        // `repo` was itself the unknown field this assertion used to be
+        // written with (#219 shipped a body of `paths` alone). #721 made it a
+        // real field, so the unknown-field guard needs a name that is still
+        // not one — otherwise this test would keep passing while asserting
+        // nothing about a shape the wire now accepts.
         assert!(serde_json::from_str::<WorktreePathsRequest>(
-            r#"{"paths":["a.txt"],"repo":"/etc"}"#
+            r#"{"paths":["a.txt"],"force":true}"#
         )
         .is_err());
+    }
+
+    /// #721: an omitted `repo` is still a legal body — the shipped browser
+    /// client does not yet send one, and refusing it here would refuse every
+    /// discard the UI makes. What an absent selector costs is the server's
+    /// business (see the type's doc comment), not the wire's.
+    #[test]
+    fn a_worktree_paths_request_may_omit_its_repository_but_never_smuggles_a_path() {
+        let unscoped: WorktreePathsRequest =
+            serde_json::from_str(r#"{"paths":["a.txt"]}"#).expect("an absent repo is legal");
+        assert_eq!(unscoped.repo, None);
+        // A selector that is a *path* deserializes — `repo` is a `String`
+        // here, exactly as `ResolveConflictRequest`'s is — and is refused by
+        // the handler, which resolves it against the catalog rather than the
+        // filesystem. Pinned so the wire's leniency is a stated fact and not
+        // an assumption: `handlers::discard`'s
+        // `a_repository_selector_that_is_a_path_is_a_wire_error` is the other
+        // half, and one without the other would be half a claim.
+        let pathy: WorktreePathsRequest =
+            serde_json::from_str(r#"{"repo":"/etc","paths":["a.txt"]}"#)
+                .expect("the wire does not judge the id's meaning");
+        assert_eq!(pathy.repo.as_deref(), Some("/etc"));
     }
 
     /// M2.21d (#238). The load-bearing half is the last assertion: the wire
