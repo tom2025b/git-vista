@@ -48,6 +48,10 @@ pub(crate) mod network_exec;
 /// [`probe::ProbeVerdict`], gating server startup (INV-13 / Global
 /// Constraint 15). See its own module doc for the full account.
 pub(crate) mod probe;
+/// #728: locating the `gv-sandbox-reaper` binary. A third impure corner, but
+/// unlike `bwrap`/`shim` its absence degrades quietly rather than refusing the
+/// operation — see the module doc.
+pub(crate) mod reaper;
 /// D2 (#66, Task 7): validated repository-metadata resolution — resolves a
 /// repository's actual git directory(ies) and refuses when that resolution
 /// lands outside the server's managed root. See its module doc for how this
@@ -59,6 +63,9 @@ pub(crate) mod repo_paths;
 pub(crate) mod shim;
 /// Task 5: the two spawn wrappers. The single chokepoint where the pure argv
 /// becomes a real git process. Task 6 migrates the server's spawn sites here.
+/// #728 adds the reaper wrap here, not in `sandbox_argv`, so INV-16's reviewed
+/// argv shapes are untouched — the reaper is how that argv is *launched*, not
+/// part of the argv itself.
 pub(crate) mod spawn;
 /// Task 7: the persisted per-repo trust flag — the only route to `Unsandboxed`.
 pub(crate) mod trust;
