@@ -102,37 +102,120 @@ mod tests {
     use git_vista_fixtures::{git, seeded};
     use git_vista_protocol::FetchError;
 
-    /// A real configured local remote whose upload-pack reports an over-cap
-    /// failure. The script sits inside the served repository so the remote
-    /// sandbox can read it without widening the grant.
-    fn repo_with_oversized_fetch_failure() -> (tempfile::TempDir, std::path::PathBuf) {
-        let (dir, repo) = seeded();
-        let remote = repo.join("upstream.git");
-        std::fs::create_dir_all(&remote).unwrap();
-        git::run(&remote, &["init", "-q", "--bare", "-b", "main"]);
-        git::run(
-            &repo,
-            &["remote", "add", "origin", &remote.display().to_string()],
-        );
+    /// Keeps the repository and its one-shot real git-protocol peer alive for
+    /// the endpoint test. The port claim remains held until the listener has
+    /// stopped, including when the test unwinds.
+    struct OversizedFetchFailure {
+        _dir: tempfile::TempDir,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        peer: Option<std::thread::JoinHandle<()>>,
+        _claim: crate::test_ports::PortClaim,
+    }
 
-        let script = repo.join("oversized-upload-pack.sh");
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\nprintf '%s' '{}' >&2\nexit 3\n",
-                "x".repeat(crate::middleware::MAX_ERROR_BODY + 8 * 1024)
-            ),
+    impl Drop for OversizedFetchFailure {
+        fn drop(&mut self) {
+            use std::sync::atomic::Ordering;
+
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = std::net::TcpStream::connect(("127.0.0.1", crate::test_ports::PortClaim::PORT));
+            if let Some(peer) = self.peer.take() {
+                let _ = peer.join();
+            }
+        }
+    }
+
+    /// A real `git://` peer whose protocol-level progress followed by a fatal
+    /// sideband is large enough to put the endpoint's typed failure body past
+    /// the middleware cap.
+    /// This must not use `remote.origin.uploadpack`: #755 intentionally makes
+    /// that repository-controlled executable inert in the Network spawn.
+    fn repo_with_oversized_fetch_failure() -> (OversizedFetchFailure, std::path::PathBuf) {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (dir, repo) = seeded();
+        let claim = crate::test_ports::PortClaim::acquire();
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", crate::test_ports::PortClaim::PORT))
+                .expect("the port claim guarantees the git-protocol port is free");
+        listener
+            .set_nonblocking(true)
+            .expect("the oversized-error peer can be nonblocking");
+
+        let pkt = |payload: &[u8]| {
+            let mut packet = format!("{:04x}", payload.len() + 4).into_bytes();
+            packet.extend_from_slice(payload);
+            packet
+        };
+        let oid = "1111111111111111111111111111111111111111";
+        let head = pkt(format!(
+            "{oid} HEAD\0multi_ack_detailed side-band-64k thin-pack ofs-delta \
+                 symref=HEAD:refs/heads/main agent=gv-test\n"
         )
-        .unwrap();
-        git::run(
-            &repo,
-            &[
-                "config",
-                "remote.origin.uploadpack",
-                &format!("sh {}", script.display()),
-            ],
+        .as_bytes());
+        let main = pkt(format!("{oid} refs/heads/main\n").as_bytes());
+        let nak = pkt(b"NAK\n");
+        let mut progress_payload = vec![2];
+        progress_payload.extend(std::iter::repeat_n(b'x', 24 * 1024));
+        progress_payload.push(b'\n');
+        let progress = pkt(&progress_payload);
+        let fatal = pkt(b"\x03fixture remote stopped after oversized progress\n");
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let peer_stop = std::sync::Arc::clone(&stop);
+        let peer = std::thread::spawn(move || {
+            while !peer_stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                        let mut request = [0u8; 4096];
+                        // The git:// client speaks first with its service/path
+                        // request. Do not close while that write is in flight:
+                        // doing so tests a local BrokenPipe, not the peer's
+                        // protocol response.
+                        let _ = stream.read(&mut request);
+                        let _ = stream.write_all(&head);
+                        let _ = stream.write_all(&main);
+                        let _ = stream.write_all(b"0000");
+                        // Drain the client's want/done negotiation before
+                        // answering NAK + sidebands for the pack phase.
+                        loop {
+                            match stream.read(&mut request) {
+                                Ok(0) => return,
+                                Ok(n) if request[..n].windows(5).any(|w| w == b"done\n") => break,
+                                Ok(_) => {}
+                                Err(_) => break,
+                            }
+                        }
+                        let _ = stream.write_all(&nak);
+                        for _ in 0..3 {
+                            let _ = stream.write_all(&progress);
+                        }
+                        let _ = stream.write_all(&fatal);
+                        let _ = stream.write_all(b"0000");
+                        return;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let remote = format!(
+            "git://127.0.0.1:{}/oversized.git",
+            crate::test_ports::PortClaim::PORT
         );
-        (dir, repo)
+        git::run(&repo, &["remote", "add", "origin", &remote]);
+        (
+            OversizedFetchFailure {
+                _dir: dir,
+                stop,
+                peer: Some(peer),
+                _claim: claim,
+            },
+            repo,
+        )
     }
 
     /// Every refusal the shape gate makes is parseable as the endpoint's one
