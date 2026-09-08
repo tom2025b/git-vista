@@ -35,6 +35,7 @@ const BADGE_CHAR_W: i32 = 7;
 const BADGE_PAD_X: i32 = 6;
 // The meta line is 11px. Round its roughly 0.75em ascender up, then keep a
 // separate whole-pixel cushion so font-specific metrics cannot meet the pill.
+// Four pixels, rather than one, leave room for whole-pixel font-metric rounding.
 const META_TEXT_ASCENT_CEIL: i32 = 9;
 const BADGE_META_CLEARANCE: i32 = 4;
 
