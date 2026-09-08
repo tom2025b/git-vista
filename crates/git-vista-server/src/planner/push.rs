@@ -378,7 +378,7 @@ pub(super) async fn exec_push(
     }
 
     // --- 2. the baseline ----------------------------------------------------
-    let before = match remote_tracking_refs(repo, need, remote).await {
+    let before = match remote_tracking_refs(repo, remote).await {
         Ok(refs) => refs,
         Err(why) => {
             return couldnt_run(
@@ -427,7 +427,7 @@ pub(super) async fn exec_push(
     };
 
     // --- 5. what the repository says happened -------------------------------
-    let after = match remote_tracking_refs(repo, need, remote).await {
+    let after = match remote_tracking_refs(repo, remote).await {
         Ok(refs) => refs,
         Err(why) => {
             journal_unobserved(repo, branch, remote, &why).await;

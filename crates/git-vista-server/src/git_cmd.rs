@@ -210,6 +210,49 @@ impl std::fmt::Display for ExecUnavailable {
 
 impl std::error::Error for ExecUnavailable {}
 
+// #753: a per-thread env override for tests, applied to every
+// `sandboxed`-built command on the thread that set it.
+//
+// Exists so a test can drive a real, unmodified production caller (e.g.
+// `planner::transfer::remote_tracking_refs`) and still substitute a fake
+// `git` on `PATH` for the one spawn it makes — without a process-global
+// `std::env::set_var` (which would race any other test thread's real
+// `git` spawn) and without a new process-spawn site (a self-reexec
+// `Command::new`, which `argv_boundary.rs`'s census would correctly flag
+// as unreviewed).
+//
+// `thread_local`, for the same reason `planner.rs`'s
+// `HOOKED_GIT_TIMEOUT_OVERRIDE` is: a `#[tokio::test]`'s default
+// current-thread runtime keeps a test's entire future tree — every
+// `.await`, transitively, including everything `remote_tracking_refs`
+// calls into — on the one OS thread that set the override, so it can
+// never leak into or be raced by another test running concurrently on a
+// different thread under `cargo test`'s default parallel-threads-one-
+// process model. Every test that uses this must stay on that default
+// current-thread `#[tokio::test]` flavor; none do at time of writing.
+#[cfg(test)]
+thread_local! {
+    static TEST_ENV_OVERRIDE: std::cell::RefCell<Option<Vec<(String, String)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only: install this thread's [`TEST_ENV_OVERRIDE`]. Pair with
+/// [`clear_test_env_override`] — a test that forgets to clear it leaves the
+/// override live for whatever this OS thread's test harness reuses the
+/// thread for next, which is why callers should install it through an RAII
+/// guard rather than calling this directly.
+#[cfg(test)]
+pub(crate) fn set_test_env_override(profile: Vec<(String, String)>) {
+    TEST_ENV_OVERRIDE.with(|c| *c.borrow_mut() = Some(profile));
+}
+
+/// Test-only: clear this thread's [`TEST_ENV_OVERRIDE`]. See that constant's
+/// doc.
+#[cfg(test)]
+pub(crate) fn clear_test_env_override() {
+    TEST_ENV_OVERRIDE.with(|c| *c.borrow_mut() = None);
+}
+
 /// # `NetworkNeed::Remote` goes through the #228 askpass-hardening harness
 ///
 /// A `Remote`-declared spawn is built via
@@ -230,11 +273,21 @@ fn sandboxed(
     let read_only = crate::state::read_only_for_path(repo);
     let need = crate::sandbox::reconcile_need(declared, args);
     let policy = crate::sandbox::policy_for(repo, read_only, need).map_err(|e| e.to_string())?;
-    Ok(if need == crate::sandbox::NetworkNeed::Remote {
+    let cmd = if need == crate::sandbox::NetworkNeed::Remote {
         crate::sandbox::network_exec::network_command(&policy, repo, args)
     } else {
         crate::sandbox::spawn::command_async(&policy, repo, args)
-    })
+    };
+    // #753: see `TEST_ENV_OVERRIDE`'s doc. Compiled out entirely in
+    // non-test builds, so production's spawn is exactly the `cmd` above —
+    // this can only ever apply inside `cargo test`, on a thread a test
+    // itself opted in.
+    #[cfg(test)]
+    let cmd = match TEST_ENV_OVERRIDE.with(|c| c.borrow().clone()) {
+        Some(profile) => cmd.pinned_env_for_test(&profile),
+        None => cmd,
+    };
+    Ok(cmd)
 }
 
 /// [`sandboxed`] plus **one** extra read-write grant.
