@@ -1379,9 +1379,15 @@ mod tests {
         );
     }
 
-    /// Every other way the panel's reply can fail to describe the live frame,
-    /// checked at the two consumers that reach a write rather than only at the
-    /// reading.
+    /// Every other way the panel's reply can fail to describe the live frame.
+    ///
+    /// The loop asserts only the refusal. Asking a refused reading for its
+    /// conflicted count or its push preview would assert nothing about this
+    /// function — `None` answers both by construction, which is the inert
+    /// shape #741 has just finished clearing out of this file. The claim that
+    /// those two consumers really do go quiet is carried where it is not
+    /// free: the positive control below, and
+    /// `moving_the_selection_between_read_and_render_empties_the_activity_panel`.
     ///
     /// `mixed_worktree()` carries a conflicted path — the one card that opens
     /// something — as well as staged, unstaged and untracked changes, so every
@@ -1391,50 +1397,44 @@ mod tests {
     #[test]
     fn only_a_reply_matching_the_live_frame_reaches_the_activity_panel() {
         let m = mixed_worktree;
-        let cases: Vec<(&str, Option<(WorktreeStatus, StatusSections)>)> = vec![
-            (
-                "stale epoch",
-                panel_worktree_reading(false, v2_reply(3, "a", m()), 4, Some("a")),
-            ),
+        type Reply = Option<(u64, Option<String>, Option<WorktreeStatus>)>;
+        let cases: Vec<(&str, bool, Reply, u64, Option<&str>)> = vec![
+            ("stale epoch", false, v2_reply(3, "a", m()), 4, Some("a")),
             (
                 "stale repository",
-                panel_worktree_reading(false, v2_reply(4, "b", m()), 4, Some("a")),
+                false,
+                v2_reply(4, "b", m()),
+                4,
+                Some("a"),
             ),
-            (
-                "still loading",
-                panel_worktree_reading(true, v2_reply(4, "a", m()), 4, Some("a")),
-            ),
-            (
-                "no accepted frame",
-                panel_worktree_reading(false, v2_reply(4, "a", m()), 4, None),
-            ),
+            ("still loading", true, v2_reply(4, "a", m()), 4, Some("a")),
+            ("no accepted frame", false, v2_reply(4, "a", m()), 4, None),
             (
                 "fetch failed",
-                panel_worktree_reading(false, Some((4, Some("a".to_string()), None)), 4, Some("a")),
+                false,
+                Some((4, Some("a".to_string()), None)),
+                4,
+                Some("a"),
             ),
-            (
-                "never fetched",
-                panel_worktree_reading(false, None, 4, Some("a")),
-            ),
+            ("never fetched", false, None, 4, Some("a")),
         ];
-        for (name, drawn) in cases {
-            assert!(drawn.is_none(), "{name} reached the panel");
-            assert_eq!(
-                drawn
-                    .as_ref()
-                    .map(|(_, s)| s.count(StatusSection::Conflicted))
-                    .unwrap_or(0),
-                0,
-                "{name} put an openable conflicted card on screen"
-            );
+        for (name, loading, reply, epoch, repo) in cases {
             assert!(
-                !drawn
-                    .as_ref()
-                    .map(|(_, s)| push_preview(s, false, true).may_push())
-                    .unwrap_or(false),
-                "{name} offered a stash push it could not describe"
+                panel_worktree_reading(loading, reply, epoch, repo).is_none(),
+                "{name} reached the panel"
             );
         }
+
+        // The positive control, and the only place the two write-reaching
+        // consumers can be asserted without asserting them of `None`: the same
+        // fixture, resolved against the frame it was read for, really does put
+        // an openable conflicted card on screen and really does offer a push.
+        // Without this every refusal above would hold on a gate that refused
+        // everything, and the panel would simply never render.
+        let (_, sections) = panel_worktree_reading(false, v2_reply(4, "a", m()), 4, Some("a"))
+            .expect("a reply matching the live frame is what the panel draws");
+        assert_eq!(sections.count(StatusSection::Conflicted), 1);
+        assert!(push_preview(&sections, false, true).may_push());
     }
 
     /// The server cannot stand in for this gate, and the comment in
