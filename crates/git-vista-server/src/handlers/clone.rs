@@ -154,11 +154,27 @@ fn clone_checkout_args() -> [&'static str; 2] {
 }
 
 /// Fetch objects and refs while the credential exists, then let that process
-/// exit before materialising attacker-chosen files. The second phase keeps the
-/// clone policy's network access, hooks, and filters, but explicitly removes
-/// every credential-bearing environment variable.
+/// exit before materialising attacker-chosen files.
+///
+/// **Two policies, not one.** ADR 0128 split clone into two processes and gave
+/// both the same `Policy`; #702 finishes that split. `policy` is the transfer's
+/// — credentialed, running no attacker code, and keeping #188's SSH grants
+/// because `url.<base>.insteadOf` can legitimately turn an accepted HTTPS URL
+/// into an SSH clone. `checkout_policy` is
+/// `sandbox::policy_for_clone_checkout`: the same policy without the agent
+/// socket, the `known_hosts` carve-out, or port 22, for the process that runs
+/// attacker-selected hooks and filters. Network, `HookMode::Run` and filters
+/// are unchanged in both — this narrows what the second process is handed,
+/// never what it may do.
+///
+/// The second phase also receives an environment **built by allowlist** rather
+/// than one with credential names removed from it (#704), so a secret nobody
+/// enumerated is absent by construction. Its redaction is carried by
+/// `network_exec::UntrustedCheckoutCommand` rather than by each call site here
+/// remembering `redact_output`.
 async fn execute_clone(
     policy: &crate::sandbox::Policy,
+    checkout_policy: &crate::sandbox::CheckoutPolicy,
     root: &Path,
     dest: &Path,
     url: &str,
@@ -179,16 +195,27 @@ async fn execute_clone(
     // `git clone` succeeds for an empty repository. Its symbolic HEAD has no
     // target to check out, so preserve that behaviour instead of turning the
     // split phase into a failure for an otherwise-valid empty remote.
-    let head = crate::sandbox::network_exec::network_command_without_credential(
-        policy,
-        dest,
-        &["show-ref", "--verify", "--quiet", "HEAD"],
-    )
-    .kill_on_drop(true)
-    .output()
-    .await
-    .map(crate::sandbox::network_exec::redact_output)
-    .map_err(CloneExecutionError::CouldntRun)?;
+    // The two `UntrustedCheckoutCommand` annotations below are load-bearing,
+    // not decoration. codex-daybreak defeated an earlier source-level version
+    // of this guarantee by aliasing — `use network_exec::network_command as
+    // network_command_without_credential` — which satisfies any scan looking
+    // for the name while returning a runnable command carrying the server's
+    // whole inherited environment. Naming the type makes that a compile error:
+    // `network_command` returns `SandboxedCommand`, and only
+    // `network_command_without_credential` yields this type. Together with
+    // `checkout_policy`'s own type, both demonstrated defeats now fail to
+    // build rather than failing a string match.
+    let head_command: crate::sandbox::network_exec::UntrustedCheckoutCommand =
+        crate::sandbox::network_exec::network_command_without_credential(
+            checkout_policy,
+            dest,
+            &["show-ref", "--verify", "--quiet", "HEAD"],
+        );
+    let head = head_command
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(CloneExecutionError::CouldntRun)?;
     if head.status.code() == Some(1) {
         return Ok(());
     }
@@ -196,16 +223,17 @@ async fn execute_clone(
         return Err(CloneExecutionError::GitFailed(head));
     }
 
-    let checkout = crate::sandbox::network_exec::network_command_without_credential(
-        policy,
-        dest,
-        &clone_checkout_args(),
-    )
-    .kill_on_drop(true)
-    .output()
-    .await
-    .map(crate::sandbox::network_exec::redact_output)
-    .map_err(CloneExecutionError::CouldntRun)?;
+    let checkout_command: crate::sandbox::network_exec::UntrustedCheckoutCommand =
+        crate::sandbox::network_exec::network_command_without_credential(
+            checkout_policy,
+            dest,
+            &clone_checkout_args(),
+        );
+    let checkout = checkout_command
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(CloneExecutionError::CouldntRun)?;
     if !checkout.status.success() {
         return Err(CloneExecutionError::GitFailed(checkout));
     }
@@ -803,7 +831,24 @@ async fn run_clone(req: CloneRequest) -> Result<Json<RepositoryDescriptor>, (Sta
             // below has already removed. The orphan outlives the request that
             // authorised it, which is precisely what this milestone's process
             // lifecycle work (INV-8) exists to prevent.
-            let execution = execute_clone(&policy, &root, &dest, &url, token.as_deref());
+            let checkout_policy = match crate::sandbox::policy_for_clone_checkout(&root) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("git-vista: /api/clone couldn't build a checkout policy: {e}");
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Couldn't prepare the sandbox for checkout: {e}"),
+                    ));
+                }
+            };
+            let execution = execute_clone(
+                &policy,
+                &checkout_policy,
+                &root,
+                &dest,
+                &url,
+                token.as_deref(),
+            );
             match run_guarded(&dest, CLONE_TIMEOUT, execution).await {
                 Ok(()) => {}
                 Err(GuardedOutcome::Failed(error)) => {
@@ -1127,8 +1172,40 @@ mod tests {
     /// transfer leaves the worktree empty; the later checkout still runs the
     /// attacker-selected hook, but only after the token-bearing process has
     /// exited and every credential environment name has been removed.
+    /// #680's canary, widened to #702 and #704's claim: the untrusted checkout
+    /// child's environment is **built**, not filtered.
+    ///
+    /// # Why the old assertion could not have caught #704
+    ///
+    /// This test used to read `"unset|unset|unset"` — the three names ADR 0128
+    /// enumerated. A denylist and an allowlist are indistinguishable on those
+    /// three, so the assertion passed identically whether every other secret
+    /// in the operator's environment reached the hook or not. It did. The two
+    /// new legs are what separate the mechanisms: `SSH_AUTH_SOCK` (#702, the
+    /// operator's live agent socket) and a canary under a name this crate
+    /// mentions nowhere except here (#704, "a credential nobody enumerated").
+    ///
+    /// # The paired positives, and why there are two kinds
+    ///
+    /// An environment that is simply *empty* would satisfy every "must be
+    /// absent" leg and produce a checkout that cannot run at all. So the hook
+    /// also reports `PATH` and `HOME`, and the pre-existing legs — that the
+    /// hook ran at all, and that the credentialed phase did not run it —
+    /// remain. And the premise is asserted rather than assumed: the canary and
+    /// the socket are checked *present in this process* at the moment the
+    /// command is composed, so "the hook saw `unset`" cannot be satisfied by
+    /// the test having failed to set them.
+    ///
+    /// # Why the variables are set around composition, not around the spawn
+    ///
+    /// `spawn::with_untrusted_checkout_env` reads `std::env::vars_os()` when
+    /// the command is *built*; the composed `Command` carries its own
+    /// environment overrides from then on. So the process-wide mutation is
+    /// held for microseconds inside `sandbox::test_env::with_env`'s guard and
+    /// never across an `.await` — see that module's doc for the whole
+    /// discipline.
     #[tokio::test]
-    async fn clone_checkout_runs_the_hook_without_any_credential_environment() {
+    async fn clone_checkout_runs_the_hook_with_only_an_allowlisted_environment() {
         use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
 
@@ -1142,6 +1219,14 @@ mod tests {
         }
 
         const CANARY: &str = "clone-hook-canary";
+        // A name this crate mentions in exactly one place — here. If it
+        // reaches the hook, the child's environment is being filtered by a
+        // list of known names rather than built from one.
+        const CANARY_VAR: &str = "GV_CLONE_ENVIRONMENT_CANARY";
+        const CANARY_VALUE: &str = "a-credential-nobody-enumerated";
+        // Never the operator's real agent. This path is a value to observe,
+        // not a socket to connect to; nothing here starts an ssh-agent.
+        const FAKE_AGENT_SOCK: &str = "/tmp/gv702-not-a-real-agent.sock";
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let source = root.join("source");
@@ -1162,10 +1247,16 @@ mod tests {
         let hook = hooks.join("post-checkout");
         std::fs::write(
             &hook,
-            "#!/bin/sh\nprintf '%s|%s|%s' \
-             \"${GIT_VISTA_CREDENTIAL_TOKEN-unset}\" \
-             \"${GIT_VISTA_GITHUB_TOKEN-unset}\" \
-             \"${GH_TOKEN-unset}\" > hook-observed\n",
+            format!(
+                "#!/bin/sh\nprintf '%s|%s|%s|%s|%s|%s|%s' \
+                 \"${{GIT_VISTA_CREDENTIAL_TOKEN-unset}}\" \
+                 \"${{GIT_VISTA_GITHUB_TOKEN-unset}}\" \
+                 \"${{GH_TOKEN-unset}}\" \
+                 \"${{SSH_AUTH_SOCK-unset}}\" \
+                 \"${{{CANARY_VAR}-unset}}\" \
+                 \"${{PATH:+PATH-present}}\" \
+                 \"${{HOME:+HOME-present}}\" > hook-observed\n"
+            ),
         )
         .unwrap();
         let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
@@ -1178,6 +1269,13 @@ mod tests {
             .current_dir(&source));
 
         let policy = crate::sandbox::policy_for_clone(root).expect("clone policy");
+        // The checkout runs under its own policy, exactly as production does.
+        // Before `CheckoutPolicy` existed this test passed the transfer's
+        // policy to both halves and nothing objected — which is precisely the
+        // transposition codex-daybreak showed a source-level scan could not
+        // catch. It is a compile error now.
+        let checkout_policy =
+            crate::sandbox::policy_for_clone_checkout(root).expect("checkout policy");
         let source_str = source.to_string_lossy();
         let dest_str = dest.to_string_lossy();
         let transfer_env = [
@@ -1217,14 +1315,35 @@ mod tests {
         git(Command::new("git")
             .args(["config", "core.hooksPath", "hooks"])
             .current_dir(&dest));
-        let checkout = crate::sandbox::network_exec::network_command_without_credential(
-            &policy,
-            &dest,
-            &clone_checkout_args(),
-        )
-        .output()
-        .await
-        .expect("credentialless checkout starts");
+        // Compose under the guard; run outside it. See this test's doc.
+        let checkout_command = crate::sandbox::test_env::with_env(
+            &[
+                (CANARY_VAR, Some(std::ffi::OsStr::new(CANARY_VALUE))),
+                ("SSH_AUTH_SOCK", Some(std::ffi::OsStr::new(FAKE_AGENT_SOCK))),
+            ],
+            || {
+                assert_eq!(
+                    std::env::var(CANARY_VAR).ok().as_deref(),
+                    Some(CANARY_VALUE),
+                    "premise: the canary must really be in this process's environment, \
+                     or the hook observing it as unset proves nothing"
+                );
+                assert_eq!(
+                    std::env::var("SSH_AUTH_SOCK").ok().as_deref(),
+                    Some(FAKE_AGENT_SOCK),
+                    "premise: SSH_AUTH_SOCK must really be set for the #702 leg to bite"
+                );
+                crate::sandbox::network_exec::network_command_without_credential(
+                    &checkout_policy,
+                    &dest,
+                    &clone_checkout_args(),
+                )
+            },
+        );
+        let checkout = checkout_command
+            .output()
+            .await
+            .expect("credentialless checkout starts");
         assert!(
             checkout.status.success(),
             "credentialless checkout failed: {}",
@@ -1232,8 +1351,66 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(dest.join("hook-observed")).unwrap(),
-            "unset|unset|unset",
-            "the hook must still run, but it must inherit no credential source"
+            "unset|unset|unset|unset|unset|PATH-present|HOME-present",
+            "fields are: the three ADR 0128 credential names, then SSH_AUTH_SOCK \
+             (#702) and an unenumerated canary (#704) — all five withheld — then \
+             PATH and HOME, which must be PRESENT: an empty environment would \
+             satisfy the first five legs while producing a checkout that cannot run"
+        );
+    }
+
+    /// A cheap regression guard on `execute_clone`'s shape — **not** the proof
+    /// that its untrusted half is correctly wired. Read this before citing it.
+    ///
+    /// It began as that proof, and codex-daybreak defeated it twice on #720.
+    /// Transposing the two `&Policy` arguments at the *call site* handed the
+    /// checkout the transfer's SSH grants while this scan — which reads only
+    /// `execute_clone`'s own body — stayed green; and aliasing the raw builder
+    /// (`use network_exec::network_command as network_command_without_credential`)
+    /// satisfied both counts while the forbidden literal never appeared.
+    ///
+    /// A text scan can be satisfied without the property holding. That is
+    /// #704's own shape and ADR 0123's rule, so both defeats are now **compile
+    /// errors**: `CheckoutPolicy` is a distinct type, so the transposition does
+    /// not typecheck, and `execute_clone` annotates both command bindings as
+    /// `UntrustedCheckoutCommand`, which no alias of `network_command` can
+    /// produce.
+    ///
+    /// What survives here is worth two lines and no more: a count that notices
+    /// if one of the two post-transfer spawns is deleted outright. Do not add
+    /// assertions to it that the type system already carries — a scan that
+    /// looks like a boundary invites someone to trust it as one.
+    #[test]
+    fn execute_clone_spawns_its_untrusted_half_through_the_sealed_builder() {
+        // Only the production half: scanning the whole file matches this
+        // test's own text, and a source-level check that reads the module it
+        // lives in reports its own reflection as a violation.
+        let whole = include_str!("clone.rs");
+        let source = whole
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("clone.rs must have exactly one test module marker")
+            .0;
+        let body = {
+            let start = source
+                .find("async fn execute_clone(")
+                .expect("execute_clone must exist");
+            let end = source[start..]
+                .find("\n/// Await `fut` under `timeout`")
+                .expect("execute_clone's following item must exist");
+            &source[start..start + end]
+        };
+
+        assert_eq!(
+            body.matches("network_command_without_credential(").count(),
+            2,
+            "both post-transfer spawns (the HEAD check and the checkout) must still be \
+             here — this notices a deletion, not a substitution; the type system \
+             handles substitution"
+        );
+        assert!(
+            body.contains("network_command_with_credential("),
+            "premise: the transfer half must still be here, or the count above is \
+             measuring a function that no longer does what this test describes"
         );
     }
 

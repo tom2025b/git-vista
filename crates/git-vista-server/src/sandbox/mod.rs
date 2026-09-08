@@ -132,6 +132,11 @@ mod shim_cli;
 #[cfg(test)]
 mod ssh_remote;
 
+/// The crate's one test-side writer of process environment state. Shared
+/// rather than file-scoped since #704 — see the module doc.
+#[cfg(test)]
+pub(crate) mod test_env;
+
 /// Absolute paths the strict tier's outer launcher is looked for at, in order.
 ///
 /// # Why this is not the bare name `bwrap`
@@ -260,6 +265,58 @@ pub(crate) const DEFAULT_GIT_PORTS: &[u16] = &[
     443,  // https:// — the only one every remote on this host actually uses
     80,   // http://  — plaintext, but still a real remote scheme
     9418, // git://   — the native protocol
+];
+
+/// The TCP ports clone's **checkout** process may `connect()` to —
+/// [`DEFAULT_GIT_PORTS`] without 22 (#702).
+///
+/// Not justified by the URL scheme. An earlier version of this constant was,
+/// and the argument was wrong: `validate_clone_url` checks a scheme prefix, so
+/// `https://host:22/…` is accepted and `url.<base>.insteadOf` can rewrite an
+/// accepted HTTPS URL into an SSH one. A clone genuinely can reach port 22.
+///
+/// The surviving justification is about the *phase*, and it costs something
+/// real that is named here rather than glossed.
+///
+/// `git checkout -f` is local: the transfer has exited and every object is on
+/// disk. The legitimate outbound traffic left is a content filter's own — a
+/// `git-lfs` smudge fetching pointers' contents.
+///
+/// **That is not always HTTPS, and an earlier version of this comment claimed
+/// it was.** Git LFS resolves its endpoint from `lfs.url`, then
+/// `remote.<name>.lfsurl`, then the remote URL; where that endpoint invokes SSH
+/// — hybrid `git-lfs-authenticate` over SSH, or the pure-SSH transfer adapter —
+/// the smudge filter needs SSH *at checkout time*, which this policy withholds.
+///
+/// The axis is the **LFS endpoint, not the git transport**: an SSH git remote
+/// with an explicit HTTPS `lfs.url` is unaffected, and an HTTPS remote whose
+/// config selects an SSH LFS endpoint is affected. And the outcome is a **failed
+/// clone, not a degraded one** — a failing smudge makes `git checkout -f` exit
+/// nonzero, `execute_clone` returns `GitFailed`, and `run_guarded`'s still-armed
+/// `DestGuard` removes the destination. Both corrections from codex-daybreak,
+/// against Git LFS's own documentation and this crate's own control flow; the
+/// first version of this comment was overbroad about scope and wrong about
+/// severity.
+///
+/// It is accepted rather than fixed, because the fix and the vulnerability are
+/// the same thing. Reaching SSH at smudge time means the agent socket, host
+/// keys and port 22 in the process that runs attacker-selected filters — the
+/// exposure #702 exists to remove. The sandbox cannot tell `git-lfs`'s `ssh`
+/// from a fetched smudge filter's: same process tree, same policy, no
+/// distinguishing signal. ADR 0137 records the two conditions that would reopen
+/// it — and why the obvious one (hand the filter an HTTPS token instead) does
+/// not work, since that token is itself a bearer credential.
+///
+/// Read [`DEFAULT_GIT_PORTS`]'s own doc before trusting this too far: a port
+/// grant is **not** an egress policy, because Landlock's port rules carry no
+/// address. This removes one destination *service class*; it confines nothing
+/// to the operator's own remote, and it does not stop the agent-protocol
+/// exfiltration path described on [`policy_for_clone_checkout`], which needs
+/// only the still-permitted 443.
+pub(crate) const CLONE_CHECKOUT_PORTS: &[u16] = &[
+    443,  // https:// — and what a git-lfs smudge filter uses
+    80,   // http://
+    9418, // git://
 ];
 
 /// Absolute paths for `Policy::secret_excludes`, given a home directory.
@@ -1184,6 +1241,35 @@ pub(crate) fn policy_for_repo(repo: &Path) -> Result<Policy, shim::ShimError> {
 /// look a trust flag up *for*, so this function neither takes nor derives one
 /// and the tier below is a constant. That is a property of the signature, not a
 /// runtime check some future edit could remove.
+///
+/// # Why #188's grants stay here, and where they come off instead (#702)
+///
+/// This is the **transfer** policy: `git clone --no-checkout`, which is
+/// credentialed and which runs no attacker-chosen code, because nothing has
+/// been materialised yet (ADR 0128). It keeps `~/.ssh/known_hosts`, the
+/// `$SSH_AUTH_SOCK` grant and the full [`DEFAULT_GIT_PORTS`].
+///
+/// #702's first attempt removed all three from here, on the argument that
+/// `validate_clone_url` accepts only `https://`, `http://` and `git://` so
+/// "this route cannot perform an SSH clone". **That argument is false and the
+/// change was a regression.** `validate_clone_url` is a scheme-prefix check
+/// with no port or transport constraint, so `https://host:22/repo.git` is
+/// accepted; and `url.<base>.insteadOf` in the operator's own `~/.gitconfig`
+/// — which this policy read-grants, and which clone honours deliberately —
+/// rewrites an accepted HTTPS URL into a real SSH clone. Operators who
+/// configure that had working clones broken by the removal. Caught in review
+/// by codex-daybreak on #720, traced to source, before it merged.
+///
+/// The correct statement is narrower and survives every counter-example: **the
+/// process that runs attacker-chosen code does not need these.** That process
+/// is not this one — see [`policy_for_clone_checkout`], which is this policy
+/// minus the agent socket, the carve-out and port 22.
+///
+/// ADR 0033's own safety argument — "neither grant reaches the Strict tier,
+/// which is where hostile repository content actually runs" — stopped being
+/// true when #680 moved hostile content into the Network tier. Splitting the
+/// two phases' policies is what makes it true again, rather than narrowing a
+/// shared policy until the legitimate half breaks.
 pub(crate) fn policy_for_clone(clones_root: &Path) -> Result<Policy, shim::ShimError> {
     let home = PathBuf::from(std::env::var_os("HOME").ok_or(shim::ShimError::NoHome)?);
     let shim = shim::shim_path().map_err(Clone::clone)?.to_path_buf();
@@ -1191,12 +1277,14 @@ pub(crate) fn policy_for_clone(clones_root: &Path) -> Result<Policy, shim::ShimE
     let (mut rw, mut ro) = default_system_trees(tier);
     rw.push(clones_root.to_path_buf());
     ro.push(home.clone());
-    // #188: identical carve-out and agent-socket grant to `policy_for`'s
-    // Network branch. This function is an **independent** `Policy`
-    // constructor, not a call into `policy_for` — skipping either grant here
-    // would leave `git clone git@host:…` broken while push/fetch on an
-    // already-cloned repository worked, since clone is the one operation
-    // that never reaches `policy_for` at all (see the doc comment above).
+    // #188's grants stay on the TRANSFER policy. #702 first removed them here
+    // and that was wrong: `validate_clone_url` is a prefix check, so
+    // `url.<base>.insteadOf` in the operator's own `~/.gitconfig` — which this
+    // policy grants and which clone deliberately honours — can rewrite an
+    // accepted `https://` URL into an SSH one. A clone really can speak SSH;
+    // it just cannot be *asked* to in the URL string. Removing these broke
+    // that configuration. `policy_for_clone_checkout` is where they come off,
+    // because that is the process that runs attacker-chosen code.
     rw.extend(ssh_agent_socket_grant(tier));
     Ok(Policy {
         tier,
@@ -1218,6 +1306,139 @@ pub(crate) fn policy_for_clone(clones_root: &Path) -> Result<Policy, shim::ShimE
         hook_mode: HookMode::Run,
     })
 }
+
+/// The policy for clone's **second** process — `git checkout -f`, the one that
+/// materialises attacker-chosen files and runs the `post-checkout` hooks and
+/// `.gitattributes` filters they select (#702).
+///
+/// # Why this exists at all
+///
+/// [ADR 0128](../../../docs/adr/0128-a-credential-exists-only-before-untrusted-checkout.md)
+/// split clone into two processes with a security boundary between them, and
+/// then handed both of them the *same* `Policy`. The credential stopped
+/// crossing that boundary; every capability kept crossing it. This constructor
+/// is that split finally reaching the grants.
+///
+/// [`policy_for_clone`] keeps #188's SSH grants because the transfer genuinely
+/// may need them — `validate_clone_url` only checks a scheme prefix, so an
+/// operator's `url.<base>.insteadOf` can turn an accepted `https://` URL into a
+/// real SSH clone. An earlier version of #702 removed them from the shared
+/// policy on the argument that "this route cannot perform an SSH clone", which
+/// is false, and which broke that configuration. The correct statement is
+/// narrower and survives: **the phase that runs attacker code does not need
+/// them.**
+///
+/// So this policy is [`policy_for_clone`] minus three things:
+///
+/// * no `$SSH_AUTH_SOCK` in `rw_trees` — the operator's agent;
+/// * no `~/.ssh/known_hosts` carve-out, so the `.ssh` exclude is exceptionless
+///   again for this process, and a `stow`/`chezmoi` user whose `known_hosts` is
+///   a symlink no longer has checkout refused by `add_carveout_rule`'s guard;
+/// * [`CLONE_CHECKOUT_PORTS`] rather than [`DEFAULT_GIT_PORTS`] — no port 22.
+///
+/// Network access, `HookMode::Run` and filter execution are **unchanged**: ADR
+/// 0128 kept them deliberately (a `git-lfs` smudge filter is a legitimate
+/// checkout-time network consumer), and this narrows what the process is
+/// handed, never what it may do.
+///
+/// # What this does NOT close, stated because it would be easy to imply
+///
+/// The load-bearing half of #702 is not here — it is
+/// [`spawn::UNTRUSTED_CHECKOUT_ENV_ALLOWLIST`], which withholds
+/// `$SSH_AUTH_SOCK`. ADR 0033 §3 measured that the Landlock socket grant is
+/// **inert** on this kernel (ABI 8 does not mediate pathname `AF_UNIX`
+/// sockets), and `ssh_remote.rs`'s own live test still proves it.
+///
+/// And withholding the locator is not the same as denying the capability. A
+/// hook can recover a socket path without enumerating anything — `$HOME` is
+/// read-granted and `~/.keychain/<host>-sh` literally contains
+/// `SSH_AUTH_SOCK=/tmp/ssh-…/agent.N` — then set the variable itself and
+/// `connect()`, because `seccomp_filter::af_unix_rule` denies `AF_UNIX` in the
+/// **Strict** tier only. Closing that needs a checkout-specific seccomp mode
+/// and is tracked separately; do not read this constructor as having done it.
+///
+/// # Why every field is written out rather than `..transfer`
+///
+/// R8 (`escape_contract.rs`) refuses a functional update in any production
+/// `Policy` construction, and refuses it loudly rather than skipping what it
+/// cannot read. Its job is to verify from source that no production
+/// constructor can yield `HookMode::Blocked`, and `..base` hides that field
+/// behind an indirection the scanner cannot follow. Caught by the gate on the
+/// first version of this function, which did exactly that. The verbosity is
+/// the price of a check that cannot be defeated by convenience syntax.
+pub(crate) fn policy_for_clone_checkout(
+    clones_root: &Path,
+) -> Result<CheckoutPolicy, shim::ShimError> {
+    let transfer = policy_for_clone(clones_root)?;
+    let agent_socket = ssh_agent_socket_grant(transfer.tier);
+    Ok(CheckoutPolicy(Policy {
+        tier: transfer.tier,
+        shim: transfer.shim,
+        bwrap: transfer.bwrap,
+        // #702: the operator's agent socket, and only it, comes out.
+        rw_trees: transfer
+            .rw_trees
+            .into_iter()
+            .filter(|p| Some(p) != agent_socket.as_ref())
+            .collect(),
+        ro_trees: transfer.ro_trees,
+        secret_excludes: transfer.secret_excludes,
+        // #702: no `known_hosts` exception — the `~/.ssh` exclude is
+        // exceptionless again for the process that runs attacker code.
+        ro_carveouts: Vec::new(),
+        // #702: no port 22.
+        net_ports: CLONE_CHECKOUT_PORTS.to_vec(),
+        // Unchanged, and spelled literally for R8: ADR 0029 rejects blocking
+        // hooks, and #702 is about what the hook is HANDED, never whether it
+        // runs.
+        hook_mode: HookMode::Run,
+    }))
+}
+
+/// A [`Policy`] that has been through [`policy_for_clone_checkout`] — the only
+/// kind an untrusted checkout may be launched under.
+///
+/// # Why a newtype and not a second `Policy` value
+///
+/// #720's first attempt at this boundary gave `execute_clone` two `&Policy`
+/// arguments and pinned the wiring with a test that read the function's source.
+/// codex-daybreak defeated that in two lines: **transposing the two arguments
+/// at the call site** silently hands the checkout the transfer's SSH grants —
+/// the exact outcome the split exists to prevent — and the scan, which only
+/// read `execute_clone`'s own body, stayed green. Aliasing the raw builder
+/// (`use network_command as network_command_without_credential`) defeated the
+/// other half the same way.
+///
+/// A text scan can be satisfied without the property holding. That is the
+/// failure this crate keeps rediscovering — it is #704's own shape, and ADR
+/// 0123's rule that the safety lives in the shape rather than in a list. So the
+/// two policies are now different **types**: the transposition does not
+/// typecheck, and `network_exec::network_command_without_credential` accepts
+/// nothing else, so an untrusted-checkout launcher cannot be built from a
+/// transfer policy at all. There is no assertion to keep in step, because there
+/// is no way to express the mistake.
+///
+/// # Construction and access are both deliberately narrow
+///
+/// The tuple field is **private to this module**, so
+/// `policy_for_clone_checkout` is the only way to make one. Rust makes a
+/// private field visible to a module's *descendants*, which is exactly the
+/// reach wanted here: `sandbox::network_exec` composes the launcher from
+/// `policy.0` and `sandbox::argv` reads it to pin the argv shape, while
+/// `handlers::clone` — the caller that must not be able to substitute one
+/// policy for the other — can only pass the value along.
+///
+/// There is deliberately **no `as_policy()` accessor**. Writing one means a
+/// `-> &Policy {` signature in `sandbox/mod.rs`, and R8's literal detector
+/// (`escape_contract::production_policy_literals`) looks through a `::` path
+/// prefix but not through a leading `&`, so it classifies that signature as a
+/// `Policy` struct literal missing its `hook_mode` field and hard-fails.
+/// Measured, not guessed: the accessor form failed R8 on this branch. Widening
+/// the detector to fix it would have to distinguish `-> &Policy {` from a
+/// genuine `&Policy { … }` reference-to-literal expression — a real
+/// improvement, but not one to make inside a change that needs it to pass.
+/// Reported for its own issue instead; a field access needs neither.
+pub(crate) struct CheckoutPolicy(Policy);
 
 /// The chokepoint. Returns the complete launcher argv **up to and including
 /// the program name `git`**; the caller appends `-C <repo> <args…>`.

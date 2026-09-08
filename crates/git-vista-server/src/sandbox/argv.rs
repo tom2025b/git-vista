@@ -5,46 +5,29 @@
 use super::*;
 use std::path::PathBuf;
 
-/// The one owner of the `SSH_AUTH_SOCK` environment variable across this
-/// file's tests.
-///
-/// `std::env::set_var`/`remove_var` mutate process-wide state, and `cargo
-/// test` runs every test in this binary on separate threads of one process
-/// by default. Three tests in this file set this same key — without a
-/// rendezvous, two running concurrently silently clobber each other, and one
-/// reads back the *other's* socket path instead of its own. Measured: this
-/// is not hypothetical, it is exactly what happened the first time these
-/// tests ran without this guard (`production_policy_for_wires_the_agent_socket_grant_into_the_network_argv`
-/// observed `policy_for_clone_carries_both_188_grants`'s socket path).
-///
-/// Scoped to this file, not shared crate-wide the way `test_ports::PortClaim`
-/// covers TCP port 9418: nothing outside this file's tests touches
-/// `SSH_AUTH_SOCK` (checked by grep when these tests were written), so a
-/// claim covering only this file's own three callers is sufficient — a
-/// wider one would just be unused generality.
-static SSH_AUTH_SOCK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Set `SSH_AUTH_SOCK` to `value` (or clear it, for `None`), run `f`, then
-/// restore whatever the variable held before `f` ran — all inside one
-/// `SSH_AUTH_SOCK_LOCK` critical section, so no other test in this file can
-/// observe or clobber the value while `f` depends on it.
+/// restore whatever the variable held before `f` ran.
+///
+/// # This file used to own the lock, and no longer may
+///
+/// The rendezvous is real and was earned: `std::env::set_var`/`remove_var`
+/// mutate process-wide state, `cargo test` runs this binary's tests on
+/// separate threads of one process, and the first time these tests ran
+/// without a guard `production_policy_for_wires_the_agent_socket_grant_into_the_network_argv`
+/// read back `policy_for_clone_carries_both_188_grants`'s socket path instead
+/// of its own. Measured, not hypothetical.
+///
+/// What changed with #704 is the *scope* claim. The old lock's doc said a
+/// file-scoped mutex was sufficient because "nothing outside this file's tests
+/// touches `SSH_AUTH_SOCK`". `spawn::with_untrusted_checkout_env` now reads
+/// the entire environment via `std::env::vars_os()`, and `handlers::clone`'s
+/// spawn proof sets this same key, so the readership left this file and the
+/// lock had to follow it. It lives in `sandbox::test_env` now, and this is a
+/// thin adapter onto it rather than a second, weaker mutex beside it — two
+/// locks over one key is the same defect the original guard fixed, wearing a
+/// different hat.
 fn with_ssh_auth_sock<T>(value: Option<&std::path::Path>, f: impl FnOnce() -> T) -> T {
-    let _guard = SSH_AUTH_SOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let prior = std::env::var_os("SSH_AUTH_SOCK");
-    // SAFETY: `SSH_AUTH_SOCK_LOCK`, held for this whole function, is the only
-    // synchronization this key needs — it is this file's one writer of it
-    // (see the lock's own doc comment), so nothing outside this critical
-    // section can observe a torn read or a lost write.
-    match value {
-        Some(p) => unsafe { std::env::set_var("SSH_AUTH_SOCK", p) },
-        None => unsafe { std::env::remove_var("SSH_AUTH_SOCK") },
-    }
-    let result = f();
-    match prior {
-        Some(v) => unsafe { std::env::set_var("SSH_AUTH_SOCK", v) },
-        None => unsafe { std::env::remove_var("SSH_AUTH_SOCK") },
-    }
-    result
+    super::test_env::with_env(&[("SSH_AUTH_SOCK", value.map(|p| p.as_os_str()))], f)
 }
 
 /// A fixed, fake bwrap path. Fake on purpose: these tests pin the *shape* of
@@ -465,43 +448,117 @@ fn ssh_agent_socket_grant_is_network_tier_only_and_only_when_set() {
     });
 }
 
-/// `policy_for_clone` is an **independent** `Policy` constructor (it does not
-/// call `policy_for`) and is hard-coded to `Tier::Network` — the one
-/// production site the issue text never names, and therefore the one a
-/// build could easily fix for push/fetch/ls-remote while leaving
-/// `git clone git@host:…` broken outright. Both #188 grants must land here
-/// too.
+/// #702: the two clone phases get **different** grants, and the difference is
+/// the whole claim.
+///
+/// # This test was wrong once, in the other direction
+///
+/// Its first version asserted `policy_for_clone` carried neither #188 grant,
+/// on the argument that `validate_clone_url` accepts only `https://`,
+/// `http://` and `git://` so clone can never speak SSH. codex-daybreak refuted
+/// that on #720 before it merged: the validator is a scheme-prefix check, so
+/// `https://host:22/…` passes, and `url.<base>.insteadOf` in the operator's
+/// own `~/.gitconfig` rewrites an accepted HTTPS URL into a real SSH clone.
+/// Removing the grants from the transfer broke those operators.
+///
+/// So the claim is no longer "clone cannot use these". It is "**the phase that
+/// runs attacker-chosen code** does not need these", and that is a difference
+/// between two policies rather than a property of one.
+///
+/// # Three legs, and each of the first two is load-bearing
+///
+/// `policy_for` and `policy_for_clone` must both still *carry* the grants —
+/// without those legs, this test passes equally well if `ssh_agent_socket_grant`
+/// were broken outright, or if the transfer had been left narrowed and SSH
+/// clones still refused. Only `policy_for_clone_checkout` gives them up.
 #[test]
-fn policy_for_clone_carries_both_188_grants() {
+fn only_the_clone_checkout_phase_gives_up_the_188_grants() {
     let clones_root = tempfile::tempdir().expect("tempdir");
-    let sock = PathBuf::from("/tmp/gv188-policy-for-clone-test-agent.sock");
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    let sock = PathBuf::from("/tmp/gv702-policy-for-clone-test-agent.sock");
+    let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
+    let known_hosts = home.join(".ssh/known_hosts");
+
     with_ssh_auth_sock(Some(&sock), || {
-        let policy = policy_for_clone(clones_root.path()).expect("policy_for_clone must build");
-        assert_eq!(
-            policy.tier,
-            Tier::Network,
-            "clone is always NetworkNeed::Remote"
+        // Leg 1 — #188 intact for fetch/push/ls-remote.
+        let remote = policy_for(repo.path(), false, NetworkNeed::Remote)
+            .expect("policy_for must build a Network policy");
+        assert!(
+            remote.rw_trees.contains(&sock) && remote.ro_carveouts == vec![known_hosts.clone()],
+            "#188 must still reach policy_for, or every assertion below could be \
+             satisfied by the grant helpers simply being broken"
         );
 
-        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
+        // Leg 2 — and intact for clone's TRANSFER, which really can speak SSH
+        // through url.<base>.insteadOf. This leg is the regression guard.
+        let transfer = policy_for_clone(clones_root.path()).expect("transfer policy must build");
+        assert!(
+            transfer.rw_trees.contains(&sock),
+            "the credentialed transfer must keep the agent socket: insteadOf can make \
+             an accepted https:// URL a real SSH clone, and #720's first attempt broke \
+             exactly that. Got {:?}",
+            transfer.rw_trees
+        );
         assert_eq!(
-            policy.ro_carveouts,
-            vec![home.join(".ssh/known_hosts")],
-            "policy_for_clone must carry the same known_hosts carve-out as policy_for"
+            transfer.ro_carveouts,
+            vec![known_hosts.clone()],
+            "the transfer must keep known_hosts, or an insteadOf SSH clone fails host-key \
+             verification"
         );
         assert!(
-            policy.rw_trees.contains(&sock),
-            "policy_for_clone must carry the same agent-socket grant as policy_for, got {:?}",
-            policy.rw_trees
+            transfer.net_ports.contains(&22),
+            "the transfer must keep port 22 for the same reason, got {:?}",
+            transfer.net_ports
         );
 
-        let argv = strs(&sandbox_argv(&policy));
+        // Leg 3 — the claim. The process that runs attacker code has none.
+        let checkout =
+            policy_for_clone_checkout(clones_root.path()).expect("checkout policy must build");
+        let checkout = &checkout.0;
+        assert_eq!(
+            checkout.tier,
+            Tier::Network,
+            "this narrows grants, never the tier: ADR 0128 keeps network for git-lfs"
+        );
+        assert!(
+            matches!(checkout.hook_mode, HookMode::Run),
+            "and never hook execution — ADR 0029 rejects blocking them, and #702 is \
+             about what the hook is HANDED, not whether it runs"
+        );
+        assert!(
+            !checkout.rw_trees.contains(&sock),
+            "#702: the operator's agent socket must not reach the checkout, got {:?}",
+            checkout.rw_trees
+        );
+        assert_eq!(
+            checkout.ro_carveouts,
+            Vec::<PathBuf>::new(),
+            "#702: the ~/.ssh exclude is exceptionless again for the untrusted phase"
+        );
+        assert!(
+            !checkout.net_ports.contains(&22),
+            "#702: no SSH service for a hostile hook, got {:?}",
+            checkout.net_ports
+        );
+        assert!(
+            checkout.net_ports.contains(&443),
+            "paired positive: HTTPS must survive or a git-lfs smudge filter breaks"
+        );
+        assert!(
+            checkout.rw_trees.iter().any(|p| p == clones_root.path()),
+            "paired positive: the checkout must still be able to write the worktree — \
+             a policy that granted nothing would satisfy every negative leg above"
+        );
+
+        // The argv is where a reviewer sees a grant (ADR 0033's D5 Option B).
+        let argv = strs(&sandbox_argv(checkout));
         let w = pairs(&argv);
-        assert!(w.contains(&(
-            "--ro-carveout",
-            home.join(".ssh/known_hosts").to_str().expect("utf8 path")
-        )));
-        assert!(w.contains(&("--rw", sock.to_str().expect("utf8 path"))));
+        assert!(
+            !argv.iter().any(|a| a == "--ro-carveout")
+                && !w.contains(&("--rw", sock.to_str().expect("utf8 path")))
+                && !w.contains(&("--net-port", "22")),
+            "the checkout launcher argv must advertise none of the three, got {argv:?}"
+        );
     });
 }
 
