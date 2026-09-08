@@ -83,17 +83,7 @@ mod tests {
     use tower::ServiceExt;
 
     fn git(repo: &Path, args: &[&str]) -> String {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(repo)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8(out.stdout).unwrap().trim().to_string()
+        git_vista_fixtures::git::out(repo, args)
     }
 
     async fn assert_discoverable(repo: &Path) {
