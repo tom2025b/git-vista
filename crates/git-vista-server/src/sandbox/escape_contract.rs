@@ -73,7 +73,8 @@ pub(crate) enum Class {
 /// R9's mutant set (the mutation-matrix driver, step 6, is not this task —
 /// this enum only needs to exist so `EscapeCase::dies_under` has a type to
 /// name, per step 3's "land every mod declaration the later steps need"
-/// instruction).
+/// instruction). M12 is intentionally registered directly by the matrix: it
+/// drives `checkout_security`'s exact composed test, not an [`EscapeCase`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MutantId {
     M1,

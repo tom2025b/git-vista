@@ -1033,11 +1033,7 @@ mod seccomp_filter;
 /// AF_UNIX socket creation is denied in Strict and checkout, while ordinary
 /// Network remains exempt; all other seccomp rules are identical across
 /// profiles.
-///
-/// The final two lines below are the obsolete tail of the pre-#723 description,
-/// retained as a byte-stable locator for the repository's M1 seccomp mutation:
-/// denied in Strict only); everything else is identical in both tiers. See
-/// `seccomp_filter::af_unix_rule`.
+// Mutation-matrix anchor M1: the filter is applied at this single boundary.
 fn apply_seccomp(net: seccomp_filter::NetScope) {
     let program = match seccomp_filter::build(net) {
         Ok(p) => p,

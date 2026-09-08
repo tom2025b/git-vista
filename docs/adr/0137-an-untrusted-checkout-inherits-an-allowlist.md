@@ -491,14 +491,25 @@ code — no `cfg`-gated arm, so nothing here reports green over its own absence.
   separately proves only checkout emits `--seccomp-checkout`, retains port 443,
   and leaves the transfer marker-free.
 
-`failure-atlas mutation_check`, run key `gv-723-checkout-af-unix`, HEAD
-`d8798726`, clean tree. Both baselines ran the two narrow targets and were green;
-both mutations were `caught`, and they failed in different compiled targets.
+The original phase-selection proof used `failure-atlas mutation_check`, run key
+`gv-723-checkout-af-unix`, at `d8798726`. Its sibling run 438 is deliberately
+not retained below: it changed the then-single `Denied | Checkout` gate to
+`Denied`, but `b0741a85` later split Strict and Checkout into independent `if`
+blocks. The mutation's `old_string` no longer exists, so citing it against the
+current tree would be a claim about unreplayable source.
+
+This record takes the re-run option. The committed M12 patch removes the current
+Checkout block exactly and the mutation matrix runs the composed fetched-hook
+test as its own exact row. On the 2026-09-08 full M0–M12 replay, M0 passed every
+row; M12 left all 18 pre-existing escape cases green and failed only the checkout
+test, then passed mutant-to-case closure. The earlier cross-family review's runs
+457 and 460 independently re-established the same property at `bf14fae3`; M12
+is the repository-owned replay that keeps it true after that review is gone.
 
 | Run | Mutation | Kind | Verdict and distinct failure |
 |---|---|---|---|
 | 437 | Route `network_command_without_credential` back through the ordinary Network launcher, removing checkout-profile selection | remove | **caught** by the composed hook test: TCP still connected, but pathname AF_UNIX also connected instead of returning `EPERM`. The seccomp rule-map test stayed green, showing the rule still existed but the phase no longer selected it. |
-| 438 | Change the rule gate from `Denied \| Checkout` to `Denied`, leaving checkout out | weaken | **caught** by the compiled `gv-sandbox` rule-map test: `SYS_socket` had no AF_UNIX rule in `Checkout`. The composed target stayed green because `cargo test --bin git-vista-server` deliberately runs the already-built production shim; the other command in the same mutation run compiled the changed shim code and caught it, so this is not an invisible or cfg-gated arm. |
+| M12 (current mutation matrix) | Delete the complete `if net == NetScope::Checkout` block that inserts argument-scoped AF_UNIX rules for `SYS_socket` and `SYS_socketpair`; leave Strict and ordinary Network untouched | remove | **caught** by the exact composed hook test after the matrix compiled the mutated shim: the checkout succeeded and its TCP leg connected, but the hook's AF_UNIX result became `connected` instead of `errno:1`. Every declarative escape case stayed green, demonstrating that the mutant removed only the checkout-specific mechanism. The patch applies with zero fuzz to the source this row names. |
 
 - **`handlers::clone::clone_checkout_runs_the_hook_with_only_an_allowlisted_environment`**
   is #680's canary widened. It builds a source repository with a tracked

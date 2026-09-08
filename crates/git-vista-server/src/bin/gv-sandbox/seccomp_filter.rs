@@ -289,9 +289,8 @@ fn af_unix_rule() -> Result<SeccompRule, seccompiler::BackendError> {
 fn rules_for(net: NetScope) -> Result<BTreeMap<i64, Vec<SeccompRule>>, seccompiler::BackendError> {
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
-    // Checkout is the second strong profile. Kept as a distinct arm so the
-    // repository's existing M8 mutant can still remove Strict's mechanism and
-    // be caught independently of #723's checkout-only rule.
+    // Checkout is the second strong profile. Kept as a distinct arm so M8 and
+    // M12 can remove Strict's and checkout's mechanisms independently.
     if net == NetScope::Checkout {
         rules.insert(libc::SYS_socket, vec![af_unix_rule()?]);
         rules.insert(libc::SYS_socketpair, vec![af_unix_rule()?]);
