@@ -1,12 +1,4 @@
-//! Bisect endpoints — `POST /api/bisect/start`, `/mark`, `/reset` (M5.34,
-//! #87, ADR 0131).
-//!
-//! No status read here yet: the server side of that (`bisect_exec::discover`)
-//! exists and is host-tested, but there is no `GET /api/bisect/status` route
-//! — see `handlers/bisect.rs`'s module doc for why that is its own,
-//! separable slice. These three writes are usable without it: git itself
-//! refuses `mark`/`reset` with a 409 when no bisect is in progress, and the
-//! app's existing error-notice path (`ErrorNotice`) already shows that.
+//! Bisect status read and start/mark/reset writes (#87, #708, ADRs 0131/0138).
 
 use git_vista_protocol::plan::BisectVerdict;
 use git_vista_protocol::CommitOid;
@@ -72,5 +64,22 @@ pub async fn bisect_reset_request() -> Result<(), String> {
         Ok(())
     } else {
         Err(user_facing_error("/api/bisect/reset", resp).await)
+    }
+}
+
+/// Read git's bisect session for the accepted frame's worktree, without a write.
+pub async fn fetch_bisect_status_for(
+    repo: &str,
+) -> Result<git_vista_protocol::dto::BisectStatus, String> {
+    let url = format!(
+        "/api/bisect/status?t={}&repo={}",
+        js_sys::Date::now(),
+        js_sys::encode_uri_component(repo)
+    );
+    let resp = super::send_read(&url).await.map_err(|e| e.to_string())?;
+    if resp.ok() {
+        resp.json().await.map_err(|e| e.to_string())
+    } else {
+        Err(super::response_error(resp).await)
     }
 }
