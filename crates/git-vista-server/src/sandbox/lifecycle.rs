@@ -727,18 +727,32 @@ async fn spawn_helper_owning_the_launcher(
     repo: &Path,
     args: &[&str],
 ) -> libc::pid_t {
-    let argv = spawn::wrap_with_reaper(spawn::full_argv(policy, repo, args));
-    let cargv = to_cstrings(&argv);
-    let mut raw: Vec<*const libc::c_char> = cargv.iter().map(|c| c.as_ptr()).collect();
-    raw.push(std::ptr::null());
+    // Deliberately NOT wrapped with the reaper yet: `wrap_with_reaper` embeds
+    // `std::process::id()` as the reaper's expected parent, and that must be
+    // the HELPER's own pid (its real, eventual OS parent once forked below),
+    // never this test task's pid. Composing it here and wrapping it in the
+    // test process would silently embed the wrong value — a bug this fixture
+    // had before this comment, caught by re-deriving the design after #728's
+    // review named the parent-pid-passing fix.
+    let bare_argv = spawn::full_argv(policy, repo, args);
 
     // SAFETY: see the doc comment above — the child branch touches only the
-    // already-built `cargv`/`raw` buffers before forking again or exiting.
+    // already-built `bare_argv` before forking again or exiting, aside from
+    // the ordinary (non-multithreaded-fork-restricted) work of composing the
+    // reaper wrap, which is safe here precisely because this process is
+    // already single-threaded post-fork — see the doc comment above.
     let helper_pid = unsafe { libc::fork() };
     if helper_pid == 0 {
         // Now single-threaded and answerable to nothing but this test: the
         // multithreaded-fork restriction applied to the fork above, not to
-        // this one.
+        // this one. `wrap_with_reaper` runs HERE, in the helper, so
+        // `std::process::id()` inside it captures the helper's own pid — the
+        // reaper's true, eventual OS parent.
+        let argv = spawn::wrap_with_reaper(bare_argv);
+        let cargv = to_cstrings(&argv);
+        let mut raw: Vec<*const libc::c_char> = cargv.iter().map(|c| c.as_ptr()).collect();
+        raw.push(std::ptr::null());
+
         let launcher_pid = unsafe { libc::fork() };
         if launcher_pid < 0 {
             unsafe { libc::_exit(126) };
@@ -848,5 +862,220 @@ async fn a_reaper_process_reaps_the_launcher_when_only_its_own_parent_is_sigkill
         !repo.path().join(ORPHAN_MARKER).exists(),
         "{case}: the delayed marker was written after the helper's death — the \
          detached setsid grandchild survived reparenting"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #728 review (Codex, PR #760) — the startup race: the real parent dies
+// BEFORE the reaper's own code ever runs even once
+// ---------------------------------------------------------------------------
+
+const LEVEL2_PID_MARKER: &str = "lifecycle-reaper-level2-pid";
+
+/// Fork a **caller** that itself forks a **soon-to-be-reaper** process, freezes
+/// that second process with `SIGSTOP` before it ever calls `execvp`, writes its
+/// pid into a marker file, then idles — waiting to be killed, exactly like
+/// `spawn_helper_owning_the_launcher`'s helper.
+///
+/// # Why this exists on top of that fixture
+///
+/// That one's helper stays alive throughout, so the reaper it eventually
+/// spawns always gets to read a live, correct parent at least once before
+/// anything can go wrong — and its test waits for hook ticks specifically so
+/// it never lands inside the window this test forces. No amount of *waiting
+/// for evidence* can land inside "the caller is already dead before the
+/// reaper's first instruction runs" on purpose; it has to be forced with
+/// `SIGSTOP`/`SIGCONT`, deterministically, rather than raced against.
+async fn spawn_caller_freezing_its_child_before_it_execs(
+    policy: &Policy,
+    repo: &Path,
+    args: &[&str],
+) -> libc::pid_t {
+    let bare_argv = spawn::full_argv(policy, repo, args);
+    let marker_path = repo.join(LEVEL2_PID_MARKER);
+    let marker_cpath = {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::CString::new(marker_path.as_os_str().as_bytes()).expect("repo path has no NUL")
+    };
+
+    // SAFETY / single-threaded-after-fork reasoning: see
+    // `spawn_helper_owning_the_launcher`'s doc comment. The same posture
+    // applies here — ordinary Rust work (composing the reaper wrap, writing
+    // the marker file) is safe in this process because it runs after this
+    // fork, not between some *other* fork and its exec.
+    let caller_pid = unsafe { libc::fork() };
+    if caller_pid == 0 {
+        let argv = spawn::wrap_with_reaper(bare_argv);
+        let cargv = to_cstrings(&argv);
+        let mut raw: Vec<*const libc::c_char> = cargv.iter().map(|c| c.as_ptr()).collect();
+        raw.push(std::ptr::null());
+
+        let level2_pid = unsafe { libc::fork() };
+        if level2_pid < 0 {
+            unsafe { libc::_exit(126) };
+        }
+        if level2_pid == 0 {
+            unsafe {
+                // Freeze before running a single line of the reaper's own
+                // logic — before even `execvp`. Self-raised rather than
+                // racing the parent's `kill(SIGSTOP)` against this process's
+                // own startup: this way the stop point is exactly here, not
+                // "sometime before or after an external signal happened to
+                // land".
+                libc::raise(libc::SIGSTOP);
+                // Resumes here, later, once the test SIGCONTs it — by which
+                // point its real parent (`caller`, this fork's own parent)
+                // may already be long dead.
+                libc::execvp(cargv[0].as_ptr(), raw.as_ptr());
+                libc::_exit(127);
+            }
+        }
+        // Report the frozen pid where the test can find it — the test is not
+        // this process's parent, so it has no standing to `waitpid` for it —
+        // then idle, never `wait()`-ing on it, same posture as the other
+        // fixture's caller.
+        unsafe {
+            let fd = libc::open(
+                marker_cpath.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                0o644,
+            );
+            if fd >= 0 {
+                let text = format!("{level2_pid}\n");
+                libc::write(fd, text.as_ptr() as *const libc::c_void, text.len());
+                libc::close(fd);
+            }
+        }
+        loop {
+            unsafe {
+                libc::sleep(60);
+            }
+        }
+    }
+    assert!(
+        caller_pid > 0,
+        "fork() (caller) failed: {}",
+        std::io::Error::last_os_error()
+    );
+    caller_pid
+}
+
+/// Poll `/proc/<pid>/stat`'s state field for `T` (stopped) — readable by any
+/// process, unlike `waitpid(..., WUNTRACED)`, which only the fixture's
+/// `caller` (not the test itself) has standing to call on `pid`.
+fn wait_until_stopped(pid: libc::pid_t, deadline: Instant) -> bool {
+    loop {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            // Fields after the parenthesised comm name are single chars/
+            // numbers separated by spaces; state is the first of them.
+            Ok(stat) => {
+                if let Some((_, after)) = stat.rsplit_once(')') {
+                    if after.trim_start().starts_with('T') {
+                        return true;
+                    }
+                }
+            }
+            Err(_) => return false, // already gone
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// #728 review finding (Codex, PR #760): an earlier version of this reaper
+/// read its own `getppid()` once, right after starting, as its baseline for
+/// every later comparison. If the real caller died BEFORE the reaper's own
+/// code ever ran even once — between the OS-level fork that creates the
+/// reaper process and that process's first executed instruction — that
+/// self-read baseline would already reflect the post-reparenting value, and
+/// every later comparison would read "nothing has changed", forever: the
+/// launcher could survive unbounded, the exact #728 shape reintroduced one
+/// layer up. `a_reaper_process_reaps_the_launcher_when_only_its_own_parent_is_sigkilled`
+/// above cannot exercise this — it waits for hook ticks before killing
+/// anything, which guarantees the reaper is already running normally by then.
+///
+/// This test forces the exact ordering deterministically, with
+/// `SIGSTOP`/`SIGCONT`, rather than hoping a timing window is hit — see
+/// `gv-sandbox-reaper`'s module doc, "Why the expected parent is passed in,
+/// not read", for the mechanism this proves: the fix passes the caller's pid
+/// in explicitly, established before the caller ever spawns anything, so the
+/// comparison is correct no matter how late the reaper's own first read of
+/// `getppid()` happens to land.
+#[tokio::test]
+async fn a_reaper_process_reaps_a_launcher_orphaned_before_it_ever_ran() {
+    let case = "lifecycle-reaper-startup-race-728";
+    let repo = hostile_hook_repo(&orphan_hook());
+    let policy = strict_baseline(repo.path(), case).await;
+
+    let caller_pid = spawn_caller_freezing_its_child_before_it_execs(
+        &policy,
+        repo.path(),
+        &["commit", "--allow-empty", "-m", "orphan-728-startup-race"],
+    )
+    .await;
+
+    // Wait for the caller to report the frozen process's pid.
+    let marker_path = repo.path().join(LEVEL2_PID_MARKER);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let level2_pid: libc::pid_t = loop {
+        if let Ok(raw) = std::fs::read_to_string(&marker_path) {
+            if let Ok(pid) = raw.trim().parse() {
+                break pid;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{case}: the caller never reported the frozen process's pid within 10s"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    // Confirm it is genuinely stopped — not merely "probably stopped by now",
+    // which would make this test a timing gamble rather than a forced
+    // ordering.
+    assert!(
+        wait_until_stopped(level2_pid, Instant::now() + Duration::from_secs(5)),
+        "{case}: the frozen process (pid {level2_pid}) never reached the \
+         STOPPED state — this test cannot force the ordering it exists to \
+         force without it"
+    );
+
+    // Kill the CALLER — the frozen process's real, immediate parent — while
+    // it is still frozen and has not run one line of its own logic yet.
+    let killed = unsafe { libc::kill(caller_pid, libc::SIGKILL) };
+    assert_eq!(
+        killed, 0,
+        "{case}: SIGKILL of the caller must be deliverable"
+    );
+    let mut status: i32 = 0;
+    unsafe {
+        libc::waitpid(caller_pid, &mut status, 0);
+    }
+
+    // Let the kernel finish reparenting before resuming — the property under
+    // test is specifically that this has ALREADY happened by the time the
+    // frozen process's own code runs for the first time.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let resumed = unsafe { libc::kill(level2_pid, libc::SIGCONT) };
+    assert_eq!(
+        resumed, 0,
+        "{case}: SIGCONT of the frozen process must be deliverable"
+    );
+
+    // Give the reaper time to run its very first check, detect the mismatch
+    // and tear down — comfortably longer than gv-sandbox-reaper's own
+    // POLL_INTERVAL (100ms), since with the fix this should not even need a
+    // second iteration to catch it.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    assert_ne!(
+        unsafe { libc::kill(level2_pid, 0) },
+        0,
+        "{case}: the process that became the reaper (pid {level2_pid}) is \
+         still alive — it never noticed it was already orphaned before its \
+         first instruction ran"
     );
 }

@@ -9,19 +9,47 @@
 //! cannot be trusted alone.
 //!
 //! This binary sits between the real caller (the server, or a test harness)
-//! and the launcher it would otherwise spawn directly (bwrap, or the shim in
-//! `Tier::Network` — see `sandbox::spawn::wrap_with_reaper`). It is invoked as
-//! `gv-sandbox-reaper <program> <args…>` and:
+//! and `Tier::Strict`'s `bwrap` launcher (see `sandbox::spawn::wrap_with_reaper`
+//! for exactly which spawns are wrapped and why not all of them are, today).
+//! It is invoked as `gv-sandbox-reaper <expected-parent-pid> <program> <args…>`
+//! and:
 //!
 //! 1. forks;
-//! 2. the child becomes its own process group leader and `execvp`s
-//!    `<program> <args…>` unchanged — from that point on it *is* the launcher
-//!    the caller asked for, byte for byte;
+//! 2. the child becomes its own process group leader, registers
+//!    `PR_SET_PDEATHSIG(SIGKILL)` against the reaper (an ordinary, single-hop
+//!    use — the reaper is its real, immediate parent, no reparenting involved
+//!    in this specific guarantee), and `execvp`s `<program> <args…>`
+//!    unchanged — from that point on it *is* the launcher the caller asked
+//!    for, byte for byte;
 //! 3. the parent (this process) polls its own `getppid()`. If it ever differs
-//!    from the PPID recorded before the fork, this process itself has been
-//!    reparented — which can only happen because ITS real parent (the actual
-//!    caller) is gone. It kills the whole child process group with `SIGKILL`
-//!    and exits.
+//!    from `<expected-parent-pid>` — the caller's own pid, passed as an
+//!    argument rather than discovered later, see "Why the expected parent is
+//!    passed in, not read" — the real caller is gone. It kills the whole
+//!    child process group with `SIGKILL` and exits.
+//!
+//! # Why the expected parent is passed in, not read
+//!
+//! An earlier version of this file called `getppid()` once, right after
+//! `main` starts, and used that as the baseline for every later comparison.
+//! That is racy in a way review caught before it shipped: the OS-level fork
+//! that creates *this* process happens entirely before a single line of this
+//! file can run. If the real caller dies inside that window — between the
+//! fork and this process's first executed instruction — this process is
+//! reparented before it ever gets a chance to look, and a self-read baseline
+//! would capture the *already-wrong* value, permanently. Every later
+//! comparison against that baseline would then read "nothing has changed",
+//! forever, and the launcher could survive unbounded — the exact #728 shape,
+//! reintroduced one layer up.
+//!
+//! The caller passing its own pid as `argv[1]` has no equivalent window: the
+//! caller reads `std::process::id()` (or platform equivalent) before it even
+//! spawns this process, so there is nothing racing it. Whatever this process's
+//! `getppid()` reads, at any point after it starts — however late that is, and
+//! however much has already gone wrong before it got the chance to run — is
+//! compared against a value that was correct before the race could begin.
+//! `sandbox::lifecycle::a_reaper_process_reaps_a_launcher_orphaned_before_it_ever_ran`
+//! proves this deterministically, forcing the worst-case ordering with
+//! `SIGSTOP`/`SIGCONT` rather than hoping a timing window is hit.
 //!
 //! # Why polling, not `PR_SET_PDEATHSIG` on this process itself
 //!
@@ -29,11 +57,11 @@
 //! and relies on receiving it cannot run any cleanup code when that signal
 //! actually arrives — it is simply gone, and its child is exactly as orphaned
 //! as it would have been with no watcher at all. This process registers
-//! **nothing** for itself; it only ever reads `getppid()`, a plain syscall
-//! whose answer does not depend on any signal being delivered, to it or to
-//! anything else, by whatever mechanism its real parent died. That is the
-//! entire reason this binary exists rather than one more layer of
-//! `--die-with-parent`.
+//! nothing for *itself*; it only ever reads `getppid()`, a plain syscall whose
+//! answer does not depend on any signal being delivered, to it or to anything
+//! else, by whatever mechanism its real parent died. (Its *child*, one step
+//! below, does register `PR_SET_PDEATHSIG` — but that is the ordinary,
+//! non-racy, single-hop case: see step 2 above and `main`'s own comments.)
 //!
 //! # The named residual
 //!
@@ -77,20 +105,31 @@ const EXIT_EXEC_FAILED: i32 = 121;
 
 fn main() {
     let argv: Vec<OsString> = std::env::args_os().collect();
-    if argv.len() < 2 {
-        eprintln!("gv-sandbox-reaper: usage: gv-sandbox-reaper <program> <args…>");
+    if argv.len() < 3 {
+        eprintln!(
+            "gv-sandbox-reaper: usage: gv-sandbox-reaper <expected-parent-pid> <program> <args…>"
+        );
         std::process::exit(EXIT_USAGE);
     }
-    let child_argv = to_cstrings(&argv[1..]);
+    // The caller's own pid, established BEFORE it spawned this process — see
+    // the module doc's "Why the expected parent is passed in, not read" for
+    // why this must never be a value this process discovers for itself later.
+    let expected_parent_pid: libc::pid_t = match argv[1].to_str().and_then(|s| s.parse().ok()) {
+        Some(pid) => pid,
+        None => {
+            eprintln!(
+                "gv-sandbox-reaper: <expected-parent-pid> must be a plain integer, got {:?}",
+                argv[1]
+            );
+            std::process::exit(EXIT_USAGE);
+        }
+    };
+    let child_argv = to_cstrings(&argv[2..]);
 
-    // Recorded before the fork: the PPID this process is *supposed* to keep,
-    // for the entire rest of its life. Any later mismatch means the real
-    // caller — not this process, not the child below — is gone.
-    let original_ppid = unsafe { libc::getppid() };
     // This process's own pid: the child's PPID once forked, and therefore
     // what the CHILD (not this process) must compare its own `getppid()`
-    // against below — a different value from `original_ppid` above, which is
-    // this process's *parent*, not this process itself.
+    // against below — a different value from `expected_parent_pid` above,
+    // which is THIS process's parent, not this process itself.
     let reaper_pid = unsafe { libc::getpid() };
 
     let pid = unsafe { libc::fork() };
@@ -110,9 +149,9 @@ fn main() {
         unsafe {
             libc::setpgid(0, 0);
         }
-        // This process (bwrap, or the shim directly for `Tier::Network`,
-        // which has no `--die-with-parent` of its own to fall back on) must
-        // die if THIS reaper does, by any means — not only when the reaper
+        // This process (bwrap, today — see `spawn::wrap_with_reaper` for why
+        // only `Tier::Strict` is wrapped) must die if THIS reaper does, by
+        // any means — not only when the reaper
         // notices it has been reparented and reacts, but also when something
         // simply kills the reaper outright. A caller cancelling a running
         // operation does exactly that: it holds this process's OS parent as
@@ -127,8 +166,9 @@ fn main() {
         // `PR_SET_PDEATHSIG` — the reaper is this process's *real, immediate*
         // parent, so no reparenting is involved in this specific guarantee.
         // It is the same mechanism `bwrap --die-with-parent` already uses for
-        // itself; applying it here too extends it to the shim under
-        // `Tier::Network`, which had nothing like it before.
+        // itself; registering it here too is what keeps the reaper's own
+        // cancel-compatibility fix (see ADR 0141) independent of bwrap's own
+        // flag.
         unsafe {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
         }
@@ -137,9 +177,9 @@ fn main() {
         // just now, this process has already been reparented away from the
         // reaper and the just-registered signal is watching the wrong (new)
         // parent, which may never die. Checking `getppid()` immediately after
-        // — against the reaper's own pid, not `original_ppid` above, which is
-        // the reaper's parent, not the reaper itself — and self-killing on a
-        // mismatch is what makes that window not matter.
+        // — against the reaper's own pid, not `expected_parent_pid` above,
+        // which is the reaper's parent, not the reaper itself — and
+        // self-killing on a mismatch is what makes that window not matter.
         if unsafe { libc::getppid() } != reaper_pid {
             unsafe {
                 libc::_exit(125);
@@ -168,7 +208,7 @@ fn main() {
         }
 
         let current_ppid = unsafe { libc::getppid() };
-        if current_ppid != original_ppid {
+        if current_ppid != expected_parent_pid {
             reap_orphan(pid);
         }
 
