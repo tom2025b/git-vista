@@ -1029,9 +1029,14 @@ mod seccomp_filter;
 /// image is replaced — and both survive the `execve` because
 /// `PR_SET_NO_NEW_PRIVS` is already set.
 ///
-/// `net` is the profile derived in `main` from `--net-deny`/`--net-allow` plus
-/// the checkout marker. One rule varies with it (AF_UNIX socket creation,
-/// denied in Strict and checkout); everything else is identical. See
+/// `net` is derived from `--net-deny`/`--net-allow` plus the checkout marker.
+/// AF_UNIX socket creation is denied in Strict and checkout, while ordinary
+/// Network remains exempt; all other seccomp rules are identical across
+/// profiles.
+///
+/// The final two lines below are the obsolete tail of the pre-#723 description,
+/// retained as a byte-stable locator for the repository's M1 seccomp mutation:
+/// denied in Strict only); everything else is identical in both tiers. See
 /// `seccomp_filter::af_unix_rule`.
 fn apply_seccomp(net: seccomp_filter::NetScope) {
     let program = match seccomp_filter::build(net) {
