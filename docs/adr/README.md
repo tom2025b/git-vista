@@ -52,7 +52,7 @@ number from then on. `--sweep` catches the ones everyone forgets.
 | [0003](0003-repository-catalog.md) | A server-owned, allowlisted repository catalog addressed by opaque id | Accepted |
 | [0004](0004-loopback-sessions.md) | Protecting loopback sessions and mutating requests | Accepted |
 | [0005](0005-lan-view-profile.md) | LAN view profile: a read-only second listener | Accepted — implemented |
-| [0006](0006-ask-every-time-mode-picker.md) | Visualize / Active is chosen per open, every time | Accepted — implemented and tested |
+| [0006](0006-ask-every-time-mode-picker.md) | Visualize / Active is chosen per open, every time | Accepted — implemented; picker flow browser-verified, topbar mode badge untested |
 | [0007](0007-selection-scoped-mode.md) | Mode rides the current-repo selection (`POST /api/select`) | Accepted — implemented and tested |
 | [0008](0008-persistent-clones-xdg.md) | Persistent, multiple clones under the XDG data dir | Accepted |
 | [0009](0009-configured-root-repo-discovery.md) | Local repos discovered from one configured root, direct children only | Accepted — implemented and tested |
@@ -87,14 +87,14 @@ number from then on. `--sweep` catches the ones everyone forgets.
 | [0038](0038-worktree-destructive-operations.md) | Worktree-destructive operations: typed per-path impact, a preview that names every file, and one required control that cannot exist | Accepted — implemented and tested |
 | [0039](0039-remote-operation-vocabulary.md) | The typed remote-operation vocabulary: `FetchRemote`, `PullBranch`, and a lease-guarded `PushBranch` | Accepted — typed contract implemented and tested; execution wired for all three by ADR 0043 (#229), ADR 0044 (#230) and ADR 0045 (#231) |
 | [0040](0040-amend-execution.md) | Amend execution: its own route, an executor-level CAS, an advisory published-history flag, and typed failure kinds | Accepted — implemented and tested |
-| [0041](0041-tag-operation-vocabulary.md) | The typed tag vocabulary: four variants, and an undo that restores the exact tag object | Accepted — typed contract implemented and tested; local execution wired by [0048](0048-local-tag-execution.md), signed execution by #239, and the remote pair by #240 |
+| [0041](0041-tag-operation-vocabulary.md) | The typed tag vocabulary: four variants, and an undo that restores the exact tag object | Accepted — typed contract implemented and tested; local execution wired by [0048](0048-local-tag-execution.md), signed attempts run and fail fast with a typed reason by #239 but no signed tag can be created here, and the remote pair is wired by #240 |
 | [0042](0042-planner-build-submit-split.md) | The planner's build / submit seam: two stages, one set of stage functions | Accepted — implemented and tested; routed by #248/#249 |
 | [0043](0043-fetch-execution.md) | Fetch execution: progress on the lifecycle that already exists, a cancel that kills the child, and an outcome read from refs rather than prose | Accepted — implemented and tested; its claim about *which host* a fetch may reach is corrected by ADR 0047 |
 | [0044](0044-pull-execution.md) | Pull execution: one fetch in the server, a strategy the wire must state, and a conflict that is an outcome rather than an error | Accepted — implemented and tested |
 | [0045](0045-push-execution.md) | Push execution: a force that cannot be built, a lease checked by two parties, and a cancel that refuses to reassure | Accepted — implemented and tested |
 | [0046](0046-mcp-plan-tool-surface.md) | The MCP plan-tool surface: 23 build-only tools, one endpoint, and a variant that cannot be exposed | Accepted — implemented and tested |
 | [0047](0047-remote-target-boundary.md) | Which host a fetch may contact: a name-shaped newtype *and* a precondition that refuses instead of being skipped | Accepted — implemented and tested |
-| [0048](0048-local-tag-execution.md) | Local tag execution: the annotation that cannot be empty, and the pin that outlives the tag | Accepted — implemented and tested; signed execution and typed failure reporting wired by #239, and the two remote-reaching tag operations by #240 |
+| [0048](0048-local-tag-execution.md) | Local tag execution: the annotation that cannot be empty, and the pin that outlives the tag | Accepted — implemented and tested; unsigned local creation and local deletion execute, signed attempts run and fail fast with a typed reason by #239 but no signed tag can be created here, and the two remote-reaching tag operations are wired by #240 |
 | [0049](0049-v1-scope-freeze.md) | V1 scope freeze: eighteen never-started issues closed as won't-do, M6/M7 retired, M8 deleted | Accepted — tracker changes only; no code or protocol touched |
 | [0050](0050-operation-by-key-lookup.md) | Learning an operation's id before it finishes: an additive `GET /api/operations/by-key/{key}` | Accepted — implemented and tested |
 | [0051](0051-intent-admission-after-the-await.md) | Intent admission belongs *after* every await, not once before them | Accepted — implemented, confirmed on a device |

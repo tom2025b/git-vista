@@ -1,6 +1,6 @@
 # 0029 — INV-13: hard-fail when the Strict tier is selected but unavailable
 
-- **Status:** Accepted — implementation pending
+- **Status:** Accepted — implemented and tested
 - **Date:** 2026-07-29
 - **Milestone / issue:** M1.13b — the Git-process sandbox (#66). Resolves
   INV-13, which the escape-battery anti-vacuity contract's ordered-work step 7

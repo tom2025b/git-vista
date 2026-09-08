@@ -1,6 +1,6 @@
 # ADR 0010 — Visualizer = the existing read-only views plus forge deep links
 
-- **Status:** Accepted — implementation pending (`feature/repo-picker-modes`)
+- **Status:** Accepted — implemented and tested
 - **Date:** 2026-07-19
 - **Milestone / issue:** Post-M1.05 feature set; design spec
   `docs/superpowers/specs/2026-07-19-repo-modes-lan-visualizer-design.md`

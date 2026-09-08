@@ -1,6 +1,6 @@
 # ADR 0009 — Local repos are discovered from one configured root, direct children only
 
-- **Status:** Accepted — implementation pending (`feature/repo-picker-modes`)
+- **Status:** Accepted — implemented and tested
 - **Date:** 2026-07-19
 - **Milestone / issue:** Post-M1.05 feature set; design spec
   `docs/superpowers/specs/2026-07-19-repo-modes-lan-visualizer-design.md`
