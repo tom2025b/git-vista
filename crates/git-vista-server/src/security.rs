@@ -274,7 +274,27 @@ pub(crate) async fn require_auth(
     }
 
     // 5. Session + CSRF, unless this is a pre-session endpoint.
-    let session_exempt = path == NEGOTIATION_PATH
+    //
+    // #705: every clause here is method-qualified, deliberately. A bare
+    // `path == NEGOTIATION_PATH` exempted *every* method on `/api/protocol`,
+    // while `route_authz.rs`'s `EXPECTED_UNAUTHENTICATED` pins the
+    // pre-session allowlist as three `(path, method)` pairs and presents
+    // itself as exact. No route was ever bypassable — `main.rs` registers
+    // only `get(protocol_info)`, so a write method ended at 405 — but a
+    // future `POST /api/protocol` handler could have been classified
+    // `SessionAndCsrf` in `ROUTE_AUTHZ`, satisfied every structural test,
+    // and still skipped both session and CSRF right here. The exemption now
+    // names the same three pairs the table does, and
+    // `the_pre_session_exemption_is_method_qualified` (route_authz.rs)
+    // fails if a future clause drops its method test.
+    //
+    // Axum serves `HEAD` implicitly from a `get(...)` route, so
+    // `HEAD /api/protocol` is no longer pre-session: it is a read like any
+    // other and needs a session. Nothing in this codebase issues one, and
+    // saying so is cheaper than pinning a fourth pair, which would need a
+    // `HEAD` row in `ROUTE_AUTHZ` that `main.rs` never registers and the
+    // route census would then reject.
+    let session_exempt = (path == NEGOTIATION_PATH && method == Method::GET)
         || (path == SESSION_PATH && matches!(method, Method::GET | Method::POST));
     // #588: the selection this request acts on belongs to the session making
     // it. Captured here, at the one place that already decides who is calling,
@@ -523,6 +543,10 @@ mod wire_tests {
             )
             .route("/api/commits", get(|| async { "graph" }))
             .route("/api/branch", post(|| async { "made" }))
+            // #705: registered `get(...)`-only, exactly as `main.rs` does, so
+            // the tests below exercise the real shape — a GET that must stay
+            // pre-session, and a write method that must not.
+            .route("/api/protocol", get(|| async { "negotiation" }))
             .layer(axum::middleware::from_fn_with_state(
                 auth_state,
                 require_auth,
@@ -572,6 +596,59 @@ mod wire_tests {
         let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let info: SessionInfo = serde_json::from_slice(&bytes).unwrap();
         (cookie, info.csrf.unwrap())
+    }
+
+    /// #705: `GET /api/protocol` is how a client learns the protocol before
+    /// a session can exist, so it must stay reachable with no cookie at all.
+    /// This is the half of the exemption that has to keep working.
+    #[tokio::test]
+    async fn the_negotiation_get_stays_pre_session() {
+        let (router, _) = app();
+        let resp = router
+            .oneshot(req("GET", "/api/protocol").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "GET /api/protocol must not require a session — it is how a client \
+             discovers the protocol in the first place"
+        );
+    }
+
+    /// #705: a write method on the negotiation path must be stopped by the
+    /// session gate, not merely by the absence of a handler.
+    ///
+    /// The distinction is the whole issue. Before the fix `session_exempt`
+    /// tested the path alone, so `POST /api/protocol` sailed through
+    /// `require_auth` and was refused only by the router, as
+    /// `405 Method Not Allowed` — no session, no CSRF, no authorization
+    /// decision of any kind. That is a safe *accident*: it holds only while
+    /// nobody registers a write handler on this path. Asserting `401` rather
+    /// than merely "not 2xx" is what makes this test able to tell the
+    /// accident from the guarantee — a `405` here means the gate is open
+    /// again and only the missing handler is hiding it.
+    #[tokio::test]
+    async fn a_write_method_on_the_negotiation_path_is_stopped_by_the_session_gate() {
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            let (router, _) = app();
+            let resp = router
+                .oneshot(
+                    req(method, "/api/protocol")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} /api/protocol must be refused by the session gate (401). \
+                 A 405 means require_auth exempted it on the path alone and only \
+                 the absent handler stopped it — the #705 shape."
+            );
+        }
     }
 
     #[tokio::test]
