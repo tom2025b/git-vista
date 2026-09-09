@@ -456,3 +456,68 @@ export async function reopenWorktreeDrawer(page) {
   await expect(page.getByRole('region', { name: WORKTREE_REGION_LABEL })).toHaveCount(0)
   return openWorktreeDrawer(page)
 }
+
+// --- #396: the commit draft survives a reload, OFFERED back and never auto-filled --
+//
+// Shared with `harness-selfcheck.spec.mjs` for the reason `RELOAD_SENTINEL`
+// above is: the self-check must run the SAME assertion the spec runs, so the
+// two cannot drift into agreeing by accident.
+//
+// What this is a proxy for, said plainly: #396 asks whether a half-typed
+// commit message survives iPad Safari SUSPENDING the tab — the page is
+// discarded and rebuilt from scratch when the user returns. Chromium on titan
+// cannot do that. What it can do is the part that matters to the storage
+// layer: a full reload, and a brand-new browser context seeded from a serialized
+// storage snapshot, both of which throw away every in-memory app signal. The
+// latter does not prove browser-process crash recovery from disk.
+
+/** The `localStorage` key prefix the draft persists under —
+ *  `features/dialogs/core.rs`'s `commit_draft_key`, `gv-commit-draft:<worktree_id>`. */
+export const DRAFT_KEY_PREFIX = 'gv-commit-draft:'
+
+/** Mirrors `features/dialogs/commit.rs`'s `DRAFT_PREVIEW_CHARS`: the banner
+ *  previews the first line cut to this many characters. */
+export const DRAFT_PREVIEW_CHARS = 40
+
+/** The draft-restore banner (`dialogs/commit.rs`, `role="status"`, "Draft from
+ *  <age>"). Filtered on its own words: the amend notice is a second
+ *  `role="status"` in the same modal. */
+export function draftBanner(page) {
+  return page.getByRole('status').filter({ hasText: /Draft from/ })
+}
+
+/** The commit modal's message box — a `<textarea aria-label="Commit message">`. */
+export function messageBox(page) {
+  return page.getByRole('textbox', { name: 'Commit message' })
+}
+
+/** Every draft key currently in `localStorage`, so a spec can state that the
+ *  draft was WRITTEN before it claims the draft was READ back. */
+export async function storedDraftKeys(page) {
+  return page.evaluate(
+    (prefix) => Object.keys(window.localStorage).filter((k) => k.startsWith(prefix)),
+    DRAFT_KEY_PREFIX,
+  )
+}
+
+/**
+ * The commit dialog offers `draft` back: banner up, with an age and the
+ * preview of the stored text — and the box itself EMPTY. The last clause is
+ * ADR 0057's whole ruling ("localStorage, but never silent"): a draft that
+ * came back by silently filling the textarea would pass a weaker check and
+ * be exactly the ambush Tom vetoed.
+ */
+export async function expectDraftOffered(page, draft) {
+  const banner = draftBanner(page)
+  await expect(banner, 'a stored draft must be OFFERED back through the banner').toBeVisible()
+  await expect(banner, 'the banner must say how old the draft is').toContainText(
+    /Draft from (just now|\d+ minutes? ago)/,
+  )
+  await expect(banner, 'the banner must preview the stored text').toContainText(
+    Array.from(draft).slice(0, DRAFT_PREVIEW_CHARS).join(''),
+  )
+  await expect(
+    messageBox(page),
+    'the box must stay EMPTY — offered, never auto-filled (ADR 0057)',
+  ).toHaveValue('')
+}

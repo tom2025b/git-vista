@@ -22,9 +22,12 @@ import {
 } from './staging-selection.mjs'
 import {
   DIFF_SCROLLER,
+  DRAFT_KEY_PREFIX,
+  expectDraftOffered,
   expectEachChainHasItsOwnMarker,
   forceOnline,
   markPage,
+  messageBox,
   openApp,
   openDiff,
   pageSurvived,
@@ -444,4 +447,124 @@ test.describe('harness self-check — every assertion must be able to go red', (
     })
     expectFailedBecause(msg, /the tab must have reloaded/, 'the #392 reload assertion')
   })
+
+  // #396: three mutations, deliberately different in kind, because one
+  // `caught` only says the assertion notices THAT break. All three are applied
+  // to the MECHANISM (storage, or every rebuild of the box) rather than to a
+  // DOM snapshot: the commit modal re-renders itself whenever the status read
+  // lands, rebuilding the textarea from the signal, so a one-off DOM edit is
+  // undone within seconds and would let the assertion pass for the wrong
+  // reason. The first version of the auto-fill check below was exactly that,
+  // and reported "passed after the mutation" — the mutation had evaporated.
+  //
+  //   1. storage wiped before the rebuild — the mechanism removed (what a
+  //      sessionStorage draft, or one never written, looks like after a
+  //      suspension);
+  //   2. the stored text swapped before the rebuild — a banner over the WRONG
+  //      draft (the shape of a scope-misfiling bug);
+  //   3. every rebuilt box pre-filled behind a correct banner — the exact
+  //      silent restore ADR 0057 vetoed, and one a banner-only check would
+  //      wave through.
+  test('the #396 draft-offer assertion fails when storage did not survive the rebuild', async ({
+    page,
+  }) => {
+    test.setTimeout(90_000)
+    await typeDraftThenRebuild(page, () => page.evaluate(() => window.localStorage.clear()))
+    const msg = await failureMessage(() => expectDraftOffered(page, DRAFT_396))
+    expectFailedBecause(msg, /must be OFFERED back/, 'the #396 draft-offer assertion')
+  })
+
+  test('the #396 draft-offer assertion fails when the banner offers the wrong text', async ({
+    page,
+  }) => {
+    test.setTimeout(90_000)
+    await typeDraftThenRebuild(page, () =>
+      page.evaluate((prefix) => {
+        for (const k of Object.keys(window.localStorage)) {
+          if (!k.startsWith(prefix)) continue
+          const rec = JSON.parse(window.localStorage.getItem(k))
+          rec.message = 'a different repository\u2019s draft, misfiled under this key'
+          window.localStorage.setItem(k, JSON.stringify(rec))
+        }
+      }, DRAFT_KEY_PREFIX),
+    )
+    const msg = await failureMessage(() => expectDraftOffered(page, DRAFT_396))
+    expectFailedBecause(msg, /must preview the stored text/, 'the #396 draft-offer assertion')
+    await page.getByRole('button', { name: 'Discard the saved draft' }).click()
+  })
+
+  test('the #396 draft-offer assertion fails when the draft is auto-filled behind the banner', async ({
+    page,
+  }) => {
+    test.setTimeout(90_000)
+    // The break has to outlive the modal's own re-renders, and a
+    // MutationObserver on insertion does not: Leptos assigns `prop:value`
+    // AFTER the element is in the tree, so an observer's fill was overwritten
+    // with the signal's "" a tick later and the assertion passed (measured:
+    // three runs, three false "passed after mutation"). So hook the property
+    // itself, from the rebuilt document onward: every write of "" to the
+    // commit box becomes the draft — exactly a client that restores silently.
+    await typeDraftThenRebuild(page, () =>
+      page.addInitScript((text) => {
+        const desc = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')
+        Object.defineProperty(HTMLTextAreaElement.prototype, 'value', {
+          configurable: true,
+          get: desc.get,
+          set(v) {
+            desc.set.call(this, v === '' ? text : v)
+          },
+        })
+      }, DRAFT_396),
+    )
+    const msg = await failureMessage(() => expectDraftOffered(page, DRAFT_396))
+    expectFailedBecause(msg, /offered, never auto-filled/, 'the #396 draft-offer assertion')
+    await page.getByRole('button', { name: 'Discard the saved draft' }).click()
+  })
 })
+
+/** Type the #396 draft, apply `mutate`, then rebuild the page and reopen the
+ *  commit dialog — the spec's own reload proxy, with a hook for the break. */
+async function typeDraftThenRebuild(page, mutate) {
+  await openFixtureRepoActive(page)
+  await openCommitDialogOnHead(page)
+  await messageBox(page).fill(DRAFT_396)
+  await expect(messageBox(page)).toHaveValue(DRAFT_396)
+  await mutate()
+  await page.reload()
+  await openFixtureRepoActive(page)
+  await openCommitDialogOnHead(page)
+}
+
+/** Text for the #396 self-checks — over 40 chars so the preview cut is real. */
+const DRAFT_396 = 'wip(#396): self-check draft, long enough to be previewed and cut'
+
+/** Open `fixture-repo` in ACTIVE mode — Visualize hides every write item,
+ *  "Commit Changes" included. Duplicated from `commit-draft-reload.spec.mjs`
+ *  rather than imported, for the same reason `openTwinRepo` above is. Nothing
+ *  here submits, so the shared fixture is never mutated. */
+async function openFixtureRepoActive(page) {
+  await forceOnline(page)
+  await page.goto(runtime().base)
+  await expect(page.getByRole('heading', { name: 'git-vista' })).toBeVisible()
+  const entry = page.getByRole('button', { name: /fixture-repo/i }).first()
+  await expect(entry, 'the picker lists the fixture repository').toBeVisible({ timeout: 20_000 })
+  await entry.click()
+  const active = page.getByRole('button', { name: /full git operations/ })
+  await expect(active, 'the mode dialog follows opening a repository').toBeVisible({
+    timeout: 20_000,
+  })
+  await active.click()
+  await expect(entry, 'the picker must be dismissed, not merely unsampled').toHaveCount(0)
+  await expect(active, 'the mode dialog must be dismissed, not merely unsampled').toHaveCount(0)
+  await expect(page.locator('p.status.repo')).toContainText(/fixture-repo/i, { timeout: 20_000 })
+  await expect(page.locator('circle.node-hit').first()).toBeAttached()
+}
+
+/** Tap HEAD (index 0) and choose the enabled "Commit Changes" item — anchored
+ *  at the end so neither the leading glyph nor the disabled variant's
+ *  appended reason matches. */
+async function openCommitDialogOnHead(page) {
+  await page.locator('circle.node-hit').nth(0).click()
+  await page.getByRole('button', { name: /Commit Changes$/ }).click()
+  await expect(messageBox(page), 'the commit modal must mount').toBeVisible()
+}
