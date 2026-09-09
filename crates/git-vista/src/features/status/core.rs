@@ -184,6 +184,7 @@ impl StatusSections {
     }
 
     /// True when every section is empty — the working tree is clean.
+    #[cfg(test)]
     pub fn is_clean(&self) -> bool {
         StatusSection::ALL.iter().all(|&s| self.count(s) == 0)
     }
