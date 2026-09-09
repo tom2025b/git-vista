@@ -41,6 +41,7 @@ use git_vista_protocol::conflict::{ConflictedFile, Continuation};
 use git_vista_protocol::OperationId;
 
 use crate::features::status::core::{StatusSection, StatusSections};
+use crate::features::status::detail::core::current_reading;
 
 // ---------------------------------------------------------------------------
 // The wire shape
@@ -267,10 +268,33 @@ pub enum DrawerView {
     Rows(Vec<StashRow>),
 }
 
+/// Resolve the Activity panel's stash-drawer resource against the live frame
+/// (#752) — the same host-tested decision
+/// [`panel_worktree_reading`](crate::features::status::core::panel_worktree_reading)
+/// applies to the v2 status read beside it, and
+/// [`panel_tag_reading`](crate::features::tags::core::panel_tag_reading)
+/// applies to the tag list beside this one. The reply carries the epoch and
+/// repository it was *requested for*; a reply that is still loading, or was
+/// requested for an epoch or repository that is no longer the live one,
+/// resolves to `None` rather than rendering another repository's stash
+/// entries under this one's drawer.
+///
+/// `current_reading` is generic exactly so this can share the one tested
+/// comparison rather than re-deriving "is this reply stale" a third time.
+pub fn panel_stash_reading(
+    loading: bool,
+    reply: Option<(u64, Option<String>, Option<Result<Vec<StashEntry>, String>>)>,
+    current_epoch: u64,
+    current_repo: Option<&str>,
+) -> Option<Result<Vec<StashEntry>, String>> {
+    current_reading(loading, reply, current_epoch, current_repo)
+}
+
 /// Classify what the stash resource currently holds.
 ///
-/// `state` is the Activity panel's resource after `.flatten()`: `None` while
-/// the fetch is unresolved (or the panel is shut), `Some(Err)` for a failed
+/// `state` is the Activity panel's resource after [`panel_stash_reading`] has
+/// resolved it against the live frame: `None` while the fetch is unresolved
+/// (or the panel is shut, or the reply is stale), `Some(Err)` for a failed
 /// fetch, `Some(Ok)` for an answer.
 pub fn drawer_view(
     state: Option<Result<Vec<StashEntry>, String>>,
@@ -2362,6 +2386,87 @@ mod tests {
             drop_offer.availability,
             Availability::Refused(READ_ONLY_REFUSAL),
             "a read-only drawer must not offer a drop"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #752: the resolution that keeps a reply from one repository out of
+    // another repository's drawer.
+    // -----------------------------------------------------------------------
+    //
+    // `features/stash/view.rs` is `#[cfg(target_arch = "wasm32")]` and never
+    // compiles under `cargo test --workspace`, so a mistake in the wiring
+    // there (the repo key missing from the resource, or the reply not
+    // carrying the repository it was requested for) cannot go red at the
+    // call site. `panel_stash_reading` is the decision moved out of that file
+    // so it can be: these tests move the selection *between* the read and the
+    // render, the one thing nothing in `view.rs` could ever do.
+
+    fn stash_reply(
+        epoch: u64,
+        repo: &str,
+        entries: Vec<StashEntry>,
+    ) -> Option<(u64, Option<String>, Option<Result<Vec<StashEntry>, String>>)> {
+        Some((epoch, Some(repo.to_string()), Some(Ok(entries))))
+    }
+
+    #[test]
+    fn a_stash_reply_requested_for_the_repo_that_is_still_selected_renders() {
+        let reply = stash_reply(1, "repo-a", vec![entry("stash@{0}", 'a')]);
+        let resolved = panel_stash_reading(false, reply, 1, Some("repo-a"));
+        assert_eq!(
+            resolved.unwrap().unwrap()[0].entry.as_str(),
+            "stash@{0}",
+            "same epoch, same repo — the reply is current"
+        );
+    }
+
+    /// The defect this issue names: a stash list requested for the repository
+    /// the panel had open *before* a switch must not render once a different
+    /// repository is selected, even though the epoch bumped (a switch bumps
+    /// it too) — the repository half of the comparison is what actually
+    /// catches this, and a fix that keys only on the epoch would still fail
+    /// this test.
+    #[test]
+    fn a_stash_reply_requested_for_a_repository_no_longer_selected_does_not_render() {
+        let stale = stash_reply(2, "repo-a", vec![entry("stash@{0}", 'a')]);
+        let resolved = panel_stash_reading(false, stale, 2, Some("repo-b"));
+        assert_eq!(
+            resolved, None,
+            "repo-a's stashes must never render under repo-b's drawer, even at \
+             the same epoch"
+        );
+    }
+
+    #[test]
+    fn a_stash_reply_requested_before_the_current_epoch_does_not_render() {
+        let old = stash_reply(1, "repo-a", vec![entry("stash@{0}", 'a')]);
+        let resolved = panel_stash_reading(false, old, 2, Some("repo-a"));
+        assert_eq!(
+            resolved, None,
+            "an epoch bump (a graph-changing write, a repo switch) means a \
+             reply requested before it is no longer current"
+        );
+    }
+
+    #[test]
+    fn a_stash_reply_still_loading_does_not_render_even_if_the_scope_matches() {
+        let reply = stash_reply(1, "repo-a", vec![entry("stash@{0}", 'a')]);
+        let resolved = panel_stash_reading(true, reply, 1, Some("repo-a"));
+        assert_eq!(
+            resolved, None,
+            "a resource retained during reload is not a reading for the new \
+             fetch in flight"
+        );
+    }
+
+    #[test]
+    fn no_accepted_frame_yet_never_renders_a_stash_reply() {
+        let reply = stash_reply(1, "repo-a", vec![entry("stash@{0}", 'a')]);
+        let resolved = panel_stash_reading(false, reply, 1, None);
+        assert_eq!(
+            resolved, None,
+            "with no accepted repository, no reply can describe the drawer"
         );
     }
 

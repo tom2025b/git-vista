@@ -46,6 +46,7 @@
 //! renumbers on every drop, so acting on it would eventually delete a stash
 //! nobody chose.
 
+use axum::extract::Query;
 use axum::http::StatusCode;
 use axum::Json;
 
@@ -54,6 +55,7 @@ use git_vista_protocol::{
     PushStashRequest, StashEntry, StashSelector, StashTarget,
 };
 
+use crate::handlers::read::{resolve_repo, RepoQuery};
 use crate::planner;
 use crate::state::reject_if_read_only;
 
@@ -215,8 +217,20 @@ mod show_stash_query_tests {
 /// A read, so it is not `full_routes`-gated and the LAN router sees it. An app
 /// that can *show* the stash list is useful before any write path exists, which
 /// is why the read shipped first.
-pub(crate) async fn stash_list() -> (StatusCode, String) {
-    let (repo, _read_only) = crate::state::current();
+///
+/// **`?repo=` selects the target the same way every other read endpoint does**
+/// (#752): an absent selector falls back to [`crate::state::current`], the
+/// per-session default — the same fallback `resolve_repo`'s own doc comment
+/// names as the arm #733 took the v2 status read off. Before this, the
+/// handler took no query at all and always answered for the process-wide
+/// default, so a client's `?repo=` — had it sent one — would have had nowhere
+/// to go; the client-side half of this fix (`fetch_stashes`, `activity.rs`)
+/// now sends it.
+pub(crate) async fn stash_list(Query(q): Query<RepoQuery>) -> (StatusCode, String) {
+    let repo = match resolve_repo(q.repo.as_deref()) {
+        Ok((repo, ..)) => repo,
+        Err((status, message)) => return (status, message),
+    };
     match git_vista_git::stash::read_stashes(&repo) {
         Ok(records) => {
             let entries: Result<Vec<StashEntry>, _> = records.iter().map(listing_entry).collect();

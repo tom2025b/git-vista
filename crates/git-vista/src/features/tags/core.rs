@@ -17,6 +17,8 @@
 
 use git_vista_protocol::dto::{SignatureStatus, TagDetail, TagKind};
 
+use crate::features::status::detail::core::current_reading;
+
 /// What an annotated tag with no message body shows instead of a message.
 /// Only annotated tags can reach this: a lightweight tag has nowhere to put a
 /// message, so its silence needs no explanation.
@@ -184,10 +186,33 @@ pub enum TagListView {
     Rows(Vec<TagRow>),
 }
 
+/// Resolve the Activity panel's tag-list resource against the live frame
+/// (#752) — the same host-tested decision
+/// [`panel_worktree_reading`](crate::features::status::core::panel_worktree_reading)
+/// applies to the v2 status read beside it. The reply carries the epoch and
+/// repository it was *requested for*; a reply that is still loading, or was
+/// requested for an epoch or repository that is no longer the live one,
+/// resolves to `None` rather than rendering another repository's tags under
+/// this one's panel.
+///
+/// `current_reading` is generic exactly so this can share the one tested
+/// comparison rather than re-deriving "is this reply stale" a second time —
+/// see its own doc comment for why a second copy of that logic is a second
+/// place for the comparison to be got wrong.
+pub fn panel_tag_reading(
+    loading: bool,
+    reply: Option<(u64, Option<String>, Option<Result<Vec<TagDetail>, String>>)>,
+    current_epoch: u64,
+    current_repo: Option<&str>,
+) -> Option<Result<Vec<TagDetail>, String>> {
+    current_reading(loading, reply, current_epoch, current_repo)
+}
+
 /// Classify what the tag resource currently holds.
 ///
-/// `state` is the Activity panel's resource after `.flatten()`: `None` while
-/// the panel's fetch is unresolved (or the panel is shut), `Some(Err)` for a
+/// `state` is the Activity panel's resource after [`panel_tag_reading`] has
+/// resolved it against the live frame: `None` while the panel's fetch is
+/// unresolved (or the panel is shut, or the reply is stale), `Some(Err)` for a
 /// failed fetch, `Some(Ok)` for an answer.
 pub fn tag_list_view(state: Option<Result<Vec<TagDetail>, String>>) -> TagListView {
     match state {
@@ -540,6 +565,89 @@ mod tests {
                 .map(|r| r.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["a", "m", "z"]
+        );
+    }
+
+    // -- #752: the resolution that keeps a reply from one repository out of
+    // -- another repository's panel. ----------------------------------------
+    //
+    // `activity.rs` is `#[cfg(target_arch = "wasm32")]` and never compiles
+    // under `cargo test --workspace`, so a mistake in the wiring there (the
+    // repo key missing from the resource, or the reply not carrying the
+    // repository it was requested for) cannot go red at the call site.
+    // `panel_tag_reading` is the decision moved out of that file so it can:
+    // these tests move the selection *between* the read and the render, the
+    // one thing nothing in `activity.rs` could ever do.
+
+    fn tags_reply(
+        epoch: u64,
+        repo: &str,
+        names: &[&str],
+    ) -> Option<(u64, Option<String>, Option<Result<Vec<TagDetail>, String>>)> {
+        let tags = names
+            .iter()
+            .map(|n| detail(n, TagKind::Lightweight))
+            .collect();
+        Some((epoch, Some(repo.to_string()), Some(Ok(tags))))
+    }
+
+    #[test]
+    fn a_reply_requested_for_the_repo_that_is_still_selected_renders() {
+        let reply = tags_reply(1, "repo-a", &["v1.0.0"]);
+        let resolved = panel_tag_reading(false, reply, 1, Some("repo-a"));
+        assert_eq!(
+            resolved.unwrap().unwrap()[0].name.as_str(),
+            "v1.0.0",
+            "same epoch, same repo — the reply is current"
+        );
+    }
+
+    /// The defect this issue names: a tag list requested for the repository
+    /// the panel had open *before* a switch must not render once a different
+    /// repository is selected, even though the epoch bumped (a switch bumps
+    /// it too) — the repository half of the comparison is what actually
+    /// catches this, and a fix that keys only on the epoch would still fail
+    /// this test.
+    #[test]
+    fn a_reply_requested_for_a_repository_no_longer_selected_does_not_render() {
+        let stale = tags_reply(2, "repo-a", &["v1.0.0"]);
+        let resolved = panel_tag_reading(false, stale, 2, Some("repo-b"));
+        assert_eq!(
+            resolved, None,
+            "repo-a's tags must never render under repo-b's panel, even at \
+             the same epoch"
+        );
+    }
+
+    #[test]
+    fn a_reply_requested_before_the_current_epoch_does_not_render() {
+        let old = tags_reply(1, "repo-a", &["v1.0.0"]);
+        let resolved = panel_tag_reading(false, old, 2, Some("repo-a"));
+        assert_eq!(
+            resolved, None,
+            "an epoch bump (a graph-changing write, a repo switch) means a \
+             reply requested before it is no longer current"
+        );
+    }
+
+    #[test]
+    fn a_reply_still_loading_does_not_render_even_if_the_scope_matches() {
+        let reply = tags_reply(1, "repo-a", &["v1.0.0"]);
+        let resolved = panel_tag_reading(true, reply, 1, Some("repo-a"));
+        assert_eq!(
+            resolved, None,
+            "a resource retained during reload is not a reading for the new \
+             fetch in flight"
+        );
+    }
+
+    #[test]
+    fn no_accepted_frame_yet_never_renders_a_reply() {
+        let reply = tags_reply(1, "repo-a", &["v1.0.0"]);
+        let resolved = panel_tag_reading(false, reply, 1, None);
+        assert_eq!(
+            resolved, None,
+            "with no accepted repository, no reply can describe the panel"
         );
     }
 }
