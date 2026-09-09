@@ -19,6 +19,18 @@ use git_vista_protocol::dto::{SignatureStatus, TagDetail, TagKind};
 
 use crate::features::status::detail::core::current_reading;
 
+/// What the tag-list resource resolves to once fetched: the tags, or the
+/// user-facing line a failed fetch produced. Named so [`panel_tag_reading`]'s
+/// reply shape reads as one thing rather than a `Result` nested three levels
+/// deep inside an `Option` tuple.
+pub type TagReading = Result<Vec<TagDetail>, String>;
+
+/// The Activity panel's tag-list resource, exactly as `activity.rs`'s
+/// `create_local_resource` produces it: `None` before the first resolution,
+/// `Some((requested_epoch, requested_repo, reading))` after — see
+/// [`panel_tag_reading`].
+pub type TagReply = Option<(u64, Option<String>, Option<TagReading>)>;
+
 /// What an annotated tag with no message body shows instead of a message.
 /// Only annotated tags can reach this: a lightweight tag has nowhere to put a
 /// message, so its silence needs no explanation.
@@ -201,10 +213,10 @@ pub enum TagListView {
 /// place for the comparison to be got wrong.
 pub fn panel_tag_reading(
     loading: bool,
-    reply: Option<(u64, Option<String>, Option<Result<Vec<TagDetail>, String>>)>,
+    reply: TagReply,
     current_epoch: u64,
     current_repo: Option<&str>,
-) -> Option<Result<Vec<TagDetail>, String>> {
+) -> Option<TagReading> {
     current_reading(loading, reply, current_epoch, current_repo)
 }
 
@@ -214,7 +226,7 @@ pub fn panel_tag_reading(
 /// resolved it against the live frame: `None` while the panel's fetch is
 /// unresolved (or the panel is shut, or the reply is stale), `Some(Err)` for a
 /// failed fetch, `Some(Ok)` for an answer.
-pub fn tag_list_view(state: Option<Result<Vec<TagDetail>, String>>) -> TagListView {
+pub fn tag_list_view(state: Option<TagReading>) -> TagListView {
     match state {
         None => TagListView::Loading,
         Some(Err(e)) => TagListView::Failed(format!("Couldn't load tags: {e}")),
@@ -579,11 +591,7 @@ mod tests {
     // these tests move the selection *between* the read and the render, the
     // one thing nothing in `activity.rs` could ever do.
 
-    fn tags_reply(
-        epoch: u64,
-        repo: &str,
-        names: &[&str],
-    ) -> Option<(u64, Option<String>, Option<Result<Vec<TagDetail>, String>>)> {
+    fn tags_reply(epoch: u64, repo: &str, names: &[&str]) -> TagReply {
         let tags = names
             .iter()
             .map(|n| detail(n, TagKind::Lightweight))

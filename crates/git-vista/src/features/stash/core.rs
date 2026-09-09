@@ -43,6 +43,18 @@ use git_vista_protocol::OperationId;
 use crate::features::status::core::{StatusSection, StatusSections};
 use crate::features::status::detail::core::current_reading;
 
+/// What the stash-drawer resource resolves to once fetched: the entries, or
+/// the user-facing line a failed fetch produced. Named so
+/// [`panel_stash_reading`]'s reply shape reads as one thing rather than a
+/// `Result` nested three levels deep inside an `Option` tuple.
+pub type StashReading = Result<Vec<StashEntry>, String>;
+
+/// The Activity panel's stash-drawer resource, exactly as `view.rs`'s
+/// `create_local_resource` produces it: `None` before the first resolution,
+/// `Some((requested_epoch, requested_repo, reading))` after — see
+/// [`panel_stash_reading`].
+pub type StashReply = Option<(u64, Option<String>, Option<StashReading>)>;
+
 // ---------------------------------------------------------------------------
 // The wire shape
 // ---------------------------------------------------------------------------
@@ -283,10 +295,10 @@ pub enum DrawerView {
 /// comparison rather than re-deriving "is this reply stale" a third time.
 pub fn panel_stash_reading(
     loading: bool,
-    reply: Option<(u64, Option<String>, Option<Result<Vec<StashEntry>, String>>)>,
+    reply: StashReply,
     current_epoch: u64,
     current_repo: Option<&str>,
-) -> Option<Result<Vec<StashEntry>, String>> {
+) -> Option<StashReading> {
     current_reading(loading, reply, current_epoch, current_repo)
 }
 
@@ -296,10 +308,7 @@ pub fn panel_stash_reading(
 /// resolved it against the live frame: `None` while the fetch is unresolved
 /// (or the panel is shut, or the reply is stale), `Some(Err)` for a failed
 /// fetch, `Some(Ok)` for an answer.
-pub fn drawer_view(
-    state: Option<Result<Vec<StashEntry>, String>>,
-    write_gate: WriteGate,
-) -> DrawerView {
+pub fn drawer_view(state: Option<StashReading>, write_gate: WriteGate) -> DrawerView {
     match state {
         None => DrawerView::Loading,
         Some(Err(e)) => DrawerView::Failed(format!("Couldn't read the stash list: {e}")),
@@ -2402,11 +2411,7 @@ mod tests {
     // so it can be: these tests move the selection *between* the read and the
     // render, the one thing nothing in `view.rs` could ever do.
 
-    fn stash_reply(
-        epoch: u64,
-        repo: &str,
-        entries: Vec<StashEntry>,
-    ) -> Option<(u64, Option<String>, Option<Result<Vec<StashEntry>, String>>)> {
+    fn stash_reply(epoch: u64, repo: &str, entries: Vec<StashEntry>) -> StashReply {
         Some((epoch, Some(repo.to_string()), Some(Ok(entries))))
     }
 
