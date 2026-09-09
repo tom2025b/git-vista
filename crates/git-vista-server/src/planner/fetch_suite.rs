@@ -383,6 +383,158 @@ async fn a_fetch_with_nothing_to_transfer_publishes_no_progress() {
 }
 
 // ---------------------------------------------------------------------------
+// Repository-config executable boundary
+// ---------------------------------------------------------------------------
+
+/// #755's load-bearing regression proof, through the whole production fetch
+/// path: a repository-local `remote.<name>.uploadpack` program executes under
+/// plain Git, but never executes when the same fetch goes through
+/// `plan_and_execute_in -> exec_fetch -> git_streamed_for -> sandboxed ->
+/// network_command`.
+///
+/// The remote is deliberately named `named`, not `origin`. A hard-coded
+/// `remote.origin.uploadpack` override looks plausible and protects the usual
+/// fixture while leaving every other accepted [`RemoteName`] exposed. The
+/// marker helper delegates to real `git-upload-pack`, so both legs must also
+/// succeed; "the marker is absent because Git failed before transport" cannot
+/// satisfy the hardened assertion.
+///
+/// Mutation proof uses this one run key in two different directions:
+///
+/// 1. remove the explicit `--upload-pack=git-upload-pack` composition;
+/// 2. replace it with a fixed `-c remote.origin.uploadpack=git-upload-pack`,
+///    which still appears to pin the key family but lets `remote.named`'s
+///    repository value win.
+///
+/// Both must be caught here by the marker's presence, while the unmutated
+/// operation remains successful.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repository_named_upload_pack_never_executes_on_the_production_fetch_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_dir, repo) = repo_with_remote_ahead(1);
+    run(&repo, &["remote", "rename", "origin", "named"]);
+
+    let no_hooks = repo.join("no-hooks");
+    std::fs::create_dir(&no_hooks).unwrap();
+    run(
+        &repo,
+        &["config", "core.hooksPath", no_hooks.to_str().unwrap()],
+    );
+
+    let marker = repo.join("repository-upload-pack-ran");
+    let helper = repo.join("repository-upload-pack.sh");
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\nprintf 'RAN\\n' >> {}\nexec git-upload-pack \"$@\"\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&helper, permissions).unwrap();
+    run(
+        &repo,
+        &[
+            "config",
+            "remote.named.uploadpack",
+            helper.to_str().unwrap(),
+        ],
+    );
+    let fsmonitor_marker = repo.join("repository-fsmonitor-ran");
+    let fsmonitor = repo.join("repository-fsmonitor.sh");
+    std::fs::write(
+        &fsmonitor,
+        format!(
+            "#!/bin/sh\nprintf 'RAN\\n' >> {}\nexit 1\n",
+            fsmonitor_marker.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&fsmonitor).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fsmonitor, permissions).unwrap();
+    run(
+        &repo,
+        &["config", "core.fsmonitor", fsmonitor.to_str().unwrap()],
+    );
+
+    // Premise: this exact repository value is live under plain Git, with all
+    // ordinary hooks disabled, and the helper still completes a real fetch.
+    run(&repo, &["fetch", "named"]);
+    assert!(
+        marker.exists(),
+        "plain Git did not execute the repository's upload-pack helper; the \
+         hardened absence assertion below would be vacuous"
+    );
+    assert!(
+        fsmonitor_marker.exists(),
+        "plain Git did not execute the repository's fsmonitor hook during \
+         fetch; the second hardened absence assertion would be vacuous"
+    );
+    std::fs::remove_file(&marker).unwrap();
+    std::fs::remove_file(&fsmonitor_marker).unwrap();
+
+    let op = GitOperation::FetchRemote {
+        remote: RemoteName::new("named").unwrap(),
+    };
+    let hash = operation_hash(&op);
+    let (repository, worktree) = tokens();
+    let (handle, record) = match crate::operations::admit(
+        &key("config-uploadpack-pin"),
+        &op,
+        &hash,
+        repository,
+        worktree,
+        None,
+    ) {
+        Admission::Fresh(handle, record) => (handle, record),
+        _ => panic!("a fresh key must be admitted"),
+    };
+    let (status, body) = run_tracked(&repo, record, op).await;
+    handle.finish(status, body.clone(), None);
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the hardened fetch must still complete, or marker absence can mean \
+         Git failed before it reached transport: {body}"
+    );
+    assert!(
+        !marker.exists(),
+        "the repository-supplied upload-pack executed through the production \
+         Network spawn path"
+    );
+    // The pipeline also performs Local/Strict preflight observations, and
+    // those intentionally do not use the Network harness; one of them may
+    // have queried fsmonitor. Clear that phase's evidence, then drive exactly
+    // the production Network spawn seam used by the fetch executor.
+    std::fs::remove_file(&fsmonitor_marker).ok();
+    let network_fetch = crate::git_cmd::git_streamed_for(
+        &repo,
+        &["fetch", "--progress", "named"],
+        crate::sandbox::NetworkNeed::Remote,
+        None,
+        |_| {},
+    )
+    .await
+    .expect("the production Network fetch spawn runs");
+    assert!(
+        network_fetch.output.status.success(),
+        "the direct production Network spawn must complete, or marker absence \
+         could be an early failure: {}",
+        String::from_utf8_lossy(&network_fetch.output.stderr)
+    );
+    assert!(
+        !fsmonitor_marker.exists(),
+        "the repository-supplied fsmonitor executable ran through the \
+         production Network spawn path"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Cancellation
 // ---------------------------------------------------------------------------
 
@@ -415,25 +567,82 @@ const HANG: Duration = Duration::from_secs(20);
 /// that; the real one lands in well under a second.
 const PROMPT: Duration = Duration::from_secs(3);
 
-/// A remote whose `upload-pack` sleeps for [`HANG`], so `git fetch` hangs at
-/// the point a real transfer would be running — deterministically, with no
-/// socket, no port to bind and no timing race.
+/// A real `git://` peer that accepts the transport connection and then says
+/// nothing for [`HANG`]. This replaced the old test fixture's repo-local
+/// `remote.origin.uploadpack = sh -c 'sleep …'`: #755 correctly pins that key,
+/// so retaining it as the cancellation mechanism would require punching the
+/// exact production hole the new regression test closes.
 ///
-/// `remote.<name>.uploadpack` is a repository-local config key git honours for
-/// a path remote (verified against git 2.43.0: the fetch blocks until the
-/// sleep ends). The sleep is short enough that a leaked grandchild (the kill
-/// reaches the direct child, not the `sh` git started — ADR 0043) dies on its
-/// own well inside one test session, and long enough that a cancel that only
-/// *waited* could never be mistaken for one that killed.
-fn hang_the_next_fetch(repo: &Path) {
+/// The fixed port is the one production grants and is held through the shared
+/// cross-process [`crate::test_ports::PortClaim`]. Drop wakes an unaccepted
+/// listener and stops an accepted wait promptly, so a failed assertion cannot
+/// park the test binary for the full natural timeout.
+struct HangingGitPeer {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    _claim: crate::test_ports::PortClaim,
+}
+
+impl Drop for HangingGitPeer {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(("127.0.0.1", crate::test_ports::PortClaim::PORT));
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn hang_the_next_fetch(repo: &Path) -> HangingGitPeer {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let claim = crate::test_ports::PortClaim::acquire();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", crate::test_ports::PortClaim::PORT))
+        .expect("the port claim guarantees the git-protocol port is free");
+    listener
+        .set_nonblocking(true)
+        .expect("the hanging peer listener can be nonblocking");
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let thread_stop = std::sync::Arc::clone(&stop);
+    let thread = std::thread::spawn(move || {
+        let accepted = loop {
+            if thread_stop.load(Ordering::SeqCst) {
+                return;
+            }
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return,
+            }
+        };
+        let _accepted = accepted;
+        let deadline = std::time::Instant::now() + HANG;
+        while std::time::Instant::now() < deadline && !thread_stop.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+
     run(
         repo,
         &[
-            "config",
-            "remote.origin.uploadpack",
-            &format!("sh -c 'sleep {}' --", HANG.as_secs()),
+            "remote",
+            "set-url",
+            "origin",
+            &format!(
+                "git://127.0.0.1:{}/anything.git",
+                crate::test_ports::PortClaim::PORT
+            ),
         ],
     );
+    HangingGitPeer {
+        stop,
+        thread: Some(thread),
+        _claim: claim,
+    }
 }
 
 /// The mechanism, observed directly: a cancelled [`git_streamed_for`] run
@@ -455,7 +664,7 @@ async fn a_cancelled_stream_leaves_a_signalled_child_not_an_exited_one() {
     use std::os::unix::process::ExitStatusExt;
 
     let (_dir, repo) = repo_with_remote_ahead(5);
-    hang_the_next_fetch(&repo);
+    let hanging_peer = hang_the_next_fetch(&repo);
 
     let (tx, rx) = tokio::sync::watch::channel(false);
     let run_repo = repo.clone();
@@ -505,7 +714,16 @@ async fn a_cancelled_stream_leaves_a_signalled_child_not_an_exited_one() {
 
     // The paired negative: no cancel, same helper, same repository — an
     // ordinary fetch is neither `cancelled` nor signalled.
-    run(&repo, &["config", "--unset", "remote.origin.uploadpack"]);
+    drop(hanging_peer);
+    run(
+        &repo,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            repo.join("upstream.git").to_str().unwrap(),
+        ],
+    );
     let ordinary = crate::git_cmd::git_streamed_for(
         &repo,
         &["fetch", "--progress", "origin"],
@@ -565,7 +783,7 @@ const SIGKILL: i32 = 9;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelling_a_running_fetch_kills_the_child_and_says_nothing_moved() {
     let (_dir, repo) = repo_with_remote_ahead(5);
-    hang_the_next_fetch(&repo);
+    let _hanging_peer = hang_the_next_fetch(&repo);
     let before_tip = std::fs::read_to_string(repo.join(".git/refs/remotes/origin/main")).ok();
 
     let (handle, record) = admit_fetch("cancel-kills");
@@ -827,22 +1045,79 @@ async fn a_dropped_connection_replays_instead_of_fetching_twice() {
 // Redaction on the live path
 // ---------------------------------------------------------------------------
 
-/// A remote that leaks a credential-bearing URL on its own stderr — the
-/// realistic shape of the leak ADR 0036 documents, since git forwards the
-/// remote side's stderr verbatim.
+/// A real git-protocol peer that answers two connections with an `ERR`
+/// pkt-line containing a credential-bearing URL. The first connection is the
+/// unredacted premise and the second is the production path under test.
 ///
-/// (git itself strips userinfo from the URLs it prints; the hole is what
-/// *other programs in the pipeline* print, which is precisely why #228's
-/// redaction operates on the captured bytes rather than trusting git.)
-fn leak_a_credential_on_the_next_fetch(repo: &Path, secret_url: &str) {
+/// This is deliberately a peer on the other end of a socket, not the old
+/// repo-local `remote.origin.uploadpack` stderr helper. #755 now pins that
+/// config key; using it here would test that the pin is absent rather than
+/// test output redaction.
+struct LeakingGitPeer {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    _claim: crate::test_ports::PortClaim,
+}
+
+impl Drop for LeakingGitPeer {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(("127.0.0.1", crate::test_ports::PortClaim::PORT));
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn leak_a_credential_on_two_fetches(repo: &Path, secret_url: &str) -> LeakingGitPeer {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let claim = crate::test_ports::PortClaim::acquire();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", crate::test_ports::PortClaim::PORT))
+        .expect("the port claim guarantees the git-protocol port is free");
+    listener
+        .set_nonblocking(true)
+        .expect("the leaking peer listener can be nonblocking");
+    let payload = format!("ERR tried {secret_url}\n");
+    let packet = format!("{:04x}{payload}", payload.len() + 4).into_bytes();
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let thread_stop = std::sync::Arc::clone(&stop);
+    let thread = std::thread::spawn(move || {
+        let mut served = 0;
+        while served < 2 && !thread_stop.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.write_all(&packet);
+                    served += 1;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
     run(
         repo,
         &[
-            "config",
-            "remote.origin.uploadpack",
-            &format!("sh -c 'echo tried {secret_url} >&2; exit 3' --"),
+            "remote",
+            "set-url",
+            "origin",
+            &format!(
+                "git://127.0.0.1:{}/anything.git",
+                crate::test_ports::PortClaim::PORT
+            ),
         ],
     );
+    LeakingGitPeer {
+        stop,
+        thread: Some(thread),
+        _claim: claim,
+    }
 }
 
 /// A secret the remote printed never reaches the operation record.
@@ -859,7 +1134,7 @@ async fn a_credential_leaked_by_the_remote_never_reaches_the_operation_record() 
     let secret_url = format!("https://svcuser:{SECRET}@leaked-host.invalid/org/repo.git");
 
     let (_dir, repo) = repo_with_remote_ahead(5);
-    leak_a_credential_on_the_next_fetch(&repo, &secret_url);
+    let _leaking_peer = leak_a_credential_on_two_fetches(&repo, &secret_url);
 
     // Premise: unredacted, this fixture really does leak.
     let raw = std::process::Command::new("git")
