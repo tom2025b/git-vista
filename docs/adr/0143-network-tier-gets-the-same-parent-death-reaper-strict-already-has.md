@@ -178,10 +178,11 @@ every residual is closed too.
 
 ## How it was proved
 
-Two new acceptance tests, both in `sandbox::lifecycle`, modeled directly on
-ADR 0141's own #728 tests (same helper-process fixture,
+Two new acceptance tests in `sandbox::lifecycle`, modeled directly on ADR
+0141's own #728 tests (same helper-process fixture,
 `spawn_helper_owning_the_launcher` — reused unmodified, since it already takes
-`&Policy` generically rather than assuming `Tier::Strict`):
+`&Policy` generically rather than assuming `Tier::Strict`), plus a third, direct
+unit test the mutation proof itself found missing (see arm 2 below):
 
 **`a_reaper_process_reaps_a_network_tier_launcher_when_only_its_own_parent_is_sigkilled`**
 is #757's positive case: a helper process (raw `fork`+`execvp`, standing in
@@ -207,17 +208,36 @@ a double-forked `setsid` orphan is not, because it left that group by
 construction and `Tier::Network` has no kernel-level namespace backstop the
 way `Tier::Strict` does.
 
-`failure-atlas`'s `mutation_check`, same `run_key` across both arms, targets
-both new lifecycle tests plus the existing `sandbox::argv`/`sandbox::spawn`
-suites so a regression in either the detection or the wrap is caught by
-whichever test actually exercises it:
+`failure-atlas`'s `mutation_check`, same `run_key` across both arms, same
+`wrap_with_reaper` edit both times:
 
-| # | Shape | Mutation | Verdict |
-|---|---|---|---|
-| 1 | remove the mechanism | `is_network_shim_launch`'s `shim_path()` comparison deleted (always `false`) | **caught** |
-| 2 | weaken the mechanism | the comparison changed from `argv.first() == Some(shim)` to `argv.first().is_some()` (wraps everything, including `Tier::Unsandboxed`'s bare `git`) | **caught** |
+| # | Shape | Mutation | Target | Verdict |
+|---|---|---|---|---|
+| 1 | remove the mechanism | `is_network_shim_launch`'s `shim_path()` comparison deleted (always `false`) | `sandbox::lifecycle::` | **caught** |
+| 2 | weaken the mechanism, attempt 1 | the comparison changed from `argv.first() == Some(shim)` to `argv.first().is_some()` (wraps everything, including `Tier::Unsandboxed`'s bare `git`) | `sandbox::lifecycle::` | **survived** |
+| 2 | weaken the mechanism, attempt 2 (same edit) | identical mutation, re-run after the fix below | `sandbox::spawn::` | **caught** |
 
-Both arms run against the same production build `cargo test -p
+**Arm 2's first `survived` is recorded honestly, not discarded — it found a
+real gap.** Every `sandbox::lifecycle` test drives either `strict_baseline`
+or `network_control`; none of them ever exercises `Tier::Unsandboxed` through
+`wrap_with_reaper` at all, so a mutation that wrapped *every* argv — including
+the bare `["git"]` shape that must never be touched — had no test in that
+file positioned to see it. This was not a gap this ADR introduced: no earlier
+test anywhere in the crate pinned `wrap_with_reaper`'s selection logic
+directly either; ADR 0141's own Strict-only scoping relied on the same
+process-tree acceptance tests, which by construction only ever exercise the
+tiers they're written for.
+
+The fix is
+`sandbox::spawn::tests::wrap_with_reaper_recognizes_exactly_the_two_sandboxed_launcher_shapes`
+— a new, fast, pure unit test calling `wrap_with_reaper` directly on all
+three raw argv shapes (`sandbox_argv_with_seccomp_profile`'s own three
+exhaustive outputs) and asserting each one's fate: Strict and Network both
+wrapped, Unsandboxed never. Re-run against the same edit with this test in
+scope, arm 2 is **caught**, pinning exactly the boundary the acceptance
+tests could not see.
+
+All three runs are against the same production build `cargo test -p
 git-vista-server` compiles by default (`tests/forces_reaper_build.rs` and
 `tests/forces_shim_build.rs` both pull their respective binaries into the
 build plan) — no `cfg`, no target filter, nothing proved over code the run
