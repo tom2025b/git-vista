@@ -122,6 +122,37 @@ pub(crate) struct BootRefusal {
     pub verdict: ProbeVerdict,
 }
 
+/// Turn a named missing prerequisite into advice that fixes that prerequisite.
+///
+/// This deliberately keys off the same stable words carried in
+/// [`ProbeVerdict::CapabilityAbsent`]. Keeping the diagnosis and remediation
+/// together prevents the exact failure #762 exposed: `missing=["shim"]`
+/// paired with advice to install an already-present bubblewrap binary.
+fn capability_absent_message(missing: &[&str]) -> String {
+    match missing {
+        ["HOME"] => "$HOME is unset, so the sandbox policy cannot identify the home tree. Set \
+                     HOME to the server user's home directory, then restart."
+            .to_string(),
+        ["shim"] => "the `gv-sandbox` launcher is missing beside the server binary. Build and \
+                     package `gv-sandbox` alongside the server, then restart."
+            .to_string(),
+        ["bwrap"] => "the bubblewrap executable was not found at a reviewed system path. Install \
+                      bubblewrap, then restart."
+            .to_string(),
+        ["strict_launch"] => "the composed strict launcher failed even though every measured \
+                              prerequisite was present. Inspect the launcher failure; installing \
+                              already-present prerequisites will not fix it."
+            .to_string(),
+        ["scratch_dir"] => "the boot probe could not create its scratch directory. Check the \
+                            server process's temporary-directory access, then restart."
+            .to_string(),
+        _ => format!(
+            "this host cannot supply the strict tier (missing: {missing:?}). Provide every named \
+             sandbox prerequisite, then restart."
+        ),
+    }
+}
+
 impl std::fmt::Display for BootRefusal {
     /// Names what was missing (or what failed) and why the server will not
     /// start, so an operator reading stderr can act on it without reading
@@ -134,9 +165,9 @@ impl std::fmt::Display for BootRefusal {
             ),
             ProbeVerdict::CapabilityAbsent { missing } => write!(
                 f,
-                "sandbox unavailable: this host cannot supply the strict tier \
-                 (missing: {missing:?}). Install bubblewrap and enable unprivileged \
-                 user namespaces, then restart. (INV-13 — there is no degraded mode.)"
+                "sandbox unavailable (missing: {missing:?}): {} (INV-13 — there is no \
+                 degraded mode.)",
+                capability_absent_message(missing)
             ),
             ProbeVerdict::FailOpen { failed_checks } => write!(
                 f,
@@ -316,15 +347,19 @@ fn boot_probe_fixture() -> std::io::Result<BootProbeFixture> {
 /// here; blocking it would make the probe blind to everything it exists to
 /// check.
 fn boot_probe_policy(scratch: &Path, markers: &Path) -> Result<Policy, &'static str> {
-    let home = PathBuf::from(std::env::var_os("HOME").ok_or("HOME")?);
+    let (home, shim, bwrap) = boot_probe_prerequisites(
+        std::env::var_os("HOME"),
+        || super::shim::shim_path().ok().map(Path::to_path_buf),
+        || super::bwrap::bwrap_path().map(Path::to_path_buf),
+    )?;
     let (mut rw, mut ro) = default_system_trees(Tier::Strict);
     rw.push(scratch.to_path_buf());
     rw.push(markers.to_path_buf());
     ro.push(home.clone());
     Ok(Policy {
         tier: Tier::Strict,
-        shim: super::shim::shim_path().map_err(|_| "shim")?.to_path_buf(),
-        bwrap: Some(super::bwrap::bwrap_path().ok_or("bwrap")?.to_path_buf()),
+        shim,
+        bwrap: Some(bwrap),
         rw_trees: rw,
         ro_trees: ro,
         secret_excludes: secret_excludes_for_home(&home),
@@ -334,6 +369,25 @@ fn boot_probe_policy(scratch: &Path, markers: &Path) -> Result<Policy, &'static 
         net_ports: Vec::new(),
         hook_mode: HookMode::Run,
     })
+}
+
+/// Resolve the three non-kernel prerequisites used while constructing the
+/// boot policy. The launcher lookups are closures so HOME still fails first
+/// without touching either process-wide path cache, matching the production
+/// order that existed before this seam was extracted.
+///
+/// Besides preserving that order, the seam lets unit tests simulate each
+/// absence without mutating process-wide environment variables or caches that
+/// sibling tests use concurrently.
+fn boot_probe_prerequisites(
+    home: Option<std::ffi::OsString>,
+    shim: impl FnOnce() -> Option<PathBuf>,
+    bwrap: impl FnOnce() -> Option<PathBuf>,
+) -> Result<(PathBuf, PathBuf, PathBuf), &'static str> {
+    let home = PathBuf::from(home.ok_or("HOME")?);
+    let shim = shim().ok_or("shim")?;
+    let bwrap = bwrap().ok_or("bwrap")?;
+    Ok((home, shim, bwrap))
 }
 
 /// Which named capability is absent, given a measured [`Capabilities`] — the
@@ -377,6 +431,16 @@ fn missing_capabilities(caps: &Capabilities) -> Vec<&'static str> {
 fn baseline_failed_verdict(caps: &Capabilities) -> ProbeVerdict {
     ProbeVerdict::CapabilityAbsent {
         missing: missing_capabilities(caps),
+    }
+}
+
+/// A failure that happened before the composed launcher could run already has
+/// a precise name from [`boot_probe_policy`]. Preserve it rather than replacing
+/// it with `missing_capabilities(caps)`, whose all-green residual is
+/// `strict_launch` and therefore describes a different failure stage.
+fn policy_failed_verdict(missing: &'static str) -> ProbeVerdict {
+    ProbeVerdict::CapabilityAbsent {
+        missing: vec![missing],
     }
 }
 
@@ -480,8 +544,9 @@ pub(crate) async fn verdict(caps: &Capabilities) -> ProbeVerdict {
             missing: vec!["scratch_dir"],
         };
     };
-    let Ok(policy) = boot_probe_policy(&fixture.repo(), &fixture.markers()) else {
-        return baseline_failed_verdict(caps);
+    let policy = match boot_probe_policy(&fixture.repo(), &fixture.markers()) {
+        Ok(policy) => policy,
+        Err(missing) => return policy_failed_verdict(missing),
     };
 
     // The baseline leg: `git --version` writes nothing, runs no hook, and
@@ -656,8 +721,8 @@ pub(crate) async fn run_at_startup() -> Result<ProbeVerdict, BootRefusal> {
         ProbeVerdict::CapabilityAbsent { missing } => {
             eprintln!("[sandbox] verdict=capability_absent missing={missing:?}");
             eprintln!(
-                "[sandbox] refusing to start: this host cannot supply the strict tier \
-                 (INV-13). Install bubblewrap and enable unprivileged user namespaces."
+                "[sandbox] refusing to start: {} (INV-13 — there is no degraded mode.)",
+                capability_absent_message(missing)
             );
         }
         ProbeVerdict::FailOpen { failed_checks } => {
@@ -709,6 +774,78 @@ mod tests {
             seccomp_available: true,
         };
         assert_eq!(missing_capabilities(&full), vec!["strict_launch"]);
+    }
+
+    fn assert_policy_failure_message(cause: &'static str, expected: &str) {
+        let verdict = policy_failed_verdict(cause);
+        assert_eq!(
+            verdict,
+            ProbeVerdict::CapabilityAbsent {
+                missing: vec![cause]
+            },
+            "the policy-construction diagnosis must survive into the verdict"
+        );
+
+        let message = BootRefusal { verdict }.to_string();
+        assert!(
+            message.contains(expected),
+            "{cause} refusal did not carry its specific remedy: {message}"
+        );
+        assert!(
+            !message.contains("strict_launch"),
+            "a named policy-construction failure must not become strict_launch: {message}"
+        );
+    }
+
+    /// `$HOME` is read before either launcher path is used. Simulate that
+    /// policy-construction failure and prove the refusal tells the operator to
+    /// set HOME, not to reinstall a launcher that may already be present.
+    #[test]
+    fn an_unset_home_reports_home_and_its_specific_remedy() {
+        let cause = boot_probe_prerequisites(
+            None,
+            || Some(PathBuf::from("/present/gv-sandbox")),
+            || Some(PathBuf::from("/present/bwrap")),
+        )
+        .unwrap_err();
+        assert_policy_failure_message(cause, "$HOME is unset");
+        let message = capability_absent_message(&["HOME"]);
+        assert!(!message.contains("Install bubblewrap"), "{message}");
+    }
+
+    /// Simulate `shim_path()` returning `NotFound`, the exact #754 build-plan
+    /// failure that motivated #762. The missing build artifact must be named
+    /// and the remediation must point at packaging, not host namespaces.
+    #[test]
+    fn a_missing_shim_reports_shim_and_its_specific_remedy() {
+        let cause = boot_probe_prerequisites(
+            Some("/home/test".into()),
+            || None,
+            || Some(PathBuf::from("/present/bwrap")),
+        )
+        .unwrap_err();
+        assert_policy_failure_message(cause, "`gv-sandbox` launcher is missing");
+        let message = capability_absent_message(&["shim"]);
+        assert!(
+            message.contains("Build and package `gv-sandbox`"),
+            "{message}"
+        );
+        assert!(!message.contains("Install bubblewrap"), "{message}");
+    }
+
+    /// Simulate `bwrap_path()` returning `None`. Unlike the two cases above,
+    /// installing bubblewrap is the relevant action and the message says so.
+    #[test]
+    fn a_missing_bwrap_reports_bwrap_and_its_specific_remedy() {
+        let cause = boot_probe_prerequisites(
+            Some("/home/test".into()),
+            || Some(PathBuf::from("/present/gv-sandbox")),
+            || None,
+        )
+        .unwrap_err();
+        assert_policy_failure_message(cause, "bubblewrap executable was not found");
+        let message = capability_absent_message(&["bwrap"]);
+        assert!(message.contains("Install bubblewrap"), "{message}");
     }
 
     /// INV-13's deciding half, and **the negative case this task's
