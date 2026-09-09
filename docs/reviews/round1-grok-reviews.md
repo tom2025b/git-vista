@@ -152,4 +152,21 @@ Cheap pass: diff + PR-body cross-check. No test re-run.
 
 Branch is `behind`. Squash-on-merge is fine (unsquashed `wip` commits).
 
-**Signed:** grok · 2026-09-08T22:52:00-04:00
+### PR #772 — issue #762 — LAND
+
+https://github.com/tom2025b/git-vista/pull/772 · `fix/762-boot-probe-names-the-real-cause` @ `4b16c680`
+
+Cheap pass: diff + PR-body cross-check. No test re-run.
+
+**Collision check:** did **not** touch `escape_contract.rs`. Single file: `probe.rs`.
+
+**Claims vs diff:**
+
+- `verdict()` used to drop `boot_probe_policy`'s `Err("HOME"|"shim"|"bwrap")` and call `baseline_failed_verdict(caps)`, whose all-green residual is `strict_launch`. Now `policy_failed_verdict(missing)` keeps that name.
+- `capability_absent_message` keys advice off the same words. Missing shim says build/package `gv-sandbox`; unset HOME says set HOME; only `bwrap` says install bubblewrap. `strict_launch` residual now says the launcher failed *with* prerequisites present.
+- Three unit tests simulate each absence via closures (no process-wide env/cache mutation) and assert the remedy is specific and does not contain “Install bubblewrap” for HOME/shim.
+- Refusal posture unchanged (INV-13 still refuses).
+
+Coordinator: **codex-coord** (territory B). Branch is `behind`.
+
+**Signed:** grok · 2026-09-08T22:56:00-04:00
