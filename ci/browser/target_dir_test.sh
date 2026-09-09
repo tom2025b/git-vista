@@ -15,6 +15,11 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." && pwd)"
 work="$(mktemp -d -t gv-browser-target-XXXXXX)"
 trap 'rm -rf "$work"' EXIT
+real_node="$(command -v node 2>/dev/null || true)"
+if [[ -z $real_node || ! -x $real_node ]]; then
+  echo 'FAIL: target-dir regression needs node to drive the real browser launchers' >&2
+  exit 1
+fi
 
 test_repo="$work/repo"
 shim_bin="$work/bin"
@@ -44,7 +49,7 @@ cat > "$shim_bin/node" <<'EOF'
 if [[ ${1:-} == -v || ${1:-} == --version ]]; then
   echo v22.0.0
 else
-  exec /usr/bin/node "$@"
+  exec "$GV_TARGET_TEST_NODE" "$@"
 fi
 EOF
 
@@ -122,7 +127,8 @@ run_case() {
   set +e
   ( cd "$test_repo" && \
     env HOME="$test_home" PATH="$shim_bin:/usr/bin:/bin" \
-      GV_TARGET_TEST_WORK="$work" GV_EXPECTED_TARGET="$expected" \
+      GV_TARGET_TEST_WORK="$work" GV_TARGET_TEST_NODE="$real_node" \
+      GV_EXPECTED_TARGET="$expected" \
       "$@" bash ./dev browser ) > "$work/transcript" 2>&1
   rc=$?
   set -e
@@ -134,6 +140,7 @@ run_case() {
     || fail "$name did not execute the server from $expected"
   [[ -e $work/fixture-args ]] \
     || fail "$name did not execute the fixture catalogue from $expected"
+  printf 'browser target-dir scenario passed: %s\n' "$name"
 }
 
 run_case 'explicit CARGO_TARGET_DIR' "$work/assigned-target" \
