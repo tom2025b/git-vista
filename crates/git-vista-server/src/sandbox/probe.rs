@@ -194,7 +194,7 @@ pub(crate) type Observation = std::collections::BTreeMap<String, String>;
 #[derive(Debug)]
 pub(crate) enum LaunchFailed {
     Spawn,
-    Carrier(Option<i32>),
+    Carrier,
     NoMarkers,
 }
 
@@ -513,7 +513,7 @@ pub(crate) async fn observe(policy: &Policy, repo: &Path) -> Result<Observation,
     .await
     .map_err(|_| LaunchFailed::Spawn)?;
     if !out.status.success() {
-        return Err(LaunchFailed::Carrier(out.status.code()));
+        return Err(LaunchFailed::Carrier);
     }
     let markers = repo
         .parent()
