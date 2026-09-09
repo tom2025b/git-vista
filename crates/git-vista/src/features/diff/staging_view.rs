@@ -289,7 +289,14 @@ fn line_check(
     local: u32,
     selection: RwSignal<DiffSelection>,
 ) -> View {
-    let checked = {
+    // Two independent closures, same reason `hunk_row`'s
+    // `checked_for_pressed`/`checked_for_glyph` split does: `file` isn't
+    // `Copy`, so one closure value can't be called from two `move` sites.
+    let checked_for_pressed = {
+        let file = file.clone();
+        move || selection.with(|s| s.is_line_selected(&file, anchor.index, local))
+    };
+    let checked_for_glyph = {
         let file = file.clone();
         move || selection.with(|s| s.is_line_selected(&file, anchor.index, local))
     };
@@ -302,11 +309,11 @@ fn line_check(
             type="button"
             class="stage-line-check"
             tabindex="-1"
-            aria-pressed=move || checked().to_string()
+            aria-pressed=move || checked_for_pressed().to_string()
             aria-label="Select this line for staging"
             on:click=on_click
         >
-            {move || if checked() { "\u{2713}" } else { "" }}
+            {move || if checked_for_glyph() { "\u{2713}" } else { "" }}
         </button>
     }
     .into_view()
