@@ -626,7 +626,9 @@ async fn send(kind: &OperationKind, key: IdempotencyKey) -> Result<WriteReceipt,
         OperationKind::DeleteUntrackedPaths { repo, paths } => {
             api::delete_untracked_paths_request(*repo, paths.clone(), key).await
         }
-        OperationKind::DeleteLocalTag { tag } => api::delete_tag_request(tag, key).await,
+        OperationKind::DeleteLocalTag { repo, tag } => {
+            api::delete_tag_request(*repo, tag, key).await
+        }
         // M11.05 (#550). `name` plays no part in the request — the server
         // resolves `id` to a real path itself, via a fresh census — so only
         // `id` crosses the wire.

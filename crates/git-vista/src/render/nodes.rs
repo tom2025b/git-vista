@@ -161,6 +161,13 @@ pub fn build_node(
         // the identical menu from a focused row's own bounding rect instead
         // of a pointer event's coordinates, without a second copy of
         // `MenuData`'s construction.
+        // Capture from this row's frame, never from the live selection at
+        // click/confirm/dispatch time (#765).
+        let tag_repo = c
+            .frame
+            .worktree_id
+            .as_deref()
+            .and_then(|id| id.parse().ok());
         let open_menu_at = {
             let commit_id = commit_id.clone();
             let short = short.clone();
@@ -191,6 +198,7 @@ pub fn build_node(
                 // here costs one lookup per tap and cannot go stale at all.
                 let wip_run = display.with_value(|d| d.run_containing_row(row_index));
                 shell.open_menu(MenuData {
+                    tag_repo,
                     wip_run,
                     commit: commit_id.clone(),
                     header: short.clone(),

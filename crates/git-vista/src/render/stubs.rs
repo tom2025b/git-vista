@@ -157,6 +157,7 @@ pub fn stubs(
             // the identical menu — same split as the commit dots in nodes.rs.
             let open_menu_at = move |x: f64, y: f64| {
                 shell.open_menu(MenuData {
+        tag_repo: None,
                     wip_run: None,
                     commit: commit_id.clone(),
                     header: header.clone(),

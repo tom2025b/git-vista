@@ -74,7 +74,10 @@ fn write_dtos_reject_smuggled_args_and_wrong_shapes() {
         ),
         (
             "delete-tag+remote",
-            serde_json::from_str::<DeleteTagRequest>(r#"{"tag":"v1","remote":"origin"}"#).err(),
+            serde_json::from_str::<DeleteTagRequest>(
+                r#"{"repo":"id","tag":"v1","remote":"origin"}"#,
+            )
+            .err(),
         ),
     ] {
         assert!(err.is_some(), "{what}: unknown field was accepted");
@@ -166,8 +169,8 @@ fn a_positional_array_body_is_the_object_body_and_smuggles_nothing() {
         "and the keyed spelling of the same extra is refused too"
     );
     assert!(
-        serde_json::from_str::<DeleteTagRequest>(r#"["v1","origin"]"#).is_err(),
-        "one field, two elements: refused"
+        serde_json::from_str::<DeleteTagRequest>(r#"["id","v1","origin"]"#).is_err(),
+        "two fields, three elements: refused"
     );
 }
 

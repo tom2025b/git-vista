@@ -316,7 +316,13 @@ pub(crate) async fn delete_tag(Json(req): Json<DeleteTagRequest>) -> (StatusCode
         // Unreachable after the two checks above; kept total rather than panic.
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()),
     };
-    planner::plan_and_execute(GitOperation::DeleteLocalTag { name }).await
+    let expected = match req.repo.parse::<git_vista_core::identity::WorktreeId>() {
+        Ok(id) => id,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Not a repository id.".to_string()),
+    };
+    // Compare at target resolution, using the same pinned target for execution
+    // (ADR 0140). Linked worktrees share tag refs, but not selection identity.
+    planner::plan_and_execute_matching(GitOperation::DeleteLocalTag { name }, expected).await
 }
 
 /// Publish a tag to a configured remote (`POST /api/push-tag`, M2.21f #240):
@@ -1744,5 +1750,165 @@ pub(crate) mod tests {
             ),
             SignatureStatus::Valid
         );
+    }
+}
+
+/// #765: a selector is a precondition on the selected worktree, including
+/// when both worktrees expose the very same shared tag ref.
+#[cfg(test)]
+mod delete_selector_tests {
+    use super::*;
+    use axum::{body::Body, http::Request, routing::post, Router};
+    use git_vista_protocol::{
+        ApiError, ErrorCode, IdempotencyKey, PROTOCOL_HEADER, PROTOCOL_VERSION,
+    };
+    use tower::ServiceExt;
+
+    static NEXT_KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    async fn request(body: serde_json::Value) -> (StatusCode, String) {
+        let app = Router::new()
+            .route("/api/delete-tag", post(delete_tag))
+            .layer(axum::middleware::from_fn(crate::middleware::api_contract));
+        let response = crate::operations::with_key(
+            IdempotencyKey::new(format!(
+                "tag-selector-{}",
+                NEXT_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ))
+            .unwrap(),
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+            app.oneshot(
+                Request::post("/api/delete-tag")
+                    .header("content-type", "application/json")
+                    .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    fn sibling(repo: &std::path::Path, desk: &std::path::Path) {
+        git_vista_fixtures::git::run(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "desk",
+                desk.to_str().unwrap(),
+            ],
+        );
+        crate::state::allow_repo_root(desk);
+    }
+
+    async fn tags(id: &str) -> Vec<TagDetail> {
+        let response = tag_list(Query(RepoQuery {
+            repo: Some(id.to_string()),
+        }))
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_tag_from_a_sibling_worktree_is_refused_with_a_typed_412() {
+        crate::state::with_isolated_test_current(async {
+            let dir = tempfile::tempdir().unwrap();
+            let desks = tempfile::tempdir().unwrap();
+            let fixture = super::tests::build_tagged_fixture(dir.path());
+            let main = crate::state::set_current(dir.path(), git_vista_protocol::RepoMode::Active)
+                .unwrap();
+            let before = tags(&fixture.repo_id).await;
+            let desk = desks.path().join("desk");
+            sibling(dir.path(), &desk);
+            let selected =
+                crate::state::set_current(&desk, git_vista_protocol::RepoMode::Active).unwrap();
+            assert_eq!(main.repository, selected.repository);
+            assert_ne!(main.worktree, selected.worktree);
+            assert_eq!(
+                before,
+                tags(&selected.worktree.to_string()).await,
+                "linked worktrees share all tag refs, including their target oids"
+            );
+            assert_eq!(before.len(), 2);
+
+            for tag in &before {
+                let (status, body) =
+                    request(serde_json::json!({"repo": fixture.repo_id, "tag": tag.name})).await;
+                // Assert non-execution independently of the returned status.
+                assert_eq!(
+                    tags(&fixture.repo_id).await,
+                    before,
+                    "a refused delete changed the shared refs: {body}"
+                );
+                assert_eq!(tags(&selected.worktree.to_string()).await, before);
+                assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+                let error: ApiError = serde_json::from_str(&body).unwrap();
+                assert_eq!(error.error.code, ErrorCode::PreconditionFailed);
+                assert!(!body.contains(&fixture.repo_id));
+                assert!(!body.contains(&selected.worktree.to_string()));
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_matching_tag_selector_deletes_the_shared_ref() {
+        crate::state::with_isolated_test_current(async {
+            let dir = tempfile::tempdir().unwrap();
+            let desks = tempfile::tempdir().unwrap();
+            let fixture = super::tests::build_tagged_fixture(dir.path());
+            let desk = desks.path().join("desk");
+            sibling(dir.path(), &desk);
+            let selected =
+                crate::state::set_current(&desk, git_vista_protocol::RepoMode::Active).unwrap();
+            for tag in ["tip-marker", "v1.0"] {
+                let (status, body) =
+                    request(serde_json::json!({"repo": selected.worktree.to_string(), "tag": tag}))
+                        .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert!(tags(&fixture.repo_id)
+                    .await
+                    .iter()
+                    .all(|t| t.name.as_str() != tag));
+                assert!(tags(&selected.worktree.to_string())
+                    .await
+                    .iter()
+                    .all(|t| t.name.as_str() != tag));
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn missing_null_and_malformed_tag_selectors_never_delete() {
+        crate::state::with_isolated_test_current(async {
+            let dir = tempfile::tempdir().unwrap();
+            let fixture = super::tests::build_tagged_fixture(dir.path());
+            let before = tags(&fixture.repo_id).await;
+            for (body, expected) in [
+                (serde_json::json!({"tag": "tip-marker"}), StatusCode::UNPROCESSABLE_ENTITY),
+                (serde_json::json!({"tag": "tip-marker", "repo": null}), StatusCode::UNPROCESSABLE_ENTITY),
+                (serde_json::json!({"tag": "tip-marker", "repo": "/etc"}), StatusCode::BAD_REQUEST),
+                (serde_json::json!({"tag": "tip-marker", "repo": ""}), StatusCode::BAD_REQUEST),
+                (serde_json::json!({"tag": "tip-marker", "repo": "00000000-0000-0000-0000-000000000001"}), StatusCode::PRECONDITION_FAILED),
+            ] {
+                let (status, body) = request(body).await;
+                assert_eq!(status, expected, "{body}");
+                assert_eq!(tags(&fixture.repo_id).await, before);
+            }
+        }).await;
     }
 }

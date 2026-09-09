@@ -175,7 +175,12 @@ pub enum OperationKind {
     /// (#74), because it opens a socket with credentials on it. Named for
     /// the server's own `GitOperation::DeleteLocalTag`, the same naming
     /// rule `DiscardTrackedPaths`/`DeleteUntrackedPaths` above follow.
-    DeleteLocalTag { tag: String },
+    DeleteLocalTag {
+        /// Captured from the frame that supplied the tag badge, before the
+        /// confirmation opens. Carried unchanged to the write (ADR 0140).
+        repo: WorktreeId,
+        tag: String,
+    },
     /// `git worktree remove <path>` on a linked sibling (`POST
     /// /api/remove-worktree`, M11.05/#550). `id` is the opaque census id and
     /// the mutation authority — the server resolves it to a real path via a
@@ -440,7 +445,7 @@ impl OperationKind {
             }
             // Mirrors the branch `Delete`/`ForceDelete` arms' wording —
             // named subject, no type-name leak.
-            Self::DeleteLocalTag { tag } => format!("Deleting tag \u{2018}{tag}\u{2019}"),
+            Self::DeleteLocalTag { tag, .. } => format!("Deleting tag \u{2018}{tag}\u{2019}"),
             // Names the desk by its display label, never its id — the
             // strip is for a person, and an id is not a name.
             Self::RemoveWorktree { name, .. } => {
@@ -602,7 +607,10 @@ mod tests {
                 repo: WorktreeId::from_git_dir("/fixture/.git"),
                 paths: vec!["scratch.txt".into(), "note.md".into()],
             },
-            OperationKind::DeleteLocalTag { tag: "v1.0".into() },
+            OperationKind::DeleteLocalTag {
+                repo: WorktreeId::from_git_dir("/fixture/.git"),
+                tag: "v1.0".into(),
+            },
             OperationKind::RemoveWorktree {
                 id: "worktree-desk-two".into(),
                 name: "desk-two".into(),
@@ -742,7 +750,11 @@ mod tests {
     /// branch delete/undo arms name their subject — never a bare "Deleting".
     #[test]
     fn delete_local_tag_names_the_tag() {
-        let text = OperationKind::DeleteLocalTag { tag: "v1.0".into() }.describe();
+        let text = OperationKind::DeleteLocalTag {
+            repo: WorktreeId::from_git_dir("/fixture/.git"),
+            tag: "v1.0".into(),
+        }
+        .describe();
         assert_eq!(text, "Deleting tag \u{2018}v1.0\u{2019}");
     }
 }
@@ -821,7 +833,10 @@ mod fetch_pull_tests {
                 repo: WorktreeId::from_git_dir("/fixture/.git"),
                 paths: vec!["scratch.txt".into()],
             },
-            OperationKind::DeleteLocalTag { tag: "v1.0".into() },
+            OperationKind::DeleteLocalTag {
+                repo: WorktreeId::from_git_dir("/fixture/.git"),
+                tag: "v1.0".into(),
+            },
             OperationKind::RemoveWorktree {
                 id: "worktree-desk-two".into(),
                 name: "desk-two".into(),

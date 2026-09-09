@@ -121,13 +121,18 @@ pub async fn fetch_tags(repo: &str) -> Result<Vec<TagDetail>, String> {
 /// destructive half of the pair, reached only from the danger-styled confirm
 /// modal, never the direct-POST path [`create_tag_request`] takes.
 ///
-/// Local only — deleting a tag already pushed to a remote reaches a different
-/// route, still to come (#74), because that one opens a socket with
-/// credentials on it.
-pub async fn delete_tag_request(tag: &str, key: IdempotencyKey) -> Result<WriteReceipt, String> {
+/// `repo` is captured with the tag badges, before confirmation. Never replace
+/// it with the live selection at dispatch: the server uses it as a precondition
+/// on the selected worktree (ADR 0140), returning a typed 412 on mismatch.
+pub async fn delete_tag_request(
+    repo: git_vista_core::identity::WorktreeId,
+    tag: &str,
+    key: IdempotencyKey,
+) -> Result<WriteReceipt, String> {
     refuse_if_offline()?;
     refuse_if_visualize()?;
     let body = DeleteTagRequest {
+        repo: repo.to_string(),
         tag: tag.to_string(),
     };
     let json = serde_json::to_string(&body).map_err(|e| e.to_string())?;

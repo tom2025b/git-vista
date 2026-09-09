@@ -296,7 +296,7 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                 // not `Irreversible`), but there is no frontend Undo
                 // affordance for it today, so claiming recoverability here
                 // would promise a button that doesn't exist.
-                PendingOp::DeleteLocalTag { tag } => ConfirmPrompt::plain(
+                PendingOp::DeleteLocalTag { tag, .. } => ConfirmPrompt::plain(
                     "Delete tag",
                     format!("Delete tag ‘{tag}’? This removes it from this repository only — a copy already pushed to a remote is untouched."),
                     "Delete",

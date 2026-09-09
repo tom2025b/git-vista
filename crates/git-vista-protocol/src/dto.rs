@@ -390,6 +390,10 @@ pub struct SignTagError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeleteTagRequest {
+    /// WorktreeId of the reading that supplied the tag (#765, ADR 0140).
+    /// Required; a mismatch with the selected worktree is a typed 412.
+    /// This is a precondition, never an address to redirect a stale delete to.
+    pub repo: String,
     pub tag: String,
 }
 
@@ -2242,6 +2246,7 @@ mod tests {
         assert!(!bare.sign);
 
         let del = DeleteTagRequest {
+            repo: "00000000-0000-0000-0000-000000000001".into(),
             tag: "v1.0.0".into(),
         };
         let json = serde_json::to_string(&del).unwrap();
@@ -2261,7 +2266,13 @@ mod tests {
             r#"{"name":"v1","commit":"c","annotated":true}"#
         )
         .is_err());
-        assert!(serde_json::from_str::<DeleteTagRequest>(r#"{"tag":"v1","repo":"/etc"}"#).is_err());
+        assert!(serde_json::from_str::<DeleteTagRequest>(
+            r#"{"tag":"v1","repo":"id","remote":"origin"}"#
+        )
+        .is_err());
+        for body in [r#"{"tag":"v1"}"#, r#"{"tag":"v1","repo":null}"#] {
+            assert!(serde_json::from_str::<DeleteTagRequest>(body).is_err());
+        }
     }
 
     /// M2.21e (#239): every [`SignTagFailureKind`] must reach the wire as the

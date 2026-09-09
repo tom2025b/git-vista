@@ -27,6 +27,11 @@ pub(super) fn build_tag_items(features: Features, ic: &'static GitIcons, m: &Men
         shell,
         ..
     } = features;
+    // The badge and selector came from the same accepted graph frame. A
+    // pending confirmation retains this id even if another tab selects a desk.
+    let Some(repo) = m.tag_repo else {
+        return ().into_view();
+    };
     m.tags
         .iter()
         .map(|t| {
@@ -39,7 +44,7 @@ pub(super) fn build_tag_items(features: Features, ic: &'static GitIcons, m: &Men
                 let intent = PendingIntent {
                     seq,
                     key,
-                    kind: PendingOp::DeleteLocalTag { tag },
+                    kind: PendingOp::DeleteLocalTag { repo, tag },
                 };
                 if !operations.admit_intent(&intent) {
                     return;

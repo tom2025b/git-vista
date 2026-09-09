@@ -2311,7 +2311,10 @@ mod branch_prompt_tests {
         }
 
         assert_eq!(
-            preview_subject(&OperationKind::DeleteLocalTag { tag: "v1".into() }),
+            preview_subject(&OperationKind::DeleteLocalTag {
+                repo: git_vista_core::identity::WorktreeId::from_git_dir("/fixture/.git"),
+                tag: "v1".into()
+            }),
             DialogSubject::NotPreviewable,
             "an operation the engine cannot picture must draw no panel at all"
         );
