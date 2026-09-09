@@ -1,5 +1,6 @@
 //! GitHub adapter at the handler boundary (#89). Only neutral DTOs leave here.
 //! No local Git lock spans provider I/O; admission is fail-fast and independent.
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -12,12 +13,14 @@ use git_vista_protocol::forge::{
     PullRequestSummary,
 };
 use reqwest::{Client, Url};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
 const PAGE_SIZE: usize = 30;
 const MAX_BODY: usize = 1024 * 1024;
 const MAX_PAGE: u32 = 10_000;
+const DETAIL_PAGE_SIZE: usize = 100;
+const MAX_DETAIL_PAGES: u32 = 10;
 const REQUEST_BUDGET: Duration = Duration::from_secs(8);
 const TOKEN_BUDGET: Duration = Duration::from_secs(2);
 
@@ -26,6 +29,7 @@ pub(crate) struct PullQuery {
     repo: Option<String>,
     #[serde(default = "first_page")]
     page: u32,
+    number: Option<u64>,
 }
 fn first_page() -> u32 {
     1
@@ -158,13 +162,14 @@ fn repository(base: &str) -> Option<ForgeRepository> {
     })
 }
 fn empty(page: u32, availability: Availability) -> ForgePage {
+    let supported = availability != Availability::Unsupported;
     ForgePage {
         repository: None,
         availability,
         capabilities: ForgeCapabilities {
-            summaries: availability != Availability::Unsupported,
-            checks: false,
-            reviews: false,
+            summaries: supported,
+            checks: supported,
+            reviews: supported,
         },
         pulls: vec![],
         page,
@@ -176,42 +181,196 @@ fn response(page: ForgePage) -> Response {
     ([(header::CACHE_CONTROL, "no-store")], Json(page)).into_response()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CheckRollup {
+    Unknown,
+    NoChecks,
+    Pending,
+    Passing,
+    Failing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ReviewRollup {
+    Unknown,
+    NoReviews,
+    Reviewed,
+    Approved,
+    ChangesRequested,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CheckState {
+    Queued,
+    InProgress,
+    Success,
+    Failure,
+    Neutral,
+    Cancelled,
+    Skipped,
+    TimedOut,
+    ActionRequired,
+    Stale,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct CheckSummary {
+    name: String,
+    state: CheckState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ReviewState {
+    Approved,
+    ChangesRequested,
+    Commented,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ReviewSummary {
+    reviewer: String,
+    state: ReviewState,
+}
+
+/// Transient, provider-neutral details for one pull request. Raw provider
+/// objects, review bodies, check output and credentials never cross this seam.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct PullDetails {
+    number: u64,
+    availability: Availability,
+    check_rollup: CheckRollup,
+    review_rollup: ReviewRollup,
+    checks: Vec<CheckSummary>,
+    reviews: Vec<ReviewSummary>,
+    retry_after_seconds: Option<u64>,
+}
+
+fn empty_details(number: u64, availability: Availability) -> PullDetails {
+    PullDetails {
+        number,
+        availability,
+        check_rollup: CheckRollup::Unknown,
+        review_rollup: ReviewRollup::Unknown,
+        checks: vec![],
+        reviews: vec![],
+        retry_after_seconds: None,
+    }
+}
+
+fn details_response(details: PullDetails) -> Response {
+    ([(header::CACHE_CONTROL, "no-store")], Json(details)).into_response()
+}
+
+fn unavailable_response(
+    query: &PullQuery,
+    availability: Availability,
+    retry: Option<u64>,
+) -> Response {
+    match query.number {
+        Some(number) => {
+            let mut details = empty_details(number, availability);
+            details.retry_after_seconds = retry;
+            details_response(details)
+        }
+        None => {
+            let mut page = empty(query.page, availability);
+            page.retry_after_seconds = retry;
+            response(page)
+        }
+    }
+}
+
+fn required_token(token: Option<String>) -> Result<String, Availability> {
+    token
+        .filter(|token| !token.is_empty())
+        .ok_or(Availability::AccessUncertain)
+}
+
 pub(crate) async fn pulls(
     Query(query): Query<PullQuery>,
 ) -> Result<Response, (StatusCode, String)> {
     if !(1..=MAX_PAGE).contains(&query.page) {
         return Err((StatusCode::BAD_REQUEST, "Invalid pull request page.".into()));
     }
+    if query.number == Some(0) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid pull request number.".into(),
+        ));
+    }
     let path = super::read::resolve_repo(query.repo.as_deref())?.0;
     let svc = service();
     let Ok(_request) = svc.requests.clone().try_acquire_owned() else {
-        return Ok(response(empty(query.page, Availability::Unavailable)));
+        return Ok(unavailable_response(
+            &query,
+            Availability::Unavailable,
+            None,
+        ));
     };
     let mapped = tokio::task::spawn_blocking(move || repository_at(&path))
         .await
         .ok()
         .flatten();
     let Some(repo) = mapped else {
-        return Ok(response(empty(query.page, Availability::Unsupported)));
+        return Ok(unavailable_response(
+            &query,
+            Availability::Unsupported,
+            None,
+        ));
     };
     if let Some(seconds) = svc.retry_after() {
-        let mut page = empty(query.page, Availability::RateLimited);
-        page.retry_after_seconds = Some(seconds);
-        return Ok(response(page));
+        return Ok(unavailable_response(
+            &query,
+            Availability::RateLimited,
+            Some(seconds),
+        ));
     }
     let token = match svc
         .token_with(crate::state::credential_token, TOKEN_BUDGET)
         .await
     {
-        Ok(token) => token,
-        Err(state) => return Ok(response(empty(query.page, state))),
+        Ok(token) => match required_token(token) {
+            Ok(token) => token,
+            Err(state) => return Ok(unavailable_response(&query, state, None)),
+        },
+        Err(state) => return Ok(unavailable_response(&query, state, None)),
     };
     // Even an accidentally credential-shaped repo name must not reflect the token.
-    if token
-        .as_deref()
-        .is_some_and(|t| !t.is_empty() && repo.web_url.contains(t))
-    {
-        return Ok(response(empty(query.page, Availability::Unavailable)));
+    if repo.web_url.contains(&token) {
+        return Ok(unavailable_response(
+            &query,
+            Availability::Unavailable,
+            None,
+        ));
+    }
+    if let Some(number) = query.number {
+        let Ok(base) = Url::parse("https://api.github.com/") else {
+            return Ok(details_response(empty_details(
+                number,
+                Availability::Unavailable,
+            )));
+        };
+        let Ok(client) = client() else {
+            return Ok(details_response(empty_details(
+                number,
+                Availability::Unavailable,
+            )));
+        };
+        let details = match tokio::time::timeout(
+            REQUEST_BUDGET,
+            fetch_details(&client, &base, &repo, number, &token, svc),
+        )
+        .await
+        {
+            Ok(details) => details,
+            Err(_) => empty_details(number, Availability::Unavailable),
+        };
+        return Ok(details_response(details));
     }
     let url = format!("https://api.github.com/repos/{}/pulls?state=open&sort=created&direction=desc&per_page={PAGE_SIZE}&page={}", repo.name, query.page);
     let page = match client().and_then(|c| {
@@ -219,9 +378,7 @@ pub(crate) async fn pulls(
             .map(|u| (c, u))
             .map_err(|_| Availability::Unavailable)
     }) {
-        Ok((client, url)) => {
-            fetch_page(&client, url, repo, query.page, token.as_deref(), svc).await
-        }
+        Ok((client, url)) => fetch_page(&client, url, repo, query.page, Some(&token), svc).await,
         Err(state) => empty(query.page, state),
     };
     Ok(response(page))
@@ -345,6 +502,34 @@ async fn fetch_page(
     token: Option<&str>,
     svc: &ForgeService,
 ) -> ForgePage {
+    let result = fetch_body(client, url.clone(), token, svc).await;
+    let (headers, body) = match result {
+        Ok(response) => response,
+        Err(state) => {
+            let mut page = empty(page, state);
+            if state == Availability::RateLimited {
+                page.retry_after_seconds = svc.retry_after();
+            }
+            return page;
+        }
+    };
+    let next = next_page(
+        headers.get("link").and_then(|s| s.to_str().ok()),
+        &url,
+        page,
+    );
+    decode(&body, repo, page, next, token).unwrap_or_else(|state| empty(page, state))
+}
+
+async fn fetch_body(
+    client: &Client,
+    url: Url,
+    token: Option<&str>,
+    svc: &ForgeService,
+) -> Result<(reqwest::header::HeaderMap, Vec<u8>), Availability> {
+    if svc.retry_after().is_some() {
+        return Err(Availability::RateLimited);
+    }
     let mut request = client
         .get(url.clone())
         .header("accept", "application/vnd.github+json")
@@ -353,13 +538,13 @@ async fn fetch_page(
         // Sensitive HeaderValue suppresses accidental debug exposure inside HTTP.
         let Ok(mut value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
         else {
-            return empty(page, Availability::Unavailable);
+            return Err(Availability::Unavailable);
         };
         value.set_sensitive(true);
         request = request.header(reqwest::header::AUTHORIZATION, value);
     }
     let Ok(mut upstream) = request.send().await else {
-        return empty(page, Availability::Unavailable);
+        return Err(Availability::Unavailable);
     };
     let status = upstream.status();
     let exhausted = header_number(upstream.headers(), "x-ratelimit-remaining") == Some(0);
@@ -370,26 +555,20 @@ async fn fetch_page(
         svc.cool_down(rate_delay(upstream.headers()));
     }
     if limited {
-        let mut result = empty(page, Availability::RateLimited);
-        result.retry_after_seconds = svc.retry_after();
-        return result;
+        return Err(Availability::RateLimited);
     }
     if matches!(status.as_u16(), 401 | 403 | 404) {
-        return empty(page, Availability::AccessUncertain);
+        return Err(Availability::AccessUncertain);
     }
     if status.as_u16() != 200 {
-        return empty(page, Availability::Unavailable);
+        return Err(Availability::Unavailable);
     }
-    let next = next_page(
-        upstream.headers().get("link").and_then(|s| s.to_str().ok()),
-        &url,
-        page,
-    );
+    let headers = upstream.headers().clone();
     if upstream
         .content_length()
         .is_some_and(|n| n > MAX_BODY as u64)
     {
-        return empty(page, Availability::Unavailable);
+        return Err(Availability::Unavailable);
     }
     let mut body = Vec::new();
     loop {
@@ -398,10 +577,265 @@ async fn fetch_page(
                 body.extend_from_slice(&chunk)
             }
             Ok(None) => break,
-            _ => return empty(page, Availability::Unavailable),
+            _ => return Err(Availability::Unavailable),
         }
     }
-    decode(&body, repo, page, next, token).unwrap_or_else(|state| empty(page, state))
+    Ok((headers, body))
+}
+
+#[derive(Deserialize)]
+struct GithubPullDetails {
+    number: u64,
+    state: String,
+    head: GithubHead,
+}
+
+#[derive(Deserialize)]
+struct GithubHead {
+    sha: String,
+}
+
+#[derive(Deserialize)]
+struct GithubCheckPage {
+    check_runs: Vec<GithubCheck>,
+}
+
+#[derive(Deserialize)]
+struct GithubCheck {
+    name: String,
+    status: String,
+    conclusion: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GithubReview {
+    id: u64,
+    user: Option<GithubUser>,
+    state: String,
+}
+
+#[derive(Deserialize)]
+struct GithubUser {
+    login: String,
+}
+
+fn endpoint(base: &Url, repo: &ForgeRepository, suffix: &str) -> Result<Url, Availability> {
+    base.join(&format!("repos/{}/{suffix}", repo.name))
+        .map_err(|_| Availability::Unavailable)
+}
+
+fn safe_text(value: String, token: &str, max_chars: usize) -> Option<String> {
+    if value.chars().count() > max_chars || value.chars().any(char::is_control) {
+        return None;
+    }
+    Some(value.replace(token, "[redacted]"))
+}
+
+fn check_state(status: &str, conclusion: Option<&str>) -> CheckState {
+    match (status, conclusion) {
+        ("queued", _) => CheckState::Queued,
+        ("in_progress", _) => CheckState::InProgress,
+        ("completed", Some("success")) => CheckState::Success,
+        ("completed", Some("failure" | "startup_failure")) => CheckState::Failure,
+        ("completed", Some("neutral")) => CheckState::Neutral,
+        ("completed", Some("cancelled")) => CheckState::Cancelled,
+        ("completed", Some("skipped")) => CheckState::Skipped,
+        ("completed", Some("timed_out")) => CheckState::TimedOut,
+        ("completed", Some("action_required")) => CheckState::ActionRequired,
+        ("completed", Some("stale")) => CheckState::Stale,
+        _ => CheckState::Unknown,
+    }
+}
+
+fn check_rollup(checks: &[CheckSummary]) -> CheckRollup {
+    if checks.is_empty() {
+        return CheckRollup::NoChecks;
+    }
+    if checks.iter().any(|check| {
+        matches!(
+            check.state,
+            CheckState::Failure
+                | CheckState::Cancelled
+                | CheckState::TimedOut
+                | CheckState::ActionRequired
+        )
+    }) {
+        CheckRollup::Failing
+    } else if checks.iter().any(|check| {
+        matches!(
+            check.state,
+            CheckState::Queued | CheckState::InProgress | CheckState::Unknown
+        )
+    }) {
+        CheckRollup::Pending
+    } else {
+        CheckRollup::Passing
+    }
+}
+
+fn review_rollup(reviews: &[ReviewSummary]) -> ReviewRollup {
+    if reviews.is_empty() {
+        ReviewRollup::NoReviews
+    } else if reviews
+        .iter()
+        .any(|review| review.state == ReviewState::ChangesRequested)
+    {
+        ReviewRollup::ChangesRequested
+    } else if reviews
+        .iter()
+        .any(|review| review.state == ReviewState::Approved)
+    {
+        ReviewRollup::Approved
+    } else {
+        ReviewRollup::Reviewed
+    }
+}
+
+async fn fetch_checks(
+    client: &Client,
+    base: &Url,
+    repo: &ForgeRepository,
+    sha: &str,
+    token: &str,
+    svc: &ForgeService,
+) -> Result<Vec<CheckSummary>, Availability> {
+    let mut checks = Vec::new();
+    for page in 1..=MAX_DETAIL_PAGES {
+        let mut url = endpoint(base, repo, &format!("commits/{sha}/check-runs"))?;
+        url.query_pairs_mut()
+            .append_pair("filter", "latest")
+            .append_pair("per_page", &DETAIL_PAGE_SIZE.to_string())
+            .append_pair("page", &page.to_string());
+        let (headers, body) = fetch_body(client, url.clone(), Some(token), svc).await?;
+        let payload: GithubCheckPage =
+            serde_json::from_slice(&body).map_err(|_| Availability::Unavailable)?;
+        if payload.check_runs.len() > DETAIL_PAGE_SIZE {
+            return Err(Availability::Unavailable);
+        }
+        for check in payload.check_runs {
+            let name = safe_text(check.name, token, 500).ok_or(Availability::Unavailable)?;
+            checks.push(CheckSummary {
+                name,
+                state: check_state(&check.status, check.conclusion.as_deref()),
+            });
+        }
+        let next = next_page(
+            headers.get("link").and_then(|value| value.to_str().ok()),
+            &url,
+            page,
+        );
+        match next {
+            None => return Ok(checks),
+            Some(_) if page == MAX_DETAIL_PAGES => return Err(Availability::Unavailable),
+            Some(_) => {}
+        }
+    }
+    Err(Availability::Unavailable)
+}
+
+async fn fetch_reviews(
+    client: &Client,
+    base: &Url,
+    repo: &ForgeRepository,
+    number: u64,
+    token: &str,
+    svc: &ForgeService,
+) -> Result<Vec<ReviewSummary>, Availability> {
+    let mut latest = BTreeMap::<String, (u64, ReviewState)>::new();
+    for page in 1..=MAX_DETAIL_PAGES {
+        let mut url = endpoint(base, repo, &format!("pulls/{number}/reviews"))?;
+        url.query_pairs_mut()
+            .append_pair("per_page", &DETAIL_PAGE_SIZE.to_string())
+            .append_pair("page", &page.to_string());
+        let (headers, body) = fetch_body(client, url.clone(), Some(token), svc).await?;
+        let payload: Vec<GithubReview> =
+            serde_json::from_slice(&body).map_err(|_| Availability::Unavailable)?;
+        if payload.len() > DETAIL_PAGE_SIZE {
+            return Err(Availability::Unavailable);
+        }
+        for review in payload {
+            let Some(user) = review.user else { continue };
+            let reviewer = safe_text(user.login, token, 100).ok_or(Availability::Unavailable)?;
+            match review.state.as_str() {
+                "APPROVED" => {
+                    latest.insert(reviewer, (review.id, ReviewState::Approved));
+                }
+                "CHANGES_REQUESTED" => {
+                    latest.insert(reviewer, (review.id, ReviewState::ChangesRequested));
+                }
+                "COMMENTED" => {
+                    latest
+                        .entry(reviewer)
+                        .or_insert((review.id, ReviewState::Commented));
+                }
+                "DISMISSED" => {
+                    latest.remove(&reviewer);
+                }
+                _ => {}
+            }
+        }
+        let next = next_page(
+            headers.get("link").and_then(|value| value.to_str().ok()),
+            &url,
+            page,
+        );
+        match next {
+            None => {
+                return Ok(latest
+                    .into_iter()
+                    .map(|(reviewer, (_, state))| ReviewSummary { reviewer, state })
+                    .collect())
+            }
+            Some(_) if page == MAX_DETAIL_PAGES => return Err(Availability::Unavailable),
+            Some(_) => {}
+        }
+    }
+    Err(Availability::Unavailable)
+}
+
+async fn fetch_details(
+    client: &Client,
+    base: &Url,
+    repo: &ForgeRepository,
+    number: u64,
+    token: &str,
+    svc: &ForgeService,
+) -> PullDetails {
+    let result = async {
+        let url = endpoint(base, repo, &format!("pulls/{number}"))?;
+        let (_, body) = fetch_body(client, url, Some(token), svc).await?;
+        let pull: GithubPullDetails =
+            serde_json::from_slice(&body).map_err(|_| Availability::Unavailable)?;
+        if pull.number != number
+            || !matches!(pull.state.as_str(), "open" | "closed")
+            || !matches!(pull.head.sha.len(), 40 | 64)
+            || !pull.head.sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(Availability::Unavailable);
+        }
+        let checks = fetch_checks(client, base, repo, &pull.head.sha, token, svc).await?;
+        let reviews = fetch_reviews(client, base, repo, number, token, svc).await?;
+        Ok::<_, Availability>((checks, reviews))
+    }
+    .await;
+    match result {
+        Ok((checks, reviews)) => PullDetails {
+            number,
+            availability: Availability::Ready,
+            check_rollup: check_rollup(&checks),
+            review_rollup: review_rollup(&reviews),
+            checks,
+            reviews,
+            retry_after_seconds: None,
+        },
+        Err(state) => {
+            let mut details = empty_details(number, state);
+            if state == Availability::RateLimited {
+                details.retry_after_seconds = svc.retry_after();
+            }
+            details
+        }
+    }
 }
 
 #[cfg(test)]

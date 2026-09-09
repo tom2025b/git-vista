@@ -708,17 +708,11 @@ const EXEMPT: &[(&str, &str)] = &[
     //     cannot currently prove it, so it is not listed as exempt either
     //     (exempting it would be arguing a false reason: "no reference
     //     found" is not this case).
-    // selection.rs:50-63's own module doc: no per-line UI wiring exists yet;
-    // issue #215's own scope box explicitly permitted splitting it out.
-    ("git-vista/src/features/diff/selection.rs", "toggle_line"),
-    (
-        "git-vista/src/features/diff/selection.rs",
-        "is_line_selected",
-    ),
-    (
-        "git-vista/src/features/diff/selection.rs",
-        "select_all_in_hunk",
-    ),
+    // #357 wired all three of these into `staging_view.rs` (a per-line
+    // checkbox for `toggle_line`/`is_line_selected`, Shift+Activate on a
+    // hunk header for `select_all_in_hunk`) — the exemption this census
+    // carried for them since #215 no longer applies; removed rather than
+    // left to rot, per this census's own stated purpose.
     // Only matters at extreme zoom-out (MIN_ZOOM=0.2); #65's 44px floor is
     // met at scale 1.0 by construction (audit.rs's own tripwire test), and
     // no production path clamps camera scale using this value today.
