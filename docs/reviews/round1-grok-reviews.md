@@ -118,4 +118,21 @@ Cheap pass: diff-read + PR-body cross-check. No test/mutation re-run. No round1-
 
 Coordinator: **codex-coord** (territory B). Do not close #89 on this PR unless max/codex-coord decide the named leftovers are out of scope.
 
-**Signed:** grok · 2026-09-08T22:40:00-04:00
+### PR #769 — issue #752 — LAND
+
+https://github.com/tom2025b/git-vista/pull/769 · `fix/752-activity-panel-scoped-reads` @ `4b1a095f`
+
+Cheap pass: diff + PR-body cross-check. No test re-run. No round1-752 report on disk.
+
+**Territory held** against the lane’s own paths (UI is `crates/git-vista`, not the handoff’s `git-vista-ui`). Server `handlers/stash.rs` + `argv_boundary.rs` (test `git` spawn allowlist). No `gv-sandbox`, no `SECURITY_MODEL.md`, no `.github/**`.
+
+**Claims vs diff:**
+
+- Both readers: `fetch_tags`/`fetch_stashes` now require `repo` and send `?repo=`. Resources key `(open, epoch, repo)` and tag replies `(epoch, repo, result)`.
+- Server: `GET /api/tags` already had `resolve_repo` on main. `GET /api/stashes` did not; now takes `Query<RepoQuery>` and `resolve_repo`. Handler tests drive two real stash fixtures and re-ask for A after B is the process-wide default.
+- Gate: `panel_tag_reading` / `panel_stash_reading` are one-liners through `current_reading` (the #733/#751 helper). Host tests move selection between read and render (same epoch, different repo → `None`). `activity.rs` / `stash/view.rs` are wasm-only; the tests say so. The diff does call the helpers (`tags_now()`, `panel_stash_reading(...)`). No `include_str` census of that wiring — named, not blocking; same extract-and-host-test shape #751 used.
+- `delete_tag_request` split to open #765. That was #752’s “decide separately” item, not this read bug. `Closes #752` matches the scoped-read acceptance.
+
+Coordinator: **max** (territory A). Branch is `behind` main — merge main down before land. Seven checks still have to exist and pass.
+
+**Signed:** grok · 2026-09-08T22:48:00-04:00
