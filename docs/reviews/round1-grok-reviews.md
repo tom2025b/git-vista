@@ -50,6 +50,30 @@ Ordinary Network transfer still allows AF_UNIX on purpose (#188 / authenticated 
 
 ## Reviews
 
-*(none yet — waiting on the first open PR among #757 #752 #357 #748 #762 #89 #396)*
+### PR #766 — issue #748 — DO NOT LAND
 
-**Signed:** grok · 2026-09-08T22:05:00-04:00
+https://github.com/tom2025b/git-vista/pull/766 · `fix/748-dev-browser-honors-cargo-target-dir` @ `36523be1`
+
+**Territory held.** Touched `dev`, `ci/browser/run.sh`, `ci/browser/fixture.mjs`, `ci/browser/server.mjs`, `ci/browser/README.md`, `ci/browser/target_dir_test.sh`. No `crates/gv-sandbox/**`, no `docs/SECURITY_MODEL.md`, no `crates/**`.
+
+**The fix itself is real.** Re-derived from the diff, not the PR body:
+
+- Root cause is lookup after `cargo build`, not cargo ignoring the env. `cmd_browser` already runs `cargo build -p git-vista-server -p git-vista-fixtures`; cargo honors `CARGO_TARGET_DIR`. `run.sh` / `server.mjs` / `fixture.mjs` all hardcoded `$repo/target/debug/…`.
+- `run.sh` now resolves `${CARGO_TARGET_DIR:-$repo/target}` to an absolute path **before** `unshare` `cd`s into `ci/browser`, then exports it so the Node launchers see the same tree. That ordering is load-bearing: Node `path.resolve` is cwd-relative, and the inner namespace cwd is `ci/browser`.
+- `server.mjs` and `fixture.mjs` join `CARGO_TARGET_DIR` when set, else the worktree `target/`.
+- Default fallback is preserved (`env -u CARGO_TARGET_DIR` case).
+
+**The test proves the mechanism when it is run, and CI never runs it.** I ran `ci/browser/target_dir_test.sh` against the PR commit: green. Two cheap mutations in a throwaway tree, both red, both differently:
+
+1. Hardcode `server.mjs` `SERVER_BIN` back to `…/target/debug/git-vista-server` → `AssertionError` assigned-target vs worktree-target.
+2. Point `run.sh` `bin=` / `fixture_bin=` back at `$repo/target` → `no server binary at …/repo/target/debug/git-vista-server`.
+
+That is the right proof. Nothing in `dev gate` or GitHub CI invokes the script. `crates/git-vista-server/tests/dev_script_guards.rs` exists specifically because “a guard nobody runs is not a guard,” and it only wraps `ci/*_test.sh` at the `ci/` root. This script sits at `ci/browser/target_dir_test.sh` and is not listed there. The Core CI job is `cargo test`; the browser CI job uses the default `target/` (no `CARGO_TARGET_DIR`), so a revert of the lookup stays green on GitHub.
+
+**What would make this LAND:** wire the script into something `cargo test --workspace` actually runs. Cheapest match to the existing pattern: one `run_guard` line in `dev_script_guards.rs` (may need the script moved to `ci/target_dir_test.sh`, or `run_guard` accepting `browser/target_dir_test.sh`). That file is `crates/**`, which this lane was forbidden to touch — coordinator (codex-coord, territory B) either authorizes that one-file exception on this PR, or lands a one-line follow-up before merge. Calling it only from `gate_body` in `dev` is not enough: GitHub CI does not run `dev gate`.
+
+**Named, not blocking the issue:** `gv` still hardcodes `SERVER_BIN="$REPO/target/debug/git-vista-server"` (line 36). The PR body already said `dev serve` still has this class of defect; confirmed. Out of #748's `allowed_paths`.
+
+Coordinator: **codex-coord** (territory B). Do not merge until the guard is on the `cargo test` path.
+
+**Signed:** grok · 2026-09-08T22:22:00-04:00
