@@ -502,16 +502,37 @@ fn command_from_argv(argv: Vec<std::ffi::OsString>) -> SandboxedCommand {
 /// INV-16's reviewed argv shapes stay exactly what they were before #728,
 /// because the reaper decides how that argv is *launched*, not what it is.
 ///
-/// **Scoped to `Tier::Strict` only** — detected structurally, by comparing the
-/// composed program against the resolved `bwrap` path, rather than by
-/// threading a `Tier` through this function (which would need to see through
-/// `CheckoutPolicy`'s private field). `Tier::Network`'s bare shim is
-/// deliberately left unwrapped by this change: it has no pid namespace, so a
-/// `killpg` there is load-bearing for the shim's own descendants in a way this
-/// PR has not built a Network-tier acceptance test for — #757 owns extending
-/// this wrapper there, with that test written first. Never applied to
-/// `Tier::Unsandboxed`'s bare `git` either (INV-16 shapes 1/2): that operation
-/// is already explicit, persisted, operator-trusted content flying a
+/// **Scoped to `Tier::Strict` and `Tier::Network`** — detected structurally,
+/// by comparing the composed program against the resolved `bwrap` path or the
+/// resolved `gv-sandbox` shim path, rather than by threading a `Tier` through
+/// this function (which would need to see through `CheckoutPolicy`'s private
+/// field). Every sandboxed argv shape has exactly one of the two as its
+/// program (`sandbox_argv_with_seccomp_profile`'s three shapes: `Strict`
+/// starts with `bwrap`, `Network` — transfer or checkout, `policy.tier` is
+/// `Network` either way — starts with the bare shim, `Unsandboxed` starts with
+/// `git` and matches neither), so this covers both sandboxed tiers without
+/// needing to see the tier itself.
+///
+/// #757: originally `Tier::Network`'s bare shim was left unwrapped here,
+/// because it has no pid namespace — `killpg` is the *entire* reaping
+/// mechanism there, not a backstop on top of one, and the PR that added the
+/// reaper had not built a Network-tier acceptance test to justify it. That
+/// test is `sandbox::lifecycle::a_reaper_process_reaps_a_network_tier_launcher_when_only_its_own_parent_is_sigkilled`,
+/// and it also names the residual `killpg` does **not** close: a
+/// double-forked, `setsid`-detached grandchild leaves the reaper's process
+/// group entirely, on every tier, and only `Tier::Strict`'s pid namespace
+/// closes that gap (killing the namespace's pid 1 makes the kernel tear down
+/// every task inside it, regardless of what process group or session it
+/// self-assigned) — see that test's module-level comparison against
+/// `strict_reaps_a_double_forked_setsid_orphan_that_the_network_tier_does_not`.
+/// `Tier::Network`'s *ordinary* orphan — the shim, `git`, and whatever `git`
+/// spawned without deliberately detaching — is exactly what `killpg` reaches,
+/// which is the shape #757 was filed about: a Network-tier operation had **no**
+/// protection of any kind against its coordinating process dying abruptly, not
+/// even the bounded, `killpg`-only guarantee this section now gives it.
+///
+/// Never applied to `Tier::Unsandboxed`'s bare `git` (INV-16 shapes 1/2): that
+/// operation is already explicit, persisted, operator-trusted content flying a
 /// permanent banner (INV-15).
 ///
 /// The caller's own pid is prepended as an explicit argument, **not** left for
@@ -536,7 +557,11 @@ fn command_from_argv(argv: Vec<std::ffi::OsString>) -> SandboxedCommand {
 pub(crate) fn wrap_with_reaper(argv: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
     let is_strict_bwrap_launch = super::bwrap::bwrap_path()
         .is_some_and(|bwrap| argv.first().map(|p| p.as_os_str()) == Some(bwrap.as_os_str()));
-    if !is_strict_bwrap_launch {
+    let is_network_shim_launch = !is_strict_bwrap_launch
+        && super::shim::shim_path()
+            .ok()
+            .is_some_and(|shim| argv.first().map(|p| p.as_os_str()) == Some(shim.as_os_str()));
+    if !is_strict_bwrap_launch && !is_network_shim_launch {
         return argv;
     }
     match super::reaper::reaper_path() {
