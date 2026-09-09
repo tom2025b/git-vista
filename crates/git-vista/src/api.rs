@@ -66,7 +66,7 @@ pub use conflicts::{
     resolve_conflict_request,
 };
 pub use diff::{fetch_diff, fetch_diff_full, fetch_file, fetch_spec_diff};
-pub use forge::fetch_forge_page;
+pub use forge::{fetch_forge_page, fetch_pull_details};
 pub use graph::{fetch_frame, fetch_page};
 pub use operations::{
     cancel_operation_request, fetch_operation_status, resolve_operation_id, CancelOutcome,
