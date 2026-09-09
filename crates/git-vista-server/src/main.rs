@@ -36,13 +36,8 @@ use std::path::{Path, PathBuf};
 // the Activity Log / Contextual Undo feature. `journal` owns the on-disk state
 // under `.git/git-vista/`; `activity` owns `GET /api/activity`.
 mod activity;
-// M4.31 (#84): the conflict model and the scan that fills it. Contract and
-// scanner first, endpoint later — the same staging `build_plan_only` uses, and
-// the same reason: the vocabulary and the index reads get reviewed before any
-// route exposes them. `allow(dead_code)` off the test build only, so the day a
-// handler wires this up the attribute stops applying on its own rather than
-// hiding a genuinely dead function.
-#[cfg_attr(not(test), allow(dead_code))]
+// M4.31 (#84): the conflict model and scan used by the conflict handlers and
+// the planner's conflict, sequence, and stash execution paths.
 mod conflicts;
 // The server-owned repository catalog (M1.03): opaque repository/worktree ids,
 // allowed-root enforcement, and the only path→id resolution in the server.
@@ -114,10 +109,8 @@ mod state;
 // gitignored local file — the fallback chain `state::credential_token`
 // (M13.01, #582) was scaffolding for. See ADR 0122.
 mod token_store;
-// M12.02 (#552): native filesystem hints over the selected worktree's Git
-// metadata. The authoritative sweep/feed lands in later M12 slices, so this
-// tested module is intentionally staged before production wiring reaches it.
-#[cfg_attr(not(test), allow(dead_code))]
+// M12.02 (#552): native filesystem hints and the authoritative reconciliation
+// feed, attached by the repository-events handler and published by the planner.
 mod reconciliation;
 mod watcher;
 // M11.01 (#546): the read-only worktree census (`git worktree list
@@ -128,16 +121,11 @@ mod watcher;
 // m3.23-worktrees.md §1.
 //
 // The `allow(dead_code)` sits on the entry point `worktree_census` itself, not
-// on this `mod` line — deliberately narrower than `conflicts` above. Its
+// on this `mod` line. Its
 // internal helpers (`correlate_missing_admin_dir`, `common_dir`,
 // `is_null_oid`, `display_name`) are each called from within the module, so a
 // future edit that orphans one should still trip the dead-code lint rather
-// than being exempted by a blanket module-level attribute. (`conflicts`' own
-// module-level attribute is a leftover from when *it* was staged this way; it
-// has had real callers since — `conflicts::scan` from `planner/conflict_exec.rs`
-// and `handlers/conflicts.rs`, `conflicts::continuation` from
-// `planner/sequence_exec.rs` and `planner/stash.rs` — so the contrast is with
-// where the attribute sits, not with whether that module is reached.)
+// than being exempted by a blanket module-level attribute.
 mod worktree_census;
 // M1.13b (#66): the single owner of TCP port 9418 in the test binary. Three
 // tests across `sandbox::escape_suite` and `planner::contract_suite` need that
