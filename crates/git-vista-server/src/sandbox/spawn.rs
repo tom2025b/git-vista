@@ -742,6 +742,80 @@ mod tests {
         );
     }
 
+    /// #757: `wrap_with_reaper`'s own selection logic, pinned directly rather
+    /// than only observed through the process-tree acceptance tests in
+    /// `sandbox::lifecycle` (real but slow, and — as this test's own history
+    /// shows — not actually able to see every way the selection could drift:
+    /// a `failure-atlas` mutation that widened `is_network_shim_launch` to
+    /// match ANY non-empty argv, wrapping `Tier::Unsandboxed`'s bare `git`
+    /// too, survived every `sandbox::lifecycle` test, because none of them
+    /// ever exercise that tier through `wrap_with_reaper` at all).
+    ///
+    /// Three raw argv shapes, matching INV-16's three exhaustive outputs
+    /// (`sandbox_argv_with_seccomp_profile`'s own doc comment) rather than
+    /// built through a real `Policy` — this test's whole claim is about the
+    /// structural comparison inside `wrap_with_reaper` itself, which reads
+    /// only `argv[0]`, so a raw argv is the more direct fixture, not a
+    /// shortcut around one.
+    ///
+    /// MUTATION 1 (remove the mechanism): delete the `shim_path()` comparison
+    /// (`is_network_shim_launch = false`). RED here on the network leg alone
+    /// — `failure-atlas` confirmed this 2026-09-08 (verdict: caught).
+    /// MUTATION 2 (weaken the mechanism): widen the comparison to
+    /// `argv.first().is_some()`. RED here on the unsandboxed leg — this is
+    /// the exact mutation that survived every `sandbox::lifecycle` test
+    /// before this one existed (`failure-atlas`, 2026-09-08, verdict:
+    /// survived), which is why this test exists rather than resting on that
+    /// suite alone.
+    #[test]
+    fn wrap_with_reaper_recognizes_exactly_the_two_sandboxed_launcher_shapes() {
+        let reaper = super::super::reaper::reaper_path().unwrap_or_else(|| {
+            panic!(
+                "gv-sandbox-reaper must be built and resolvable, or this test proves \
+                 nothing about the mechanism under test — see tests/forces_reaper_build.rs"
+            )
+        });
+        let bwrap = super::super::bwrap::bwrap_path().unwrap_or_else(|| {
+            panic!("bwrap must be resolvable on this host, or the Strict leg proves nothing")
+        });
+        let shim = super::super::shim::shim_path().unwrap_or_else(|e| {
+            panic!(
+                "gv-sandbox must be built and resolvable, or this test proves nothing \
+                 about the mechanism under test: {e}"
+            )
+        });
+
+        let strict_argv = vec![
+            bwrap.as_os_str().to_os_string(),
+            std::ffi::OsString::from("--"),
+            std::ffi::OsString::from("git"),
+        ];
+        let network_argv = vec![
+            shim.as_os_str().to_os_string(),
+            std::ffi::OsString::from("--"),
+            std::ffi::OsString::from("git"),
+        ];
+        let unsandboxed_argv = vec![std::ffi::OsString::from("git")];
+
+        assert_eq!(
+            wrap_with_reaper(strict_argv.clone()).first(),
+            Some(&reaper.as_os_str().to_os_string()),
+            "a Strict (bwrap-prefixed) argv must be wrapped with the reaper"
+        );
+        assert_eq!(
+            wrap_with_reaper(network_argv.clone()).first(),
+            Some(&reaper.as_os_str().to_os_string()),
+            "#757: a Network (bare-shim) argv must be wrapped with the reaper too"
+        );
+        assert_eq!(
+            wrap_with_reaper(unsandboxed_argv.clone()),
+            unsandboxed_argv,
+            "Tier::Unsandboxed's bare `git` argv must never be wrapped with the \
+             reaper (INV-16 shapes 1/2): that operation is already explicit, \
+             persisted, operator-trusted content flying a permanent banner (INV-15)"
+        );
+    }
+
     /// The composition test: a real git actually runs through the async wrapper
     /// under a real policy. This is what makes the wrapper more than argv
     /// assembly — it proves the process the server will spawn works.
