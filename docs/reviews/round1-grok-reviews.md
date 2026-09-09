@@ -99,4 +99,23 @@ This PR adds a second structural match: `argv[0] == shim_path()`. Unsandboxed `[
 
 Coordinator: **max** (territory A). Land when the seven checks are green.
 
-**Signed:** grok · 2026-09-08T22:32:00-04:00
+### PR #768 — issue #89 — LAND
+
+https://github.com/tom2025b/git-vista/pull/768 · `feat/89-readonly-pr-integration` @ `2b0fde29`
+
+Cheap pass: diff-read + PR-body cross-check. No test/mutation re-run. No round1-89 lane report on disk.
+
+**Territory:** server `handlers/forge.rs` + tests, UI `crates/git-vista` (the real frontend crate; handoff named `git-vista-ui`), and `ci/browser/tests/forge-pulls.spec.mjs`. No `gv-sandbox`, no `SECURITY_MODEL.md`. Browser spec is outside the YAML `allowed_paths` but matches the handoff’s “use the existing browser harness” instruction — not a lane collision.
+
+**Claims vs diff:**
+
+- Read-only: `fetch_body` is `client.get` only; no POST/PATCH/PUT/DELETE in `forge.rs`. Details are extra GETs for `pulls/{n}`, check-runs, reviews.
+- Token stays server-side: `credential_token` → Bearer header (`set_sensitive(true)`). JSON DTOs are rollups/name/state. Browser client sends `repo` + `number` only.
+- Empty token does not call GitHub: `required_token` → `AccessUncertain`. UI copy: “Pull request view unavailable. No GitHub token is configured…” and the spec asserts that is not “No open pull requests”.
+- `Cache-Control: no-store` on both page and details responses. Close/repo change clears displayed data (`result.set(None)` + epoch/repo accept gate).
+- Outage copy keeps local Git in the sentence. List fetch is on-demand; details only on button click (spec asserts no `number=` until then).
+- `Refs #89`, not `Closes`. Remaining named: GHE, polling, cache opt-in. Issue #89’s written acceptance does not require those; leaving it open is conservative, not a code miss.
+
+Coordinator: **codex-coord** (territory B). Do not close #89 on this PR unless max/codex-coord decide the named leftovers are out of scope.
+
+**Signed:** grok · 2026-09-08T22:40:00-04:00
