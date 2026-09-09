@@ -17,6 +17,10 @@ import { expect, test } from '@playwright/test'
 
 import { TWIN_CHECKPOINTS, TWIN_REWRITTEN } from '../fixture.mjs'
 import {
+  FIRST_HUNK, FIRST_LINES, expectLineSelection, expectSelectionPlan,
+  lineFile, openStagingSelection,
+} from './staging-selection.mjs'
+import {
   DIFF_SCROLLER,
   expectEachChainHasItsOwnMarker,
   forceOnline,
@@ -155,6 +159,45 @@ function expectFailedBecause(message, pattern, what) {
 }
 
 test.describe('harness self-check — every assertion must be able to go red', () => {
+  test('#357 line-selection assertion catches a disconnected pointer handler', async ({ page }) => {
+    const viewer = await openStagingSelection(page)
+    await expectLineSelection(viewer, [])
+    // Prevent this real click from reaching Leptos's delegated handler.
+    await viewer.locator('.stage-line-check').first().evaluate(node => {
+      node.addEventListener('click', event => event.stopImmediatePropagation(), { capture: true })
+    })
+    await viewer.locator('.stage-line-check').first().click()
+    const msg = await failureMessage(() => expectLineSelection(viewer, [0], 300))
+    expectFailedBecause(msg, /#357 exact line selection and glyphs/, 'the line-selection assertion')
+  })
+
+  test('#357 plan assertion catches Shift-Activate weakened to whole-hunk selection', async ({ page }) => {
+    const viewer = await openStagingSelection(page)
+    await expectLineSelection(viewer, [])
+    const header = viewer.locator('.stage-hunk-text').first()
+    // Strip only Shift before the shipped handler runs; the same real
+    // activation now takes the whole-hunk branch. Check the outbound plan
+    // independently of the line glyphs, which also distinguish these states.
+    await header.evaluate(node => {
+      node.addEventListener('keydown', event => {
+        if (!event.shiftKey) return
+        event.preventDefault()
+        event.stopImmediatePropagation()
+        node.dispatchEvent(new KeyboardEvent('keydown', {
+          key: event.key, code: event.code, bubbles: true, cancelable: true,
+        }))
+      }, { capture: true })
+    })
+    await header.click()
+    await expect(header).toBeFocused()
+    await page.keyboard.press('Shift+Enter')
+    await expect(viewer.locator('.stage-hunk-check').first()).toHaveAttribute('aria-pressed', 'true')
+    const msg = await failureMessage(() => expectSelectionPlan(page, viewer, [
+      lineFile('alpha.txt', [{ hunk: FIRST_HUNK, lines: FIRST_LINES }]),
+    ]))
+    expectFailedBecause(msg, /#357 exact selection plan/, 'the selection-plan assertion')
+  })
+
   test('the accessible-list assertion fails when the labels are stripped', async ({ page }) => {
     await openApp(page)
     await page.getByRole('button', { name: 'Activity' }).click()
