@@ -76,4 +76,27 @@ That is the right proof. Nothing in `dev gate` or GitHub CI invokes the script. 
 
 Coordinator: **codex-coord** (territory B). Do not merge until the guard is on the `cargo test` path.
 
-**Signed:** grok · 2026-09-08T22:22:00-04:00
+### PR #767 — issue #757 — LAND
+
+https://github.com/tom2025b/git-vista/pull/767 · `fix/757-network-tier-parent-death` @ `77c72e1baeec`
+
+**Territory held.** Touched `crates/git-vista-server/src/sandbox/{spawn,lifecycle}.rs`, new ADR 0143, ADR index, and a one-line forward pointer on ADR 0141. No `.github/**`, no `crates/git-vista-ui/**`, no `docs/SECURITY_MODEL.md`. The 0141 pointer is slightly outside “a NEW adr only”; it does not rewrite 0141’s record.
+
+**The claim holds, re-derived from the diff.**
+
+On `origin/main`, `wrap_with_reaper` returns unwrapped argv unless `argv[0]` is the resolved `bwrap` path. Network’s `sandbox_argv` starts with `policy.shim` (`gv-sandbox`), so it never wrapped. Production spawn is one chokepoint: `command_async` and `checkout_command_async` both go through `command_from_argv` → `wrap_with_reaper`. `policy_for` / `policy_for_repo` set `policy.shim` from `shim::shim_path()`, the same `OnceLock` the new comparison reads, so the unit test’s `shim_path()` argv is not a circular fake — the lifecycle test goes through `full_argv(policy)` and would miss the wrap if those paths disagreed.
+
+This PR adds a second structural match: `argv[0] == shim_path()`. Unsandboxed `["git"]` matches neither. The reaper itself is unchanged: fork, `setpgid`, poll `getppid()` against the caller pid passed in, `killpg` on mismatch. For Network that `killpg` is the whole mechanism (no pid namespace). Ordinary descendants stay in the group; `setsid` leaves it. That residual is a run test (`a_network_tier_reaper_does_not_reach_a_double_forked_setsid_grandchild` asserts ticks *keep growing*), which is what #757 asked for when a full Strict-equivalent guarantee is unreachable without breaking F3.
+
+**Mutation arms, from the tests, not from the PR body.** I did not re-run failure-atlas.
+
+1. Remove: `is_network_shim_launch = false`. Unit test network leg fails (`argv[0]` stays the shim). Lifecycle Network-orphan test fails (ticks continue after helper SIGKILL). Native `#[cfg(test)]` in `spawn.rs` / `lifecycle.rs` — `cargo test` compiles both.
+2. Weaken: `argv.first().is_some()`. Unit test unsandboxed leg fails (bare `git` gets a reaper prefix). They recorded honestly that this arm *survived* `sandbox::lifecycle` alone, then added this unit test so the second arm has somewhere to go red. Different failure from arm 1.
+
+**#728 overlap:** none. Same reaper, second argv shape. #728 already on main.
+
+**Named, not blocking:** `gv-sandbox-reaper/main.rs` still comments that only Strict is wrapped. That file is outside this lane’s `allowed_paths`; comment drift, not a mechanism miss. Three `wip(#757)` commits were not squashed (permission gate); squash-on-merge is fine.
+
+Coordinator: **max** (territory A). Land when the seven checks are green.
+
+**Signed:** grok · 2026-09-08T22:32:00-04:00
