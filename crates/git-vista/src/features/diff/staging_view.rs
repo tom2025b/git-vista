@@ -171,12 +171,16 @@ fn hunk_row(
                 // selecting it whole (`None`/`Hunks`) — the same "Shift
                 // changes what the roving key means" idiom `blame_row` already
                 // uses for its own Shift+Arrow range-extend, applied to this
-                // surface's own Activate instead of Move. This is the
-                // keyboard path onto `select_all_in_hunk`; toggling one
-                // arbitrary line by keyboard alone remains unwired (see this
-                // file's and `selection`'s module docs).
+                // surface's own Activate instead of Move. This reads `mods.shift`
+                // (already captured above for `roving_row_key`) rather than
+                // calling `ev.shift_key()` again — `roving_row_key` alone still
+                // decides whether this press is handled at all (#660); this is
+                // only choosing between two actions once it already has said
+                // yes. This is the keyboard path onto `select_all_in_hunk`;
+                // toggling one arbitrary line by keyboard alone remains unwired
+                // (see this file's and `selection`'s module docs).
                 RowKey::Activate => {
-                    if ev.shift_key() {
+                    if mods.shift {
                         selection.update(|s| {
                             s.select_all_in_hunk(&file, anchor, changed_lines.iter().copied())
                         });
