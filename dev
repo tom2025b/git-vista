@@ -234,9 +234,9 @@ cmd_browser() {
   # NOT a by-product of `cargo test`, so build it explicitly.
   #
   # The FIXTURE binary is built here for the same reason, and it was missing
-  # (#594). `run.sh` checks that `target/debug/gv-fixture` exists and its own
-  # comment says "this binary is as much a prerequisite as the server" — but
-  # nothing built it, so an out-of-date one sailed past the existence check and
+  # (#594). `run.sh` checks that the selected Cargo target's `debug/gv-fixture`
+  # exists. Its own comment says "this binary is as much a prerequisite as the
+  # server" — but nothing built it, so an out-of-date one sailed past the check and
   # died later with `unknown shape "..."`, which reads as a broken spec rather
   # than a missing build step. Reachable two ways: adding a shape and running
   # `dev browser` without a prior workspace build, and — measured on titan,

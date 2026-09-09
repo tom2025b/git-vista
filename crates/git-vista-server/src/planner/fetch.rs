@@ -247,7 +247,7 @@ pub(super) async fn run_fetch(
          (correctly) deny the connect"
     );
 
-    let before = match remote_tracking_refs(repo, need, remote).await {
+    let before = match remote_tracking_refs(repo, remote).await {
         Ok(refs) => refs,
         Err(why) => {
             return FetchStep::CouldNotRun {
@@ -296,7 +296,7 @@ pub(super) async fn run_fetch(
         Err(e) => return FetchStep::CouldNotRun { why: e.to_string() },
     };
 
-    let after = match remote_tracking_refs(repo, need, remote).await {
+    let after = match remote_tracking_refs(repo, remote).await {
         Ok(refs) => refs,
         Err(why) => {
             // The only exit path reached *after* git fetch has already run

@@ -85,8 +85,25 @@ fn target(entry: &str, expected_oid: &str) -> Result<StashTarget, String> {
 /// render it as an empty list. The server keeps those apart on purpose — its
 /// own handler comment says so — and collapsing them in the client would undo
 /// that: "no stashes" and "could not look" authorise different UI.
-pub async fn fetch_stashes() -> Result<Vec<StashEntry>, String> {
-    let url = format!("/api/stashes?t={}", js_sys::Date::now());
+///
+/// **`repo` is required, not optional, and that is deliberate** (#752) — the
+/// same reason [`crate::api::fetch_worktree_status_for`] requires one. An
+/// unscoped request resolves server-side through `resolve_repo(None)`, which
+/// falls back to the per-session `current()` selection — precisely the arm
+/// #733 took the v2 status read off. Making the parameter unrepresentable,
+/// rather than merely uncalled, is what stops a later caller forgetting to
+/// scope one.
+///
+/// The reply is still only a *candidate* reading. Whether the frame it was
+/// requested for is still the accepted one is
+/// [`current_reading`](crate::features::status::detail::core::current_reading)'s
+/// decision, at the call site, on values this function never sees.
+pub async fn fetch_stashes(repo: &str) -> Result<Vec<StashEntry>, String> {
+    let url = format!(
+        "/api/stashes?t={}&repo={}",
+        js_sys::Date::now(),
+        js_sys::encode_uri_component(repo)
+    );
     let resp = req_get(&url).send().await.map_err(network_error)?;
     if resp.ok() {
         resp.json::<Vec<StashEntry>>()

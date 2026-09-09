@@ -42,7 +42,7 @@ use super::{checkout_sandbox_argv, sandbox_argv, CheckoutPolicy, Policy};
 /// Split out from both wrappers so the argv they will run is testable without
 /// spawning anything, and so the two wrappers cannot drift apart in how they
 /// assemble it.
-fn full_argv(policy: &Policy, repo: &Path, args: &[&str]) -> Vec<std::ffi::OsString> {
+pub(crate) fn full_argv(policy: &Policy, repo: &Path, args: &[&str]) -> Vec<std::ffi::OsString> {
     let mut argv = sandbox_argv(policy);
     argv.push(std::ffi::OsString::from("-C"));
     argv.push(repo.as_os_str().to_os_string());
@@ -485,6 +485,7 @@ pub(crate) fn checkout_command_async(
 }
 
 fn command_from_argv(argv: Vec<std::ffi::OsString>) -> SandboxedCommand {
+    let argv = wrap_with_reaper(argv);
     let (program, rest) = split(&argv);
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(rest);
@@ -492,6 +493,87 @@ fn command_from_argv(argv: Vec<std::ffi::OsString>) -> SandboxedCommand {
         cmd.env_remove(var);
     }
     SandboxedCommand(cmd)
+}
+
+/// #728: an abrupt death of the process that spawns `bwrap` must not leave it
+/// reparented and running forever — see `sandbox::reaper`'s module doc for the
+/// full account and ADR 0141 for the design. Layered here, at the one place
+/// pure argv becomes a real process, rather than inside `sandbox_argv` itself:
+/// INV-16's reviewed argv shapes stay exactly what they were before #728,
+/// because the reaper decides how that argv is *launched*, not what it is.
+///
+/// **Scoped to `Tier::Strict` and `Tier::Network`** — detected structurally,
+/// by comparing the composed program against the resolved `bwrap` path or the
+/// resolved `gv-sandbox` shim path, rather than by threading a `Tier` through
+/// this function (which would need to see through `CheckoutPolicy`'s private
+/// field). Every sandboxed argv shape has exactly one of the two as its
+/// program (`sandbox_argv_with_seccomp_profile`'s three shapes: `Strict`
+/// starts with `bwrap`, `Network` — transfer or checkout, `policy.tier` is
+/// `Network` either way — starts with the bare shim, `Unsandboxed` starts with
+/// `git` and matches neither), so this covers both sandboxed tiers without
+/// needing to see the tier itself.
+///
+/// #757: originally `Tier::Network`'s bare shim was left unwrapped here,
+/// because it has no pid namespace — `killpg` is the *entire* reaping
+/// mechanism there, not a backstop on top of one, and the PR that added the
+/// reaper had not built a Network-tier acceptance test to justify it. That
+/// test is `sandbox::lifecycle::a_reaper_process_reaps_a_network_tier_launcher_when_only_its_own_parent_is_sigkilled`,
+/// and it also names the residual `killpg` does **not** close: a
+/// double-forked, `setsid`-detached grandchild leaves the reaper's process
+/// group entirely, on every tier, and only `Tier::Strict`'s pid namespace
+/// closes that gap (killing the namespace's pid 1 makes the kernel tear down
+/// every task inside it, regardless of what process group or session it
+/// self-assigned) — see that test's module-level comparison against
+/// `strict_reaps_a_double_forked_setsid_orphan_that_the_network_tier_does_not`.
+/// `Tier::Network`'s *ordinary* orphan — the shim, `git`, and whatever `git`
+/// spawned without deliberately detaching — is exactly what `killpg` reaches,
+/// which is the shape #757 was filed about: a Network-tier operation had **no**
+/// protection of any kind against its coordinating process dying abruptly, not
+/// even the bounded, `killpg`-only guarantee this section now gives it.
+///
+/// Never applied to `Tier::Unsandboxed`'s bare `git` (INV-16 shapes 1/2): that
+/// operation is already explicit, persisted, operator-trusted content flying a
+/// permanent banner (INV-15).
+///
+/// The caller's own pid is prepended as an explicit argument, **not** left for
+/// the reaper to discover via its own `getppid()` at some uncertain later
+/// time. A self-observed baseline is racy: the OS-level fork that creates the
+/// reaper process happens *before* a single line of the reaper's own code can
+/// run, so if the real caller dies inside that window, the reaper's first
+/// `getppid()` read already reflects the post-reparenting value, and the
+/// reaper would treat an already-orphaned state as normal from the start,
+/// never detecting anything wrong. `std::process::id()`, read here — in the
+/// caller, before the reaper is even spawned — has no such window: this
+/// process trivially knows its own pid before it exists to race against.
+/// `sandbox::lifecycle::a_reaper_process_reaps_a_launcher_orphaned_before_it_ever_ran`
+/// proves this deterministically (a SIGSTOP/SIGCONT fixture that forces the
+/// exact ordering: caller dies, reparenting completes, *then* the reaper's
+/// own code runs for the first time).
+///
+/// A host missing `gv-sandbox-reaper` gets `argv` back unwrapped: exactly the
+/// sandbox it had before #728, no capability lost — see `reaper::reaper_path`
+/// for why that absence is a soft condition, not a policy-construction
+/// failure.
+pub(crate) fn wrap_with_reaper(argv: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let is_strict_bwrap_launch = super::bwrap::bwrap_path()
+        .is_some_and(|bwrap| argv.first().map(|p| p.as_os_str()) == Some(bwrap.as_os_str()));
+    let is_network_shim_launch = !is_strict_bwrap_launch
+        && super::shim::shim_path()
+            .ok()
+            .is_some_and(|shim| argv.first().map(|p| p.as_os_str()) == Some(shim.as_os_str()));
+    if !is_strict_bwrap_launch && !is_network_shim_launch {
+        return argv;
+    }
+    match super::reaper::reaper_path() {
+        Some(reaper) => {
+            let mut wrapped = Vec::with_capacity(argv.len() + 2);
+            wrapped.push(reaper.as_os_str().to_os_string());
+            wrapped.push(std::ffi::OsString::from(std::process::id().to_string()));
+            wrapped.extend(argv);
+            wrapped
+        }
+        None => argv,
+    }
 }
 
 #[cfg(test)]
@@ -657,6 +739,80 @@ mod tests {
             &argv[..pure.len()],
             &pure[..],
             "the launcher prefix drifted"
+        );
+    }
+
+    /// #757: `wrap_with_reaper`'s own selection logic, pinned directly rather
+    /// than only observed through the process-tree acceptance tests in
+    /// `sandbox::lifecycle` (real but slow, and — as this test's own history
+    /// shows — not actually able to see every way the selection could drift:
+    /// a `failure-atlas` mutation that widened `is_network_shim_launch` to
+    /// match ANY non-empty argv, wrapping `Tier::Unsandboxed`'s bare `git`
+    /// too, survived every `sandbox::lifecycle` test, because none of them
+    /// ever exercise that tier through `wrap_with_reaper` at all).
+    ///
+    /// Three raw argv shapes, matching INV-16's three exhaustive outputs
+    /// (`sandbox_argv_with_seccomp_profile`'s own doc comment) rather than
+    /// built through a real `Policy` — this test's whole claim is about the
+    /// structural comparison inside `wrap_with_reaper` itself, which reads
+    /// only `argv[0]`, so a raw argv is the more direct fixture, not a
+    /// shortcut around one.
+    ///
+    /// MUTATION 1 (remove the mechanism): delete the `shim_path()` comparison
+    /// (`is_network_shim_launch = false`). RED here on the network leg alone
+    /// — `failure-atlas` confirmed this 2026-09-08 (verdict: caught).
+    /// MUTATION 2 (weaken the mechanism): widen the comparison to
+    /// `argv.first().is_some()`. RED here on the unsandboxed leg — this is
+    /// the exact mutation that survived every `sandbox::lifecycle` test
+    /// before this one existed (`failure-atlas`, 2026-09-08, verdict:
+    /// survived), which is why this test exists rather than resting on that
+    /// suite alone.
+    #[test]
+    fn wrap_with_reaper_recognizes_exactly_the_two_sandboxed_launcher_shapes() {
+        let reaper = super::super::reaper::reaper_path().unwrap_or_else(|| {
+            panic!(
+                "gv-sandbox-reaper must be built and resolvable, or this test proves \
+                 nothing about the mechanism under test — see tests/forces_reaper_build.rs"
+            )
+        });
+        let bwrap = super::super::bwrap::bwrap_path().unwrap_or_else(|| {
+            panic!("bwrap must be resolvable on this host, or the Strict leg proves nothing")
+        });
+        let shim = super::super::shim::shim_path().unwrap_or_else(|e| {
+            panic!(
+                "gv-sandbox must be built and resolvable, or this test proves nothing \
+                 about the mechanism under test: {e}"
+            )
+        });
+
+        let strict_argv = vec![
+            bwrap.as_os_str().to_os_string(),
+            std::ffi::OsString::from("--"),
+            std::ffi::OsString::from("git"),
+        ];
+        let network_argv = vec![
+            shim.as_os_str().to_os_string(),
+            std::ffi::OsString::from("--"),
+            std::ffi::OsString::from("git"),
+        ];
+        let unsandboxed_argv = vec![std::ffi::OsString::from("git")];
+
+        assert_eq!(
+            wrap_with_reaper(strict_argv.clone()).first(),
+            Some(&reaper.as_os_str().to_os_string()),
+            "a Strict (bwrap-prefixed) argv must be wrapped with the reaper"
+        );
+        assert_eq!(
+            wrap_with_reaper(network_argv.clone()).first(),
+            Some(&reaper.as_os_str().to_os_string()),
+            "#757: a Network (bare-shim) argv must be wrapped with the reaper too"
+        );
+        assert_eq!(
+            wrap_with_reaper(unsandboxed_argv.clone()),
+            unsandboxed_argv,
+            "Tier::Unsandboxed's bare `git` argv must never be wrapped with the \
+             reaper (INV-16 shapes 1/2): that operation is already explicit, \
+             persisted, operator-trusted content flying a permanent banner (INV-15)"
         );
     }
 

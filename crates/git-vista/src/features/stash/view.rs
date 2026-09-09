@@ -37,11 +37,12 @@ use leptos::*;
 use crate::api::{fetch_stash_patch, fetch_stashes, push_stash_request};
 use crate::datetime::time_ago;
 use crate::features::stash::core::{
-    ceremony, drawer_view, push_preview, Availability, Ceremony, DrawerView, PushPreview,
-    StashAction, StashRow, DRAWER_REGION_LABEL, LOADING_STASHES, NO_STASHES,
+    ceremony, drawer_view, panel_stash_reading, push_preview, Availability, Ceremony, DrawerView,
+    PushPreview, StashAction, StashRow, DRAWER_REGION_LABEL, LOADING_STASHES, NO_STASHES,
 };
 use crate::features::stash::signals::{compose_pop, StashDrawer, StashNotice, PUSH_KEY};
 use crate::features::status::core::StatusSections;
+use crate::features::status::signals as status_state;
 use crate::icons::icon_set;
 use crate::state::{Features, Settings, ViewerDoc};
 
@@ -63,20 +64,54 @@ pub fn stash_section_view(
     // outcome notice with it.
     drawer: StashDrawer,
 ) -> impl IntoView {
-    let Features { graph, shell, .. } = features;
+    let Features {
+        graph,
+        shell,
+        status,
+        ..
+    } = features;
     let nerd_icons = settings.nerd_icons;
     let write_gate = crate::features::stash::core::write_gate(read_only);
 
+    // Keyed and tagged on the accepted repository as well as the epoch
+    // (#752, matching the tag list and the v2 status read in `activity.rs`
+    // beside it): `repo` is part of the key, so a repository switch refetches
+    // rather than retaining a stale drawer, and the reply carries the epoch
+    // and repository it was *requested for* so `panel_stash_reading` below
+    // cannot compare the live frame against itself. An unscoped
+    // `fetch_stashes()` — no `repo` in the key, no `?repo=` on the wire — is
+    // exactly the arm #733 took the v2 read off; #752 found it still open
+    // here.
     let stashes = create_local_resource(
-        move || (shell.activity_is_open(), graph.get().epoch()),
-        |(open, _)| async move {
-            if open {
-                Some(fetch_stashes().await)
-            } else {
-                None
-            }
+        move || {
+            (
+                shell.activity_is_open(),
+                graph.get().epoch(),
+                status_state::repo(status),
+            )
+        },
+        |(open, epoch, repo)| async move {
+            let result = match (open, repo.as_deref()) {
+                (true, Some(id)) => Some(fetch_stashes(id).await),
+                // Closed, or no accepted frame yet: no request can describe
+                // this drawer, so nothing is fetched and nothing is claimed.
+                _ => None,
+            };
+            (epoch, repo, result)
         },
     );
+    // Resolved once, here, through the same host-tested decision
+    // `panel_worktree_reading` and `panel_tag_reading` use beside it — see
+    // `panel_stash_reading`'s own doc comment for why a second copy of that
+    // comparison is a second place for it to be got wrong.
+    let stashes_now = move || {
+        panel_stash_reading(
+            stashes.loading().get(),
+            stashes.get(),
+            graph.get().epoch(),
+            status_state::repo(status).as_deref(),
+        )
+    };
 
     // The patch of whichever row is expanded. Keyed on the selector, so
     // collapsing and re-expanding re-reads rather than showing a patch from
@@ -298,7 +333,7 @@ pub fn stash_section_view(
     };
 
     // -- The rows. ---------------------------------------------------------
-    let rows_view = move || match drawer_view(stashes.get().flatten(), write_gate) {
+    let rows_view = move || match drawer_view(stashes_now(), write_gate) {
         DrawerView::Loading => view! { <p class="detail-status">{LOADING_STASHES}</p> }.into_view(),
         DrawerView::Failed(line) => {
             view! { <p class="detail-status detail-error">{line}</p> }.into_view()

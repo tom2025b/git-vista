@@ -21,13 +21,16 @@
 // under the temp dir it is handed.
 
 import { execFileSync } from 'node:child_process'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 
 /** Repo root, from this file's location: ci/browser -> ../.. */
 const REPO = join(import.meta.dirname, '..', '..')
 
 /** The catalogue binary. Built by `cargo build -p git-vista-fixtures`. */
-const FIXTURE_BIN = join(REPO, 'target', 'debug', 'gv-fixture')
+const TARGET_DIR = process.env.CARGO_TARGET_DIR
+  ? resolve(process.env.CARGO_TARGET_DIR)
+  : join(REPO, 'target')
+const FIXTURE_BIN = join(TARGET_DIR, 'debug', 'gv-fixture')
 
 /**
  * Build one named shape into `root` by invoking the Rust catalogue.

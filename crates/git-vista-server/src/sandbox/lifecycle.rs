@@ -104,6 +104,7 @@ use std::time::{Duration, Instant};
 
 use super::escape_contract::production_env_profile;
 use super::escape_suite::hostile_hook_repo;
+use super::spawn;
 use super::spawn::command_async;
 use super::*;
 
@@ -666,5 +667,617 @@ async fn strict_gets_a_private_dev_shm_tmpfs_that_the_network_tier_does_not() {
         shm.host.is_file(),
         "C4: the host marker must still exist after the run; if the sandbox could \
          delete it, `ABSENT` would be self-inflicted rather than observed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #728 — the reaper survives its own parent's death, not just the launcher's
+// ---------------------------------------------------------------------------
+
+/// `to_cstrings`/`spawn_helper_owning_the_launcher` below exist because of a
+/// gap Codex's review of #728 named precisely: every SIGKILL test above this
+/// point (including `strict_reaps_a_double_forked_setsid_orphan…`) calls
+/// `child.start_kill()` on the composed launcher **the test itself spawned**.
+/// That proves the launcher's own pid-namespace teardown reaps a
+/// double-forked orphan when the launcher is killed directly. It says nothing
+/// about #728's actual defect, which is one hop further out: whatever process
+/// *spawned* the launcher dying, before the launcher itself is ever signalled.
+///
+/// This builds that missing hop for real, through the exact production seam:
+/// a **helper** process — standing in for whatever real process calls
+/// `command_async` in production (the server, or a test harness) — is made,
+/// via raw `fork`+`execvp`, the actual OS parent of the composed launcher,
+/// built with the same two calls production code makes
+/// (`spawn::full_argv` then `spawn::wrap_with_reaper`). SIGKILLing the
+/// **helper** — never the launcher, never the reaper — is the scenario #728
+/// names and the one no test here reached before it.
+fn to_cstrings(argv: &[std::ffi::OsString]) -> Vec<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    argv.iter()
+        .map(|a| std::ffi::CString::new(a.as_os_str().as_bytes()).expect("argv has no NUL"))
+        .collect()
+}
+
+/// Fork a **helper** that itself spawns the composed launcher and then idles,
+/// deliberately never `wait()`-ing on it — standing in for a real caller that
+/// is simply busy elsewhere when it dies, which is exactly the shape #728's
+/// own evidence showed (the two found orphans' real parent was gone, not
+/// gracefully shut down). Returns the helper's pid: this is what the test
+/// SIGKILLs, never the launcher or the reaper.
+///
+/// # Why two forks, not one
+///
+/// `fork()` inside a multithreaded program — this `#[tokio::test]`'s runtime
+/// — is safe only if the forked child does nothing before `exec`/`_exit` but
+/// read data already built in the parent: no allocation, no locking, nothing
+/// that could touch a mutex some other, non-forked thread held at the moment
+/// of the fork. The **helper**'s own body needs to fork *again* and then
+/// sleep — more than that bare minimum — so it is done from inside a
+/// **second**, by-then single-threaded process (this first fork's child),
+/// where none of those restrictions apply, rather than from the tokio runtime
+/// directly. Neither forked branch below calls back into Rust's panic
+/// machinery (`assert!`, `unwrap`, …) for the same reason: unwinding or
+/// printing through possibly-inconsistent inherited state is exactly what the
+/// restriction above rules out. `libc::_exit`, not `std::process::exit`, is
+/// the only safe way out of either child branch — it skips at-exit handlers
+/// and Rust's own global destructors, which the same inherited-state hazard
+/// applies to.
+async fn spawn_helper_owning_the_launcher(
+    policy: &Policy,
+    repo: &Path,
+    args: &[&str],
+) -> libc::pid_t {
+    // Deliberately NOT wrapped with the reaper yet: `wrap_with_reaper` embeds
+    // `std::process::id()` as the reaper's expected parent, and that must be
+    // the HELPER's own pid (its real, eventual OS parent once forked below),
+    // never this test task's pid. Composing it here and wrapping it in the
+    // test process would silently embed the wrong value — a bug this fixture
+    // had before this comment, caught by re-deriving the design after #728's
+    // review named the parent-pid-passing fix.
+    let bare_argv = spawn::full_argv(policy, repo, args);
+
+    // SAFETY: see the doc comment above — the child branch touches only the
+    // already-built `bare_argv` before forking again or exiting, aside from
+    // the ordinary (non-multithreaded-fork-restricted) work of composing the
+    // reaper wrap, which is safe here precisely because this process is
+    // already single-threaded post-fork — see the doc comment above.
+    let helper_pid = unsafe { libc::fork() };
+    if helper_pid == 0 {
+        // Now single-threaded and answerable to nothing but this test: the
+        // multithreaded-fork restriction applied to the fork above, not to
+        // this one. `wrap_with_reaper` runs HERE, in the helper, so
+        // `std::process::id()` inside it captures the helper's own pid — the
+        // reaper's true, eventual OS parent.
+        let argv = spawn::wrap_with_reaper(bare_argv);
+        let cargv = to_cstrings(&argv);
+        let mut raw: Vec<*const libc::c_char> = cargv.iter().map(|c| c.as_ptr()).collect();
+        raw.push(std::ptr::null());
+
+        let launcher_pid = unsafe { libc::fork() };
+        if launcher_pid < 0 {
+            unsafe { libc::_exit(126) };
+        }
+        if launcher_pid == 0 {
+            unsafe {
+                libc::execvp(cargv[0].as_ptr(), raw.as_ptr());
+                // execvp only returns on failure.
+                libc::_exit(127);
+            }
+        }
+        loop {
+            unsafe {
+                libc::sleep(60);
+            }
+        }
+    }
+    assert!(
+        helper_pid > 0,
+        "fork() (helper) failed: {}",
+        std::io::Error::last_os_error()
+    );
+    helper_pid
+}
+
+/// #728's acceptance criterion, built from the fixture above: "a sandboxed
+/// process whose parent dies abruptly (SIGKILL, not SIGTERM) is reaped rather
+/// than reparented and left running." The paired positive that makes this
+/// mean anything is every other test in this file — `orphan_hook`'s detached
+/// `setsid` ticker/marker is the identical hook `strict_reaps_a_double_forked…`
+/// already showed *does* survive a direct SIGKILL of the composed launcher
+/// under `Tier::Network` (no namespace, no reaper needed to explain it) and
+/// *does not* survive one under `Tier::Strict` via pid-namespace teardown
+/// alone. This test's subject is a third, harder case neither of those
+/// covers: the launcher is never touched directly at all.
+#[tokio::test]
+async fn a_reaper_process_reaps_the_launcher_when_only_its_own_parent_is_sigkilled() {
+    let case = "lifecycle-reaper-728";
+
+    assert!(
+        super::reaper::reaper_path().is_some(),
+        "{case}: gv-sandbox-reaper must be built and resolvable, or this test \
+         proves nothing about the mechanism under test — see \
+         tests/forces_reaper_build.rs. If this fails, the build plan is missing \
+         the binary, not the mechanism."
+    );
+
+    let repo = hostile_hook_repo(&orphan_hook());
+    let policy = strict_baseline(repo.path(), case).await;
+
+    let helper_pid = spawn_helper_owning_the_launcher(
+        &policy,
+        repo.path(),
+        &["commit", "--allow-empty", "-m", "orphan-728"],
+    )
+    .await;
+
+    // Wait for evidence the detached grandchild is actually running — the same
+    // discipline `observe_orphan` uses, and for the same reason: a fixed delay
+    // landing before the hook fires would make this whole test vacuous.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if tick_count(repo.path()) >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{case}: the hook's detached ticker never wrote two ticks within 30s \
+             — nothing about reaping can be observed from a run whose hook never \
+             ran"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // SIGKILL the HELPER — never the launcher, never the reaper, never bwrap.
+    // This is the one hop #728 says no earlier test in this file reached.
+    let killed = unsafe { libc::kill(helper_pid, libc::SIGKILL) };
+    assert_eq!(
+        killed, 0,
+        "{case}: SIGKILL of the helper must be deliverable"
+    );
+    let mut status: i32 = 0;
+    unsafe {
+        libc::waitpid(helper_pid, &mut status, 0);
+    }
+
+    // POLL_INTERVAL (gv-sandbox-reaper) is 100ms; this settle window is well
+    // past it, so a failure below is the mechanism's, not the timing's.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let ticks_at_kill = tick_count(repo.path());
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+
+    assert!(
+        ticks_at_kill >= 2,
+        "{case}: the detached ticker must have been running before the helper \
+         was killed, got {ticks_at_kill} ticks — otherwise the comparison below \
+         is zero versus zero"
+    );
+    assert_eq!(
+        tick_count(repo.path()),
+        ticks_at_kill,
+        "{case}: #728 — a descendant kept running after only its GRANDPARENT \
+         (never the launcher itself) was killed. The reaper did not notice it \
+         had been reparented, or did not tear the sandbox down when it did."
+    );
+    assert!(
+        !repo.path().join(ORPHAN_MARKER).exists(),
+        "{case}: the delayed marker was written after the helper's death — the \
+         detached setsid grandchild survived reparenting"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #728 review (Codex, PR #760) — the startup race: the real parent dies
+// BEFORE the reaper's own code ever runs even once
+// ---------------------------------------------------------------------------
+
+const LEVEL2_PID_MARKER: &str = "lifecycle-reaper-level2-pid";
+
+/// Fork a **caller** that itself forks a **soon-to-be-reaper** process, freezes
+/// that second process with `SIGSTOP` before it ever calls `execvp`, writes its
+/// pid into a marker file, then idles — waiting to be killed, exactly like
+/// `spawn_helper_owning_the_launcher`'s helper.
+///
+/// # Why this exists on top of that fixture
+///
+/// That one's helper stays alive throughout, so the reaper it eventually
+/// spawns always gets to read a live, correct parent at least once before
+/// anything can go wrong — and its test waits for hook ticks specifically so
+/// it never lands inside the window this test forces. No amount of *waiting
+/// for evidence* can land inside "the caller is already dead before the
+/// reaper's first instruction runs" on purpose; it has to be forced with
+/// `SIGSTOP`/`SIGCONT`, deterministically, rather than raced against.
+async fn spawn_caller_freezing_its_child_before_it_execs(
+    policy: &Policy,
+    repo: &Path,
+    args: &[&str],
+) -> libc::pid_t {
+    let bare_argv = spawn::full_argv(policy, repo, args);
+    let marker_path = repo.join(LEVEL2_PID_MARKER);
+    let marker_cpath = {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::CString::new(marker_path.as_os_str().as_bytes()).expect("repo path has no NUL")
+    };
+
+    // SAFETY / single-threaded-after-fork reasoning: see
+    // `spawn_helper_owning_the_launcher`'s doc comment. The same posture
+    // applies here — ordinary Rust work (composing the reaper wrap, writing
+    // the marker file) is safe in this process because it runs after this
+    // fork, not between some *other* fork and its exec.
+    let caller_pid = unsafe { libc::fork() };
+    if caller_pid == 0 {
+        let argv = spawn::wrap_with_reaper(bare_argv);
+        let cargv = to_cstrings(&argv);
+        let mut raw: Vec<*const libc::c_char> = cargv.iter().map(|c| c.as_ptr()).collect();
+        raw.push(std::ptr::null());
+
+        let level2_pid = unsafe { libc::fork() };
+        if level2_pid < 0 {
+            unsafe { libc::_exit(126) };
+        }
+        if level2_pid == 0 {
+            unsafe {
+                // Freeze before running a single line of the reaper's own
+                // logic — before even `execvp`. Self-raised rather than
+                // racing the parent's `kill(SIGSTOP)` against this process's
+                // own startup: this way the stop point is exactly here, not
+                // "sometime before or after an external signal happened to
+                // land".
+                libc::raise(libc::SIGSTOP);
+                // Resumes here, later, once the test SIGCONTs it — by which
+                // point its real parent (`caller`, this fork's own parent)
+                // may already be long dead.
+                libc::execvp(cargv[0].as_ptr(), raw.as_ptr());
+                libc::_exit(127);
+            }
+        }
+        // Report the frozen pid where the test can find it — the test is not
+        // this process's parent, so it has no standing to `waitpid` for it —
+        // then idle, never `wait()`-ing on it, same posture as the other
+        // fixture's caller.
+        unsafe {
+            let fd = libc::open(
+                marker_cpath.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                0o644,
+            );
+            if fd >= 0 {
+                let text = format!("{level2_pid}\n");
+                libc::write(fd, text.as_ptr() as *const libc::c_void, text.len());
+                libc::close(fd);
+            }
+        }
+        loop {
+            unsafe {
+                libc::sleep(60);
+            }
+        }
+    }
+    assert!(
+        caller_pid > 0,
+        "fork() (caller) failed: {}",
+        std::io::Error::last_os_error()
+    );
+    caller_pid
+}
+
+/// Poll `/proc/<pid>/stat`'s state field for `T` (stopped) — readable by any
+/// process, unlike `waitpid(..., WUNTRACED)`, which only the fixture's
+/// `caller` (not the test itself) has standing to call on `pid`.
+fn wait_until_stopped(pid: libc::pid_t, deadline: Instant) -> bool {
+    loop {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            // Fields after the parenthesised comm name are single chars/
+            // numbers separated by spaces; state is the first of them.
+            Ok(stat) => {
+                if let Some((_, after)) = stat.rsplit_once(')') {
+                    if after.trim_start().starts_with('T') {
+                        return true;
+                    }
+                }
+            }
+            Err(_) => return false, // already gone
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// #728 review finding (Codex, PR #760): an earlier version of this reaper
+/// read its own `getppid()` once, right after starting, as its baseline for
+/// every later comparison. If the real caller died BEFORE the reaper's own
+/// code ever ran even once — between the OS-level fork that creates the
+/// reaper process and that process's first executed instruction — that
+/// self-read baseline would already reflect the post-reparenting value, and
+/// every later comparison would read "nothing has changed", forever: the
+/// launcher could survive unbounded, the exact #728 shape reintroduced one
+/// layer up. `a_reaper_process_reaps_the_launcher_when_only_its_own_parent_is_sigkilled`
+/// above cannot exercise this — it waits for hook ticks before killing
+/// anything, which guarantees the reaper is already running normally by then.
+///
+/// This test forces the exact ordering deterministically, with
+/// `SIGSTOP`/`SIGCONT`, rather than hoping a timing window is hit — see
+/// `gv-sandbox-reaper`'s module doc, "Why the expected parent is passed in,
+/// not read", for the mechanism this proves: the fix passes the caller's pid
+/// in explicitly, established before the caller ever spawns anything, so the
+/// comparison is correct no matter how late the reaper's own first read of
+/// `getppid()` happens to land.
+#[tokio::test]
+async fn a_reaper_process_reaps_a_launcher_orphaned_before_it_ever_ran() {
+    let case = "lifecycle-reaper-startup-race-728";
+    let repo = hostile_hook_repo(&orphan_hook());
+    let policy = strict_baseline(repo.path(), case).await;
+
+    let caller_pid = spawn_caller_freezing_its_child_before_it_execs(
+        &policy,
+        repo.path(),
+        &["commit", "--allow-empty", "-m", "orphan-728-startup-race"],
+    )
+    .await;
+
+    // Wait for the caller to report the frozen process's pid.
+    let marker_path = repo.path().join(LEVEL2_PID_MARKER);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let level2_pid: libc::pid_t = loop {
+        if let Ok(raw) = std::fs::read_to_string(&marker_path) {
+            if let Ok(pid) = raw.trim().parse() {
+                break pid;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{case}: the caller never reported the frozen process's pid within 10s"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    // Confirm it is genuinely stopped — not merely "probably stopped by now",
+    // which would make this test a timing gamble rather than a forced
+    // ordering.
+    assert!(
+        wait_until_stopped(level2_pid, Instant::now() + Duration::from_secs(5)),
+        "{case}: the frozen process (pid {level2_pid}) never reached the \
+         STOPPED state — this test cannot force the ordering it exists to \
+         force without it"
+    );
+
+    // Kill the CALLER — the frozen process's real, immediate parent — while
+    // it is still frozen and has not run one line of its own logic yet.
+    let killed = unsafe { libc::kill(caller_pid, libc::SIGKILL) };
+    assert_eq!(
+        killed, 0,
+        "{case}: SIGKILL of the caller must be deliverable"
+    );
+    let mut status: i32 = 0;
+    unsafe {
+        libc::waitpid(caller_pid, &mut status, 0);
+    }
+
+    // Let the kernel finish reparenting before resuming — the property under
+    // test is specifically that this has ALREADY happened by the time the
+    // frozen process's own code runs for the first time.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let resumed = unsafe { libc::kill(level2_pid, libc::SIGCONT) };
+    assert_eq!(
+        resumed, 0,
+        "{case}: SIGCONT of the frozen process must be deliverable"
+    );
+
+    // Give the reaper time to run its very first check, detect the mismatch
+    // and tear down — comfortably longer than gv-sandbox-reaper's own
+    // POLL_INTERVAL (100ms), since with the fix this should not even need a
+    // second iteration to catch it.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    assert_ne!(
+        unsafe { libc::kill(level2_pid, 0) },
+        0,
+        "{case}: the process that became the reaper (pid {level2_pid}) is \
+         still alive — it never noticed it was already orphaned before its \
+         first instruction ran"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #757 — the reaper wraps Tier::Network's bare shim too, and what it does not
+// reach
+// ---------------------------------------------------------------------------
+
+/// A single, ordinary background child — no `setsid`, so it stays in whatever
+/// process group its parent (the hook's shell, itself a child of `git`, itself
+/// a child of the shim) already belongs to. This is the shape `killpg` is
+/// built to reach: `Tier::Network` puts none of this tree in a pid namespace,
+/// so there is no kernel-level backstop the way `Tier::Strict` has — the
+/// process GROUP the reaper set at spawn time is the only boundary, and this
+/// hook never leaves it. Same two-marker shape as `orphan_hook` (a ticker to
+/// count, a delayed marker to catch survival), deliberately without the
+/// `setsid` detachment that hook uses.
+fn ordinary_orphan_hook() -> String {
+    format!(
+        "sh -c 'i=0; while [ $i -lt 80 ]; do echo t >> {TICKS}; \
+         i=$((i+1)); sleep 0.1; done' >/dev/null 2>&1 &\n\
+         sh -c 'sleep 2; echo alive > {ORPHAN_MARKER}' >/dev/null 2>&1 &\n\
+         sleep 10\n"
+    )
+}
+
+/// #757's acceptance criterion: "a Network-tier process is reaped." Built the
+/// same way #728's
+/// `a_reaper_process_reaps_the_launcher_when_only_its_own_parent_is_sigkilled`
+/// proves it for `Tier::Strict` — a **helper**, standing in for a real caller,
+/// is the launcher's actual OS parent, and is SIGKILLed directly, never the
+/// launcher and never the reaper. Before #757, `Tier::Network` had no reaper
+/// wrap at all, so this exact scenario reparented the shim (and everything
+/// under it) to init/systemd and left it running forever — issue #757's
+/// finding, reproduced here as the failing control this test's subject leg
+/// answers.
+///
+/// The hook is deliberately the ordinary, non-detached shape
+/// (`ordinary_orphan_hook`), not the double-forked `setsid` one the `Strict`
+/// tier's equivalent test uses: see
+/// `a_network_tier_reaper_does_not_reach_a_double_forked_setsid_grandchild`,
+/// immediately below, for why that harder shape is out of scope for this tier
+/// — proven so, not assumed.
+#[tokio::test]
+async fn a_reaper_process_reaps_a_network_tier_launcher_when_only_its_own_parent_is_sigkilled() {
+    let case = "lifecycle-reaper-757-network";
+
+    assert!(
+        super::reaper::reaper_path().is_some(),
+        "{case}: gv-sandbox-reaper must be built and resolvable, or this test \
+         proves nothing about the mechanism under test — see \
+         tests/forces_reaper_build.rs. If this fails, the build plan is missing \
+         the binary, not the mechanism."
+    );
+
+    let repo = hostile_hook_repo(&ordinary_orphan_hook());
+    let policy = network_control(repo.path(), case);
+
+    let helper_pid = spawn_helper_owning_the_launcher(
+        &policy,
+        repo.path(),
+        &["commit", "--allow-empty", "-m", "orphan-757-network"],
+    )
+    .await;
+
+    // Wait for evidence the background ticker is actually running, same
+    // discipline as every other leg in this file.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if tick_count(repo.path()) >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{case}: the hook's background ticker never wrote two ticks within \
+             30s — nothing about reaping can be observed from a run whose hook \
+             never ran"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // SIGKILL the HELPER — never the launcher, never the reaper. Exactly
+    // #728's shape, one tier down.
+    let killed = unsafe { libc::kill(helper_pid, libc::SIGKILL) };
+    assert_eq!(
+        killed, 0,
+        "{case}: SIGKILL of the helper must be deliverable"
+    );
+    let mut status: i32 = 0;
+    unsafe {
+        libc::waitpid(helper_pid, &mut status, 0);
+    }
+
+    // POLL_INTERVAL (gv-sandbox-reaper) is 100ms; this settle window is well
+    // past it, so a failure below is the mechanism's, not the timing's.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let ticks_at_kill = tick_count(repo.path());
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+
+    assert!(
+        ticks_at_kill >= 2,
+        "{case}: the ticker must have been running before the helper was \
+         killed, got {ticks_at_kill} ticks — otherwise the comparison below is \
+         zero versus zero"
+    );
+    assert_eq!(
+        tick_count(repo.path()),
+        ticks_at_kill,
+        "{case}: #757 — an ordinary Network-tier descendant kept running after \
+         only its GRANDPARENT (never the launcher itself) was killed. Before \
+         #757 this tier had no reaper wrap at all, so this is the exact defect \
+         the issue reported."
+    );
+    assert!(
+        !repo.path().join(ORPHAN_MARKER).exists(),
+        "{case}: the delayed marker was written after the helper's death — the \
+         ordinary background child survived reparenting"
+    );
+}
+
+/// The named residual `killpg` does not close, proven rather than asserted in
+/// prose: a double-forked `setsid` grandchild leaves the process group the
+/// reaper set at spawn time (that is what `setsid` is *for*), and `killpg`
+/// only reaches members of that group. `Tier::Strict` gets away with this
+/// because its pid namespace is a second, independent backstop — killing the
+/// namespace's pid 1 makes the KERNEL tear down every task inside it,
+/// regardless of what process group or session any of them self-assigned
+/// (see `strict_reaps_a_double_forked_setsid_orphan_that_the_network_tier_does_not`,
+/// whose subject leg is this same hook reaped by that stronger mechanism).
+/// `Tier::Network` has no pid namespace at all — unsharing one breaks push
+/// (F3: `argv.rs`'s `network_tier_never_names_bwrap_and_never_unshares_net`)
+/// — so for this tier `killpg` is not a backstop on top of something else, it
+/// is the entire mechanism, and this is exactly its edge.
+///
+/// This answers #757's acceptance criterion "if not reachable within this
+/// issue's scope, say why... with the mechanism that prevents a fix" as a
+/// real, run test rather than a comment left to go stale: the mechanism is
+/// `setsid`'s process-group detachment, and closing it for this tier would
+/// need the same kernel-level namespace guarantee `Tier::Strict` already has
+/// — which `Tier::Network` cannot take on without breaking the outbound
+/// network access this tier exists to provide.
+#[tokio::test]
+async fn a_network_tier_reaper_does_not_reach_a_double_forked_setsid_grandchild() {
+    let case = "lifecycle-reaper-757-network-setsid-residual";
+
+    assert!(
+        super::reaper::reaper_path().is_some(),
+        "{case}: gv-sandbox-reaper must be built and resolvable, or this test \
+         proves nothing about the mechanism under test."
+    );
+
+    let repo = hostile_hook_repo(&orphan_hook());
+    let policy = network_control(repo.path(), case);
+
+    let helper_pid = spawn_helper_owning_the_launcher(
+        &policy,
+        repo.path(),
+        &["commit", "--allow-empty", "-m", "orphan-757-network-setsid"],
+    )
+    .await;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if tick_count(repo.path()) >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{case}: the hook's detached setsid ticker never wrote two ticks \
+             within 30s — nothing about reaping can be observed from a run \
+             whose hook never ran"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let killed = unsafe { libc::kill(helper_pid, libc::SIGKILL) };
+    assert_eq!(
+        killed, 0,
+        "{case}: SIGKILL of the helper must be deliverable"
+    );
+    let mut status: i32 = 0;
+    unsafe {
+        libc::waitpid(helper_pid, &mut status, 0);
+    }
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let ticks_at_kill = tick_count(repo.path());
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+
+    assert!(
+        ticks_at_kill >= 2,
+        "{case}: the detached ticker must have been running before the helper \
+         was killed, got {ticks_at_kill} ticks — otherwise the comparison \
+         below is zero versus zero"
+    );
+    assert!(
+        tick_count(repo.path()) > ticks_at_kill,
+        "{case}: a double-forked setsid grandchild was reaped after all — if \
+         this ever goes red, that is GOOD NEWS (the residual this test \
+         documents has closed some other way), and this test's doc comment \
+         and #757 both need updating to say so rather than the assertion \
+         inverted silently"
     );
 }

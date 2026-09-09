@@ -6,7 +6,7 @@
 
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 
 /** The port the server binds. NOT configurable, and deliberately the same 8080
@@ -17,10 +17,11 @@ import { setTimeout as sleep } from 'node:timers/promises'
  *  interfaces that cannot see each other. */
 export const TEST_PORT = 8080
 
-export const SERVER_BIN = join(
-  process.env.GV_REPO_ROOT || join(import.meta.dirname, '..', '..'),
-  'target', 'debug', 'git-vista-server',
-)
+const TARGET_DIR = process.env.CARGO_TARGET_DIR
+  ? resolve(process.env.CARGO_TARGET_DIR)
+  : join(process.env.GV_REPO_ROOT || join(import.meta.dirname, '..', '..'), 'target')
+
+export const SERVER_BIN = join(TARGET_DIR, 'debug', 'git-vista-server')
 
 /**
  * Spawn the server and wait until it answers.

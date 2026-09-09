@@ -34,7 +34,7 @@ use crate::features::status::core::{
 };
 use crate::features::status::signals as status_state;
 use crate::features::tags::core::{
-    tag_list_view, tag_row_lines, TagListView, TagRow, LOADING_TAGS, NO_TAGS,
+    panel_tag_reading, tag_list_view, tag_row_lines, TagListView, TagRow, LOADING_TAGS, NO_TAGS,
 };
 use crate::features::worktrees::view::worktree_section_view;
 use crate::icons::icon_set;
@@ -140,20 +140,45 @@ pub fn activity_panel_view(
     // second "is the panel open" to drift, which is the defect M1.11 removed.
     let status_sections = Signal::derive(move || worktree_now().map(|(_, sections)| sections));
 
-    // The tag list (M2.21b, #236), keyed exactly like the feed above: open the
-    // panel and it is read fresh, and any operation that bumps the graph epoch
-    // — including one that creates or deletes a tag — refreshes it in place.
-    // Same key, one fetch each, no second "is the panel open" to drift.
+    // The tag list (M2.21b, #236). Keyed and tagged on the accepted repository
+    // as well as the epoch (#752, matching the v2 status read above and #711/
+    // #733's own fix for the same class): `repo` is part of the key, so a
+    // repository switch refetches rather than retaining a stale list, and the
+    // reply carries the epoch and repository it was *requested for* so the
+    // resolution below cannot compare the live frame against itself. An
+    // unscoped `fetch_tags()` — no `repo` in the key, no `?repo=` on the wire
+    // — is exactly the arm #733 took the v2 read off; #752 found it still
+    // open here.
     let tags = create_local_resource(
-        move || (shell.activity_is_open(), graph.get().epoch()),
-        |(open, _)| async move {
-            if open {
-                Some(fetch_tags().await)
-            } else {
-                None
-            }
+        move || {
+            (
+                shell.activity_is_open(),
+                graph.get().epoch(),
+                status_state::repo(status),
+            )
+        },
+        |(open, epoch, repo)| async move {
+            let result = match (open, repo.as_deref()) {
+                (true, Some(id)) => Some(fetch_tags(id).await),
+                // Closed, or no accepted frame yet: no request can describe
+                // this panel, so nothing is fetched and nothing is claimed.
+                _ => None,
+            };
+            (epoch, repo, result)
         },
     );
+    // Resolved once, here, through the same host-tested decision
+    // `panel_worktree_reading` uses above — see `panel_tag_reading`'s own doc
+    // comment for why a second copy of that comparison is a second place for
+    // it to be got wrong.
+    let tags_now = move || {
+        panel_tag_reading(
+            tags.loading().get(),
+            tags.get(),
+            graph.get().epoch(),
+            status_state::repo(status).as_deref(),
+        )
+    };
 
     // The right-edge exclusivity effect that used to sit here is gone (M1.11, #64,
     // Task 8). It cleared the detail panel one reactive tick *after* this panel's
@@ -344,7 +369,7 @@ pub fn activity_panel_view(
             // compiled by `trunk build` and by nothing that asserts anything.
             // What is left below is one arm per variant with no condition of
             // its own — the mapping a reader can check by eye.
-            let tags_section = move || match tag_list_view(tags.get().flatten()) {
+            let tags_section = move || match tag_list_view(tags_now()) {
                 TagListView::Loading => {
                     view! { <p class="detail-status">{LOADING_TAGS}</p> }.into_view()
                 }
