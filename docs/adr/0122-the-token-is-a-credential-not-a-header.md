@@ -279,7 +279,8 @@ the credentialed launcher without assessing the remaining execution surfaces.
 `network_exec::tests::a_repo_credential_helper_is_blocked_and_its_unforced_output_is_redactable`
 proves the configured helper runs in an unforced positive control and does
 not run through the shared launcher. The argv checks additionally verify
-reset-before-helper ordering; the server helper's own value remains non-empty.
+the shared reset and the server helper's variable name; the helper's own
+value remains non-empty.
 
 ### 9. `state::credential_token()` is a placeholder, and says so
 
