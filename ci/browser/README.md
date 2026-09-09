@@ -27,9 +27,11 @@ First run installs `@playwright/test` and needs a Chromium build present
 
 Prerequisites, each checked with a clear message rather than a stack trace:
 
-- `target/debug/git-vista-server` — `cargo build -p git-vista-server`
-- `target/debug/gv-fixture` — `cargo build -p git-vista-fixtures` (since #448 the
-  fixtures are built by the Rust catalogue, not in JavaScript — see ADR 0076)
+- `${CARGO_TARGET_DIR:-target}/debug/git-vista-server` —
+  `cargo build -p git-vista-server`
+- `${CARGO_TARGET_DIR:-target}/debug/gv-fixture` —
+  `cargo build -p git-vista-fixtures` (since #448 the fixtures are built by the
+  Rust catalogue, not in JavaScript — see ADR 0076)
 - `crates/git-vista/dist/` — `trunk build --config crates/git-vista/Trunk.toml`
 
 ## Why it runs in a network namespace
@@ -43,6 +45,10 @@ free port, and `dev testbed` pays for its own port with a 10–25 minute rebuild
 loopback and therefore their own 8080, invisible to whatever the operator is
 running on the host's 8080. Nothing is rebuilt, the bind guard is untouched, and
 the binary under test is the real one.
+
+Binary lookup follows Cargo's target-directory environment variable. Set
+`CARGO_TARGET_DIR` before `dev browser` or `run.sh` to use an assigned build
+tree; when it is unset, the harness falls back to the repository's `target/`.
 
 **The cost of that choice, stated plainly:** a namespace with only loopback has
 no network, so Chromium reports `navigator.onLine === false` and the app's
