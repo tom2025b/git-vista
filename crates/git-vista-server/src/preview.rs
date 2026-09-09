@@ -376,19 +376,14 @@ impl PreviewTarget {
     /// The single-root analogue, for a caller that holds one root rather than
     /// the catalog.
     ///
-    /// Exactly the reason `repo_paths::resolve_and_validate` is "kept as its
-    /// own function anyway rather than folded away": a single fixed root is
-    /// the right shape for a hostile-geometry test. Every fixture in this
-    /// module's suite already owns its `TempDir`, so every test builds its
-    /// target through the *same* containment check production uses rather
-    /// than through a `#[cfg(test)]` bypass that would leave the suite
-    /// exercising a shape production never takes.
+    /// Every fixture owns its `TempDir`, so this constructor resolves the
+    /// repository geometry and checks containment of both gitdir and
+    /// commondir against that one root. Fixtures still validate containment;
+    /// they do not construct an unchecked target.
     ///
-    /// No production caller today — the server always has the catalog — so it
-    /// carries the house `cfg_attr` rather than a `#[cfg(test)]`: it is
-    /// ordinary code, compiled and clippy-checked in every build, and the day
-    /// a single-root caller appears the attribute simply comes off.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Test-only: the server always validates against the catalog's full set
+    /// of allowed roots through `in_managed_catalog`.
+    #[cfg(test)]
     pub(crate) fn resolved_in(
         repo: &Path,
         managed_root: &Path,

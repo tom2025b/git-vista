@@ -117,11 +117,17 @@ fn grant_in(trust_dir: &Path, canonical_repo: &Path) -> std::io::Result<()> {
 
 /// Remove trust from `canonical_repo` (an operator revoke). Idempotent — a
 /// missing marker is success, because the desired state (not trusted) holds.
-#[cfg_attr(not(test), allow(dead_code))] // wired to the operator-revoke handler in a later task
+///
+/// Test-only alongside `grant`: no operator-trust flow exists until trust
+/// self-propagation is addressed. See the module doc and the
+/// `grant_is_unreachable_from_production_until_self_propagation_is_addressed`
+/// tripwire below before wiring either half of that flow.
+#[cfg(test)]
 pub(crate) fn revoke(canonical_repo: &Path) -> std::io::Result<()> {
     revoke_in(&sandbox_trust_dir(), canonical_repo)
 }
 
+#[cfg(test)]
 fn revoke_in(trust_dir: &Path, canonical_repo: &Path) -> std::io::Result<()> {
     let marker = trust_dir.join(marker_name(canonical_repo));
     match std::fs::remove_file(&marker) {

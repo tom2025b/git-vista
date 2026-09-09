@@ -7,12 +7,6 @@
 //! nothing but argv, the sync and async spawn wrappers share one policy
 //! function and neither needs `block_on` or a `pre_exec` closure.
 
-// Task 1 lands the pure chokepoint before Task 5 wires the spawn wrappers to
-// it. `cargo clippy --workspace --all-targets -- -D warnings` builds the bin
-// target *without* `cfg(test)`, where these items have no caller yet.
-// REMOVE THIS ALLOW IN TASK 5, once `sandbox::spawn` calls `sandbox_argv`.
-#![allow(dead_code)]
-
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -602,8 +596,13 @@ pub(crate) enum HookMode {
     /// Repository hooks run. They gate the operation normally (INV-11).
     Run,
     /// `core.hooksPath` is pointed at a server-owned empty directory, so no
-    /// repository hook can run at all. The state the probe drops to when the
-    /// host cannot provide the declared minimum (INV-13).
+    /// repository hook can run at all. Production constructors never select
+    /// this mode: ADR 0029's "Where the plan still disagrees with this ADR"
+    /// rejects the degrade-and-block fallback. Keep the variant and its argv
+    /// match arms compiled for R8's blocked-hooks exemption; see
+    /// `r8_exemptions_expire_when_their_named_blocker_disappears` and
+    /// `documented_gaps.rs:388` (`policy_for_clone_shape_regression_guard`).
+    #[cfg_attr(not(test), allow(dead_code))]
     Blocked { empty_dir: PathBuf },
 }
 

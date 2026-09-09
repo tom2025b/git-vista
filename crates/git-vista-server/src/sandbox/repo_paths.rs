@@ -90,6 +90,7 @@ pub(crate) enum RepoPathsError {
     /// convincing the pointer chain is: a repository this server was never
     /// configured to serve gets no sandbox grant, no matter what its own
     /// `.git` claims about itself.
+    #[cfg(test)]
     #[error(
         "the git directory of {} resolves to {} (commondir {}), which lies outside the \
          server's managed root — refusing rather than granting sandbox access to an \
@@ -179,8 +180,9 @@ pub(crate) fn resolve(repo: &Path) -> Result<RepoPaths, RepoPathsError> {
 /// [`resolve`] directly and checks containment against the catalog's full set
 /// via `state::path_is_allowed` instead of calling this single-root wrapper.
 /// Kept as its own function anyway rather than folded away, because a single
-/// fixed root is the right shape for a hostile-geometry test and for any
-/// future caller that only ever has one root to check against.
+/// fixed root is the right shape for a hostile-geometry test and the preview
+/// suite's single-root fixtures.
+#[cfg(test)]
 pub(crate) fn resolve_and_validate(
     repo: &Path,
     managed_root: &Path,
