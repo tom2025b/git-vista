@@ -1,4 +1,4 @@
-# ADR 0142 — Network spawns use server-authored transport programs
+# ADR 0144 — Network spawns use server-authored transport programs
 
 - **Status:** Accepted — implemented for #755; installed remote helpers remain an explicit residual
 - **Date:** 2026-09-08
