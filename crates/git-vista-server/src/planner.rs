@@ -704,7 +704,6 @@ async fn pin_recovery(repo: &Path, recovery: &RecoveryStrategy) {
 /// roundtrip safe. Deliberately guard-free for the same reason the composed
 /// path builds before locking: building only *reads*, and a concurrent review
 /// must not serialize behind (or block) a running mutation.
-#[cfg_attr(not(test), allow(dead_code))] // routed by #248; contract-suite-only until then
 pub(crate) async fn build_plan_only(
     repo: &Path,
     op: GitOperation,

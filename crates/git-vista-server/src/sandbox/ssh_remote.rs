@@ -96,7 +96,7 @@ fn free_tcp_port() -> u16 {
 
 /// A child process killed (and reaped) on drop, so a panicking assertion
 /// mid-test leaves no `sshd`/`ssh-agent` behind.
-struct KillOnDrop(Child, &'static str);
+struct KillOnDrop(Child);
 
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
@@ -322,7 +322,7 @@ impl SshFixture {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap_or_else(|e| panic!("spawn sshd: {e}"));
-        let sshd = KillOnDrop(sshd_child, "sshd");
+        let sshd = KillOnDrop(sshd_child);
         let up = wait_until(Duration::from_secs(5), || {
             TcpStream::connect(("127.0.0.1", port)).is_ok()
         });
@@ -340,7 +340,7 @@ impl SshFixture {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap_or_else(|e| panic!("spawn ssh-agent: {e}"));
-        let agent = KillOnDrop(agent_child, "ssh-agent");
+        let agent = KillOnDrop(agent_child);
         let sock_up = wait_until(Duration::from_secs(5), || agent_sock.exists());
         assert!(
             sock_up,

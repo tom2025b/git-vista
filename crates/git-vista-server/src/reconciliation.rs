@@ -102,6 +102,7 @@ const WRITE_SWEEP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Held by every open stream. When the last one drops, [`Drop`] stops the
 /// driver — which stops the watcher, which releases its inotify watches.
 pub(crate) struct Feed {
+    #[cfg(test)]
     repo: PathBuf,
     snapshots: watch::Sender<Option<ChangeFeedSnapshot>>,
     /// Asks the driver to sweep now and **say when it has**, without saying
@@ -128,6 +129,7 @@ pub(crate) struct Feed {
     /// of reads — a cheap read may happen far more often than an expensive one
     /// and still be within budget, which is the whole point of a
     /// self-calibrating floor. So the second is asserted on occupancy.
+    #[cfg(test)]
     reads: Arc<ReadMeter>,
     driver: StdMutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -139,22 +141,26 @@ impl Feed {
         self.snapshots.subscribe()
     }
 
+    #[cfg(test)]
     pub(crate) fn repo(&self) -> &Path {
         &self.repo
     }
 
     /// How many times this feed has read the repository.
+    #[cfg(test)]
     pub(crate) fn reads(&self) -> u64 {
         self.reads.count.load(Ordering::Relaxed)
     }
 
     /// How long those reads took in total — the numerator of the duty cycle.
+    #[cfg(test)]
     pub(crate) fn read_time(&self) -> Duration {
         Duration::from_nanos(self.reads.nanos.load(Ordering::Relaxed))
     }
 
     /// Times this feed's driver has been round its loop. A feed doing nothing
     /// should be round it a handful of times; a spinning one, millions.
+    #[cfg(test)]
     pub(crate) fn driver_turns(&self) -> u64 {
         self.reads.turns.load(Ordering::Relaxed)
     }
@@ -228,9 +234,11 @@ pub(crate) fn attach_with_hints(repo: &Path, hints: Hints) -> Arc<Feed> {
     let (wake, wake_rx) = mpsc::unbounded_channel();
     let reads = Arc::new(ReadMeter::default());
     let feed = Arc::new(Feed {
+        #[cfg(test)]
         repo: repo.to_path_buf(),
         snapshots: snapshots.clone(),
         wake,
+        #[cfg(test)]
         reads: Arc::clone(&reads),
         driver: StdMutex::new(None),
     });
