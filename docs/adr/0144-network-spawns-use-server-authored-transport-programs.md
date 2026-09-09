@@ -1,10 +1,76 @@
 # ADR 0144 — Network spawns use server-authored transport programs
 
-- **Status:** Accepted — implemented for #755; installed remote helpers remain an explicit residual
+- **Status:** Accepted — extended by #779 to constrain native Git and custom helpers
 - **Date:** 2026-09-08
-- **Issue:** #755
+- **Issue:** #755, #779; LFS checkout/filter follow-up #782
 - **Extends:** [ADR 0036](0036-network-tier-exec-harness-askpass-and-redaction.md)
 - **Related:** [ADR 0122](0122-the-token-is-a-credential-not-a-header.md), [ADR 0128](0128-a-credential-exists-only-before-untrusted-checkout.md), [ADR 0137](0137-an-untrusted-checkout-inherits-an-allowlist.md)
+
+## #779 amendment — fixed transport policy (2026-09-09)
+
+The original decision below left two transport selectors open. The shared
+Network launcher now seals `GIT_ALLOW_PROTOCOL=http:https:ssh:git:file` and
+`GIT_PROXY_COMMAND=` into every command, including credentialed transfer and
+credentialless checkout. These restrictions are applied immediately before
+both `output()` and `spawn()`, after all environment construction, so inherited
+values or checkout's `env_clear` cannot remove them. The sealed API accepts no
+caller-supplied protocol names or proxy commands.
+
+Git [documents the protocol allowlist](https://git-scm.com/docs/git#Documentation/git.txt-GITALLOWPROTOCOL)
+as overriding existing protocol configuration. Unlike `-c protocol.allow=never`,
+it beats a repository's specific `protocol.<name>.allow=always`, including
+selection through `remote.<name>.vcs`, custom URLs, push URLs and URL rewrites.
+Git also [documents the proxy environment override](https://git-scm.com/docs/git-config#Documentation/git-config.txt-coregitProxy).
+An empty `GIT_PROXY_COMMAND` bypasses all `core.gitProxy` entries: the marker
+experiment verifies that Git attempts a direct connection instead of executing
+the first matching configured proxy. This works where a later
+`-c core.gitProxy=none` does not, so disabling native Git is unnecessary.
+
+Supported transports are HTTP, HTTPS, SSH (including scp-style syntax), direct
+native `git://`, and local paths / `file://`. HTTP(S) still uses Git's standard
+installed helpers; executable lookup through the operator's `PATH` /
+`GIT_EXEC_PATH` remains trusted, as do existing SSH environment overrides.
+This is not binary provenance verification or general hook containment.
+
+Compatibility costs are explicit:
+
+- Proxy commands configured by `core.gitProxy` or inherited through
+  `GIT_PROXY_COMMAND` no longer run. Native Git must connect directly; an
+  operator requiring such a proxy must use another supported transport.
+- Custom remote helpers such as `git-remote-hg`, and `ext`, are denied even
+  when installed and enabled in global or repository config.
+- The fixed protocol policy replaces an inherited `GIT_ALLOW_PROTOCOL`,
+  including a more restrictive parent value; protocol policy is server-owned.
+- Checkout receives the same fixed transport policy in addition to its
+  inherited-environment allowlist. Hooks and filters still run. Git LFS's own
+  custom-transfer and extension selectors are not governed by these settings;
+  [#782](https://github.com/tom2025b/git-vista/issues/782) owns runtime measurement
+  and compatibility decisions for that separate scope.
+
+Behavioral regressions in `network_exec::https_suite` install real marker
+programs with ordinary hooks disabled. Their positive controls demonstrate a
+proxy surviving the naive reset and an installed helper surviving the blanket
+protocol default. Hardened runs require an absent marker and either direct
+connection failure (proxy) or Git's protocol denial (custom helper), through
+ordinary output, streamed spawn, credentialed and tokenless wrappers, and the
+checkout wrapper. Proxy tests cover config-only and hostile inherited values;
+helper cases include a non-origin named remote's `vcs`, URL, `insteadOf`,
+`pushurl`, and `pushInsteadOf`. Existing real native-Git and SSH transfer suites
+verify that supported transports still work.
+
+Verification on Git 2.53.0: all 135 affected Network, spawn, SSH, clone,
+fetch/push/pull, and sandbox-contract tests pass; server all-target Clippy and
+workspace formatting checks pass. Two compiled-code mutations were caught by
+both marker tests: removing the transport policy, and replacing it with the
+naive `protocol.allow=never` / `core.gitProxy=none` config pins. In each mutation
+both forbidden programs actually ran, causing the marker-absence assertions to
+fail. Production source was restored after each experiment.
+
+The remainder of this ADR records PR #775's original decision and evidence;
+its proxy and installed-helper residuals are superseded by this amendment.
+LFS is tracked separately; #755's closure still requires its broader reassessment.
+
+Signed: **codex** · 2026-09-09
 
 ## Context
 

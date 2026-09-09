@@ -58,25 +58,22 @@
 //! Git-Vista's own [`network_command_with_credential`] helper; tokenless
 //! fetch/push and clone no longer fall back to an operator credential helper.
 //!
-//! Some executable selectors remain outside these pins. Git's
-//! `GIT_SSH_COMMAND`, `GIT_SSH`, `GIT_PROXY_COMMAND`, `GIT_ASKPASS` and
-//! `SSH_ASKPASS` environment variables are inherited from the server's parent,
-//! not writable through repository config; preserving that ambient operator
-//! choice is the same trust boundary as preserving `PATH`. `core.gitProxy` is
-//! worse: it is repository-controlled and arbitrary, but it is a first-match
-//! multi-value key. Measured directly, a later `-c core.gitProxy=none` does
-//! **not** outrank the repository's earlier matching entry. Disabling
-//! `protocol.git` would close it by disabling every native Git-protocol remote,
-//! a compatibility break this change does not hide inside an argv constant. A
-//! `remote.<name>.vcs` or custom URL protocol can select only an installed
-//! `git-remote-<vcs>` helper, also found through that operator-controlled
-//! executable environment. Git has no higher-precedence "unset" spelling for
-//! `remote.<name>.vcs` (an empty value tries to execute `git-remote-`), and a
-//! blanket protocol default is still overridden by a repository's more
-//! specific `protocol.<name>.allow`. Closing that installed-helper residual
-//! requires a server-side validated transport allowlist, not a pin that only
-//! looks effective. The direct-shell `ext` case does have an exact fixed key,
-//! so it is denied here.
+//! #779 closes native Git proxies and unapproved installed remote helpers with
+//! fixed `GIT_ALLOW_PROTOCOL=http:https:ssh:git:file` and `GIT_PROXY_COMMAND=`
+//! values at spawn time. The allowlist outranks even specific repository
+//! protocol rules, including after URL rewriting and for `remote.<name>.vcs`.
+//! The empty proxy environment override bypasses all `core.gitProxy` entries,
+//! unlike a later config reset, while preserving direct `git://` connections.
+//! Proxy commands and custom helpers (including `ext`) are unavailable even
+//! when global or repository config enables them.
+//!
+//! `PATH`, `GIT_EXEC_PATH`, SSH and askpass environment selectors still come
+//! from the operator's parent environment; executable lookup remains trusted.
+//! HTTP(S) uses Git's installed standard helpers. Both transport environment
+//! values are server-authored and replace inherited values. Checkout also
+//! receives them after its environment is cleared, but LFS custom-transfer/
+//! extension and general filter commands are separate executable surfaces,
+//! not constrained by Git's protocol policy.
 //!
 //! [`redact_output`] remains defence in depth for diagnostics emitted by the
 //! selected transport. A [`CredentialedCommand`] additionally knows and
@@ -191,7 +188,7 @@ pub(crate) fn network_command(
     args: &[&str],
 ) -> spawn::SandboxedCommand {
     let full = compose_network_args(args, None);
-    spawn::command_async(policy, repo, &full)
+    spawn::command_async(policy, repo, &full).with_network_transport_policy()
 }
 
 /// The literal appended as `-c credential.helper=<this>` when
@@ -292,7 +289,9 @@ pub(crate) fn network_command_with_credential(
     let command = if let Some(token) = token {
         let helper_config = format!("credential.helper={}", credential_helper_config());
         let full = compose_network_args(args, Some(&helper_config));
-        spawn::command_async(policy, repo, &full).credential_env(token)
+        spawn::command_async(policy, repo, &full)
+            .with_network_transport_policy()
+            .credential_env(token)
     } else {
         network_command(policy, repo, args)
     };
@@ -364,7 +363,9 @@ pub(crate) fn network_command_without_credential(
 ) -> UntrustedCheckoutCommand {
     let full = compose_network_args(args, None);
     UntrustedCheckoutCommand(
-        spawn::checkout_command_async(policy, repo, &full).with_untrusted_checkout_env(),
+        spawn::checkout_command_async(policy, repo, &full)
+            .with_network_transport_policy()
+            .with_untrusted_checkout_env(),
     )
 }
 
@@ -1538,5 +1539,228 @@ mod https_suite {
              network_command; stderr={}",
             String::from_utf8_lossy(&hardened.stderr)
         );
+    }
+
+    fn selector_repo(fixture: &HomeAndCwd) {
+        run(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&fixture.cwd),
+            "init selector repo",
+        );
+        // No hooks can account for the observed execution.
+        std::fs::create_dir(fixture.cwd.join("no-hooks")).unwrap();
+        selector_config(fixture, "core.hooksPath", "no-hooks");
+    }
+
+    fn selector_config(fixture: &HomeAndCwd, key: &str, value: &str) {
+        run(
+            Command::new("git")
+                .args(["config", key, value])
+                .current_dir(&fixture.cwd),
+            "configure selector",
+        );
+    }
+
+    fn selector_marker(repo: &Path, name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let program = repo.join(name);
+        let marker = repo.join("selector-ran");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf 'RAN\\n' >> '{}'\nexit 1\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&program).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&program, permissions).unwrap();
+        (program, marker)
+    }
+
+    /// Run the same attack through every Network constructor and both public
+    /// completion paths. The hostile test environment is installed AFTER the
+    /// builder, so this also detects an allowlist erased by env replacement.
+    async fn assert_selector_blocked(
+        fixture: &HomeAndCwd,
+        policy: &Policy,
+        args: &[&str],
+        env: &[(&str, String)],
+        marker: &Path,
+        protocol: &str,
+    ) {
+        for mode in [
+            "output",
+            "spawn",
+            "credential-none",
+            "credential-some",
+            "checkout",
+        ] {
+            let out = match mode {
+                "output" => network_command(policy, &fixture.cwd, args)
+                    .pinned_env_for_test(env)
+                    .output()
+                    .await
+                    .unwrap(),
+                "spawn" => network_command(policy, &fixture.cwd, args)
+                    .pinned_env_for_test(env)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+                    .wait_with_output()
+                    .await
+                    .unwrap(),
+                "credential-none" | "credential-some" => network_command_with_credential(
+                    policy,
+                    &fixture.cwd,
+                    args,
+                    (mode == "credential-some").then_some("selector-test-token"),
+                )
+                .pinned_env_for_test(env)
+                .output()
+                .await
+                .unwrap(),
+                "checkout" => {
+                    let checkout = crate::sandbox::CheckoutPolicy(policy.clone());
+                    // Apply a hermetic profile to the already sealed command;
+                    // unlike reapplying hardening here, this cannot mask a
+                    // missing constructor pin in production.
+                    let mut command =
+                        network_command_without_credential(&checkout, &fixture.cwd, args);
+                    command.0 = command.0.pinned_env_for_test(env);
+                    command.output().await.unwrap()
+                }
+                _ => unreachable!(),
+            };
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                !marker.exists(),
+                "{mode}: {protocol} marker executed; stderr={stderr}"
+            );
+            assert!(
+                !out.status.success(),
+                "{mode}: failing marker/remote unexpectedly succeeded"
+            );
+            if protocol != "git" {
+                assert!(
+                    stderr.contains(&format!("transport '{protocol}' not allowed")),
+                    "{mode}: expected protocol rejection, got {stderr}"
+                );
+            } else {
+                assert!(
+                    stderr.contains("unable to connect to 127.0.0.1"),
+                    "{mode}: expected direct connection after proxy suppression, got {stderr}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_git_proxy_selector_is_blocked() {
+        let fixture = home_and_cwd();
+        selector_repo(&fixture);
+        let (program, marker) = selector_marker(&fixture.cwd, "hostile-proxy");
+        selector_config(&fixture, "core.gitProxy", program.to_str().unwrap());
+        selector_config(&fixture, "protocol.git.allow", "always");
+        // Reserve a port without listening: direct connects fail immediately,
+        // and no concurrent fixture can acquire it during either test leg.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let policy = network_policy(&fixture.home, &fixture.cwd, port);
+        let mut env = hermetic_env(&fixture.home);
+        env.push(("GIT_ALLOW_PROTOCOL", "git:http:https:ssh:file".into()));
+        let url = format!("git://127.0.0.1:{port}/repo");
+        let args = ["ls-remote", &url];
+        // The naive reset still executes the first matching repository proxy.
+        let unforced = spawn::command_async(
+            &policy,
+            &fixture.cwd,
+            &["-c", "core.gitProxy=none", args[0], args[1]],
+        )
+        .pinned_env_for_test(&env)
+        .output()
+        .await
+        .unwrap();
+        assert!(
+            marker.exists(),
+            "positive control: proxy did not run: {}",
+            String::from_utf8_lossy(&unforced.stderr)
+        );
+        std::fs::remove_file(&marker).unwrap();
+        assert_selector_blocked(&fixture, &policy, &args, &env, &marker, "git").await;
+        env.push(("GIT_PROXY_COMMAND", program.to_string_lossy().into_owned()));
+        assert_selector_blocked(&fixture, &policy, &args, &env, &marker, "git").await;
+    }
+
+    #[tokio::test]
+    async fn installed_remote_helper_selectors_are_blocked() {
+        for selector in ["vcs", "url", "insteadOf", "pushurl", "pushInsteadOf"] {
+            let fixture = home_and_cwd();
+            selector_repo(&fixture);
+            let (_, marker) = selector_marker(&fixture.cwd, "git-remote-gv779");
+            selector_config(&fixture, "protocol.gv779.allow", "always");
+            selector_config(&fixture, "remote.named.url", "https://example.invalid/repo");
+            match selector {
+                "vcs" => selector_config(&fixture, "remote.named.vcs", "gv779"),
+                "url" => selector_config(&fixture, "remote.named.url", "gv779::repo"),
+                "insteadOf" => selector_config(
+                    &fixture,
+                    "url.gv779::.insteadOf",
+                    "https://example.invalid/",
+                ),
+                "pushurl" => selector_config(&fixture, "remote.named.pushurl", "gv779::repo"),
+                "pushInsteadOf" => selector_config(
+                    &fixture,
+                    "url.gv779::.pushInsteadOf",
+                    "https://example.invalid/",
+                ),
+                _ => unreachable!(),
+            }
+            // Push needs a source ref before it will dispatch a transport.
+            run(
+                Command::new("git")
+                    .args([
+                        "-c",
+                        "user.name=Test",
+                        "-c",
+                        "user.email=test@example.invalid",
+                        "commit",
+                        "-qm",
+                        "fixture",
+                        "--allow-empty",
+                    ])
+                    .current_dir(&fixture.cwd),
+                "create push source",
+            );
+            let policy = network_policy(&fixture.home, &fixture.cwd, 9418);
+            let env = vec![
+                ("PATH", format!("{}:/usr/bin:/bin", fixture.cwd.display())),
+                ("HOME", fixture.home.to_string_lossy().into_owned()),
+                ("GIT_CONFIG_NOSYSTEM", "1".into()),
+            ];
+            let args: &[&str] = if selector.starts_with("push") {
+                &["push", "named", "HEAD:refs/heads/test"]
+            } else {
+                &["fetch", "named"]
+            };
+            // Specific repo policy beats even this command-line default.
+            let mut naive = vec!["-c", "protocol.allow=never"];
+            naive.extend_from_slice(args);
+            let unforced = spawn::command_async(&policy, &fixture.cwd, &naive)
+                .pinned_env_for_test(&env)
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                marker.exists(),
+                "{selector} positive control: helper did not run: {}",
+                String::from_utf8_lossy(&unforced.stderr)
+            );
+            std::fs::remove_file(&marker).unwrap();
+            assert_selector_blocked(&fixture, &policy, args, &env, &marker, "gv779").await;
+        }
     }
 }

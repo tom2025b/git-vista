@@ -367,6 +367,28 @@ below.
   truncate the hostile bits before the seccomp-visible register held them — and
   dies under `ci/mutants/M9-widen-af-unix-comparison.patch`.
 
+### Network transport selection — #755 / #779
+
+The shared Network launcher supplies fixed
+`GIT_ALLOW_PROTOCOL=http:https:ssh:git:file` and empty `GIT_PROXY_COMMAND`
+values immediately before process launch. These override specific repository
+protocol rules, all `core.gitProxy` entries, and inherited values. HTTP(S), SSH,
+direct native `git://`, and local-path transports remain supported. Proxy
+commands no longer run: an operator requiring one must switch to another
+supported transport. Custom installed remote helpers are rejected, including
+selection through `remote.<name>.vcs`, push URLs and URL rewrites. Git's standard
+HTTP(S) helpers and executable lookup through the operator's `PATH` /
+`GIT_EXEC_PATH` remain trusted.
+
+This supplements ADR 0144's credential-helper, SSH, fsmonitor and pack-program
+pins. It also applies after clone checkout's environment is built from its
+allowlist: these two values are server-authored, never copied from the parent.
+It does not disable hooks or filters or constrain Git LFS's own custom-transfer/
+extension commands; those are tracked separately in
+[#782](https://github.com/tom2025b/git-vista/issues/782). See
+[ADR 0144's amendment](adr/0144-network-spawns-use-server-authored-transport-programs.md)
+for compatibility and behavioral proof.
+
 ### Network-tier spawns with hooks enabled — #744 census
 
 `HookMode::Run` means Git is allowed to dispatch a hook; it does not mean every

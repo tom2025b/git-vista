@@ -167,7 +167,9 @@ const SCRUBBED_GIT_GEOMETRY_ENV: &[&str] = &[
 /// variable later.
 ///
 /// So the child's environment is **built**, not filtered: start from nothing,
-/// copy across only the names below. A credential nobody enumerated is absent
+/// copy across only the names below. The Network harness additionally supplies
+/// fixed, non-secret `GIT_ALLOW_PROTOCOL` and empty `GIT_PROXY_COMMAND` values
+/// at spawn time (#779), never their inherited values. A credential nobody enumerated is absent
 /// because it was never added, which is a property of the shape rather than of
 /// anyone's diligence.
 ///
@@ -265,9 +267,11 @@ where
 /// `env` is excluded on the same reasoning as `arg`: `GIT_DIR`, `GIT_SSH_COMMAND`
 /// and `GIT_EXTERNAL_DIFF` redirect or execute, so an environment appended
 /// after classification is an argv change wearing a different hat — with
-/// [`credential_env`](SandboxedCommand::credential_env) as the one deliberate,
-/// narrow exception (M13.01, #582): see [`CREDENTIAL_TOKEN_VAR`]'s doc for why
-/// that one variable does not carry the hazard the exclusion is about.
+/// two narrow exceptions: [`credential_env`](SandboxedCommand::credential_env)
+/// supplies server-owned credential data (#582), and
+/// [`with_network_transport_policy`](SandboxedCommand::with_network_transport_policy)
+/// selects a fixed server-authored restriction (#779). Neither exposes an
+/// arbitrary environment name/value setter.
 ///
 /// The *inherited* environment gets the complementary treatment:
 /// [`command_async`] removes the fixed [`SCRUBBED_GIT_GEOMETRY_ENV`] family at
@@ -276,12 +280,16 @@ where
 ///
 /// The setters consume and return `Self` so a call site still reads as one
 /// chain ending in `output()`/`spawn()`.
-pub(crate) struct SandboxedCommand(tokio::process::Command);
+pub(crate) struct SandboxedCommand {
+    command: tokio::process::Command,
+    restrict_network_transports: bool,
+}
 
 /// The one environment variable a production caller may set on a
 /// [`SandboxedCommand`] (M13.01, #582), via [`SandboxedCommand::credential_env`]
-/// — and the *only* exception to the "no `env`" rule this type's doc comment
-/// states, made narrow rather than reopening a general surface.
+/// — the only caller-supplied environment value this type permits. The Network
+/// protocol restriction separately sets a fixed server-authored value (#779);
+/// neither method reopens a general environment setter.
 ///
 /// # Why this one variable does not carry the hazard `env` was excluded for
 ///
@@ -304,14 +312,14 @@ pub(crate) struct SandboxedCommand(tokio::process::Command);
 /// after review (#668, grok, 2026-09-05).** The variable is set on the
 /// *git* process; `gv-sandbox` `execve`s git without clearing the
 /// environment, and git's credential helpers are children of that git. So
-/// **every helper in the chain inherits this value**, not only ours — and
-/// `network_exec`'s append-never-clear rule (ADR 0122 decision 8) is
-/// precisely what puts an operator's or a repository's own helper *earlier*
-/// in that chain, in the same process, with the same environment.
+/// **every helper in the chain inherits this value**, not only ours. The
+/// original append-never-clear rule (ADR 0122 decision 8) put an operator's or
+/// repository's helper earlier in that chain. PR #775 superseded that rule:
+/// the Network harness now resets configured helpers before appending exactly
+/// Git-Vista's helper (ADR 0144).
 ///
-/// Isolation and append cannot both be true of a value that lives in git's
-/// environment. Append is what the code does; isolation is the claim that
-/// loses.
+/// Resetting the helper chain does not isolate a process environment value to
+/// one descendant. Any other program the Git process runs still inherits it.
 ///
 /// #680 showed why “no repo-local config exists yet” was not enough: global
 /// `core.hooksPath` or filter configuration can let fetched content select a
@@ -322,25 +330,44 @@ pub(crate) struct SandboxedCommand(tokio::process::Command);
 /// an env-backed credential has only this internal name in the child.
 ///
 /// **Read this before reusing `network_command_with_credential` on
-/// fetch/push/pull.** Those run against an *existing* repository whose
-/// `.git/config` may declare a `credential.helper` that runs first and can
-/// read this variable straight out of its environment. That is a
-/// served-repo exfiltration path, and closing it is a separate decision
-/// (isolating the token to our own helper — e.g. passing it on a pipe the
-/// helper reads rather than an inherited variable), not something to add
-/// silently alongside a new call site.
+/// fetch/push/pull.** The helper reset and transport pins constrain the named
+/// transport selectors, but these operations may also run repository-selected
+/// hooks. Those descendants can read this variable from their environment.
+/// Reuse therefore still requires a separate credential-isolation decision,
+/// not just relying on the configured helper chain being reset.
 pub(crate) const CREDENTIAL_TOKEN_VAR: &str = "GIT_VISTA_CREDENTIAL_TOKEN";
 
 impl SandboxedCommand {
+    /// Seal Network transport selection to Git-Vista's supported protocols.
+    /// No caller-supplied names or values: repository protocol rules must not
+    /// reopen installed helpers. Apply at completion so checkout's env_clear
+    /// and test-only environment replacement cannot erase this restriction.
+    pub(crate) fn with_network_transport_policy(mut self) -> Self {
+        self.restrict_network_transports = true;
+        self
+    }
+
+    fn apply_network_transport_policy(&mut self) {
+        if self.restrict_network_transports {
+            // Unlike protocol.allow=never, this overrides specific repository
+            // protocol.<name>.allow rules too. The empty proxy environment
+            // override bypasses ALL core.gitProxy entries (first-match config
+            // cannot be reset with a later -c), while retaining direct git://.
+            self.command
+                .env("GIT_ALLOW_PROTOCOL", "http:https:ssh:git:file");
+            self.command.env("GIT_PROXY_COMMAND", "");
+        }
+    }
+
     /// Set [`CREDENTIAL_TOKEN_VAR`] to `token` on this command's environment —
     /// the one deliberate exception to "no `env`", see that constant's doc.
     /// Never call this with a value that did not come from Git-Vista's own
     /// token source; it is not a general secret-passing mechanism.
     pub(crate) fn credential_env(mut self, token: &str) -> Self {
         for var in crate::token_store::TOKEN_SOURCE_ENV_VARS {
-            self.0.env_remove(var);
+            self.command.env_remove(var);
         }
-        self.0.env(CREDENTIAL_TOKEN_VAR, token);
+        self.command.env(CREDENTIAL_TOKEN_VAR, token);
         self
     }
 
@@ -355,14 +382,16 @@ impl SandboxedCommand {
     /// [`UNTRUSTED_CHECKOUT_ENV_ALLOWLIST`] for what survives and why.
     ///
     /// `env_clear()` first, then the allowlist: the child's environment is the
-    /// returned set and nothing else. The three ADR 0128 names are absent here
+    /// returned set. At spawn time the Network harness adds its fixed,
+    /// non-secret `GIT_ALLOW_PROTOCOL` and empty `GIT_PROXY_COMMAND` restrictions
+    /// (#779); no parent value is copied for either name. The three ADR 0128 names are absent here
     /// because they were never copied in — a strictly stronger statement than
     /// the removals this replaces, and one that holds for every name nobody
     /// has thought of yet.
     pub(crate) fn with_untrusted_checkout_env(mut self) -> Self {
-        self.0.env_clear();
+        self.command.env_clear();
         for (key, value) in untrusted_checkout_env(std::env::vars_os()) {
-            self.0.env(key, value);
+            self.command.env(key, value);
         }
         self
     }
@@ -388,7 +417,7 @@ impl SandboxedCommand {
     /// `/proc/self/cmdline` back from the kernel.
     #[cfg(test)]
     pub(crate) fn credential_env_for_test(&self) -> Option<String> {
-        self.0.as_std().get_envs().find_map(|(k, v)| {
+        self.command.as_std().get_envs().find_map(|(k, v)| {
             (k == std::ffi::OsStr::new(CREDENTIAL_TOKEN_VAR))
                 .then(|| v.map(|v| v.to_string_lossy().into_owned()))
                 .flatten()
@@ -396,37 +425,40 @@ impl SandboxedCommand {
     }
 
     pub(crate) fn stdin(mut self, cfg: impl Into<std::process::Stdio>) -> Self {
-        self.0.stdin(cfg);
+        self.command.stdin(cfg);
         self
     }
 
     pub(crate) fn stdout(mut self, cfg: impl Into<std::process::Stdio>) -> Self {
-        self.0.stdout(cfg);
+        self.command.stdout(cfg);
         self
     }
 
     pub(crate) fn stderr(mut self, cfg: impl Into<std::process::Stdio>) -> Self {
-        self.0.stderr(cfg);
+        self.command.stderr(cfg);
         self
     }
 
     pub(crate) fn kill_on_drop(mut self, kill: bool) -> Self {
-        self.0.kill_on_drop(kill);
+        self.command.kill_on_drop(kill);
         self
     }
 
     pub(crate) async fn output(mut self) -> std::io::Result<std::process::Output> {
-        self.0.output().await
+        self.apply_network_transport_policy();
+        self.command.output().await
     }
 
     pub(crate) fn spawn(mut self) -> std::io::Result<tokio::process::Child> {
-        self.0.spawn()
+        self.apply_network_transport_policy();
+        self.command.spawn()
     }
 
     /// Test-only: exit status, for fixture setup that only needs "did it work".
     #[cfg(test)]
     pub(crate) async fn status(mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.0.status().await
+        self.apply_network_transport_policy();
+        self.command.status().await
     }
 
     /// Test-only: **replace** the environment with `profile`, wholesale.
@@ -448,9 +480,9 @@ impl SandboxedCommand {
         K: AsRef<std::ffi::OsStr>,
         V: AsRef<std::ffi::OsStr>,
     {
-        self.0.env_clear();
+        self.command.env_clear();
         for (k, v) in profile {
-            self.0.env(k, v);
+            self.command.env(k, v);
         }
         self
     }
@@ -492,7 +524,10 @@ fn command_from_argv(argv: Vec<std::ffi::OsString>) -> SandboxedCommand {
     for var in SCRUBBED_GIT_GEOMETRY_ENV {
         cmd.env_remove(var);
     }
-    SandboxedCommand(cmd)
+    SandboxedCommand {
+        command: cmd,
+        restrict_network_transports: false,
+    }
 }
 
 /// #728: an abrupt death of the process that spawns `bwrap` must not leave it
@@ -688,7 +723,7 @@ mod tests {
             command_async(&policy, &repo, &["checkout", "-f"]).with_untrusted_checkout_env();
 
         assert!(
-            command.0.as_std().get_envs().all(|(key, value)| {
+            command.command.as_std().get_envs().all(|(key, value)| {
                 value.is_some()
                     && UNTRUSTED_CHECKOUT_ENV_ALLOWLIST
                         .iter()
@@ -705,7 +740,7 @@ mod tests {
         // reads the child's whole environment back out of a running hook.
         assert!(
             command
-                .0
+                .command
                 .as_std()
                 .get_envs()
                 .any(|(key, _)| key == std::ffi::OsStr::new("PATH")),
@@ -928,7 +963,7 @@ mod tests {
         let cmd = command_async(&policy, &repo, &["status", "--short"]);
 
         let removed: std::collections::BTreeSet<std::ffi::OsString> = cmd
-            .0
+            .command
             .as_std()
             .get_envs()
             .filter(|(_, v)| v.is_none())
