@@ -769,6 +769,10 @@ const EXEMPT: &[(&str, &str)] = &[
     // features/activity/signals.rs:44: `self.core.update(ActivityCore::toggle);`
     // — `RwSignal::update` takes the function itself, not a call.
     ("git-vista/src/features/activity/core.rs", "toggle"),
+    // features/tags/core.rs:163: `tags.iter().map(tag_row).collect()`.
+    ("git-vista/src/features/tags/core.rs", "tag_row"),
+    // features/dialogs/commit.rs:730: `let breadth = status.map(staged_breadth);`.
+    ("git-vista/src/features/dialogs/commit.rs", "staged_breadth"),
     // ── Self-documented dead-by-design, found by this census, not in the
     // original 15-item manual list ─────────────────────────────────────────
     //
@@ -816,14 +820,10 @@ const EXEMPT: &[(&str, &str)] = &[
     ("git-vista/src/features/activity/signals.rs", "toggle"),
     // ── Found by this census, no self-documentation located anywhere in the
     // surrounding module — genuinely new candidates the original manual
-    // 15-item census did not include. Verified: `grep -rn "\bNAME("
-    // --include=*.rs crates` finds no hit anywhere in the workspace (all 7
-    // crates) outside the defining file's own #[cfg(test)] module. Exempted
-    // here so the census is green against today's tree; each is a real,
+    // 15-item census did not include. Exempted here so the census is green
+    // against today's tree; each is a real,
     // reportable finding for a human to either wire up or remove — NOT an
     // argued-dead decision the way every entry above this line is. ────────
-    ("git-vista/src/features/tags/core.rs", "tag_row"),
-    ("git-vista/src/features/dialogs/commit.rs", "staged_breadth"),
     // `git-vista-core/src/request_generation.rs`'s `issue` used to sit here.
     // The census asked whoever found it to "wire it up or remove"; ADR 0053
     // answered *remove* — Leptos 0.6.15's own resource already drops
