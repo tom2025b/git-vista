@@ -27,10 +27,19 @@ This ritual was proven across ~10 merges on 2026-08-05.
 5. Any failing check: STOP and report. Never merge around a red gate.
 6. `gh pr merge <n> --merge --subject "<conventional title> (#<n>)"` —
    avoid a bare `(#NNN)` for any issue that must stay open.
-7. Refresh the app mirror: `git -C ~/projects/gv/mirror pull --ff-only`
-   (the owner's big-screen view reads it).
+7. Refresh the checkout the running `git-vista-server` actually serves. Read
+   the repository argument from the server process's argv, require that checkout
+   to be on `main`, then run `git -C "$served_repo" pull --ff-only origin main`.
+   If no server is running, print an explicit (successful) skip: there is no app
+   view to refresh. If a server is running but its repository cannot be resolved
+   or refreshed, stop and report the failure loudly. Never restart the server;
+   the owner reloads the existing browser session.
 8. If a tracked PDF conflicted anywhere: re-render from the merged .md with
    render-md-pdf; never side-pick a binary.
 
 `land.sh` beside this file is the reference implementation of steps 1-7 for
 non-conflicting PRs; edit its `land` lines rather than rewriting the loop.
+
+Existing per-issue worktrees retain the tracked skill version from their branch.
+They receive this corrected step only after main is merged down or the worktree
+is recreated; do not assume an older worktree refreshes the live app checkout.
