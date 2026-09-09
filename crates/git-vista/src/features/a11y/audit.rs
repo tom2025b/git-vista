@@ -382,6 +382,16 @@ const INTERACTIVE_CENSUS: &[(&str, bool)] = &[
     (".blame-row", true),
     (".blame-select", true),
     (".blame-history-commit", true),
+    // #357: the staging view's per-line selection checkbox. Honestly `false`
+    // for a third reason distinct from the two above (SVG sizing, and the
+    // as-yet-unrecorded) — this one IS ordinary CSS-sized, and deliberately
+    // does not meet #65's 44px floor: `features::diff::selection`'s module
+    // doc explains why (ADR 0011 treats mouse and pen as precise pointers
+    // that don't need a finger-sized target, and a 44px band per rendered
+    // line would triple the patch's vertical footprint). `.stage-hunk-check`
+    // above stays the 44px finger target; this is the precise-pointer-only
+    // sibling it doesn't have.
+    (".stage-line-check", false),
 ];
 
 #[test]
