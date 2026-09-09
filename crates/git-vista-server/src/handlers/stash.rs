@@ -381,6 +381,157 @@ mod listing_tests {
     }
 }
 
+/// #752: `GET /api/stashes` did not accept `?repo=` at all — every request
+/// answered for the process-wide default selection ([`crate::state::current`]),
+/// regardless of which repository a client meant. These tests drive the real
+/// handler against two on-disk repositories, each with its own stash, and
+/// prove a request scoped to one never answers with the other's entries.
+#[cfg(test)]
+mod scope_tests {
+    use super::stash_list;
+    use crate::handlers::read::RepoQuery;
+    use axum::extract::Query;
+    use axum::http::StatusCode;
+    use git_vista_protocol::StashEntry;
+
+    /// One repository with exactly one stash entry, registered in the catalog
+    /// under its own opaque worktree id — addressed by `?repo=<id>`, never by
+    /// the process-wide default selection, so this fixture cannot be
+    /// perturbed by another test in this binary moving `CURRENT`.
+    fn build_stash_fixture(dir: &std::path::Path, file_contents: &str) -> String {
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "Ada Lovelace")
+                .env("GIT_AUTHOR_EMAIL", "ada@example.com")
+                .env("GIT_COMMITTER_NAME", "Ada Lovelace")
+                .env("GIT_COMMITTER_EMAIL", "ada@example.com")
+                .env("GIT_AUTHOR_DATE", "@1753300000 +0000")
+                .env("GIT_COMMITTER_DATE", "@1753300000 +0000")
+                .status()
+                .expect("git should be runnable")
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("tracked.txt"), "original\n").expect("seed file");
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "-q", "-m", "root"]);
+        std::fs::write(dir.join("tracked.txt"), file_contents).expect("dirty the tree");
+        git(&["stash", "push", "-q", "-m", "wip"]);
+
+        crate::state::allow_repo_root(dir);
+        let handle = crate::state::set_current(dir, git_vista_protocol::RepoMode::Active)
+            .expect("the fixture registers in the catalog");
+        handle.worktree.to_string()
+    }
+
+    async fn list(repo_id: &str) -> Vec<StashEntry> {
+        let (status, body) = stash_list(Query(RepoQuery {
+            repo: Some(repo_id.to_string()),
+        }))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        serde_json::from_str(&body).expect("a scoped read parses as the listing")
+    }
+
+    /// The defect this issue names, reproduced against real repositories: two
+    /// distinct stash entries, each in its own repository, and a request
+    /// naming one must never answer with the other's.
+    #[tokio::test]
+    async fn a_scoped_read_never_answers_with_a_different_repositorys_stash() {
+        crate::state::with_isolated_test_current(
+            a_scoped_read_never_answers_with_a_different_repositorys_stash_in_scope(),
+        )
+        .await;
+    }
+
+    async fn a_scoped_read_never_answers_with_a_different_repositorys_stash_in_scope() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let id_a = build_stash_fixture(dir_a.path(), "changed in A\n");
+        let id_b = build_stash_fixture(dir_b.path(), "changed in B\n");
+
+        let entries_a = list(&id_a).await;
+        let entries_b = list(&id_b).await;
+
+        assert_eq!(entries_a.len(), 1, "repo A holds exactly one stash");
+        assert_eq!(entries_b.len(), 1, "repo B holds exactly one stash");
+        assert_ne!(
+            entries_a[0].oid, entries_b[0].oid,
+            "each repository stashed different content, so the oids must differ \
+             — a shared/unscoped read would make this assertion meaningless \
+             rather than fail it, which is why the fixture stashes distinct \
+             file contents per repository"
+        );
+
+        // Registering B as the *last* selection moved the process-wide
+        // default onto it. If the handler still ignored `?repo=` and fell
+        // through to that default, asking for A here would silently answer
+        // with B's entry instead.
+        let recheck_a = list(&id_a).await;
+        assert_eq!(
+            recheck_a, entries_a,
+            "asking for A by id must answer with A's stash even though B is \
+             now the process-wide default selection"
+        );
+    }
+
+    /// Backward compatibility: an absent `?repo=` still resolves through
+    /// [`crate::state::current`], the pre-#752 behaviour every existing
+    /// caller relies on.
+    #[tokio::test]
+    async fn an_absent_repo_selector_falls_back_to_the_current_default() {
+        crate::state::with_isolated_test_current(
+            an_absent_repo_selector_falls_back_to_the_current_default_in_scope(),
+        )
+        .await;
+    }
+
+    async fn an_absent_repo_selector_falls_back_to_the_current_default_in_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        build_stash_fixture(dir.path(), "changed\n");
+
+        let (status, body) = stash_list(Query(RepoQuery { repo: None })).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let entries: Vec<StashEntry> = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "no ?repo= must still answer for the current default selection"
+        );
+    }
+
+    /// An id the catalog never registered is a `404`, not a fall-through to
+    /// the default selection — the same posture [`resolve_repo`] documents
+    /// for every other scoped read.
+    ///
+    /// [`resolve_repo`]: crate::handlers::read::resolve_repo
+    #[tokio::test]
+    async fn an_unknown_repo_id_is_refused_not_silently_redirected() {
+        crate::state::with_isolated_test_current(
+            an_unknown_repo_id_is_refused_not_silently_redirected_in_scope(),
+        )
+        .await;
+    }
+
+    async fn an_unknown_repo_id_is_refused_not_silently_redirected_in_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        build_stash_fixture(dir.path(), "changed\n");
+
+        let (status, _body) = stash_list(Query(RepoQuery {
+            repo: Some("not-a-registered-worktree-id".to_string()),
+        }))
+        .await;
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "an unregistered id must not quietly answer for some other repository"
+        );
+    }
+}
+
 /// `POST /api/stash/push` — put the working tree in the drawer.
 ///
 /// Every field of [`PushStashRequest`] is already the type the operation
