@@ -1763,4 +1763,78 @@ mod https_suite {
             assert_selector_blocked(&fixture, &policy, args, &env, &marker, "gv779").await;
         }
     }
+
+    /// #779's allowlist must also cover the *path* shape of a helper
+    /// selector, not only the installed-name shape
+    /// [`installed_remote_helper_selectors_are_blocked`] covers.
+    ///
+    /// Git builds a helper's program name by concatenation — `git-remote-` +
+    /// the selector's value — and hands the result to `execvp`. POSIX gives
+    /// `execvp` a second mode: any name containing a slash is used as a path
+    /// directly, with no `PATH` search. So `vcs = ../r1` never asks `PATH`
+    /// for an installed `git-remote-../r1`; it resolves `git-remote-../r1`
+    /// from the child's cwd — the served worktree — and runs whatever the
+    /// repository itself put there. A repository can plant that file: it is
+    /// ordinary tracked content, no install step and no operator involvement.
+    ///
+    /// That makes it a distinct reachability story from an installed helper,
+    /// and it is the shape a 2026-09-09 review claimed was still open after
+    /// #779. It is not: `GIT_ALLOW_PROTOCOL` rejects `../r1` as a transport
+    /// name before Git ever reaches helper dispatch. This test pins that,
+    /// because nothing else does — and the argument for why is subtle enough
+    /// that re-deriving it from the code is expensive.
+    ///
+    /// The positive control runs under Git's *default* protocol policy
+    /// rather than a naive `protocol.allow=never`: a user-initiated fetch
+    /// permits unknown helper protocols by default, so the marker really
+    /// does execute when the pin is absent. A control that denied first
+    /// would prove only that the denial worked, never that the attack was
+    /// reachable.
+    #[tokio::test]
+    async fn worktree_relative_remote_helper_selector_is_blocked() {
+        let fixture = home_and_cwd();
+        selector_repo(&fixture);
+        let helper_dir = fixture.cwd.join("git-remote-..");
+        std::fs::create_dir(&helper_dir).unwrap();
+        let (_, marker) = selector_marker(&helper_dir, "r1");
+        selector_config(&fixture, "remote.named.url", "https://example.invalid/repo");
+        selector_config(&fixture, "remote.named.vcs", "../r1");
+        run(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-qm",
+                    "fixture",
+                    "--allow-empty",
+                ])
+                .current_dir(&fixture.cwd),
+            "create push source",
+        );
+        let policy = network_policy(&fixture.home, &fixture.cwd, 9418);
+        let env = vec![
+            ("PATH", format!("{}:/usr/bin:/bin", fixture.cwd.display())),
+            ("HOME", fixture.home.to_string_lossy().into_owned()),
+            ("GIT_CONFIG_NOSYSTEM", "1".into()),
+        ];
+        let args: &[&str] = &["fetch", "named"];
+        // Positive control: DEFAULT protocol policy, no naive denial at all.
+        // A user-initiated fetch allows unknown helper protocols by default,
+        // so if this attack is real at all, the marker runs here.
+        let unforced = spawn::command_async(&policy, &fixture.cwd, args)
+            .pinned_env_for_test(&env)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            marker.exists(),
+            "positive control: helper did not run: {}",
+            String::from_utf8_lossy(&unforced.stderr)
+        );
+        std::fs::remove_file(&marker).unwrap();
+        assert_selector_blocked(&fixture, &policy, args, &env, &marker, "../r1").await;
+    }
 }
