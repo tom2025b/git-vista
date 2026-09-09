@@ -916,7 +916,7 @@ jobs:
       # slowly stops meaning anything.
       - name: The suite actually executed specs, and passed
         env:
-          EXPECTED_MIN_SPECS: "120"
+          EXPECTED_MIN_SPECS: "125"
         run: |
           report="${{ github.workspace }}/ci/browser/results.json"
           if [ ! -f "$report" ]; then
