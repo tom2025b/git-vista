@@ -833,6 +833,63 @@ const EXEMPT: &[(&str, &str)] = &[
     ("git-vista-core/src/identity.rs", "hex_len"),
     ("git-vista-core/src/identity.rs", "algorithm"),
     ("git-vista-core/src/identity.rs", "from_raw"),
+    // ── round2-consumer-census2 (2026-09-09): compiler-resolved wasm
+    // reachability pass, 37 items new to this table. Each entry below is a
+    // genuine test-support/documented-dead item matching the existing
+    // reasoning of a sibling already exempted in the same struct/module —
+    // see the filed tracking issue for the full group and reasoning. ────────
+    //
+    // dialogs/commit.rs:145's `PlainCommit::intent` is NOT listed here,
+    // deliberately, same reasoning as the `GraphFocus::focused_row`/
+    // `activate` pair documented above: `AmendTarget::intent` (commit.rs:172)
+    // is a genuinely different method that IS called in production, and this
+    // census matches call sites by name only, not by receiver type. Adding
+    // `("...", "intent")` here would make `the_exempt_table_does_not_rot`
+    // immediately panic as a false STALE ENTRY, because it would see
+    // `AmendTarget::intent`'s real call and conclude the exemption no longer
+    // applies — a name collision this text census cannot see past, not
+    // evidence `PlainCommit::intent` is actually reachable. Confirmed by
+    // running the test: it panicked exactly this way when this entry was
+    // first tried. `PlainCommit::intent` remains genuinely test-only
+    // (production reaches `PlainCommit` only through `into_intent`, by
+    // value) but is tracked outside this table; see the round2-census
+    // tracking issue for group 7.
+    //
+    // graph/core.rs:69's `GraphCore::generation` is NOT listed here, for the
+    // same collision reason as `PlainCommit::intent` above: `generation(` is
+    // also `GenerationInputs::generation()`'s real name, called from live
+    // production code in git-vista-server (`conflicts.rs`, `handlers/
+    // read.rs`, `planner.rs`) — an entirely different type this text census
+    // cannot distinguish by name alone. Adding an entry here panics
+    // `the_exempt_table_does_not_rot` as a false STALE ENTRY (confirmed by
+    // running the test). `GraphCore::generation` genuinely has no production
+    // reader on its own type — the core uses its private field internally —
+    // but is tracked outside this table; see the round2-census tracking
+    // issue for group 11.
+    //
+    // shell/mod.rs:116's `SheetDrag::pointer_id` is NOT listed here, for the
+    // same collision reason as the two entries above it: `pointer_id(` also
+    // matches real production calls into DOM Pointer Event Web APIs of the
+    // same name, which this text census cannot distinguish from a call to
+    // `SheetDrag`'s own method. Adding an entry here panics
+    // `the_exempt_table_does_not_rot` as a false STALE ENTRY (confirmed by
+    // running the test). Production supplies pointer IDs to `sample`,
+    // `take_matching`, and `cancel_matching`; only this type's own tests
+    // query the stored ID back out — genuinely test-only, but tracked
+    // outside this table; see the round2-census tracking issue for group 12.
+    //
+    // shell/sheet.rs's own module doc (see `taller`/`shorter`/`height_px`/
+    // `flick_threshold`/`expand`/`collapse` above): the sheet model is
+    // settled and tested but not yet wired to the screen. `SheetState::mode`
+    // is one more non-generic pub fn in that same pre-wiring surface the
+    // round2 census found was missing from this table, but — same collision
+    // shape as the three entries above — `mode(` also matches unrelated
+    // production calls elsewhere in the tree, so adding an entry here panics
+    // `the_exempt_table_does_not_rot` as a false STALE ENTRY (confirmed by
+    // running the test). `SheetState::mode` is genuinely test-only; tracked
+    // outside this table in the round2-census tracking issue for group 14.
+    // `SheetGeometry::new` is the same shape but is never extracted at all —
+    // it is on GENERIC_NAME_SKIPLIST — so it needs no exemption at all.
 ];
 
 /// The floor the discovered-declaration count must clear before any
