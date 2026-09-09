@@ -84,6 +84,8 @@ use git_vista_protocol::{
     FileSelection, HunkLines, HunkRef, PatchPlan, SelectionShape, StageDirection,
 };
 
+use super::core::CompleteHunkLines;
+
 /// One file's selection state: each selected hunk, either whole or narrowed
 /// to specific lines.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -105,13 +107,33 @@ struct HunkEntry {
     lines: Option<BTreeSet<u32>>,
 }
 
-/// The staging selection: which files, which hunks, and (deliberately
-/// unwired to any tap target in this issue — see the module doc) which
-/// lines within a hunk are selected right now.
+/// The staging selection: which files, hunks, and individual lines are selected.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DiffSelection {
     files: BTreeMap<String, FileSel>,
 }
+
+/// A whole hunk cannot be expanded without its complete changed-line set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncompleteHunk {
+    pub path: String,
+    pub hunk: HunkRef,
+}
+
+impl std::fmt::Display for IncompleteHunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Cannot include the whole hunk {} in {}: the displayed patch does not \
+             contain its complete changed lines. Deselect that hunk or select \
+             individual visible lines.",
+            u64::from(self.hunk.index) + 1,
+            self.path,
+        )
+    }
+}
+
+impl std::error::Error for IncompleteHunk {}
 
 impl DiffSelection {
     /// A fresh, empty selection.
@@ -191,9 +213,8 @@ impl DiffSelection {
     }
 
     /// Toggle one line (an index into the hunk's parsed `Hunk::lines`,
-    /// [`HunkLines`]'s coordinate space) within `hunk` of `path`. See the
-    /// module doc: not wired to any tap target in this issue, kept pure and
-    /// tested for the follow-up Pencil-surface issue to build on.
+    /// [`HunkLines`]'s coordinate space) within `hunk` of `path`. The
+    /// staging view's per-line checkbox drives this transition (#357).
     ///
     /// A hunk that was previously whole-selected is narrowed to exactly
     /// `line` — toggling a specific line is the user saying "not the whole
@@ -263,29 +284,26 @@ impl DiffSelection {
         }
     }
 
-    /// Build the wire [`PatchPlan`] for this selection. `None` when nothing
+    /// Build the wire [`PatchPlan`] for this selection. `Ok(None)` when nothing
     /// is selected (a plan with no files is malformed — [`PatchPlan::validate`]
-    /// would reject it, so this returns `None` up front rather than handing
+    /// would reject it, so this returns `Ok(None)` up front rather than handing
     /// the caller something certain to fail).
     ///
     /// **Mixed hunk/line files.** A file whose selected hunks are entirely
     /// whole serializes as [`SelectionShape::Hunks`]; a file with at least
     /// one line-narrowed hunk serializes as [`SelectionShape::Lines`] — and
-    /// in that second case, any *whole*-selected hunks in the same file are
-    /// dropped from the plan (documented here, and pinned by this module's
-    /// tests): the wire format has one shape per file, not a mix, and since
-    /// no caller in this issue can produce a line-narrowed hunk in the first
-    /// place (see the module doc), this branch exists for the follow-up
-    /// issue to resolve properly — most likely by expressing a whole hunk as
-    /// `Lines` over its full line set once that caller has the parsed patch
-    /// in hand to enumerate it.
+    /// in that second case, whole-selected hunks expand to their complete
+    /// changed-line sets from the caller's patch. Missing or incomplete hunks
+    /// refuse the entire plan with an error; a visible subset cannot stand in
+    /// for a whole hunk. Serialization never narrows the UI selection state.
     pub fn to_patch_plan(
         &self,
         repository: RepositoryToken,
         worktree: WorktreeToken,
         generation: GenerationToken,
         direction: StageDirection,
-    ) -> Option<PatchPlan> {
+        whole_hunk_lines: &CompleteHunkLines,
+    ) -> Result<Option<PatchPlan>, IncompleteHunk> {
         let mut files = Vec::new();
         for (path, sel) in &self.files {
             if sel.hunks.is_empty() {
@@ -293,18 +311,23 @@ impl DiffSelection {
             }
             let has_lines = sel.hunks.values().any(|e| e.lines.is_some());
             let selection = if has_lines {
-                let hunks: Vec<HunkLines> = sel
-                    .hunks
-                    .values()
-                    .filter_map(|e| {
-                        e.lines.as_ref().map(|lines| HunkLines {
-                            hunk: e.anchor,
-                            lines: lines.iter().copied().collect(),
-                        })
-                    })
-                    .collect();
-                if hunks.is_empty() {
-                    continue;
+                let mut hunks = Vec::new();
+                for e in sel.hunks.values() {
+                    let lines = match &e.lines {
+                        Some(lines) => lines.iter().copied().collect(),
+                        None => whole_hunk_lines
+                            .get(path, e.anchor)
+                            .filter(|lines| !lines.is_empty())
+                            .ok_or_else(|| IncompleteHunk {
+                                path: path.clone(),
+                                hunk: e.anchor,
+                            })?
+                            .to_vec(),
+                    };
+                    hunks.push(HunkLines {
+                        hunk: e.anchor,
+                        lines,
+                    });
                 }
                 SelectionShape::Lines { hunks }
             } else {
@@ -318,15 +341,15 @@ impl DiffSelection {
             });
         }
         if files.is_empty() {
-            return None;
+            return Ok(None);
         }
-        Some(PatchPlan {
+        Ok(Some(PatchPlan {
             repository,
             worktree,
             generation,
             direction,
             files,
-        })
+        }))
     }
 }
 
@@ -374,7 +397,16 @@ mod tests {
         let sel = DiffSelection::new();
         assert!(sel.is_empty());
         let (r, w, g) = tokens();
-        assert_eq!(sel.to_patch_plan(r, w, g, StageDirection::Stage), None);
+        assert_eq!(
+            sel.to_patch_plan(
+                r,
+                w,
+                g,
+                StageDirection::Stage,
+                &CompleteHunkLines::default()
+            ),
+            Ok(None)
+        );
     }
 
     #[test]
@@ -487,7 +519,14 @@ mod tests {
         sel.toggle_hunk("b.rs", href(1));
         let (r, w, g) = tokens();
         let plan = sel
-            .to_patch_plan(r.clone(), w.clone(), g.clone(), StageDirection::Unstage)
+            .to_patch_plan(
+                r.clone(),
+                w.clone(),
+                g.clone(),
+                StageDirection::Unstage,
+                &CompleteHunkLines::default(),
+            )
+            .unwrap()
             .unwrap();
         assert_eq!(plan.repository, r);
         assert_eq!(plan.worktree, w);
@@ -520,7 +559,16 @@ mod tests {
         sel.toggle_line("a.rs", href(0), 1);
         sel.toggle_line("a.rs", href(0), 3);
         let (r, w, g) = tokens();
-        let plan = sel.to_patch_plan(r, w, g, StageDirection::Stage).unwrap();
+        let plan = sel
+            .to_patch_plan(
+                r,
+                w,
+                g,
+                StageDirection::Stage,
+                &CompleteHunkLines::default(),
+            )
+            .unwrap()
+            .unwrap();
         assert_eq!(plan.files.len(), 1);
         assert_eq!(
             plan.files[0].selection,
@@ -534,27 +582,108 @@ mod tests {
         assert_eq!(plan.validate(), Ok(()));
     }
 
+    const MIXED_PATCH: &str = "\
+diff --git a/a.rs b/a.rs
+--- a/a.rs
++++ b/a.rs
+@@ -10,4 +10,4 @@
+ lead
+-old red
++new red
+ middle
+-old blue
++new blue
+\\ No newline at end of file
+@@ -20,3 +20,3 @@
+ before second
+-old second
++new second
+ after second
+@@ -30,2 +30,2 @@
+ context
+-cut here
+";
+
     #[test]
-    fn to_patch_plan_drops_whole_hunks_mixed_into_a_line_selected_file() {
-        // Documented simplification (module doc): no caller in this issue can
-        // produce this state (line selection is unwired), but the pure
-        // module's behaviour is still pinned rather than left to guess.
+    fn to_patch_plan_preserves_every_changed_line_of_a_mixed_whole_hunk() {
+        // #808 retires the old drop expectation: #357/#771/#781 wired
+        // toggle_line into production, so a whole-hunk click followed by a
+        // line click in a different hunk now reaches this state by mouse.
+        // The trailing incomplete hunk is unselected: completeness must be
+        // per hunk, not a global patch-truncated flag.
         let mut sel = DiffSelection::new();
         sel.toggle_hunk("a.rs", href(0));
-        sel.toggle_line("a.rs", href(2), 1);
-        let (r, w, g) = tokens();
-        let plan = sel.to_patch_plan(r, w, g, StageDirection::Stage).unwrap();
-        assert_eq!(plan.files.len(), 1);
-        assert_eq!(
-            plan.files[0].selection,
-            SelectionShape::Lines {
-                hunks: vec![HunkLines {
-                    hunk: href(2),
-                    lines: vec![1],
-                }]
-            },
-            "the whole-hunk selection for hunk 0 was dropped, not smuggled into Lines"
-        );
+        sel.toggle_line("a.rs", href(1), 1);
+        sel.toggle_hunk("b.rs", href(0));
+        let original = sel.clone();
+        let whole_lines = CompleteHunkLines::from_patch(MIXED_PATCH);
+        for direction in [StageDirection::Stage, StageDirection::Unstage] {
+            let (r, w, g) = tokens();
+            let plan = sel
+                .to_patch_plan(r, w, g, direction, &whole_lines)
+                .unwrap()
+                .unwrap();
+            assert_eq!(plan.direction, direction);
+            assert_eq!(
+                plan.files,
+                vec![
+                    FileSelection {
+                        path: "a.rs".into(),
+                        selection: SelectionShape::Lines {
+                            hunks: vec![
+                                HunkLines {
+                                    hunk: href(0),
+                                    lines: vec![1, 2, 4, 5],
+                                },
+                                HunkLines {
+                                    hunk: href(1),
+                                    lines: vec![1],
+                                },
+                            ],
+                        },
+                    },
+                    FileSelection {
+                        path: "b.rs".into(),
+                        selection: SelectionShape::Hunks {
+                            hunks: vec![href(0)],
+                        },
+                    },
+                ],
+                "every changed line of the whole hunk and the explicit subset must survive"
+            );
+            assert_eq!(plan.validate(), Ok(()));
+            assert_eq!(sel, original, "serialization must not narrow UI state");
+        }
+    }
+
+    #[test]
+    fn to_patch_plan_refuses_incomplete_missing_or_stale_whole_hunks() {
+        let whole_lines = CompleteHunkLines::from_patch(MIXED_PATCH);
+        let stale = HunkRef {
+            old_start: 999,
+            ..href(0)
+        };
+        for whole in [href(2), href(3), stale] {
+            for direction in [StageDirection::Stage, StageDirection::Unstage] {
+                let mut sel = DiffSelection::new();
+                sel.toggle_line("a.rs", href(1), 1);
+                sel.toggle_hunk("a.rs", whole);
+                let (r, w, g) = tokens();
+                let error = sel
+                    .to_patch_plan(r, w, g, direction, &whole_lines)
+                    .unwrap_err();
+                assert_eq!(
+                    error,
+                    IncompleteHunk {
+                        path: "a.rs".into(),
+                        hunk: whole
+                    }
+                );
+                assert!(error.to_string().contains("complete changed lines"));
+                assert!(error.to_string().contains("a.rs"));
+                assert!(sel.is_hunk_selected("a.rs", whole.index));
+            }
+        }
     }
 
     #[test]

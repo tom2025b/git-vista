@@ -34,7 +34,9 @@ fn plan(generation: &str, hunk: u32) -> PatchPlan {
             WorktreeToken::new("wt-1").expect("valid token"),
             GenerationToken::new(generation).expect("valid token"),
             StageDirection::Stage,
+            &CompleteHunkLines::default(),
         )
+        .expect("whole-hunk selection needs no line expansion")
         .expect("a non-empty selection builds a plan")
 }
 
