@@ -9,8 +9,9 @@
 //! cannot be trusted alone.
 //!
 //! This binary sits between the real caller (the server, or a test harness)
-//! and `Tier::Strict`'s `bwrap` launcher (see `sandbox::spawn::wrap_with_reaper`
-//! for exactly which spawns are wrapped and why not all of them are, today).
+//! and both sandboxed launcher shapes: `Tier::Strict`'s `bwrap` and
+//! `Tier::Network`'s bare `gv-sandbox` shim. `Tier::Unsandboxed`'s bare `git`
+//! is never wrapped (see `sandbox::spawn::wrap_with_reaper`).
 //! It is invoked as `gv-sandbox-reaper <expected-parent-pid> <program> <args…>`
 //! and:
 //!
@@ -149,8 +150,9 @@ fn main() {
         unsafe {
             libc::setpgid(0, 0);
         }
-        // This process (bwrap, today — see `spawn::wrap_with_reaper` for why
-        // only `Tier::Strict` is wrapped) must die if THIS reaper does, by
+        // This process (`Tier::Strict`'s bwrap or `Tier::Network`'s bare
+        // gv-sandbox shim — `Tier::Unsandboxed` is never wrapped; see
+        // `spawn::wrap_with_reaper`) must die if THIS reaper does, by
         // any means — not only when the reaper
         // notices it has been reparented and reacts, but also when something
         // simply kills the reaper outright. A caller cancelling a running
