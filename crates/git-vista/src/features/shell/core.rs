@@ -334,11 +334,6 @@ impl OverlayStack {
     pub fn contains(&self, o: Overlay) -> bool {
         self.stack.contains(&o)
     }
-
-    /// Whether nothing is presented at all.
-    pub fn is_empty(&self) -> bool {
-        self.stack.is_empty()
-    }
 }
 
 /// Which of four layout modes the window is in, decided from width alone.
