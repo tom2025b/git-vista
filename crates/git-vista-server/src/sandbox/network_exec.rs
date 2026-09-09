@@ -5,13 +5,11 @@
 //!
 //! [`network_command`] is wired into production at `git_cmd.rs`'s single
 //! spawn chokepoint (`sandboxed`): any call declaring
-//! [`NetworkNeed::Remote`] gets this module's forced askpass hardening on
+//! [`NetworkNeed::Remote`] gets this module's forced executable hardening on
 //! the way in and [`redact_output`]'s redaction on the way out, rather than
 //! this module owning a second, parallel policy-build-and-spawn path of its
-//! own. `exec_push` (`planner.rs`) is the one production caller today —
-//! wiring `exec_fetch`/`exec_pull` on, once #227 adds them, is "declare
-//! `NetworkNeed::Remote`", not "remember to call this module" — the
-//! chokepoint they already go through is what enforces it.
+//! own. Fetch, pull and push all declare `NetworkNeed::Remote`; the chokepoint
+//! they already go through is what enforces the boundary.
 //!
 //! # What this closes
 //!
@@ -32,35 +30,58 @@
 //! repository controls; [`network_command`] is the one place that flag is
 //! added, so every caller gets it by construction rather than by remembering.
 //!
-//! # Why this does not also force `credential.helper=`
+//! # Repository-named executables are not operator configuration
 //!
-//! `credential.helper` is the *sanctioned* HTTPS-auth mechanism this server
-//! relies on (`docs/SECURITY_MODEL.md`, "Remote and Forge Credentials":
-//! "Prefer existing Git credential helpers and SSH agents on the Linux
-//! host") — forcing it off would not harden anything (there is no attacker
-//! path through the operator's own configured helper that `core.askpass`
-//! doesn't already cover) and would break the one HTTPS-push path that is
-//! meant to work. `core.askpass` has the opposite shape: it exists only to
-//! drive an *interactive* prompt, and this server never has a terminal to
-//! prompt through, so forcing it off costs nothing.
+//! #755 measured the transport commands themselves, with every ordinary hook
+//! disabled. A repository-local `core.sshCommand`, `core.gitProxy`,
+//! `credential.helper`, `core.fsmonitor`, `remote.<name>.uploadpack` or
+//! `remote.<name>.receivepack` still ran an arbitrary marker program. The same
+//! experiment found `remote.<name>.vcs` and URL-selected remote helpers, and
+//! found that `protocol.ext.allow=always` turns an `ext::` URL into an
+//! arbitrary shell-command selector.
 //!
-//! That said, a credential helper is itself an arbitrary program (repo-local
-//! `credential.helper` is exactly as executable as `core.askpass`), and git
-//! forwards its stderr verbatim — verified directly below
-//! (`network_exec_redacts_a_real_credential_helpers_leaked_url`): a helper
-//! that prints a secret-bearing URL to its own stderr puts that URL in git's
-//! stderr unchanged. [`redact_output`] removes URL userinfo for ordinary
-//! Network-tier output. A [`CredentialedCommand`] additionally knows and
+//! [`FORCED_NETWORK_ARGS`] therefore supplies safe server-authored values for
+//! the fixed-name keys, and [`compose_network_args`] supplies Git's explicit
+//! `--upload-pack=git-upload-pack` / `--receive-pack=git-receive-pack` options
+//! for transport commands. Those options, unlike a hard-coded
+//! `remote.origin.*` config override, cover every validated remote name. The
+//! `ext` protocol is forced off. Command-line config and explicit transport
+//! options outrank `.git/config`, which is writable inside this tier's
+//! repository grant.
+//!
+//! This deliberately breaks repository or global configuration that chooses
+//! a credential helper, an fsmonitor hook, a custom SSH command, or a custom
+//! upload/receive-pack command for a Network-tier spawn. Ordinary OpenSSH
+//! configuration (`~/.ssh/config`, keys,
+//! jump hosts and the inherited agent) still works through the server-authored
+//! `ssh` command. HTTPS authentication now needs a credential supplied by
+//! Git-Vista's own [`network_command_with_credential`] helper; tokenless
+//! fetch/push and clone no longer fall back to an operator credential helper.
+//!
+//! Some executable selectors remain outside these pins. Git's
+//! `GIT_SSH_COMMAND`, `GIT_SSH`, `GIT_PROXY_COMMAND`, `GIT_ASKPASS` and
+//! `SSH_ASKPASS` environment variables are inherited from the server's parent,
+//! not writable through repository config; preserving that ambient operator
+//! choice is the same trust boundary as preserving `PATH`. `core.gitProxy` is
+//! worse: it is repository-controlled and arbitrary, but it is a first-match
+//! multi-value key. Measured directly, a later `-c core.gitProxy=none` does
+//! **not** outrank the repository's earlier matching entry. Disabling
+//! `protocol.git` would close it by disabling every native Git-protocol remote,
+//! a compatibility break this change does not hide inside an argv constant. A
+//! `remote.<name>.vcs` or custom URL protocol can select only an installed
+//! `git-remote-<vcs>` helper, also found through that operator-controlled
+//! executable environment. Git has no higher-precedence "unset" spelling for
+//! `remote.<name>.vcs` (an empty value tries to execute `git-remote-`), and a
+//! blanket protocol default is still overridden by a repository's more
+//! specific `protocol.<name>.allow`. Closing that installed-helper residual
+//! requires a server-side validated transport allowlist, not a pin that only
+//! looks effective. The direct-shell `ext` case does have an exact fixed key,
+//! so it is denied here.
+//!
+//! [`redact_output`] remains defence in depth for diagnostics emitted by the
+//! selected transport. A [`CredentialedCommand`] additionally knows and
 //! removes the exact token it supplied, so a bare-token diagnostic cannot
 //! leave that value even though it is not URL-shaped (#680, ADR 0128).
-//!
-//! **Post-M13.01 update:** the above is still why this module never forces
-//! `credential.helper=` *off*. [`network_command_with_credential`] does the
-//! opposite — it *appends* Git-Vista's own helper, never clearing whatever
-//! the operator's config already declares — for the narrow case #582
-//! measured: the operator's own helper executes under this sandbox but
-//! cannot reach its token store, so a token Git-Vista holds itself has
-//! nowhere to go without one. See that function's doc for the design.
 //!
 //! # The one thing this harness could not pin, before #582
 //!
@@ -98,8 +119,8 @@ use super::{spawn, Policy};
 
 const REDACTED_CREDENTIAL: &[u8] = b"[REDACTED CREDENTIAL]";
 
-/// Prepended to every Network-tier spawn's args, ahead of the subcommand —
-/// see the module doc for why this is the one flag this harness forces.
+/// Prepended to every Network-tier spawn's args, ahead of the subcommand.
+/// Every value is server-authored and outranks repository config.
 ///
 /// Positioned first, not last: git's `-c` flags must precede the subcommand,
 /// and every caller in this crate already passes `args` as `[subcommand,
@@ -107,9 +128,48 @@ const REDACTED_CREDENTIAL: &[u8] = b"[REDACTED CREDENTIAL]";
 /// legitimate later occurrence of the same key for this to lose a
 /// last-one-wins race against. `args` here is always server-authored, never
 /// raw request data — if a future caller ever needs to pass its own `-c`
-/// flags, it must not repeat `core.askpass` ahead of the subcommand, and
-/// that should be caught in review, not by this ordering.
-const FORCED_NETWORK_ARGS: &[&str] = &["-c", "core.askpass="];
+/// flags, it must not repeat one of these keys ahead of the subcommand.
+const FORCED_NETWORK_ARGS: &[&str] = &[
+    "-c",
+    "core.askpass=",
+    "-c",
+    "credential.helper=",
+    "-c",
+    "core.sshCommand=ssh",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "protocol.ext.allow=never",
+];
+
+/// Compose the fixed config pins and the transport-side executable pin.
+///
+/// `remote.<name>.uploadpack` / `receivepack` cannot be pinned with one fixed
+/// config key because `<name>` is request-selected. Git's explicit transport
+/// options are the stronger spelling and avoid teaching this security boundary
+/// how to parse a remote name out of each command shape. They must follow the
+/// subcommand, while every `-c` above must precede it.
+fn compose_network_args<'a>(
+    args: &'a [&'a str],
+    credential_helper: Option<&'a str>,
+) -> Vec<&'a str> {
+    let mut full: Vec<&str> = FORCED_NETWORK_ARGS.to_vec();
+    if let Some(helper) = credential_helper {
+        full.extend_from_slice(&["-c", helper]);
+    }
+
+    let Some((subcommand, rest)) = args.split_first() else {
+        return full;
+    };
+    full.push(subcommand);
+    match *subcommand {
+        "fetch" | "pull" | "ls-remote" | "clone" => full.push("--upload-pack=git-upload-pack"),
+        "push" => full.push("--receive-pack=git-receive-pack"),
+        _ => {}
+    }
+    full.extend_from_slice(rest);
+    full
+}
 
 /// Build the composed launcher for one Network-tier remote spawn: `policy`'s
 /// argv (#188's SSH carve-out and agent-socket grant included, whenever
@@ -130,8 +190,7 @@ pub(crate) fn network_command(
     repo: &Path,
     args: &[&str],
 ) -> spawn::SandboxedCommand {
-    let mut full: Vec<&str> = FORCED_NETWORK_ARGS.to_vec();
-    full.extend_from_slice(args);
+    let full = compose_network_args(args, None);
     spawn::command_async(policy, repo, &full)
 }
 
@@ -171,22 +230,18 @@ fn credential_helper_config() -> String {
 /// helper needs no such grant: the helper this function forces reads
 /// exactly one environment variable and touches no filesystem at all.
 ///
-/// # Never clears, only appends
+/// # Clears first, then supplies exactly one server helper
 ///
-/// The forced `-c credential.helper=` is **not** the empty-value form
-/// [`FORCED_NETWORK_ARGS`] uses for `core.askpass` (which *disables* a
-/// config-level entry) — a non-empty `credential.helper` value is added to
-/// whatever chain the operator's own config already declares. Git tries
-/// configured helpers in the order they are defined, config-file entries
-/// before `-c` overrides, and moves to the next helper whenever one answers
-/// nothing for `get` — so this one runs *last*, as the fallback for exactly
-/// the case an operator's own helper cannot handle under this sandbox, and
-/// never shadows a host credential path that happens to work.
+/// [`FORCED_NETWORK_ARGS`]'s empty `credential.helper=` resets the helper
+/// chain after repository/global config has been read. This function then
+/// adds Git-Vista's non-empty helper after that reset. The credential-bearing
+/// child therefore runs exactly the server-authored helper and cannot hand the
+/// token environment to a repository-authored helper first.
 ///
 /// # `token: None` changes nothing
 ///
 /// When `token` is `None` this is byte-identical to [`network_command`] —
-/// no `-c credential.helper=`, no environment variable set — so every
+/// no server-authored non-empty helper and no environment variable set — so every
 /// existing Remote-tier caller (`exec_push`, and everywhere else this
 /// crate's `git_cmd::sandboxed()` routes `NetworkNeed::Remote`) is
 /// unaffected until it deliberately opts in.
@@ -236,10 +291,7 @@ pub(crate) fn network_command_with_credential(
 ) -> CredentialedCommand {
     let command = if let Some(token) = token {
         let helper_config = format!("credential.helper={}", credential_helper_config());
-        let mut full: Vec<&str> = FORCED_NETWORK_ARGS.to_vec();
-        full.push("-c");
-        full.push(&helper_config);
-        full.extend_from_slice(args);
+        let full = compose_network_args(args, Some(&helper_config));
         spawn::command_async(policy, repo, &full).credential_env(token)
     } else {
         network_command(policy, repo, args)
@@ -310,8 +362,7 @@ pub(crate) fn network_command_without_credential(
     repo: &Path,
     args: &[&str],
 ) -> UntrustedCheckoutCommand {
-    let mut full: Vec<&str> = FORCED_NETWORK_ARGS.to_vec();
-    full.extend_from_slice(args);
+    let full = compose_network_args(args, None);
     UntrustedCheckoutCommand(
         spawn::checkout_command_async(policy, repo, &full).with_untrusted_checkout_env(),
     )
@@ -509,12 +560,12 @@ mod tests {
     // --- pure argv shape ----------------------------------------------
 
     /// `network_command`'s argv is exactly `command_async`'s own argv with
-    /// [`FORCED_NETWORK_ARGS`] spliced in immediately after `-C <repo>` and
-    /// before the caller's own args — mirrors `spawn.rs`'s
+    /// [`FORCED_NETWORK_ARGS`] spliced in immediately after `-C <repo>`, then
+    /// the transport option after the subcommand — mirrors `spawn.rs`'s
     /// `the_wrapper_argv_is_the_sandbox_argv_plus_the_repo_and_args`, one
     /// layer up.
     #[tokio::test]
-    async fn network_command_prepends_forced_askpass_hardening_before_user_args() {
+    async fn network_command_pins_every_fixed_selector_and_the_transport_program() {
         let repo = fixture().await;
         let policy = production_policy(repo.path());
 
@@ -557,12 +608,25 @@ mod tests {
             .split('\u{1f}')
             .collect();
 
-        // ends with the caller's own args, untouched
-        assert_eq!(&args[args.len() - 3..], ["push", "origin", "main"]);
-        // and the forced flag sits immediately before them
+        assert_eq!(&args[..2], ["-C", repo.path().to_str().unwrap()]);
         assert_eq!(
-            &args[args.len() - 5..args.len() - 3],
-            ["-c", "core.askpass="]
+            &args[2..],
+            [
+                "-c",
+                "core.askpass=",
+                "-c",
+                "credential.helper=",
+                "-c",
+                "core.sshCommand=ssh",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "protocol.ext.allow=never",
+                "push",
+                "--receive-pack=git-receive-pack",
+                "origin",
+                "main",
+            ]
         );
     }
 
@@ -755,9 +819,9 @@ mod tests {
     }
 
     /// `token: None` must be byte-identical to plain [`network_command`] — no
-    /// `-c credential.helper=`, no environment variable — so every existing
-    /// Remote-tier caller that has no token to offer is provably unaffected,
-    /// not merely "probably fine because nothing broke in review."
+    /// additional non-empty helper and no environment variable — so every
+    /// existing Remote-tier caller that has no token to offer gets exactly the
+    /// base harness's deliberate helper reset and nothing credential-bearing.
     #[tokio::test]
     async fn no_token_is_byte_identical_to_plain_network_command() {
         let repo = fixture().await;
@@ -788,18 +852,17 @@ mod tests {
         );
     }
 
-    /// The forced flag is the **non-empty** form. [`FORCED_NETWORK_ARGS`]'s
-    /// `-c core.askpass=` is empty on purpose, to *clear* a config-level
-    /// entry; this one must never accidentally take that shape, because an
-    /// empty `credential.helper=` value clears every helper the operator's
-    /// own config already declares — the opposite of "append a fallback".
+    /// Git-Vista's own helper is the **non-empty** form, deliberately composed
+    /// after [`FORCED_NETWORK_ARGS`]'s empty reset. It must never accidentally
+    /// become a second empty value or the credential-bearing command would
+    /// clear the chain and provide no way to consume its token.
     #[test]
     fn the_forced_credential_helper_value_is_never_empty() {
         let cfg = credential_helper_config();
         assert!(
             !cfg.is_empty(),
-            "an empty credential.helper value clears the operator's own \
-             configured helpers instead of falling back after them"
+            "an empty server credential.helper value leaves the supplied \
+             token with no helper able to consume it"
         );
         assert!(
             cfg.contains(spawn::CREDENTIAL_TOKEN_VAR),
@@ -1312,21 +1375,18 @@ mod https_suite {
     }
 
     /// The redaction half of the deliverable, proven against **real**
-    /// captured process output rather than a hand-built `Output`: a
-    /// repo-local credential helper — a real subprocess, run by real git —
-    /// prints a secret-bearing URL to its own stderr, which git forwards
+    /// captured process output rather than a hand-built `Output`: an
+    /// unforced repo-local credential helper — a real subprocess, run by real
+    /// git — prints a secret-bearing URL to its own stderr, which git forwards
     /// verbatim (measured directly, 2026-08-01, see this file's module doc).
-    /// `core.askpass=` forcing does not touch `credential.helper` at all
-    /// (by design — see module doc), so this is a genuine, currently-live
-    /// leak this harness's redaction step is the thing that closes.
     ///
-    /// Paired positive/negative in one test, same captured bytes: the RAW
+    /// Paired positive/negative in one test, same captured bytes: the raw
     /// output is asserted to contain the secret first (the census would
     /// have found it), then the redacted output is asserted not to (proving
     /// the assertion below is capable of failing, not just of passing
     /// against text the secret was never in).
     #[tokio::test]
-    async fn network_exec_redacts_a_real_credential_helpers_leaked_url() {
+    async fn a_repo_credential_helper_is_blocked_and_its_unforced_output_is_redactable() {
         let server = Http401::start();
         let fixture = home_and_cwd();
         let repo = fixture.cwd.clone();
@@ -1336,26 +1396,30 @@ mod https_suite {
         );
 
         let secret_url = "https://s3cr3t-token:hunter2@leaked-host.invalid/org/repo.git";
+        let marker = repo.join("helper-ran");
         let helper = repo.join("helper.sh");
         std::fs::write(
             &helper,
-            format!("#!/bin/sh\necho 'debug: tried {secret_url}' >&2\nexit 1\n"),
+            format!(
+                "#!/bin/sh\necho RAN >> {}\necho 'debug: tried {secret_url}' >&2\nexit 1\n",
+                marker.display()
+            ),
         )
         .expect("write helper");
         let mut perm = std::fs::metadata(&helper).unwrap().permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
         std::fs::set_permissions(&helper, perm).unwrap();
-        run(
-            Command::new("git")
-                .args(["config", "credential.helper", helper.to_str().unwrap()])
-                .current_dir(&repo),
-            "git config credential.helper",
-        );
-
         let policy = network_policy(&fixture.home, &repo, server.port);
         let url = format!("http://127.0.0.1:{}/repo.git", server.port);
+        let scoped_helper = format!("credential.{url}.helper");
+        run(
+            Command::new("git")
+                .args(["config", &scoped_helper, helper.to_str().unwrap()])
+                .current_dir(&repo),
+            "git config URL-scoped credential helper",
+        );
 
-        let raw = network_command(&policy, &repo, &["ls-remote", &url])
+        let raw = spawn::command_async(&policy, &repo, &["ls-remote", &url])
             .pinned_env_for_test(&hermetic_env(&fixture.home))
             .output()
             .await
@@ -1368,6 +1432,10 @@ mod https_suite {
              in the raw, unredacted output, or this test cannot show redaction \
              does anything. raw stderr={raw_stderr}"
         );
+        assert!(
+            marker.exists(),
+            "paired positive: the unforced repository helper must really have run"
+        );
 
         let redacted = redact_output(raw);
         let redacted_stderr = String::from_utf8_lossy(&redacted.stderr);
@@ -1379,6 +1447,96 @@ mod https_suite {
         assert!(
             !redacted_stdout.contains("s3cr3t-token") && !redacted_stdout.contains("hunter2"),
             "the secret survived redaction in stdout: {redacted_stdout}"
+        );
+
+        std::fs::remove_file(&marker).expect("remove unforced marker");
+        let hardened = network_command(&policy, &repo, &["ls-remote", &url])
+            .pinned_env_for_test(&hermetic_env(&fixture.home))
+            .output()
+            .await
+            .expect("git runs through the Network harness");
+        assert!(
+            !hardened.status.success(),
+            "the 401-only remote must not become reachable just because the \
+             repository helper is suppressed"
+        );
+        assert!(
+            !marker.exists(),
+            "the repository credential helper executed through network_command; \
+             stderr={}",
+            String::from_utf8_lossy(&hardened.stderr)
+        );
+    }
+
+    /// A repository can opt an `ext::` URL back into use with
+    /// `protocol.ext.allow=always`; the URL then names a shell command
+    /// directly. Prove both halves with the same repository and URL: plain
+    /// Git really executes the marker, while the production Network launcher
+    /// forces the protocol off and leaves no marker behind.
+    #[tokio::test]
+    async fn a_repo_enabled_ext_transport_never_executes_through_network_command() {
+        let server = Http401::start();
+        let fixture = home_and_cwd();
+        let repo = fixture.cwd.clone();
+        run(
+            Command::new("git").args(["init", "-q"]).current_dir(&repo),
+            "git init",
+        );
+        run(
+            Command::new("git")
+                .args(["config", "protocol.ext.allow", "always"])
+                .current_dir(&repo),
+            "git config protocol.ext.allow",
+        );
+
+        let marker = repo.join("ext-transport-ran");
+        let program = repo.join("ext-transport.sh");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf 'RAN\\n' >> {}\nexit 1\n",
+                marker.display()
+            ),
+        )
+        .expect("write ext transport program");
+        let mut perm = std::fs::metadata(&program).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+        std::fs::set_permissions(&program, perm).unwrap();
+
+        let policy = network_policy(&fixture.home, &repo, server.port);
+        let url = format!("ext::{} %S ignored", program.display());
+
+        let unforced = spawn::command_async(&policy, &repo, &["ls-remote", &url])
+            .pinned_env_for_test(&hermetic_env(&fixture.home))
+            .output()
+            .await
+            .expect("plain git runs");
+        assert!(
+            !unforced.status.success(),
+            "the marker transport exits 1, so the premise run must fail"
+        );
+        assert!(
+            marker.exists(),
+            "paired positive: repository-enabled ext transport did not run, so \
+             the denial assertion below would be vacuous; stderr={}",
+            String::from_utf8_lossy(&unforced.stderr)
+        );
+
+        std::fs::remove_file(&marker).expect("remove premise marker");
+        let hardened = network_command(&policy, &repo, &["ls-remote", &url])
+            .pinned_env_for_test(&hermetic_env(&fixture.home))
+            .output()
+            .await
+            .expect("git runs through the Network harness");
+        assert!(
+            !hardened.status.success(),
+            "an ext transport forced to `never` must be rejected"
+        );
+        assert!(
+            !marker.exists(),
+            "the repository-enabled ext transport executed through \
+             network_command; stderr={}",
+            String::from_utf8_lossy(&hardened.stderr)
         );
     }
 }
