@@ -757,11 +757,17 @@ jobs:
           # The namespace is necessary but not sufficient. The server refuses to
           # start unless it can construct the Strict tier (ADR 0029 / INV-13 —
           # there is no degraded mode), and that tier is a real `bwrap` launch
-          # made from INSIDE the namespace above. On run 34276280085 every named
-          # knob read true (`landlock_abi=7 seccomp_available=true userns=true
-          # bwrap_present=true`) and the launch still failed, which the probe can
-          # only report as the residual `strict_launch`. Asking the question here
-          # turns that into bwrap's own error message, eight minutes earlier.
+          # made from INSIDE the namespace above. This asks that question in the
+          # first seconds rather than meeting a generic refusal eight minutes in.
+          #
+          # BE PRECISE ABOUT WHAT IT DOES NOT CATCH. On runs 34276280085 and
+          # 34284038137 the server reported the residual `missing=["strict_launch"]`
+          # while this very probe passed, and the cause was not a host capability
+          # at all: the `gv-sandbox` shim was missing from the build (see the
+          # build step below). `strict_launch` is the name `missing_capabilities`
+          # gives when every named knob read true and the launch still failed, so
+          # it covers "the host cannot" and "the tree is missing a binary" alike.
+          # A green here rules out the first, never the second.
           echo "--- probe: bwrap inside that namespace (the Strict tier's launch) ---"
           if unshare --user --map-root-user --net --mount -- \
                bash -c 'ip link set lo up && bwrap --ro-bind / / --proc /proc --dev /dev -- /bin/true && echo BWRAP_OK'; then
