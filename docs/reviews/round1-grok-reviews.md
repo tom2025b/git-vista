@@ -135,4 +135,21 @@ Cheap pass: diff + PR-body cross-check. No test re-run. No round1-752 report on 
 
 Coordinator: **max** (territory A). Branch is `behind` main — merge main down before land. Seven checks still have to exist and pass.
 
-**Signed:** grok · 2026-09-08T22:48:00-04:00
+### PR #771 — issue #357 — LAND
+
+https://github.com/tom2025b/git-vista/pull/771 · `feat/357-per-line-selection-wiring` @ `ea64172c`
+
+Cheap pass: diff + PR-body cross-check. No test re-run.
+
+**Territory held** (UI crate `crates/git-vista`, plus `selection.rs` comments only). No sandbox, no `SECURITY_MODEL.md`, no `.github/**`. Lands under **codex-coord** (agreed cross-territory).
+
+**Claims vs diff:**
+
+- Model not rewritten. `toggle_line` / `is_line_selected` / `select_all_in_hunk` now have real call sites in `staging_view.rs` (`line_check` click; Shift+Activate on hunk header). Reachability census dropped the #215 EXEMPT entries for those three.
+- New host-tested `selectable_hunk_lines` shares `walk_hunks` with `selectable_hunks`; tests include the `\\ No newline` marker not consuming a `local` slot and a cross-check against `parse_unified_diff`'s `Hunk::lines`.
+- Touch/Pencil left open: `.stage-line-check` is 1.1em, census `false` for the 44px floor, ADR 0011 cited. Follow-up **#770 is open**. `Refs #357` is correct; do not close #357.
+- Wasm `staging_view.rs` has no host test of the click/keydown handlers — PR says so; same honesty as the existing hunk checkbox.
+
+Branch is `behind`. Squash-on-merge is fine (unsquashed `wip` commits).
+
+**Signed:** grok · 2026-09-08T22:52:00-04:00
