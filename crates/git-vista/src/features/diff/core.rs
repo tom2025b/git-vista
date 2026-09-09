@@ -199,29 +199,78 @@ pub struct SelectableHunk {
     pub new_start: u32,
 }
 
-/// Every selectable (ordinary, non-combined) hunk header in `patch`, in
-/// rendering order — see [`SelectableHunk`].
-pub fn selectable_hunks(patch: &str) -> Vec<SelectableHunk> {
-    struct Pending {
-        line_index: usize,
-        file: String,
-        old_start: u32,
-        new_start: u32,
-    }
-    let mut pending: Vec<Pending> = Vec::new();
+struct PendingHunk {
+    line_index: usize,
+    file: String,
+    old_start: u32,
+    new_start: u32,
+}
+
+/// One raw-text body line inside a selectable hunk's own line sequence —
+/// [`selectable_hunk_lines`]'s coordinate, kept alongside the flat hunk index
+/// so a caller never has to re-walk the patch to learn which hunk a line
+/// belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectableHunkLine {
+    /// Index into [`selectable_hunks`]'s returned `Vec` — the same flat
+    /// index `staging_view.rs`'s `nav_at`/`hunks_by_flat_idx` already key on.
+    pub hunk_idx: usize,
+    /// 0-based index into that hunk's own `Hunk::lines` — the exact
+    /// coordinate [`super::selection::DiffSelection::toggle_line`] and
+    /// [`git_vista_protocol::HunkLines`] expect. Counts every body line
+    /// (context included), matching how
+    /// [`git_vista_protocol::diff::parse_unified_diff`] populates
+    /// `Hunk::lines`, so the two never drift apart.
+    pub local: u32,
+    pub kind: git_vista_protocol::diff::LineKind,
+}
+
+/// The shared raw-text walk behind [`selectable_hunks`] and
+/// [`selectable_hunk_lines`] — one state machine, so the two coordinate
+/// spaces (which hunk a header starts, which line a hunk's body line is) can
+/// never drift apart by keeping separate copies of the same countdown.
+fn walk_hunks(patch: &str) -> (Vec<PendingHunk>, HashMap<usize, SelectableHunkLine>) {
+    use git_vista_protocol::diff::LineKind;
+
+    let mut pending: Vec<PendingHunk> = Vec::new();
+    let mut body_lines: HashMap<usize, SelectableHunkLine> = HashMap::new();
     let (mut old_left, mut new_left) = (0u32, 0u32);
     let (mut minus_file, mut plus_file) = (None::<String>, None::<String>);
+    let mut local: u32 = 0;
 
     for (i, line) in patch.lines().enumerate() {
         if old_left > 0 || new_left > 0 {
-            match line.as_bytes().first() {
-                Some(b'+') => new_left = new_left.saturating_sub(1),
-                Some(b'-') => old_left = old_left.saturating_sub(1),
-                Some(b'\\') => {}
+            // `pending` always has at least one entry once this branch can
+            // run — it only executes after a header has set `old_left`/
+            // `new_left` above zero, and that same assignment always follows
+            // a `pending.push` for the hunk in progress.
+            let hunk_idx = pending.len() - 1;
+            let kind = match line.as_bytes().first() {
+                Some(b'+') => {
+                    new_left = new_left.saturating_sub(1);
+                    Some(LineKind::Added)
+                }
+                Some(b'-') => {
+                    old_left = old_left.saturating_sub(1);
+                    Some(LineKind::Removed)
+                }
+                Some(b'\\') => None,
                 _ => {
                     old_left = old_left.saturating_sub(1);
                     new_left = new_left.saturating_sub(1);
+                    Some(LineKind::Context)
                 }
+            };
+            if let Some(kind) = kind {
+                body_lines.insert(
+                    i,
+                    SelectableHunkLine {
+                        hunk_idx,
+                        local,
+                        kind,
+                    },
+                );
+                local += 1;
             }
             continue;
         }
@@ -243,17 +292,25 @@ pub fn selectable_hunks(patch: &str) -> Vec<SelectableHunk> {
                 .and_then(|(old, _)| parse_range(old))
                 .map(|(start, _)| start)
                 .unwrap_or(0);
-            pending.push(Pending {
+            pending.push(PendingHunk {
                 line_index: i,
                 file,
                 old_start,
                 new_start,
             });
+            local = 0;
             old_left = old_len;
             new_left = new_len;
         }
     }
 
+    (pending, body_lines)
+}
+
+/// Every selectable (ordinary, non-combined) hunk header in `patch`, in
+/// rendering order — see [`SelectableHunk`].
+pub fn selectable_hunks(patch: &str) -> Vec<SelectableHunk> {
+    let (pending, _) = walk_hunks(patch);
     let mut seen: HashMap<&str, u32> = HashMap::new();
     pending
         .iter()
@@ -273,6 +330,17 @@ pub fn selectable_hunks(patch: &str) -> Vec<SelectableHunk> {
             }
         })
         .collect()
+}
+
+/// Every raw-text line that is part of a selectable hunk's own body (context
+/// included), keyed by its index into `patch.lines()` — the per-line
+/// counterpart to [`selectable_hunks`], for a per-line selection UI
+/// (`toggle_line`/`is_line_selected`/`select_all_in_hunk`, #357) to pair each
+/// rendered line with the hunk/line-index coordinate those methods need.
+/// Header, meta, and combined-diff lines are simply absent from the map —
+/// there is nothing for a caller to select there.
+pub fn selectable_hunk_lines(patch: &str) -> HashMap<usize, SelectableHunkLine> {
+    walk_hunks(patch).1
 }
 
 /// The path from one side of a `---`/`+++` header, `None` for `/dev/null`.
@@ -535,6 +603,164 @@ diff --git a/bar.txt b/bar.txt
                 },
             ]
         );
+    }
+
+    // ---- selectable_hunk_lines (#357) ---------------------------------
+
+    #[test]
+    fn selectable_hunk_lines_keys_every_body_line_by_hunk_and_local_index() {
+        use git_vista_protocol::diff::LineKind;
+
+        let lines = selectable_hunk_lines(PATCH);
+
+        // Headers, file meta, and the `diff --git` line carry no entry.
+        for i in [0, 1, 2, 3, 10, 14, 15, 16, 17] {
+            assert!(
+                !lines.contains_key(&i),
+                "line {i} is a header/meta line, not a hunk body line"
+            );
+        }
+
+        // Hunk 0 (foo.rs's first hunk): context, added, added, context, removed.
+        assert_eq!(
+            lines[&5],
+            SelectableHunkLine {
+                hunk_idx: 0,
+                local: 0,
+                kind: LineKind::Context
+            }
+        );
+        assert_eq!(
+            lines[&6],
+            SelectableHunkLine {
+                hunk_idx: 0,
+                local: 1,
+                kind: LineKind::Added
+            }
+        );
+        assert_eq!(
+            lines[&7],
+            SelectableHunkLine {
+                hunk_idx: 0,
+                local: 2,
+                kind: LineKind::Added
+            }
+        );
+        assert_eq!(
+            lines[&8],
+            SelectableHunkLine {
+                hunk_idx: 0,
+                local: 3,
+                kind: LineKind::Context
+            }
+        );
+        assert_eq!(
+            lines[&9],
+            SelectableHunkLine {
+                hunk_idx: 0,
+                local: 4,
+                kind: LineKind::Removed
+            }
+        );
+
+        // Hunk 1 (foo.rs's second hunk): the local counter resets to 0.
+        assert_eq!(
+            lines[&11],
+            SelectableHunkLine {
+                hunk_idx: 1,
+                local: 0,
+                kind: LineKind::Context
+            }
+        );
+        assert_eq!(
+            lines[&12],
+            SelectableHunkLine {
+                hunk_idx: 1,
+                local: 1,
+                kind: LineKind::Removed
+            }
+        );
+        assert_eq!(
+            lines[&13],
+            SelectableHunkLine {
+                hunk_idx: 1,
+                local: 2,
+                kind: LineKind::Added
+            }
+        );
+
+        // Hunk 2 (bar.txt): a fresh file, but still hunk_idx 2 — flat across
+        // every file, not reset per file the way `SelectableHunk::ordinal` is.
+        assert_eq!(
+            lines[&18],
+            SelectableHunkLine {
+                hunk_idx: 2,
+                local: 0,
+                kind: LineKind::Removed
+            }
+        );
+        assert_eq!(
+            lines[&19],
+            SelectableHunkLine {
+                hunk_idx: 2,
+                local: 1,
+                kind: LineKind::Added
+            }
+        );
+    }
+
+    #[test]
+    fn selectable_hunk_lines_does_not_count_the_no_newline_marker() {
+        // The marker line must not consume a `local` slot — it isn't one of
+        // `Hunk::lines`'s entries (it flips `no_newline_at_eof` on the
+        // previous one instead), so a per-line UI must not offer it a
+        // checkbox, and the line after a hunk boundary must not be shifted.
+        let patch = "\
+--- a/x
++++ b/x
+@@ -1,2 +1,1 @@
+-old
+\\ No newline at end of file
++new
+";
+        let lines = selectable_hunk_lines(patch);
+        assert!(!lines.contains_key(&4), "the marker line has no coordinate");
+        assert_eq!(
+            lines[&3],
+            SelectableHunkLine {
+                hunk_idx: 0,
+                local: 0,
+                kind: LineKind::Removed
+            }
+        );
+        assert_eq!(
+            lines[&5],
+            SelectableHunkLine {
+                hunk_idx: 0,
+                local: 1,
+                kind: LineKind::Added
+            },
+            "local index continues past the marker rather than skipping a slot"
+        );
+    }
+
+    #[test]
+    fn selectable_hunk_lines_matches_parse_unified_diffs_own_line_indices() {
+        // The coordinate this function invents must agree with the
+        // coordinate `parse_unified_diff` actually assigns via `Hunk::lines`
+        // — that agreement is the entire point (`toggle_line`'s space).
+        // Cross-checked directly rather than assumed.
+        let parsed = git_vista_protocol::diff::parse_unified_diff(PATCH);
+        let git_vista_protocol::diff::FileDiff::Hunks { hunks, .. } = &parsed.files[0] else {
+            panic!("expected an ordinary edit for src/foo.rs");
+        };
+        let lines = selectable_hunk_lines(PATCH);
+        // Hunk 0's local index 4 (raw line 9, "-removed one") must be
+        // `Hunk::lines[4]`, a `Removed` line with that exact text.
+        let target = &hunks[0].lines[4];
+        assert_eq!(target.kind, LineKind::Removed);
+        assert_eq!(target.text, "removed one");
+        assert_eq!(lines[&9].local, 4);
     }
 
     #[test]
