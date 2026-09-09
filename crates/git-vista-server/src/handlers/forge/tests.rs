@@ -17,7 +17,7 @@ fn production_shaped_fixture_maps_only_neutral_summary_fields() {
         "https://github.com/octocat/Hello-World/pull/1348"
     );
     assert_eq!(page.next_page, Some(2));
-    assert!(!page.capabilities.checks && !page.capabilities.reviews);
+    assert!(page.capabilities.checks && page.capabilities.reviews);
     let wire = serde_json::to_string(&page).unwrap();
     for omitted in [
         "malicious.invalid",
@@ -122,6 +122,213 @@ fn fixture_client() -> Client {
         .timeout(Duration::from_secs(2))
         .build()
         .unwrap()
+}
+
+async fn upstream_sequence<F>(replies_for: F) -> (Url, tokio::task::JoinHandle<Vec<String>>)
+where
+    F: FnOnce(&Url) -> Vec<(u16, String, Vec<u8>)>,
+{
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+    let replies = replies_for(&base);
+    let task = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for (status, headers, body) in replies {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = vec![];
+            loop {
+                let mut chunk = [0u8; 1024];
+                let n = stream.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..n]);
+                if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let reply = format!(
+                "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n",
+                body.len()
+            );
+            stream.write_all(reply.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+            requests.push(String::from_utf8(bytes).unwrap());
+        }
+        requests
+    });
+    (base, task)
+}
+
+#[test]
+fn missing_or_empty_credentials_are_an_explicit_access_state() {
+    assert_eq!(required_token(None), Err(Availability::AccessUncertain));
+    assert_eq!(
+        required_token(Some(String::new())),
+        Err(Availability::AccessUncertain)
+    );
+    assert_eq!(
+        required_token(Some("configured".into())).unwrap(),
+        "configured"
+    );
+}
+
+#[tokio::test]
+async fn detail_adapter_projects_checks_and_latest_reviews_without_raw_provider_data() {
+    let token = format!("ghp_{}", "detail-canary".repeat(3));
+    let sha = "a".repeat(40);
+    let pull = serde_json::json!({
+        "number": 1347,
+        "state": "open",
+        "head": { "sha": sha },
+        "body": format!("must not cross the boundary: {token}"),
+        "html_url": "https://malicious.invalid/provider-link"
+    });
+    let checks = serde_json::json!({
+        "total_count": 2,
+        "check_runs": [
+            { "name": "build", "status": "completed", "conclusion": "success", "output": { "text": token } },
+            { "name": "browser", "status": "completed", "conclusion": "failure", "details_url": "https://malicious.invalid/check" }
+        ]
+    });
+    let reviews = serde_json::json!([
+        { "id": 1, "state": "COMMENTED", "body": token, "user": { "login": "octocat" } },
+        { "id": 2, "state": "APPROVED", "body": token, "user": { "login": "octocat" } },
+        { "id": 3, "state": "CHANGES_REQUESTED", "body": token, "user": { "login": "hubot" } }
+    ]);
+    let (base, task) = upstream_sequence(|_| {
+        vec![
+            (200, String::new(), serde_json::to_vec(&pull).unwrap()),
+            (200, String::new(), serde_json::to_vec(&checks).unwrap()),
+            (200, String::new(), serde_json::to_vec(&reviews).unwrap()),
+        ]
+    })
+    .await;
+    let details = fetch_details(
+        &fixture_client(),
+        &base,
+        &repo(),
+        1347,
+        &token,
+        &ForgeService::new(),
+    )
+    .await;
+    assert_eq!(details.availability, Availability::Ready);
+    assert_eq!(details.check_rollup, CheckRollup::Failing);
+    assert_eq!(details.review_rollup, ReviewRollup::ChangesRequested);
+    assert_eq!(
+        details.checks,
+        vec![
+            CheckSummary {
+                name: "build".into(),
+                state: CheckState::Success,
+            },
+            CheckSummary {
+                name: "browser".into(),
+                state: CheckState::Failure,
+            },
+        ]
+    );
+    assert_eq!(
+        details.reviews,
+        vec![
+            ReviewSummary {
+                reviewer: "hubot".into(),
+                state: ReviewState::ChangesRequested,
+            },
+            ReviewSummary {
+                reviewer: "octocat".into(),
+                state: ReviewState::Approved,
+            },
+        ]
+    );
+    let wire = serde_json::to_string(&details).unwrap();
+    assert!(!wire.contains(&token));
+    assert!(!wire.contains("malicious.invalid"));
+    let response = details_response(details);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+
+    let requests = task.await.unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].starts_with("GET /repos/octocat/Hello-World/pulls/1347 "));
+    assert!(requests[1].starts_with(&format!(
+        "GET /repos/octocat/Hello-World/commits/{sha}/check-runs?"
+    )));
+    assert!(requests[2].starts_with("GET /repos/octocat/Hello-World/pulls/1347/reviews?"));
+    for request in requests {
+        assert!(request.contains(&format!("authorization: Bearer {token}\r\n")));
+        assert!(!request.lines().next().unwrap().contains(&token));
+    }
+}
+
+#[tokio::test]
+async fn check_and_review_pages_are_reconstructed_and_aggregated() {
+    let sha = "b".repeat(40);
+    let pull = serde_json::to_vec(&serde_json::json!({
+        "number": 9, "state": "open", "head": { "sha": sha.clone() }
+    }))
+    .unwrap();
+    let check_one = serde_json::to_vec(&serde_json::json!({
+        "check_runs": [{ "name": "queued", "status": "queued", "conclusion": null }]
+    }))
+    .unwrap();
+    let check_two = serde_json::to_vec(&serde_json::json!({
+        "check_runs": [{ "name": "built", "status": "completed", "conclusion": "success" }]
+    }))
+    .unwrap();
+    let review_one = serde_json::to_vec(&serde_json::json!([
+        { "id": 1, "state": "COMMENTED", "user": { "login": "octocat" } }
+    ]))
+    .unwrap();
+    let review_two = serde_json::to_vec(&serde_json::json!([
+        { "id": 2, "state": "APPROVED", "user": { "login": "octocat" } }
+    ]))
+    .unwrap();
+    let (base, task) = upstream_sequence(|base| {
+        let checks_next = format!(
+            "Link: <{}repos/octocat/Hello-World/commits/{sha}/check-runs?filter=latest&per_page=100&page=2>; rel=\"next\"\r\n",
+            base.as_str()
+        );
+        let reviews_next = format!(
+            "Link: <{}repos/octocat/Hello-World/pulls/9/reviews?per_page=100&page=2>; rel=\"next\"\r\n",
+            base.as_str()
+        );
+        vec![
+            (200, String::new(), pull),
+            (200, checks_next, check_one),
+            (200, String::new(), check_two),
+            (200, reviews_next, review_one),
+            (200, String::new(), review_two),
+        ]
+    })
+    .await;
+    let details = fetch_details(
+        &fixture_client(),
+        &base,
+        &repo(),
+        9,
+        "token",
+        &ForgeService::new(),
+    )
+    .await;
+    assert_eq!(details.availability, Availability::Ready);
+    assert_eq!(details.checks.len(), 2);
+    assert_eq!(details.check_rollup, CheckRollup::Pending);
+    assert_eq!(
+        details.reviews,
+        vec![ReviewSummary {
+            reviewer: "octocat".into(),
+            state: ReviewState::Approved,
+        }]
+    );
+    assert_eq!(details.review_rollup, ReviewRollup::Approved);
+    let requests = task.await.unwrap();
+    assert_eq!(requests.len(), 5);
+    assert!(requests[2].starts_with(&format!(
+        "GET /repos/octocat/Hello-World/commits/{sha}/check-runs?filter=latest&per_page=100&page=2 "
+    )));
+    assert!(requests[4]
+        .starts_with("GET /repos/octocat/Hello-World/pulls/9/reviews?per_page=100&page=2 "));
 }
 
 #[tokio::test]

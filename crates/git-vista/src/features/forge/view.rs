@@ -1,7 +1,92 @@
 //! DOM wiring only. Provider requests never participate in the graph resource.
-use super::core::{accepts_response, availability_line, capability_line, page_for};
-use git_vista_protocol::forge::ForgePage;
+use super::core::{
+    accepts_response, availability_line, capability_line, check_state_label, detail_line, page_for,
+    review_state_label, PullDetails,
+};
+use git_vista_protocol::forge::{ForgePage, PullRequestSummary};
 use leptos::*;
+
+fn pull_row(
+    open: RwSignal<bool>,
+    repo: Signal<Option<String>>,
+    pr: PullRequestSummary,
+    details_available: bool,
+) -> impl IntoView {
+    let loading = create_rw_signal(false);
+    let result = create_rw_signal(None::<Result<PullDetails, String>>);
+    let epoch = create_rw_signal(0u64);
+    let number = pr.number;
+    let load = move |_| {
+        let Some(requested_repo) = repo.get_untracked() else {
+            return;
+        };
+        let request_epoch = epoch.get_untracked().wrapping_add(1);
+        epoch.set(request_epoch);
+        result.set(None);
+        loading.set(true);
+        spawn_local(async move {
+            let answer = crate::api::fetch_pull_details(&requested_repo, number).await;
+            if open.get_untracked()
+                && epoch.get_untracked() == request_epoch
+                && repo.get_untracked().as_deref() == Some(requested_repo.as_str())
+            {
+                result.set(Some(answer));
+                loading.set(false);
+            }
+        });
+    };
+    view! {
+        <li style="margin:10px 0;">
+            <a href=pr.web_url target="_blank" rel="noopener noreferrer">{format!("#{} {}", pr.number, pr.title)}</a>
+            {if pr.draft { " · Draft" } else { "" }}
+            <div>
+                <button class="refresh" prop:disabled=move || loading.get() || !details_available
+                    on:click=load>{move || if loading.get() { "Loading details…" } else { "Checks and reviews" }}</button>
+            </div>
+            {move || result.get().map(|answer| match answer {
+                Err(error) => view! { <p role="alert">{error}</p> }.into_view(),
+                Ok(details) => {
+                    let message = detail_line(&details);
+                    let ready = details.availability == git_vista_protocol::forge::ForgeAvailability::Ready;
+                    let checks = details.checks;
+                    let reviews = details.reviews;
+                    let detail_body = if ready {
+                        let check_view = if checks.is_empty() {
+                            view! { <p>"No check runs reported."</p> }.into_view()
+                        } else {
+                            view! { <ul aria-label=format!("Checks for pull request #{number}")>{checks.into_iter().map(|check| view! {
+                                <li>{format!("{} · {}", check.name, check_state_label(check.state))}</li>
+                            }).collect_view()}</ul> }.into_view()
+                        };
+                        let review_view = if reviews.is_empty() {
+                            view! { <p>"No reviews reported."</p> }.into_view()
+                        } else {
+                            view! { <ul aria-label=format!("Reviews for pull request #{number}")>{reviews.into_iter().map(|review| view! {
+                                <li>{format!("{} · {}", review.reviewer, review_state_label(review.state))}</li>
+                            }).collect_view()}</ul> }.into_view()
+                        };
+                        view! {
+                            <div>
+                                <h3>"Checks"</h3>
+                                {check_view}
+                                <h3>"Reviews"</h3>
+                                {review_view}
+                            </div>
+                        }.into_view()
+                    } else {
+                        view! { <div></div> }.into_view()
+                    };
+                    view! {
+                        <div class="forge-pr-details">
+                            <p role="status">{message}</p>
+                            {detail_body}
+                        </div>
+                    }.into_view()
+                }
+            })}
+        </li>
+    }
+}
 
 pub fn forge_view(open: RwSignal<bool>, repo: Signal<Option<String>>) -> impl IntoView {
     let page = create_rw_signal(1u32);
@@ -68,17 +153,13 @@ pub fn forge_view(open: RwSignal<bool>, repo: Signal<Option<String>>) -> impl In
                         Ok(data) => {
                             let message = availability_line(&data);
                             let capabilities = capability_line(&data.capabilities);
+                            let details_available = data.capabilities.checks || data.capabilities.reviews;
                             let next = data.next_page;
                             view! {
                                 {data.repository.map(|r| view! { <p><a href=r.web_url target="_blank" rel="noopener noreferrer">{r.name}</a></p> })}
                                 <p role="status">{message}</p>
                                 <p>{capabilities}</p>
-                                <ul>{data.pulls.into_iter().map(|pr| view! {
-                                    <li style="margin:10px 0;">
-                                        <a href=pr.web_url target="_blank" rel="noopener noreferrer">{format!("#{} {}", pr.number, pr.title)}</a>
-                                        {if pr.draft { " · Draft" } else { "" }}
-                                    </li>
-                                }).collect_view()}</ul>
+                                <ul>{data.pulls.into_iter().map(|pr| pull_row(open, repo, pr, details_available)).collect_view()}</ul>
                                 <div style="display:flex; gap:8px; align-items:center;">
                                     <button class="refresh" prop:disabled=move || page.get() <= 1 || loading.get()
                                         on:click=move |_| page.update(|p| *p = p.saturating_sub(1).max(1))>"Previous"</button>
