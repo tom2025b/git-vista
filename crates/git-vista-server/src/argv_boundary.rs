@@ -151,6 +151,17 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // `sandbox::escape_contract`'s R7 pins `main.rs`'s `GIT_*` surface to two
     // variables.
     "src/handlers/tags.rs",
+    // #752: `#[cfg(test)]` fixture setup only. `GET /api/stashes`
+    // (`stash_list`) resolves its repository through `resolve_repo` and reads
+    // it with `git_vista_git::stash::read_stashes`, which opens the
+    // repository with `gix` — no `Command` at all, same posture as `GET
+    // /api/tags`'s `read_tags` beside it. `GET /api/stash/show` goes through
+    // `crate::git_cmd::git_output`, the sealed sandbox launcher, and every
+    // write in this file builds a typed `GitOperation` for the planner (ADR
+    // 0016). The one `Command::new("git")` here builds a throwaway
+    // repository, with a real stash entry, for the handler-level tests added
+    // when `stash_list` gained `?repo=` scoping.
+    "src/handlers/stash.rs",
     // #327: `#[cfg(test)]` fixture setup only. The production probe —
     // `revert_would_conflict`'s `git merge-tree --write-tree`, which
     // establishes whether a revert can actually apply before the UI offers it

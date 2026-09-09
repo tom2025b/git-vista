@@ -47,20 +47,35 @@
 //! already has) — the same "whatever a tap can reach, a keyboard press
 //! reaches too" contract #210 set for navigation, extended to selection.
 //!
-//! **Pencil-specific surface deliberately left for a follow-up issue.** This
-//! module's line-level API (`toggle_line`, `HunkSelection::Lines`,
-//! `to_patch_plan`'s `Lines` branch) is implemented and host-tested here
+//! **Pencil-specific surface deliberately left for a follow-up issue** (this
+//! paragraph described Task 1 of #215; #357 below is what changed since).
+//! This module's line-level API (`toggle_line`, `HunkSelection::Lines`,
+//! `to_patch_plan`'s `Lines` branch) was implemented and host-tested here
 //! because it is cheap, pure, and the wire format ([`HunkLines`]) already
-//! exists from #214 — but no DOM wiring calls `toggle_line` in this issue.
-//! A real per-line UI (visible per-line tap targets in the rendered patch,
-//! hover/press affordances distinguishing "this needs a stylus" from "this
-//! is a dead zone for a finger", and pen-vs-touch-gated visibility) is a
-//! second, substantial design surface of its own — building it without a
-//! device in the loop to check that a 17px-tall inline target is even
-//! reachable with a Pencil would be guessing, not implementing. Per the
-//! issue's own explicit permission, that is split into a follow-up issue
-//! rather than guessed at here. What ships in this issue is finger (and
-//! keyboard) hunk-level selection, end to end, wired to preview/apply.
+//! existed from #214 — but #215 wired no DOM consumer to it. A real per-line
+//! UI (visible per-line tap targets in the rendered patch, hover/press
+//! affordances distinguishing "this needs a stylus" from "this is a dead
+//! zone for a finger", and pen-vs-touch-gated visibility) is a second,
+//! substantial design surface of its own — building it without a device in
+//! the loop to check that a 17px-tall inline target is even reachable with a
+//! Pencil would be guessing, not implementing. Per #215's own explicit
+//! permission, that surface was split into a follow-up issue rather than
+//! guessed at then — #357 is that follow-up.
+//!
+//! **What #357 wired, and what it didn't.** `staging_view.rs` now calls
+//! `toggle_line` from a per-line mouse/pointer checkbox (mirroring the
+//! existing hunk checkbox and `blame_row`'s own per-row select target — a
+//! precise pointer, mouse or pen alike per ADR 0011, needs no larger target
+//! than that) and calls `select_all_in_hunk` from Shift+Enter/Space on the
+//! roving-focused hunk header (mirroring `blame_row`'s own "Shift changes
+//! what the roving key means" idiom, not a new one). What #357 did **not**
+//! wire, because it remained genuinely open rather than becoming answerable
+//! by inspection: touch/Pencil-specific affordances (still needs a device in
+//! the loop), and keyboard access to one arbitrary line by itself (as
+//! opposed to "every changed line in this hunk") — that would need its own
+//! roving focus nested inside the hunk-level one #210 already owns, which is
+//! a design surface in its own right, not a wiring gap. See #357's own
+//! follow-up issue for both.
 
 use std::collections::{BTreeMap, BTreeSet};
 
