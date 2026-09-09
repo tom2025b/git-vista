@@ -2874,7 +2874,7 @@ fn post_route_census() -> &'static [PostRoute] {
         (
             "/api/delete-tag",
             "handlers::tags::delete_tag",
-            GitWrite(Ordinary),
+            GitWrite(Matching),
         ),
         (
             "/api/push-tag",

@@ -80,6 +80,7 @@ mod worktree_items;
 /// worse than a disabled item.
 pub fn open_for_commit(shell: Shell, commit: String, header: String, x: f64, y: f64) {
     shell.open_menu(MenuData {
+        tag_repo: None,
         wip_run: None,
         commit,
         header,

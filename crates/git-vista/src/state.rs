@@ -31,6 +31,9 @@ use git_vista_protocol::StageDirection;
 /// part of the pan/zoomed SVG), and the commit's GitHub URL when it has one.
 #[derive(Clone)]
 pub struct MenuData {
+    /// Worktree identity captured from the frame that supplied the tag badges.
+    /// Missing for entry points without a frame; those cannot delete tags.
+    pub tag_repo: Option<git_vista_core::identity::WorktreeId>,
     /// When this commit sits inside a WIP run the user has opened, the run it
     /// belongs to (#374 follow-up) — drives the "Fold these N checkpoints"
     /// item, which folds that one section rather than the whole graph the way

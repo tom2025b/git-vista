@@ -1903,6 +1903,7 @@ mod write_route_tests {
                 onto: HeadBranch::Known("main".into()),
             },
             OperationKind::DeleteLocalTag {
+                repo: git_vista_core::identity::WorktreeId::from_git_dir("/fixture/.git"),
                 tag: "v1.0.0".into(),
             },
             OperationKind::RemoveWorktree {
