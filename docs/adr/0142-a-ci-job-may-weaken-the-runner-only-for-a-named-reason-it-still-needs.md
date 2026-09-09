@@ -123,8 +123,9 @@ flowchart TD
 ```
 
 1. **A degenerate invocation still qualifies.** A job running `ci/browser/run.sh --grep nothing` reads exactly like one running the whole suite: this test sees an *invocation*, not an *execution*. What covers that is `ci.yml`'s own `EXPECTED_MIN_SPECS` floor — a different guard, in a different file, which a later edit could weaken without this test noticing. Before #754 the qualifying set was one this test could verify end to end; now one of its two routes leans on a guard it does not own.
-2. **The set of jobs permitted to weaken the runner grew by one class.** That is the intent, not an accident — but it is strictly more than before.
-3. **The tripwire does not read `run.sh`'s semantics**, only that it still contains `unshare`. A script that kept the token while ceasing to depend on a namespace would keep the privilege.
+2. **A trailing comment can qualify a job.** `without_full_line_comments` strips whole-line `#` comments by design, so a token naming the entrypoint in a *trailing* comment survives the strip and resolves against the tree exactly like a real invocation. Found by an outside reviewer (a different model family) as a **surviving mutation**: add the `uses:` *and* a trailing comment naming the script, and a job that runs nothing qualifies. It is a property of scanning tokens rather than parsing invocations, shared with the older `cargo test` route — but this decision widened its reach, so it is recorded rather than left implicit. Accidental drift, a bare `uses:` with no such token, still fails; defeating this takes a deliberate comment.
+3. **The set of jobs permitted to weaken the runner grew by one class.** That is the intent, not an accident — but it is strictly more than before.
+4. **The tripwire does not read `run.sh`'s semantics**, only that it still contains `unshare`. A script that kept the token while ceasing to depend on a namespace would keep the privilege.
 
 None of these is hidden: each is written into the test's own doc comment, next to the code that causes it.
 

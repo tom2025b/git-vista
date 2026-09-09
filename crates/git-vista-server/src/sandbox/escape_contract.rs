@@ -2787,6 +2787,17 @@ fn job_uses_local_action(body: &str, action_dir: &str) -> bool {
 ///    this test noticing. Before #754 the qualifying set was one this test
 ///    could verify end to end; now one of its two routes leans on a guard it
 ///    does not own.
+///  - **A trailing comment can qualify a job.** `without_full_line_comments`
+///    strips whole-line `#` comments by design, so a token naming the
+///    entrypoint in a *trailing* comment survives the strip and resolves
+///    against the tree like a real invocation. Found by an outside reviewer as
+///    a surviving mutation: adding the `uses:` **and** a trailing comment
+///    naming the script qualifies a job that runs nothing. This is a property
+///    of scanning tokens rather than parsing invocations, and it is shared with
+///    the older `cargo test` route — but #754 widened its reach, so it is
+///    written down here rather than left implicit. Accidental drift (a bare
+///    `uses:` with no such token) still fails, which is the realistic
+///    regression; defeating it takes a deliberate comment.
 ///  - **The set of jobs permitted to weaken the runner grew by one class.**
 ///    That is the point of the change, not an accident of it — but it is
 ///    strictly more than before, and the argument for the new class lives in
