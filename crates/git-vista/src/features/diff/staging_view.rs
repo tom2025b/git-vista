@@ -8,9 +8,22 @@
 //! design decisions this view implements: selection is an *always-on*
 //! affordance layered on #210's roving hunk navigation (a checkbox beside
 //! each hunk header, not a second meaning bolted onto the header's own tap),
-//! finger/keyboard selection is hunk-granularity, and per-line (Pencil)
-//! selection is intentionally left unwired here — the pure state for it
-//! exists, but no control in this file calls `toggle_line`.
+//! and finger selection is hunk-granularity.
+//!
+//! **Per-line selection (#357).** A precise pointer (mouse or pen — ADR
+//! 0011) gets its own per-line checkbox beside each rendered added/removed
+//! line (`line_check`), calling `toggle_line`/`is_line_selected` directly —
+//! the same click-only pattern as the hunk checkbox, just with no drag-select
+//! (no idempotent per-line setter exists yet; nothing in this issue's scope
+//! needed one). The roving-focused hunk header's own Shift+Enter/Space calls
+//! `select_all_in_hunk` for every changed line in that hunk — mirroring
+//! `blame_row`'s "Shift changes what the roving key means" idiom rather than
+//! inventing a new one. Deliberately **not** wired here: touch/Pencil-specific
+//! affordances (needs a device in the loop) and keyboard access to one
+//! arbitrary line on its own (would need its own roving focus nested inside
+//! #210's hunk-level one — a design surface, not a wiring gap). See
+//! [`crate::features::diff::selection`]'s module doc and #357's own
+//! follow-up issue.
 //!
 //! **What is unverified from this box** (matching #210/#226/#242's honesty
 //! pattern): the drag-select gesture below (pointerdown + pointerenter across
@@ -34,7 +47,8 @@ use crate::api::{staging_apply_request, staging_preview_request};
 use crate::detail::diff_line_class;
 use crate::features::a11y::focus::GraphFocus;
 use crate::features::diff::core::{
-    preview_state, selectable_hunks, stage_direction_copy, staging_actions, PreviewState,
+    preview_state, selectable_hunk_lines, selectable_hunks, stage_direction_copy, staging_actions,
+    PreviewState, SelectableHunkLine,
 };
 use crate::features::diff::selection::{drag_range, DiffSelection};
 use crate::features::graph::core::{roving_row_key, KeyMods, RenderCtx, RowKey};
@@ -87,6 +101,11 @@ fn hunk_row(
     selection: RwSignal<DiffSelection>,
     drag_anchor: StoredValue<Option<usize>>,
     hunks_by_flat_idx: StoredValue<Vec<(String, HunkRef)>>,
+    // Every non-context local line index in this hunk (#357) — what
+    // Shift+Activate below hands to `select_all_in_hunk`. Plain owned data,
+    // not a `StoredValue`: it's read-only inside the `move` keydown closure,
+    // never re-fetched, so it needs no reactive plumbing of its own.
+    changed_lines: Vec<u32>,
 ) -> View {
     let tabindex = move || {
         if focus.with(|f| f.tabbable_row()) == Some(idx) {
@@ -145,8 +164,25 @@ fn hunk_row(
                 // Keyboard/VoiceOver equivalence (Task 1): whatever the
                 // checkbox's tap does, Space/Enter on the currently
                 // roving-focused header does too.
+                //
+                // Shift+Activate (#357) is a *different* transition, not a
+                // modifier on the same one: `select_all_in_hunk` narrows the
+                // hunk to its explicit changed-line set (`Lines`) rather than
+                // selecting it whole (`None`/`Hunks`) — the same "Shift
+                // changes what the roving key means" idiom `blame_row` already
+                // uses for its own Shift+Arrow range-extend, applied to this
+                // surface's own Activate instead of Move. This is the
+                // keyboard path onto `select_all_in_hunk`; toggling one
+                // arbitrary line by keyboard alone remains unwired (see this
+                // file's and `selection`'s module docs).
                 RowKey::Activate => {
-                    selection.update(|s| s.toggle_hunk(&file, anchor));
+                    if ev.shift_key() {
+                        selection.update(|s| {
+                            s.select_all_in_hunk(&file, anchor, changed_lines.iter().copied())
+                        });
+                    } else {
+                        selection.update(|s| s.toggle_hunk(&file, anchor));
+                    }
                 }
             }
         }
@@ -238,6 +274,62 @@ fn hunk_row(
     .into_view()
 }
 
+/// One selectable line's own tap target (#357) — a pointer-only "select this
+/// line" checkbox beside an added/removed line, mirroring `hunk_row`'s own
+/// check button and `blame_row`'s `.blame-select`: `tabindex="-1"`, so it
+/// adds no Tab stop of its own (per-line would be far worse than per-hunk on
+/// that front, and #357's own module doc says why keyboard access to one
+/// arbitrary line stays unwired for now). Click toggles; no drag-select — no
+/// idempotent per-line setter exists yet (`set_hunk_selected`'s doc explains
+/// why `toggle_hunk`/`toggle_line` are wrong for a drag gesture), and nothing
+/// in this issue's scope needed one built.
+fn line_check(
+    file: String,
+    anchor: HunkRef,
+    local: u32,
+    selection: RwSignal<DiffSelection>,
+) -> View {
+    let checked = {
+        let file = file.clone();
+        move || selection.with(|s| s.is_line_selected(&file, anchor.index, local))
+    };
+    let on_click = move |ev: web_sys::MouseEvent| {
+        ev.stop_propagation();
+        selection.update(|s| s.toggle_line(&file, anchor, local));
+    };
+    view! {
+        <button
+            type="button"
+            class="stage-line-check"
+            tabindex="-1"
+            aria-pressed=move || checked().to_string()
+            aria-label="Select this line for staging"
+            on:click=on_click
+        >
+            {move || if checked() { "\u{2713}" } else { "" }}
+        </button>
+    }
+    .into_view()
+}
+
+/// `line_check` for raw line `i`, or `None` when `i` isn't a line inside a
+/// selectable hunk — a combined-diff body, or (patch truncation) a line past
+/// what its hunk header declared. A plain function taking `line_coords` by
+/// reference, not a closure: called from two match arms in the same `.map`
+/// over owned data (`selection`, `hunks_by_flat_idx`) that closures would
+/// otherwise have to clone at each call site, the same reasoning
+/// `staging_body`'s own `build_plan` free function documents.
+fn line_checkbox_for(
+    i: usize,
+    line_coords: &HashMap<usize, SelectableHunkLine>,
+    hunks_by_flat_idx: StoredValue<Vec<(String, HunkRef)>>,
+    selection: RwSignal<DiffSelection>,
+) -> Option<View> {
+    let coord = line_coords.get(&i)?;
+    let (file, anchor) = hunks_by_flat_idx.with_value(|all| all.get(coord.hunk_idx).cloned())?;
+    Some(line_check(file, anchor, coord.local, selection))
+}
+
 /// The staging patch, rendered with the selection UI. Still a raw-text
 /// line-by-line walk (same `diff_line_class` colouring the surfaces shared
 /// before #361), deliberately separate from `detail::accessible_rows_window`:
@@ -267,6 +359,29 @@ fn staging_patch_view(
             .collect::<Vec<_>>(),
     );
     let drag_anchor: StoredValue<Option<usize>> = store_value(None);
+    // Per-line coordinates (#357): every hunk body line, keyed by its raw
+    // `patch.lines()` index, to (flat hunk index, local index into that
+    // hunk's own `Hunk::lines`) — the same walk `selectable_hunks` itself is
+    // built on (`core::walk_hunks`), so the two can never disagree about
+    // where a hunk starts.
+    let line_coords: HashMap<usize, SelectableHunkLine> = selectable_hunk_lines(patch);
+    // Every hunk's own non-context (addable/removable) local line indices,
+    // flat-indexed the same way `hunks_by_flat_idx` is — what Shift+Activate
+    // on a hunk header hands `select_all_in_hunk` (see `hunk_row`). Built
+    // once here rather than re-derived per keypress: this is exactly the
+    // "explicit set the caller must enumerate" `select_all_in_hunk`'s own
+    // doc comment says the pure `selection` module cannot know on its own.
+    let mut changed_by_hunk: Vec<Vec<u32>> = vec![Vec::new(); hunks.len()];
+    for coord in line_coords.values() {
+        if coord.kind != git_vista_protocol::diff::LineKind::Context {
+            if let Some(v) = changed_by_hunk.get_mut(coord.hunk_idx) {
+                v.push(coord.local);
+            }
+        }
+    }
+    for v in &mut changed_by_hunk {
+        v.sort_unstable();
+    }
     // The spoken VoiceOver labels, from the structured path (#361): the same
     // `hunk_label` text the detail panel and viewer speak, paired with
     // `selectable_hunks` by (file, per-file ordinal) — NOT by position,
@@ -314,25 +429,34 @@ fn staging_patch_view(
                         selection,
                         drag_anchor,
                         hunks_by_flat_idx,
+                        changed_by_hunk.get(idx).cloned().unwrap_or_default(),
                     )
                 }
                 None if class == "diff-hunk" => {
                     view! { <span class="diff-hunk-combined">{text}</span> }.into_view()
                 }
-                None if class == "diff-add" => view! {
-                    <span class=class>
-                        <span class="sr-only">"added line: "</span>
-                        {text}
-                    </span>
+                None if class == "diff-add" => {
+                    let check = line_checkbox_for(i, &line_coords, hunks_by_flat_idx, selection);
+                    view! {
+                        <span class=class>
+                            {check}
+                            <span class="sr-only">"added line: "</span>
+                            {text}
+                        </span>
+                    }
+                    .into_view()
                 }
-                .into_view(),
-                None if class == "diff-del" => view! {
-                    <span class=class>
-                        <span class="sr-only">"removed line: "</span>
-                        {text}
-                    </span>
+                None if class == "diff-del" => {
+                    let check = line_checkbox_for(i, &line_coords, hunks_by_flat_idx, selection);
+                    view! {
+                        <span class=class>
+                            {check}
+                            <span class="sr-only">"removed line: "</span>
+                            {text}
+                        </span>
+                    }
+                    .into_view()
                 }
-                .into_view(),
                 None => view! { <span class=class>{text}</span> }.into_view(),
             }
         })

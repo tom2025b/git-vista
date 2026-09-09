@@ -487,6 +487,7 @@ mod staging_actions_suite;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use git_vista_protocol::diff::LineKind;
 
     // A realistic two-file patch: foo.rs has two hunks (the second with a
     // section heading), bar.txt one. Bodies are exact per the header counts.
@@ -609,8 +610,6 @@ diff --git a/bar.txt b/bar.txt
 
     #[test]
     fn selectable_hunk_lines_keys_every_body_line_by_hunk_and_local_index() {
-        use git_vista_protocol::diff::LineKind;
-
         let lines = selectable_hunk_lines(PATCH);
 
         // Headers, file meta, and the `diff --git` line carry no entry.

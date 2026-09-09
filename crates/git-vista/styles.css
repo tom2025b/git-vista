@@ -300,6 +300,36 @@ html, body {
   padding: 6px 0;
 }
 .stage-hunk-text:focus-visible { background: #10233d; }
+
+/* #357: a per-line selection target — deliberately NOT a 44px finger target
+   like `.stage-hunk-check` above (see `features::diff::selection`'s module
+   doc: line granularity is for precise pointers only, mouse or pen per ADR
+   0011). Sized to the diff's own inline text instead, so a column of these
+   doesn't triple the patch's vertical footprint the way a 44px band per
+   line would. */
+.stage-line-check {
+  cursor: pointer;
+  display: inline-block;
+  box-sizing: border-box;
+  width: 1.1em;
+  height: 1.1em;
+  margin-right: 0.3em;
+  vertical-align: -0.15em;
+  background: transparent;
+  color: #2f81f7;
+  border: 1px solid #30363d;
+  border-radius: 2px;
+  font: inherit;
+  font-size: 0.85em;
+  line-height: 1;
+  padding: 0;
+}
+.stage-line-check[aria-pressed="true"] {
+  background: #1f6feb;
+  border-color: #1f6feb;
+  color: #fff;
+}
+
 .stage-actions {
   display: flex;
   gap: 8px;
