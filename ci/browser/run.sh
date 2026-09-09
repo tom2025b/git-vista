@@ -21,7 +21,18 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
 
-bin="$repo/target/debug/git-vista-server"
+# Cargo accepts a relative CARGO_TARGET_DIR relative to the directory it is
+# invoked from. `dev browser` builds from the repository root, which is also
+# run.sh's working directory in that path. Resolve it before the namespace
+# changes directory to ci/browser, then export the absolute path so the Node
+# launchers below use exactly the same target directory as this preflight.
+target_dir="${CARGO_TARGET_DIR:-$repo/target}"
+if [[ $target_dir != /* ]]; then
+  target_dir="$PWD/$target_dir"
+fi
+export CARGO_TARGET_DIR="$target_dir"
+
+bin="$target_dir/debug/git-vista-server"
 if [[ ! -x $bin ]]; then
   echo "browser tests: no server binary at $bin" >&2
   echo "               build it first:  cargo build -p git-vista-server" >&2
@@ -33,7 +44,7 @@ fi
 # Checked here rather than left to the first spec: a missing binary otherwise
 # surfaces as a spec failing against an empty directory, which reads as a
 # product defect instead of a missing build step.
-fixture_bin="$repo/target/debug/gv-fixture"
+fixture_bin="$target_dir/debug/gv-fixture"
 if [[ ! -x $fixture_bin ]]; then
   echo "browser tests: no fixture binary at $fixture_bin" >&2
   echo "               build it first:  cargo build -p git-vista-fixtures" >&2

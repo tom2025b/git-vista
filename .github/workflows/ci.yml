@@ -116,6 +116,27 @@ jobs:
           bash -n gv dev
           ./gv help >/dev/null
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # #748: this is a required job, so the browser harness's Cargo target
+      # contract cannot regress behind a green pipeline. Count the two completed
+      # scenarios rather than trusting a success-looking final line: an empty or
+      # prematurely skipped test must fail this step even if its process exits 0.
+      - name: Browser harness honors Cargo target dir
+        run: |
+          set -euo pipefail
+          report=$(mktemp)
+          trap 'rm -f "$report"' EXIT
+          ci/browser/target_dir_test.sh | tee "$report"
+          count=$(grep -c '^browser target-dir scenario passed:' "$report" || true)
+          if [[ $count -ne 2 ]]; then
+            echo "::error::browser target-dir regression executed $count of 2 scenarios"
+            exit 1
+          fi
+          echo "browser target-dir regression executed $count of 2 scenarios"
+
   # ---------------------------------------------------------------------------
   # 1. Core + git + protocol + server + frontend crates: build check + tests,
   #    plus the runner's own git version against the documented floor.
