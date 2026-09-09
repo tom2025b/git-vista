@@ -8,6 +8,8 @@
 
 - **Superseded in part by:** [ADR 0133](0133-forge-reads-have-their-own-credential-and-wait-boundary.md): the read-only forge API introduces a server HTTP client; Git transfers retain this helper boundary.
 
+- **Superseded in part by:** [ADR 0144](0144-network-spawns-use-server-authored-transport-programs.md) (#755, PR #775): Network commands reset configured credential helpers before optionally appending exactly one server helper. Decision 8 below records the current behavior.
+
 ## Context
 
 M13 is "private repositories for anyone." #582 is the issue that blocks
@@ -68,12 +70,12 @@ sequenceDiagram
     Op->>Srv: (future) stores a token — #583
     Note over Srv: state::credential_token()<br/>reads GIT_VISTA_GITHUB_TOKEN<br/>(placeholder for #583's real store)
     Srv->>Cmd: network_command_with_credential(policy, repo, args, Some(token))
-    Note over Cmd: -c credential.helper= a literal naming<br/>CREDENTIAL_TOKEN_VAR by NAME only<br/>appended, never clearing config-level helpers
+    Note over Cmd: -c credential.helper= resets configured helpers<br/>then one server helper names<br/>CREDENTIAL_TOKEN_VAR by NAME only
     Cmd->>Cmd: credential_env(token) — sets<br/>GIT_VISTA_CREDENTIAL_TOKEN on THIS<br/>child's environment only
     Cmd->>Sh: spawn — argv has the variable's NAME,<br/>the value is in env, never argv
     Sh->>GH: HTTPS request, no credential yet
     GH-->>Sh: 401 — asks for auth
-    Sh->>Helper: credential.helper get<br/>operator's own config-level helpers tried first,<br/>each answers nothing under this sandbox
+    Sh->>Helper: credential.helper get<br/>only the server helper follows the reset
     Helper->>Helper: reads $GIT_VISTA_CREDENTIAL_TOKEN<br/>touches no file, no socket
     Helper-->>Sh: username=x-access-token<br/>password=(the token)
     Sh->>GH: retries with Basic auth
@@ -122,8 +124,10 @@ dedicated section, per this milestone's standing instruction.
 
 ### 4. Argv carries the variable's name, never its value
 
-`sandbox::network_exec::network_command_with_credential` appends
-`-c credential.helper=<shell literal>` where the literal is a fixed string
+After the shared launcher resets the configured helper chain with
+`-c credential.helper=`, `sandbox::network_exec::network_command_with_credential`
+appends `-c credential.helper=<shell literal>` when a token is supplied.
+The literal is a fixed string
 this crate authored, containing `spawn::CREDENTIAL_TOKEN_VAR`'s **name**
 (`GIT_VISTA_CREDENTIAL_TOKEN`) — never the token's value. The value is set
 separately, via `SandboxedCommand::credential_env`, directly into the
@@ -201,12 +205,12 @@ withdrawn.**
 The variable is set on the *git* process; `gv-sandbox` `execve`s git
 without clearing the environment (verified: its exec path contains no
 `env_clear`/`env_remove`); git's credential helpers are children of that
-git and inherit it. Decision 8's append-never-clear is exactly what places
-an operator's — or a repository's — own helper *earlier in the same chain,
-in the same process, with the same environment*. Decision 7's isolation and
-decision 8's append cannot both hold of a token living in git's
-environment. Append is what the code does, so isolation is the claim that
-loses.
+git and inherit it. At the time of this correction, decision 8's append-only
+behavior placed an operator's — or a repository's — own helper *earlier in
+the same chain, in the same process, with the same environment*. The
+isolation claim was therefore false. PR #775 later replaced that helper
+ordering with the reset described in decision 8; the token still lives in
+the Git process's inherited environment.
 
 What held after that correction, and what did not:
 
@@ -247,19 +251,35 @@ helper variable. The fetch/push/pull reuse blocker above remains: those
 operations act on an already-existing hostile repository before the
 credentialed process can be separated from repository-selected execution.
 
-### 8. Never clears, only appends
+### 8. Reset first, then append exactly one server helper
 
-The forced flag is the **non-empty** form. `FORCED_NETWORK_ARGS`'s
-`-c core.askpass=` is empty on purpose — it *disables* a config-level entry,
-closing the M1.13 finding I5 RCE gap. This ADR's `credential.helper` value
-is never empty (`network_exec::tests::the_forced_credential_helper_value_is_never_empty`
-pins this), because an empty value would clear every helper the operator's
-own configuration already declares. Git tries configured `credential.helper`
-entries in the order they are defined — config-file entries before `-c`
-overrides — and moves to the next whenever one answers nothing for `get`.
-So Git-Vista's helper runs **last**, as the fallback for exactly the case an
-operator's own helper cannot handle under this sandbox, and never shadows a
-host credential path that happens to work.
+**Updated 2026-09-09 by #755 / PR #775, superseding the original append-only
+choice.** [ADR 0144](0144-network-spawns-use-server-authored-transport-programs.md)
+records the transport selector boundary and its compatibility costs.
+
+`FORCED_NETWORK_ARGS` supplies `-c credential.helper=` before the Git
+subcommand. Git's empty helper value resets the accumulated helper chain,
+including repository/global and URL-scoped helpers. When a token is supplied,
+`network_command_with_credential` then appends exactly one non-empty,
+server-authored helper. That helper reads `CREDENTIAL_TOKEN_VAR`; configured
+helpers are no longer tried first or used as fallbacks. With no token, the
+reset still applies and no server helper is appended.
+
+This deliberately removes authentication through operator-configured helpers
+on these Network commands. Tokenless fetch/push/clone cannot authenticate via
+those helpers; credentialed clone uses Git-Vista's helper. The token stays
+in the Git child's environment, never argv or URL userinfo. Resetting helper
+selection does not make that environment private to the helper or close
+other executable selectors; #755 remains open, with the ADR 0144 residuals
+tracked in [#779](https://github.com/tom2025b/git-vista/issues/779).
+The historical fetch/push/pull reuse warning in decision 7 must therefore not
+be read as either an unchanged helper-chain exploit or permission to reuse
+the credentialed launcher without assessing the remaining execution surfaces.
+
+`network_exec::tests::a_repo_credential_helper_is_blocked_and_its_unforced_output_is_redactable`
+proves the configured helper runs in an unforced positive control and does
+not run through the shared launcher. The argv checks additionally verify
+reset-before-helper ordering; the server helper's own value remains non-empty.
 
 ### 9. `state::credential_token()` is a placeholder, and says so
 
@@ -315,7 +335,7 @@ A general setter reopens the exact hazard C10's Task 5 closed — any future
 caller could set `GIT_SSH_COMMAND` or `GIT_EXTERNAL_DIFF` through it, and a
 type that seals argv but not environment has not actually sealed the spawn.
 
-## Consequences
+## Consequences (original #582 implementation)
 
 - `sandbox::spawn::SandboxedCommand` gains its first environment-setting
   method, `credential_env`, and the crate gains one new inert environment
@@ -337,7 +357,12 @@ type that seals argv but not environment has not actually sealed the spawn.
   token to this same `credential_token()` shape, and they do not touch
   `path_is_allowed`.
 
-## Mutation proof
+## Mutation proof (historical #582 evidence)
+
+These runs document the original append-only implementation. They are not
+proof of PR #775's reset-before-helper boundary; see decision 8 and ADR 0144
+for the current behavior and evidence. The non-empty server-helper literal
+and the preceding empty reset are separate arguments.
 
 Two arms against `crates/git-vista-server/src/sandbox/network_exec.rs`,
 proved via `failure-atlas`'s `mutation_check` (a fresh clone at HEAD, run

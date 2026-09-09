@@ -18,6 +18,8 @@
   Credentials" section (annotated by this branch with an implemented-vs-aspirational table
   this ADR keeps in sync with).
 
+- **Superseded in part by:** [ADR 0144](0144-network-spawns-use-server-authored-transport-programs.md) (#755, PR #775): the shared Network launcher now resets configured credential helpers and optionally appends exactly one server helper. The rejected reset and open credential-helper findings below describe the original decision, not current helper selection.
+
 ## Context
 
 M1.13's design-trail review (finding I5) named a live arbitrary-code-execution class:
