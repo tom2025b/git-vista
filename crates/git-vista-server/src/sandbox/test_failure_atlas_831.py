@@ -25,7 +25,19 @@ class CheckoutBoundaryMutations(unittest.TestCase):
         # leak at the actual child spawn, not an incidental config failure.
         cls.env["GV_CLONE_ENVIRONMENT_CANARY"] = "atlas-ambient-canary"
         cls.env["SSH_AUTH_SOCK"] = "/tmp/gv831-atlas-agent.sock"
-        cls.run_buildlocked("build", "-p", "git-vista-server", "--bins")
+        # The focused Rust tests compile the server test binary themselves.
+        # Build only the two sibling executables they launch; compiling the
+        # non-test server binary here as well wastes enough cold-clone time to
+        # exceed failure-atlas's transport deadline.
+        cls.run_buildlocked(
+            "build",
+            "-p",
+            "git-vista-server",
+            "--bin",
+            "gv-sandbox",
+            "--bin",
+            "gv-sandbox-reaper",
+        )
 
     @classmethod
     def run_buildlocked(cls, command: str, *args: str) -> None:
