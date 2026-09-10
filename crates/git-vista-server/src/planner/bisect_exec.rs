@@ -22,8 +22,9 @@
 //! Bisect notes and automated test adapters are deliberately absent here.
 //! They are optional extensions with no production consumer. If either is
 //! wanted, its first implementation should land with its complete boundary:
-//! storage plus API/UI for notes, or a closed server-owned ID plus its route
-//! for an adapter. ADR 0131 §§5 and 7 record the constraints on those designs.
+//! storage plus API/UI for notes, or a closed server-owned ID set plus its
+//! listing and execution routes for adapters. ADR 0131 §§5 and 7 record the
+//! constraints on those designs.
 
 use std::path::{Path, PathBuf};
 
