@@ -47,12 +47,15 @@
 //! silently until it is added to [`SINK_FUNCTIONS`] (the same "reviewed after
 //! the fact" posture `ALLOWED_SPAWN_SITES` accepts for spawn sites); and
 //! *inside* an already-listed function, aliasing `args` to a differently
-//! named binding before logging it defeats the token match, because this is
-//! text matching over `code_only`-stripped source, not real data-flow
-//! analysis. What it does prove: none of the six functions that constitute
-//! this crate's actual Network-tier/chokepoint call chain today log `args`
-//! unredacted, and any of them regressing to do so — including the exact
-//! shape `reconcile_need` had — fails the build.
+//! named binding before logging it defeats the token match — `let argv =
+//! args; eprintln!("{argv:?}")` inside a listed function passes this test —
+//! because this is text matching over `code_only`-stripped source for the
+//! literal identifier `args`, not real data-flow analysis. What it *does*
+//! prove, and no more: none of the seven functions in [`SINK_FUNCTIONS`] —
+//! this crate's actual Network-tier/chokepoint call chain today — logs the
+//! literal identifier `args` unredacted, and a regression back to exactly the
+//! shape `reconcile_need` had fails the build. That is a real, narrow
+//! guarantee, not a proof that this class of leak is now impossible.
 //!
 //! # Why this needs the *raw* source, not only `code_only`'s
 //!
@@ -369,9 +372,9 @@ fn network_argv_sink_functions_never_log_args_unredacted() {
 /// `reconcile_need` shipped with, clear the exact shape it was fixed to, and
 /// still flag a body where only *one* of two call sites was fixed — the
 /// shape a partial, "weakened" fix would take. Without this, the assertion
-/// above is only ever evidence that six specific files happen to pass it
-/// today, the same failure mode `argv_boundary.rs`'s own `why_dead` guards
-/// against for its allowlist.
+/// above is only ever evidence that the seven functions in [`SINK_FUNCTIONS`]
+/// happen to pass it today, the same failure mode `argv_boundary.rs`'s own
+/// `why_dead` guards against for its allowlist.
 #[test]
 fn the_detector_flags_unredacted_args_and_clears_redacted_args() {
     let cases: &[(&str, bool, &str)] = &[
