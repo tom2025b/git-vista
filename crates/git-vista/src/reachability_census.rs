@@ -859,9 +859,10 @@ const EXEMPT: &[(&str, &str)] = &[
     // `SheetGeometry::new` is the same shape but is never extracted at all —
     // it is on GENERIC_NAME_SKIPLIST — so it needs no exemption at all.
     //
-    // #794 considered gating both `#[cfg(test)]` (the fix applied to the
-    // three siblings above) and deliberately did NOT: unlike those three,
-    // this pair is forward-looking pre-wiring, the same posture as the six
+    // #794 considered gating both `#[cfg(test)]` (the fix applied to
+    // #787/#792 above; #791's sibling item had no caller anywhere and was
+    // deleted outright instead) and deliberately did NOT: unlike those
+    // three, this pair is forward-looking pre-wiring, the same posture as the six
     // already-exempted `sheet.rs` siblings above (`taller`/`shorter`/
     // `height_px`/`flick_threshold`/`expand`/`collapse`) — none of which are
     // `#[cfg(test)]`-gated either, because the whole point is that they stay
