@@ -255,9 +255,12 @@ export async function openStashRepo(page) {
   await entry.click()
 
   const full = page.getByRole('button', { name: /full git operations/ })
-  if (await full.isVisible().catch(() => false)) {
-    await full.click()
-  }
+  await expect(full, 'the mode dialog follows opening a repository').toBeVisible()
+  await full.click()
+
+  await expect(entry, 'the picker must be dismissed before graph interactions').toHaveCount(0)
+  await expect(full, 'the mode dialog must be dismissed before graph interactions').toHaveCount(0)
+
   await expect(page.getByRole('region', { name: 'Commit history graph' })).toBeVisible()
 }
 
@@ -414,9 +417,12 @@ export async function openWorktreeRepo(page) {
   await entry.click()
 
   const full = page.getByRole('button', { name: /full git operations/ })
-  if (await full.isVisible().catch(() => false)) {
-    await full.click()
-  }
+  await expect(full, 'the mode dialog follows opening a repository').toBeVisible()
+  await full.click()
+
+  await expect(entry, 'the picker must be dismissed before graph interactions').toHaveCount(0)
+  await expect(full, 'the mode dialog must be dismissed before graph interactions').toHaveCount(0)
+
   await expect(page.getByRole('region', { name: 'Commit history graph' })).toBeVisible()
 }
 
