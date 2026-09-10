@@ -4,13 +4,6 @@
 //! here reads the DOM; it turns numbers and states into verdicts and literal strings, so
 //! the parts of issue #65 that *are* arithmetic can be settled without a device.
 
-/// The minimum interactive target, in CSS pixels, that issue #65 names: "interactive
-/// targets meet 44-by-44 CSS pixel guidance".
-///
-/// 44 is Apple's Human Interface Guidelines figure and also WCAG 2.2 SC 2.5.5 (Target
-/// Size, Enhanced). Both axes, not the diagonal or the area.
-pub const MIN_TAP_TARGET_PX: f64 = 44.0;
-
 /// The accessible name of the graph region landmark, rendered by `app::App` as the
 /// `aria-label` on `<section class="graph">`.
 ///
@@ -18,18 +11,53 @@ pub const MIN_TAP_TARGET_PX: f64 = 44.0;
 /// without one it is an anonymous generic container and a screen-reader user has no
 /// landmark to jump to. The literal lives here so `audit`'s markup tripwire and the
 /// markup itself cannot drift apart.
+///
+/// Kept out of the `#[cfg(test)]` block below, deliberately: unlike everything else in
+/// this module, `app/mod.rs` renders this in production (`aria-label=GRAPH_REGION_LABEL`
+/// on the graph `<section>`), so it stays compiled unconditionally. #784's own finding
+/// says the same: "`GRAPH_REGION_LABEL` is separately live and not part of this finding."
 pub const GRAPH_REGION_LABEL: &str = "Commit history graph";
 
-/// The extra radius, in user units, that `render::nodes` and `render::stubs` draw around
-/// each commit dot as an invisible pointer target (`r = NODE_RADIUS + 8`).
+// #784: everything below this point — the 44px tap-target arithmetic — is shipped to
+// production for test/audit use only. `rg`-verified (2026-09-10): every reference to
+// `MIN_TAP_TARGET_PX`, `NODE_HIT_PADDING`, `TapTarget`, `TargetVerdict`,
+// `node_hit_extent_px` and `min_camera_scale_for_guidance` anywhere in `crates/` is
+// either this module's own `#[cfg(test)] mod tests` below or `features/a11y/audit.rs`,
+// which is itself `#[cfg(test)]` at its `mod audit;` declaration site
+// (`features/a11y/mod.rs`). No production view builds a `TapTarget`, calls
+// `node_hit_extent_px`, or reads either constant — the render code that draws the actual
+// hit circle (`render/nodes.rs`, `render/stubs.rs`) uses its own literal `+ 15`, which
+// `NODE_HIT_PADDING` only mirrors for the host test below to check against. Gated
+// `#[cfg(test)]` per item rather than deleted, because the audit module still uses this
+// arithmetic to prove the commit dot's real hit target meets guidance
+// (`commit_dot_hit_target_meets_guidance_at_default_zoom`) — deleting it would remove
+// that proof, not just dead weight. Grouped together (rather than left interleaved with
+// `GRAPH_REGION_LABEL` above) so this whole block reads, and gates, as one unit.
+
+/// The minimum interactive target, in CSS pixels, that issue #65 names: "interactive
+/// targets meet 44-by-44 CSS pixel guidance".
 ///
-/// Mirrored here so [`node_hit_extent_px`] can be exercised on the host — `render/` is
-/// wasm-only and cannot be linked into a host test. `audit`'s
-/// `node_hit_padding_still_matches_the_render_code` tripwire is what keeps the mirror
-/// honest: change the literal in either render module and that test fails.
+/// 44 is Apple's Human Interface Guidelines figure and also WCAG 2.2 SC 2.5.5 (Target
+/// Size, Enhanced). Both axes, not the diagonal or the area.
+#[cfg(test)]
+pub const MIN_TAP_TARGET_PX: f64 = 44.0;
+
+/// The extra radius, in user units, that `render::nodes` and `render::stubs` draw around
+/// each commit dot as an invisible pointer target (`r = NODE_RADIUS +` this constant's
+/// own value).
+///
+/// The value is deliberately not restated as a bare number in this sentence: an earlier
+/// version of this doc said `+ 8` and went silently stale once the render literal (and
+/// this constant) moved to 15 for #65's 44px guidance — found during #784's review, no
+/// test catches prose drift. Mirrored here so [`node_hit_extent_px`] can be exercised on
+/// the host — `render/` is wasm-only and cannot be linked into a host test. `audit`'s
+/// `node_hit_padding_still_matches_the_render_code` tripwire, not this sentence, is what
+/// actually keeps render/ and this constant in agreement.
+#[cfg(test)]
 pub const NODE_HIT_PADDING: f64 = 15.0;
 
 /// A rendered interactive target's size in CSS pixels.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TapTarget {
     pub width_px: f64,
@@ -40,6 +68,7 @@ pub struct TapTarget {
 ///
 /// The shortfalls are reported per axis rather than as one number because the two fixes
 /// are different — a short button is a padding change, a narrow one usually is not.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TargetVerdict {
     /// Both axes are at least [`MIN_TAP_TARGET_PX`].
@@ -52,6 +81,7 @@ pub enum TargetVerdict {
     },
 }
 
+#[cfg(test)]
 impl TapTarget {
     pub fn new(width_px: f64, height_px: f64) -> Self {
         Self {
@@ -89,6 +119,7 @@ impl TapTarget {
 ///
 /// This is the arithmetic that makes the commit dot's #65 status *decidable* rather than
 /// a matter of opinion: it is not one size, it is a size per zoom level.
+#[cfg(test)]
 pub fn node_hit_extent_px(node_radius: f64, hit_padding: f64, camera_scale: f64) -> f64 {
     2.0 * (node_radius + hit_padding) * camera_scale
 }
@@ -98,6 +129,14 @@ pub fn node_hit_extent_px(node_radius: f64, hit_padding: f64, camera_scale: f64)
 ///
 /// Returns `f64::INFINITY` for a degenerate (zero or negative) hit radius: no zoom makes
 /// a zero-sized target tappable, and that is a truer answer than a division result.
+///
+/// #784: used to carry a `reachability_census::EXEMPT` entry instead of this attribute —
+/// the only member of this cluster the census's automated scan actually flagged, since
+/// every other item here reads as "reachable" to that scan through `audit.rs`'s calls
+/// (the scan cannot see that `audit` is itself `#[cfg(test)]`-gated one file away). Now
+/// `#[cfg(test)]` like the rest of the cluster, so the exemption has nothing left to
+/// exempt; see the retired entry's comment in `reachability_census.rs`.
+#[cfg(test)]
 pub fn min_camera_scale_for_guidance(node_radius: f64, hit_padding: f64) -> f64 {
     let diameter = 2.0 * (node_radius + hit_padding);
     if diameter <= 0.0 {
@@ -176,9 +215,14 @@ mod tests {
         assert_eq!(t.height_px, 30.0);
     }
 
-    /// The commit dot at the app's default zoom, with the numbers the render code
-    /// actually uses (`NODE_RADIUS` = 7, padding 8): a 30 CSS pixel target, 14 short on
-    /// both axes. `audit` is what ties those two inputs to their real definitions.
+    /// The commit dot at the app's default zoom, with the numbers the render code used
+    /// **before** #65's fix (`NODE_RADIUS` = 7, padding 8 — since raised to
+    /// `NODE_HIT_PADDING` = 15): a 30 CSS pixel target, 14 short on both axes. Found
+    /// stale during #784's review — this doc used to claim these were the numbers
+    /// render "actually uses", which stopped being true the moment the padding fix
+    /// landed. The current, real numbers are pinned by `audit`'s
+    /// `commit_dot_hit_target_meets_guidance_at_default_zoom`, which this test is the
+    /// historical negative for: same shape, the padding the fix closed.
     #[test]
     fn commit_dot_hit_circle_is_thirty_pixels_at_default_zoom() {
         let side = node_hit_extent_px(7.0, 8.0, 1.0);

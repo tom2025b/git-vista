@@ -48,17 +48,16 @@ fn an_invalidation_with_no_generation_bumps_conservatively() {
     assert_eq!(g.epoch(), before + 1);
 }
 
-#[test]
-fn an_invalidation_scoped_elsewhere_is_ignored() {
-    let mut g = GraphCore::at_generation("77");
-    let before = g.epoch();
-    let applied = g.on_invalidate(&Invalidate {
-        generation: Some(gen("78")),
-        scope: InvalidateScope::Activity,
-    });
-    assert_eq!(applied, Applied::NoChange);
-    assert_eq!(g.epoch(), before);
-}
+// #783: `an_invalidation_scoped_elsewhere_is_ignored` used to live here,
+// constructing `InvalidateScope::Activity` purely as a witness for "a scope
+// GraphCore doesn't care about" — Activity itself had no producer and no
+// consumer of its own anywhere in this crate. #783 deleted that variant (see
+// `features/core_traits.rs`), which leaves `InvalidateScope` with only
+// `Everything` and `Graph` — nothing left to construct as a third, ignored
+// scope, so the test that needed one is gone with it. `on_invalidate`'s own
+// `if !matches!(.., Graph | Everything)` guard is unchanged and still
+// compiles; it simply has no reachable case to prove false right now. Whoever
+// adds the next real scope should add this test back against it.
 
 #[test]
 fn an_invalidation_scoped_everything_still_bumps_the_graph() {

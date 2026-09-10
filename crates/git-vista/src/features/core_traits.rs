@@ -23,14 +23,23 @@ pub trait FeatureCore {
 }
 
 /// What a request was about, so an out-of-order response can be recognised.
+///
+/// #783: this used to also carry `Page(u64)` and `Operation(String)`, from the
+/// original M1.11 design doc's plan to generalise `PageRequestKey`'s own
+/// fencing (`features/graph/core.rs`) and per-operation fencing into this one
+/// type. Neither generalisation ever happened — `PageRequestKey` remains its
+/// own separate, still-used mechanism, and every real operation fence
+/// (`menu/{branch,tag,commit,remote}_items.rs`) already uses `Branch`/`Tag`/
+/// `Commit`/`Repository` directly, which is what an operation's target
+/// actually is. Both variants had zero constructors anywhere, in any build
+/// (host test or wasm), and no match arm depended on them. No spec or open
+/// issue cites either as needed groundwork — deleted rather than kept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestTarget {
     Repository,
     Branch(String),
     Tag(String),
     Commit(String),
-    Page(u64),
-    Operation(String),
 }
 
 /// Identity carried by every async continuation that writes shared state.
@@ -70,12 +79,38 @@ pub struct Invalidate {
     pub scope: InvalidateScope,
 }
 
+/// #783: this enum used to also carry `Status` and `Activity`. Both were
+/// deleted, and the deletion needed a second pass to get right — the first
+/// draft of this comment argued for keeping them by citing #551 (M12) and #68
+/// (M2.15) as open work that would consume them. **Checked again: both are
+/// CLOSED** (#68 since 2026-08-07; #551 and its children #552-#556 since
+/// 2026-09-06), and neither shipped anything that constructs or matches
+/// either variant. M12 built an entirely separate mechanism for external
+/// changes instead — `git_vista_protocol::change_feed` /
+/// `features/freshness/core.rs` — with zero references to `InvalidateScope`.
+/// #68 wired the status feature through `status::signals::create`/
+/// `fetch_status()` directly, never through this enum. Grepping the current
+/// tree confirms neither variant had a matcher anywhere, at any point in this
+/// investigation, and no other open issue names a replacement plan. The
+/// reason to keep them was borrowed from milestones whose own completed work
+/// didn't need them; once that borrowed reason is subtracted, nothing argues
+/// for keeping speculative vocabulary no one is building toward. Deleted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidateScope {
     Everything,
+    /// Survives for a code-structural reason, independent of any issue
+    /// tracker state: `GraphCore::on_invalidate` (`features/graph/core.rs`)
+    /// matches `Graph` unconditionally as a case distinct from `Everything`,
+    /// in code that ships to every build. Deleting the variant would force
+    /// editing that live, always-compiled match arm to compensate — a change
+    /// to invalidation behaviour dressed as dead-code cleanup, not a cleanup
+    /// itself. No current publisher constructs it in production
+    /// (`OperationsCore::settle`, `features/operations/core.rs`, always
+    /// publishes `Everything`), so it is `#[allow(dead_code)]`; it is
+    /// exercised only by `graph/core/graph_core_suite.rs`'s tests of that
+    /// matcher.
+    #[allow(dead_code)]
     Graph,
-    Status,
-    Activity,
 }
 
 #[cfg(test)]

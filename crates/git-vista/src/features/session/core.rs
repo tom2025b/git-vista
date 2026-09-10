@@ -30,6 +30,19 @@ pub struct SessionCore {
     hook_policy: HookPolicy,
 }
 
+/// #783: this used to also carry a `SignedOut` variant, from the original
+/// M1.11 design doc's shape for this enum. It never got a production caller:
+/// there is no sign-out UI, the client never calls `DELETE /api/session`
+/// (the server-side revoke exists and is exercised from the server's own
+/// tests, `git-vista-server/src/handlers/session.rs`, but nothing on the
+/// client side reaches it), and `session.rs`'s own module doc argues
+/// explicitly *against* any in-place session transition — a pasted fresh
+/// token reloads the whole page rather than re-resolving state in place,
+/// specifically because `via_lan`, the CSRF token and the hook policy are
+/// "fixed once `establish_session` resolves". A `SignedOut` event would be
+/// exactly the in-place transition that design deliberately avoids. Only its
+/// own unit test ever constructed it. Deleted, along with that test and its
+/// `apply` match arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
     /// The session was established or re-checked (`POST`/`GET /api/session`).
@@ -42,7 +55,6 @@ pub enum SessionEvent {
     UiModeObserved(Option<RepoMode>),
     /// The user picked a mode on the picker's mode screen.
     UiModeSelected(RepoMode),
-    SignedOut,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,13 +136,6 @@ impl FeatureCore for SessionCore {
                     return Ok(Applied::NoChange);
                 }
                 self.ui_mode = Some(m);
-                Ok(Applied::Committed)
-            }
-            SessionEvent::SignedOut => {
-                if self.csrf.is_none() {
-                    return Ok(Applied::NoChange);
-                }
-                self.csrf = None;
                 Ok(Applied::Committed)
             }
         }
@@ -513,14 +518,6 @@ mod tests {
         s.apply(SessionEvent::UiModeSelected(RepoMode::Active))
             .expect("not a LAN session, so the change is admitted");
         assert_eq!(s.ui_mode(), Some(RepoMode::Active));
-    }
-
-    #[test]
-    fn signing_out_clears_the_token_but_keeps_the_transport_fact() {
-        let mut s = established(true);
-        s.apply(SessionEvent::SignedOut).unwrap();
-        assert_eq!(s.csrf_token(), None, "the credential is gone");
-        assert!(s.is_lan(), "how we are connected did not change");
     }
 
     #[test]
