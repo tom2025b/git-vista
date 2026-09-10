@@ -8,8 +8,48 @@ repository's build-lock and target-directory rules.
 
 from pathlib import Path
 import os
+import re
 import subprocess
 import unittest
+
+
+class MutationMatrixContract(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.repo = Path(__file__).resolve().parents[4]
+        cls.matrix = (cls.repo / "ci/mutation-matrix.sh").read_text()
+
+    def test_mutation_matrix_exact_row_names_a_live_checkout_test(self) -> None:
+        normalized = [line.strip().removesuffix("\\").strip() for line in self.matrix.splitlines()]
+        case_id = None
+        for index, line in enumerate(normalized[:-3]):
+            if line == "checkout_security" and normalized[index + 2 : index + 4] == [
+                "M12",
+                "exact >> \"$declarations\"",
+            ]:
+                case_id = normalized[index + 1]
+                break
+        self.assertIsNotNone(case_id, "M12 exact checkout row is missing")
+        source = (
+            self.repo / "crates/git-vista-server/src/sandbox/checkout_security.rs"
+        ).read_text()
+        self.assertRegex(
+            source,
+            rf"(?:async )?fn\s+{re.escape(case_id)}\s*\(",
+            "the exact matrix row must name a test that still exists",
+        )
+
+    def test_mutation_matrix_exact_row_rejects_a_successful_zero_test_run(self) -> None:
+        self.assertIn(
+            "grep -q '^test result: ok\\. 1 passed; 0 failed;'",
+            self.matrix,
+            "an exact Cargo filter exiting zero after running no tests must not read PASS",
+        )
+        self.assertIn(
+            "--bin git-vista-server",
+            self.matrix,
+            "the exact row must inspect one test binary's summary",
+        )
 
 
 class CheckoutBoundaryMutations(unittest.TestCase):
