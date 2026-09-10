@@ -138,7 +138,7 @@ const REDACTED_CREDENTIAL: &[u8] = b"[REDACTED CREDENTIAL]";
 /// flags, it must not repeat one of these keys ahead of the subcommand.
 const FORCED_NETWORK_ARGS: &[&str] = &[
     "-c",
-    "init.templateDir=",
+    spawn::EMPTY_INIT_TEMPLATE_CONFIG,
     "-c",
     "core.askpass=",
     "-c",

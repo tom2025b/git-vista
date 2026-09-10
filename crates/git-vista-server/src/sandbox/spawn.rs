@@ -340,6 +340,12 @@ pub(crate) struct SandboxedCommand {
 /// not just relying on the configured helper chain being reset.
 pub(crate) const CREDENTIAL_TOKEN_VAR: &str = "GIT_VISTA_CREDENTIAL_TOKEN";
 
+/// The config half of clone-template neutralization. Kept beside the
+/// completion-time `GIT_TEMPLATE_DIR` removal so the two precedence layers are
+/// reviewable together; [`super::network_exec`] places it in every Network
+/// argv before the subcommand.
+pub(super) const EMPTY_INIT_TEMPLATE_CONFIG: &str = "init.templateDir=";
+
 impl SandboxedCommand {
     /// Seal Network transport selection to Git-Vista's supported protocols.
     /// No caller-supplied names or values: repository protocol rules must not
@@ -746,6 +752,9 @@ mod tests {
     /// MUTATION 2 (weaken the mechanism): omit only the
     /// `GIT_CONFIG_GLOBAL=/dev/null` override; the system scope is still
     /// disabled but the hostile global path reaches the child.
+    /// MUTATION 3 (weaken the other template layer): point
+    /// `EMPTY_INIT_TEMPLATE_CONFIG` at an operator directory; the inherited
+    /// variable stays absent but argv reopens template copying.
     #[tokio::test]
     async fn checkout_config_policy_overrides_test_environment_at_completion() {
         let command = tokio::process::Command::new("/usr/bin/env");
@@ -773,9 +782,17 @@ mod tests {
         assert_eq!(value("GIT_CONFIG_NOSYSTEM"), Some("1"));
         assert_eq!(value("GIT_CONFIG_GLOBAL"), Some("/dev/null"));
         assert_eq!(
+            EMPTY_INIT_TEMPLATE_CONFIG, "init.templateDir=",
+            "the config half must select no template before clone transfer"
+        );
+        assert_eq!(
             value("GIT_TEMPLATE_DIR"),
             None,
             "the higher-precedence template selector must be removed at completion"
+        );
+        assert_eq!(
+            EMPTY_INIT_TEMPLATE_CONFIG, "init.templateDir=",
+            "the config-level template selector must remain empty"
         );
     }
 
