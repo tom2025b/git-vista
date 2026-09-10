@@ -270,8 +270,10 @@ on these Network commands. Tokenless fetch/push/clone cannot authenticate via
 those helpers; credentialed clone uses Git-Vista's helper. The token stays
 in the Git child's environment, never argv or URL userinfo. Resetting helper
 selection does not make that environment private to the helper or close
-other executable selectors; #755 remains open, with the ADR 0144 residuals
-tracked in [#779](https://github.com/tom2025b/git-vista/issues/779).
+other executable selectors. [ADR 0144](0144-network-spawns-use-server-authored-transport-programs.md)
+and the [#755 closeout](../investigations/2026-09-10-issue-755-closeout.md)
+record their dispositions; the remaining checkout/filter scope stays owned by
+[#782](https://github.com/tom2025b/git-vista/issues/782).
 The historical fetch/push/pull reuse warning in decision 7 must therefore not
 be read as either an unchanged helper-chain exploit or permission to reuse
 the credentialed launcher without assessing the remaining execution surfaces.
