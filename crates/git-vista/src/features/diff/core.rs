@@ -204,6 +204,9 @@ struct PendingHunk {
     file: String,
     old_start: u32,
     new_start: u32,
+    old_left: u32,
+    new_left: u32,
+    valid_body: bool,
 }
 
 /// One raw-text body line inside a selectable hunk's own line sequence —
@@ -234,30 +237,38 @@ fn walk_hunks(patch: &str) -> (Vec<PendingHunk>, HashMap<usize, SelectableHunkLi
 
     let mut pending: Vec<PendingHunk> = Vec::new();
     let mut body_lines: HashMap<usize, SelectableHunkLine> = HashMap::new();
-    let (mut old_left, mut new_left) = (0u32, 0u32);
     let (mut minus_file, mut plus_file) = (None::<String>, None::<String>);
     let mut local: u32 = 0;
 
     for (i, line) in patch.lines().enumerate() {
-        if old_left > 0 || new_left > 0 {
-            // `pending` always has at least one entry once this branch can
-            // run — it only executes after a header has set `old_left`/
-            // `new_left` above zero, and that same assignment always follows
-            // a `pending.push` for the hunk in progress.
-            let hunk_idx = pending.len() - 1;
+        let hunk_idx = pending.len().saturating_sub(1);
+        if let Some(hunk) = pending
+            .last_mut()
+            .filter(|h| h.old_left > 0 || h.new_left > 0)
+        {
             let kind = match line.as_bytes().first() {
                 Some(b'+') => {
-                    new_left = new_left.saturating_sub(1);
+                    hunk.valid_body &= hunk.new_left > 0;
+                    hunk.new_left = hunk.new_left.saturating_sub(1);
                     Some(LineKind::Added)
                 }
                 Some(b'-') => {
-                    old_left = old_left.saturating_sub(1);
+                    hunk.valid_body &= hunk.old_left > 0;
+                    hunk.old_left = hunk.old_left.saturating_sub(1);
                     Some(LineKind::Removed)
                 }
-                Some(b'\\') => None,
+                Some(b'\\') => {
+                    hunk.valid_body &= line == "\\ No newline at end of file";
+                    None
+                }
                 _ => {
-                    old_left = old_left.saturating_sub(1);
-                    new_left = new_left.saturating_sub(1);
+                    // Keep the rendering walk's coordinates, but never let
+                    // malformed text or an exhausted side certify a complete
+                    // hunk merely because saturating subtraction reaches zero.
+                    hunk.valid_body &=
+                        line.starts_with(' ') && hunk.old_left > 0 && hunk.new_left > 0;
+                    hunk.old_left = hunk.old_left.saturating_sub(1);
+                    hunk.new_left = hunk.new_left.saturating_sub(1);
                     Some(LineKind::Context)
                 }
             };
@@ -297,10 +308,11 @@ fn walk_hunks(patch: &str) -> (Vec<PendingHunk>, HashMap<usize, SelectableHunkLi
                 file,
                 old_start,
                 new_start,
+                old_left: old_len,
+                new_left: new_len,
+                valid_body: true,
             });
             local = 0;
-            old_left = old_len;
-            new_left = new_len;
         }
     }
 
@@ -341,6 +353,58 @@ pub fn selectable_hunks(patch: &str) -> Vec<SelectableHunk> {
 /// there is nothing for a caller to select there.
 pub fn selectable_hunk_lines(patch: &str) -> HashMap<usize, SelectableHunkLine> {
     walk_hunks(patch).1
+}
+
+/// Complete changed-line sets for serialization of whole-selected hunks as
+/// `Lines` (#808). Only the patch walk can populate this index: a caller
+/// cannot certify a visible subset by supplying an unchecked completeness flag.
+#[derive(Debug, Default)]
+pub struct CompleteHunkLines {
+    files: HashMap<String, HashMap<u32, git_vista_protocol::HunkLines>>,
+}
+
+impl CompleteHunkLines {
+    /// Preserve completeness per hunk, even when a later hunk is truncated.
+    pub fn from_patch(patch: &str) -> Self {
+        use git_vista_protocol::{diff::LineKind, HunkLines, HunkRef};
+
+        let (pending, body_lines) = walk_hunks(patch);
+        let mut changed = vec![Vec::new(); pending.len()];
+        for line in body_lines.values() {
+            if line.kind != LineKind::Context {
+                changed[line.hunk_idx].push(line.local);
+            }
+        }
+        let mut seen = HashMap::<String, u32>::new();
+        let mut result = Self::default();
+        for (h, mut lines) in pending.into_iter().zip(changed) {
+            let ordinal = seen.entry(h.file.clone()).or_default();
+            let index = *ordinal;
+            *ordinal += 1;
+            if h.old_left != 0 || h.new_left != 0 || !h.valid_body {
+                continue;
+            }
+            lines.sort_unstable();
+            result.files.entry(h.file).or_default().insert(
+                index,
+                HunkLines {
+                    hunk: HunkRef {
+                        index,
+                        old_start: h.old_start,
+                        new_start: h.new_start,
+                    },
+                    lines,
+                },
+            );
+        }
+        result
+    }
+
+    /// Missing, incomplete, and stale anchors cannot supply a whole hunk.
+    pub fn get(&self, path: &str, hunk: git_vista_protocol::HunkRef) -> Option<&[u32]> {
+        let entry = self.files.get(path)?.get(&hunk.index)?;
+        (entry.hunk == hunk).then_some(entry.lines.as_slice())
+    }
 }
 
 /// The path from one side of a `---`/`+++` header, `None` for `/dev/null`.
@@ -607,6 +671,84 @@ diff --git a/bar.txt b/bar.txt
     }
 
     // ---- selectable_hunk_lines (#357) ---------------------------------
+
+    #[test]
+    fn complete_hunk_lines_include_only_changes_and_match_full_anchors() {
+        use git_vista_protocol::HunkRef;
+
+        let lines = CompleteHunkLines::from_patch(PATCH);
+        let first = HunkRef {
+            index: 0,
+            old_start: 10,
+            new_start: 10,
+        };
+        assert_eq!(lines.get("src/foo.rs", first), Some([1, 2, 4].as_slice()));
+        assert_eq!(
+            lines.get(
+                "src/foo.rs",
+                HunkRef {
+                    index: 1,
+                    old_start: 30,
+                    new_start: 31
+                }
+            ),
+            Some([1, 2].as_slice()),
+        );
+        assert_eq!(
+            lines.get(
+                "bar.txt",
+                HunkRef {
+                    index: 0,
+                    old_start: 1,
+                    new_start: 1
+                }
+            ),
+            Some([0, 1].as_slice()),
+        );
+        assert_eq!(lines.get("missing.rs", first), None);
+        assert_eq!(
+            lines.get(
+                "src/foo.rs",
+                HunkRef {
+                    new_start: 11,
+                    ..first
+                }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn complete_hunk_lines_require_both_declared_counts_without_underflow() {
+        use git_vista_protocol::HunkRef;
+
+        let anchor = HunkRef {
+            index: 0,
+            old_start: 1,
+            new_start: 1,
+        };
+        for (ranges, body, expected) in [
+            ("-1 +1", "-old\n+new\n", Some(vec![0, 1])),
+            (
+                "-1 +1",
+                "-old\n\\ No newline at end of file\n+new\n",
+                Some(vec![0, 1]),
+            ),
+            ("-1,0 +1,2", "+one\n+two\n", Some(vec![0, 1])),
+            ("-1,2 +1,0", "-one\n-two\n", Some(vec![0, 1])),
+            ("-1,2 +1,2", " context\n-old\n", None), // only new side incomplete
+            ("-1,2 +1,2", " context\n+new\n", None), // only old side incomplete
+            ("-1,2 +1,2", " context\n", None),       // both sides incomplete
+            ("-1 +1", "+one\n+extra\n-old\n", None), // saturated new count
+            ("-1 +1", "-one\n-extra\n+new\n", None), // saturated old count
+            ("-1,0 +1", " context\n", None),         // context needs both sides
+            ("-1 +1", "not a body line\n", None),    // metadata cannot satisfy counts
+        ] {
+            let patch = format!("--- a/x\n+++ b/x\n@@ {ranges} @@\n{body}");
+            let lines = CompleteHunkLines::from_patch(&patch);
+            assert_eq!(lines.get("x", anchor), expected.as_deref(), "{patch}");
+        }
+    }
 
     #[test]
     fn selectable_hunk_lines_keys_every_body_line_by_hunk_and_local_index() {

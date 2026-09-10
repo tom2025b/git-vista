@@ -48,9 +48,9 @@ use crate::detail::diff_line_class;
 use crate::features::a11y::focus::GraphFocus;
 use crate::features::diff::core::{
     preview_state, selectable_hunk_lines, selectable_hunks, stage_direction_copy, staging_actions,
-    PreviewState, SelectableHunkLine,
+    CompleteHunkLines, PreviewState, SelectableHunkLine,
 };
-use crate::features::diff::selection::{drag_range, DiffSelection};
+use crate::features::diff::selection::{drag_range, DiffSelection, IncompleteHunk};
 use crate::features::graph::core::{roving_row_key, KeyMods, RenderCtx, RowKey};
 use crate::features::shell::signals::Shell;
 use crate::features::status::signals::StatusResource;
@@ -496,6 +496,12 @@ pub fn staging_body(
     // file is wasm-only, so a copy kept here is unreachable from every test.
     let (action_word, flow) = stage_direction_copy(direction);
     let generation = d.generation.clone();
+    let whole_hunk_lines = store_value(CompleteHunkLines::from_patch(&d.patch));
+    let plan_error = create_rw_signal(None::<String>);
+    create_effect(move |_| {
+        selection.track();
+        plan_error.set(None);
+    });
     let patch = staging_patch_view(&d.patch, hunk_focus, selection);
     let truncated_note = d.truncated.then(|| {
         view! {
@@ -517,17 +523,30 @@ pub fn staging_body(
         selection: RwSignal<DiffSelection>,
         generation: &GenerationToken,
         direction: StageDirection,
-    ) -> Option<PatchPlan> {
-        let (repository, worktree) = repo_tokens(ctx)?;
-        selection.with(|s| s.to_patch_plan(repository, worktree, generation.clone(), direction))
+        whole_hunk_lines: StoredValue<CompleteHunkLines>,
+    ) -> Result<Option<PatchPlan>, IncompleteHunk> {
+        let Some((repository, worktree)) = repo_tokens(ctx) else {
+            return Ok(None);
+        };
+        whole_hunk_lines.with_value(|lines| {
+            selection.with(|s| {
+                s.to_patch_plan(repository, worktree, generation.clone(), direction, lines)
+            })
+        })
     }
 
     let on_preview = {
         let generation = generation.clone();
         move |_| {
-            let Some(plan) = build_plan(ctx, selection, &generation, direction) else {
-                return;
+            let plan = match build_plan(ctx, selection, &generation, direction, whole_hunk_lines) {
+                Ok(Some(plan)) => plan,
+                Ok(None) => return,
+                Err(error) => {
+                    plan_error.set(Some(error.to_string()));
+                    return;
+                }
             };
+            plan_error.set(None);
             busy.set(true);
             preview.set(None);
             // Recorded at request time, not after the response lands: what
@@ -555,15 +574,24 @@ pub fn staging_body(
         move || {
             preview_state(
                 previewed_plan.get().as_ref(),
-                build_plan(ctx, selection, &generation, direction).as_ref(),
+                build_plan(ctx, selection, &generation, direction, whole_hunk_lines)
+                    .ok()
+                    .flatten()
+                    .as_ref(),
             )
         }
     };
 
     let on_apply = move |_| {
-        let Some(plan) = build_plan(ctx, selection, &generation, direction) else {
-            return;
+        let plan = match build_plan(ctx, selection, &generation, direction, whole_hunk_lines) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return,
+            Err(error) => {
+                plan_error.set(Some(error.to_string()));
+                return;
+            }
         };
+        plan_error.set(None);
         busy.set(true);
         spawn_local(async move {
             match staging_apply_request(&plan).await {
@@ -673,6 +701,9 @@ pub fn staging_body(
                 "Clear selection"
             </button>
         </div>
+        {move || plan_error.get().map(|error| view! {
+            <p class="detail-status detail-error" role="alert">{error}</p>
+        })}
         {preview_view}
         {truncated_note}
         <pre class="detail-diff viewer-pre">{patch}</pre>

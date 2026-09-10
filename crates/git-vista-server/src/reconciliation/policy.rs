@@ -202,6 +202,7 @@ impl FeedPolicy {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn misses(&self) -> WatcherMisses {
         self.misses
     }

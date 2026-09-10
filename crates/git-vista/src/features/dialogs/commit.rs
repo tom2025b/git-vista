@@ -142,6 +142,13 @@ pub struct PlainCommit(CommitIntent);
 
 impl PlainCommit {
     /// The intent this path commits — never `CommitIntent::Amend`.
+    ///
+    /// #787: no production caller — production consumes `PlainCommit` only
+    /// through `into_intent`, by value. `AmendTarget::intent` below is a
+    /// different, genuinely-called method; this census matches call sites by
+    /// name only, which is why this could not be listed in `EXEMPT` without
+    /// that one going stale.
+    #[cfg(test)]
     pub fn intent(&self) -> &CommitIntent {
         &self.0
     }

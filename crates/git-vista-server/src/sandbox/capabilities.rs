@@ -93,6 +93,7 @@ impl Capabilities {
 
     /// Can the host provide the **network** tier? Landlock at the floor is
     /// enough — the network tier has no namespaces by design (F3).
+    #[cfg(test)]
     pub fn network_available(&self) -> bool {
         self.landlock_meets_floor()
     }
