@@ -78,7 +78,7 @@ pub(super) fn checkout_config_with_program(clone_url: &str, program: &str) -> Ve
         "-c".into(),
         format!("filter.lfs.process={program} filter-process"),
         "-c".into(),
-        format!("filter.lfs.smudge={program} smudge -- %f"),
+        format!("filter.lfs.smudge={program} smudge"),
         "-c".into(),
         "filter.lfs.required=true".into(),
         "-c".into(),
@@ -192,7 +192,11 @@ mod tests {
         let joined = config.join("\n");
         let selected = program();
         assert!(joined.contains(&format!("filter.lfs.process={selected} filter-process")));
-        assert!(joined.contains(&format!("filter.lfs.smudge={selected} smudge -- %f")));
+        assert!(joined.contains(&format!("filter.lfs.smudge={selected} smudge")));
+        assert!(
+            !joined.contains("%f"),
+            "a remote-controlled pathname is unnecessary in the server-authored command"
+        );
         assert!(joined.contains("filter.lfs.required=true"));
         assert!(joined.contains("lfs.basictransfersonly=true"));
         assert!(joined.contains("lfs.standalonetransferagent="));

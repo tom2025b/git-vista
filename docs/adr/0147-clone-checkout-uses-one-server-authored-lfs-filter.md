@@ -59,9 +59,13 @@ for add, clean, push, or an arbitrary argument list. It prepends:
 
 ```text
 -c filter.lfs.process=<absolute reviewed git-lfs> filter-process
--c filter.lfs.smudge=<absolute reviewed git-lfs> smudge -- %f
+-c filter.lfs.smudge=<absolute reviewed git-lfs> smudge
 -c filter.lfs.required=true
 ```
+
+The fallback smudge command deliberately omits Git's `%f` placeholder. Git LFS
+does not require the pathname to read the pointer from stdin, so no
+remote-controlled filename needs to enter a shell-interpreted command string.
 
 The executable is resolved only from `/usr/bin/git-lfs`, `/bin/git-lfs`, and
 `/usr/local/bin/git-lfs`, in that order, and must be an executable regular
