@@ -18,7 +18,7 @@ class CheckoutBoundaryMutations(unittest.TestCase):
         cls.repo = Path(__file__).resolve().parents[4]
         cls.env = os.environ.copy()
         cls.env["GV_BUILD_SLOTS"] = "1"
-        cls.env["CARGO_TARGET_DIR"] = str(cls.repo / "target/gv831-mutation")
+        cls.env["CARGO_TARGET_DIR"] = "/home/tom/.cargo-targets/gv-831"
         # These stay present in the cargo-test process after the Rust test's
         # short composition guard restores its environment. Removing
         # env_clear/allowlist construction therefore produces an observable
