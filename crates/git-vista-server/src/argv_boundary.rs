@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 //
 // Every child is a private submodule under `#[cfg(test)] mod argv_boundary;`
 // (declared in `main.rs`), so none of them need their own `#[cfg(test)]`.
+mod argv_redaction_boundary; // #801: no sink logs a spawn's argv unredacted.
 mod bounded_read; // Layer 1b: the streaming/bounded-read source boundary.
 mod dto_gates; // Layers 2, 2b, 3: DTO, clone-URL and wire adversarial fixtures.
 mod sandbox_argv_shapes; // INV-16: `sandbox_argv`'s three shapes, every tier.

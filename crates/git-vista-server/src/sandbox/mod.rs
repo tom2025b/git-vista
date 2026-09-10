@@ -785,18 +785,31 @@ pub(crate) fn network_need(args: &[&str]) -> NetworkNeed {
 /// posture C10 rejected, just with an extra step.
 pub(crate) fn reconcile_need(declared: NetworkNeed, args: &[&str]) -> NetworkNeed {
     if declared == NetworkNeed::Local && network_need(args) == NetworkNeed::Remote {
+        // #801: this is precisely the shape `network_exec::redact_args`
+        // exists for. `args` can carry a remote URL's `user:token@`
+        // userinfo, and this branch fires exactly when the argv *looks*
+        // remote — so both messages below are formatted from `redacted`,
+        // never `args`. Neither a `debug_assert!` panic message nor a
+        // release `eprintln!` goes through `redact_output` (that only ever
+        // sees a spawn's captured stdout/stderr, never its argv); before
+        // this fix both interpolated raw `args`, which meant this exact
+        // cross-check — reached only when a caller has already mislabelled a
+        // remote-shaped operation `Local` — was itself a credential-leak
+        // site. `argv_redaction_boundary`'s tripwire (`argv_boundary` module)
+        // pins this so it cannot regress.
+        let redacted = crate::sandbox::network_exec::redact_args(args);
         debug_assert!(
             false,
             "sandbox tier cross-check (D3): an operation declared \
              NetworkNeed::Local but its argv starts with a known remote \
-             subcommand — argv = {args:?}. Either the declaration in \
+             subcommand — argv = {redacted:?}. Either the declaration in \
              `network_need_for_operation` is wrong for this operation, or this \
              call site is running a remote command under a local declaration. \
              Fix the declaration; do not widen the tier."
         );
         eprintln!(
             "git-vista: sandbox tier cross-check (D3): declared NetworkNeed::Local \
-             but argv looks remote ({args:?}); keeping the stricter tier (Strict). \
+             but argv looks remote ({redacted:?}); keeping the stricter tier (Strict). \
              This is a server bug — the operation will fail if it really needs a socket."
         );
     }
