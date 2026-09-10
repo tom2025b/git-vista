@@ -234,6 +234,8 @@ export const CONFLICTING_SUBJECT = 'will not apply cleanly'
 export const CONFLICTING_PATH = 'collision.txt'
 /** Left in the working tree by the fixture and never stashed by it. */
 export const UNTRACKED = '1 untracked file'
+/** The repository label rendered by the accepted stash fixture Frame. */
+const STASH_REPO = 'stash-repo'
 
 /**
  * Open the stash repo in FULL mode.
@@ -255,10 +257,22 @@ export async function openStashRepo(page) {
   await entry.click()
 
   const full = page.getByRole('button', { name: /full git operations/ })
-  if (await full.isVisible().catch(() => false)) {
-    await full.click()
-  }
+  await expect(full, 'the mode dialog follows opening a repository').toBeVisible({
+    timeout: 20_000,
+  })
+  await full.click()
+
+  await expect(entry, 'the picker must be dismissed before graph interactions').toHaveCount(0)
+  await expect(full, 'the mode dialog must be dismissed before graph interactions').toHaveCount(0)
+
   await expect(page.getByRole('region', { name: 'Commit history graph' })).toBeVisible()
+  // The preceding repository's graph can remain attached until `/api/select`
+  // starts a new history epoch. The repo line and graph are mounted from the
+  // same accepted Frame, so identify the fixture before using its nodes.
+  await expect(page.locator('p.status.repo')).toContainText(STASH_REPO, {
+    timeout: 20_000,
+  })
+  await expect(page.locator('circle.node-hit').first()).toBeAttached()
 }
 
 /**
@@ -387,6 +401,8 @@ export const PREVIEW_HEADING = 'What this would do'
 
 /** The drawer's landmark label — mirrors `worktrees::view::DRAWER_REGION_LABEL`. */
 export const WORKTREE_REGION_LABEL = 'Worktrees'
+/** The repository label rendered by the accepted worktree fixture Frame. */
+const WORKTREE_REPO = 'worktree-repo'
 
 /** The fence sentence, mirrored from `Serviceable::refusal` and pinned there
  *  too (`the_fence_sentence_is_the_one_the_issue_names`), so a reword is a
@@ -414,10 +430,22 @@ export async function openWorktreeRepo(page) {
   await entry.click()
 
   const full = page.getByRole('button', { name: /full git operations/ })
-  if (await full.isVisible().catch(() => false)) {
-    await full.click()
-  }
+  await expect(full, 'the mode dialog follows opening a repository').toBeVisible({
+    timeout: 20_000,
+  })
+  await full.click()
+
+  await expect(entry, 'the picker must be dismissed before graph interactions').toHaveCount(0)
+  await expect(full, 'the mode dialog must be dismissed before graph interactions').toHaveCount(0)
+
   await expect(page.getByRole('region', { name: 'Commit history graph' })).toBeVisible()
+  // The preceding repository's graph can remain attached until `/api/select`
+  // starts a new history epoch. The repo line and graph are mounted from the
+  // same accepted Frame, so identify the fixture before using its nodes.
+  await expect(page.locator('p.status.repo')).toContainText(WORKTREE_REPO, {
+    timeout: 20_000,
+  })
+  await expect(page.locator('circle.node-hit').first()).toBeAttached()
 }
 
 /**
