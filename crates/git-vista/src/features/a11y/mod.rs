@@ -20,6 +20,9 @@
 //!   decidable off-device as the tap-target arithmetic is.
 //! - [`stylesheet`] is a small, fixture-tested CSS reader. It exists so the audits below
 //!   are statements about the *actual* `styles.css` rather than about a paraphrase of it.
+//!   `#[cfg(test)]` (#786): its only reader is [`audit`], itself test-only, and no
+//!   production view parses CSS — so unlike `core` and `focus`, this module's contents do
+//!   not ship.
 //! - [`audit`] is test-only and holds the tripwires: invariants over the real
 //!   `styles.css`, the real `app/mod.rs` markup, and the real `render/nodes.rs`
 //!   geometry. They are ratchets — they fail when someone adds a hover affordance with
@@ -37,6 +40,16 @@
 
 pub mod core;
 pub mod focus;
+
+// #786: the CSS reader below existed to make `audit`'s tripwires statements about the
+// real `styles.css` rather than a paraphrase of it. `rg`-verified (2026-09-10): its only
+// reader anywhere in `crates/` is `audit` (below, `#[cfg(test)]`) plus its own fixture
+// tests — no production view parses CSS. Gated at the module boundary, matching how
+// `audit` (its sole consumer) is already gated, rather than per-item: nearly every item
+// here is a type, const, or struct field, outside `reachability_census::EXEMPT`'s
+// function-only scope, so a coherent single gate is the only shape that covers the whole
+// cluster.
+#[cfg(test)]
 pub mod stylesheet;
 
 #[cfg(test)]
