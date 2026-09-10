@@ -4,6 +4,9 @@ Date: 2026-09-10
 
 Base: `bbd47193cd60d5c373b80dc30b624362def8d5e7` (`origin/main`)
 
+Current-source recheck: `d3c238cab8b6be7598492ef0b4ce8f6cd327a947`
+(`origin/main`, merged after measurement)
+
 Lane: `r5-e2`
 
 Investigator: `codex`
@@ -28,10 +31,28 @@ repository. For the failing test's repository, the monotonic trace was:
 | `reference-transaction committed` hook entry | **not observed** | — |
 | first tracking-ref observation by `within()` | **not observed** | — |
 
+The trace also exposes the queue in front of the target at the instant it
+entered the await:
+
+| Queue audit | Observed value |
+|---|---:|
+| earlier `lock(None)` entries still awaiting acquisition | **15** |
+| those earlier waiters that acquired during the target's wait | **15 / 15** |
+| acquisitions during the target's wait whose waiter entered later | **0** |
+| FIFO-order violations among the 15 acquisitions | **0** |
+| maximum gap between consecutive acquisitions | **1.717 s** |
+
+Thus the failing test entered the process-global FIFO mutex behind 15 waiters.
+Their acquisition order exactly matched their entry order, and all 15 acquired
+before the assertion cancelled the target's wait.
+
 The instrumented run reported 380 passed, 2 failed, 1 ignored, and 1006
-filtered out in 239.22 seconds. The second failure was the unrelated
+filtered out in 239.22 seconds. The second failure was the
 `create_tag_signing_fails_fast_with_a_typed_reason_and_touches_nothing` timing
-bound; it is recorded below and was not changed.
+bound; it is recorded below and was not investigated or changed. Current
+source shows that its contract-suite `pipeline` also passes `None` to
+`plan_and_execute_in`, so it requests the same process-global
+`Key::Unregistered` guard as the push test.
 
 **REASONED FROM THOSE OBSERVATIONS.** The roughly 20-second Leg 1 budget was
 spent as 0.775 seconds on the pre-lock path (task scheduling plus plan building)
@@ -64,6 +85,9 @@ source site instead of carrying over the issue's line references:
   now identifies the test declaration, not the assertion.
 - `run_tracked` calls `pipeline`, and `pipeline` passes `None` to
   `plan_and_execute_in` (`push_suite.rs:148-177`).
+- The contract suite's `pipeline` also passes `None` to
+  `plan_and_execute_in` (`contract_suite.rs:135-140`), including the signing
+  test at lines 5283-5302.
 - `plan_and_execute_within` builds the plan before awaiting
   `crate::coordinator::lock(repo_id)` (`planner.rs:593-610`).
 - `coordinator::lock(None)` maps to the process-global `Key::Unregistered` and
@@ -109,6 +133,17 @@ The scratch instrumentation did four things:
 The test's 20-second value, condition, and assertion message were unchanged.
 The local hook still slept for 20 seconds. No scratch instrumentation was copied
 back into `crates/**`.
+
+The lock trace has entry and acquisition stamps, but no release stamp. Under
+continuous contention, the interval between consecutive acquisitions gives an
+indirect upper bound on the preceding holder's hold plus scheduling delay; it
+does not identify which code held the guard or measure hold duration directly.
+
+Concurrent reaper processes interleaved 11 of the 4540 lines in
+`/tmp/gv811-contended-reaper.trace` (0.24%), so a strict parser must skip those
+malformed lines. All 19 push-child PIDs used for the reaper distribution still
+had intact matching entries; none of those matches depended on a malformed
+line.
 
 **REASONED.** The unmodified run failing first rules out the scratch writes as
 the source of the Leg 1 failure. All events use the same Linux monotonic clock;
@@ -194,14 +229,31 @@ filtered out in 252.27 seconds. In that interleaving the target entered
 `lock(None)` at 22047.841322574 and returned at 22047.841378724: 0.056150 ms.
 It then reached the push, hook, ref observation, and Leg 1 normally.
 
+Pairing each lock entry with its acquisition for the same repository gives the
+following population-scale distribution. The median is the mean of the two
+middle values; p90 uses nearest rank.
+
+| Run | Completed acquisitions | p50 | p90 | max | waits >15 s | waits >20 s | entries without an acquisition stamp |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| failing contended run | 226 | 11.154 s | 21.737 s | 27.271 s | 76 | 37 | 1 |
+| passing same-combination control | 228 | 11.355 s | 23.265 s | 26.545 s | 75 | 41 | 0 |
+
 **REASONED.** The same recipe can pass or fail according to where the target
 lands in the shared `None` queue. Forty CPU workers alone do not create the
 failure when the queue is empty; the failing measurement and this pass differ
 at the coordinator await, before the push exists.
 
-Two attempted confirmation invocations were rejected as evidence and
-interrupted immediately because their stressor setup commands were malformed;
-neither reached the target test, and no output from them is used above.
+The 20-second Leg 1 budget is above the median wait in both loaded runs but
+below p90. The passing run had 41 acquisitions wait more than 20 seconds while
+the target happened to wait only 0.056 ms. This is a broad queue-position
+hazard under the measured load, not a narrowly timed transition after push
+startup.
+
+Three earlier confirmation attempts were rejected as evidence. `confirm` used
+the malformed stressor option `--gada?`; `confirm2` started the stressor but
+produced no trace; and `confirm3` produced traces but no `leg1_assert` event.
+The `confirm` trace likewise has no `leg1_assert` event. None reached the target
+test, and no output from them is used above.
 
 ## Reaper check
 
@@ -238,9 +290,11 @@ named failure and 1373 other server tests passing. Neither PR body, issue #811,
 nor their comments records a hostname, runner name, machine ID, or concurrency
 inventory.
 
-The GitHub Actions rollups do identify hosted run and job IDs, but those are
-green: PR #805's Core job succeeded in run 34354061785, and PR #812's Core job
-succeeded in run 34370032933. They are not the failing local gate processes.
+The GitHub Actions rollups do identify hosted run and job IDs. PR #805's Core
+job succeeded in run 34354061785, although that run's overall conclusion was
+failure because its non-required Browser suite job failed. PR #812's Core job
+and overall run 34370032933 succeeded. These hosted jobs are not the failing
+local gate processes.
 
 **REASONED.** The common `/home/tom` and Cargo-target naming convention is
 compatible with one workstation, but it is not evidence that the two local
@@ -254,6 +308,9 @@ hypothesis should remain unestablished.
 `create_tag_signing_fails_fast_with_a_typed_reason_and_touches_nothing`, whose
 20-second outer budget says its internal bound is 10 seconds. The unmodified
 reproduction did not fail there, and this lane did not investigate or alter it.
+The current contract-suite helper passes `None`, so the test shares the same
+process-global `Key::Unregistered` guard; the available test-specific stamps do
+not establish how much of that test's timeout was spent waiting for the guard.
 
 No production code, test, timeout, assertion, or hook behavior changed in the
 real worktree. No pinning test was added, so there are no mutation results. The
