@@ -19,7 +19,7 @@ const GIT_LFS_CANDIDATES: &[&str] = &["/usr/bin/git-lfs", "/bin/git-lfs", "/usr/
 /// with this program makes an LFS-attributed checkout fail at the exact file
 /// instead of silently leaving its pointer. Non-LFS repositories never invoke
 /// it and remain cloneable.
-const GIT_LFS_UNAVAILABLE: &str = "/usr/bin/git-vista-lfs-unavailable";
+const GIT_LFS_UNAVAILABLE: &str = "/dev/null/git-vista-lfs-unavailable";
 
 fn is_executable_file(path: &Path) -> bool {
     std::fs::metadata(path)
@@ -27,7 +27,7 @@ fn is_executable_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-pub(super) fn program() -> &'static str {
+fn program() -> &'static str {
     GIT_LFS_CANDIDATES
         .iter()
         .copied()
@@ -41,7 +41,7 @@ pub(super) fn program() -> &'static str {
 /// an LFS endpoint path. URL userinfo may itself be a credential, so it must not
 /// cross from the transfer into checkout argv. The result is still data passed
 /// as one argv element; it is never parsed as a command.
-pub(super) fn endpoint(clone_url: &str) -> String {
+fn endpoint(clone_url: &str) -> String {
     let without_fragment = clone_url.split_once('#').map_or(clone_url, |(url, _)| url);
     let without_query = without_fragment
         .split_once('?')
@@ -72,7 +72,7 @@ pub(super) fn endpoint(clone_url: &str) -> String {
 /// the generic setting. Pinning `lfs.url` prevents a fetched `.lfsconfig` from
 /// switching an HTTPS checkout to SSH and thereby selecting `ssh` or
 /// `git-lfs-authenticate` as another executable path.
-pub(super) fn checkout_config_with_program(clone_url: &str, program: &str) -> Vec<String> {
+fn checkout_config_for_program(clone_url: &str, program: &str) -> Vec<String> {
     let endpoint = endpoint(clone_url);
     vec![
         "-c".into(),
@@ -95,7 +95,14 @@ pub(super) fn checkout_config_with_program(clone_url: &str, program: &str) -> Ve
 }
 
 pub(super) fn checkout_config(clone_url: &str) -> Vec<String> {
-    checkout_config_with_program(clone_url, program())
+    checkout_config_for_program(clone_url, program())
+}
+
+/// Test-only fault injection for the loud-unavailability behavior. Production
+/// exposes no builder that accepts an executable selected by its caller.
+#[cfg(test)]
+pub(super) fn checkout_config_with_program(clone_url: &str, program: &str) -> Vec<String> {
+    checkout_config_for_program(clone_url, program)
 }
 
 #[cfg(test)]

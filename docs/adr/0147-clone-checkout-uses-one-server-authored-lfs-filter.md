@@ -70,9 +70,12 @@ remote-controlled filename needs to enter a shell-interpreted command string.
 The executable is resolved only from `/usr/bin/git-lfs`, `/bin/git-lfs`, and
 `/usr/local/bin/git-lfs`, in that order, and must be an executable regular
 file. `PATH` never selects this driver. If no candidate exists, the required
-driver names an intentionally absent absolute path. A non-LFS checkout never
-invokes it and succeeds; an LFS checkout fails, identifies the unavailable
-driver in stderr, and leaves no apparently materialised pointer file.
+driver names `/dev/null/git-vista-lfs-unavailable`, a path that cannot become a
+file beneath the character device. A non-LFS checkout never invokes it and
+succeeds; an LFS checkout fails, identifies the unavailable driver in stderr,
+and leaves no apparently materialised pointer file. The arbitrary-program
+builder used by that fault-injection test is compiled only under `cfg(test)`;
+production exposes no caller-selected LFS executable constructor.
 
 Both process and smudge are pinned because Git may use either filter protocol.
 The command-line values outrank repository config. System and global config
