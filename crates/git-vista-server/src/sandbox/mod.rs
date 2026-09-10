@@ -280,37 +280,20 @@ pub(crate) const DEFAULT_GIT_PORTS: &[u16] = &[
 /// `https://host:22/…` is accepted and `url.<base>.insteadOf` can rewrite an
 /// accepted HTTPS URL into an SSH one. A clone genuinely can reach port 22.
 ///
-/// The surviving justification is about the *phase*, and it costs something
-/// real that is named here rather than glossed.
+/// The original justification was Git LFS smudging. That consumer no longer
+/// exists on a fresh clone: checkout disables system/global Git config, and
+/// transfer prevents `init.templateDir` / `GIT_TEMPLATE_DIR` from seeding a
+/// repository-local filter. On hosts where Git LFS installs `filter.lfs.*` in
+/// system config, checkout now succeeds silently with pointer text on disk
+/// because the unread `filter.lfs.required=true` cannot make the absent driver
+/// fail. ADR 0146 records that compatibility break.
 ///
-/// `git checkout -f` is local: the transfer has exited and every object is on
-/// disk. The legitimate outbound traffic left is a content filter's own — a
-/// `git-lfs` smudge fetching pointers' contents.
-///
-/// **That is not always HTTPS, and an earlier version of this comment claimed
-/// it was.** Git LFS resolves its endpoint from `lfs.url`, then
-/// `remote.<name>.lfsurl`, then the remote URL; where that endpoint invokes SSH
-/// — hybrid `git-lfs-authenticate` over SSH, or the pure-SSH transfer adapter —
-/// the smudge filter needs SSH *at checkout time*, which this policy withholds.
-///
-/// The axis is the **LFS endpoint, not the git transport**: an SSH git remote
-/// with an explicit HTTPS `lfs.url` is unaffected, and an HTTPS remote whose
-/// config selects an SSH LFS endpoint is affected. And the outcome is a **failed
-/// clone, not a degraded one** — a failing smudge makes `git checkout -f` exit
-/// nonzero, `execute_clone` returns `GitFailed`, and `run_guarded`'s still-armed
-/// `DestGuard` removes the destination. Both corrections from codex-daybreak,
-/// against Git LFS's own documentation and this crate's own control flow; the
-/// first version of this comment was overbroad about scope and wrong about
-/// severity.
-///
-/// It is accepted rather than fixed, because the fix and the vulnerability are
-/// the same thing. Reaching SSH at smudge time means the agent socket, host
-/// keys and port 22 in the process that runs attacker-selected filters — the
-/// exposure #702 exists to remove. The sandbox cannot tell `git-lfs`'s `ssh`
-/// from a fetched smudge filter's: same process tree, same policy, no
-/// distinguishing signal. ADR 0137 records the two conditions that would reopen
-/// it — and why the obvious one (hand the filter an HTTPS token instead) does
-/// not work, since that token is itself a bearer credential.
+/// These ports remain temporarily while the LFS replacement is designed and
+/// tested. They are retained capability with no legitimate fresh-clone
+/// consumer today, not evidence that an LFS route still works. Dropping them
+/// together with `HookMode::Run` is tracked in the same follow-up as restoring
+/// an explicit, server-owned LFS path; combining that larger policy change with
+/// the config-scope repair would obscure which boundary each regression proves.
 ///
 /// Read [`DEFAULT_GIT_PORTS`]'s own doc before trusting this too far: a port
 /// grant is **not** an egress policy, because Landlock's port rules carry no
@@ -319,7 +302,7 @@ pub(crate) const DEFAULT_GIT_PORTS: &[u16] = &[
 /// exfiltration path described on [`policy_for_clone_checkout`], which needs
 /// only the still-permitted 443.
 pub(crate) const CLONE_CHECKOUT_PORTS: &[u16] = &[
-    443,  // https:// — and what a git-lfs smudge filter uses
+    443,  // retained pending the explicit LFS / least-authority follow-up
     80,   // http://
     9418, // git://
 ];
@@ -1268,9 +1251,13 @@ pub(crate) fn policy_for_repo(repo: &Path) -> Result<Policy, shim::ShimError> {
 /// # Why #188's grants stay here, and where they come off instead (#702)
 ///
 /// This is the **transfer** policy: `git clone --no-checkout`, which is
-/// credentialed and which runs no attacker-chosen code, because nothing has
-/// been materialised yet (ADR 0128). It keeps `~/.ssh/known_hosts`, the
-/// `$SSH_AUTH_SOCK` grant and the full [`DEFAULT_GIT_PORTS`].
+/// credentialed. No fetched worktree content is materialised yet (ADR 0128),
+/// but that alone was not sufficient: an operator-selected init template could
+/// copy executable hooks and config into the new repository during this phase.
+/// The shared Network launcher now removes `GIT_TEMPLATE_DIR` and forces
+/// `init.templateDir=` before clone begins. This policy keeps
+/// `~/.ssh/known_hosts`, the `$SSH_AUTH_SOCK` grant and the full
+/// [`DEFAULT_GIT_PORTS`] for the transport itself.
 ///
 /// #702's first attempt removed all three from here, on the argument that
 /// `validate_clone_url` accepts only `https://`, `http://` and `git://` so
@@ -1331,8 +1318,8 @@ pub(crate) fn policy_for_clone(clones_root: &Path) -> Result<Policy, shim::ShimE
 }
 
 /// The policy for clone's **second** process — `git checkout -f`, the one that
-/// materialises attacker-chosen files and runs the `post-checkout` hooks and
-/// `.gitattributes` filters they select (#702).
+/// materialises attacker-chosen files and therefore must be unable to select
+/// executable hooks or filters from operator configuration (#702).
 ///
 /// # Why this exists at all
 ///
@@ -1359,10 +1346,14 @@ pub(crate) fn policy_for_clone(clones_root: &Path) -> Result<Policy, shim::ShimE
 ///   a symlink no longer has checkout refused by `add_carveout_rule`'s guard;
 /// * [`CLONE_CHECKOUT_PORTS`] rather than [`DEFAULT_GIT_PORTS`] — no port 22.
 ///
-/// TCP access, `HookMode::Run` and filter execution remain: ADR 0128 kept them
-/// deliberately (a `git-lfs` smudge filter is a legitimate checkout-time
-/// network consumer). The sealed [`CheckoutPolicy`] spawn path now also selects
-/// #723's AF_UNIX-denying seccomp profile without moving this policy to Strict.
+/// TCP access and `HookMode::Run` remain as capabilities, but a fresh clone has
+/// no legitimate selector for either hooks or filters: the transfer launcher
+/// prevents template-seeded repository config/hooks, and the sealed
+/// [`CheckoutPolicy`] spawn path prevents Git from loading system or global
+/// config. An LFS installation configured only at those scopes therefore
+/// leaves pointer text unsmudged, silently when its `required=true` setting is
+/// hidden with the driver. The same spawn path also selects #723's
+/// AF_UNIX-denying seccomp profile without moving this policy to Strict.
 ///
 /// # Why the constructor alone is not the #723 boundary
 ///
@@ -1406,9 +1397,10 @@ pub(crate) fn policy_for_clone_checkout(
         ro_carveouts: Vec::new(),
         // #702: no port 22.
         net_ports: CLONE_CHECKOUT_PORTS.to_vec(),
-        // Unchanged, and spelled literally for R8: ADR 0029 rejects blocking
-        // hooks, and #702 is about what the hook is HANDED, never whether it
-        // runs.
+        // Retained temporarily, and spelled literally for R8. A fresh clone
+        // now has no selectable hook after the transfer/config-scope pins; ADR
+        // 0146 records why removing this latent capability is a follow-up
+        // rather than being folded into the present boundary repair.
         hook_mode: HookMode::Run,
     }))
 }

@@ -67,13 +67,25 @@
 //! Proxy commands and custom helpers (including `ext`) are unavailable even
 //! when global or repository config enables them.
 //!
+//! Clone transfer also forces an empty `init.templateDir` and removes inherited
+//! `GIT_TEMPLATE_DIR`. Both are required: the environment variable has higher
+//! precedence than command-line config. Without them, `clone --no-checkout`
+//! can copy operator-selected hooks and config into the destination, and the
+//! later checkout deliberately reads that repository-local state. The same
+//! argv pins replace `core.alternateRefsCommand` with the inert standard
+//! `true` program before connectivity checks can consult it. Git documents
+//! `gc.recentObjectsHook` as multi-valued, so appending a safe value would not
+//! clear earlier hooks; `maintenance.auto=false` disables the only production
+//! Network consumer instead, the automatic maintenance run after fetch.
+//!
 //! `PATH`, `GIT_EXEC_PATH`, SSH and askpass environment selectors still come
 //! from the operator's parent environment; executable lookup remains trusted.
 //! HTTP(S) uses Git's installed standard helpers. Both transport environment
 //! values are server-authored and replace inherited values. Checkout also
-//! receives them after its environment is cleared, but LFS custom-transfer/
-//! extension and general filter commands are separate executable surfaces,
-//! not constrained by Git's protocol policy.
+//! receives them after its environment is cleared. Its separate config-scope
+//! policy disables system and global Git configuration, because LFS
+//! custom-transfer/extension and general filter commands are executable
+//! surfaces that the protocol policy cannot constrain.
 //!
 //! [`redact_output`] remains defence in depth for diagnostics emitted by the
 //! selected transport. A [`CredentialedCommand`] additionally knows and
@@ -128,6 +140,8 @@ const REDACTED_CREDENTIAL: &[u8] = b"[REDACTED CREDENTIAL]";
 /// flags, it must not repeat one of these keys ahead of the subcommand.
 const FORCED_NETWORK_ARGS: &[&str] = &[
     "-c",
+    spawn::EMPTY_INIT_TEMPLATE_CONFIG,
+    "-c",
     "core.askpass=",
     "-c",
     "credential.helper=",
@@ -137,6 +151,10 @@ const FORCED_NETWORK_ARGS: &[&str] = &[
     "core.fsmonitor=false",
     "-c",
     "protocol.ext.allow=never",
+    "-c",
+    "core.alternateRefsCommand=true",
+    "-c",
+    "maintenance.auto=false",
 ];
 
 /// Compose the fixed config pins and the transport-side executable pin.
@@ -321,10 +339,11 @@ pub(crate) fn network_command_with_credential(
 /// an untrusted-checkout launcher carrying a full environment, because that
 /// value is not constructible.
 ///
-/// What it deliberately keeps is TCP network access, `HookMode::Run` and filter
-/// execution — ADR 0128's product behaviour. #723 now narrows one capability
-/// as well: this sealed path selects the checkout seccomp profile that denies
-/// AF_UNIX while leaving HTTPS available for Git LFS.
+/// What it keeps is TCP network access and `HookMode::Run`. System and global
+/// Git configuration are disabled, so a fresh clone has no selectable filter
+/// or hook from those scopes; repository-local configuration remains readable.
+/// #723 also narrows one capability: this sealed path selects the checkout
+/// seccomp profile that denies AF_UNIX while retaining the TCP grants.
 pub(crate) struct UntrustedCheckoutCommand(spawn::SandboxedCommand);
 
 impl UntrustedCheckoutCommand {
@@ -345,9 +364,10 @@ impl UntrustedCheckoutCommand {
 }
 
 /// A Network-tier command for the phase after credential use has ended.
-/// It preserves TCP, hooks and filters while replacing the child's environment
-/// with the allowlisted one ([`spawn::UNTRUSTED_CHECKOUT_ENV_ALLOWLIST`]) and
-/// selecting the checkout-only AF_UNIX denial.
+/// It preserves TCP and repository-local configuration while replacing the
+/// child's environment with the allowlisted one
+/// ([`spawn::UNTRUSTED_CHECKOUT_ENV_ALLOWLIST`]), disabling system and global
+/// Git configuration, and selecting the checkout-only AF_UNIX denial.
 ///
 /// The allowlist is applied here rather than left to the caller: this function
 /// is the boundary, and a boundary a caller can decline to cross is not one.
@@ -576,6 +596,32 @@ mod tests {
 
     // --- pure argv shape ----------------------------------------------
 
+    /// A shim-independent view of the shared fixed-selector list. The real
+    /// spawned-argv test below remains the stronger production proof; this
+    /// focused assertion can also run in a fresh failure-atlas clone, where
+    /// Cargo has not installed the top-level `gv-sandbox` executable that the
+    /// integration launcher needs.
+    ///
+    /// MUTATION  1: remove `init.templateDir=` while the environment half
+    /// remains; the operator-global template route reopens.
+    /// MUTATION 2: remove the alternate-refs replacement or automatic-
+    /// maintenance denial while every older transport pin remains; an
+    /// executable selector reopens.
+    #[test]
+    fn forced_network_args_pin_template_alternate_refs_and_maintenance() {
+        let args = compose_network_args(&["fetch", "origin"], None);
+        for required in [
+            "init.templateDir=",
+            "core.alternateRefsCommand=true",
+            "maintenance.auto=false",
+        ] {
+            assert!(
+                args.contains(&required),
+                "the shared Network argv omitted fixed selector {required}"
+            );
+        }
+    }
+
     /// `network_command`'s argv is exactly `command_async`'s own argv with
     /// [`FORCED_NETWORK_ARGS`] spliced in immediately after `-C <repo>`, then
     /// the transport option after the subcommand — mirrors `spawn.rs`'s
@@ -630,6 +676,8 @@ mod tests {
             &args[2..],
             [
                 "-c",
+                "init.templateDir=",
+                "-c",
                 "core.askpass=",
                 "-c",
                 "credential.helper=",
@@ -639,6 +687,10 @@ mod tests {
                 "core.fsmonitor=false",
                 "-c",
                 "protocol.ext.allow=never",
+                "-c",
+                "core.alternateRefsCommand=true",
+                "-c",
+                "maintenance.auto=false",
                 "push",
                 "--receive-pack=git-receive-pack",
                 "origin",
@@ -1228,6 +1280,383 @@ mod https_suite {
             home: home_path,
             cwd: cwd_path,
         }
+    }
+
+    /// A tracked attribute can select any filter name, so the system and both
+    /// operator-global config paths must be absent from the real checkout
+    /// launcher. This is not an LFS-only test: three generic smudge drivers
+    /// make the scope boundary observable without requiring git-lfs or a
+    /// network service. `$HOME/.gitconfig` and
+    /// `$XDG_CONFIG_HOME/git/config` are the production-shaped paths: those
+    /// two environment names survive the checkout allowlist, while
+    /// `GIT_CONFIG_GLOBAL` itself does not.
+    ///
+    /// The first checkout is the executing control. It uses the same compiled
+    /// checkout policy, shim and reaper, but omits
+    /// [`network_command_without_credential`]'s environment hardening; one
+    /// driver comes from a synthetic system file and the other two from the
+    /// real home and XDG global paths. The production launcher receives that
+    /// identical environment through `pinned_env_for_test`.
+    ///
+    /// The control uses `checkout_command_async`, while production also adds
+    /// `FORCED_NETWORK_ARGS` and the transport environment policy. Those pins
+    /// do not suppress smudge filters; the two mutation arms below isolate the
+    /// config-scope completion policy as the load-bearing difference.
+    ///
+    /// MUTATION 1 (remove the mechanism): omit
+    /// `apply_checkout_git_config_policy` from the completion policies. All
+    /// three markers execute in the production leg.
+    /// MUTATION 2 (weaken the mechanism): retain `GIT_CONFIG_NOSYSTEM=1` but
+    /// omit `GIT_CONFIG_GLOBAL=/dev/null`. The home and XDG markers execute.
+    #[tokio::test]
+    async fn clone_checkout_ignores_system_home_and_xdg_filter_commands() {
+        let fixture = home_and_cwd();
+        let system_marker = fixture.cwd.join("system-filter-ran");
+        let home_marker = fixture.cwd.join("home-filter-ran");
+        let xdg_marker = fixture.cwd.join("xdg-filter-ran");
+        let system_filter = fixture.home.join("system-filter.sh");
+        let home_filter = fixture.home.join("home-filter.sh");
+        let xdg_filter = fixture.home.join("xdg-filter.sh");
+
+        for (program, marker) in [
+            (&system_filter, &system_marker),
+            (&home_filter, &home_marker),
+            (&xdg_filter, &xdg_marker),
+        ] {
+            std::fs::write(
+                program,
+                format!(
+                    "#!/bin/sh\nprintf 'RAN\\n' > '{}'\nexec /bin/cat\n",
+                    marker.display()
+                ),
+            )
+            .expect("write filter program");
+            let mut permissions = std::fs::metadata(program).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+            std::fs::set_permissions(program, permissions).unwrap();
+        }
+
+        let system_config = fixture.home.join("system.gitconfig");
+        let home_config = fixture.home.join(".gitconfig");
+        let xdg_home = fixture.home.join("xdg");
+        let xdg_config = xdg_home.join("git/config");
+        std::fs::create_dir_all(xdg_config.parent().unwrap()).expect("create XDG config dir");
+        for (config, name, program) in [
+            (&system_config, "gv782system", &system_filter),
+            (&home_config, "gv782home", &home_filter),
+            (&xdg_config, "gv782xdg", &xdg_filter),
+        ] {
+            std::fs::write(
+                config,
+                format!(
+                    "[filter \"{name}\"]\n\tsmudge = {}\n\trequired = true\n",
+                    program.display()
+                ),
+            )
+            .expect("write filter config");
+        }
+
+        run(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&fixture.cwd),
+            "init filter repo",
+        );
+        std::fs::write(
+            fixture.cwd.join(".gitattributes"),
+            "system-payload filter=gv782system\nhome-payload filter=gv782home\nxdg-payload filter=gv782xdg\n",
+        )
+        .expect("write filter attributes");
+        for (path, contents) in [
+            ("system-payload", "system payload\n"),
+            ("home-payload", "home payload\n"),
+            ("xdg-payload", "xdg payload\n"),
+        ] {
+            std::fs::write(fixture.cwd.join(path), contents).expect("write filtered payload");
+        }
+        run(
+            Command::new("git")
+                .args(["add", "."])
+                .current_dir(&fixture.cwd),
+            "stage filter fixture",
+        );
+        run(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-qm",
+                    "filter fixture",
+                ])
+                .current_dir(&fixture.cwd),
+            "commit filter fixture",
+        );
+
+        let env = vec![
+            ("PATH", "/usr/bin:/bin".to_string()),
+            ("HOME", fixture.home.to_string_lossy().into_owned()),
+            ("XDG_CONFIG_HOME", xdg_home.to_string_lossy().into_owned()),
+            (
+                "GIT_CONFIG_SYSTEM",
+                system_config.to_string_lossy().into_owned(),
+            ),
+        ];
+        let policy = network_policy(&fixture.home, &fixture.cwd, 9418);
+        let checkout = crate::sandbox::CheckoutPolicy(policy);
+
+        for name in ["system-payload", "home-payload", "xdg-payload"] {
+            std::fs::remove_file(fixture.cwd.join(name)).expect("remove payload before control");
+        }
+        let control = spawn::checkout_command_async(&checkout, &fixture.cwd, &["checkout", "-f"])
+            .pinned_env_for_test(&env)
+            .output()
+            .await
+            .expect("unhardened checkout starts");
+        assert!(
+            control.status.success(),
+            "executing control checkout failed: {}",
+            String::from_utf8_lossy(&control.stderr)
+        );
+        assert!(
+            system_marker.exists() && home_marker.exists() && xdg_marker.exists(),
+            "executing control did not reach all three filter config paths"
+        );
+
+        for path in [
+            &system_marker,
+            &home_marker,
+            &xdg_marker,
+            &fixture.cwd.join("system-payload"),
+            &fixture.cwd.join("home-payload"),
+            &fixture.cwd.join("xdg-payload"),
+        ] {
+            std::fs::remove_file(path).expect("reset fixture before hardened checkout");
+        }
+
+        let mut hardened =
+            network_command_without_credential(&checkout, &fixture.cwd, &["checkout", "-f"]);
+        hardened.0 = hardened.0.pinned_env_for_test(&env);
+        let output = hardened.output().await.expect("hardened checkout starts");
+        assert!(
+            output.status.success(),
+            "hardened checkout failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !system_marker.exists() && !home_marker.exists() && !xdg_marker.exists(),
+            "an operator-configured filter executed during hardened checkout"
+        );
+        for (path, contents) in [
+            ("system-payload", b"system payload\n".as_slice()),
+            ("home-payload", b"home payload\n".as_slice()),
+            ("xdg-payload", b"xdg payload\n".as_slice()),
+        ] {
+            assert_eq!(std::fs::read(fixture.cwd.join(path)).unwrap(), contents);
+        }
+    }
+
+    /// Clone transfer must not let an operator-selected template create the
+    /// repository-local executable state that checkout intentionally keeps.
+    /// The control runs the transfer without the shared Network hardening,
+    /// then runs the real hardened checkout: the template's config selects a
+    /// filter from the remote's `.gitattributes`, and its executable
+    /// `post-checkout` hook also runs. That is the live cross-phase bypass this
+    /// regression guards, not an inference from the files clone copied.
+    ///
+    /// The production transfer has two independent template controls because
+    /// Git gives the environment variable higher precedence than config:
+    /// completion removes inherited `GIT_TEMPLATE_DIR`, and
+    /// [`FORCED_NETWORK_ARGS`] supplies `-c init.templateDir=` to override
+    /// system/global config. The production checkout must then materialise the
+    /// payload with neither marker present.
+    ///
+    /// MUTATION 1 (remove the environment half): stop removing
+    /// `GIT_TEMPLATE_DIR`; the environment-selected template is copied and
+    /// both markers run.
+    /// MUTATION 2 (remove the config half): drop `-c init.templateDir=`; the
+    /// same template selected by `$HOME/.gitconfig` is copied and both markers
+    /// run.
+    #[tokio::test]
+    async fn clone_transfer_cannot_seed_checkout_filters_or_hooks_from_a_template() {
+        let fixture = home_and_cwd();
+        let source = fixture.cwd.join("source");
+        let template = fixture.cwd.join("template");
+        let control_dest = fixture.cwd.join("control-dest");
+        let hardened_dest = fixture.cwd.join("hardened-dest");
+        let filter_marker = fixture.cwd.join("template-filter-ran");
+        let hook_marker = fixture.cwd.join("template-hook-ran");
+        let filter = fixture.cwd.join("template-filter.sh");
+
+        std::fs::create_dir_all(&source).expect("create source repo");
+        run(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&source),
+            "init template source",
+        );
+        std::fs::write(source.join(".gitattributes"), "payload filter=gv827\n")
+            .expect("write template attack attributes");
+        std::fs::write(source.join("payload"), "payload contents\n")
+            .expect("write template attack payload");
+        run(
+            Command::new("git").args(["add", "."]).current_dir(&source),
+            "stage template source",
+        );
+        run(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-qm",
+                    "template source",
+                ])
+                .current_dir(&source),
+            "commit template source",
+        );
+
+        std::fs::create_dir_all(template.join("hooks")).expect("create template hooks");
+        std::fs::write(
+            &filter,
+            format!(
+                "#!/bin/sh\nprintf 'RAN\\n' > '{}'\nexec /bin/cat\n",
+                filter_marker.display()
+            ),
+        )
+        .expect("write template filter");
+        let hook = template.join("hooks/post-checkout");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\nprintf 'RAN\\n' > '{}'\n", hook_marker.display()),
+        )
+        .expect("write template hook");
+        for program in [&filter, &hook] {
+            let mut permissions = std::fs::metadata(program).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+            std::fs::set_permissions(program, permissions).unwrap();
+        }
+        std::fs::write(
+            template.join("config"),
+            format!(
+                "[filter \"gv827\"]\n\tsmudge = {}\n\trequired = true\n",
+                filter.display()
+            ),
+        )
+        .expect("write template config");
+        std::fs::write(
+            fixture.home.join(".gitconfig"),
+            format!("[init]\n\ttemplateDir = {}\n", template.display()),
+        )
+        .expect("write operator template config");
+
+        let env = vec![
+            ("PATH", "/usr/bin:/bin".to_string()),
+            ("HOME", fixture.home.to_string_lossy().into_owned()),
+            ("GIT_TEMPLATE_DIR", template.to_string_lossy().into_owned()),
+        ];
+        let transfer_policy = network_policy(&fixture.home, &fixture.cwd, 9418);
+        let checkout =
+            crate::sandbox::CheckoutPolicy(network_policy(&fixture.home, &fixture.cwd, 9418));
+        let source_arg = source.to_string_lossy();
+        let control_arg = control_dest.to_string_lossy();
+        let control_transfer = spawn::command_async(
+            &transfer_policy,
+            &fixture.cwd,
+            &[
+                "clone",
+                "--no-checkout",
+                "--",
+                source_arg.as_ref(),
+                control_arg.as_ref(),
+            ],
+        )
+        .pinned_env_for_test(&env)
+        .output()
+        .await
+        .expect("unhardened transfer starts");
+        assert!(
+            control_transfer.status.success(),
+            "unhardened transfer failed: {}",
+            String::from_utf8_lossy(&control_transfer.stderr)
+        );
+        let mut control_checkout =
+            network_command_without_credential(&checkout, &control_dest, &["checkout", "-f"]);
+        control_checkout.0 = control_checkout.0.pinned_env_for_test(&env);
+        let control_checkout = control_checkout
+            .output()
+            .await
+            .expect("control checkout starts");
+        assert!(
+            control_checkout.status.success(),
+            "control checkout failed: {}",
+            String::from_utf8_lossy(&control_checkout.stderr)
+        );
+        assert!(
+            filter_marker.exists() && hook_marker.exists(),
+            "template-seeded repository config and hook must both execute in the control"
+        );
+
+        std::fs::remove_file(&filter_marker).expect("clear filter marker");
+        std::fs::remove_file(&hook_marker).expect("clear hook marker");
+
+        let hardened_arg = hardened_dest.to_string_lossy();
+        let hardened_transfer = network_command_with_credential(
+            &transfer_policy,
+            &fixture.cwd,
+            &[
+                "clone",
+                "--no-checkout",
+                "--",
+                source_arg.as_ref(),
+                hardened_arg.as_ref(),
+            ],
+            None,
+        )
+        .pinned_env_for_test(&env)
+        .output()
+        .await
+        .expect("hardened transfer starts");
+        assert!(
+            hardened_transfer.status.success(),
+            "hardened transfer failed: {}",
+            String::from_utf8_lossy(&hardened_transfer.stderr)
+        );
+        assert!(
+            !hardened_dest.join(".git/hooks/post-checkout").exists(),
+            "production transfer copied an operator-selected hook"
+        );
+        let cloned_config = std::fs::read_to_string(hardened_dest.join(".git/config"))
+            .expect("read cloned repository config");
+        assert!(
+            !cloned_config.contains("gv827"),
+            "production transfer copied operator-selected filter config"
+        );
+
+        let mut hardened_checkout =
+            network_command_without_credential(&checkout, &hardened_dest, &["checkout", "-f"]);
+        hardened_checkout.0 = hardened_checkout.0.pinned_env_for_test(&env);
+        let hardened_checkout = hardened_checkout
+            .output()
+            .await
+            .expect("hardened checkout starts");
+        assert!(
+            hardened_checkout.status.success(),
+            "hardened checkout failed: {}",
+            String::from_utf8_lossy(&hardened_checkout.stderr)
+        );
+        assert_eq!(
+            std::fs::read(hardened_dest.join("payload")).unwrap(),
+            b"payload contents\n"
+        );
+        assert!(
+            !filter_marker.exists() && !hook_marker.exists(),
+            "template-seeded executable state survived the production transfer"
+        );
     }
 
     /// I5, closed: a repo-local `core.askpass` marker script never runs
