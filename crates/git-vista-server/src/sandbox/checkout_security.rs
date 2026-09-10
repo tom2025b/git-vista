@@ -1,35 +1,22 @@
-//! #723's composed checkout proof.
+//! #723/#831's composed checkout proof.
 //!
-//! The unit test in `bin/gv-sandbox/seccomp_filter.rs` can prove the rule map,
-//! but it cannot prove clone checkout selects that map. This test crosses every
-//! production boundary that matters: a tracked hook is fetched by a no-checkout
-//! clone, the checkout command is built from `CheckoutPolicy`, the real shim
-//! applies Landlock and seccomp, and Git executes the fetched hook.
+//! Clone checkout now blocks hooks, so the executable child that still matters
+//! is a content filter. This test crosses the production boundaries: a
+//! no-checkout clone fetches attributes and a hook, a repository-local test
+//! fixture selects a filter, the #831 LFS checkout builder applies the real
+//! `CheckoutPolicy`, and the compiled shim denies the filter's AF_UNIX socket.
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
 
-/// A fetched hook reads an ssh-agent pathname from `$HOME`, exports
-/// `SSH_AUTH_SOCK` itself, and makes the actual connection attempt. The parent
-/// deliberately has no `SSH_AUTH_SOCK`, so env scrubbing cannot make this pass.
-///
-/// The TCP leg is in the same Python process, under the same compiled filter.
-/// Port 9418 is used because it is the only unprivileged port in the production
-/// checkout allowlist; `sandbox::argv::only_the_clone_checkout_phase_gives_up_the_188_grants`
-/// separately pins 443, the HTTPS Git LFS port, in that exact policy and argv.
-/// Together they prove the checkout profile retained real TCP while denying
-/// only AF_UNIX.
+/// A filter recovers an ssh-agent pathname from readable `$HOME` and attempts
+/// the connection without inheriting `SSH_AUTH_SOCK`. The tracked hook beside
+/// it is selected in local config but must not run at all.
 #[tokio::test]
-async fn a_fetched_hook_that_self_sets_ssh_auth_sock_cannot_connect_but_tcp_survives() {
-    let _port = crate::test_ports::PortClaim::acquire();
-    let tcp_listener =
-        std::net::TcpListener::bind(("127.0.0.1", crate::test_ports::PortClaim::PORT))
-            .expect("bind the checkout policy's unprivileged TCP port");
-
+async fn a_checkout_filter_cannot_reach_an_agent_and_a_fetched_hook_does_not_run() {
     let clones = tempfile::tempdir().expect("clones root");
     let home = tempfile::tempdir().expect("synthetic HOME");
     let socket_dir = tempfile::tempdir().expect("agent socket directory");
-    let socket_path = socket_dir.path().join("agent.723");
+    let socket_path = socket_dir.path().join("agent.831");
     let _agent = std::os::unix::net::UnixListener::bind(&socket_path)
         .expect("bind the pathname AF_UNIX control listener");
 
@@ -51,55 +38,23 @@ async fn a_fetched_hook_that_self_sets_ssh_auth_sock_cannot_connect_but_tcp_surv
     super::network_exec::run_fixture_git(&source, ["config", "user.name", "git-vista-test"]);
     super::network_exec::run_fixture_git(&source, ["config", "user.email", "test@example.invalid"]);
 
+    std::fs::write(source.join(".gitattributes"), "payload filter=gv831\n")
+        .expect("write tracked filter selection");
+    std::fs::write(source.join("payload"), "attacker-chosen content\n")
+        .expect("write filtered payload");
     let hooks = source.join("hooks");
     std::fs::create_dir(&hooks).expect("create tracked hooks directory");
-    let probe = hooks.join("probe.py");
-    std::fs::write(
-        &probe,
-        format!(
-            r#"#!/usr/bin/python3
-import os
-import socket
-
-try:
-    tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    tcp.connect(("127.0.0.1", {port}))
-    tcp.sendall(b"checkout-tcp")
-    tcp_result = "connected"
-except OSError as error:
-    tcp_result = f"errno:{{error.errno}}"
-
-try:
-    unix = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    unix.connect(os.environ["SSH_AUTH_SOCK"])
-    unix_result = "connected"
-except OSError as error:
-    unix_result = f"errno:{{error.errno}}"
-
-print(f"tcp={{tcp_result}}|unix={{unix_result}}|sock={{os.environ['SSH_AUTH_SOCK']}}")
-"#,
-            port = crate::test_ports::PortClaim::PORT,
-        ),
-    )
-    .expect("write the hook's socket probe");
     let hook = hooks.join("post-checkout");
-    std::fs::write(
-        &hook,
-        "#!/bin/sh\n. \"$HOME/.keychain/fixture-sh\"\nexec /usr/bin/python3 hooks/probe.py > hook-observed\n",
-    )
-    .expect("write fetched post-checkout hook");
+    std::fs::write(&hook, "#!/bin/sh\nprintf RAN > hook-observed\n")
+        .expect("write fetched post-checkout hook");
     let mut permissions = std::fs::metadata(&hook)
         .expect("hook metadata")
         .permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&hook, permissions).expect("make hook executable");
-    std::fs::write(source.join("tracked"), "attacker-chosen content\n")
-        .expect("write tracked content");
     super::network_exec::run_fixture_git(&source, ["add", "."]);
     super::network_exec::run_fixture_git(&source, ["commit", "-qm", "fixture"]);
 
-    // Materialise no remote-controlled files yet: this mirrors clone's first
-    // phase closely enough that the hook itself arrives only at checkout.
     super::network_exec::run_fixture_git(
         clones.path(),
         [
@@ -112,25 +67,64 @@ print(f"tcp={{tcp_result}}|unix={{unix_result}}|sock={{os.environ['SSH_AUTH_SOCK
         ],
     );
     assert!(!dest.join("hooks/post-checkout").exists(), "premise");
-    super::network_exec::run_fixture_git(&dest, ["config", "core.hooksPath", "hooks"]);
 
-    let home_path: &Path = home.path();
+    let observed = dest.join("filter-observed");
+    let probe = home.path().join("filter.py");
+    std::fs::write(
+        &probe,
+        format!(
+            r#"#!/usr/bin/python3
+import os
+import socket
+import sys
+
+socket_path = None
+with open(os.path.join(os.environ["HOME"], ".keychain", "fixture-sh"), encoding="utf-8") as stream:
+    socket_path = stream.read().split(";", 1)[0].split("=", 1)[1]
+try:
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(socket_path)
+    result = "connected"
+except OSError as error:
+    result = f"errno:{{error.errno}}"
+with open("{}", "w", encoding="utf-8") as stream:
+    stream.write(result)
+sys.stdout.buffer.write(sys.stdin.buffer.read())
+"#,
+            observed.display()
+        ),
+    )
+    .expect("write filter socket probe");
+    let mut permissions = std::fs::metadata(&probe)
+        .expect("probe metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&probe, permissions).expect("make probe executable");
+
+    super::network_exec::run_fixture_git(&dest, ["config", "core.hooksPath", "hooks"]);
+    super::network_exec::run_fixture_git(
+        &dest,
+        [
+            std::ffi::OsString::from("config"),
+            std::ffi::OsString::from("filter.gv831.smudge"),
+            probe.as_os_str().to_owned(),
+        ],
+    );
+    super::network_exec::run_fixture_git(&dest, ["config", "filter.gv831.required", "true"]);
+
     let checkout = super::test_env::with_env(
         &[
-            ("HOME", Some(home_path.as_os_str())),
+            ("HOME", Some(home.path().as_os_str())),
             ("SSH_AUTH_SOCK", None),
         ],
         || {
-            assert!(
-                std::env::var_os("SSH_AUTH_SOCK").is_none(),
-                "premise: the hook must recover and set the variable itself"
-            );
+            assert!(std::env::var_os("SSH_AUTH_SOCK").is_none(), "premise");
             let policy = super::policy_for_clone_checkout(clones.path())
                 .expect("checkout policy must build");
-            super::network_exec::network_command_without_credential(
+            super::network_exec::lfs_checkout_command(
                 &policy,
                 &dest,
-                &["checkout", "-f"],
+                "https://example.invalid/repo.git",
             )
         },
     );
@@ -140,24 +134,13 @@ print(f"tcp={{tcp_result}}|unix={{unix_result}}|sock={{os.environ['SSH_AUTH_SOCK
         "checkout failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-
-    let observed =
-        std::fs::read_to_string(dest.join("hook-observed")).expect("the fetched hook must run");
     assert_eq!(
-        observed.trim(),
-        format!(
-            "tcp=connected|unix=errno:{}|sock={}",
-            libc::EPERM,
-            socket_path.display()
-        ),
-        "the hook must read the pathname from HOME and set SSH_AUTH_SOCK itself; \
-         the AF_UNIX connect must then fail with EPERM while TCP still connects"
+        std::fs::read_to_string(&observed).expect("the selected filter must run"),
+        format!("errno:{}", libc::EPERM),
+        "the filter must recover the agent path itself and still receive EPERM"
     );
-
-    let (mut accepted, _) = tcp_listener
-        .accept()
-        .expect("the hook's TCP connection must reach the listener");
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut accepted, &mut bytes).expect("read TCP marker");
-    assert_eq!(bytes, b"checkout-tcp");
+    assert!(
+        !dest.join("hook-observed").exists(),
+        "the fetched post-checkout hook must be blocked"
+    );
 }

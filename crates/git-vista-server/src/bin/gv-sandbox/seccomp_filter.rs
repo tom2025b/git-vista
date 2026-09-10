@@ -112,8 +112,8 @@ pub enum NetScope {
     /// `--net-allow`: the Network tier, the only one in which `git
     /// push`/`fetch`/`clone` can work (F3).
     Allowed,
-    /// `--net-allow --seccomp-checkout`: TCP remains available for HTTPS Git
-    /// LFS smudge filters, but AF_UNIX is denied because this is the clone
+    /// `--net-allow --seccomp-checkout`: TCP remains available for Git LFS
+    /// smudge filters on the policy's allowed port, but AF_UNIX is denied because this is the clone
     /// phase that executes remote-supplied hooks and filters (#723).
     Checkout,
 }
@@ -250,8 +250,8 @@ fn prctl_rule() -> Result<SeccompRule, seccompiler::BackendError> {
 /// socket. Issue #188 defers that carve-out deliberately, so denying AF_UNIX in
 /// the ordinary Network profile would break authenticated remotes. That profile
 /// therefore keeps exactly the filter it had before this rule existed. Clone
-/// checkout is the narrower exception: it keeps TCP because an HTTPS Git LFS
-/// smudge filter needs it, while denying AF_UNIX so a fetched hook cannot recover
+/// checkout is the narrower exception: it keeps TCP because a Git LFS smudge
+/// filter needs it, while denying AF_UNIX so a fetched hook cannot recover
 /// an agent pathname from `$HOME` and connect after setting `SSH_AUTH_SOCK`
 /// itself (#723).
 ///

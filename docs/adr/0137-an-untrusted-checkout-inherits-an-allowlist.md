@@ -5,7 +5,7 @@
 - **Issues:** #702, #704, #723 — locator removal and capability denial are separate halves
 - **Extends:** [ADR 0128](0128-a-credential-exists-only-before-untrusted-checkout.md) (the credential boundary this widens from three names to a built environment)
 - **Supersedes in part:** [ADR 0033](0033-ssh-remote-carveout.md) — its safety argument for granting the SSH agent socket and `known_hosts` to `policy_for_clone`. ADR 0033 stands unchanged for `policy_for`.
-- **Superseded in part by:** [ADR 0146](0146-clone-checkout-does-not-read-operator-git-config.md) — checkout no longer preserves operator-selected hooks, filters, or Git LFS configuration
+- **Superseded in part by:** [ADR 0146](0146-clone-checkout-does-not-read-operator-git-config.md) and [ADR 0148](0148-clone-checkout-uses-one-server-authored-lfs-filter.md) — checkout no longer preserves operator-selected hooks/filters; it now restores only a server-authored LFS driver and blocks hooks
 - **Related:** [ADR 0028](0028-network-tier-ports-not-hosts.md) (a port grant is not an egress policy — read before believing the port half buys more than it does), [ADR 0122](0122-the-token-is-a-credential-not-a-header.md), [ADR 0123](0123-the-safety-lives-in-the-shape-not-a-list.md)
 
 ## Context
@@ -567,13 +567,14 @@ is the repository-owned replay that keeps it true after that review is gone.
 | 437 | Route `network_command_without_credential` back through the ordinary Network launcher, removing checkout-profile selection | remove | **caught** by the composed hook test: TCP still connected, but pathname AF_UNIX also connected instead of returning `EPERM`. The seccomp rule-map test stayed green, showing the rule still existed but the phase no longer selected it. |
 | M12 (current mutation matrix) | Delete the complete `if net == NetScope::Checkout` block that inserts argument-scoped AF_UNIX rules for `SYS_socket` and `SYS_socketpair`; leave Strict and ordinary Network untouched | remove | **caught** by the exact composed hook test after the matrix compiled the mutated shim: the checkout succeeded and its TCP leg connected, but the hook's AF_UNIX result became `connected` instead of `errno:1`. Every declarative escape case stayed green, demonstrating that the mutant removed only the checkout-specific mechanism. The patch applies with zero fuzz to the source this row names. |
 
-- **`handlers::clone::clone_checkout_runs_the_hook_with_only_an_allowlisted_environment`**
-  is #680's canary widened. It builds a source repository with a tracked
-  executable `hooks/post-checkout`, performs the credentialed `--no-checkout`
-  transfer, confirms no content and no marker, selects the hook with
-  `core.hooksPath=hooks`, and runs the production credentialless checkout with a
+- **`handlers::clone::clone_checkout_runs_a_filter_with_only_an_allowlisted_environment`**
+  is #680's canary widened and updated for ADR 0148's hook block. It builds a
+  source repository with a tracked path carrying a generic filter attribute,
+  performs the credentialed `--no-checkout` transfer, confirms no content and
+  no marker, plants the filter in the destination as a same-user test control,
+  and runs the production credentialless checkout with a
   canary variable and a fake `SSH_AUTH_SOCK` genuinely present in the server
-  process. The hook reports seven fields: the three ADR 0128 names,
+  process. The filter reports seven fields: the three ADR 0128 names,
   `SSH_AUTH_SOCK`, the canary — all five `unset` — then `PATH` and `HOME`,
   which must be **present**. An empty environment would satisfy the first five
   legs while producing a checkout that cannot run, which is why the last two

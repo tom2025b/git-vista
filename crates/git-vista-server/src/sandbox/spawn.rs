@@ -162,8 +162,9 @@ const SCRUBBED_GIT_GEOMETRY_ENV: &[&str] = &[
 /// environment is only ever as complete as the last person to think about it.
 /// Everything else the operator happened to export — `AWS_SECRET_ACCESS_KEY`,
 /// `NPM_TOKEN`, a CI job's injected secret, `SSH_AUTH_SOCK` (#702) — reached
-/// attacker-selected `post-checkout` hooks and `.gitattributes`-selected
-/// filters untouched. Adding a fourth name rebuilds the same defect one
+/// checkout-time hooks and `.gitattributes`-selected filters untouched. #831
+/// now blocks clone hooks, but the allowlist remains necessary for the fixed
+/// LFS filter. Adding a fourth removed name rebuilds the same defect one
 /// variable later.
 ///
 /// So the child's environment is **built**, not filtered: start from nothing,
@@ -177,9 +178,9 @@ const SCRUBBED_GIT_GEOMETRY_ENV: &[&str] = &[
 ///
 /// * `PATH` — load-bearing twice over. `gv-sandbox` reaches git through
 ///   `Command::new("git").exec()`, which is a `PATH` lookup, so an empty
-///   `PATH` does not run a reduced checkout, it runs none at all. Hooks and
-///   filters are `#!/bin/sh` scripts that then need it themselves.
-/// * `HOME` — checkout-time hooks and filter programs can use it for ordinary
+///   `PATH` does not run a reduced checkout, it runs none at all. Filter
+///   programs may need it for their own children.
+/// * `HOME` — checkout-time filter programs can use it for ordinary
 ///   operator-owned resources. It is a path, not a secret, and the paths
 ///   underneath it that *are* secrets (`~/.ssh`, `~/.config/gh`, …) stay
 ///   withheld by `secret_excludes` regardless of what this variable says.
@@ -203,8 +204,8 @@ const SCRUBBED_GIT_GEOMETRY_ENV: &[&str] = &[
 ///   `GIT_CONFIG_GLOBAL=/dev/null`: system and operator-global configuration
 ///   are unavailable, while the repository-local config Git created during
 ///   `clone --no-checkout` remains readable. This deliberately gives up
-///   operator-level hooks and filters, including automatic LFS smudging when
-///   its filter exists only in those scopes.
+///   operator-level hooks and filters. #831 restores LFS through fixed
+///   command-line configuration rather than either hidden scope.
 /// * `TMPDIR`, `TERM`, `TZ` — nothing in `git checkout -f` needs them, and
 ///   `/tmp` is not a grant this policy gives out in any case.
 /// * The [`SCRUBBED_GIT_GEOMETRY_ENV`] family — already removed for every
@@ -328,8 +329,8 @@ pub(crate) struct SandboxedCommand {
 /// `core.hooksPath` or filter configuration can let fetched content select a
 /// descendant during clone's implicit checkout. Clone now uses this method
 /// only for a `--no-checkout` transfer and lets that process exit before a
-/// separately spawned, credentialless checkout runs hooks and filters (ADR
-/// 0128). This method also removes the two ambient token-source variables so
+/// separately spawned, credentialless checkout runs filters (ADR 0128; #831
+/// now blocks its hooks). This method also removes the two ambient token-source variables so
 /// an env-backed credential has only this internal name in the child.
 ///
 /// **Read this before reusing `network_command_with_credential` on
@@ -545,8 +546,8 @@ pub(crate) fn command_async(policy: &Policy, repo: &Path, args: &[&str]) -> Sand
 }
 
 /// The only spawn seam for [`CheckoutPolicy`]. Its distinct argument type is
-/// what makes `--seccomp-checkout` mandatory for the phase that runs fetched
-/// hooks and filters.
+/// what makes `--seccomp-checkout` mandatory for the phase that materialises
+/// fetched content and runs the fixed LFS filter.
 pub(crate) fn checkout_command_async(
     policy: &CheckoutPolicy,
     repo: &Path,
@@ -833,8 +834,8 @@ mod tests {
         // `env_clear()` itself has no accessor on `Command`, so this test
         // deliberately stops short of claiming it. The half it cannot see is
         // proved by a real spawn instead:
-        // `handlers::clone`'s `clone_checkout_runs_the_hook_with_only_an_allowlisted_environment`
-        // reads the child's whole environment back out of a running hook.
+        // `handlers::clone`'s `clone_checkout_runs_a_filter_with_only_an_allowlisted_environment`
+        // reads the child's whole environment back out of a running filter.
         assert!(
             command
                 .command

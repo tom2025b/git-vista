@@ -598,43 +598,39 @@ fn commit_inside(policy: &Policy, repo: &Path) -> HookRun {
 /// keeping the nine already-green cases on the entry point they have always used
 /// means retiring the Strict exemptions changed nothing about them.
 ///
-/// # The one exemption left
+/// # Blocked hooks now use production
 ///
-/// `hook_mode_suite`'s `blocked_hooks` is still built here, in the harness,
-/// because **no production policy constructor yields `HookMode::Blocked`** —
-/// `policy_for`, `policy_for_clone` and `probe::boot_probe_policy` all spell
-/// `HookMode::Run`, and ADR 0029 rejects the degrade-and-block posture by name.
-/// That is the blocker `r8_exemptions_expire_when_their_named_blocker_disappears`
-/// checks, over production source, and it is the condition that has to disappear
-/// before this last exemption can be retired.
-///
-/// This function contains a `Policy { .. }` literal on purpose — R6's ban on
-/// that literal scopes to `escape_suite.rs`/`hook_mode_suite.rs`, not to the
-/// harness that serves them, because the point of R6 is that the *battery*
-/// cannot fabricate its own policy; the harness fabricating one for a shape
-/// production cannot express, in one reviewed place, is exactly R8's expiring
-/// exemption.
+/// `hook_mode_suite`'s `blocked_hooks` routes through
+/// `policy_for_clone_checkout`: #831 made that the first production policy
+/// which blocks hooks. Every other case retains the ordinary production
+/// dispatch below. No harness-built `Policy` remains.
 fn policy_for_case(case: &EscapeCase, repo: &Path) -> Policy {
     if case.exemption == Exemption::None {
-        let policy = match case.tier {
-            Tier::Network => policy_for_repo(repo)
-                .expect("policy_for_repo must build for a case with no R8 exemption"),
-            Tier::Strict => policy_for(repo, false, NetworkNeed::Local).unwrap_or_else(|e| {
-                panic!(
-                    "{}: production policy_for(.., NetworkNeed::Local) refused to build \
+        let policy = if case.hooks_blocked {
+            policy_for_clone_checkout(repo)
+                .expect("the production clone-checkout policy must build")
+                .0
+        } else {
+            match case.tier {
+                Tier::Network => policy_for_repo(repo)
+                    .expect("policy_for_repo must build for a case with no R8 exemption"),
+                Tier::Strict => policy_for(repo, false, NetworkNeed::Local).unwrap_or_else(|e| {
+                    panic!(
+                        "{}: production policy_for(.., NetworkNeed::Local) refused to build \
                      the Strict tier on this host ({e:?}). The CI preflight asserts \
                      bwrap, unprivileged user namespaces and the Landlock floor before \
                      any case runs, so this is a real refusal (INV-13 / ADR 0029), never \
                      a reason to fall back to a harness-built policy.",
-                    case.id
-                )
-            }),
-            Tier::Unsandboxed => panic!(
-                "{}: no battery case may declare Tier::Unsandboxed — it installs no \
+                        case.id
+                    )
+                }),
+                Tier::Unsandboxed => panic!(
+                    "{}: no battery case may declare Tier::Unsandboxed — it installs no \
                  ruleset at all, so a containment claim written against it is vacuous \
                  by construction",
-                case.id
-            ),
+                    case.id
+                ),
+            }
         };
         assert_eq!(
             policy.tier, case.tier,
@@ -645,58 +641,11 @@ fn policy_for_case(case: &EscapeCase, repo: &Path) -> Policy {
         );
         return policy;
     }
-    let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
-    let (mut rw, mut ro) = default_system_trees(case.tier);
-    rw.push(repo.to_path_buf());
-    ro.push(home.clone());
-    let bwrap = if case.tier == Tier::Strict {
-        bwrap::bwrap_path().map(Path::to_path_buf)
-    } else {
-        None
-    };
-    let shim = shim::shim_path()
-        .expect("gv-sandbox must be built; tests/forces_shim_build.rs ensures it")
-        .to_path_buf();
-    Policy {
-        tier: case.tier,
-        shim,
-        bwrap,
-        rw_trees: rw,
-        ro_trees: ro,
-        secret_excludes: secret_excludes_for_home(&home),
-        // #188 is Network-tier only. The one case still built through this
-        // harness branch (`hook_mode_suite`'s `blocked_hooks`) is
-        // `Tier::Strict` — see this function's own doc comment — so there is
-        // nothing to carve out for any configuration this branch builds
-        // today; written as a real per-tier match rather than a bare
-        // `Vec::new()` so a future Network-tier exemption does not silently
-        // inherit an empty carve-out set the way a `..` default would.
-        ro_carveouts: match case.tier {
-            Tier::Network => ssh_known_hosts_carveout(&home),
-            Tier::Strict | Tier::Unsandboxed => Vec::new(),
-        },
-        net_ports: if case.tier == Tier::Network {
-            DEFAULT_GIT_PORTS.to_vec()
-        } else {
-            Vec::new()
-        },
-        hook_mode: if case.hooks_blocked {
-            HookMode::Blocked {
-                empty_dir: leaked_empty_dir(),
-            }
-        } else {
-            HookMode::Run
-        },
-    }
-}
-
-/// A tempdir whose handle is intentionally leaked: `HookMode::Blocked` needs
-/// a path that outlives the policy, and the process is short-lived per test.
-fn leaked_empty_dir() -> PathBuf {
-    let d = tempfile::tempdir().expect("empty dir");
-    let p = d.path().to_path_buf();
-    std::mem::forget(d);
-    p
+    panic!(
+        "{}: no battery exemption has a production-unreachable policy now; \
+         add a checked blocker before adding an exempt case",
+        case.id
+    )
 }
 
 /// Append one line to `$GV_ESCAPE_REPORT` (R5). Silently does nothing if the
@@ -1708,7 +1657,7 @@ fn r7_both_legs_share_one_pinned_environment_profile() {
 /// `hook_mode_suite.rs`'s `blocker:` string byte for byte — that equality is
 /// half of R8, and it is what makes a *reworded* blocker fail the build instead
 /// of quietly re-labelling an exemption whose reason has changed.
-const CHECKED_BLOCKERS: &[&str] = &["no production policy constructor yields HookMode::Blocked"];
+const CHECKED_BLOCKERS: &[&str] = &[];
 
 /// The index of the `}` that closes the `{` at byte `open`, on source that has
 /// already been through [`crate::argv_boundary::code_only`] (so braces inside
@@ -1841,16 +1790,13 @@ fn production_policy_literals(prod: &str) -> Vec<&str> {
 ///     carrying a blocker nobody checks fails here — the old hard-coded pair
 ///     silently permitted exactly that — and a blocker this test still checks
 ///     after the last case naming it is gone fails here too.
-///  2. **No production policy constructor yields `HookMode::Blocked`.** Every
-///     production module under `src/sandbox` is walked (the test-only ones are
-///     *derived* from `mod.rs`'s own `#[cfg(test)] mod …;` declarations, so a new
-///     production module is scanned without anyone remembering to add it), each
-///     file's pre-`mod tests` region is taken, and every `Policy { … }` literal
-///     in it must spell the field `hook_mode: HookMode::Run` — a *literal*, so a
-///     `hook_mode: hook_mode_for(x)` helper fails it too — with nothing anywhere
-///     assigning `HookMode::Blocked`. Give any constructor a route to `Blocked`
-///     and this goes red, which is precisely when `hook_mode_suite`'s exemption
-///     must be retired.
+///  2. **Exactly one production policy blocks hooks.** Every production module
+///     under `src/sandbox` is walked (the test-only set is derived from
+///     `mod.rs`), and every `Policy { … }` literal must spell a literal hook
+///     mode. `policy_for_clone_checkout` must be the sole `Blocked` site and
+///     must name `/dev/null`; every ordinary constructor remains `Run`. This
+///     keeps #831's phase-specific reduction from becoming ADR 0029's rejected
+///     general degrade-and-block fallback.
 ///
 /// Finding the literals is [`production_policy_literals`], which is token-exact
 /// on the left (so a `-> HookPolicy {` signature is not mistaken for a `Policy`
@@ -1888,8 +1834,8 @@ fn r8_exemptions_expire_when_their_named_blocker_disappears() {
         checked.difference(&declared).collect::<Vec<_>>(),
     );
 
-    // (2) `no production policy constructor yields HookMode::Blocked`, checked
-    // over production source. The test-only module list is read out of
+    // (2) The one production `HookMode::Blocked` site, checked over production
+    // source. The test-only module list is read out of
     // `mod.rs`'s own declarations rather than restated here, so this cannot
     // drift from the module list the crate actually compiles.
     let mod_code = crate::argv_boundary::code_only(&read_rs("src/sandbox/mod.rs"));
@@ -1923,7 +1869,8 @@ fn r8_exemptions_expire_when_their_named_blocker_disappears() {
     let mut files = Vec::new();
     crate::argv_boundary::rs_files(&server_root().join("src/sandbox"), &mut files);
     files.sort();
-    let mut sites = 0usize;
+    let mut run_sites = 0usize;
+    let mut blocked_sites = 0usize;
     for path in &files {
         let stem = path
             .file_stem()
@@ -1933,10 +1880,10 @@ fn r8_exemptions_expire_when_their_named_blocker_disappears() {
         if test_only.contains(&stem) {
             continue;
         }
-        let code = crate::argv_boundary::code_only(
-            &std::fs::read_to_string(path)
-                .unwrap_or_else(|e| panic!("{}: must be readable: {e}", path.display())),
-        );
+        let raw = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("{}: must be readable: {e}", path.display()));
+        let uncommented = comments_only_blanked(&raw);
+        let code = crate::argv_boundary::code_only(&raw);
         // Everything before the file's inline `#[cfg(test)] mod tests` block —
         // a production file's own unit tests may build whatever policy they
         // like, and often must.
@@ -1944,12 +1891,6 @@ fn r8_exemptions_expire_when_their_named_blocker_disappears() {
             Some(at) => &code[..at],
             None => code.as_str(),
         };
-        assert!(
-            !prod.contains("= HookMode::Blocked"),
-            "R8: {stem}.rs assigns HookMode::Blocked in production code — the \
-             blocked-hooks exemption in hook_mode_suite.rs must be retired, not left \
-             standing"
-        );
         let field = ["hook_mode", ":"].concat();
         for body in production_policy_literals(prod) {
             let f = body.find(&field).unwrap_or_else(|| {
@@ -1963,21 +1904,35 @@ fn r8_exemptions_expire_when_their_named_blocker_disappears() {
                 )
             });
             let value = body[f + field.len()..].trim_start();
-            assert!(
-                value.starts_with("HookMode::Run"),
-                "R8: a production `Policy` literal in {stem}.rs sets hook_mode to \
-                 something other than the literal `HookMode::Run` — production can now \
-                 express a policy that blocks hooks, so the blocked-hooks exemption in \
-                 hook_mode_suite.rs must be retired, not left standing"
-            );
-            sites += 1;
+            if value.starts_with("HookMode::Run") {
+                run_sites += 1;
+            } else if value.starts_with("HookMode::Blocked") {
+                blocked_sites += 1;
+                assert_eq!(
+                    stem, "mod",
+                    "R8: only policy_for_clone_checkout in sandbox/mod.rs may block hooks"
+                );
+                assert!(
+                    uncommented.contains("empty_dir: PathBuf::from(\"/dev/null\")"),
+                    "R8: clone checkout must use immutable /dev/null, not a writable \
+                     directory whose emptiness an attacker could change"
+                );
+            } else {
+                panic!(
+                    "R8: a production `Policy` literal in {stem}.rs computes or inherits \
+                     its hook mode instead of spelling Run or Blocked literally"
+                );
+            }
         }
     }
     assert!(
-        sites >= 3,
-        "R8: found only {sites} production `Policy` construction sites under \
-         src/sandbox — policy_for, policy_for_clone and probe::boot_probe_policy are \
-         the three that must be there, so the scan broke rather than the code shrinking"
+        run_sites >= 3,
+        "R8: found only {run_sites} ordinary HookMode::Run policy sites; policy_for, \
+         policy_for_clone and probe::boot_probe_policy must remain"
+    );
+    assert_eq!(
+        blocked_sites, 1,
+        "R8: exactly clone checkout must block hooks, found {blocked_sites} sites"
     );
 }
 
