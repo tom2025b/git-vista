@@ -65,7 +65,14 @@ fn repo_with_a_sibling_on(
 }
 
 async fn pipeline(repo: &Path, op: GitOperation) -> (StatusCode, String) {
-    plan_and_execute_in(repo, None, tokens(), op, crate::planner::DropProof::Nothing).await
+    plan_and_execute_in(
+        repo,
+        fixture_repo_key(repo),
+        tokens(),
+        op,
+        crate::planner::DropProof::Nothing,
+    )
+    .await
 }
 
 fn checkout(branch_name: &str) -> GitOperation {

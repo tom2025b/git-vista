@@ -148,7 +148,14 @@ fn lease(oid: &str) -> ForcePublish {
 /// Drive the real pipeline (`build_plan → validate → enforce_fresh → execute`)
 /// against `repo`, exactly as `plan_and_execute` would for a live request.
 async fn pipeline(repo: &Path, op: GitOperation) -> (StatusCode, String) {
-    super::plan_and_execute_in(repo, None, tokens(), op, crate::planner::DropProof::Nothing).await
+    super::plan_and_execute_in(
+        repo,
+        super::fixture_repo_key(repo),
+        tokens(),
+        op,
+        crate::planner::DropProof::Nothing,
+    )
+    .await
 }
 
 /// Admit one push operation into the registry and return what the caller needs

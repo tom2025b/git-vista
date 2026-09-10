@@ -590,6 +590,25 @@ pub(crate) async fn plan_and_execute_in(
     .await
 }
 
+/// The coordinator key for a repository-backed test fixture, derived through
+/// the same repository classification path the production catalog uses.
+///
+/// The injectable planner seams accept `None` for production's degraded mode,
+/// where the repository has no catalog identity and all such writes must share
+/// the fail-closed fallback guard. These suites create real, independent git
+/// repositories, so treating them as unidentified would serialize unrelated
+/// tests on that process-global fallback instead of exercising production's
+/// normal per-repository coordination.
+#[cfg(test)]
+fn fixture_repo_key(repo: &Path) -> Option<RepositoryId> {
+    Some(
+        git_vista_git::read_repo_facts(repo)
+            .expect("a planner fixture classifies as a repository")
+            .handle
+            .repository,
+    )
+}
+
 async fn plan_and_execute_within(
     repo: &Path,
     repo_id: Option<RepositoryId>,
