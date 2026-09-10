@@ -4,6 +4,16 @@
 - **Date:** 2026-09-08
 - **Issue:** #755, #779; LFS checkout/filter follow-up #782
 - **Extends:** [ADR 0036](0036-network-tier-exec-harness-askpass-and-redaction.md)
+- **Extended by:** [ADR 0145](0145-four-path-shaped-selectors-depend-on-upstream-git.md)
+  (#817) — the #779 amendment below is accurate that the sealed
+  `GIT_ALLOW_PROTOCOL` beats repository config, but it groups five path-shaped
+  selectors together as though one mechanism refuses them all. Mutation testing
+  shows otherwise: among those five, the allowlist is what blocks
+  `remote.<name>.vcs`; path-shaped `url`, `insteadOf`, `pushurl` and
+  `pushInsteadOf` are rejected first by upstream Git's own `<scheme>::` parser,
+  and the two mutations that fail the `vcs` test leave those four passing.
+  **Nothing in this ADR is retracted** — read 0145 before relying on any
+  paragraph here for per-route coverage.
 - **Related:** [ADR 0122](0122-the-token-is-a-credential-not-a-header.md), [ADR 0128](0128-a-credential-exists-only-before-untrusted-checkout.md), [ADR 0137](0137-an-untrusted-checkout-inherits-an-allowlist.md)
 
 ## #779 amendment — fixed transport policy (2026-09-09)
@@ -20,14 +30,6 @@ Git [documents the protocol allowlist](https://git-scm.com/docs/git#Documentatio
 as overriding existing protocol configuration. Unlike `-c protocol.allow=never`,
 it beats a repository's specific `protocol.<name>.allow=always`, including
 selection through `remote.<name>.vcs`, custom URLs, push URLs and URL rewrites.
-
-**Narrowed by [ADR 0145](0145-four-path-shaped-selectors-depend-on-upstream-git.md)
-(#817).** That sentence is broader than what is actually proven. Mutation
-testing shows `GIT_ALLOW_PROTOCOL` is what blocks the `remote.<name>.vcs` route
-only; for path-shaped `url`, `insteadOf`, `pushurl` and `pushInsteadOf`, upstream
-Git's own `<scheme>::` parser rejects the value first, and the same two mutations
-that fail the `vcs` test leave those four passing. Read 0145 before relying on
-this paragraph for per-route coverage.
 Git also [documents the proxy environment override](https://git-scm.com/docs/git-config#Documentation/git-config.txt-coregitProxy).
 An empty `GIT_PROXY_COMMAND` bypasses all `core.gitProxy` entries: the marker
 experiment verifies that Git attempts a direct connection instead of executing
@@ -62,7 +64,9 @@ protocol default. Hardened runs require an absent marker and either direct
 connection failure (proxy) or Git's protocol denial (custom helper), through
 ordinary output, streamed spawn, credentialed and tokenless wrappers, and the
 checkout wrapper. Proxy tests cover config-only and hostile inherited values;
-helper cases include a non-origin named remote's `vcs`, URL, `insteadOf`,
+helper cases (see the 0145 narrowing above: only the `vcs` case fails by
+allowlist denial; the other four are refused earlier by Git's own scheme parser)
+include a non-origin named remote's `vcs`, URL, `insteadOf`,
 `pushurl`, and `pushInsteadOf`. Existing real native-Git and SSH transfer suites
 verify that supported transports still work.
 

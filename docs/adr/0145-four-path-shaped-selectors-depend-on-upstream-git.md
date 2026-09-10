@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-09-10
 - **Issue:** #817
-- **Clarifies:** [ADR 0144](0144-network-spawns-use-server-authored-transport-programs.md)
+- **Extends:** [ADR 0144](0144-network-spawns-use-server-authored-transport-programs.md) — narrows its #779 amendment's per-route claim. Nothing in 0144 is retracted.
 
 ## Context
 
