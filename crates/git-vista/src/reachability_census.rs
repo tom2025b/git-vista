@@ -685,29 +685,15 @@ fn to_rel_path(root: &Path, path: &Path) -> String {
 /// function has since GAINED a real caller, or been deleted, must be removed
 /// from here, not left stale.
 const EXEMPT: &[(&str, &str)] = &[
-    // gestures.rs:250's own doc comment: Enter/Space handling reads the DOM
-    // event's own target rather than asking GraphFocus which row is
-    // focused, making both `GraphFocus::focused_row` AND `::activate`
-    // redundant by design. Neither is listed here, for two DIFFERENT
-    // reasons this census's own rules produce, worth recording so a future
-    // reader doesn't "fix" either by re-adding it:
-    //   - `focused_row` has a real call site: `activate`'s own body
-    //     (focus.rs:188). `activate` itself has none — but this census only
-    //     walks one hop (module doc limitation #1), so `focused_row` reads
-    //     as reachable even though its only caller is itself unreached.
-    //   - `activate` reads as reachable too, but for a WRONG reason: a
-    //     completely unrelated local closure in gestures.rs (captured
-    //     earlier in that function, nothing to do with `GraphFocus`) is
-    //     also named `activate` and is called at gestures.rs:313 with a
-    //     matching call shape (`activate(x, y)` vs. `GraphFocus::activate`'s
-    //     own `(&self)` — different signatures, same text). A genuine name
-    //     collision this text census cannot see past (module doc
-    //     limitation #6's sibling case: collision, not by-value passing).
-    //     `GraphFocus::activate` is, by the same reasoning that made
-    //     `focused_row` redundant, still real dead code — this census just
-    //     cannot currently prove it, so it is not listed as exempt either
-    //     (exempting it would be arguing a false reason: "no reference
-    //     found" is not this case).
+    // #785: `GraphFocus::focused_row` and `::activate` (features/a11y/focus.rs)
+    // used to sit here as a documented EXEMPT-avoidance case — both were
+    // genuinely dead in production (gestures.rs:250's own doc: Enter/Space
+    // handling reads the DOM event's own target instead) but couldn't be
+    // exempted, one because this census only walks one hop, the other
+    // because of a name collision with an unrelated `gestures.rs` closure.
+    // #785 gated both `#[cfg(test)]` instead — they no longer declare in
+    // production at all, so there is nothing left for this table to argue
+    // about. The exemption has nothing to exempt.
     // #357 wired all three of these into `staging_view.rs` (a per-line
     // checkbox for `toggle_line`/`is_line_selected`, Shift+Activate on a
     // hunk header for `select_all_in_hunk`) — the exemption this census
@@ -839,44 +825,26 @@ const EXEMPT: &[(&str, &str)] = &[
     // reasoning of a sibling already exempted in the same struct/module —
     // see the filed tracking issue for the full group and reasoning. ────────
     //
-    // dialogs/commit.rs:145's `PlainCommit::intent` is NOT listed here,
-    // deliberately, same reasoning as the `GraphFocus::focused_row`/
-    // `activate` pair documented above: `AmendTarget::intent` (commit.rs:172)
-    // is a genuinely different method that IS called in production, and this
-    // census matches call sites by name only, not by receiver type. Adding
-    // `("...", "intent")` here would make `the_exempt_table_does_not_rot`
-    // immediately panic as a false STALE ENTRY, because it would see
-    // `AmendTarget::intent`'s real call and conclude the exemption no longer
-    // applies — a name collision this text census cannot see past, not
-    // evidence `PlainCommit::intent` is actually reachable. Confirmed by
-    // running the test: it panicked exactly this way when this entry was
-    // first tried. `PlainCommit::intent` remains genuinely test-only
-    // (production reaches `PlainCommit` only through `into_intent`, by
-    // value) but is tracked outside this table; see the round2-census
-    // tracking issue for group 7.
+    // dialogs/commit.rs:145's `PlainCommit::intent` used to sit here as a
+    // documented EXEMPT-avoidance case (collision with `AmendTarget::intent`,
+    // a genuinely different, genuinely-called method this census cannot tell
+    // apart by name alone). #787 gated it `#[cfg(test)]` instead of arguing
+    // around the collision — production only ever reached `PlainCommit`
+    // through `into_intent`, by value, so nothing was lost.
     //
-    // graph/core.rs:69's `GraphCore::generation` is NOT listed here, for the
-    // same collision reason as `PlainCommit::intent` above: `generation(` is
-    // also `GenerationInputs::generation()`'s real name, called from live
-    // production code in git-vista-server (`conflicts.rs`, `handlers/
-    // read.rs`, `planner.rs`) — an entirely different type this text census
-    // cannot distinguish by name alone. Adding an entry here panics
-    // `the_exempt_table_does_not_rot` as a false STALE ENTRY (confirmed by
-    // running the test). `GraphCore::generation` genuinely has no production
-    // reader on its own type — the core uses its private field internally —
-    // but is tracked outside this table; see the round2-census tracking
-    // issue for group 11.
+    // graph/core.rs:69's `GraphCore::generation` used to sit here for the
+    // same reason (collision with `GenerationInputs::generation()`, called
+    // from live production code in git-vista-server). Unlike its siblings in
+    // this group, it had no caller anywhere — not even its own test suite
+    // (`graph_core_suite.rs` compares `GraphCore` by field, never by this
+    // getter). #791 deleted it outright rather than gating dead code that
+    // nothing exercises.
     //
-    // shell/mod.rs:116's `SheetDrag::pointer_id` is NOT listed here, for the
-    // same collision reason as the two entries above it: `pointer_id(` also
-    // matches real production calls into DOM Pointer Event Web APIs of the
-    // same name, which this text census cannot distinguish from a call to
-    // `SheetDrag`'s own method. Adding an entry here panics
-    // `the_exempt_table_does_not_rot` as a false STALE ENTRY (confirmed by
-    // running the test). Production supplies pointer IDs to `sample`,
-    // `take_matching`, and `cancel_matching`; only this type's own tests
-    // query the stored ID back out — genuinely test-only, but tracked
-    // outside this table; see the round2-census tracking issue for group 12.
+    // shell/mod.rs:116's `SheetDrag::pointer_id` used to sit here for the
+    // same collision reason (DOM Pointer Event Web APIs share the name).
+    // #792 gated it `#[cfg(test)]` — production supplies pointer IDs to
+    // `sample`, `take_matching`, and `cancel_matching`; only tests queried
+    // the stored ID back out.
     //
     // shell/sheet.rs's own module doc (see `taller`/`shorter`/`height_px`/
     // `flick_threshold`/`expand`/`collapse` above): the sheet model is
@@ -890,6 +858,18 @@ const EXEMPT: &[(&str, &str)] = &[
     // outside this table in the round2-census tracking issue for group 14.
     // `SheetGeometry::new` is the same shape but is never extracted at all —
     // it is on GENERIC_NAME_SKIPLIST — so it needs no exemption at all.
+    //
+    // #794 considered gating both `#[cfg(test)]` (the fix applied to
+    // #787/#792 above; #791's sibling item had no caller anywhere and was
+    // deleted outright instead) and deliberately did NOT: unlike those
+    // three, this pair is forward-looking pre-wiring, the same posture as the six
+    // already-exempted `sheet.rs` siblings above (`taller`/`shorter`/
+    // `height_px`/`flick_threshold`/`expand`/`collapse`) — none of which are
+    // `#[cfg(test)]`-gated either, because the whole point is that they stay
+    // callable from production once the sheet is wired to the screen.
+    // Gating `SheetGeometry::new`/`SheetState::mode` now would remove that
+    // option for no benefit today. Left unchanged; still tracked outside
+    // this table in the round2-census issue for group 14.
 ];
 
 /// The floor the discovered-declaration count must clear before any

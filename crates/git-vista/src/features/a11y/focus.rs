@@ -125,6 +125,13 @@ impl GraphFocus {
 
     /// The row currently holding real keyboard focus, or `None` when focus is
     /// elsewhere — before the first `Tab` into the graph, or after `Escape`.
+    ///
+    /// #785: no production caller — `on_node_keydown` (`gestures.rs`) reads
+    /// the DOM event's own target instead of asking `GraphFocus` which row is
+    /// focused (see that function's doc). Kept `#[cfg(test)]` because the
+    /// test suite below still uses it as the primary way to observe
+    /// `engaged`, which has no other public accessor.
+    #[cfg(test)]
     pub fn focused_row(&self) -> Option<usize> {
         self.engaged.then_some(self.active)
     }
@@ -188,6 +195,12 @@ impl GraphFocus {
     /// would mean the event fired on an element that isn't actually focused,
     /// which should not happen given the wiring in `render::nodes::build_node`,
     /// but the model does not assume its caller got that right.
+    ///
+    /// #785: no production caller — the same collision this census's own
+    /// `EXEMPT` doc used to record no longer applies once this is
+    /// `#[cfg(test)]`: an unrelated `activate` closure in `gestures.rs` shares
+    /// the name, which is what made this read as reachable before.
+    #[cfg(test)]
     pub fn activate(&self) -> Option<usize> {
         self.focused_row()
     }
