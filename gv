@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # gv — build the Git-Vista frontend and start the server for a Git repository.
 #
-# Git-Vista serves only IPv4 loopback. An iPad reaches that listener through an
-# SSH local-port forward; direct LAN serving is deliberately unsupported because
-# it would expose a plain-HTTP Git control surface beyond this machine.
+# Git-Vista's control interface serves only IPv4 loopback. An iPad reaches that
+# listener through an SSH local-port forward; the optional LAN listener is a
+# separate, read-only profile because plain HTTP must never expose Git writes.
 #
 #   gv                  visualise the current directory's repository
 #   gv ~/code/myproj    visualise another repository
@@ -24,13 +24,22 @@
 #                       guest/shared network.
 #   gv --lan-ip <addr>  the explicit LAN IP for --lan-view, when auto-detect
 #                       can't pick a single candidate.
-#
 # A setup token lives only in a URL fragment (`#s=...`), is single-use, and is
 # exchanged for an HttpOnly session cookie. Run `gv --token` again for each new
 # browser/device. Never paste the token as a password or reuse one link twice.
 set -euo pipefail
 
+# The server's listener port is runtime-configurable for isolated harnesses,
+# but this launcher still owns one default instance and one unscoped set of
+# runtime/auth files. Do not let an ambient override turn that partial contract
+# into a second instance that stop_repo_servers could mistake for the first.
+# `dev testbed` rewrites this pinned value inside its isolated worktree.
 PORT=8080
+if [[ -n ${GIT_VISTA_PORT+x} && $GIT_VISTA_PORT != "$PORT" ]]; then
+  echo "gv: GIT_VISTA_PORT is not supported by this launcher yet; see issue #130" >&2
+  exit 2
+fi
+export GIT_VISTA_PORT="$PORT"
 START_DIR="$PWD"
 REPO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 SERVER_BIN="$REPO/target/debug/git-vista-server"
