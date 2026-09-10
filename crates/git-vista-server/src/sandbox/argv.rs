@@ -545,12 +545,12 @@ fn only_the_clone_checkout_phase_gives_up_the_188_grants() {
         );
         assert!(
             checkout_policy.net_ports.contains(&443),
-            "paired positive: HTTPS must survive for the fixed git-lfs filter"
+            "paired positive: TCP 443 must survive for the fixed git-lfs filter"
         );
         assert_eq!(
             checkout_policy.net_ports,
             vec![443],
-            "#831: no checkout network service except HTTPS has a consumer"
+            "#831: no checkout TCP port except 443 has a consumer"
         );
         assert!(
             checkout_policy

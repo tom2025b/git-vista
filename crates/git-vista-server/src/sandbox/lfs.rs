@@ -69,8 +69,11 @@ fn endpoint(clone_url: &str) -> String {
 /// an explicit `lfs.standalonetransferagent` still executes. Both the generic
 /// and exact-URL standalone selectors are therefore reset, and the exact URL's
 /// basic-only value is pinned as well so URL-match specificity cannot outrank
-/// the generic setting. Pinning `lfs.url` prevents a fetched `.lfsconfig` from
-/// switching an HTTPS checkout to SSH and thereby selecting `ssh` or
+/// the generic setting. `skipdownloaderrors`, `fetchinclude`, and
+/// `fetchexclude` are also pinned: Git LFS otherwise accepts each from a
+/// tracked `.lfsconfig`, can deliberately leave pointer text for a selected
+/// path, and still report filter success. Pinning `lfs.url` prevents a fetched
+/// `.lfsconfig` from switching checkout to SSH and thereby selecting `ssh` or
 /// `git-lfs-authenticate` as another executable path.
 fn checkout_config_for_program(clone_url: &str, program: &str) -> Vec<String> {
     let endpoint = endpoint(clone_url);
@@ -81,6 +84,12 @@ fn checkout_config_for_program(clone_url: &str, program: &str) -> Vec<String> {
         format!("filter.lfs.smudge={program} smudge"),
         "-c".into(),
         "filter.lfs.required=true".into(),
+        "-c".into(),
+        "lfs.skipdownloaderrors=false".into(),
+        "-c".into(),
+        "lfs.fetchinclude=".into(),
+        "-c".into(),
+        "lfs.fetchexclude=".into(),
         "-c".into(),
         "lfs.basictransfersonly=true".into(),
         "-c".into(),
@@ -205,6 +214,9 @@ mod tests {
             "a remote-controlled pathname is unnecessary in the server-authored command"
         );
         assert!(joined.contains("filter.lfs.required=true"));
+        assert!(joined.contains("lfs.skipdownloaderrors=false"));
+        assert!(joined.contains("lfs.fetchinclude="));
+        assert!(joined.contains("lfs.fetchexclude="));
         assert!(joined.contains("lfs.basictransfersonly=true"));
         assert!(joined.contains("lfs.standalonetransferagent="));
         assert!(joined
@@ -362,6 +374,78 @@ mod tests {
             std::fs::read_to_string(dest.join("plain")).expect("plain file materialised"),
             "ordinary tracked content\n"
         );
+    }
+
+    async fn assert_tracked_lfsconfig_cannot_skip_missing_object(
+        clone_name: &str,
+        lfsconfig: &str,
+    ) {
+        assert_ne!(
+            program(),
+            GIT_LFS_UNAVAILABLE,
+            "this integration test requires one reviewed git-lfs installation"
+        );
+        let (clones, source) = lfs_fixture();
+        std::fs::write(source.join(".lfsconfig"), lfsconfig)
+            .expect("write tracked LFS configuration");
+        super::super::network_exec::run_fixture_git(&source, ["add", ".lfsconfig"]);
+        super::super::network_exec::run_fixture_git(
+            &source,
+            ["commit", "-qm", "hostile LFS configuration"],
+        );
+
+        let dest = clones.path().join(clone_name);
+        super::super::network_exec::run_fixture_git(
+            clones.path(),
+            [
+                std::ffi::OsString::from("clone"),
+                std::ffi::OsString::from("-q"),
+                std::ffi::OsString::from("--no-checkout"),
+                std::ffi::OsString::from("--"),
+                source.as_os_str().to_owned(),
+                dest.as_os_str().to_owned(),
+            ],
+        );
+        let policy = super::super::policy_for_clone_checkout(clones.path())
+            .expect("checkout policy must build");
+        let output = super::super::network_exec::lfs_checkout_command(
+            &policy,
+            &dest,
+            "https://127.0.0.1/repo.git",
+        )
+        .output()
+        .await
+        .expect("checkout starts");
+        assert!(
+            !output.status.success(),
+            "tracked .lfsconfig must not convert a missing object into successful pointer text"
+        );
+        assert!(
+            !dest.join("asset.bin").exists(),
+            "failed checkout must not leave an LFS pointer as apparent success"
+        );
+    }
+
+    #[tokio::test]
+    async fn tracked_lfsconfig_skipdownloaderrors_cannot_make_checkout_succeed() {
+        assert_tracked_lfsconfig_cannot_skip_missing_object(
+            "skip-errors-dest",
+            "[lfs]\n\tskipdownloaderrors = true\n",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn tracked_lfsconfig_fetch_filters_cannot_make_checkout_succeed() {
+        for (name, config) in [
+            (
+                "fetch-include-dest",
+                "[lfs]\n\tfetchinclude = another-file.bin\n",
+            ),
+            ("fetch-exclude-dest", "[lfs]\n\tfetchexclude = asset.bin\n"),
+        ] {
+            assert_tracked_lfsconfig_cannot_skip_missing_object(name, config).await;
+        }
     }
 
     /// Retained #782 measurement: extensions have no transfer consumer under

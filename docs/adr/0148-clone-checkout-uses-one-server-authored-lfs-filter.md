@@ -61,6 +61,9 @@ for add, clean, push, or an arbitrary argument list. It prepends:
 -c filter.lfs.process=<absolute reviewed git-lfs> filter-process
 -c filter.lfs.smudge=<absolute reviewed git-lfs> smudge
 -c filter.lfs.required=true
+-c lfs.skipdownloaderrors=false
+-c lfs.fetchinclude=
+-c lfs.fetchexclude=
 ```
 
 The fallback smudge command deliberately omits Git's `%f` placeholder. Git LFS
@@ -78,10 +81,13 @@ builder used by that fault-injection test is compiled only under `cfg(test)`;
 production exposes no caller-selected LFS executable constructor.
 
 Both process and smudge are pinned because Git may use either filter protocol.
-The command-line values outrank repository config. System and global config
-remain disabled exactly as in ADR 0146.
+The command-line values outrank repository config. The three additional pins
+close Git LFS 3.7.1's tracked-`.lfsconfig` fake-success paths: error skipping or
+a matching include/exclude rule can otherwise emit pointer text and report
+success without triggering Git's required-filter failure. System and global
+config remain disabled exactly as in ADR 0146.
 
-### Permit only the ordinary HTTPS LFS transfer
+### Permit only the built-in HTTP adapter on TCP port 443
 
 The same command pins `lfs.url` to the standard `/info/lfs` endpoint derived
 from the already-validated clone URL after removing query, fragment, and URL
@@ -97,10 +103,15 @@ The command also supplies generic plus exact-URL controls:
 
 This prevents a fetched `.lfsconfig` or repository-local value from switching
 endpoint discovery to SSH or selecting a standalone/custom transfer program.
-The checkout policy grants only TCP port 443. HTTP, native Git, and SSH remain
-available to the transfer phase but have no checkout grant. HTTPS endpoints on
-nonstandard ports are not supported by this policy, consistent with the prior
-fixed checkout port set.
+The checkout policy grants only TCP port 443. Landlock's network rule has no
+scheme or address field, so this is not HTTPS enforcement: `http://host:443`
+is reachable, and an HTTPS LFS batch response can supply a direct
+`http://host:443/...` object-action URL to the built-in adapter without using a
+redirect. HTTP on port 80, native Git, and SSH remain available to the transfer
+phase but have no checkout grant. Endpoints on nonstandard ports are not
+supported by this policy. Enforcing TLS for both the clone-derived endpoint and
+server-supplied object actions is follow-up scope
+([#836](https://github.com/tom2025b/git-vista/issues/836)).
 
 ### Block hooks and preserve the no-secret boundary
 
@@ -119,13 +130,13 @@ The LFS process remains inside `UntrustedCheckoutCommand`:
 - the checkout policy has no agent-socket grant or `known_hosts` carve-out;
 - the checkout seccomp profile returns `EPERM` for `AF_UNIX` socket and
   socketpair creation;
-- captured output is URL-userinfo-redacted before the clone handler receives
-  it.
+- captured output has URL userinfo and complete URL queries removed before the
+  clone handler receives it. This covers time-limited credentials in LFS
+  object-action URLs before stderr reaches either the response or release log.
 
 The credentialed `clone --no-checkout` process exits before this command is
 built. This change does not give private-LFS checkout the transfer token; it
-restores the credentialless HTTPS behavior the split boundary can safely
-support.
+restores credentialless LFS behavior on the policy's permitted TCP port.
 
 ## Executable-selection audit
 
@@ -136,7 +147,7 @@ Every value that could name a process during the new path is accounted for:
 | System/global `filter.<name>.*`, `lfs.customtransfer.*`, `lfs.extension.*`, hooks path | arbitrary operator program | scopes remain unreadable through `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL=/dev/null` |
 | Clone init template (`init.templateDir`, `GIT_TEMPLATE_DIR`) | repository-local filter, hook, LFS extension or custom transfer | neutralized during transfer by ADR 0146 before destination config/hooks exist |
 | Fetched `.gitattributes` | filter name | only `lfs` resolves, and its process/smudge values are command-line pins; every other absent filter is a no-op |
-| Fetched `.lfsconfig` | endpoint or LFS selectors | endpoint, basic-only mode, and generic/exact standalone selectors are command-line pins; Git LFS does not accept extension commands from `.lfsconfig` |
+| Fetched `.lfsconfig` | endpoint or LFS selectors | endpoint, basic-only mode, generic/exact standalone selectors, `skipdownloaderrors=false`, and empty fetch include/exclude selectors are command-line pins; Git LFS does not accept extension commands from `.lfsconfig` |
 | Destination `.git/config` created by clone | LFS/filter/hook selector | fresh clone writes transport metadata, not source-local executable config; a same-user process that later writes another generic filter already controls the managed tree and is outside this remote/operator-config threat |
 | Operator `PATH` / `GIT_EXEC_PATH` | top-level `git` and programs it ordinarily resolves | unchanged trusted host boundary for the existing shim; the new `git-lfs` driver itself uses an absolute reviewed path |
 | Validated clone URL | LFS endpoint data | only supplies one config value after query/fragment/userinfo removal; it cannot alter argv shape or any executable field |
@@ -159,7 +170,8 @@ managed tree; this sandbox does not claim to defend the operator from itself.
   require a separate credential mediation design. The existing no-credential
   boundary stays intact.
 - **Keep hooks or ports 80/9418 for compatibility: rejected.** #827 leaves no
-  fresh-clone hook source, and the explicit consumer is HTTPS only.
+  fresh-clone hook source, and the explicit consumer needs only TCP 443. This
+  does not claim that the port grant enforces HTTPS.
 - **Fail every clone when git-lfs is absent: rejected.** Required-filter
   failure is conditional on an LFS-attributed path, so ordinary repositories
   remain usable without the optional executable.

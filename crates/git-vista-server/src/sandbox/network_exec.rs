@@ -274,9 +274,9 @@ impl CredentialedCommand {
         self
     }
 
-    /// Run the command and return only output with both URL userinfo and the
-    /// exact credential removed. The raw bytes never leave this value, so a
-    /// caller cannot remember one redaction rule and forget the other.
+    /// Run the command and return only output with URL userinfo, URL queries,
+    /// and the exact credential removed. The raw bytes never leave this value,
+    /// so a caller cannot remember one redaction rule and forget the others.
     pub(crate) async fn output(self) -> std::io::Result<Output> {
         let output = self.command.output().await?;
         Ok(redact_output_with_credential(output, self.token.as_deref()))
@@ -346,7 +346,7 @@ pub(crate) fn network_command_with_credential(
 /// are disabled, and the checkout policy blocks hooks. Repository-local config
 /// remains readable, but #827 prevents a fresh remote from supplying it. #723
 /// also narrows one capability: this sealed path selects the checkout seccomp
-/// profile that denies AF_UNIX while retaining the HTTPS grant.
+/// profile that denies AF_UNIX while retaining the TCP-port-443 grant.
 pub(crate) struct UntrustedCheckoutCommand(spawn::SandboxedCommand);
 
 impl UntrustedCheckoutCommand {
@@ -355,11 +355,13 @@ impl UntrustedCheckoutCommand {
         self
     }
 
-    /// Run the command and return output with URL userinfo already removed.
+    /// Run the command and return output with URL userinfo and queries already
+    /// removed.
     ///
     /// No Git-Vista credential can appear here — this child never received one
     /// — but the *remote URL* git echoes into its own diagnostics can still
-    /// carry operator-supplied userinfo, and this output reaches both the
+    /// carry operator-supplied userinfo, while an LFS object-action URL can
+    /// carry a time-limited query credential. This output reaches both the
     /// server log and the HTTP error body.
     pub(crate) async fn output(self) -> std::io::Result<Output> {
         self.0.output().await.map(redact_output)
@@ -424,8 +426,9 @@ pub(super) fn lfs_checkout_command_with_program(
     network_command_without_credential(policy, repo, &refs)
 }
 
-/// Strip `user[:pass]@` userinfo from every `<scheme>://…` URL substring
-/// found in `bytes`, leaving the scheme, host and path intact —
+/// Strip `user[:pass]@` userinfo and the complete query from every
+/// `<scheme>://…` URL substring found in `bytes`, leaving the scheme, host,
+/// path, and any fragment intact —
 /// `docs/SECURITY_MODEL.md`'s "Remote and Forge Credentials" bullet: "Redact
 /// URL userinfo … from logs and operation records."
 ///
@@ -510,6 +513,32 @@ fn redact_url_userinfo_bytes(bytes: &[u8]) -> Vec<u8> {
             out.extend_from_slice(b"://");
             let keep_from = at.map_or(i + 3, |a| a + 1);
             out.extend_from_slice(&bytes[keep_from..end]);
+
+            // Git LFS errors can echo a server-supplied object-action URL.
+            // Those URLs commonly carry time-limited credentials in their
+            // query even though their authority has no userinfo. Remove the
+            // entire query rather than trying to maintain an inevitably
+            // incomplete list of credential-shaped parameter names.
+            let token_end = bytes[end..]
+                .iter()
+                .position(|b| b.is_ascii_whitespace())
+                .map_or(n, |offset| end + offset);
+            let fragment = bytes[end..token_end]
+                .iter()
+                .position(|b| *b == b'#')
+                .map(|offset| end + offset);
+            let query = bytes[end..fragment.unwrap_or(token_end)]
+                .iter()
+                .position(|b| *b == b'?')
+                .map(|offset| end + offset);
+            if let Some(query) = query {
+                out.extend_from_slice(&bytes[end..query]);
+                if let Some(fragment) = fragment {
+                    out.extend_from_slice(&bytes[fragment..token_end]);
+                }
+                i = token_end;
+                continue;
+            }
             i = end;
             continue;
         }
@@ -519,9 +548,9 @@ fn redact_url_userinfo_bytes(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// [`redact_url_userinfo_bytes`] over a `&str`, for callers (and this file's
-/// own pure unit tests) that already have text rather than raw process
-/// output.
+/// [`redact_url_userinfo_bytes`] over a `&str`, including its query stripping,
+/// for callers (and this file's own pure unit tests) that already have text
+/// rather than raw process output.
 ///
 /// The round-trip through `String::from_utf8` cannot fail for `str` input:
 /// see [`redact_url_userinfo_bytes`]'s doc for why every slice boundary it
@@ -539,7 +568,7 @@ pub(crate) fn redact_url_userinfo(text: &str) -> String {
 /// Works directly on the raw bytes, with no UTF-8 validity check or
 /// fallback: git's stdout in particular can carry non-UTF-8 path bytes
 /// (`git_cmd.rs`'s own byte-not-`String` convention exists for the same
-/// reason), and this redaction is ASCII-anchored (`://`, `@`) so it has
+/// reason), and this redaction is ASCII-anchored (`://`, `@`, `?`) so it has
 /// nothing to find *in* a non-UTF-8 byte and nothing to corrupt by leaving
 /// it untouched — see [`redact_url_userinfo_bytes`]'s doc. Earlier revisions
 /// of this function validated the whole buffer as UTF-8 first and skipped
@@ -1011,6 +1040,26 @@ mod tests {
     }
 
     #[test]
+    fn redact_url_userinfo_strips_the_complete_query_and_keeps_a_fragment() {
+        assert_eq!(
+            redact_url_userinfo(
+                "download https://objects.invalid/a.bin?token=hunter2&sig=secret#retry"
+            ),
+            "download https://objects.invalid/a.bin#retry"
+        );
+    }
+
+    #[test]
+    fn redact_url_userinfo_strips_queries_from_several_urls_in_one_string() {
+        assert_eq!(
+            redact_url_userinfo(
+                "first https://a.invalid/x?X-Amz-Signature=one second http://b.invalid:443/y?token=two"
+            ),
+            "first https://a.invalid/x second http://b.invalid:443/y"
+        );
+    }
+
+    #[test]
     fn redact_url_userinfo_uses_the_last_at_when_the_password_contains_one() {
         // A password containing '@' is exactly why this scans for the LAST
         // '@' in the authority, not the first.
@@ -1154,6 +1203,59 @@ mod tests {
         let redacted = redact_output(raw);
         assert_eq!(redacted.stdout, b"cloning https://host/a.git");
         assert_eq!(redacted.stderr, b"fatal: https://host/a.git unreachable");
+    }
+
+    #[test]
+    fn redact_output_removes_lfs_action_query_credentials_from_both_streams() {
+        let raw = Output {
+            status: std::process::ExitStatus::default(),
+            stdout: b"download https://objects.invalid/a?token=stdout-secret".to_vec(),
+            stderr: b"LFS: GET http://objects.invalid:443/a?sig=stderr-secret failed".to_vec(),
+        };
+        let redacted = redact_output(raw);
+        assert_eq!(
+            redacted.stdout,
+            b"download https://objects.invalid/a".to_vec()
+        );
+        assert_eq!(
+            redacted.stderr,
+            b"LFS: GET http://objects.invalid:443/a failed".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn untrusted_checkout_output_never_exposes_an_lfs_action_query() {
+        let repo = fixture().await;
+        let bin_dir = repo.path().join("query-redaction-bin");
+        std::fs::create_dir(&bin_dir).expect("create fake binary directory");
+        let git = bin_dir.join("git");
+        std::fs::write(
+            &git,
+            "#!/bin/sh\nprintf '%s\\n' 'LFS: GET https://objects.invalid/a?token=checkout-secret failed' >&2\nexit 1\n",
+        )
+        .expect("write fake git");
+        let mut permissions = std::fs::metadata(&git)
+            .expect("fake git metadata")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&git, permissions).expect("make fake git executable");
+
+        let policy = super::super::policy_for_clone_checkout(repo.path())
+            .expect("checkout policy must build");
+        let command = super::super::test_env::with_env(
+            &[
+                ("PATH", Some(bin_dir.as_os_str())),
+                ("HOME", Some(repo.path().as_os_str())),
+            ],
+            || network_command_without_credential(&policy, repo.path(), &["status"]),
+        );
+        let output = command.output().await.expect("fake git runs");
+        assert!(!output.status.success(), "fixture must retain its failure");
+        assert_eq!(
+            output.stderr,
+            b"LFS: GET https://objects.invalid/a failed\n".to_vec(),
+            "the sealed checkout command must redact before returning captured output"
+        );
     }
 
     #[test]

@@ -282,11 +282,12 @@ pub(crate) const DEFAULT_GIT_PORTS: &[u16] = &[
 /// `https://host:22/…` is accepted and `url.<base>.insteadOf` can rewrite an
 /// accepted HTTPS URL into an SSH one. A clone genuinely can reach port 22.
 ///
-/// HTTPS Git LFS is the only remaining consumer. The checkout launcher supplies
-/// the LFS filter itself, pins its endpoint to the validated HTTPS clone URL,
-/// and forces the basic HTTP transfer adapter. Port 80 and git protocol port
-/// 9418 therefore have no checkout consumer and are absent. Port 22 was already
-/// removed by #702; SSH remains transfer-phase authority only.
+/// Git LFS's built-in HTTP adapter is the only remaining consumer. The checkout
+/// launcher supplies the LFS filter itself and pins its endpoint to the
+/// validated clone URL. Port 80 and git protocol port 9418 have no checkout
+/// grant; port 22 was already removed by #702. This is intentionally a
+/// port-number boundary, not a scheme or address boundary: `http://host:443`
+/// and a direct HTTP object-action URL on port 443 remain reachable.
 ///
 /// Read [`DEFAULT_GIT_PORTS`]'s own doc before trusting this too far: a port
 /// grant is **not** an egress policy, because Landlock's port rules carry no
@@ -1333,8 +1334,8 @@ pub(crate) fn policy_for_clone(clones_root: &Path) -> Result<Policy, shim::ShimE
 ///   a symlink no longer has checkout refused by `add_carveout_rule`'s guard;
 /// * [`CLONE_CHECKOUT_PORTS`] rather than [`DEFAULT_GIT_PORTS`] — no port 22.
 ///
-/// HTTPS access remains for the server-authored LFS filter. No other checkout
-/// port survives, and hooks are blocked: the transfer launcher prevents
+/// TCP connect access on port 443 remains for the server-authored LFS filter.
+/// No other checkout port survives, and hooks are blocked: the transfer launcher prevents
 /// template-seeded repository config/hooks, while the sealed [`CheckoutPolicy`]
 /// spawn path prevents Git from loading system or global config. The LFS
 /// launcher restores only the fixed `filter.lfs.*` values it owns and marks the
@@ -1383,7 +1384,7 @@ pub(crate) fn policy_for_clone_checkout(
         // #702: no `known_hosts` exception — the `~/.ssh` exclude is
         // exceptionless again for the process that runs the LFS filter.
         ro_carveouts: Vec::new(),
-        // #702 removed port 22; #831 leaves only HTTPS for the fixed LFS path.
+        // #702 removed port 22; #831 leaves only TCP 443 for the fixed LFS path.
         net_ports: CLONE_CHECKOUT_PORTS.to_vec(),
         // `/dev/null` is immutable host state and cannot acquire a hook. Git
         // appends each hook name to this path and observes ENOTDIR, exactly the

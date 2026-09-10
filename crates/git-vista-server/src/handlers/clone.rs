@@ -159,8 +159,8 @@ fn clone_transfer_args<'a>(url: &'a str, dest: &'a str) -> [&'a str; 5] {
 /// into an SSH clone. `checkout_policy` is
 /// `sandbox::policy_for_clone_checkout`: the same policy without the agent
 /// socket, the `known_hosts` carve-out, or port 22, for the process that
-/// materialises attacker-selected content. The checkout keeps only HTTPS,
-/// blocks Git hooks, and receives one server-authored required LFS filter;
+/// materialises attacker-selected content. The checkout keeps only TCP port
+/// 443 (without scheme or address enforcement), blocks Git hooks, and receives one server-authored required LFS filter;
 /// system/global filter configuration remains unreadable.
 ///
 /// The second phase also receives an environment **built by allowlist** rather

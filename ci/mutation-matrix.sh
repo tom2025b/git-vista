@@ -96,10 +96,11 @@ PY
 # has only production Strict and Network cases. Make that exact composed test a
 # first-class matrix row instead of weakening the claim into another rule-map
 # assertion. M12 removes only Checkout's AF_UNIX rules; this test must then fail
-# because its fetched hook reaches the pathname socket while its TCP leg lives.
+# because its fetched filter reaches the pathname socket. The tracked hook is
+# independently required not to run.
 printf '%s\t%s\t%s\t%s\n' \
   checkout_security \
-  a_fetched_hook_that_self_sets_ssh_auth_sock_cannot_connect_but_tcp_survives \
+  a_checkout_filter_cannot_reach_an_agent_and_a_fetched_hook_does_not_run \
   M12 \
   exact >> "$declarations"
 
@@ -195,11 +196,15 @@ run_one_tree() {
     local test_log="$work_root/test-${label}-${case_id}.log"
     local status=0
 
+    local -a cargo_args=(test -p git-vista-server "$test_name" -- --exact --test-threads=1)
+    if [[ ${case_modes[$case_id]} == exact ]]; then
+      cargo_args=(test -p git-vista-server --bin git-vista-server "$test_name" -- --exact --test-threads=1)
+    fi
     if (
       cd "$tree"
       GV_ESCAPE_REPORT="$report" \
         CARGO_TARGET_DIR="$tree/target" \
-        cargo test -p git-vista-server "$test_name" -- --exact --test-threads=1
+        cargo "${cargo_args[@]}"
     ) > "$test_log" 2>&1; then
       status=0
     else
@@ -207,10 +212,16 @@ run_one_tree() {
     fi
 
     if [[ ${case_modes[$case_id]} == exact ]]; then
-      if [[ $status -eq 0 ]]; then
+      if [[ $status -eq 0 ]] && \
+        grep -q '^test result: ok\. 1 passed; 0 failed;' "$test_log"; then
         outcome["$label|$case_id"]=PASS
       else
         outcome["$label|$case_id"]=FAIL
+        if [[ $status -eq 0 ]]; then
+          printf 'mutation-matrix: %s/%s did not run exactly one test\n' \
+            "$label" "$case_id" >&2
+          tail -40 "$test_log" >&2
+        fi
       fi
     else
       local records
