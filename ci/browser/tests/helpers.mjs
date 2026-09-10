@@ -67,6 +67,45 @@ export async function openApp(page) {
 
   await expect(page.getByRole('region', { name: 'Commit history graph' })).toBeVisible()
   await expect(page.locator('circle.node-hit').first()).toBeAttached()
+
+  // ---- #623 MEASUREMENT, NOT A FIX -------------------------------------
+  //
+  // Hypothesis under test: the two dismissals above are point-in-time checks
+  // (`isVisible()` answers for the instant it runs), so a dialog that has not
+  // mounted yet is silently skipped. Neither gate above catches that —
+  // `toBeAttached()` requires only presence in the DOM, not visibility and not
+  // hit-testability — so `openApp` can return "clean" with a modal still up,
+  // and the NEXT click on `circle.node-hit` is intercepted by a <div> 30s
+  // later, in whichever spec happened to call this helper.
+  //
+  // This probe asks the question that click will ask, here, where the cause
+  // is: at the node's own centre, what does the browser say it would hit? If
+  // something covers it, name it. `elementFromPoint` is the same hit test
+  // Playwright's actionability check uses, so a pass here is not a proxy.
+  //
+  // It reports rather than guessing at a dialog selector: any covering
+  // element is named by tag and class, including one nobody has thought of.
+  const cover = await page.evaluate(() => {
+    const hit = document.querySelector('circle.node-hit')
+    if (!hit) return 'no circle.node-hit in the DOM at all'
+    const box = hit.getBoundingClientRect()
+    if (box.width === 0 || box.height === 0) return 'circle.node-hit has a zero-sized box'
+    const x = box.x + box.width / 2
+    const y = box.y + box.height / 2
+    if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) {
+      return `circle.node-hit centre (${Math.round(x)}, ${Math.round(y)}) is outside the viewport`
+    }
+    const top = document.elementFromPoint(x, y)
+    if (!top) return 'elementFromPoint found nothing at the node centre'
+    if (top === hit || hit.contains(top) || top.contains(hit)) return null
+    const cls = typeof top.className === 'string' ? top.className : top.className?.baseVal || ''
+    return `<${top.tagName.toLowerCase()}${cls ? ` class="${cls}"` : ''}> covers circle.node-hit`
+  })
+  expect(
+    cover,
+    '#623 probe: openApp returned but the graph is not hit-testable — the next ' +
+      'click will time out 30s from now, in whatever spec called this helper',
+  ).toBeNull()
 }
 
 /**
