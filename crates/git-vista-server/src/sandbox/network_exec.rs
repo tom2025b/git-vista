@@ -72,9 +72,11 @@
 //! precedence than command-line config. Without them, `clone --no-checkout`
 //! can copy operator-selected hooks and config into the destination, and the
 //! later checkout deliberately reads that repository-local state. The same
-//! argv pins replace `core.alternateRefsCommand` and `gc.recentObjectsHook`
-//! with the inert standard `true` program before connectivity checks or
-//! fetch-triggered maintenance can consult them.
+//! argv pins replace `core.alternateRefsCommand` with the inert standard
+//! `true` program before connectivity checks can consult it. Git documents
+//! `gc.recentObjectsHook` as multi-valued, so appending a safe value would not
+//! clear earlier hooks; `maintenance.auto=false` disables the only production
+//! Network consumer instead, the automatic maintenance run after fetch.
 //!
 //! `PATH`, `GIT_EXEC_PATH`, SSH and askpass environment selectors still come
 //! from the operator's parent environment; executable lookup remains trusted.
@@ -152,7 +154,7 @@ const FORCED_NETWORK_ARGS: &[&str] = &[
     "-c",
     "core.alternateRefsCommand=true",
     "-c",
-    "gc.recentObjectsHook=true",
+    "maintenance.auto=false",
 ];
 
 /// Compose the fixed config pins and the transport-side executable pin.
@@ -602,15 +604,16 @@ mod tests {
     ///
     /// MUTATION  1: remove `init.templateDir=` while the environment half
     /// remains; the operator-global template route reopens.
-    /// MUTATION 2: remove either conditional command replacement while every
-    /// older transport pin remains; an executable selector reopens.
+    /// MUTATION 2: remove the alternate-refs replacement or automatic-
+    /// maintenance denial while every older transport pin remains; an
+    /// executable selector reopens.
     #[test]
-    fn forced_network_args_pin_templates_and_conditional_commands() {
+    fn forced_network_args_pin_template_alternate_refs_and_maintenance() {
         let args = compose_network_args(&["fetch", "origin"], None);
         for required in [
             "init.templateDir=",
             "core.alternateRefsCommand=true",
-            "gc.recentObjectsHook=true",
+            "maintenance.auto=false",
         ] {
             assert!(
                 args.contains(&required),
@@ -687,7 +690,7 @@ mod tests {
                 "-c",
                 "core.alternateRefsCommand=true",
                 "-c",
-                "gc.recentObjectsHook=true",
+                "maintenance.auto=false",
                 "push",
                 "--receive-pack=git-receive-pack",
                 "origin",

@@ -383,8 +383,9 @@ HTTP(S) helpers and executable lookup through the operator's `PATH` /
 This supplements ADR 0144's credential-helper, SSH, fsmonitor and pack-program
 pins. The launcher also prevents clone transfer from seeding executable state:
 it forces `init.templateDir=`, removes the higher-precedence inherited
-`GIT_TEMPLATE_DIR`, and replaces `core.alternateRefsCommand` and
-`gc.recentObjectsHook` with an inert server-authored command. Checkout receives
+`GIT_TEMPLATE_DIR`, replaces `core.alternateRefsCommand` with an inert
+server-authored command, and sets `maintenance.auto=false` so fetch cannot
+launch the multi-valued `gc.recentObjectsHook` chain. Checkout receives
 the transport environment values after its environment is built from the
 allowlist; none is copied from the parent.
 

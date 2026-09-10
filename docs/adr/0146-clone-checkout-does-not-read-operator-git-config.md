@@ -76,20 +76,29 @@ driver and that a template hook executes; its hardened leg requires the cloned
 config and hook to be absent, the payload to materialize, and both markers to
 remain absent.
 
-### 2. Replace conditional transfer commands with an inert program
+### 2. Replace one conditional command and disable the other's consumer
 
 Every Network command also receives:
 
 ```text
 -c core.alternateRefsCommand=true
--c gc.recentObjectsHook=true
+-c maintenance.auto=false
 ```
 
-`true` is selected through the already-trusted executable environment, ignores
-any arguments, emits no object IDs, and exits successfully. Empty values were
-not chosen because an empty command is not a documented portable spelling for
-"disabled" on both consumers and could turn a safe no-op into a clone/fetch
-failure. The exact argv order is asserted through a real spawned argument
+For `core.alternateRefsCommand`, `true` is selected through the already-trusted
+executable environment, ignores any arguments, emits no object IDs, and exits
+successfully. An empty value was not chosen because it is not a documented
+portable spelling for "disabled" and could turn a safe no-op into a transfer
+failure.
+
+`gc.recentObjectsHook` is different: Git reads it as a multi-valued list and
+runs every entry, so appending `true` would leave every earlier executable in
+the chain. The production Network routes do not explicitly run maintenance;
+fetch/pull can trigger `git maintenance run --auto` after transfer. Forcing
+`maintenance.auto=false` disables that consumer before it can read the hook
+list. This deliberately gives up automatic foreground maintenance during
+Network operations; scheduled or explicit maintenance outside this launcher is
+unchanged. The exact argv order is asserted through a real spawned argument
 dumper.
 
 ### 3. Fresh-clone checkout has no selectable executable filter or hook
@@ -160,8 +169,9 @@ support for a route that no longer exists.
 
 - Fresh clone transfer cannot import hooks or config through either
   `init.templateDir` config or inherited `GIT_TEMPLATE_DIR`.
-- Network commands cannot select repository/operator
-  `core.alternateRefsCommand` or `gc.recentObjectsHook` programs.
+- Network commands cannot select a repository/operator
+  `core.alternateRefsCommand`; fetch/pull cannot launch the multi-valued
+  `gc.recentObjectsHook` chain because automatic maintenance is disabled.
 - Fresh-clone checkout cannot execute operator-selected hooks or filters.
 - Existing fetch/pull/push operations on pre-existing repositories still have
   their separately documented hook/filter posture; this is not a global hook
