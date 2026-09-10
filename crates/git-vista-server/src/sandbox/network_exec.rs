@@ -1814,8 +1814,9 @@ mod https_suite {
         // The "ordinary tracked content" claim above is only true if the
         // helper is actually tracked: stage and commit it, rather than
         // leaving it as an untracked file on disk next to an unrelated
-        // empty commit. This also supplies push's source ref, same as
-        // installed_remote_helper_selectors_are_blocked's commit does.
+        // empty commit. (This test only fetches, so unlike
+        // installed_remote_helper_selectors_are_blocked's commit, there is
+        // no push source ref to supply here.)
         run(
             Command::new("git")
                 .args(["add", "--", "git-remote-../r1"])
