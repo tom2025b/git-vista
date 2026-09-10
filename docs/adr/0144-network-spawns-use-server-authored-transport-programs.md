@@ -20,6 +20,14 @@ Git [documents the protocol allowlist](https://git-scm.com/docs/git#Documentatio
 as overriding existing protocol configuration. Unlike `-c protocol.allow=never`,
 it beats a repository's specific `protocol.<name>.allow=always`, including
 selection through `remote.<name>.vcs`, custom URLs, push URLs and URL rewrites.
+
+**Narrowed by [ADR 0145](0145-four-path-shaped-selectors-depend-on-upstream-git.md)
+(#817).** That sentence is broader than what is actually proven. Mutation
+testing shows `GIT_ALLOW_PROTOCOL` is what blocks the `remote.<name>.vcs` route
+only; for path-shaped `url`, `insteadOf`, `pushurl` and `pushInsteadOf`, upstream
+Git's own `<scheme>::` parser rejects the value first, and the same two mutations
+that fail the `vcs` test leave those four passing. Read 0145 before relying on
+this paragraph for per-route coverage.
 Git also [documents the proxy environment override](https://git-scm.com/docs/git-config#Documentation/git-config.txt-coregitProxy).
 An empty `GIT_PROXY_COMMAND` bypasses all `core.gitProxy` entries: the marker
 experiment verifies that Git attempts a direct connection instead of executing
