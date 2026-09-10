@@ -113,12 +113,12 @@ fn split(argv: &[std::ffi::OsString]) -> (&std::ffi::OsString, &[std::ffi::OsStr
 ///
 /// * `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM` / `GIT_CONFIG_NOSYSTEM` and
 ///   the `GIT_CONFIG_COUNT` family — they select *configuration*, not
-///   geometry: the same config the operator's own command-line git would
-///   read. The server's posture is user-git parity (`preview_suite.rs`'s
+///   geometry. Ordinary commands retain user-git parity (`preview_suite.rs`'s
 ///   `fast_forward_shape` doc records that a developer's `~/.gitconfig`
-///   reaches every git the server runs, and fixtures pin their own), and
-///   preview and execution inherit them identically, so neither can see a
-///   config the other did not.
+///   reaches those git processes, and fixtures pin their own). The untrusted
+///   clone-checkout path is the deliberate exception: it replaces the system
+///   and global selectors at completion because fetched `.gitattributes` can
+///   select executable filter commands from those scopes.
 /// * `GIT_CEILING_DIRECTORIES` — can only make discovery *refuse*, never
 ///   land somewhere else; a loud failure is the fail-closed direction.
 /// * `GIT_REPLACE_REF_BASE` / `GIT_NO_REPLACE_OBJECTS` — select a *view* of
@@ -179,31 +179,32 @@ const SCRUBBED_GIT_GEOMETRY_ENV: &[&str] = &[
 ///   `Command::new("git").exec()`, which is a `PATH` lookup, so an empty
 ///   `PATH` does not run a reduced checkout, it runs none at all. Hooks and
 ///   filters are `#!/bin/sh` scripts that then need it themselves.
-/// * `HOME` — git resolves `~/.gitconfig` through it. ADR 0128's decision is
-///   explicit that the split "changes when checkout happens, not whether it
-///   happens": operator-level `core.hooksPath` and filter configuration are
-///   *deliberate product behaviour* and must keep applying. Dropping `HOME`
-///   would silently stop them. It is a path, not a secret, and the paths
+/// * `HOME` — checkout-time hooks and filter programs can use it for ordinary
+///   operator-owned resources. It is a path, not a secret, and the paths
 ///   underneath it that *are* secrets (`~/.ssh`, `~/.config/gh`, …) stay
 ///   withheld by `secret_excludes` regardless of what this variable says.
-/// * `XDG_CONFIG_HOME` — the other root git consults for global config
-///   (`$XDG_CONFIG_HOME/git/config`). Same justification as `HOME`, and
-///   omitting it would make config resolution differ between the credentialed
-///   transfer and the checkout for exactly the operators who use it.
+///   Git itself does not load `$HOME/.gitconfig` on this path: the fixed
+///   `GIT_CONFIG_GLOBAL=/dev/null` completion policy below prevents that.
+/// * `XDG_CONFIG_HOME` — preserves the operator's conventional configuration
+///   root for checkout-time child programs, subject to the same filesystem
+///   grants and exclusions. Git's `$XDG_CONFIG_HOME/git/config` is likewise
+///   bypassed by the fixed global-config selector.
 /// * `LANG`, `LC_ALL`, `LC_CTYPE`, `LC_MESSAGES` — locale. They select message
 ///   text and character handling; they name no resource and grant no access.
 ///
 /// # What was deliberately left out, and why each is a decision
 ///
 /// * `SSH_AUTH_SOCK` — the whole of #702. See `sandbox::policy_for_clone`.
-/// * `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`,
-///   `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` — these would buy the same
-///   config parity `HOME` and `XDG_CONFIG_HOME` buy, and they can *carry a
-///   credential in the value itself* (`credential.helper=!echo password=…`).
-///   A config channel whose payload is an arbitrary string is not something
-///   to forward into attacker-selected code. An operator who configures
-///   Git-Vista's server this way loses that configuration at checkout, and
-///   that is the trade this list makes on purpose.
+/// * `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` and inherited
+///   `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`/`GIT_CONFIG_NOSYSTEM` — these can
+///   carry arbitrary configuration, including a credential or executable
+///   selector in the value itself. None is forwarded. At command completion,
+///   checkout instead receives fixed `GIT_CONFIG_NOSYSTEM=1` and
+///   `GIT_CONFIG_GLOBAL=/dev/null`: system and operator-global configuration
+///   are unavailable, while the repository-local config Git created during
+///   `clone --no-checkout` remains readable. This deliberately gives up
+///   operator-level hooks and filters, including automatic LFS smudging when
+///   its filter exists only in those scopes.
 /// * `TMPDIR`, `TERM`, `TZ` — nothing in `git checkout -f` needs them, and
 ///   `/tmp` is not a grant this policy gives out in any case.
 /// * The [`SCRUBBED_GIT_GEOMETRY_ENV`] family — already removed for every
@@ -267,11 +268,12 @@ where
 /// `env` is excluded on the same reasoning as `arg`: `GIT_DIR`, `GIT_SSH_COMMAND`
 /// and `GIT_EXTERNAL_DIFF` redirect or execute, so an environment appended
 /// after classification is an argv change wearing a different hat — with
-/// two narrow exceptions: [`credential_env`](SandboxedCommand::credential_env)
-/// supplies server-owned credential data (#582), and
+/// narrow, fixed exceptions: [`credential_env`](SandboxedCommand::credential_env)
+/// supplies server-owned credential data (#582),
 /// [`with_network_transport_policy`](SandboxedCommand::with_network_transport_policy)
-/// selects a fixed server-authored restriction (#779). Neither exposes an
-/// arbitrary environment name/value setter.
+/// selects a server-authored transport restriction (#779), and the untrusted
+/// checkout builder selects fixed system/global Git-config restrictions.
+/// None exposes an arbitrary environment name/value setter.
 ///
 /// The *inherited* environment gets the complementary treatment:
 /// [`command_async`] removes the fixed [`SCRUBBED_GIT_GEOMETRY_ENV`] family at
@@ -283,6 +285,7 @@ where
 pub(crate) struct SandboxedCommand {
     command: tokio::process::Command,
     restrict_network_transports: bool,
+    restrict_checkout_git_config: bool,
 }
 
 /// The one environment variable a production caller may set on a
@@ -337,6 +340,12 @@ pub(crate) struct SandboxedCommand {
 /// not just relying on the configured helper chain being reset.
 pub(crate) const CREDENTIAL_TOKEN_VAR: &str = "GIT_VISTA_CREDENTIAL_TOKEN";
 
+/// The config half of clone-template neutralization. Kept beside the
+/// completion-time `GIT_TEMPLATE_DIR` removal so the two precedence layers are
+/// reviewable together; [`super::network_exec`] places it in every Network
+/// argv before the subcommand.
+pub(super) const EMPTY_INIT_TEMPLATE_CONFIG: &str = "init.templateDir=";
+
 impl SandboxedCommand {
     /// Seal Network transport selection to Git-Vista's supported protocols.
     /// No caller-supplied names or values: repository protocol rules must not
@@ -356,7 +365,35 @@ impl SandboxedCommand {
             self.command
                 .env("GIT_ALLOW_PROTOCOL", "http:https:ssh:git:file");
             self.command.env("GIT_PROXY_COMMAND", "");
+            // `GIT_TEMPLATE_DIR` outranks `-c init.templateDir=`. Removing the
+            // inherited value is therefore the other half of preventing a
+            // clone transfer from copying operator-selected hooks and config
+            // into the new repository before its hardened checkout begins.
+            self.command.env_remove("GIT_TEMPLATE_DIR");
         }
+    }
+
+    /// Remove the two operator-controlled configuration scopes from an
+    /// untrusted clone checkout. A fetched `.gitattributes` file can select an
+    /// arbitrary `filter.<name>` configured in either scope, so filtering
+    /// individual known keys would leave the same executable surface under a
+    /// different name. Repository-local config remains enabled: a remote
+    /// repository's `.git/config` is not copied by clone, and the destination's
+    /// config is created locally by Git during the no-checkout transfer.
+    ///
+    /// Applied at completion, after test-only environment replacement, so a
+    /// spawned regression test exercises the same final authority as
+    /// production and cannot accidentally erase the restriction.
+    fn apply_checkout_git_config_policy(&mut self) {
+        if self.restrict_checkout_git_config {
+            self.command.env("GIT_CONFIG_NOSYSTEM", "1");
+            self.command.env("GIT_CONFIG_GLOBAL", "/dev/null");
+        }
+    }
+
+    fn apply_completion_policies(&mut self) {
+        self.apply_network_transport_policy();
+        self.apply_checkout_git_config_policy();
     }
 
     /// Set [`CREDENTIAL_TOKEN_VAR`] to `token` on this command's environment —
@@ -381,18 +418,20 @@ impl SandboxedCommand {
     /// reach for it and rebuild the same defect one variable later. See
     /// [`UNTRUSTED_CHECKOUT_ENV_ALLOWLIST`] for what survives and why.
     ///
-    /// `env_clear()` first, then the allowlist: the child's environment is the
-    /// returned set. At spawn time the Network harness adds its fixed,
-    /// non-secret `GIT_ALLOW_PROTOCOL` and empty `GIT_PROXY_COMMAND` restrictions
-    /// (#779); no parent value is copied for either name. The three ADR 0128 names are absent here
-    /// because they were never copied in — a strictly stronger statement than
-    /// the removals this replaces, and one that holds for every name nobody
-    /// has thought of yet.
+    /// `env_clear()` first, then the allowlist: the child's inherited
+    /// environment is the returned set. At spawn time the Network harness adds
+    /// fixed, non-secret `GIT_ALLOW_PROTOCOL` and empty `GIT_PROXY_COMMAND`
+    /// restrictions (#779), plus fixed system/global Git-config restrictions;
+    /// no parent value is copied for any of those names. The three ADR 0128
+    /// names are absent here because they were never copied in — a strictly
+    /// stronger statement than the removals this replaces, and one that holds
+    /// for every name nobody has thought of yet.
     pub(crate) fn with_untrusted_checkout_env(mut self) -> Self {
         self.command.env_clear();
         for (key, value) in untrusted_checkout_env(std::env::vars_os()) {
             self.command.env(key, value);
         }
+        self.restrict_checkout_git_config = true;
         self
     }
 
@@ -445,19 +484,19 @@ impl SandboxedCommand {
     }
 
     pub(crate) async fn output(mut self) -> std::io::Result<std::process::Output> {
-        self.apply_network_transport_policy();
+        self.apply_completion_policies();
         self.command.output().await
     }
 
     pub(crate) fn spawn(mut self) -> std::io::Result<tokio::process::Child> {
-        self.apply_network_transport_policy();
+        self.apply_completion_policies();
         self.command.spawn()
     }
 
     /// Test-only: exit status, for fixture setup that only needs "did it work".
     #[cfg(test)]
     pub(crate) async fn status(mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.apply_network_transport_policy();
+        self.apply_completion_policies();
         self.command.status().await
     }
 
@@ -527,6 +566,7 @@ fn command_from_argv(argv: Vec<std::ffi::OsString>) -> SandboxedCommand {
     SandboxedCommand {
         command: cmd,
         restrict_network_transports: false,
+        restrict_checkout_git_config: false,
     }
 }
 
@@ -697,6 +737,63 @@ mod tests {
                  filtered by name rather than built by allowlist"
             );
         }
+    }
+
+    /// The checkout config policy is applied at completion, after every
+    /// construction-time environment choice. This child-process probe avoids
+    /// the control-leg differences in the real-Git integration test: it starts
+    /// with hostile values for exactly the two variables, runs the same
+    /// `SandboxedCommand::output` completion path production uses, and reads
+    /// back the environment the kernel supplied to the child.
+    ///
+    /// MUTATION 1 (remove the mechanism): omit
+    /// `apply_checkout_git_config_policy` from `apply_completion_policies`;
+    /// both hostile values reach the child.
+    /// MUTATION 2 (weaken the mechanism): omit only the
+    /// `GIT_CONFIG_GLOBAL=/dev/null` override; the system scope is still
+    /// disabled but the hostile global path reaches the child.
+    /// MUTATION 3 (weaken the other template layer): point
+    /// `EMPTY_INIT_TEMPLATE_CONFIG` at an operator directory; the inherited
+    /// variable stays absent but argv reopens template copying.
+    #[tokio::test]
+    async fn checkout_config_policy_overrides_test_environment_at_completion() {
+        let command = tokio::process::Command::new("/usr/bin/env");
+        let output = SandboxedCommand {
+            command,
+            restrict_network_transports: true,
+            restrict_checkout_git_config: true,
+        }
+        .pinned_env_for_test(&[
+            ("GIT_CONFIG_NOSYSTEM", "hostile-system-value"),
+            ("GIT_CONFIG_GLOBAL", "/tmp/hostile-global-config"),
+            ("GIT_TEMPLATE_DIR", "/tmp/hostile-template"),
+        ])
+        .output()
+        .await
+        .expect("environment probe runs");
+        assert!(output.status.success(), "environment probe must succeed");
+
+        let environment = String::from_utf8(output.stdout).expect("environment is UTF-8");
+        let value = |name: &str| {
+            environment
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{name}=")))
+        };
+        assert_eq!(value("GIT_CONFIG_NOSYSTEM"), Some("1"));
+        assert_eq!(value("GIT_CONFIG_GLOBAL"), Some("/dev/null"));
+        assert_eq!(
+            EMPTY_INIT_TEMPLATE_CONFIG, "init.templateDir=",
+            "the config half must select no template before clone transfer"
+        );
+        assert_eq!(
+            value("GIT_TEMPLATE_DIR"),
+            None,
+            "the higher-precedence template selector must be removed at completion"
+        );
+        assert_eq!(
+            EMPTY_INIT_TEMPLATE_CONFIG, "init.templateDir=",
+            "the config-level template selector must remain empty"
+        );
     }
 
     /// An allowlisted name that the source does not have must not be
@@ -940,11 +1037,11 @@ mod tests {
     ///
     /// The kept set is asserted too. `GIT_TERMINAL_PROMPT` and `GIT_EDITOR`
     /// are set by `main.rs` and must reach git; `GIT_CONFIG_GLOBAL`/`_SYSTEM`
-    /// are the documented user-git-parity decision (`preview_suite.rs`'s
-    /// `fast_forward_shape` doc records that a developer's own config reaches
-    /// every git the server runs, and the fixtures pin their own). A scrub
-    /// that grew to swallow those would be a different change than the one
-    /// reviewed here.
+    /// are retained by this ordinary-command constructor for the documented
+    /// user-git-parity decision. Untrusted clone checkout overrides the two
+    /// config scopes later, at completion. A construction-time scrub that grew
+    /// to swallow them from every command would be a different change than the
+    /// checkout-specific policy reviewed here.
     ///
     /// # Two mutations that make this red, failing differently
     ///
