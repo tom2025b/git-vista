@@ -4,11 +4,12 @@
 //!
 //! # Why `#[ignore]` (the `sandbox::clone_live` precedent)
 //!
-//! The server's port is a compile-time constant (8080, loopback-only, no env
-//! override — a deliberate security posture), so a test cannot spawn a
-//! private instance beside a running one, and CI has no server at all. Like
-//! `clone_live`, this test is therefore ignored by default and run explicitly
-//! on the dev box, where the real server is a systemd service:
+//! The server can now bind a private loopback port, but the native session
+//! client and this test support still target the default endpoint and token
+//! root. Until #130 wires those together, spawning a private server would not
+//! make these calls reach it, and CI has no default server. Like `clone_live`,
+//! this test is therefore ignored by default and run explicitly on the dev box,
+//! where the real default server is a systemd service:
 //!
 //! ```text
 //! cargo test -p git-vista-mcp --test live_handshake -- --ignored
@@ -381,10 +382,11 @@ mod read_tools {
 /// #248's literal acceptance criterion, against a real repository: calling
 /// **every** `plan_*` tool leaves the repository's generation unchanged.
 ///
-/// `#[ignore]` for the same reason as every case above — the server's port is
-/// a compile-time constant, so this needs the real `git-vista-server` on
-/// `127.0.0.1:8080`. Written and ready for a human to run off-hours; **never**
-/// run it against the box's live server while an iPad session is using it.
+/// `#[ignore]` for the same reason as every case above — the client and test
+/// support still select the default endpoint and token root, so this needs the
+/// real `git-vista-server` on `127.0.0.1:8080`. Written and ready for a human to
+/// run off-hours; **never** run it against the box's live server while an iPad
+/// session is using it.
 ///
 /// The non-ignored proof of the same property lives where CI can reach it:
 /// `git-vista-server`'s
