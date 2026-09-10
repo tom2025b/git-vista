@@ -85,6 +85,12 @@ pub struct RenderWindow {
     pub pad_bottom: f64,
 }
 
+// #789: these conveniences are test observations, not part of the production
+// rendering path. The detail and full-page views consume `start`, `end`, and
+// both padding fields directly; only this module's tests ask these three
+// derived questions. Keep them for the virtualization proofs below without
+// shipping an otherwise-unused public API.
+#[cfg(test)]
 impl RenderWindow {
     /// Number of lines this window renders.
     pub fn len(&self) -> usize {
