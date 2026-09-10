@@ -111,11 +111,12 @@ const SINK_FUNCTIONS: &[(&str, &str)] = &[
 /// `panic!`/`assert!`/`debug_assert!` count for the same reason `eprintln!`
 /// does: `reconcile_need`'s own hazard shipped inside a `debug_assert!`
 /// message, which a crash reporter or CI log captures exactly like any other
-/// diagnostic. (`debug_assert!(` and `assert!(` both appear here even though
-/// the former's text contains the latter's as a substring — a `debug_assert!`
-/// call is therefore matched twice and reported at most twice for the same
-/// violation; harmless, since it only ever adds a duplicate to an already-
-/// failing assertion's message, never hides one.)
+/// diagnostic. (Two pairs here are substrings of each other — `debug_assert!(`
+/// contains `assert!(`, and `eprintln!(` contains `println!(` — so a single
+/// violating call is matched, and reported, twice; a mutation-proof run
+/// confirmed exactly this for an `eprintln!` regression. Harmless: it only
+/// ever adds a duplicate line to an already-failing assertion's message,
+/// never hides one.)
 const EMISSION_MACROS: &[&str] = &[
     "eprintln!(",
     "println!(",
