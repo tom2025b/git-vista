@@ -594,6 +594,31 @@ mod tests {
 
     // --- pure argv shape ----------------------------------------------
 
+    /// A shim-independent view of the shared fixed-selector list. The real
+    /// spawned-argv test below remains the stronger production proof; this
+    /// focused assertion can also run in a fresh failure-atlas clone, where
+    /// Cargo has not installed the top-level `gv-sandbox` executable that the
+    /// integration launcher needs.
+    ///
+    /// MUTATION  1: remove `init.templateDir=` while the environment half
+    /// remains; the operator-global template route reopens.
+    /// MUTATION 2: remove either conditional command replacement while every
+    /// older transport pin remains; an executable selector reopens.
+    #[test]
+    fn forced_network_args_pin_templates_and_conditional_commands() {
+        let args = compose_network_args(&["fetch", "origin"], None);
+        for required in [
+            "init.templateDir=",
+            "core.alternateRefsCommand=true",
+            "gc.recentObjectsHook=true",
+        ] {
+            assert!(
+                args.contains(&required),
+                "the shared Network argv omitted fixed selector {required}"
+            );
+        }
+    }
+
     /// `network_command`'s argv is exactly `command_async`'s own argv with
     /// [`FORCED_NETWORK_ARGS`] spliced in immediately after `-C <repo>`, then
     /// the transport option after the subcommand — mirrors `spawn.rs`'s

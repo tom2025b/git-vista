@@ -751,12 +751,13 @@ mod tests {
         let command = tokio::process::Command::new("/usr/bin/env");
         let output = SandboxedCommand {
             command,
-            restrict_network_transports: false,
+            restrict_network_transports: true,
             restrict_checkout_git_config: true,
         }
         .pinned_env_for_test(&[
             ("GIT_CONFIG_NOSYSTEM", "hostile-system-value"),
             ("GIT_CONFIG_GLOBAL", "/tmp/hostile-global-config"),
+            ("GIT_TEMPLATE_DIR", "/tmp/hostile-template"),
         ])
         .output()
         .await
@@ -771,6 +772,11 @@ mod tests {
         };
         assert_eq!(value("GIT_CONFIG_NOSYSTEM"), Some("1"));
         assert_eq!(value("GIT_CONFIG_GLOBAL"), Some("/dev/null"));
+        assert_eq!(
+            value("GIT_TEMPLATE_DIR"),
+            None,
+            "the higher-precedence template selector must be removed at completion"
+        );
     }
 
     /// An allowlisted name that the source does not have must not be
