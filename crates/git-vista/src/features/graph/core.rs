@@ -66,10 +66,6 @@ impl GraphCore {
         self.epoch
     }
 
-    pub fn generation(&self) -> Option<&GenerationToken> {
-        self.generation.as_ref()
-    }
-
     /// Apply a published invalidation. Only `InvalidateScope::Graph` and
     /// `InvalidateScope::Everything` are this core's business; anything else is
     /// silently `NoChange` — the invalidation was never addressed to it.

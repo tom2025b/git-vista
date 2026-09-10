@@ -113,6 +113,12 @@ impl SheetDrag {
         self.frame
     }
 
+    /// #792: no production caller — production supplies pointer IDs to
+    /// `sample`, `take_matching`, and `cancel_matching`; only tests query the
+    /// stored ID back out. `pointer_id(` also matches real calls into DOM
+    /// Pointer Event Web APIs of the same name, which is why this census
+    /// cannot exempt it by name alone.
+    #[cfg(test)]
     pub(crate) fn pointer_id(&self) -> i32 {
         self.pointer_id
     }
