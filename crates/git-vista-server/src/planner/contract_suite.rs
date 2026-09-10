@@ -128,15 +128,22 @@ fn wpath(s: &str) -> WorktreePath {
     WorktreePath::new(s).unwrap()
 }
 
-/// The full planner pipeline, driven through the real entry point with the
-/// process-global selection injected: guard → busy check → build → validate →
-/// staleness gate → execute. What every test in layer 1 and 3 drives.
+/// The full planner pipeline, driven through the injectable entry point:
+/// build → guard → busy check → validate → staleness gate → execute. What
+/// every test in layer 1 and 3 drives.
 ///
 /// Since #60 this calls [`plan_and_execute_in`] rather than re-composing the
 /// stages, so these tests exercise the production composition — mutation guard
 /// included — instead of a copy of it that could drift.
 async fn pipeline(repo: &Path, op: GitOperation) -> (StatusCode, String) {
-    plan_and_execute_in(repo, None, tokens(), op, crate::planner::DropProof::Nothing).await
+    plan_and_execute_in(
+        repo,
+        fixture_repo_key(repo),
+        tokens(),
+        op,
+        crate::planner::DropProof::Nothing,
+    )
+    .await
 }
 
 /// [`pipeline`] driven inside a tracked operation's progress scope — the shape
@@ -161,7 +168,7 @@ async fn tracked_pipeline(repo: &Path, op: GitOperation, key: &str) -> (StatusCo
         record,
         plan_and_execute_in(
             repo,
-            None,
+            fixture_repo_key(repo),
             tokens(),
             op.clone(),
             crate::planner::DropProof::Nothing,
@@ -170,6 +177,53 @@ async fn tracked_pipeline(repo: &Path, op: GitOperation, key: &str) -> (StatusCo
     .await;
     handle.finish(out.0, out.1.clone(), None);
     out
+}
+
+/// Independent repository fixtures use independent coordinator keys.
+///
+/// The first leg proves a real fixture does not use degraded mode's global
+/// fallback. The second proves the fixture key retains repository identity
+/// rather than replacing every fixture with a different shared test bucket.
+#[tokio::test]
+async fn independent_fixtures_do_not_share_a_coordinator_guard() {
+    let (_dir_a, repo_a) = seeded_repo();
+    let (_dir_b, repo_b) = seeded_repo();
+
+    let src = source("src/planner.rs");
+    for seam in ["plan_and_execute_in", "submit_plan"] {
+        assert!(
+            fn_body(&src, seam).contains("repo_id.or_else(|| fixture_repo_key(repo))"),
+            "{seam} must promote an omitted test-fixture key before reaching the coordinator"
+        );
+    }
+
+    let fallback = crate::coordinator::lock(None).await;
+    let fixture_a = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        crate::coordinator::lock(fixture_repo_key(&repo_a)),
+    )
+    .await;
+    assert!(
+        fixture_a.is_ok(),
+        "a registered fixture must not queue behind the degraded-mode guard"
+    );
+    drop(fallback);
+    drop(fixture_a);
+
+    // Bound with a leading underscore, never `let _ =`: this guard must stay held
+    // for the rest of the scope so `repo_b`'s lock is attempted while `repo_a` is
+    // still locked. `let _ =` drops immediately and would make the assertion below
+    // pass for the wrong reason.
+    let _fixture_a = crate::coordinator::lock(fixture_repo_key(&repo_a)).await;
+    let fixture_b = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        crate::coordinator::lock(fixture_repo_key(&repo_b)),
+    )
+    .await;
+    assert!(
+        fixture_b.is_ok(),
+        "distinct repository fixtures must not share a coordinator guard"
+    );
 }
 
 /// The pipeline from `validate` on, for tests that tamper with a built plan
@@ -6060,9 +6114,8 @@ async fn building_a_plan_takes_no_guard_and_submitting_takes_the_real_one() {
     let generation_before =
         generation_token(&repo, &observe_live_for_generation(&repo).await).await;
 
-    // Hold the exact guard the pipeline serializes on (repo_id None ⇒ the
-    // Unregistered bucket, the one every injected-token suite drive uses).
-    let held = crate::coordinator::lock(None).await;
+    // Hold the exact per-repository guard the fixture pipeline serializes on.
+    let held = crate::coordinator::lock(fixture_repo_key(&repo)).await;
 
     let plan = tokio::time::timeout(
         std::time::Duration::from_secs(60),
@@ -6087,7 +6140,7 @@ async fn building_a_plan_takes_no_guard_and_submitting_takes_the_real_one() {
     // hold. Two seconds is ~20× an unguarded submit's runtime here, so a
     // submit that stopped taking the guard would finish (and create the
     // branch) well inside the window and fail both assertions.
-    let submit = submit_plan(&repo, None, tokens(), plan);
+    let submit = submit_plan(&repo, fixture_repo_key(&repo), tokens(), plan);
     tokio::pin!(submit);
     assert!(
         tokio::time::timeout(std::time::Duration::from_secs(2), submit.as_mut())
@@ -6141,7 +6194,7 @@ async fn every_plan_tool_operation_builds_while_the_mutation_guard_is_held() {
     let (_dir, repo) = seeded_repo();
     let before = repo_fingerprint(&repo);
 
-    let held = crate::coordinator::lock(None).await;
+    let held = crate::coordinator::lock(fixture_repo_key(&repo)).await;
     for op in samples() {
         let label = serde_json::to_value(&op).unwrap()["op"]
             .as_str()
@@ -6188,7 +6241,7 @@ async fn the_split_path_is_byte_identical_to_the_single_shot_path() {
         let single_shot = pipeline(&repo_single, op.clone()).await;
 
         let plan = build_plan_only(&repo_split, op.clone(), tokens()).await;
-        let split = submit_plan(&repo_split, None, tokens(), plan).await;
+        let split = submit_plan(&repo_split, fixture_repo_key(&repo_split), tokens(), plan).await;
 
         assert_eq!(
             single_shot, split,
@@ -6223,7 +6276,7 @@ async fn a_stale_plan_is_refused_at_submit_and_mutates_nothing() {
     run(&repo, &["add", "b.txt"]);
     run(&repo, &["commit", "-q", "-m", "moved during review"]);
 
-    let (status, why) = submit_plan(&repo, None, tokens(), plan).await;
+    let (status, why) = submit_plan(&repo, fixture_repo_key(&repo), tokens(), plan).await;
     assert_eq!(status, StatusCode::CONFLICT, "{why}");
     assert!(why.contains("changed while this plan was pending"), "{why}");
     assert_eq!(
@@ -6243,7 +6296,7 @@ async fn a_stale_plan_is_refused_at_submit_and_mutates_nothing() {
         tokens(),
     )
     .await;
-    let (status, body) = submit_plan(&repo, None, tokens(), plan).await;
+    let (status, body) = submit_plan(&repo, fixture_repo_key(&repo), tokens(), plan).await;
     assert_ok(status, &body);
     assert_eq!(tip(&repo, "fresh"), fresh_at);
 }
@@ -6259,7 +6312,7 @@ async fn a_tampered_plan_is_refused_at_submit_and_mutates_nothing() {
     plan.operation = GitOperation::ForceDeleteBranch {
         branch: branch("side"),
     };
-    let (status, why) = submit_plan(&repo, None, tokens(), plan).await;
+    let (status, why) = submit_plan(&repo, fixture_repo_key(&repo), tokens(), plan).await;
     assert_eq!(status, StatusCode::CONFLICT, "{why}");
     assert!(why.contains("doesn't match"), "{why}");
     assert_ne!(
@@ -6288,7 +6341,7 @@ async fn an_expired_plan_is_refused_at_submit_and_mutates_nothing() {
     )
     .await;
     plan.expires_at = UnixSeconds(crate::activity::now_secs() - 1);
-    let (status, why) = submit_plan(&repo, None, tokens(), plan).await;
+    let (status, why) = submit_plan(&repo, fixture_repo_key(&repo), tokens(), plan).await;
     assert_eq!(status, StatusCode::CONFLICT, "{why}");
     assert!(why.contains("expired"), "{why}");
     assert_eq!(
@@ -6328,7 +6381,7 @@ async fn a_plan_built_for_another_selection_is_refused_at_submit() {
         RepositoryToken::new("other-repo").unwrap(),
         WorktreeToken::new("other-worktree").unwrap(),
     );
-    let (status, why) = submit_plan(&repo_b, None, other, plan.clone()).await;
+    let (status, why) = submit_plan(&repo_b, fixture_repo_key(&repo_b), other, plan.clone()).await;
     assert_eq!(status, StatusCode::CONFLICT, "{why}");
     assert!(why.contains("different repository or worktree"), "{why}");
     assert_eq!(
@@ -6341,7 +6394,7 @@ async fn a_plan_built_for_another_selection_is_refused_at_submit() {
     // through `enforce_fresh` against the twin — its generation matches —
     // and executes. This is the leg that proves the refusal above came from
     // the token check and could not have come from the generation.
-    let (status, body) = submit_plan(&repo_b, None, tokens(), plan).await;
+    let (status, body) = submit_plan(&repo_b, fixture_repo_key(&repo_b), tokens(), plan).await;
     assert_ok(status, &body);
     assert_eq!(
         tip(&repo_b, "crossed"),
@@ -6395,8 +6448,8 @@ async fn a_generation_invisible_break_while_queued_is_refused_by_the_gates_live_
         "PushBranch no longer carries RemoteConfigured — this test's premise is gone"
     );
 
-    let held = crate::coordinator::lock(None).await;
-    let submit = submit_plan(&repo, None, tokens(), plan);
+    let held = crate::coordinator::lock(fixture_repo_key(&repo)).await;
+    let submit = submit_plan(&repo, fixture_repo_key(&repo), tokens(), plan);
     tokio::pin!(submit);
     // Two seconds is ~20× an unguarded submit's runtime (see the guard test
     // above): by the time this times out, `observe_for_submission` has read
@@ -6483,7 +6536,7 @@ async fn review_window_remote_drift_fails_closed_with_the_never_configured_refus
     run(&repo_b, &["remote", "remove", "origin"]);
     let fingerprint = repo_fingerprint(&repo_b);
 
-    let split = submit_plan(&repo_b, None, tokens(), plan).await;
+    let split = submit_plan(&repo_b, fixture_repo_key(&repo_b), tokens(), plan).await;
     assert!(
         !split.0.is_success(),
         "review-window remote drift must fail closed on the split path: {}",
@@ -6545,7 +6598,7 @@ async fn review_window_seed_drift_fails_closed_with_the_never_recorded_refusal()
     std::fs::remove_file(state.join("seed-refs")).unwrap();
     std::fs::remove_file(state.join("seed-head")).unwrap();
 
-    let split = submit_plan(&repo_b, None, tokens(), plan).await;
+    let split = submit_plan(&repo_b, fixture_repo_key(&repo_b), tokens(), plan).await;
     assert_eq!(
         single_shot, split,
         "seed drift during the review window must be indistinguishable from a \
