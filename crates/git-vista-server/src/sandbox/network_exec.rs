@@ -538,8 +538,8 @@ fn redact_bytes(bytes: &[u8]) -> Vec<u8> {
 /// that want to log or journal "ran: git <args…>" style diagnostics.
 ///
 /// [`redact_output`] only ever sees a spawn's captured stdout/stderr —
-/// `run_network_git`'s own `args: &[&str]` parameter is a second sink for
-/// exactly the same secret shape, since every SSH test in this file (and
+/// `sandboxed`'s (`git_cmd.rs`) `args: &[&str]` parameter is a second sink
+/// for exactly the same secret shape, since every SSH test in this file (and
 /// every real caller) routinely passes the remote URL as one of `args`
 /// (`&["push", &fixture.repo_url, …]`). Nothing upstream can redact args on
 /// this module's behalf — a caller that logs `args` directly bypasses
@@ -547,8 +547,24 @@ fn redact_bytes(bytes: &[u8]) -> Vec<u8> {
 /// [`redact_url_userinfo`] treatment as a first-class, explicit primitive
 /// rather than leaving args logging to rediscover (or forget) the need for
 /// it independently.
-#[allow(dead_code)] // no caller yet — see this file's module doc; wired in
-                    // once a diagnostic/journal path logs the argv.
+///
+/// # #801: this had no caller, and that was the wrong state to leave it in
+///
+/// This function used to carry `#[allow(dead_code)]` and a comment promising
+/// it was "wired in once a diagnostic/journal path logs the argv" — with
+/// nothing tracking that wiring, and nothing stopping a future log line from
+/// being added without it. It now has a real one:
+/// [`super::reconcile_need`]'s D3 cross-check, the one place in this crate
+/// that already formatted a Network-tier spawn's raw `args` into a
+/// diagnostic message (a `debug_assert!` panic message and a release
+/// `eprintln!`) — reached only when a caller has already mislabelled a
+/// remote-shaped operation `Local`, but reachable, and unredacted until that
+/// fix landed in the same commit as this comment. `argv_boundary`'s
+/// `argv_redaction_boundary` module is the tripwire that keeps a *future*
+/// site like it from reintroducing the same gap: it scans this crate's known
+/// Network-tier/chokepoint sink functions for exactly this pattern — a
+/// logging or panic macro that names `args` without routing it through this
+/// function first.
 pub(crate) fn redact_args(args: &[&str]) -> Vec<String> {
     args.iter().map(|a| redact_url_userinfo(a)).collect()
 }
