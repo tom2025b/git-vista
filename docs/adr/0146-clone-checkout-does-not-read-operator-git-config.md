@@ -1,0 +1,217 @@
+# ADR 0146 — Clone checkout does not read operator Git config
+
+- **Status:** Accepted — implemented; mutation proof recorded below
+- **Date:** 2026-09-10
+- **Issue:** #782; explicit LFS and least-authority follow-up #831
+- **Supersedes in part:** [ADR 0128](0128-a-credential-exists-only-before-untrusted-checkout.md) and [ADR 0137](0137-an-untrusted-checkout-inherits-an-allowlist.md) — fresh-clone checkout no longer preserves operator-selected hooks, filters, or Git LFS configuration
+- **Extends:** [ADR 0144](0144-network-spawns-use-server-authored-transport-programs.md) — adds three fixed config selectors and one higher-precedence environment control to the shared Network launcher
+
+## Context
+
+ADRs 0128 and 0137 deliberately kept clone checkout in the Network tier with
+`HookMode::Run`, TCP access, and filter execution. Their compatibility reason
+was concrete: a `git-lfs` smudge filter is a legitimate checkout-time network
+consumer. They removed credentials and the SSH agent from that phase, but
+preserved system, global, and repository-local Git configuration so Git could
+select the filter.
+
+PR #827 changes that decision. A remote controls `.gitattributes`, and an
+attribute can name any filter. There is no safe key list that distinguishes a
+legitimate global `filter.lfs.*` command from another operator-configured
+arbitrary command after the remote chooses the name. The checkout launcher now
+sets `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL=/dev/null` immediately
+before spawn. The latter suppresses both `$HOME/.gitconfig` and
+`$XDG_CONFIG_HOME/git/config` on Git 2.53.0. Repository-local config remains
+readable.
+
+### The transfer-to-checkout bypass
+
+Disabling operator config only at checkout was insufficient. Clone transfer
+runs first as:
+
+```text
+git clone --no-checkout -- <url> <destination>
+```
+
+Git init templates are copied into the destination during that command. A
+template may contain both executable `.git/hooks/*` files and a `.git/config`.
+The later hardened checkout deliberately trusts repository-local config and
+hooks, so an operator-selected template could seed a filter definition that a
+remote `.gitattributes` selects, then execute it after the credentialed
+transfer exits. It could also seed a `post-checkout` hook directly. The
+two-phase credential boundary did not prevent the first phase from manufacturing
+executable authority for the second.
+
+This was reproduced through the compiled launchers. The control ran an
+unhardened `clone --no-checkout`, followed by the production hardened checkout;
+both the template's filter marker and its executable `post-checkout` marker ran.
+
+### Two more transfer selectors
+
+`core.alternateRefsCommand` can execute while Git enumerates alternate refs for
+connectivity work. `gc.recentObjectsHook` can execute when fetch-triggered
+maintenance determines which objects are recent. They are fixed-name command
+selectors and belong at the same shared Network argv boundary as askpass,
+fsmonitor, proxy, and pack-program pins. A route-scoped negative measurement is
+not a reason to leave a command selector repository-controlled when its
+conditional consumer exists in the same process class.
+
+## Decision
+
+### 1. Neutralize templates before transfer creates the repository
+
+Every Network command receives `-c init.templateDir=` before its subcommand.
+That overrides system and global `init.templateDir` for clone without requiring
+Git-Vista to parse those scopes.
+
+The launcher also removes inherited `GIT_TEMPLATE_DIR` at completion, after any
+test-only environment replacement and immediately before spawn. This second
+control is independently load-bearing: Git gives the environment variable
+higher precedence than `-c init.templateDir=`, so the argv pin alone does not
+stop an inherited template.
+
+The production regression drives the complete transfer-to-checkout chain. Its
+control proves that a template config plus remote attribute executes a smudge
+driver and that a template hook executes; its hardened leg requires the cloned
+config and hook to be absent, the payload to materialize, and both markers to
+remain absent.
+
+### 2. Replace one conditional command and disable the other's consumer
+
+Every Network command also receives:
+
+```text
+-c core.alternateRefsCommand=true
+-c maintenance.auto=false
+```
+
+For `core.alternateRefsCommand`, `true` is selected through the already-trusted
+executable environment, ignores any arguments, emits no object IDs, and exits
+successfully. An empty value was not chosen because it is not a documented
+portable spelling for "disabled" and could turn a safe no-op into a transfer
+failure.
+
+`gc.recentObjectsHook` is different: Git reads it as a multi-valued list and
+runs every entry, so appending `true` would leave every earlier executable in
+the chain. The production Network routes do not explicitly run maintenance;
+fetch/pull can trigger `git maintenance run --auto` after transfer. Forcing
+`maintenance.auto=false` disables that consumer before it can read the hook
+list. This deliberately gives up automatic foreground maintenance during
+Network operations; scheduled or explicit maintenance outside this launcher is
+unchanged. The exact argv order is asserted through a real spawned argument
+dumper.
+
+### 3. Fresh-clone checkout has no selectable executable filter or hook
+
+Checkout continues to read repository-local config in general. On the fresh
+clone path, however, that config is generated by the template-neutralized
+transfer; a source repository's local config is not copied. System and global
+config are disabled, `.git/hooks` is not populated from a template, and remote
+tracked content cannot populate `.git/hooks`. A remote `.gitattributes` may
+still name a filter, but no operator or remote-supplied driver is selectable.
+
+`HookMode::Run` and the TCP ports in `CLONE_CHECKOUT_PORTS` remain as latent
+capabilities, not legitimate fresh-clone consumers. Removing them in this
+repair would combine a second policy transition with the config-scope fix and
+would prejudge the explicit LFS design. #831 owns both restoring an explicit,
+server-authored HTTPS LFS route and removing any checkout authority that route
+does not need.
+
+### 4. Accept and surface the LFS compatibility break
+
+This decision does **not** preserve current Git LFS checkout behavior. On this
+host, Git 2.53.0 and git-lfs 3.7.1 place `filter.lfs.clean`, `smudge`, `process`,
+and `required=true` in system config; none is global. With system/global config
+disabled, `git checkout -f` of an LFS-attributed pointer exits 0 and writes the
+pointer text verbatim. Because the same hidden scope contains
+`filter.lfs.required=true`, the missing filter is not an error.
+
+The degradation is therefore **silent**: Git-Vista reports a successful clone
+while the worktree contains pointer stubs, with no signal in the application,
+server log, or HTTP response. #831 is required follow-up work, not evidence that
+an LFS route survives this decision. #782 remains open because its transfer,
+clean/add measurements, compatibility decision, and preserved-HTTPS acceptance
+criteria are not complete.
+
+## Alternatives considered, and why they lost
+
+### Preserve only `filter.lfs.*` from operator config
+
+Rejected. Replaying effective values requires either trusting executable
+strings read from the same merged config under attack or implementing a partial
+Git config engine with include, conditional-include, URL, quoting, and
+precedence semantics. A key prefix also does not constrain
+`lfs.customtransfer.*` or `lfs.extension.*`. A supported LFS route must be
+server-authored or separately mediated, not copied from ambient executable
+configuration.
+
+### Deny a census of dangerous filter names
+
+Rejected on shape. `.gitattributes` chooses the name, so every name not yet in
+the census is another executable surface. Removing both operator-controlled
+config scopes is the closed boundary.
+
+### Keep checkout compatibility and rely on credential/AF_UNIX isolation
+
+Rejected. Those controls limit what an executed filter receives; they do not
+make remote-selected arbitrary execution acceptable. TCP remains a direct
+exfiltration capability even with credentials and AF_UNIX removed.
+
+### Drop all checkout TCP and hook capability now
+
+Deferred to #831. It is the least-authority endpoint if no explicit LFS
+consumer remains, but implementing it here would add a second behavioral
+change without the dedicated mutation proof and compatibility design it
+deserves. The retained authority is stated as unused rather than described as
+support for a route that no longer exists.
+
+## Consequences
+
+- Fresh clone transfer cannot import hooks or config through either
+  `init.templateDir` config or inherited `GIT_TEMPLATE_DIR`.
+- Network commands cannot select a repository/operator
+  `core.alternateRefsCommand`; fetch/pull cannot launch the multi-valued
+  `gc.recentObjectsHook` chain because automatic maintenance is disabled.
+- Fresh-clone checkout cannot execute operator-selected hooks or filters.
+- Existing fetch/pull/push operations on pre-existing repositories still have
+  their separately documented hook/filter posture; this is not a global hook
+  ban.
+- HTTPS Git LFS materialization is currently lost when its filter definition is
+  only system/global, and that loss is silent.
+- TCP and `HookMode::Run` remain provisioned to checkout pending #831 despite
+  having no legitimate fresh-clone consumer today.
+
+## Verification
+
+The compiled server-bin tests exercise the production launchers with real Git:
+
+- `clone_checkout_ignores_system_home_and_xdg_filter_commands` uses a synthetic
+  system file plus the real `$HOME/.gitconfig` and
+  `$XDG_CONFIG_HOME/git/config` paths. Its control executes all three filters;
+  the hardened leg executes none and materializes all payloads.
+- `clone_transfer_cannot_seed_checkout_filters_or_hooks_from_a_template`
+  proves the live cross-phase bypass in its control and proves both template
+  selectors neutralized in production.
+- `checkout_config_policy_overrides_test_environment_at_completion` removes
+  the integration control's extra argv, transport, and sandbox variables: a
+  spawned child reads back the two completion-time overrides directly.
+- `network_command_pins_every_fixed_selector_and_the_transport_program` reads
+  the spawned argv rather than re-deriving the constant.
+
+Failure-atlas ran against committed, clean baselines; all four conclusive arms
+were `caught`:
+
+| Boundary | Mutation | Record | Result |
+|---|---|---:|---|
+| Checkout config policy is reached | Remove `apply_checkout_git_config_policy` from completion | 546 | **caught** — both hostile values reached the child |
+| Both config scopes are required | Keep `GIT_CONFIG_NOSYSTEM=1`, remove `GIT_CONFIG_GLOBAL=/dev/null` | 547 | **caught** — the hostile global path reached the child |
+| Environment template precedence is closed | Stop removing inherited `GIT_TEMPLATE_DIR` | 548 | **caught** — the hostile template path reached the child |
+| Config template precedence is closed | Replace empty `init.templateDir=` with an operator path | 555 | **caught** — the exact safe-value assertion failed |
+
+The first attempt to mutate the real-Git integration test had a red baseline in
+the atlas clone because that fresh Cargo target did not contain the top-level
+`gv-sandbox` executable; it was non-conclusive and is not counted. The focused
+child-process probe exists to remove that artifact dependency while retaining
+the full production-launcher integration tests above.
+
+Signed: **codex** · 2026-09-10
