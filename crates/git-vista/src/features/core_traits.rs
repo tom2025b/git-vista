@@ -33,8 +33,7 @@ pub trait FeatureCore {
 /// `Commit`/`Repository` directly, which is what an operation's target
 /// actually is. Both variants had zero constructors anywhere, in any build
 /// (host test or wasm), and no match arm depended on them. No spec or open
-/// issue cites either as needed groundwork, unlike the M12 external-changes
-/// spec's citation of `InvalidateScope` below — deleted rather than kept.
+/// issue cites either as needed groundwork — deleted rather than kept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestTarget {
     Repository,
@@ -80,45 +79,38 @@ pub struct Invalidate {
     pub scope: InvalidateScope,
 }
 
-/// #783: none of `Graph`/`Status`/`Activity` below has a production publisher
-/// today — `OperationsCore::settle` (`features/operations/core.rs`) always
-/// publishes `Everything` (a write can move refs, the tree and the journal at
-/// once, so a self-write has no reason to narrow the scope). All three read
-/// as "never constructed" on a wasm production build. They are kept anyway,
-/// not deleted, because the M12 external-changes decision spec
-/// (`docs/superpowers/specs/m3.26-external-changes.md`'s own "checked rather
-/// than assumed" table) already cites this exact vocabulary —
-/// `InvalidateScope::{Everything, Graph, Status, Activity}` — as **DONE**
-/// groundwork that #551 (open, blocks #552-#556) builds its file-watch/sweep
-/// producer on top of. Deleting any of the three now would mean that
-/// currently-open work has to re-add it.
+/// #783: this enum used to also carry `Status` and `Activity`. Both were
+/// deleted, and the deletion needed a second pass to get right — the first
+/// draft of this comment argued for keeping them by citing #551 (M12) and #68
+/// (M2.15) as open work that would consume them. **Checked again: both are
+/// CLOSED** (#68 since 2026-08-07; #551 and its children #552-#556 since
+/// 2026-09-06), and neither shipped anything that constructs or matches
+/// either variant. M12 built an entirely separate mechanism for external
+/// changes instead — `git_vista_protocol::change_feed` /
+/// `features/freshness/core.rs` — with zero references to `InvalidateScope`.
+/// #68 wired the status feature through `status::signals::create`/
+/// `fetch_status()` directly, never through this enum. Grepping the current
+/// tree confirms neither variant had a matcher anywhere, at any point in this
+/// investigation, and no other open issue names a replacement plan. The
+/// reason to keep them was borrowed from milestones whose own completed work
+/// didn't need them; once that borrowed reason is subtracted, nothing argues
+/// for keeping speculative vocabulary no one is building toward. Deleted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidateScope {
     Everything,
-    /// The one sibling with a real consumer already built: `GraphCore::
-    /// on_invalidate` (`features/graph/core.rs`) matches `Graph` unconditionally
-    /// as a case distinct from `Everything`, so this can never be `#[cfg(test)]`-
-    /// gated without editing that live, always-compiled match arm — a change to
-    /// invalidation behaviour, not a dead-code cleanup. Constructed today only
-    /// by `graph/core/graph_core_suite.rs`'s tests of that matcher.
+    /// Survives for a code-structural reason, independent of any issue
+    /// tracker state: `GraphCore::on_invalidate` (`features/graph/core.rs`)
+    /// matches `Graph` unconditionally as a case distinct from `Everything`,
+    /// in code that ships to every build. Deleting the variant would force
+    /// editing that live, always-compiled match arm to compensate — a change
+    /// to invalidation behaviour dressed as dead-code cleanup, not a cleanup
+    /// itself. No current publisher constructs it in production
+    /// (`OperationsCore::settle`, `features/operations/core.rs`, always
+    /// publishes `Everything`), so it is `#[allow(dead_code)]`; it is
+    /// exercised only by `graph/core/graph_core_suite.rs`'s tests of that
+    /// matcher.
     #[allow(dead_code)]
     Graph,
-    /// #68 (M2.15): `features/status/mod.rs`'s own module doc already documents
-    /// this as the "documented destination" for the working-tree-status state
-    /// machine M1.11 deliberately left unbuilt ("writing speculative state here
-    /// would be worse than leaving a shaped hole"). No constructor and no
-    /// matcher exist yet; both are #68's to add.
-    #[allow(dead_code)]
-    Status,
-    /// No matcher exists anywhere (unlike `Graph`) — the Activity panel's own
-    /// data currently rides the blanket `Everything` invalidation like
-    /// everything else. Named explicitly in the M12 spec table above rather
-    /// than merely plausible; #551 owns wiring a real producer/consumer pair
-    /// for it, or removing it if M12 lands without needing scope precision
-    /// this fine. Constructed today only by `graph_core_suite.rs`'s negative
-    /// test (an invalidation scoped somewhere GraphCore doesn't care about).
-    #[allow(dead_code)]
-    Activity,
 }
 
 #[cfg(test)]

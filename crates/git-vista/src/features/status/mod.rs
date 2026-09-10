@@ -20,7 +20,15 @@ pub mod detail;
 #[cfg(target_arch = "wasm32")]
 pub mod signals;
 
-/// Placeholder so the module has a public surface and `InvalidateScope::Status` has a
-/// documented destination. Carries no state by design.
+/// Placeholder so the module has a public surface. Carries no state by design.
+///
+/// #783: this used to also justify itself as giving `InvalidateScope::Status`
+/// "a documented destination" — that variant is deleted now
+/// (`features/core_traits.rs`). #68 (M2.15) shipped without ever
+/// constructing or matching it: the status feature reads through
+/// [`signals::create`]/`fetch_status()` directly, never through an
+/// invalidation scope. This struct's own reason for existing (a public
+/// surface placeholder) still holds independent of that; only the specific
+/// claim about `InvalidateScope::Status` was removed.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct StatusSeam;
