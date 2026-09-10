@@ -23,14 +23,24 @@ pub trait FeatureCore {
 }
 
 /// What a request was about, so an out-of-order response can be recognised.
+///
+/// #783: this used to also carry `Page(u64)` and `Operation(String)`, from the
+/// original M1.11 design doc's plan to generalise `PageRequestKey`'s own
+/// fencing (`features/graph/core.rs`) and per-operation fencing into this one
+/// type. Neither generalisation ever happened — `PageRequestKey` remains its
+/// own separate, still-used mechanism, and every real operation fence
+/// (`menu/{branch,tag,commit,remote}_items.rs`) already uses `Branch`/`Tag`/
+/// `Commit`/`Repository` directly, which is what an operation's target
+/// actually is. Both variants had zero constructors anywhere, in any build
+/// (host test or wasm), and no match arm depended on them. No spec or open
+/// issue cites either as needed groundwork, unlike the M12 external-changes
+/// spec's citation of `InvalidateScope` below — deleted rather than kept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestTarget {
     Repository,
     Branch(String),
     Tag(String),
     Commit(String),
-    Page(u64),
-    Operation(String),
 }
 
 /// Identity carried by every async continuation that writes shared state.
@@ -70,11 +80,44 @@ pub struct Invalidate {
     pub scope: InvalidateScope,
 }
 
+/// #783: none of `Graph`/`Status`/`Activity` below has a production publisher
+/// today — `OperationsCore::settle` (`features/operations/core.rs`) always
+/// publishes `Everything` (a write can move refs, the tree and the journal at
+/// once, so a self-write has no reason to narrow the scope). All three read
+/// as "never constructed" on a wasm production build. They are kept anyway,
+/// not deleted, because the M12 external-changes decision spec
+/// (`docs/superpowers/specs/m3.26-external-changes.md`'s own "checked rather
+/// than assumed" table) already cites this exact vocabulary —
+/// `InvalidateScope::{Everything, Graph, Status, Activity}` — as **DONE**
+/// groundwork that #551 (open, blocks #552-#556) builds its file-watch/sweep
+/// producer on top of. Deleting any of the three now would mean that
+/// currently-open work has to re-add it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidateScope {
     Everything,
+    /// The one sibling with a real consumer already built: `GraphCore::
+    /// on_invalidate` (`features/graph/core.rs`) matches `Graph` unconditionally
+    /// as a case distinct from `Everything`, so this can never be `#[cfg(test)]`-
+    /// gated without editing that live, always-compiled match arm — a change to
+    /// invalidation behaviour, not a dead-code cleanup. Constructed today only
+    /// by `graph/core/graph_core_suite.rs`'s tests of that matcher.
+    #[allow(dead_code)]
     Graph,
+    /// #68 (M2.15): `features/status/mod.rs`'s own module doc already documents
+    /// this as the "documented destination" for the working-tree-status state
+    /// machine M1.11 deliberately left unbuilt ("writing speculative state here
+    /// would be worse than leaving a shaped hole"). No constructor and no
+    /// matcher exist yet; both are #68's to add.
+    #[allow(dead_code)]
     Status,
+    /// No matcher exists anywhere (unlike `Graph`) — the Activity panel's own
+    /// data currently rides the blanket `Everything` invalidation like
+    /// everything else. Named explicitly in the M12 spec table above rather
+    /// than merely plausible; #551 owns wiring a real producer/consumer pair
+    /// for it, or removing it if M12 lands without needing scope precision
+    /// this fine. Constructed today only by `graph_core_suite.rs`'s negative
+    /// test (an invalidation scoped somewhere GraphCore doesn't care about).
+    #[allow(dead_code)]
     Activity,
 }
 
