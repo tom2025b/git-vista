@@ -5,6 +5,7 @@
 - **Issues:** #702, #704, #723 — locator removal and capability denial are separate halves
 - **Extends:** [ADR 0128](0128-a-credential-exists-only-before-untrusted-checkout.md) (the credential boundary this widens from three names to a built environment)
 - **Supersedes in part:** [ADR 0033](0033-ssh-remote-carveout.md) — its safety argument for granting the SSH agent socket and `known_hosts` to `policy_for_clone`. ADR 0033 stands unchanged for `policy_for`.
+- **Superseded in part by:** [ADR 0146](0146-clone-checkout-does-not-read-operator-git-config.md) — checkout no longer preserves operator-selected hooks, filters, or Git LFS configuration
 - **Related:** [ADR 0028](0028-network-tier-ports-not-hosts.md) (a port grant is not an egress policy — read before believing the port half buys more than it does), [ADR 0122](0122-the-token-is-a-credential-not-a-header.md), [ADR 0123](0123-the-safety-lives-in-the-shape-not-a-list.md)
 
 ## Context

@@ -4,6 +4,7 @@
 - **Date:** 2026-09-06
 - **Issue:** #680
 - **Extends:** [ADR 0122](0122-the-token-is-a-credential-not-a-header.md)
+- **Superseded in part by:** [ADR 0146](0146-clone-checkout-does-not-read-operator-git-config.md) — checkout no longer preserves operator-selected hooks, filters, or Git LFS configuration
 - **Related:** [ADR 0119](0119-a-guarantee-that-holds-only-on-the-success-arm-is-not-a-guarantee.md) (the safety lives in the value on every outcome)
 
 ## Context

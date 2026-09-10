@@ -359,6 +359,11 @@ impl SandboxedCommand {
             self.command
                 .env("GIT_ALLOW_PROTOCOL", "http:https:ssh:git:file");
             self.command.env("GIT_PROXY_COMMAND", "");
+            // `GIT_TEMPLATE_DIR` outranks `-c init.templateDir=`. Removing the
+            // inherited value is therefore the other half of preventing a
+            // clone transfer from copying operator-selected hooks and config
+            // into the new repository before its hardened checkout begins.
+            self.command.env_remove("GIT_TEMPLATE_DIR");
         }
     }
 
