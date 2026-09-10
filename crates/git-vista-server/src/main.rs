@@ -183,9 +183,11 @@ use history::CursorCodec;
 use ratelimit::SignInLimiter;
 use security::{AuthState, HostPolicy};
 use session::{SessionManager, BOOTSTRAP_REFRESH_INTERVAL};
+#[cfg(test)]
+use state::PORT;
 use state::{
-    bind_addr, bootstrap_token_path, current, lan_bind_addr, set_current, DEFAULT_REPO, DIST_DIR,
-    PORT,
+    bind_addr, bootstrap_token_path, configured_port, current, lan_bind_addr, set_current,
+    DEFAULT_REPO, DIST_DIR,
 };
 
 #[tokio::main]
@@ -321,10 +323,18 @@ async fn main() {
         );
     }
 
-    // Resolve the fixed loopback address first. `bind_addr` rejects every
+    let port = match configured_port() {
+        Ok(port) => port,
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(2);
+        }
+    };
+
+    // Resolve the fixed loopback host at the configured port. `bind_addr` rejects every
     // non-loopback override so neither a stale launcher nor a service file can
     // expose this plain-HTTP control surface.
-    let addr = match bind_addr() {
+    let addr = match bind_addr(port) {
         Ok(addr) => addr,
         Err(error) => {
             eprintln!("error: {error}");
@@ -343,7 +353,7 @@ async fn main() {
             eprintln!("error: could not bind {addr}: {error}");
             if error.kind() == ErrorKind::AddrInUse {
                 eprintln!(
-                    "  Port {PORT} is already in use — another git-vista-server may be running."
+                    "  Port {port} is already in use — another git-vista-server may be running."
                 );
                 eprintln!("  Run `gv doctor`, then stop it with its owning launcher/service.");
             }
@@ -355,7 +365,7 @@ async fn main() {
     // responsible for auto-detecting the LAN IP or requiring --lan-ip before
     // ever setting GIT_VISTA_LAN_IP, so a rejection here is a clean startup
     // error, matching the loopback bind_addr() error path above.
-    let lan_addr = match lan_bind_addr() {
+    let lan_addr = match lan_bind_addr(port) {
         None => None,
         Some(Ok(addr)) => Some(addr),
         Some(Err(error)) => {
@@ -402,13 +412,13 @@ async fn main() {
     let history_codec = Arc::new(CursorCodec::new());
     let loopback_app = build_app(
         loopback_session_state,
-        HostPolicy::loopback(PORT),
+        HostPolicy::loopback(port),
         true,
         history_codec.clone(),
         request_token_resolver.clone(),
     );
 
-    print_startup_banner(&bootstrap_token_path(), lan_addr);
+    print_startup_banner(&bootstrap_token_path(), addr, lan_addr);
 
     match lan_listener {
         Some(lan_listener) => {
@@ -422,7 +432,7 @@ async fn main() {
             };
             let lan_app = build_app(
                 lan_session_state,
-                HostPolicy::lan(lan_ip, PORT),
+                HostPolicy::lan(lan_ip, port),
                 false,
                 history_codec.clone(),
                 request_token_resolver.clone(),
@@ -954,11 +964,16 @@ fn panic_to_response(panic: Box<dyn std::any::Any + Send>) -> axum::response::Re
 /// Print the supported access paths: local loopback, an SSH tunnel whose remote
 /// endpoint is that same loopback listener, and — only when `lan_addr` is
 /// `Some` — the LAN view profile's plain-HTTP address and its documented risk.
-fn print_startup_banner(token_path: &Path, lan_addr: Option<SocketAddr>) {
+fn print_startup_banner(
+    token_path: &Path,
+    loopback_addr: SocketAddr,
+    lan_addr: Option<SocketAddr>,
+) {
+    let port = loopback_addr.port();
     println!("git-vista server — serving {}", current().0.display());
-    println!("  • on this machine: http://localhost:{PORT}/");
-    println!("  • from the iPad: use an SSH local port forward to 127.0.0.1:{PORT}");
-    println!("    example: ssh -N -L {PORT}:127.0.0.1:{PORT} <linux-host>");
+    println!("  • on this machine: http://localhost:{port}/");
+    println!("  • from the iPad: use an SSH local port forward to {loopback_addr}");
+    println!("    example: ssh -N -L {port}:{loopback_addr} <linux-host>");
     match lan_addr {
         Some(addr) => {
             println!("  • LAN view (ADR 0005, read-only): http://{addr}/");

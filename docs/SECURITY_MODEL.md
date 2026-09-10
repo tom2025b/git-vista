@@ -401,7 +401,7 @@ filter failure makes the clone fail instead of leaving a silent pointer stub.
 Only TCP 443 remains in the checkout policy. [#782](https://github.com/tom2025b/git-vista/issues/782)
 retains the broader measurements that are not part of this clone repair. See
 [ADR 0144's amendment](adr/0144-network-spawns-use-server-authored-transport-programs.md)
-and [ADR 0147](adr/0147-clone-checkout-uses-one-server-authored-lfs-filter.md)
+and [ADR 0148](adr/0148-clone-checkout-uses-one-server-authored-lfs-filter.md)
 for compatibility and behavioral proof.
 
 ### Network-tier spawn and hook posture — #744 census

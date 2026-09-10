@@ -2,8 +2,8 @@
 //!
 //! # Why hand-rolled
 //!
-//! This crate talks to exactly one server — git-vista-server, loopback-only on
-//! its fixed port — and calls two kinds of endpoint, both of which answer
+//! This crate talks to exactly one server — git-vista-server's default
+//! loopback instance — and calls two kinds of endpoint, both of which answer
 //! small JSON bodies with an explicit `Content-Length` (axum always sets it
 //! for these routes). A full HTTP client crate (reqwest, hyper-as-client)
 //! would add a dependency tree that `docs/NATIVE_DEPENDENCIES.md`'s review
@@ -29,9 +29,9 @@ use std::time::Duration;
 
 use git_vista_protocol::{IDEMPOTENCY_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION};
 
-/// The server's fixed loopback endpoint. Mirrors `state::PORT` (8080), which
-/// is a compile-time constant on the server side by design (loopback-only,
-/// no env override) — so a mirror here is stable, not fragile.
+/// The default server's loopback endpoint. The server can use another port for
+/// isolated harnesses, but this client cannot select it yet; endpoint and token
+/// selection remain part of #130's full instance contract.
 const SERVER: &str = "127.0.0.1:8080";
 
 /// A per-read-syscall bound (`SO_RCVTIMEO`), honestly named: `read_to_end`

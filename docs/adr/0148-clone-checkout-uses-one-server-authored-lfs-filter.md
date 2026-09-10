@@ -1,4 +1,4 @@
-# ADR 0147 — Clone checkout uses one server-authored LFS filter
+# ADR 0148 — Clone checkout uses one server-authored LFS filter
 
 - **Status:** Accepted — implemented; mutation proof recorded below
 - **Date:** 2026-09-10

@@ -5,7 +5,7 @@
 - **Issues:** #702, #704, #723 — locator removal and capability denial are separate halves
 - **Extends:** [ADR 0128](0128-a-credential-exists-only-before-untrusted-checkout.md) (the credential boundary this widens from three names to a built environment)
 - **Supersedes in part:** [ADR 0033](0033-ssh-remote-carveout.md) — its safety argument for granting the SSH agent socket and `known_hosts` to `policy_for_clone`. ADR 0033 stands unchanged for `policy_for`.
-- **Superseded in part by:** [ADR 0146](0146-clone-checkout-does-not-read-operator-git-config.md) and [ADR 0147](0147-clone-checkout-uses-one-server-authored-lfs-filter.md) — checkout no longer preserves operator-selected hooks/filters; it now restores only a server-authored LFS driver and blocks hooks
+- **Superseded in part by:** [ADR 0146](0146-clone-checkout-does-not-read-operator-git-config.md) and [ADR 0148](0148-clone-checkout-uses-one-server-authored-lfs-filter.md) — checkout no longer preserves operator-selected hooks/filters; it now restores only a server-authored LFS driver and blocks hooks
 - **Related:** [ADR 0028](0028-network-tier-ports-not-hosts.md) (a port grant is not an egress policy — read before believing the port half buys more than it does), [ADR 0122](0122-the-token-is-a-credential-not-a-header.md), [ADR 0123](0123-the-safety-lives-in-the-shape-not-a-list.md)
 
 ## Context
@@ -568,7 +568,7 @@ is the repository-owned replay that keeps it true after that review is gone.
 | M12 (current mutation matrix) | Delete the complete `if net == NetScope::Checkout` block that inserts argument-scoped AF_UNIX rules for `SYS_socket` and `SYS_socketpair`; leave Strict and ordinary Network untouched | remove | **caught** by the exact composed hook test after the matrix compiled the mutated shim: the checkout succeeded and its TCP leg connected, but the hook's AF_UNIX result became `connected` instead of `errno:1`. Every declarative escape case stayed green, demonstrating that the mutant removed only the checkout-specific mechanism. The patch applies with zero fuzz to the source this row names. |
 
 - **`handlers::clone::clone_checkout_runs_a_filter_with_only_an_allowlisted_environment`**
-  is #680's canary widened and updated for ADR 0147's hook block. It builds a
+  is #680's canary widened and updated for ADR 0148's hook block. It builds a
   source repository with a tracked path carrying a generic filter attribute,
   performs the credentialed `--no-checkout` transfer, confirms no content and
   no marker, plants the filter in the destination as a same-user test control,
