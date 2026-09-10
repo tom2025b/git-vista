@@ -76,11 +76,15 @@ workspace formatting checks pass. Two compiled-code mutations were caught by
 both marker tests: removing the transport policy, and replacing it with the
 naive `protocol.allow=never` / `core.gitProxy=none` config pins. In each mutation
 both forbidden programs actually ran, causing the marker-absence assertions to
-fail. Production source was restored after each experiment.
+fail. Production source was restored after each experiment. These PR #797 runs
+were not recorded in failure-atlas, so there are no atlas IDs to cite; the
+contemporaneous record is PR #797's validation report, paired with the in-test
+positive controls for both naive pins.
 
 The remainder of this ADR records PR #775's original decision and evidence;
 its proxy and installed-helper residuals are superseded by this amendment.
-LFS is tracked separately; #755's closure still requires its broader reassessment.
+LFS is tracked separately; the broader reassessment and decision to retire #755
+are recorded in the [#755 closeout](../investigations/2026-09-10-issue-755-closeout.md).
 
 Signed: **codex** · 2026-09-09
 

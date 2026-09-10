@@ -16,7 +16,8 @@ Closing the parent does not declare that checkout/filter work complete.
 | `core.gitProxy` remained executable while native `git://` stayed enabled. | Fixed without disabling native Git. Every Network command gets an empty `GIT_PROXY_COMMAND`, which bypasses configured proxy commands. | [ADR 0144's #779 amendment](../adr/0144-network-spawns-use-server-authored-transport-programs.md#779-amendment--fixed-transport-policy-2026-09-09) and [PR #797](https://github.com/tom2025b/git-vista/pull/797). |
 | Repository policy could select installed or worktree-relative `git-remote-*` helpers. | Fixed for the reachable selector. The sealed `GIT_ALLOW_PROTOCOL=http:https:ssh:git:file` blocks `remote.<name>.vcs`, including a slash-shaped worktree-relative value. | [ADR 0144's #779 amendment](../adr/0144-network-spawns-use-server-authored-transport-programs.md#779-amendment--fixed-transport-policy-2026-09-09) and the behavioral coverage landed in [PR #804](https://github.com/tom2025b/git-vista/pull/804). |
 | Path-shaped `url`, `insteadOf`, `pushurl`, and `pushInsteadOf` might dispatch a worktree helper. | Explicitly accepted as an upstream dependency, not credited to Git-Vista's allowlist. Git 2.53.0 rejects these at its `<scheme>::` parser; the real-Git tripwire requires the selector to fire, the helper to remain absent, and the failure not to be an allowlist denial. | [ADR 0145](../adr/0145-four-path-shaped-selectors-depend-on-upstream-git.md) and [PR #804](https://github.com/tom2025b/git-vista/pull/804). |
-| Pinning might break legitimate operator configuration. | Decided and documented. Proxy commands, custom helpers, repository credential helpers, SSH wrappers, fsmonitor programs, custom pack programs, and `ext::` remotes are deliberate compatibility losses; inherited operator command environment remains trusted. | [ADR 0144's compatibility record](../adr/0144-network-spawns-use-server-authored-transport-programs.md#compatibility-cost). |
+| Pinning might break legitimate operator configuration. | Decided and documented. Proxy commands, custom helpers, repository credential helpers, SSH wrappers, fsmonitor programs, custom pack programs, and `ext::` remotes are deliberate compatibility losses. | [ADR 0144's compatibility record](../adr/0144-network-spawns-use-server-authored-transport-programs.md#compatibility-cost). |
+| Operator-provided executable environment remains a separate trust boundary. | Accepted explicitly for ordinary transport spawns. `GIT_SSH_COMMAND`, `GIT_SSH`, `GIT_ASKPASS`, and `SSH_ASKPASS` remain inherited because repository content and hooks cannot mutate the server parent's environment. Checkout clears them through its separate allowlist, and every Network spawn overwrites `GIT_PROXY_COMMAND` with an empty value. | [ADR 0144's operator-provenance decision](../adr/0144-network-spawns-use-server-authored-transport-programs.md#what-remains-outside-the-pins) and the current completion policy in `sandbox::spawn`. |
 | LFS and general filters can name executables during the separately spawned checkout. | Measured and deliberately not folded into the transport fix. System `filter.lfs.process` and an operator-global generic smudge filter execute under the checkout sandbox. The landed record's unmeasured custom-transfer/extension cases and the policy decision remain owned by the open #782. | [The landed #782 investigation](2026-09-09-issue-782-lfs-selectors.md#5-verdicts), from [PR #816](https://github.com/tom2025b/git-vista/pull/816), and [#782](https://github.com/tom2025b/git-vista/issues/782). |
 | A tracked `.lfsconfig` might directly provide those executable selectors. | Not a landed premise at the reviewed base. The landed investigation explicitly left the safe-key claim unverified. PR #823 was open and carried a direct measurement; its eventual disposition does not affect ownership because #782 already owns the question. | [The landed investigation's gap list](2026-09-09-issue-782-lfs-selectors.md#6-honest-gap-list), [#782](https://github.com/tom2025b/git-vista/issues/782), and [PR #823](https://github.com/tom2025b/git-vista/pull/823). |
 
@@ -43,6 +44,22 @@ transport decisions already recorded in ADRs 0144 and 0145 while obscuring the
 more precise boundary: #782 is the sole open owner for checkout/filter
 measurement and policy. Conversely, treating #782 as finished would be wrong;
 its constraint decision and some direct selector measurements remain live.
+
+## What would reopen this decision
+
+Reopen #755 and reassess this closeout before accepting any of these events:
+
+- #782 measures an executable selector in a pure Git transport phase rather
+  than only in checkout, clean/add, or another filter consumer;
+- Git-Vista adds the server-owned operator-configuration allowlist deferred by
+  ADR 0144, because deciding which SSH commands, proxies, or remote helpers are
+  supported reopens #755's operator-control criterion; or
+- an inherited `GIT_SSH_COMMAND`, `GIT_SSH`, `GIT_ASKPASS`, or `SSH_ASKPASS`
+  path stops being purely operator-provenanced and becomes mutable by repository
+  content or a child it launches.
+
+#782's fifth acceptance item routes any pure-transport measurement to this
+record and ADR 0144, so closing the parent does not leave a closed destination.
 
 No new test or mutation is needed for this documentation-only decision. The
 behavioral and two-arm mutation evidence belongs to the implementation records
