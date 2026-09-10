@@ -52,6 +52,28 @@ class MutationMatrixContract(unittest.TestCase):
         )
 
 
+class DocumentationBoundaryContract(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        repo = Path(__file__).resolve().parents[4]
+        cls.security_model = (repo / "docs/SECURITY_MODEL.md").read_text()
+        cls.adr = (
+            repo
+            / "docs/adr/0148-clone-checkout-uses-one-server-authored-lfs-filter.md"
+        ).read_text()
+
+    def test_security_model_calls_checkout_port_based_not_https_enforced(self) -> None:
+        self.assertIn("That rule is port-based, not HTTPS enforcement", self.security_model)
+        self.assertIn("`http://host:443`", self.security_model)
+        self.assertIn("direct HTTP object-action URL", self.security_model)
+
+    def test_adr_records_both_plaintext_paths_and_the_tls_followup(self) -> None:
+        self.assertIn("this is not HTTPS enforcement", self.adr)
+        self.assertIn("`http://host:443`", self.adr)
+        self.assertIn("direct\n`http://host:443/...` object-action URL", self.adr)
+        self.assertIn("[#836](https://github.com/tom2025b/git-vista/issues/836)", self.adr)
+
+
 class CheckoutBoundaryMutations(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
