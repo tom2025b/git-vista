@@ -2,7 +2,9 @@
 
 - **Status:** Accepted — implemented and tested. The surface is **build-only**: no tool
   in it can execute anything, and `POST /api/plan` (this slice's other half) reaches
-  only `planner::build_plan_only`. Submitting an approved plan is #249.
+  only `planner::build_plan_only`. Submitting an approved plan is #249. The stale
+  compile-time-port premise for its ignored live test is amended by
+  [0147](0147-runtime-port-configuration-precedes-instance-identity.md).
 - **Date:** 2026-08-02.
 - **Milestone / issue:** M2.23d, issue #248 ("MCP `plan_<operation>` tool surface,
   build-only, no execution"), sub-issue of #153. Branch
@@ -284,10 +286,11 @@ that silently *lost* its arguments lands in that assertion rather than going une
 | No tool error carries a secret | `a_failed_request_never_leaks_the_session_cookie_or_csrf_into_its_error`, plus `debugging_a_session_prints_neither_the_cookie_nor_the_csrf_token` and its `HttpResponse` twin; both `Debug` impls now destructure, so a new field is a compile error until someone decides whether it may print | CI |
 | The token-hygiene scan covers the whole crate | `production_code_never_writes_files_env_or_spawns_processes` enumerates `src/*.rs` from disk instead of a hand-written `include_str!` list, with `the_source_census_really_sees_every_file_in_the_crate` as its anti-vacuity floor | CI |
 
-The last row is `#[ignore]`d for the reason every live test in that file is: the server's
-port is a compile-time constant, so a test cannot spawn a private instance. It is #248's
-literal acceptance criterion, written and ready; the CI-reachable rows above are what
-carry the weight day to day.
+The last row is `#[ignore]`d for the reason every live test in that file is: the native
+session client and test support still select the default 8080 endpoint and shared token
+root. The server can now bind a private loopback port, but #130 has not yet made those
+clients target it. It is #248's literal acceptance criterion, written and ready; the
+CI-reachable rows above are what carry the weight day to day.
 
 ## Alternatives considered
 

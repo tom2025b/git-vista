@@ -2426,9 +2426,10 @@ const HOST_SETUP_ACTION_DIR: &str = ".github/actions/host-sandbox-setup";
 /// Until #754 the rule was binary: a job provisions the host **iff** it runs
 /// this crate's Rust tests. The browser suite broke that model honestly rather
 /// than by drift. `ci/browser/run.sh` runs the whole tree inside
-/// `unshare --user --map-root-user --net --mount`, because the server's port is
-/// a compile-time constant and `parse_bind_addr` refuses any other address, so
-/// a test server cannot pick a free port. GitHub's ubuntu-24.04 ships
+/// `unshare --user --map-root-user --net --mount`: the private network keeps
+/// its stable test origin separate from the host's server, and the private
+/// mount isolates a candidate frontend bundle. Runtime port selection provides
+/// neither guarantee. GitHub's ubuntu-24.04 ships
 /// `kernel.apparmor_restrict_unprivileged_userns=1`, under which that `unshare`
 /// dies with `write failed /proc/self/uid_map: Operation not permitted`
 /// (measured, CI run 34268833753). The capability it needs — `user_namespaces`
