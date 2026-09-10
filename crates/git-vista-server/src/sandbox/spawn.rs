@@ -733,6 +733,46 @@ mod tests {
         }
     }
 
+    /// The checkout config policy is applied at completion, after every
+    /// construction-time environment choice. This child-process probe avoids
+    /// the control-leg differences in the real-Git integration test: it starts
+    /// with hostile values for exactly the two variables, runs the same
+    /// `SandboxedCommand::output` completion path production uses, and reads
+    /// back the environment the kernel supplied to the child.
+    ///
+    /// MUTATION 1 (remove the mechanism): omit
+    /// `apply_checkout_git_config_policy` from `apply_completion_policies`;
+    /// both hostile values reach the child.
+    /// MUTATION 2 (weaken the mechanism): omit only the
+    /// `GIT_CONFIG_GLOBAL=/dev/null` override; the system scope is still
+    /// disabled but the hostile global path reaches the child.
+    #[tokio::test]
+    async fn checkout_config_policy_overrides_test_environment_at_completion() {
+        let command = tokio::process::Command::new("/usr/bin/env");
+        let output = SandboxedCommand {
+            command,
+            restrict_network_transports: false,
+            restrict_checkout_git_config: true,
+        }
+        .pinned_env_for_test(&[
+            ("GIT_CONFIG_NOSYSTEM", "hostile-system-value"),
+            ("GIT_CONFIG_GLOBAL", "/tmp/hostile-global-config"),
+        ])
+        .output()
+        .await
+        .expect("environment probe runs");
+        assert!(output.status.success(), "environment probe must succeed");
+
+        let environment = String::from_utf8(output.stdout).expect("environment is UTF-8");
+        let value = |name: &str| {
+            environment
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{name}=")))
+        };
+        assert_eq!(value("GIT_CONFIG_NOSYSTEM"), Some("1"));
+        assert_eq!(value("GIT_CONFIG_GLOBAL"), Some("/dev/null"));
+    }
+
     /// An allowlisted name that the source does not have must not be
     /// fabricated. Without this, an implementation that wrote every
     /// allowlisted name with an empty value would pass the test above while

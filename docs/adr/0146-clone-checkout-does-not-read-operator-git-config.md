@@ -182,6 +182,9 @@ The compiled server-bin tests exercise the production launchers with real Git:
 - `clone_transfer_cannot_seed_checkout_filters_or_hooks_from_a_template`
   proves the live cross-phase bypass in its control and proves both template
   selectors neutralized in production.
+- `checkout_config_policy_overrides_test_environment_at_completion` removes
+  the integration control's extra argv, transport, and sandbox variables: a
+  spawned child reads back the two completion-time overrides directly.
 - `network_command_pins_every_fixed_selector_and_the_transport_program` reads
   the spawned argv rather than re-deriving the constant.
 
