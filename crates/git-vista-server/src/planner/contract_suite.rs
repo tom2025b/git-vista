@@ -189,6 +189,14 @@ async fn independent_fixtures_do_not_share_a_coordinator_guard() {
     let (_dir_a, repo_a) = seeded_repo();
     let (_dir_b, repo_b) = seeded_repo();
 
+    let src = source("src/planner.rs");
+    for seam in ["plan_and_execute_in", "submit_plan"] {
+        assert!(
+            fn_body(&src, seam).contains("repo_id.or_else(|| fixture_repo_key(repo))"),
+            "{seam} must promote an omitted test-fixture key before reaching the coordinator"
+        );
+    }
+
     let fallback = crate::coordinator::lock(None).await;
     let fixture_a = tokio::time::timeout(
         std::time::Duration::from_secs(2),

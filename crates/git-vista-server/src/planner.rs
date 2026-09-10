@@ -575,6 +575,8 @@ pub(crate) async fn plan_and_execute_in(
     op: GitOperation,
     proof: DropProof,
 ) -> (StatusCode, String) {
+    #[cfg(test)]
+    let repo_id = repo_id.or_else(|| fixture_repo_key(repo));
     // M12.04 (#554): publish what this write left behind — and publish it
     // *after* the write, through a wrapper the write cannot skip. Nothing here
     // records "what I wrote"; the wrapper asks the feed to read the world and
@@ -593,9 +595,10 @@ pub(crate) async fn plan_and_execute_in(
 /// The coordinator key for a repository-backed test fixture, derived through
 /// the same repository classification path the production catalog uses.
 ///
-/// The injectable planner seams accept `None` for production's degraded mode,
+/// In production the injectable planner seams accept `None` for degraded mode,
 /// where the repository has no catalog identity and all such writes must share
-/// the fail-closed fallback guard. These suites create real, independent git
+/// the fail-closed fallback guard. Under `cfg(test)`, those seams use this key
+/// when an older fixture omits the id: the suites create real, independent git
 /// repositories, so treating them as unidentified would serialize unrelated
 /// tests on that process-global fallback instead of exercising production's
 /// normal per-repository coordination.
@@ -779,6 +782,8 @@ pub(crate) async fn submit_plan(
     tokens: (RepositoryToken, WorktreeToken),
     plan: Plan,
 ) -> (StatusCode, String) {
+    #[cfg(test)]
+    let repo_id = repo_id.or_else(|| fixture_repo_key(repo));
     // M12.04 (#554), same wrapper and same reason as `plan_and_execute_in`:
     // the *other* path a write can take out of this module.
     crate::reconciliation::with_publish(repo, submit_plan_within(repo, repo_id, tokens, plan)).await
