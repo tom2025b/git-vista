@@ -18,6 +18,12 @@
 //! that finds the culprit, so [`discover`]'s candidate-range computation is
 //! what decides "finished", never the exit code and never git's printed
 //! sentence.
+//!
+//! Bisect notes and automated test adapters are deliberately absent here.
+//! They are optional extensions with no production consumer. If either is
+//! wanted, its first implementation should land with its complete boundary:
+//! storage plus API/UI for notes, or a closed server-owned ID plus its route
+//! for an adapter. ADR 0131 §§5 and 7 record the constraints on those designs.
 
 use std::path::{Path, PathBuf};
 
@@ -36,19 +42,6 @@ use super::{
     couldnt_run, journal_app_event, run_git_argv, short, stderr_stdout_or, Obs, Observed,
     RunFailure,
 };
-
-/// Placeholder for the reviewed-adapter set a future milestone wires up for
-/// automated bisect test execution (ADR 0131 §7) — **not load-bearing
-/// today**. Nothing constructs, matches on, or routes through this type;
-/// the actual safety property right now is scope, not type: there is no
-/// `POST /api/bisect/run-adapter`-shaped endpoint of any kind, so there is
-/// nothing for any value of this type, real or otherwise, to reach. When a
-/// served repository needs one, the endpoint and its first real variant
-/// land together, reviewed in that PR — this shape is named in advance so
-/// that slice has a home, not to claim an enforcement this file does not
-/// yet perform.
-#[allow(dead_code)]
-pub(crate) enum BisectAdapterId {}
 
 // ---------------------------------------------------------------------------
 // Discovery — read git's own state, never mirror it
@@ -229,56 +222,6 @@ pub(crate) async fn discover(repo: &Path) -> BisectStatus {
 }
 
 // ---------------------------------------------------------------------------
-// Notes — app-only metadata, outside the GitOperation vocabulary (ADR 0131 §5)
-// ---------------------------------------------------------------------------
-
-/// A free-text note never moves a ref or touches the index, so it does not
-/// go through the planner — see `GitOperation`'s doc comment on why every
-/// *mutation* does, and ADR 0131 §5 on why a note is not one. Stored at the
-/// per-worktree private path `git rev-parse --git-path
-/// git-vista-bisect-notes.json` — the same worktree-correct resolution
-/// [`discover`] uses, since notes are scoped to the bisect session running
-/// in THIS worktree, not shared with the repository's other worktrees.
-const NOTES_FILE: &str = "git-vista-bisect-notes.json";
-
-// #87: no HTTP route calls either of these yet — `discover`'s `BisectStatus`
-// carries no notes field, and there is no `/api/bisect/note` endpoint to
-// write one. These helpers are awaiting HTTP wiring and dedicated tests;
-// the planner contract suite currently exercises start/mark/reset.
-#[allow(dead_code)]
-pub(crate) async fn read_notes(repo: &Path) -> std::collections::BTreeMap<String, String> {
-    let Some(text) = read_git_file(repo, NOTES_FILE).await else {
-        return std::collections::BTreeMap::new();
-    };
-    serde_json::from_str(&text).unwrap_or_default()
-}
-
-#[allow(dead_code)] // #87: same status as read_notes above — see its comment.
-pub(crate) async fn write_note(repo: &Path, commit: &str, note: &str) -> Result<(), String> {
-    let Some(path) = git_path(repo, NOTES_FILE).await else {
-        return Err("could not resolve this worktree's git directory".to_string());
-    };
-    let mut notes = read_notes(repo).await;
-    if note.is_empty() {
-        notes.remove(commit);
-    } else {
-        notes.insert(commit.to_string(), note.to_string());
-    }
-    let text = serde_json::to_string_pretty(&notes).map_err(|e| e.to_string())?;
-    tokio::fs::write(&path, text)
-        .await
-        .map_err(|e| format!("couldn't write {}: {e}", path.display()))
-}
-
-/// Cleared when a bisect ends — notes are scoped to the session they were
-/// written during (ADR 0131 §5).
-async fn clear_notes(repo: &Path) {
-    if let Some(path) = git_path(repo, NOTES_FILE).await {
-        let _ = tokio::fs::remove_file(path).await;
-    }
-}
-
-// ---------------------------------------------------------------------------
 // The executors
 // ---------------------------------------------------------------------------
 
@@ -448,7 +391,6 @@ pub(super) async fn exec_reset(
         "bisect: reset".to_string(),
     )
     .await;
-    clear_notes(repo).await;
     (
         StatusCode::OK,
         "Bisect ended. The repository is back where it started.".to_string(),
