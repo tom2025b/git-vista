@@ -1763,4 +1763,332 @@ mod https_suite {
             assert_selector_blocked(&fixture, &policy, args, &env, &marker, "gv779").await;
         }
     }
+
+    /// #779's allowlist must also cover the *path* shape of a helper
+    /// selector, not only the installed-name shape
+    /// [`installed_remote_helper_selectors_are_blocked`] covers.
+    ///
+    /// Git builds a helper's program name by concatenation — `git-remote-` +
+    /// the selector's value — and hands the result to `execvp`. POSIX gives
+    /// `execvp` a second mode: any name containing a slash is used as a path
+    /// directly, with no `PATH` search. So `vcs = ../r1` never asks `PATH`
+    /// for an installed `git-remote-../r1`; it resolves `git-remote-../r1`
+    /// from the child's cwd — the served worktree — and runs whatever the
+    /// repository itself put there.
+    ///
+    /// "Ordinary tracked content, no install step and no operator
+    /// involvement" is the actual claim, so the fixture below `git add`s and
+    /// commits the helper rather than just writing it to disk and making an
+    /// unrelated `--allow-empty` commit alongside it — a 2026-09-09 review of
+    /// an earlier version of this test caught exactly that gap: the helper
+    /// existed but was never shown to be something a repository could
+    /// plausibly ship.
+    ///
+    /// That makes this a distinct reachability story from an installed
+    /// helper, and it is the shape a separate 2026-09-09 review claimed was
+    /// still open after #779. It is not: `GIT_ALLOW_PROTOCOL` rejects
+    /// `../r1` as a transport name before Git ever reaches helper dispatch.
+    /// This test pins that, because nothing else does — and the argument for
+    /// why is subtle enough that re-deriving it from the code is expensive.
+    /// (The other four selector routes named alongside `vcs` — `url`,
+    /// `insteadOf`, `pushurl`, `pushInsteadOf` — do NOT share this
+    /// reachability at all; see
+    /// [`path_shaped_url_based_selectors_never_reach_helper_dispatch`] for
+    /// why, and do not read this test as implying they do.)
+    ///
+    /// The positive control runs under Git's *default* protocol policy
+    /// rather than a naive `protocol.allow=never`: a user-initiated fetch
+    /// permits unknown helper protocols by default, so the marker really
+    /// does execute when the pin is absent. A control that denied first
+    /// would prove only that the denial worked, never that the attack was
+    /// reachable.
+    #[tokio::test]
+    async fn worktree_relative_remote_helper_selector_is_blocked() {
+        let fixture = home_and_cwd();
+        selector_repo(&fixture);
+        let helper_dir = fixture.cwd.join("git-remote-..");
+        std::fs::create_dir(&helper_dir).unwrap();
+        let (_, marker) = selector_marker(&helper_dir, "r1");
+        selector_config(&fixture, "remote.named.url", "https://example.invalid/repo");
+        selector_config(&fixture, "remote.named.vcs", "../r1");
+        // The "ordinary tracked content" claim above is only true if the
+        // helper is actually tracked: stage and commit it, rather than
+        // leaving it as an untracked file on disk next to an unrelated
+        // empty commit. (This test only fetches, so unlike
+        // installed_remote_helper_selectors_are_blocked's commit, there is
+        // no push source ref to supply here.)
+        run(
+            Command::new("git")
+                .args(["add", "--", "git-remote-../r1"])
+                .current_dir(&fixture.cwd),
+            "stage hostile helper",
+        );
+        run(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-qm",
+                    "hostile relative remote helper, tracked in the repository",
+                ])
+                .current_dir(&fixture.cwd),
+            "commit hostile helper",
+        );
+        let policy = network_policy(&fixture.home, &fixture.cwd, 9418);
+        let env = vec![
+            ("PATH", format!("{}:/usr/bin:/bin", fixture.cwd.display())),
+            ("HOME", fixture.home.to_string_lossy().into_owned()),
+            ("GIT_CONFIG_NOSYSTEM", "1".into()),
+        ];
+        let args: &[&str] = &["fetch", "named"];
+        // Positive control: DEFAULT protocol policy, no naive denial at all.
+        // A user-initiated fetch allows unknown helper protocols by default,
+        // so if this attack is real at all, the marker runs here.
+        let unforced = spawn::command_async(&policy, &fixture.cwd, args)
+            .pinned_env_for_test(&env)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            marker.exists(),
+            "positive control: helper did not run: {}",
+            String::from_utf8_lossy(&unforced.stderr)
+        );
+        std::fs::remove_file(&marker).unwrap();
+        assert_selector_blocked(&fixture, &policy, args, &env, &marker, "../r1").await;
+    }
+
+    /// Companion to [`worktree_relative_remote_helper_selector_is_blocked`]:
+    /// checks whether `url`, `insteadOf`, `pushurl` and `pushInsteadOf` —
+    /// named alongside `vcs` in
+    /// [`installed_remote_helper_selectors_are_blocked`] — share `vcs`'s
+    /// slash-into-`execvp` reachability, or whether that shape is unique to
+    /// `vcs`. A 2026-09-09 review raised exactly this as an open question
+    /// about an earlier version of this file: "path-shaped url/insteadOf/
+    /// pushurl/pushInsteadOf selectors are not tested and could bypass while
+    /// this stays green."
+    ///
+    /// It is unique to `vcs`, and this test is what actually establishes
+    /// that rather than asserting it. All four routes here are parsed by Git
+    /// as `<scheme>::<address>`, and Git validates `<scheme>` against
+    /// `[A-Za-z0-9.+-]` *before* it will treat the value as a helper
+    /// selector at all — verified directly against this build (git 2.53.0,
+    /// plain command-line git, no sandbox, no `protocol.allow` override of
+    /// any kind): a `/` in that position makes Git read the whole value as a
+    /// literal (local) path instead and fail with "does not appear to be a
+    /// git repository". `remote.<name>.vcs` has no such charset check — its
+    /// value is handed to `execvp` verbatim — which is the actual reason it
+    /// alone can carry a path.
+    ///
+    /// That means there is no "genuinely honoured when unhardened" positive
+    /// control to write here the way
+    /// [`worktree_relative_remote_helper_selector_is_blocked`] has one: the
+    /// premise such a control would demonstrate (Git dispatches a
+    /// slash-shaped value to a helper) does not hold for these four routes,
+    /// so a control built on that premise could only ever pass by
+    /// construction. This test proves the negative directly instead, across
+    /// every Network completion path, with the hostile helper sitting
+    /// exactly where it would need to be for the vulnerability to exist: if
+    /// a future Git version ever loosened that charset, the helper would
+    /// start running and this test would fail on `!marker.exists()`. It
+    /// also asserts the rejection is never `GIT_ALLOW_PROTOCOL`'s — if the
+    /// sandbox's allowlist had to intervene here, that alone would mean Git
+    /// silently started dispatching a slash-shaped scheme, which is exactly
+    /// the regression this guards against.
+    #[tokio::test]
+    async fn path_shaped_url_based_selectors_never_reach_helper_dispatch() {
+        for selector in ["url", "insteadOf", "pushurl", "pushInsteadOf"] {
+            let fixture = home_and_cwd();
+            selector_repo(&fixture);
+            let helper_dir = fixture.cwd.join("git-remote-..");
+            std::fs::create_dir(&helper_dir).unwrap();
+            let (_, marker) = selector_marker(&helper_dir, "r1");
+            selector_config(&fixture, "remote.named.url", "https://example.invalid/repo");
+            match selector {
+                "url" => selector_config(&fixture, "remote.named.url", "../r1::repo"),
+                "insteadOf" => selector_config(
+                    &fixture,
+                    "url.../r1::.insteadOf",
+                    "https://example.invalid/",
+                ),
+                "pushurl" => selector_config(&fixture, "remote.named.pushurl", "../r1::repo"),
+                "pushInsteadOf" => selector_config(
+                    &fixture,
+                    "url.../r1::.pushInsteadOf",
+                    "https://example.invalid/",
+                ),
+                _ => unreachable!(),
+            }
+            // Push needs a source ref before it will dispatch a transport.
+            run(
+                Command::new("git")
+                    .args([
+                        "-c",
+                        "user.name=Test",
+                        "-c",
+                        "user.email=test@example.invalid",
+                        "commit",
+                        "-qm",
+                        "fixture",
+                        "--allow-empty",
+                    ])
+                    .current_dir(&fixture.cwd),
+                "create push source",
+            );
+            let policy = network_policy(&fixture.home, &fixture.cwd, 9418);
+            let env = vec![
+                ("PATH", format!("{}:/usr/bin:/bin", fixture.cwd.display())),
+                ("HOME", fixture.home.to_string_lossy().into_owned()),
+                ("GIT_CONFIG_NOSYSTEM", "1".into()),
+            ];
+            let args: &[&str] = if selector.starts_with("push") {
+                &["push", "named", "HEAD:refs/heads/test"]
+            } else {
+                &["fetch", "named"]
+            };
+            // Strongest available "unhardened" baseline: the same sandboxed
+            // spawn substrate as every other case in this suite, but
+            // WITHOUT `.with_network_transport_policy()` — no
+            // `GIT_ALLOW_PROTOCOL` override at all, default Git protocol
+            // policy. If Git dispatched this by path the way it does for
+            // `vcs`, the marker would run right here.
+            let unforced = spawn::command_async(&policy, &fixture.cwd, args)
+                .pinned_env_for_test(&env)
+                .output()
+                .await
+                .unwrap();
+            let unforced_stderr = String::from_utf8_lossy(&unforced.stderr);
+            assert!(
+                !marker.exists(),
+                "{selector} unhardened: helper ran anyway — Git DID dispatch a slash-shaped \
+                 scheme by path, contradicting this test's premise: {unforced_stderr}"
+            );
+            assert!(
+                !unforced.status.success(),
+                "{selector} unhardened: unexpectedly succeeded"
+            );
+            assert!(
+                !unforced_stderr.contains("not allowed"),
+                "{selector} unhardened: got a protocol-allowlist rejection with no transport \
+                 policy applied at all — that shouldn't be possible: {unforced_stderr}"
+            );
+            // The positive half of this control: prove the selector actually
+            // fired, rather than treating "the marker didn't run" as proof by
+            // itself. `insteadOf`/`pushInsteadOf` rewrite a URL only when
+            // their base matches; a mistyped or non-matching rule silently
+            // does nothing, and `remote.named.url`'s untouched
+            // `https://example.invalid/repo` then fails for an unrelated
+            // reason (DNS resolution) that would satisfy every assertion
+            // above without the slash-shaped selector ever having been
+            // interpreted at all. Verified directly against this build: all
+            // four routes' effective value, when the selector genuinely
+            // fires, is the literal string `../r1::repo` in Git's own
+            // rejection message; a silently-ignored `insteadOf`/
+            // `pushInsteadOf` produces a DNS-failure message with no such
+            // substring instead.
+            assert!(
+                unforced_stderr.contains("../r1::repo"),
+                "{selector} unhardened: the selector did not appear to fire at all — expected \
+                 Git's own rejection to name the rewritten value `../r1::repo`, got: \
+                 {unforced_stderr}"
+            );
+
+            assert_url_based_selector_never_reaches_helper(&fixture, &policy, args, &env, &marker)
+                .await;
+        }
+    }
+
+    /// Shared by
+    /// [`path_shaped_url_based_selectors_never_reach_helper_dispatch`]: run
+    /// the same slash-shaped selector through every Network constructor and
+    /// completion path — the same coverage [`assert_selector_blocked`] gives
+    /// the installed-name and `vcs` path-shaped cases — but assert the
+    /// opposite failure signature: no marker, a failing status, and
+    /// **never** the sandbox's `transport '<x>' not allowed` message. That
+    /// message appearing here would mean `GIT_ALLOW_PROTOCOL` had to reject
+    /// a dispatched helper, which would mean Git's own `<scheme>::` charset
+    /// check had already been bypassed — the actual regression this guards
+    /// against.
+    async fn assert_url_based_selector_never_reaches_helper(
+        fixture: &HomeAndCwd,
+        policy: &Policy,
+        args: &[&str],
+        env: &[(&str, String)],
+        marker: &Path,
+    ) {
+        for mode in [
+            "output",
+            "spawn",
+            "credential-none",
+            "credential-some",
+            "checkout",
+        ] {
+            let out = match mode {
+                "output" => network_command(policy, &fixture.cwd, args)
+                    .pinned_env_for_test(env)
+                    .output()
+                    .await
+                    .unwrap(),
+                "spawn" => network_command(policy, &fixture.cwd, args)
+                    .pinned_env_for_test(env)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+                    .wait_with_output()
+                    .await
+                    .unwrap(),
+                "credential-none" | "credential-some" => network_command_with_credential(
+                    policy,
+                    &fixture.cwd,
+                    args,
+                    (mode == "credential-some").then_some("selector-test-token"),
+                )
+                .pinned_env_for_test(env)
+                .output()
+                .await
+                .unwrap(),
+                "checkout" => {
+                    let checkout = crate::sandbox::CheckoutPolicy(policy.clone());
+                    // Apply a hermetic profile to the already sealed command;
+                    // unlike reapplying hardening here, this cannot mask a
+                    // missing constructor pin in production.
+                    let mut command =
+                        network_command_without_credential(&checkout, &fixture.cwd, args);
+                    command.0 = command.0.pinned_env_for_test(env);
+                    command.output().await.unwrap()
+                }
+                _ => unreachable!(),
+            };
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                !marker.exists(),
+                "{mode}: helper executed via a slash-shaped `<scheme>::` selector; \
+                 stderr={stderr}"
+            );
+            assert!(
+                !out.status.success(),
+                "{mode}: failing remote unexpectedly succeeded"
+            );
+            assert!(
+                !stderr.contains("not allowed"),
+                "{mode}: sandbox protocol allowlist rejected this — meaning Git DID try to \
+                 dispatch a slash-shaped scheme as a transport, contradicting this test's \
+                 premise: {stderr}"
+            );
+            // Same positive-proof requirement as the unhardened control
+            // above: without this, a silently-ignored `insteadOf`/
+            // `pushInsteadOf` rule would pass every assertion above for the
+            // wrong reason (an unrelated DNS failure against the untouched
+            // URL), never having exercised the selector this test names.
+            assert!(
+                stderr.contains("../r1::repo"),
+                "{mode}: the selector did not appear to fire at all — expected Git's own \
+                 rejection to name the rewritten value `../r1::repo`, got: {stderr}"
+            );
+        }
+    }
 }
