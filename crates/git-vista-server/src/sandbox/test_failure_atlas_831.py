@@ -19,6 +19,13 @@ class CheckoutBoundaryMutations(unittest.TestCase):
         cls.env = os.environ.copy()
         cls.env["GV_BUILD_SLOTS"] = "1"
         cls.env["CARGO_TARGET_DIR"] = "/home/tom/.cargo-targets/gv-831"
+        # failure-atlas already holds the host-wide buildlock around this
+        # top-level unittest command. Its child closes the inherited lock fd,
+        # so a nested buildlock on the same file would wait on its own parent
+        # until the atlas timeout. Keep the required buildlock prefix on every
+        # Cargo command, but give that re-entrant inner layer its own one-slot
+        # file; the atlas parent remains the outer host-wide exclusion.
+        cls.env["BUILDLOCK_FILE"] = "/tmp/git-vista-failure-atlas-inner-buildlock"
         # These stay present in the cargo-test process after the Rust test's
         # short composition guard restores its environment. Removing
         # env_clear/allowlist construction therefore produces an observable
