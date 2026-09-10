@@ -201,15 +201,23 @@ async function openTwinRepo(page) {
   await expect(entry).toBeVisible()
   await entry.click()
 
-  // The mode dialog only appears when the repository is not already open.
   const visualize = page.getByRole('button', { name: /look only/ })
-  if (await visualize.isVisible().catch(() => false)) {
-    await visualize.click()
-  }
+  await expect(visualize, 'the mode dialog follows opening a repository').toBeVisible({
+    timeout: 20_000,
+  })
+  await visualize.click()
+
+  await expect(entry, 'the picker must be dismissed before graph interactions').toHaveCount(0)
+  await expect(
+    visualize,
+    'the mode dialog must be dismissed before graph interactions',
+  ).toHaveCount(0)
 
   // Prove we are looking at the right repository before asserting on its rows.
-  await expect(page.locator('p.status.repo')).toContainText(/interleaved-repo/i)
   await expect(page.getByRole('region', { name: 'Commit history graph' })).toBeVisible()
+  await expect(page.locator('p.status.repo')).toContainText(/interleaved-repo/i, {
+    timeout: 20_000,
+  })
   await expect(page.locator('circle.node-hit').first()).toBeAttached()
 }
 

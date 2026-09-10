@@ -32,11 +32,18 @@ async function openNonTextRepo(page) {
   await expect(entry).toBeVisible()
   await entry.click()
 
-  const active = page.getByRole('button', { name: /full git operations/ })
-  if (await active.isVisible().catch(() => false)) {
-    await active.click()
-  }
+  const full = page.getByRole('button', { name: /full git operations/ })
+  await expect(full, 'the mode dialog follows opening a repository').toBeVisible({
+    timeout: 20_000,
+  })
+  await full.click()
+
+  await expect(entry, 'the picker must be dismissed before graph interactions').toHaveCount(0)
+  await expect(full, 'the mode dialog must be dismissed before graph interactions').toHaveCount(0)
+
   await expect(page.getByRole('region', { name: 'Commit history graph' })).toBeVisible()
+  await expect(page.locator('p.status.repo')).toContainText('nontext-repo', { timeout: 20_000 })
+  await expect(page.locator('circle.node-hit').first()).toBeAttached()
   await page.getByRole('button', { name: /activity/i }).first().click()
 }
 
