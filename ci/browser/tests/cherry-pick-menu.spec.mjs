@@ -28,15 +28,28 @@ async function openActiveApp(page) {
   await page.goto(base)
   await expect(page.getByRole('heading', { name: 'git-vista' })).toBeVisible()
 
+  // Like `openApp`, wait for each guaranteed overlay instead of sampling an
+  // instant. The graph paints behind both dialogs, so graph visibility cannot
+  // prove that either full-viewport pointer interceptor has gone away.
   const pickerEntry = page.getByRole('button', { name: /fixture-repo/i }).first()
-  if (await pickerEntry.isVisible().catch(() => false)) {
-    await pickerEntry.click()
-  }
+  await expect(pickerEntry, 'the picker lists the fixture repository').toBeVisible({
+    timeout: 20_000,
+  })
+  await pickerEntry.click()
+
   const active = page.getByRole('button', { name: /full git operations/ })
-  if (await active.isVisible().catch(() => false)) {
-    await active.click()
-  }
+  await expect(active, 'the mode dialog follows opening a repository').toBeVisible({
+    timeout: 20_000,
+  })
+  await active.click()
+
+  await expect(pickerEntry, 'the picker must be dismissed before menu clicks').toHaveCount(0)
+  await expect(active, 'the mode dialog must be dismissed before menu clicks').toHaveCount(0)
+
   await expect(page.getByRole('region', { name: 'Commit history graph' })).toBeVisible()
+  await expect(page.locator('p.status.repo')).toContainText('fixture-repo', {
+    timeout: 20_000,
+  })
   await expect(page.locator('circle.node-hit').first()).toBeAttached()
 }
 

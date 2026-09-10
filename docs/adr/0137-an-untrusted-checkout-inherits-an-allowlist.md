@@ -374,17 +374,15 @@ that builds the environment.
   `remote.origin.uploadpack`, and an SSH fetch still ran the program named by
   `core.sshCommand`, both in the network-capable phase and with no hook involved.
   This experiment measured Git's behaviour against local paths and a throwaway
-  repository, not the sandbox's mediation of those executions. The repository
-  config that names the programs is inside the write grant: `policy_for` grants
-  the served repository and separate commondir read-write
-  (`sandbox/mod.rs:1083-1087`); its exclusions are the `$HOME`-relative secret
-  set and trust store (`sandbox/mod.rs:226-246, 1134-1138`), not `.git/config`;
-  and the Network harness pins only `core.askpass=`
-  (`sandbox/network_exec.rs:101-112`). A process that already runs can therefore
-  name an executable for the later network-capable phase even if that phase
-  blocks every hook. #755 tracks that separately fixable config-executable path
-  and requires its operator-compatibility cost to be decided before values are
-  pinned.
+  repository, not the sandbox's mediation of those executions. At the time, the
+  repository configuration was inside the write grant and the Network harness
+  pinned only `core.askpass=`, so a process that already ran could name an
+  executable for the later network-capable phase even if that phase blocked
+  every hook. #755 tracked that distinct finding. ADR 0144 records the later
+  selector pins, explicit operator-compatibility decision, and residual
+  dispositions; the [#755 closeout](../investigations/2026-09-10-issue-755-closeout.md)
+  records why the parent can now retire. The historical measurement here still
+  establishes why a hook-only phase split was not sufficient by itself.
 
   Paying for the hook-only split would thus leave the measured path open while
   making fetch two processes and push four, rewriting three production
