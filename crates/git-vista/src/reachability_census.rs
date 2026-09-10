@@ -699,13 +699,19 @@ const EXEMPT: &[(&str, &str)] = &[
     // hunk header for `select_all_in_hunk`) — the exemption this census
     // carried for them since #215 no longer applies; removed rather than
     // left to rot, per this census's own stated purpose.
-    // Only matters at extreme zoom-out (MIN_ZOOM=0.2); #65's 44px floor is
-    // met at scale 1.0 by construction (audit.rs's own tripwire test), and
-    // no production path clamps camera scale using this value today.
-    (
-        "git-vista/src/features/a11y/core.rs",
-        "min_camera_scale_for_guidance",
-    ),
+    // #784: `min_camera_scale_for_guidance` (features/a11y/core.rs) used to sit here,
+    // argued as "only matters at extreme zoom-out (MIN_ZOOM=0.2); #65's 44px floor is
+    // met at scale 1.0 by construction, and no production path clamps camera scale
+    // using this value today." It was the one member of #784's dead tap-target-
+    // arithmetic cluster this census's automated scan could actually see as an orphan
+    // — every sibling in that cluster (`TapTarget`, `node_hit_extent_px`,
+    // `MIN_TAP_TARGET_PX`, …) reads as "reachable" to this scan through `audit.rs`'s
+    // calls, because the scan has no way to know `audit` is itself `#[cfg(test)]`-
+    // gated one file away (`features/a11y/mod.rs`) — the same blind spot `fake_graph`
+    // documents below for `main.rs`. #784 gated the whole cluster `#[cfg(test)]`,
+    // including this one, instead of leaving it as the cluster's odd one out — it no
+    // longer declares in production at all, so there is nothing left for this table to
+    // argue about.
     // signals.rs:506's own doc says it exists "for the submit handler that
     // must not subscribe" — but dialogs/commit.rs's real submit_commit
     // closure takes the intent as a parameter instead, so this was never
