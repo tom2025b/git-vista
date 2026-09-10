@@ -19,6 +19,12 @@ class CheckoutBoundaryMutations(unittest.TestCase):
         cls.env = os.environ.copy()
         cls.env["GV_BUILD_SLOTS"] = "3"
         cls.env["CARGO_TARGET_DIR"] = str(cls.repo / "target/gv831-mutation")
+        # These stay present in the cargo-test process after the Rust test's
+        # short composition guard restores its environment. Removing
+        # env_clear/allowlist construction therefore produces an observable
+        # leak at the actual child spawn, not an incidental config failure.
+        cls.env["GV_CLONE_ENVIRONMENT_CANARY"] = "atlas-ambient-canary"
+        cls.env["SSH_AUTH_SOCK"] = "/tmp/gv831-atlas-agent.sock"
         cls.run_buildlocked("build", "-p", "git-vista-server", "--bins")
 
     @classmethod
