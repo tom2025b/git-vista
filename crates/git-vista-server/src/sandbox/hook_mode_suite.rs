@@ -1,25 +1,14 @@
 //! M1.13b (#66): declarative functional hook-mode case.
 //!
-//! # The one live R8 exemption in the battery (#206)
+//! # The former R8 exemption is retired
 //!
-//! `blocked_hooks` needs a policy with `hook_mode: HookMode::Blocked`, and no
-//! production constructor builds one: `sandbox::policy_for`,
-//! `sandbox::policy_for_clone` and `sandbox::probe::boot_probe_policy` each
-//! spell `HookMode::Run`, and ADR 0029 rejects the degrade-and-block posture by
-//! name — a host that cannot supply the Strict tier gets a refusal
-//! (`ShimError::StrictUnavailable`), never a weaker sandbox with hooks turned
-//! off. So the shape this case runs against is one production genuinely cannot
-//! express, and the harness builds it in `escape_contract::policy_for_case`.
-//!
-//! The blocker below used to read `"policy_for_repo hard-codes HookMode::Run"`.
-//! That named the wrong thing twice over: `policy_for_repo` is a `#[cfg(test)]`
-//! wrapper that sets no hook mode at all, and after #197 the token R8 grepped
-//! for survived only inside its `debug_assert!` — so the tripwire would have
-//! gone on passing even if `policy_for` had grown a route to `Blocked`. The
-//! wording here now states the property R8 actually checks, over every
-//! production module under `src/sandbox`. Give any production constructor a way
-//! to emit `HookMode::Blocked` and R8 goes red, which is exactly when this
-//! exemption must be retired and the case moved onto the production dispatch.
+//! #831 makes `policy_for_clone_checkout` produce `HookMode::Blocked`: #827
+//! removed every fresh-clone hook source, while #831's server-authored LFS
+//! filter is not a hook. The battery now reaches that production constructor
+//! through `escape_contract::policy_for_case`; no harness-fabricated policy and
+//! no named exemption remain. ADR 0029 is unchanged for ordinary operations:
+//! an unavailable Strict tier is still a refusal, never a degraded Network
+//! policy with hooks suppressed.
 
 use super::escape_contract::{
     run_case, Class, Errno, EscapeCase, Exemption, GitPortUse, MutantId, Provenance,
@@ -41,9 +30,7 @@ const CASE_BLOCKED_HOOKS: EscapeCase = EscapeCase {
     expect_granted_provenance: Provenance::NotApplicable,
     expect_carrier_code: 0,
     dies_under: &[MutantId::M6],
-    exemption: Exemption::NotProductionReachable {
-        blocker: "no production policy constructor yields HookMode::Blocked",
-    },
+    exemption: Exemption::None,
     // A shell probe that never touches the network.
     git_port: GitPortUse::Unused,
 };

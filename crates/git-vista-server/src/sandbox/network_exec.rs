@@ -79,13 +79,16 @@
 //! Network consumer instead, the automatic maintenance run after fetch.
 //!
 //! `PATH`, `GIT_EXEC_PATH`, SSH and askpass environment selectors still come
-//! from the operator's parent environment; executable lookup remains trusted.
+//! from the operator's parent environment; executable lookup remains trusted
+//! for ordinary Network commands. Clone checkout is narrower: its LFS driver
+//! is an absolute path from `sandbox::lfs`'s reviewed candidate list.
 //! HTTP(S) uses Git's installed standard helpers. Both transport environment
 //! values are server-authored and replace inherited values. Checkout also
 //! receives them after its environment is cleared. Its separate config-scope
 //! policy disables system and global Git configuration, because LFS
 //! custom-transfer/extension and general filter commands are executable
-//! surfaces that the protocol policy cannot constrain.
+//! surfaces that the protocol policy cannot constrain. #831 restores only a
+//! fixed LFS driver through [`lfs_checkout_command`].
 //!
 //! [`redact_output`] remains defence in depth for diagnostics emitted by the
 //! selected transport. A [`CredentialedCommand`] additionally knows and
@@ -124,7 +127,7 @@
 use std::path::Path;
 use std::process::Output;
 
-use super::{spawn, Policy};
+use super::{lfs, spawn, Policy};
 
 const REDACTED_CREDENTIAL: &[u8] = b"[REDACTED CREDENTIAL]";
 
@@ -339,11 +342,11 @@ pub(crate) fn network_command_with_credential(
 /// an untrusted-checkout launcher carrying a full environment, because that
 /// value is not constructible.
 ///
-/// What it keeps is TCP network access and `HookMode::Run`. System and global
-/// Git configuration are disabled, so a fresh clone has no selectable filter
-/// or hook from those scopes; repository-local configuration remains readable.
-/// #723 also narrows one capability: this sealed path selects the checkout
-/// seccomp profile that denies AF_UNIX while retaining the TCP grants.
+/// What it keeps is TCP network access. System and global Git configuration
+/// are disabled, and the checkout policy blocks hooks. Repository-local config
+/// remains readable, but #827 prevents a fresh remote from supplying it. #723
+/// also narrows one capability: this sealed path selects the checkout seccomp
+/// profile that denies AF_UNIX while retaining the HTTPS grant.
 pub(crate) struct UntrustedCheckoutCommand(spawn::SandboxedCommand);
 
 impl UntrustedCheckoutCommand {
@@ -387,6 +390,38 @@ pub(crate) fn network_command_without_credential(
             .with_network_transport_policy()
             .with_untrusted_checkout_env(),
     )
+}
+
+/// The only fresh-clone materialisation command that receives an executable
+/// filter. It starts from [`network_command_without_credential`]'s sealed
+/// environment/config/seccomp boundary, then adds only #831's server-authored
+/// LFS settings ahead of the checkout subcommand.
+///
+/// `clone_url` has already passed `validate_clone_url`. It is used only to pin
+/// `lfs.url` as data; no part of it can select the filter executable, a transfer
+/// adapter, a hook, or a shell fragment.
+pub(crate) fn lfs_checkout_command(
+    policy: &crate::sandbox::CheckoutPolicy,
+    repo: &Path,
+    clone_url: &str,
+) -> UntrustedCheckoutCommand {
+    let mut owned = lfs::checkout_config(clone_url);
+    owned.extend(["checkout".to_string(), "-f".to_string()]);
+    let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+    network_command_without_credential(policy, repo, &refs)
+}
+
+#[cfg(test)]
+pub(super) fn lfs_checkout_command_with_program(
+    policy: &crate::sandbox::CheckoutPolicy,
+    repo: &Path,
+    clone_url: &str,
+    program: &str,
+) -> UntrustedCheckoutCommand {
+    let mut owned = lfs::checkout_config_with_program(clone_url, program);
+    owned.extend(["checkout".to_string(), "-f".to_string()]);
+    let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+    network_command_without_credential(policy, repo, &refs)
 }
 
 /// Strip `user[:pass]@` userinfo from every `<scheme>://…` URL substring
@@ -1153,16 +1188,28 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("git starts");
+    let output = fixture_git_output(cwd, args);
     assert!(
         output.status.success(),
         "git command failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// Output-returning sibling for measurements that need to inspect a fixture
+/// command's status or bytes. It deliberately shares the reviewed test-only
+/// spawn site above instead of creating another process boundary.
+#[cfg(test)]
+pub(super) fn fixture_git_output<I, S>(cwd: &Path, args: I) -> Output
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .expect("git starts")
 }
 
 /// Real-git tests that need a Network-tier `Policy` pointed at a loopback

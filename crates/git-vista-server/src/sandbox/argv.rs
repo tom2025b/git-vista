@@ -462,8 +462,8 @@ fn ssh_agent_socket_grant_is_network_tier_only_and_only_when_set() {
 /// Removing the grants from the transfer broke those operators.
 ///
 /// So the claim is no longer "clone cannot use these". It is "**the phase that
-/// runs attacker-chosen code** does not need these", and that is a difference
-/// between two policies rather than a property of one.
+/// materialises attacker-chosen content** does not need these", and that is a
+/// difference between two policies rather than a property of one.
 ///
 /// # Three legs, and each of the first two is load-bearing
 ///
@@ -511,7 +511,7 @@ fn only_the_clone_checkout_phase_gives_up_the_188_grants() {
             transfer.net_ports
         );
 
-        // Leg 3 — the claim. The process that runs attacker code has none.
+        // Leg 3 — the claim. The materialisation process has none.
         let checkout =
             policy_for_clone_checkout(clones_root.path()).expect("checkout policy must build");
         let checkout_policy = &checkout.0;
@@ -520,10 +520,13 @@ fn only_the_clone_checkout_phase_gives_up_the_188_grants() {
             Tier::Network,
             "this narrows grants, never the tier: ADR 0128 keeps network for git-lfs"
         );
-        assert!(
-            matches!(checkout_policy.hook_mode, HookMode::Run),
-            "and never hook execution — ADR 0029 rejects blocking them, and #702 is \
-             about what the hook is HANDED, not whether it runs"
+        assert_eq!(
+            checkout_policy.hook_mode,
+            HookMode::Blocked {
+                empty_dir: PathBuf::from("/dev/null")
+            },
+            "#831: fresh-clone checkout has no legitimate hook consumer; blocking it is \
+             a phase-specific reduction, not ADR 0029's degraded-host fallback"
         );
         assert!(
             !checkout_policy.rw_trees.contains(&sock),
@@ -542,7 +545,12 @@ fn only_the_clone_checkout_phase_gives_up_the_188_grants() {
         );
         assert!(
             checkout_policy.net_ports.contains(&443),
-            "paired positive: HTTPS must survive or a git-lfs smudge filter breaks"
+            "paired positive: HTTPS must survive for the fixed git-lfs filter"
+        );
+        assert_eq!(
+            checkout_policy.net_ports,
+            vec![443],
+            "#831: no checkout network service except HTTPS has a consumer"
         );
         assert!(
             checkout_policy

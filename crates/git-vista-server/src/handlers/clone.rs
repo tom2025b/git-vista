@@ -149,10 +149,6 @@ fn clone_transfer_args<'a>(url: &'a str, dest: &'a str) -> [&'a str; 5] {
     ["clone", "--no-checkout", "--", url, dest]
 }
 
-fn clone_checkout_args() -> [&'static str; 2] {
-    ["checkout", "-f"]
-}
-
 /// Fetch objects and refs while the credential exists, then let that process
 /// exit before materialising attacker-chosen files.
 ///
@@ -162,10 +158,10 @@ fn clone_checkout_args() -> [&'static str; 2] {
 /// because `url.<base>.insteadOf` can legitimately turn an accepted HTTPS URL
 /// into an SSH clone. `checkout_policy` is
 /// `sandbox::policy_for_clone_checkout`: the same policy without the agent
-/// socket, the `known_hosts` carve-out, or port 22, for the process that runs
-/// attacker-selected hooks and filters. Network, `HookMode::Run` and filters
-/// are unchanged in both — this narrows what the second process is handed,
-/// never what it may do.
+/// socket, the `known_hosts` carve-out, or port 22, for the process that
+/// materialises attacker-selected content. The checkout keeps only HTTPS,
+/// blocks Git hooks, and receives one server-authored required LFS filter;
+/// system/global filter configuration remains unreadable.
 ///
 /// The second phase also receives an environment **built by allowlist** rather
 /// than one with credential names removed from it (#704), so a secret nobody
@@ -224,11 +220,7 @@ async fn execute_clone(
     }
 
     let checkout_command: crate::sandbox::network_exec::UntrustedCheckoutCommand =
-        crate::sandbox::network_exec::network_command_without_credential(
-            checkout_policy,
-            dest,
-            &clone_checkout_args(),
-        );
+        crate::sandbox::network_exec::lfs_checkout_command(checkout_policy, dest, url);
     let checkout = checkout_command
         .kill_on_drop(true)
         .output()
@@ -1169,9 +1161,10 @@ mod tests {
     }
 
     /// Permanent form of #680's dynamic reproduction. The credentialed
-    /// transfer leaves the worktree empty; the later checkout still runs the
-    /// attacker-selected hook, but only after the token-bearing process has
-    /// exited and every credential environment name has been removed.
+    /// transfer leaves the worktree empty; the later checkout runs a selected
+    /// content filter only after the token-bearing process has exited and every
+    /// credential environment name has been removed. #831 blocks hooks, so a
+    /// filter is the remaining executable checkout observer.
     /// #680's canary, widened to #702 and #704's claim: the untrusted checkout
     /// child's environment is **built**, not filtered.
     ///
@@ -1180,7 +1173,7 @@ mod tests {
     /// This test used to read `"unset|unset|unset"` — the three names ADR 0128
     /// enumerated. A denylist and an allowlist are indistinguishable on those
     /// three, so the assertion passed identically whether every other secret
-    /// in the operator's environment reached the hook or not. It did. The two
+    /// in the operator's environment reached the child or not. It did. The two
     /// new legs are what separate the mechanisms: `SSH_AUTH_SOCK` (#702, the
     /// operator's live agent socket) and a canary under a name this crate
     /// mentions nowhere except here (#704, "a credential nobody enumerated").
@@ -1188,12 +1181,12 @@ mod tests {
     /// # The paired positives, and why there are two kinds
     ///
     /// An environment that is simply *empty* would satisfy every "must be
-    /// absent" leg and produce a checkout that cannot run at all. So the hook
+    /// absent" leg and produce a checkout that cannot run at all. So the filter
     /// also reports `PATH` and `HOME`, and the pre-existing legs — that the
-    /// hook ran at all, and that the credentialed phase did not run it —
+    /// filter ran at all, and that the credentialed phase did not run it —
     /// remain. And the premise is asserted rather than assumed: the canary and
     /// the socket are checked *present in this process* at the moment the
-    /// command is composed, so "the hook saw `unset`" cannot be satisfied by
+    /// command is composed, so "the filter saw `unset`" cannot be satisfied by
     /// the test having failed to set them.
     ///
     /// # Why the variables are set around composition, not around the spawn
@@ -1205,7 +1198,7 @@ mod tests {
     /// never across an `.await` — see that module's doc for the whole
     /// discipline.
     #[tokio::test]
-    async fn clone_checkout_runs_the_hook_with_only_an_allowlisted_environment() {
+    async fn clone_checkout_runs_a_filter_with_only_an_allowlisted_environment() {
         use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
 
@@ -1218,9 +1211,9 @@ mod tests {
             );
         }
 
-        const CANARY: &str = "clone-hook-canary";
+        const CANARY: &str = "clone-filter-canary";
         // A name this crate mentions in exactly one place — here. If it
-        // reaches the hook, the child's environment is being filtered by a
+        // reaches the filter, the child's environment is being filtered by a
         // list of known names rather than built from one.
         const CANARY_VAR: &str = "GV_CLONE_ENVIRONMENT_CANARY";
         const CANARY_VALUE: &str = "a-credential-nobody-enumerated";
@@ -1242,11 +1235,9 @@ mod tests {
             .args(["config", "user.email", "test@example.invalid"])
             .current_dir(&source));
 
-        let hooks = source.join("hooks");
-        std::fs::create_dir_all(&hooks).unwrap();
-        let hook = hooks.join("post-checkout");
+        let filter = root.join("checkout-filter.sh");
         std::fs::write(
-            &hook,
+            &filter,
             format!(
                 "#!/bin/sh\nprintf '%s|%s|%s|%s|%s|%s|%s' \
                  \"${{GIT_VISTA_CREDENTIAL_TOKEN-unset}}\" \
@@ -1255,13 +1246,14 @@ mod tests {
                  \"${{SSH_AUTH_SOCK-unset}}\" \
                  \"${{{CANARY_VAR}-unset}}\" \
                  \"${{PATH:+PATH-present}}\" \
-                 \"${{HOME:+HOME-present}}\" > hook-observed\n"
+                 \"${{HOME:+HOME-present}}\" > filter-observed\nexec /bin/cat\n"
             ),
         )
         .unwrap();
-        let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+        let mut permissions = std::fs::metadata(&filter).unwrap().permissions();
         permissions.set_mode(0o755);
-        std::fs::set_permissions(&hook, permissions).unwrap();
+        std::fs::set_permissions(&filter, permissions).unwrap();
+        std::fs::write(source.join(".gitattributes"), "tracked filter=gvclone\n").unwrap();
         std::fs::write(source.join("tracked"), "attacker-chosen content\n").unwrap();
         git(Command::new("git").args(["add", "."]).current_dir(&source));
         git(Command::new("git")
@@ -1285,9 +1277,6 @@ mod tests {
                 crate::sandbox::spawn::CREDENTIAL_TOKEN_VAR,
                 CANARY.to_string(),
             ),
-            ("GIT_CONFIG_COUNT", "1".to_string()),
-            ("GIT_CONFIG_KEY_0", "core.hooksPath".to_string()),
-            ("GIT_CONFIG_VALUE_0", "hooks".to_string()),
         ];
         let transfer = crate::sandbox::network_exec::network_command_with_credential(
             &policy,
@@ -1305,15 +1294,19 @@ mod tests {
             String::from_utf8_lossy(&transfer.stderr)
         );
         assert!(
-            !dest.join("tracked").exists() && !dest.join("hook-observed").exists(),
-            "the credentialed phase must not materialise content or run post-checkout"
+            !dest.join("tracked").exists() && !dest.join("filter-observed").exists(),
+            "the credentialed phase must not materialise content or run the filter"
         );
 
-        // Reproduce the operator-level config precondition without touching
-        // the developer's real global config. This selects the tracked hook
-        // exactly as `core.hooksPath=hooks` did in the original canary run.
         git(Command::new("git")
-            .args(["config", "core.hooksPath", "hooks"])
+            .args([
+                "config",
+                "filter.gvclone.smudge",
+                filter.to_str().expect("utf8 filter path"),
+            ])
+            .current_dir(&dest));
+        git(Command::new("git")
+            .args(["config", "filter.gvclone.required", "true"])
             .current_dir(&dest));
         // Compose under the guard; run outside it. See this test's doc.
         let checkout_command = crate::sandbox::test_env::with_env(
@@ -1326,17 +1319,17 @@ mod tests {
                     std::env::var(CANARY_VAR).ok().as_deref(),
                     Some(CANARY_VALUE),
                     "premise: the canary must really be in this process's environment, \
-                     or the hook observing it as unset proves nothing"
+                     or the filter observing it as unset proves nothing"
                 );
                 assert_eq!(
                     std::env::var("SSH_AUTH_SOCK").ok().as_deref(),
                     Some(FAKE_AGENT_SOCK),
                     "premise: SSH_AUTH_SOCK must really be set for the #702 leg to bite"
                 );
-                crate::sandbox::network_exec::network_command_without_credential(
+                crate::sandbox::network_exec::lfs_checkout_command(
                     &checkout_policy,
                     &dest,
-                    &clone_checkout_args(),
+                    "https://example.invalid/repo.git",
                 )
             },
         );
@@ -1350,7 +1343,7 @@ mod tests {
             String::from_utf8_lossy(&checkout.stderr)
         );
         assert_eq!(
-            std::fs::read_to_string(dest.join("hook-observed")).unwrap(),
+            std::fs::read_to_string(dest.join("filter-observed")).unwrap(),
             "unset|unset|unset|unset|unset|PATH-present|HOME-present",
             "fields are: the three ADR 0128 credential names, then SSH_AUTH_SOCK \
              (#702) and an unenumerated canary (#704) — all five withheld — then \
@@ -1402,10 +1395,13 @@ mod tests {
 
         assert_eq!(
             body.matches("network_command_without_credential(").count(),
-            2,
-            "both post-transfer spawns (the HEAD check and the checkout) must still be \
-             here — this notices a deletion, not a substitution; the type system \
-             handles substitution"
+            1,
+            "the credentialless HEAD probe must still use the sealed builder"
+        );
+        assert_eq!(
+            body.matches("lfs_checkout_command(").count(),
+            1,
+            "the one materialisation spawn must still use the fixed LFS checkout builder"
         );
         assert!(
             body.contains("network_command_with_credential("),

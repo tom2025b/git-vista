@@ -30,6 +30,9 @@ pub(crate) mod capabilities;
 /// cannot supply the tier a repository needs. See its module doc for why the
 /// plan's `CapabilityAbsent => Blocked` mapping is not implemented.
 pub(crate) mod hook_policy;
+/// #831: the fixed executable and configuration used to materialise HTTPS
+/// Git LFS objects without reopening system or operator-global Git config.
+pub(crate) mod lfs;
 /// #228/#755: the shared Network-tier exec harness — repository-config
 /// executable pins and output redaction, the one execution path every
 /// fetch/pull/push spawn is meant to go through. See its module doc for the
@@ -71,8 +74,8 @@ pub(crate) mod worktree;
 
 #[cfg(test)]
 mod argv;
-/// #723: the clone checkout's distinct seccomp profile, exercised by a real
-/// tracked post-checkout hook rather than a primitive-only filter test.
+/// #723/#831: clone checkout's distinct seccomp profile and hook block,
+/// exercised by a real selected filter plus a fetched hook that must stay off.
 #[cfg(test)]
 mod checkout_security;
 /// A real HTTPS clone through the production `policy_for_clone`. Separate from
@@ -272,28 +275,18 @@ pub(crate) const DEFAULT_GIT_PORTS: &[u16] = &[
     9418, // git://   — the native protocol
 ];
 
-/// The TCP ports clone's **checkout** process may `connect()` to —
-/// [`DEFAULT_GIT_PORTS`] without 22 (#702).
+/// The one TCP port clone's **checkout** process may `connect()` to.
 ///
 /// Not justified by the URL scheme. An earlier version of this constant was,
 /// and the argument was wrong: `validate_clone_url` checks a scheme prefix, so
 /// `https://host:22/…` is accepted and `url.<base>.insteadOf` can rewrite an
 /// accepted HTTPS URL into an SSH one. A clone genuinely can reach port 22.
 ///
-/// The original justification was Git LFS smudging. That consumer no longer
-/// exists on a fresh clone: checkout disables system/global Git config, and
-/// transfer prevents `init.templateDir` / `GIT_TEMPLATE_DIR` from seeding a
-/// repository-local filter. On hosts where Git LFS installs `filter.lfs.*` in
-/// system config, checkout now succeeds silently with pointer text on disk
-/// because the unread `filter.lfs.required=true` cannot make the absent driver
-/// fail. ADR 0146 records that compatibility break.
-///
-/// These ports remain temporarily while the LFS replacement is designed and
-/// tested. They are retained capability with no legitimate fresh-clone
-/// consumer today, not evidence that an LFS route still works. Dropping them
-/// together with `HookMode::Run` is tracked in the same follow-up as restoring
-/// an explicit, server-owned LFS path; combining that larger policy change with
-/// the config-scope repair would obscure which boundary each regression proves.
+/// HTTPS Git LFS is the only remaining consumer. The checkout launcher supplies
+/// the LFS filter itself, pins its endpoint to the validated HTTPS clone URL,
+/// and forces the basic HTTP transfer adapter. Port 80 and git protocol port
+/// 9418 therefore have no checkout consumer and are absent. Port 22 was already
+/// removed by #702; SSH remains transfer-phase authority only.
 ///
 /// Read [`DEFAULT_GIT_PORTS`]'s own doc before trusting this too far: a port
 /// grant is **not** an egress policy, because Landlock's port rules carry no
@@ -301,11 +294,7 @@ pub(crate) const DEFAULT_GIT_PORTS: &[u16] = &[
 /// to the operator's own remote, and it does not stop the agent-protocol
 /// exfiltration path described on [`policy_for_clone_checkout`], which needs
 /// only the still-permitted 443.
-pub(crate) const CLONE_CHECKOUT_PORTS: &[u16] = &[
-    443,  // retained pending the explicit LFS / least-authority follow-up
-    80,   // http://
-    9418, // git://
-];
+pub(crate) const CLONE_CHECKOUT_PORTS: &[u16] = &[443];
 
 /// Absolute paths for `Policy::secret_excludes`, given a home directory.
 ///
@@ -576,16 +565,15 @@ pub(crate) enum Tier {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HookMode {
-    /// Repository hooks run. They gate the operation normally (INV-11).
+    /// Repository hooks run. They gate ordinary operations normally (INV-11).
     Run,
-    /// `core.hooksPath` is pointed at a server-owned empty directory, so no
-    /// repository hook can run at all. Production constructors never select
-    /// this mode: ADR 0029's "Where the plan still disagrees with this ADR"
-    /// rejects the degrade-and-block fallback. Keep the variant and its argv
-    /// match arms compiled for R8's blocked-hooks exemption; see
-    /// `r8_exemptions_expire_when_their_named_blocker_disappears` and
-    /// `documented_gaps.rs:388` (`policy_for_clone_shape_regression_guard`).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// `core.hooksPath` is pointed at a server-owned path under which no hook
+    /// can exist, so no repository hook can run at all. Ordinary policy construction never
+    /// selects this as a degraded fallback: ADR 0029 still requires refusal
+    /// when Strict is unavailable. Clone checkout is the deliberate production
+    /// exception: #827 removed every legitimate fresh-clone hook source, so
+    /// #831 points `core.hooksPath` at `/dev/null` instead of carrying a latent
+    /// executable capability beside the one server-authored LFS filter.
     Blocked { empty_dir: PathBuf },
 }
 
@@ -1271,9 +1259,8 @@ pub(crate) fn policy_for_repo(repo: &Path) -> Result<Policy, shim::ShimError> {
 /// by codex-daybreak on #720, traced to source, before it merged.
 ///
 /// The correct statement is narrower and survives every counter-example: **the
-/// process that runs attacker-chosen code does not need these.** That process
-/// is not this one — see [`policy_for_clone_checkout`], which is this policy
-/// minus the agent socket, the carve-out and port 22.
+/// process that materialises attacker-chosen content does not need these.**
+/// That process is not this one — see [`policy_for_clone_checkout`].
 ///
 /// ADR 0033's own safety argument — "neither grant reaches the Strict tier,
 /// which is where hostile repository content actually runs" — stopped being
@@ -1294,7 +1281,7 @@ pub(crate) fn policy_for_clone(clones_root: &Path) -> Result<Policy, shim::ShimE
     // accepted `https://` URL into an SSH one. A clone really can speak SSH;
     // it just cannot be *asked* to in the URL string. Removing these broke
     // that configuration. `policy_for_clone_checkout` is where they come off,
-    // because that is the process that runs attacker-chosen code.
+    // because that is the process that materialises attacker-chosen content.
     rw.extend(ssh_agent_socket_grant(tier));
     Ok(Policy {
         tier,
@@ -1335,8 +1322,8 @@ pub(crate) fn policy_for_clone(clones_root: &Path) -> Result<Policy, shim::ShimE
 /// real SSH clone. An earlier version of #702 removed them from the shared
 /// policy on the argument that "this route cannot perform an SSH clone", which
 /// is false, and which broke that configuration. The correct statement is
-/// narrower and survives: **the phase that runs attacker code does not need
-/// them.**
+/// narrower and survives: **the phase that materialises attacker-chosen
+/// content does not need them.**
 ///
 /// So this policy is [`policy_for_clone`] minus three things:
 ///
@@ -1346,19 +1333,19 @@ pub(crate) fn policy_for_clone(clones_root: &Path) -> Result<Policy, shim::ShimE
 ///   a symlink no longer has checkout refused by `add_carveout_rule`'s guard;
 /// * [`CLONE_CHECKOUT_PORTS`] rather than [`DEFAULT_GIT_PORTS`] — no port 22.
 ///
-/// TCP access and `HookMode::Run` remain as capabilities, but a fresh clone has
-/// no legitimate selector for either hooks or filters: the transfer launcher
-/// prevents template-seeded repository config/hooks, and the sealed
-/// [`CheckoutPolicy`] spawn path prevents Git from loading system or global
-/// config. An LFS installation configured only at those scopes therefore
-/// leaves pointer text unsmudged, silently when its `required=true` setting is
-/// hidden with the driver. The same spawn path also selects #723's
-/// AF_UNIX-denying seccomp profile without moving this policy to Strict.
+/// HTTPS access remains for the server-authored LFS filter. No other checkout
+/// port survives, and hooks are blocked: the transfer launcher prevents
+/// template-seeded repository config/hooks, while the sealed [`CheckoutPolicy`]
+/// spawn path prevents Git from loading system or global config. The LFS
+/// launcher restores only the fixed `filter.lfs.*` values it owns and marks the
+/// filter required, so a missing or refused LFS process is loud rather than a
+/// successful checkout containing pointer stubs. The same spawn path selects
+/// #723's AF_UNIX-denying seccomp profile without moving this policy to Strict.
 ///
 /// # Why the constructor alone is not the #723 boundary
 ///
 /// ADR 0033 §3 measured that the removed Landlock socket grant is inert on
-/// pathname `AF_UNIX`. A hook can still recover a socket path from readable
+/// pathname `AF_UNIX`. A filter can still recover a socket path from readable
 /// `$HOME` — `~/.keychain/<host>-sh` contains `SSH_AUTH_SOCK=/tmp/ssh-…/agent.N`
 /// — and set the variable itself. The denial therefore cannot be represented by
 /// this filesystem/network-port `Policy` value. It lives in the only consumer
@@ -1371,10 +1358,11 @@ pub(crate) fn policy_for_clone(clones_root: &Path) -> Result<Policy, shim::ShimE
 /// R8 (`escape_contract.rs`) refuses a functional update in any production
 /// `Policy` construction, and refuses it loudly rather than skipping what it
 /// cannot read. Its job is to verify from source that no production
-/// constructor can yield `HookMode::Blocked`, and `..base` hides that field
-/// behind an indirection the scanner cannot follow. Caught by the gate on the
-/// first version of this function, which did exactly that. The verbosity is
-/// the price of a check that cannot be defeated by convenience syntax.
+/// constructor spells its hook mode literally, and `..base` hides that field
+/// behind an indirection the scanner cannot follow. It now also verifies this
+/// is the sole production `Blocked` literal and that it names `/dev/null`.
+/// The verbosity is the price of a check that cannot be defeated by
+/// convenience syntax.
 pub(crate) fn policy_for_clone_checkout(
     clones_root: &Path,
 ) -> Result<CheckoutPolicy, shim::ShimError> {
@@ -1393,15 +1381,17 @@ pub(crate) fn policy_for_clone_checkout(
         ro_trees: transfer.ro_trees,
         secret_excludes: transfer.secret_excludes,
         // #702: no `known_hosts` exception — the `~/.ssh` exclude is
-        // exceptionless again for the process that runs attacker code.
+        // exceptionless again for the process that runs the LFS filter.
         ro_carveouts: Vec::new(),
-        // #702: no port 22.
+        // #702 removed port 22; #831 leaves only HTTPS for the fixed LFS path.
         net_ports: CLONE_CHECKOUT_PORTS.to_vec(),
-        // Retained temporarily, and spelled literally for R8. A fresh clone
-        // now has no selectable hook after the transfer/config-scope pins; ADR
-        // 0146 records why removing this latent capability is a follow-up
-        // rather than being folded into the present boundary repair.
-        hook_mode: HookMode::Run,
+        // `/dev/null` is immutable host state and cannot acquire a hook. Git
+        // appends each hook name to this path and observes ENOTDIR, exactly the
+        // desired "no hook exists" result, without a writable empty directory
+        // whose emptiness would itself need protecting.
+        hook_mode: HookMode::Blocked {
+            empty_dir: PathBuf::from("/dev/null"),
+        },
     }))
 }
 

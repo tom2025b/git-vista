@@ -5,6 +5,11 @@
 - **Issue:** #782; explicit LFS and least-authority follow-up #831
 - **Supersedes in part:** [ADR 0128](0128-a-credential-exists-only-before-untrusted-checkout.md) and [ADR 0137](0137-an-untrusted-checkout-inherits-an-allowlist.md) — fresh-clone checkout no longer preserves operator-selected hooks, filters, or Git LFS configuration
 - **Extends:** [ADR 0144](0144-network-spawns-use-server-authored-transport-programs.md) — adds three fixed config selectors and one higher-precedence environment control to the shared Network launcher
+- **Superseded in part by:** [ADR 0147](0147-clone-checkout-uses-one-server-authored-lfs-filter.md) — checkout now supplies a fixed required LFS filter, blocks hooks, and retains only HTTPS
+
+> This ADR records the #827 boundary and its then-current compatibility break.
+> ADR 0147 is the current checkout behavior; the sections below remain the
+> historical rationale for removing operator configuration.
 
 ## Context
 
