@@ -1359,10 +1359,12 @@ pub(crate) fn policy_for_clone(clones_root: &Path) -> Result<Policy, shim::ShimE
 ///   a symlink no longer has checkout refused by `add_carveout_rule`'s guard;
 /// * [`CLONE_CHECKOUT_PORTS`] rather than [`DEFAULT_GIT_PORTS`] — no port 22.
 ///
-/// TCP access, `HookMode::Run` and filter execution remain: ADR 0128 kept them
-/// deliberately (a `git-lfs` smudge filter is a legitimate checkout-time
-/// network consumer). The sealed [`CheckoutPolicy`] spawn path now also selects
-/// #723's AF_UNIX-denying seccomp profile without moving this policy to Strict.
+/// TCP access, `HookMode::Run` and filter execution remain. The sealed
+/// [`CheckoutPolicy`] spawn path separately prevents Git from loading system
+/// or global config, so only repository-local filter definitions can select a
+/// filter here; an LFS installation configured only at operator scope leaves
+/// its pointer unsmudged. The same spawn path also selects #723's
+/// AF_UNIX-denying seccomp profile without moving this policy to Strict.
 ///
 /// # Why the constructor alone is not the #723 boundary
 ///

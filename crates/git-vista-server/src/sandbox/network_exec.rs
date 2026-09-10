@@ -71,9 +71,10 @@
 //! from the operator's parent environment; executable lookup remains trusted.
 //! HTTP(S) uses Git's installed standard helpers. Both transport environment
 //! values are server-authored and replace inherited values. Checkout also
-//! receives them after its environment is cleared, but LFS custom-transfer/
-//! extension and general filter commands are separate executable surfaces,
-//! not constrained by Git's protocol policy.
+//! receives them after its environment is cleared. Its separate config-scope
+//! policy disables system and global Git configuration, because LFS
+//! custom-transfer/extension and general filter commands are executable
+//! surfaces that the protocol policy cannot constrain.
 //!
 //! [`redact_output`] remains defence in depth for diagnostics emitted by the
 //! selected transport. A [`CredentialedCommand`] additionally knows and
@@ -345,9 +346,10 @@ impl UntrustedCheckoutCommand {
 }
 
 /// A Network-tier command for the phase after credential use has ended.
-/// It preserves TCP, hooks and filters while replacing the child's environment
-/// with the allowlisted one ([`spawn::UNTRUSTED_CHECKOUT_ENV_ALLOWLIST`]) and
-/// selecting the checkout-only AF_UNIX denial.
+/// It preserves TCP, hooks and repository-local filters while replacing the
+/// child's environment with the allowlisted one
+/// ([`spawn::UNTRUSTED_CHECKOUT_ENV_ALLOWLIST`]), disabling system and global
+/// Git configuration, and selecting the checkout-only AF_UNIX denial.
 ///
 /// The allowlist is applied here rather than left to the caller: this function
 /// is the boundary, and a boundary a caller can decline to cross is not one.
@@ -1228,6 +1230,174 @@ mod https_suite {
             home: home_path,
             cwd: cwd_path,
         }
+    }
+
+    /// A tracked attribute can select any filter name, so both operator config
+    /// scopes must be absent from the real checkout launcher. This is not an
+    /// LFS-only test: two generic smudge drivers make the scope boundary
+    /// observable without requiring git-lfs or a network service.
+    ///
+    /// The first checkout is the executing control. It uses the same compiled
+    /// checkout policy, shim and reaper, but omits
+    /// [`network_command_without_credential`]'s environment hardening; one
+    /// driver comes from a synthetic system file and the other from a
+    /// synthetic global file, and both must write their marker. The production
+    /// launcher then receives that identical environment through
+    /// `pinned_env_for_test`. Completion-time hardening must override both
+    /// selectors, leave both markers absent, and still materialise the files.
+    ///
+    /// MUTATION 1 (remove the mechanism): omit
+    /// `apply_checkout_git_config_policy` from the completion policies. Both
+    /// markers execute in the production leg.
+    /// MUTATION 2 (weaken the mechanism): retain `GIT_CONFIG_NOSYSTEM=1` but
+    /// omit `GIT_CONFIG_GLOBAL=/dev/null`. The global marker alone executes.
+    #[tokio::test]
+    async fn clone_checkout_ignores_system_and_global_filter_commands() {
+        let fixture = home_and_cwd();
+        let system_marker = fixture.cwd.join("system-filter-ran");
+        let global_marker = fixture.cwd.join("global-filter-ran");
+        let system_filter = fixture.home.join("system-filter.sh");
+        let global_filter = fixture.home.join("global-filter.sh");
+
+        for (program, marker) in [
+            (&system_filter, &system_marker),
+            (&global_filter, &global_marker),
+        ] {
+            std::fs::write(
+                program,
+                format!(
+                    "#!/bin/sh\nprintf 'RAN\\n' > '{}'\nexec /bin/cat\n",
+                    marker.display()
+                ),
+            )
+            .expect("write filter program");
+            let mut permissions = std::fs::metadata(program).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+            std::fs::set_permissions(program, permissions).unwrap();
+        }
+
+        let system_config = fixture.home.join("system.gitconfig");
+        let global_config = fixture.home.join("global.gitconfig");
+        std::fs::write(
+            &system_config,
+            format!(
+                "[filter \"gv782system\"]\n\tsmudge = {}\n\trequired = true\n",
+                system_filter.display()
+            ),
+        )
+        .expect("write synthetic system config");
+        std::fs::write(
+            &global_config,
+            format!(
+                "[filter \"gv782global\"]\n\tsmudge = {}\n\trequired = true\n",
+                global_filter.display()
+            ),
+        )
+        .expect("write synthetic global config");
+
+        run(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&fixture.cwd),
+            "init filter repo",
+        );
+        std::fs::write(
+            fixture.cwd.join(".gitattributes"),
+            "system-payload filter=gv782system\nglobal-payload filter=gv782global\n",
+        )
+        .expect("write filter attributes");
+        std::fs::write(fixture.cwd.join("system-payload"), "system payload\n")
+            .expect("write system payload");
+        std::fs::write(fixture.cwd.join("global-payload"), "global payload\n")
+            .expect("write global payload");
+        run(
+            Command::new("git")
+                .args(["add", "."])
+                .current_dir(&fixture.cwd),
+            "stage filter fixture",
+        );
+        run(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-qm",
+                    "filter fixture",
+                ])
+                .current_dir(&fixture.cwd),
+            "commit filter fixture",
+        );
+
+        let env = vec![
+            ("PATH", "/usr/bin:/bin".to_string()),
+            ("HOME", fixture.home.to_string_lossy().into_owned()),
+            (
+                "GIT_CONFIG_SYSTEM",
+                system_config.to_string_lossy().into_owned(),
+            ),
+            (
+                "GIT_CONFIG_GLOBAL",
+                global_config.to_string_lossy().into_owned(),
+            ),
+        ];
+        let policy = network_policy(&fixture.home, &fixture.cwd, 9418);
+        let checkout = crate::sandbox::CheckoutPolicy(policy);
+
+        for name in ["system-payload", "global-payload"] {
+            std::fs::remove_file(fixture.cwd.join(name)).expect("remove payload before control");
+        }
+        let control = spawn::checkout_command_async(&checkout, &fixture.cwd, &["checkout", "-f"])
+            .pinned_env_for_test(&env)
+            .output()
+            .await
+            .expect("unhardened checkout starts");
+        assert!(
+            control.status.success(),
+            "executing control checkout failed: {}",
+            String::from_utf8_lossy(&control.stderr)
+        );
+        assert!(
+            system_marker.exists() && global_marker.exists(),
+            "executing control did not reach both operator filter scopes"
+        );
+
+        for path in [
+            &system_marker,
+            &global_marker,
+            &fixture.cwd.join("system-payload"),
+            &fixture.cwd.join("global-payload"),
+        ] {
+            std::fs::remove_file(path).expect("reset fixture before hardened checkout");
+        }
+
+        let mut hardened =
+            network_command_without_credential(&checkout, &fixture.cwd, &["checkout", "-f"]);
+        hardened.0 = hardened.0.pinned_env_for_test(&env);
+        let output = hardened.output().await.expect("hardened checkout starts");
+        assert!(
+            output.status.success(),
+            "hardened checkout failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !system_marker.exists(),
+            "system-config filter executed during hardened checkout"
+        );
+        assert!(
+            !global_marker.exists(),
+            "global-config filter executed during hardened checkout"
+        );
+        assert_eq!(
+            std::fs::read(fixture.cwd.join("system-payload")).unwrap(),
+            b"system payload\n"
+        );
+        assert_eq!(
+            std::fs::read(fixture.cwd.join("global-payload")).unwrap(),
+            b"global payload\n"
+        );
     }
 
     /// I5, closed: a repo-local `core.askpass` marker script never runs
