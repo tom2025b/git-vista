@@ -722,6 +722,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # A fast structural backstop for #830's seven repository openers. The
+      # Playwright suite below remains the semantic proof; this check makes a
+      # reintroduction of the specific instant-sample race fail before builds.
+      - name: Repository mode openers keep their sequencing guards
+        run: python3 -m unittest ci.browser.tests.test_mode_dialog_openers
+
       # The suite needs an unprivileged user namespace, and ubuntu-24.04 ships
       # the AppArmor clamp that refuses one — measured on run 34268833753, where
       # `unshare --user` died with "write failed /proc/self/uid_map: Operation

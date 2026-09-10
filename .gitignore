@@ -115,3 +115,6 @@ target-testbed-*/
 
 # Lane handoff prompts — session scratch, never product
 FIRST-MESSAGE*.txt
+
+# Lane coordination artifact — never product code (2026-09-10)
+PR-REQUEST.md
