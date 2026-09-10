@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+# Build one integration PR from 2–5 source PRs. Run --merge NAME after CI.
+# REPO_DIR / BATCH_WT select local paths; origin must name the repository below.
+# ALLOW_CLOSING="123 456" declares a literal set; DRY=1 never writes to GitHub.
+# BATCH_ALLOW_OVERLAP=1 deliberately permits shared paths. BATCH_FORCE=1 permits
+# more than five sources. Neither bypasses the closing-keyword gate.
+#
+# Creation is a snapshot check, not a lasting authorization to merge. --merge
+# checks live source/batch metadata again and sends a synchronous SHA-conditioned
+# merge request. GitHub has no conditional title/body merge API: edits between
+# the final reads and that request, or merges outside this tool, remain a limit.
+set -euo pipefail
+umask 077
+export LC_ALL=C
+
+die() { echo "batch-land: $*" >&2; exit 1; }
+REPO_DIR="${REPO_DIR:-/home/tom/projects/git-vista}"
+# Canonical spelling, as GitHub's own .full_name reports it. The clone's origin
+# URL uses this casing too; the earlier "Git-Vista" spelling matched neither.
+REPO="tom2025b/git-vista"
+MODE=build
+if [ "${1:-}" = --merge ]; then MODE=merge; shift; fi
+NAME="${1:-}"
+[ "$#" -gt 0 ] && shift
+[[ "$NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "name must be a simple branch label"
+PRS=("$@")
+if [ "$MODE" = build ]; then
+  [ "${#PRS[@]}" -ge 2 ] || die "usage: batch-land NAME PR PR [PR...] | batch-land --merge NAME"
+  if [ "${#PRS[@]}" -gt 5 ] && [ "${BATCH_FORCE:-0}" != 1 ]; then
+    die "recommended maximum is 5 PRs; set BATCH_FORCE=1 to proceed"
+  fi
+else
+  [ "$#" -eq 0 ] || die "usage: batch-land --merge NAME"
+fi
+
+# Keep the coordinator's reviewed grammar identical in both standalone tools.
+KW='(^|[^A-Za-z0-9_])(close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)[[:space:]]*:?[[:space:]]*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+'
+declare -A ALLOWED=()
+declare -a allow_words=()
+read -r -a allow_words <<< "${ALLOW_CLOSING:-}"
+for issue in "${allow_words[@]}"; do
+  issue="${issue#\#}"
+  [[ "$issue" =~ ^[1-9][0-9]*$ ]] || die "ALLOW_CLOSING must contain literal positive issue numbers"
+  ALLOWED["$issue"]=1
+done
+gate() {
+  local file="$1" matches rc match issue
+  if matches=$(grep -ioE "$KW" -- "$file"); then
+    while IFS= read -r match; do
+      issue="${match##*#}"
+      [ "${ALLOWED[$issue]:-0}" = 1 ] || die "REFUSING undeclared closing reference #$issue in $file"
+    done <<< "$matches"
+  else
+    rc=$?
+    [ "$rc" -eq 1 ] || die "cannot scan $file (grep exit $rc)"
+  fi
+}
+
+check_origin() {
+  local origin lc_origin lc_repo
+  origin=$(git -C "$REPO_DIR" remote get-url "$@" origin) || die "cannot read origin"
+  # GitHub owner/repo names are case-insensitive IDENTIFIERS -- tom2025b/Git-Vista
+  # and tom2025b/git-vista resolve to the same repository, and no two repositories
+  # can differ only by case. So folding case here admits exactly the same set of
+  # repositories and removes only false negatives; it is a correctness fix, not a
+  # relaxed boundary. A case-sensitive compare refused every real invocation of
+  # this tool -- the clone's origin is .../git-vista.git while REPO read Git-Vista
+  # -- which is why 15 findings, two reviews and a GO audit all missed it: none of
+  # them ran it against the live origin.
+  lc_origin="${origin,,}"
+  lc_repo="${REPO,,}"
+  case "$lc_origin" in
+    "https://github.com/$lc_repo"|"https://github.com/$lc_repo.git"|"git@github.com:$lc_repo"|"git@github.com:$lc_repo.git"|"ssh://git@github.com/$lc_repo"|"ssh://git@github.com/$lc_repo.git") ;;
+    *) die "origin must identify $REPO (got: $origin)" ;;
+  esac
+}
+check_origin
+check_origin --push
+WT=$(realpath -m -- "${BATCH_WT:-/tmp/claude-1000/batch-land-wt}")
+mkdir -p -- "$(dirname -- "$WT")"
+# Canonical sibling path, held from before any worktree access through push,
+# creation, manifest publication, or merge. Never unlink a flock lock file.
+exec {lock_fd}>"$WT.batch-land.lock"
+flock -n "$lock_fd" || die "another batch-land run owns $WT"
+# Git/gh may launch persistent credential helpers. Only this shell owns the lock.
+git() { command git "$@" {lock_fd}>&-; }
+gh() { command gh "$@" {lock_fd}>&-; }
+STATE="${BATCH_STATE_DIR:-$HOME/.local/state/batch-land}"
+mkdir -p -- "$STATE"
+MANIFEST="$STATE/$NAME.json"
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/batch-land.XXXXXXXX") || die "cannot allocate private scratch directory"
+cleanup() { rm -rf -- "$TMP"; }
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+FIELDS=number,headRefName,headRefOid,baseRefName,baseRefOid,title,body,state,isDraft,autoMergeRequest
+read_meta() {
+  local pr="$1" out="$2"
+  gh pr view "$pr" --repo "$REPO" --json "$FIELDS" > "$TMP/meta.raw" || die "cannot read PR $pr"
+  jq -e '
+    type == "object" and (.number | type == "number" and . > 0 and floor == .)
+    and (.headRefName | type == "string" and length > 0)
+    and (.headRefOid | type == "string" and test("^[0-9a-f]{40}$"))
+    and (.baseRefOid | type == "string" and test("^[0-9a-f]{40}$"))
+    and .baseRefName == "main" and .state == "OPEN"
+    and (.title | type == "string") and (.body | type == "string")
+    and (.isDraft | type == "boolean") and has("autoMergeRequest")
+  ' "$TMP/meta.raw" >/dev/null || die "invalid, closed, or non-main PR $pr"
+  jq -S . "$TMP/meta.raw" > "$out" || die "cannot save PR $pr metadata"
+}
+scan_meta() {
+  jq -r '.title, .body' "$1" > "$TMP/metadata.txt" || die "cannot decode metadata"
+  gate "$TMP/metadata.txt"
+}
+fetch_oid() {
+  git -C "$REPO_DIR" fetch -q --no-tags origin "$1" || die "cannot fetch pinned commit $1"
+  [ "$(git -C "$REPO_DIR" rev-parse --verify "$1^{commit}")" = "$1" ] || die "pinned object is not a commit"
+}
+check_sources() {
+  local p
+  for p in "${PRS[@]}"; do
+    read_meta "$p" "$TMP/current-$p.json"
+    scan_meta "$TMP/current-$p.json"
+    cmp -s "$TMP/source-$p.json" "$TMP/current-$p.json" || die "PR #$p changed since the snapshot; rebuild the batch"
+  done
+}
+BRANCH="integration/$NAME"
+
+if [ "$MODE" = merge ]; then
+  [ -f "$MANIFEST" ] || die "no saved creation manifest for $NAME"
+  jq -e --arg repo "$REPO" --arg branch "$BRANCH" '
+    .version == 1 and .repo == $repo and .branch == $branch
+    and (.head | type == "string" and test("^[0-9a-f]{40}$"))
+    and (.base | type == "string" and test("^[0-9a-f]{40}$"))
+    and (.batch | type == "number" and . > 0 and floor == .)
+    and (.sources | type == "array" and length >= 2)
+  ' "$MANIFEST" >/dev/null || die "invalid creation manifest"
+  HEAD_OID=$(jq -r .head "$MANIFEST")
+  BASE=$(jq -r .base "$MANIFEST")
+  batch=$(jq -r .batch "$MANIFEST")
+  jq -r '.sources[].number' "$MANIFEST" > "$TMP/numbers"
+  mapfile -t PRS < "$TMP/numbers"
+  for p in "${PRS[@]}"; do
+    [[ "$p" =~ ^[1-9][0-9]*$ ]] || die "invalid saved PR number"
+    jq --argjson p "$p" -S '.sources[] | select(.number == $p)' "$MANIFEST" > "$TMP/source-$p.json"
+  done
+  fetch_oid "$HEAD_OID"
+  fetch_oid "$BASE"
+  git -C "$REPO_DIR" log "$BASE..$HEAD_OID" --format='%B' > "$TMP/commits.txt"
+  gate "$TMP/commits.txt"
+  check_sources
+  read_meta "$batch" "$TMP/batch.json"
+  [ "$(jq -r .headRefOid "$TMP/batch.json")" = "$HEAD_OID" ] || die "batch head changed; rebuild"
+  [ "$(jq -r .headRefName "$TMP/batch.json")" = "$BRANCH" ] || die "wrong batch branch"
+  [ "$(jq -r .baseRefOid "$TMP/batch.json")" = "$BASE" ] || die "main changed; rebuild and rerun CI"
+  jq -e '.autoMergeRequest == null' "$TMP/batch.json" >/dev/null || die "disable pending auto-merge before using this gate"
+  scan_meta "$TMP/batch.json"
+  if [ "${DRY:-0}" = 1 ]; then
+    echo "DRY=1: merge preflight passed for #$batch at $HEAD_OID; no GitHub writes"
+    exit 0
+  fi
+  if [ "$(jq -r .isDraft "$TMP/batch.json")" = true ]; then
+    gh pr ready "$batch" --repo "$REPO" || die "cannot mark batch ready"
+  fi
+  # Fresh reads follow the ready operation. No CI wait or asynchronous auto-merge
+  # may separate these checks from the synchronous merge request.
+  check_sources
+  read_meta "$batch" "$TMP/final-batch.json"
+  jq '.isDraft = false' "$TMP/batch.json" > "$TMP/ready-batch.json"
+  cmp -s "$TMP/ready-batch.json" "$TMP/final-batch.json" || die "batch metadata changed during preflight"
+  scan_meta "$TMP/final-batch.json"
+  gh api --method PUT "repos/$REPO/pulls/$batch/merge" \
+    -f "sha=$HEAD_OID" -f merge_method=merge \
+    -f "commit_title=Integrate batch $NAME (#$batch)" \
+    -f "commit_message=Validated integration head $HEAD_OID" > "$TMP/merge.json" || die "merge failed; no auto-merge scheduled"
+  jq -e '.merged == true' "$TMP/merge.json" >/dev/null || die "GitHub did not confirm a merge"
+  echo "merged batch #$batch at $HEAD_OID"
+  exit 0
+fi
+
+[ ! -e "$MANIFEST" ] || die "batch name already has a manifest; use --merge or a new name"
+declare -A seen_prs=() owners=()
+declare -a source_files=()
+BASE=""
+overlap=0
+for p in "${PRS[@]}"; do
+  [[ "$p" =~ ^[1-9][0-9]*$ ]] || die "PRs must be positive numbers"
+  [ "${seen_prs[$p]:-0}" = 0 ] || die "duplicate PR #$p"
+  seen_prs["$p"]=1
+  read_meta "$p" "$TMP/source-$p.json"
+  [ "$(jq -r .number "$TMP/source-$p.json")" = "$p" ] || die "PR identity mismatch"
+  scan_meta "$TMP/source-$p.json"
+  oid=$(jq -r .headRefOid "$TMP/source-$p.json")
+  base_oid=$(jq -r .baseRefOid "$TMP/source-$p.json")
+  [ -n "$BASE" ] || BASE="$base_oid"
+  [ "$BASE" = "$base_oid" ] || die "main changed while reading sources; retry"
+  fetch_oid "$oid"
+  fetch_oid "$base_oid"
+  # Git supplies the complete diff of the pinned objects. Disabling rename
+  # detection lists BOTH old and new paths. NUL separation preserves every path.
+  git -C "$REPO_DIR" diff --no-ext-diff --no-textconv --no-renames --name-only -z \
+    "$base_oid...$oid" -- > "$TMP/paths" || die "cannot read full diff for #$p"
+  while IFS= read -r -d '' path; do
+    if [ -n "${owners[$path]:-}" ]; then
+      printf 'SHARED: #%s #%s %q\n' "${owners[$path]}" "$p" "$path"
+      overlap=1
+    fi
+    owners["$path"]="$p"
+  done < "$TMP/paths"
+  source_files+=("$TMP/source-$p.json")
+done
+if [ "$overlap" = 1 ] && [ "${BATCH_ALLOW_OVERLAP:-0}" != 1 ]; then
+  die "shared files require BATCH_ALLOW_OVERLAP=1"
+fi
+echo "File check complete; disjoint paths can still interact semantically."
+
+if [ -e "$WT" ]; then
+  [ "$(git -C "$WT" rev-parse --show-toplevel)" = "$WT" ] || die "BATCH_WT is not a worktree root"
+  [ "$(git -C "$WT" rev-parse --path-format=absolute --git-common-dir)" = \
+    "$(git -C "$REPO_DIR" rev-parse --path-format=absolute --git-common-dir)" ] || die "BATCH_WT belongs to another repository"
+  [ -z "$(git -C "$WT" status --porcelain --untracked-files=all)" ] || die "BATCH_WT is dirty; inspect it manually"
+  if git -C "$WT" rev-parse -q --verify MERGE_HEAD >/dev/null; then die "BATCH_WT has an unfinished merge"; fi
+else
+  git -C "$REPO_DIR" worktree add -q --detach "$WT" "$BASE" || die "cannot create integration worktree"
+fi
+git -C "$WT" checkout -q --detach "$BASE"
+for p in "${PRS[@]}"; do
+  oid=$(jq -r .headRefOid "$TMP/source-$p.json")
+  if ! git -C "$WT" -c user.name=Claude_Max \
+      -c user.email=262510778+tom2025b@users.noreply.github.com \
+      merge --no-ff --no-edit -m "batch: merge #$p" "$oid"; then
+    git -C "$WT" merge --abort || true
+    die "merge failed for #$p; see diagnostics above"
+  fi
+done
+HEAD_OID=$(git -C "$WT" rev-parse HEAD)
+git -C "$WT" log "$BASE..$HEAD_OID" --format='%B' > "$TMP/commits.txt"
+gate "$TMP/commits.txt"
+
+# Generate and scan the exact bytes submitted. A single checked jq write avoids
+# a brace group whose final successful echo could hide an earlier short write.
+TITLE="batch: $NAME (${#PRS[@]} PRs)"
+jq -rs '"Integration batch; source commits are preserved with true merges.\n\n"
+  + (map("- #\(.number) \(.title) (\(.headRefOid))") | join("\n"))
+  + "\n\nCreation checks are a snapshot. Use batch-land --merge NAME after CI to recheck before merging."
+  ' "${source_files[@]}" > "$TMP/body.md" || die "cannot write complete batch body"
+printf '%s\n' "$TITLE" > "$TMP/title.txt"
+gate "$TMP/body.md"
+gate "$TMP/title.txt"
+check_sources
+if [ "${DRY:-0}" = 1 ]; then
+  echo "DRY=1: built $HEAD_OID; no push or PR creation"
+  exit 0
+fi
+# Push the scanned OID, never the mutable worktree HEAD.
+git -C "$WT" push -q origin "$HEAD_OID:refs/heads/$BRANCH" || die "push failed"
+check_sources
+gh pr create --repo "$REPO" --base main --head "$BRANCH" --draft \
+  --title "$TITLE" --body-file "$TMP/body.md" > "$TMP/created.txt" || die "PR creation failed; branch $BRANCH remains pushed"
+read_meta "$BRANCH" "$TMP/batch.json"
+[ "$(jq -r .headRefOid "$TMP/batch.json")" = "$HEAD_OID" ] || die "created batch head mismatch; leave draft for inspection"
+scan_meta "$TMP/batch.json"
+check_sources
+batch=$(jq -r .number "$TMP/batch.json")
+jq -s --arg repo "$REPO" --arg branch "$BRANCH" --arg head "$HEAD_OID" \
+  --arg base "$BASE" --argjson batch "$batch" \
+  '{version:1, repo:$repo, branch:$branch, head:$head, base:$base, batch:$batch, sources:.}' \
+  "${source_files[@]}" > "$TMP/manifest.json"
+staged=$(mktemp "$STATE/.manifest.XXXXXXXX")
+if ! cp -- "$TMP/manifest.json" "$staged" || ! mv -- "$staged" "$MANIFEST"; then
+  rm -f -- "$staged"
+  die "could not publish manifest; batch remains draft"
+fi
+cat "$TMP/created.txt"
+echo "Draft created. After CI, run batch-land --merge $NAME with the same ALLOW_CLOSING declaration."

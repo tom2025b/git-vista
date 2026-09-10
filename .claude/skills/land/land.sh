@@ -98,7 +98,8 @@ land() {
   echo "  $(gh pr view "$n" --json state,mergeCommit --jq '"\(.state) \(.mergeCommit.oid[0:7] // "-")"')"
 }
 main() {
-  land 322 fix/316-error-surfacing "fix(#316): errors as words in the app's modal, never wire JSON in an alert() (#322)" || exit 1
+  land 796 docs/deadcode-triage-round2-census "docs(census): document 4 round2 name-collision cases in EXEMPT (#796)" || exit 1
+  land 781 test/357-ui-interaction-selection "test(#357): cover staging line selection through browser interactions (#781)" || exit 1
   git checkout -q main && git pull -q --ff-only origin main
   if ! refresh_app_mirror; then
     echo "=== LANDING INCOMPLETE: SERVED APP CHECKOUT NOT REFRESHED ===" >&2
