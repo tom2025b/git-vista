@@ -187,10 +187,19 @@ the buildlocked driver in `sandbox/test_failure_atlas_831.py`:
 |---|---|---|
 | `mutation_history` **571** | Remove `with_untrusted_checkout_env()` from the credentialless launcher | **caught** — baseline 1 passed; the mutant filter observed both `/tmp/gv831-atlas-agent.sock` and the ambient canary instead of `unset` |
 | `mutation_history` **572** | Route `CheckoutPolicy` through ordinary `full_argv`, omitting the checkout seccomp selection | **caught** — baseline 1 passed; the mutant filter's real pathname-AF_UNIX result changed from `errno:1` to `connected` |
+| `mutation_history` **576** | Remove `lfs.skipdownloaderrors=false` | **caught** — baseline 2 passed; the tracked `skipdownloaderrors=true` fixture then returned successful pointer text instead of failing checkout |
+| `mutation_history` **577** | Remove both empty fetch include/exclude pins | **caught** — baseline 2 passed; the tracked fetch-filter fixture then returned successful pointer text instead of failing checkout |
+| `mutation_history` **578** | Remove query stripping while retaining URL-userinfo stripping | **caught** — baseline 1 passed; the sealed checkout output returned `token=checkout-secret` verbatim |
+| `mutation_history` **579** | Bypass `redact_output` in `UntrustedCheckoutCommand::output` | **caught** — baseline 1 passed; the raw LFS action URL crossed the sealed output boundary |
+| `mutation_history` **580** | Restore the stale M12 exact test name | **caught** — baseline 2 passed; the matrix contract found that the row no longer named a live checkout-security test |
+| `mutation_history` **581** | Accept a Cargo summary reporting zero passed tests | **caught** — baseline 2 passed; the anti-vacuity contract rejected the weakened exact-row criterion |
+| `mutation_history` **582** | Restore an HTTPS-enforcement claim in `SECURITY_MODEL.md` | **caught** — baseline 2 passed; the documentation boundary contract rejected the port/scheme contradiction |
+| `mutation_history` **583** | Restore the same HTTPS-enforcement claim in this ADR | **caught** — baseline 2 passed; the contract rejected the false claim beside the two plaintext paths |
 
-Both mutations compiled. The first removes environment construction; the
-second weakens the remaining boundary after the environment still withholds the
-agent locator. They therefore fail on different observations rather than
-crediting one test twice for the same break.
+Each repaired invariant has two distinct caught mutations. Records 574 and 575
+were inconclusive baseline timeouts caused by nesting the driver's buildlock on
+the lock already held by failure-atlas; they are not counted. The driver now
+keeps every Cargo command buildlocked on its own one-slot inner file while the
+atlas parent retains the host-wide outer exclusion.
 
 Signed: **codex** · 2026-09-10
