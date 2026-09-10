@@ -1,6 +1,6 @@
 # ADR 0142 — A CI job may weaken the runner only for a named reason it still needs
 
-- **Status:** Implemented — #754 adds the second qualifying route and the browser job that uses it.
+- **Status:** Implemented — #754 adds the second qualifying route and the browser job that uses it. The stale compile-time-port premise is amended by [ADR 0147](0147-runtime-port-configuration-precedes-instance-identity.md); the namespace requirement remains.
 - **Date:** 2026-09-08
 - **Issue:** #754; refs #355, #66, #207
 - **Extends:** [ADR 0029](0029-sandbox-tiers.md) — the Strict tier a host must be able to provide, and the refusal-rather-than-downgrade posture that makes provisioning load-bearing. Nothing in 0029 is retracted.
@@ -33,7 +33,7 @@ Equality rather than a subset is the point: the defect being fixed was two hand-
 
 That rule was **binary** — a job provisions the host *iff* it runs this crate's Rust tests — and #754 met the first honest exception to it.
 
-The browser suite (#355) is the only thing in CI that *runs* wasm; `cargo test` never compiles a line behind `#[cfg(target_arch = "wasm32")]`. It runs inside `unshare --user --map-root-user --net --mount`, because the server's listen port is a **compile-time constant** and `parse_bind_addr` refuses any other address on purpose — a test server cannot simply pick a free port. So it needs `user_namespaces`: the same capability the Strict tier needs, for a different reason.
+The browser suite (#355) is the only thing in CI that *runs* wasm; `cargo test` never compiles a line behind `#[cfg(target_arch = "wasm32")]`. Its harness runs inside `unshare --user --map-root-user --net --mount`: the private network keeps its stable 8080 origin invisible to the operator's server, while the private mount lets it serve a candidate bundle without replacing the files that server is reading. The server can now select another loopback port at runtime, but that does not provide either namespace guarantee or change the harness's fixed test origin. So the suite still needs `user_namespaces`: the same capability the Strict tier needs, for a different reason.
 
 Measured on CI run 34268833753, before any change:
 

@@ -29,8 +29,6 @@ pub(crate) const DEFAULT_REPO: &str = ".";
 // time relative to this crate so the server runs from any working directory.
 pub(crate) const DIST_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../git-vista/dist");
 pub(crate) const PORT: u16 = 8080;
-#[cfg(test)]
-pub(crate) const LOOPBACK_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), PORT);
 
 /// Resolve the instance port. The default remains 8080; zero is never a usable
 /// TCP listener port and is refused instead of asking the OS to choose one.
@@ -65,11 +63,6 @@ pub(crate) fn bind_addr(port: u16) -> Result<SocketAddr, String> {
         Err(std::env::VarError::NotPresent) => parse_bind_addr_for_port(None, port),
         Err(error) => Err(format!("could not read GIT_VISTA_BIND_ADDR: {error}")),
     }
-}
-
-#[cfg(test)]
-fn parse_bind_addr(value: Option<&str>) -> Result<SocketAddr, String> {
-    parse_bind_addr_for_port(value, PORT)
 }
 
 fn parse_bind_addr_for_port(value: Option<&str>, port: u16) -> Result<SocketAddr, String> {
@@ -1183,7 +1176,6 @@ pub(crate) fn reject_if_read_only() -> Option<(StatusCode, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::{parse_bind_addr, LOOPBACK_ADDR};
 
     fn selection(path: &str) -> Current {
         Current {
@@ -1682,32 +1674,35 @@ mod tests {
 
     #[test]
     fn bind_address_defaults_to_loopback() {
-        assert_eq!(parse_bind_addr(None).unwrap(), LOOPBACK_ADDR);
+        assert_eq!(
+            parse_bind_addr_for_port(None, PORT).unwrap(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), PORT)
+        );
     }
 
     #[test]
     fn bind_address_accepts_the_explicit_loopback_service_value() {
         assert_eq!(
-            parse_bind_addr(Some("127.0.0.1:8080")).unwrap(),
-            LOOPBACK_ADDR
+            parse_bind_addr_for_port(Some("127.0.0.1:8080"), PORT).unwrap(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), PORT)
         );
     }
 
     #[test]
     fn bind_address_rejects_an_all_interface_listener() {
-        let error = parse_bind_addr(Some("0.0.0.0:8080")).unwrap_err();
+        let error = parse_bind_addr_for_port(Some("0.0.0.0:8080"), PORT).unwrap_err();
         assert!(error.contains("only listens on 127.0.0.1:8080"));
     }
 
     #[test]
     fn bind_address_rejects_a_lan_interface() {
-        let error = parse_bind_addr(Some("192.168.1.5:8080")).unwrap_err();
+        let error = parse_bind_addr_for_port(Some("192.168.1.5:8080"), PORT).unwrap_err();
         assert!(error.contains("only listens on 127.0.0.1:8080"));
     }
 
     #[test]
     fn bind_address_rejects_invalid_configuration() {
-        let error = parse_bind_addr(Some("not-an-address")).unwrap_err();
+        let error = parse_bind_addr_for_port(Some("not-an-address"), PORT).unwrap_err();
         assert!(error.contains("invalid GIT_VISTA_BIND_ADDR"));
     }
 
