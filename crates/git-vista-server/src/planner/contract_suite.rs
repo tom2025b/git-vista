@@ -210,7 +210,11 @@ async fn independent_fixtures_do_not_share_a_coordinator_guard() {
     drop(fallback);
     drop(fixture_a);
 
-    let fixture_a = crate::coordinator::lock(fixture_repo_key(&repo_a)).await;
+    // Bound with a leading underscore, never `let _ =`: this guard must stay held
+    // for the rest of the scope so `repo_b`'s lock is attempted while `repo_a` is
+    // still locked. `let _ =` drops immediately and would make the assertion below
+    // pass for the wrong reason.
+    let _fixture_a = crate::coordinator::lock(fixture_repo_key(&repo_a)).await;
     let fixture_b = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         crate::coordinator::lock(fixture_repo_key(&repo_b)),
