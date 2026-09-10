@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # gv — build the Git-Vista frontend and start the server for a Git repository.
 #
-# Git-Vista serves only IPv4 loopback. An iPad reaches that listener through an
-# SSH local-port forward; direct LAN serving is deliberately unsupported because
-# it would expose a plain-HTTP Git control surface beyond this machine.
+# Git-Vista's control interface serves only IPv4 loopback. An iPad reaches that
+# listener through an SSH local-port forward; the optional LAN listener is a
+# separate, read-only profile because plain HTTP must never expose Git writes.
 #
 #   gv                  visualise the current directory's repository
 #   gv ~/code/myproj    visualise another repository
@@ -24,13 +24,21 @@
 #                       guest/shared network.
 #   gv --lan-ip <addr>  the explicit LAN IP for --lan-view, when auto-detect
 #                       can't pick a single candidate.
+#   GIT_VISTA_PORT=8081 gv
+#                       run the launcher and server on a non-default port.
 #
 # A setup token lives only in a URL fragment (`#s=...`), is single-use, and is
 # exchanged for an HttpOnly session cookie. Run `gv --token` again for each new
 # browser/device. Never paste the token as a password or reuse one link twice.
 set -euo pipefail
 
-PORT=8080
+PORT="${GIT_VISTA_PORT:-8080}"
+if [[ ! $PORT =~ ^[0-9]{1,5}$ ]] || (( 10#$PORT == 0 || 10#$PORT > 65535 )); then
+  echo "gv: invalid GIT_VISTA_PORT '$PORT': expected an integer from 1 to 65535" >&2
+  exit 2
+fi
+PORT=$((10#$PORT))
+export GIT_VISTA_PORT="$PORT"
 START_DIR="$PWD"
 REPO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 SERVER_BIN="$REPO/target/debug/git-vista-server"

@@ -29,33 +29,64 @@ pub(crate) const DEFAULT_REPO: &str = ".";
 // time relative to this crate so the server runs from any working directory.
 pub(crate) const DIST_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../git-vista/dist");
 pub(crate) const PORT: u16 = 8080;
+#[cfg(test)]
 pub(crate) const LOOPBACK_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), PORT);
 
+/// Resolve the instance port. The default remains 8080; zero is never a usable
+/// TCP listener port and is refused instead of asking the OS to choose one.
+pub(crate) fn configured_port() -> Result<u16, String> {
+    match std::env::var("GIT_VISTA_PORT") {
+        Ok(value) => parse_port(Some(&value)),
+        Err(std::env::VarError::NotPresent) => parse_port(None),
+        Err(error) => Err(format!("could not read GIT_VISTA_PORT: {error}")),
+    }
+}
+
+fn parse_port(value: Option<&str>) -> Result<u16, String> {
+    let Some(value) = value else {
+        return Ok(PORT);
+    };
+    let port = value
+        .parse::<u16>()
+        .map_err(|error| format!("invalid GIT_VISTA_PORT '{value}': {error}"))?;
+    if port == 0 {
+        return Err("invalid GIT_VISTA_PORT '0': port must be between 1 and 65535".to_owned());
+    }
+    Ok(port)
+}
+
 /// Git-Vista is intentionally loopback-only. An explicit environment value is
-/// accepted for service files only when it repeats the exact safe address; this
-/// prevents a stale launcher or service override from exposing the server.
-pub(crate) fn bind_addr() -> Result<SocketAddr, String> {
+/// accepted for service files only when it repeats the safe loopback address at
+/// the configured port; this prevents a stale launcher or service override from
+/// exposing the server or silently selecting a different instance.
+pub(crate) fn bind_addr(port: u16) -> Result<SocketAddr, String> {
     match std::env::var("GIT_VISTA_BIND_ADDR") {
-        Ok(value) => parse_bind_addr(Some(&value)),
-        Err(std::env::VarError::NotPresent) => parse_bind_addr(None),
+        Ok(value) => parse_bind_addr_for_port(Some(&value), port),
+        Err(std::env::VarError::NotPresent) => parse_bind_addr_for_port(None, port),
         Err(error) => Err(format!("could not read GIT_VISTA_BIND_ADDR: {error}")),
     }
 }
 
+#[cfg(test)]
 fn parse_bind_addr(value: Option<&str>) -> Result<SocketAddr, String> {
+    parse_bind_addr_for_port(value, PORT)
+}
+
+fn parse_bind_addr_for_port(value: Option<&str>, port: u16) -> Result<SocketAddr, String> {
+    let loopback_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     match value {
         Some(value) => {
             let addr: SocketAddr = value
                 .parse()
                 .map_err(|error| format!("invalid GIT_VISTA_BIND_ADDR '{value}': {error}"))?;
-            if addr != LOOPBACK_ADDR {
+            if addr != loopback_addr {
                 return Err(format!(
-                    "refusing GIT_VISTA_BIND_ADDR '{value}': Git-Vista only listens on {LOOPBACK_ADDR}; use an SSH local-port forward for remote access"
+                    "refusing GIT_VISTA_BIND_ADDR '{value}': Git-Vista only listens on {loopback_addr}; use an SSH local-port forward for remote access"
                 ));
             }
             Ok(addr)
         }
-        None => Ok(LOOPBACK_ADDR),
+        None => Ok(loopback_addr),
     }
 }
 
@@ -65,15 +96,15 @@ fn parse_bind_addr(value: Option<&str>) -> Result<SocketAddr, String> {
 /// IP or requiring `--lan-ip` before it ever sets this variable, so a parse
 /// failure here means the launcher passed something bad — still handled as a
 /// clean startup error, never a panic.
-pub(crate) fn lan_bind_addr() -> Option<Result<SocketAddr, String>> {
-    parse_lan_ip_env(std::env::var("GIT_VISTA_LAN_IP").ok().as_deref())
+pub(crate) fn lan_bind_addr(port: u16) -> Option<Result<SocketAddr, String>> {
+    parse_lan_ip_env(std::env::var("GIT_VISTA_LAN_IP").ok().as_deref(), port)
 }
 
 /// The pure resolution behind [`lan_bind_addr`], parameterised so tests never
 /// read or write process env — the same pattern as `parse_bind_addr`. An empty
 /// value counts as unset, matching `resolve_clones_root`'s convention (a
 /// systemd unit with `Environment=X=` must not silently enable the feature).
-fn parse_lan_ip_env(value: Option<&str>) -> Option<Result<SocketAddr, String>> {
+fn parse_lan_ip_env(value: Option<&str>, port: u16) -> Option<Result<SocketAddr, String>> {
     let value = value.filter(|v| !v.trim().is_empty())?;
     let ip: IpAddr = match value.trim().parse() {
         Ok(ip) => ip,
@@ -89,7 +120,7 @@ fn parse_lan_ip_env(value: Option<&str>) -> Option<Result<SocketAddr, String>> {
             "refusing GIT_VISTA_LAN_IP '{value}': 0.0.0.0 is never accepted — pass one explicit interface address"
         )));
     }
-    Some(Ok(SocketAddr::new(ip, PORT)))
+    Some(Ok(SocketAddr::new(ip, port)))
 }
 
 // Upper bound on how much history to walk; plenty for now. `/api/frame` and the
@@ -1680,39 +1711,87 @@ mod tests {
         assert!(error.contains("invalid GIT_VISTA_BIND_ADDR"));
     }
 
+    #[test]
+    fn custom_port_still_rejects_every_non_loopback_host() {
+        for address in ["0.0.0.0:8081", "192.168.1.5:8081"] {
+            let error = parse_bind_addr_for_port(Some(address), 8081).unwrap_err();
+            assert!(
+                error.contains("only listens on 127.0.0.1:8081"),
+                "unexpected refusal for {address}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_port_accepts_only_its_exact_loopback_address() {
+        assert_eq!(
+            parse_bind_addr_for_port(Some("127.0.0.1:8081"), 8081).unwrap(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081)
+        );
+        assert!(parse_bind_addr_for_port(Some("127.0.0.1:8080"), 8081).is_err());
+    }
+
+    #[test]
+    fn port_defaults_to_8080_and_accepts_a_nonzero_override() {
+        assert_eq!(parse_port(None).unwrap(), PORT);
+        assert_eq!(parse_port(Some("8081")).unwrap(), 8081);
+    }
+
+    #[test]
+    fn port_rejects_zero_and_invalid_values() {
+        for value in ["0", "65536", "not-a-port"] {
+            let error = parse_port(Some(value)).unwrap_err();
+            assert!(error.contains("invalid GIT_VISTA_PORT"));
+        }
+    }
+
     // --- LAN listener address resolution (ADR 0005) -------------------------
 
     #[test]
     fn lan_ip_is_none_when_unset() {
-        assert!(parse_lan_ip_env(None).is_none());
+        assert!(parse_lan_ip_env(None, PORT).is_none());
     }
 
     #[test]
     fn lan_ip_is_none_when_empty() {
-        assert!(parse_lan_ip_env(Some("")).is_none());
+        assert!(parse_lan_ip_env(Some(""), PORT).is_none());
     }
 
     #[test]
     fn lan_ip_accepts_an_explicit_lan_address() {
-        let addr = parse_lan_ip_env(Some("192.168.1.42")).unwrap().unwrap();
+        let addr = parse_lan_ip_env(Some("192.168.1.42"), PORT)
+            .unwrap()
+            .unwrap();
         assert_eq!(addr, SocketAddr::new("192.168.1.42".parse().unwrap(), PORT));
     }
 
     #[test]
+    fn lan_ip_uses_the_configured_port() {
+        let addr = parse_lan_ip_env(Some("192.168.1.42"), 8081)
+            .unwrap()
+            .unwrap();
+        assert_eq!(addr, "192.168.1.42:8081".parse().unwrap());
+    }
+
+    #[test]
     fn lan_ip_rejects_loopback() {
-        let error = parse_lan_ip_env(Some("127.0.0.1")).unwrap().unwrap_err();
+        let error = parse_lan_ip_env(Some("127.0.0.1"), PORT)
+            .unwrap()
+            .unwrap_err();
         assert!(error.contains("loopback"));
     }
 
     #[test]
     fn lan_ip_rejects_unspecified() {
-        let error = parse_lan_ip_env(Some("0.0.0.0")).unwrap().unwrap_err();
+        let error = parse_lan_ip_env(Some("0.0.0.0"), PORT)
+            .unwrap()
+            .unwrap_err();
         assert!(error.contains("0.0.0.0"));
     }
 
     #[test]
     fn lan_ip_rejects_invalid_input() {
-        let error = parse_lan_ip_env(Some("not-an-address"))
+        let error = parse_lan_ip_env(Some("not-an-address"), PORT)
             .unwrap()
             .unwrap_err();
         assert!(error.contains("invalid GIT_VISTA_LAN_IP"));
