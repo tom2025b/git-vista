@@ -395,8 +395,10 @@ config, so neither an operator-selected hook nor a fetched-attribute filter is
 selectable there. This also disables system/global Git LFS filters. On hosts
 where `filter.lfs.required=true` lives in the same hidden scope, checkout exits
 successfully and leaves LFS pointer text on disk with no app, log, or HTTP
-signal. The explicit-LFS compatibility work remains tracked under
-[#782](https://github.com/tom2025b/git-vista/issues/782). See
+signal. [#831](https://github.com/tom2025b/git-vista/issues/831) owns an
+explicit HTTPS LFS path and removal of checkout's otherwise-unused TCP/hook
+authority; [#782](https://github.com/tom2025b/git-vista/issues/782) remains open
+until its broader measurements and acceptance criteria are complete. See
 [ADR 0144's amendment](adr/0144-network-spawns-use-server-authored-transport-programs.md)
 and [ADR 0146](adr/0146-clone-checkout-does-not-read-operator-git-config.md)
 for compatibility and behavioral proof.

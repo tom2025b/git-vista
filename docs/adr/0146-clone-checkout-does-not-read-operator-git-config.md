@@ -188,7 +188,20 @@ The compiled server-bin tests exercise the production launchers with real Git:
 - `network_command_pins_every_fixed_selector_and_the_transport_program` reads
   the spawned argv rather than re-deriving the constant.
 
-Failure-atlas mutation records are added after the committed test baseline is
-available; only `caught` results count.
+Failure-atlas ran against committed, clean baselines; all four conclusive arms
+were `caught`:
+
+| Boundary | Mutation | Record | Result |
+|---|---|---:|---|
+| Checkout config policy is reached | Remove `apply_checkout_git_config_policy` from completion | 546 | **caught** — both hostile values reached the child |
+| Both config scopes are required | Keep `GIT_CONFIG_NOSYSTEM=1`, remove `GIT_CONFIG_GLOBAL=/dev/null` | 547 | **caught** — the hostile global path reached the child |
+| Environment template precedence is closed | Stop removing inherited `GIT_TEMPLATE_DIR` | 548 | **caught** — the hostile template path reached the child |
+| Config template precedence is closed | Replace empty `init.templateDir=` with an operator path | 555 | **caught** — the exact safe-value assertion failed |
+
+The first attempt to mutate the real-Git integration test had a red baseline in
+the atlas clone because that fresh Cargo target did not contain the top-level
+`gv-sandbox` executable; it was non-conclusive and is not counted. The focused
+child-process probe exists to remove that artifact dependency while retaining
+the full production-launcher integration tests above.
 
 Signed: **codex** · 2026-09-10
