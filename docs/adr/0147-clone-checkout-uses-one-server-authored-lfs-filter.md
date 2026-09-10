@@ -161,7 +161,17 @@ managed tree; this sandbox does not claim to defend the operator from itself.
 
 The server-bin tests cover real materialisation, explicit refusal, phase
 measurements, selector pinning, hook suppression, and the no-agent/no-secret
-boundary. Mutation record identifiers are added here after the committed HEAD
-is exercised through failure-atlas.
+boundary. Failure-atlas cloned committed HEAD and ran each compiled test through
+the buildlocked driver in `sandbox/test_failure_atlas_831.py`:
+
+| Record | Mutation | Verdict and distinct failure |
+|---|---|---|
+| `mutation_history` **571** | Remove `with_untrusted_checkout_env()` from the credentialless launcher | **caught** — baseline 1 passed; the mutant filter observed both `/tmp/gv831-atlas-agent.sock` and the ambient canary instead of `unset` |
+| `mutation_history` **572** | Route `CheckoutPolicy` through ordinary `full_argv`, omitting the checkout seccomp selection | **caught** — baseline 1 passed; the mutant filter's real pathname-AF_UNIX result changed from `errno:1` to `connected` |
+
+Both mutations compiled. The first removes environment construction; the
+second weakens the remaining boundary after the environment still withholds the
+agent locator. They therefore fail on different observations rather than
+crediting one test twice for the same break.
 
 Signed: **codex** · 2026-09-10
