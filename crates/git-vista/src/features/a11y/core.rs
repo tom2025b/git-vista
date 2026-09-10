@@ -43,12 +43,16 @@ pub const GRAPH_REGION_LABEL: &str = "Commit history graph";
 pub const MIN_TAP_TARGET_PX: f64 = 44.0;
 
 /// The extra radius, in user units, that `render::nodes` and `render::stubs` draw around
-/// each commit dot as an invisible pointer target (`r = NODE_RADIUS + 8`).
+/// each commit dot as an invisible pointer target (`r = NODE_RADIUS +` this constant's
+/// own value).
 ///
-/// Mirrored here so [`node_hit_extent_px`] can be exercised on the host — `render/` is
-/// wasm-only and cannot be linked into a host test. `audit`'s
-/// `node_hit_padding_still_matches_the_render_code` tripwire is what keeps the mirror
-/// honest: change the literal in either render module and that test fails.
+/// The value is deliberately not restated as a bare number in this sentence: an earlier
+/// version of this doc said `+ 8` and went silently stale once the render literal (and
+/// this constant) moved to 15 for #65's 44px guidance — found during #784's review, no
+/// test catches prose drift. Mirrored here so [`node_hit_extent_px`] can be exercised on
+/// the host — `render/` is wasm-only and cannot be linked into a host test. `audit`'s
+/// `node_hit_padding_still_matches_the_render_code` tripwire, not this sentence, is what
+/// actually keeps render/ and this constant in agreement.
 #[cfg(test)]
 pub const NODE_HIT_PADDING: f64 = 15.0;
 
@@ -211,9 +215,14 @@ mod tests {
         assert_eq!(t.height_px, 30.0);
     }
 
-    /// The commit dot at the app's default zoom, with the numbers the render code
-    /// actually uses (`NODE_RADIUS` = 7, padding 8): a 30 CSS pixel target, 14 short on
-    /// both axes. `audit` is what ties those two inputs to their real definitions.
+    /// The commit dot at the app's default zoom, with the numbers the render code used
+    /// **before** #65's fix (`NODE_RADIUS` = 7, padding 8 — since raised to
+    /// `NODE_HIT_PADDING` = 15): a 30 CSS pixel target, 14 short on both axes. Found
+    /// stale during #784's review — this doc used to claim these were the numbers
+    /// render "actually uses", which stopped being true the moment the padding fix
+    /// landed. The current, real numbers are pinned by `audit`'s
+    /// `commit_dot_hit_target_meets_guidance_at_default_zoom`, which this test is the
+    /// historical negative for: same shape, the padding the fix closed.
     #[test]
     fn commit_dot_hit_circle_is_thirty_pixels_at_default_zoom() {
         let side = node_hit_extent_px(7.0, 8.0, 1.0);
