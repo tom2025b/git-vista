@@ -4,6 +4,16 @@
 - **Date:** 2026-09-08
 - **Issue:** #755, #779; LFS checkout/filter follow-up #782
 - **Extends:** [ADR 0036](0036-network-tier-exec-harness-askpass-and-redaction.md)
+- **Extended by:** [ADR 0145](0145-four-path-shaped-selectors-depend-on-upstream-git.md)
+  (#817) — the #779 amendment below is accurate that the sealed
+  `GIT_ALLOW_PROTOCOL` beats repository config, but it groups five path-shaped
+  selectors together as though one mechanism refuses them all. Mutation testing
+  shows otherwise: among those five, the allowlist is what blocks
+  `remote.<name>.vcs`; path-shaped `url`, `insteadOf`, `pushurl` and
+  `pushInsteadOf` are rejected first by upstream Git's own `<scheme>::` parser,
+  and the two mutations that fail the `vcs` test leave those four passing.
+  **Nothing in this ADR is retracted** — read 0145 before relying on any
+  paragraph here for per-route coverage.
 - **Related:** [ADR 0122](0122-the-token-is-a-credential-not-a-header.md), [ADR 0128](0128-a-credential-exists-only-before-untrusted-checkout.md), [ADR 0137](0137-an-untrusted-checkout-inherits-an-allowlist.md)
 
 ## #779 amendment — fixed transport policy (2026-09-09)
@@ -54,7 +64,9 @@ protocol default. Hardened runs require an absent marker and either direct
 connection failure (proxy) or Git's protocol denial (custom helper), through
 ordinary output, streamed spawn, credentialed and tokenless wrappers, and the
 checkout wrapper. Proxy tests cover config-only and hostile inherited values;
-helper cases include a non-origin named remote's `vcs`, URL, `insteadOf`,
+helper cases (see the 0145 narrowing above: only the `vcs` case fails by
+allowlist denial; the other four are refused earlier by Git's own scheme parser)
+include a non-origin named remote's `vcs`, URL, `insteadOf`,
 `pushurl`, and `pushInsteadOf`. Existing real native-Git and SSH transfer suites
 verify that supported transports still work.
 
@@ -64,11 +76,15 @@ workspace formatting checks pass. Two compiled-code mutations were caught by
 both marker tests: removing the transport policy, and replacing it with the
 naive `protocol.allow=never` / `core.gitProxy=none` config pins. In each mutation
 both forbidden programs actually ran, causing the marker-absence assertions to
-fail. Production source was restored after each experiment.
+fail. Production source was restored after each experiment. These PR #797 runs
+were not recorded in failure-atlas, so there are no atlas IDs to cite; the
+contemporaneous record is PR #797's validation report, paired with the in-test
+positive controls for both naive pins.
 
 The remainder of this ADR records PR #775's original decision and evidence;
 its proxy and installed-helper residuals are superseded by this amendment.
-LFS is tracked separately; #755's closure still requires its broader reassessment.
+LFS is tracked separately; the broader reassessment and decision to retire #755
+are recorded in the [#755 closeout](../investigations/2026-09-10-issue-755-closeout.md).
 
 Signed: **codex** · 2026-09-09
 

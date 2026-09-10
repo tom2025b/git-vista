@@ -62,15 +62,24 @@ test('the bisect menu items start, mark and reset a real bisect session', async 
 
   const nodes = page.locator('circle.node-hit')
   const count = await nodes.count()
-  expect(count, 'the fixture must have at least two commits to bisect between').toBeGreaterThanOrEqual(2)
+  expect(count, 'the fixture must have at least three commits to bisect between').toBeGreaterThanOrEqual(3)
+
+  // Name the endpoints by fixture subject rather than assuming adjacent graph
+  // rows form a useful range. main~1 is strictly between this bad tip and the
+  // shared base, so Git must check out a real candidate before it can finish.
+  const bad = page.getByRole('button', { name: /main: add 2\.txt$/ })
+  const good = page.getByRole('button', { name: /seed: the shared base$/ })
+  await expect(bad).toBeAttached()
+  await expect(good).toBeAttached()
+  const candidateOid = git(['rev-parse', 'main~1'])
 
   // Mark the tip commit bad, mark an older one good — the two-step anchor
   // flow `menu/bisect_items.rs`'s module doc describes.
-  await nodes.nth(0).click()
+  await bad.click()
   await page
     .getByRole('button', { name: 'Mark bad (start bisect here)' })
     .click()
-  await nodes.nth(1).click()
+  await good.click()
   await page
     .getByRole('button', { name: 'Start bisect: this commit is good' })
     .click()
@@ -82,10 +91,29 @@ test('the bisect menu items start, mark and reset a real bisect session', async 
       message: 'git bisect log must show a start line after the request succeeds',
     })
     .toContain('git bisect start')
+  expect(
+    git(['rev-parse', 'HEAD']),
+    'the chosen endpoints must leave a real intermediate candidate to test',
+  ).toBe(candidateOid)
 
-  // Mark the new candidate good — real git state grows a second log line.
-  await nodes.nth(0).click()
+  // The menu row only opens the command: the mark itself applies to Git's
+  // current HEAD. Require the request to succeed before consulting the log;
+  // Git can append `git bisect good` before rejecting an invalid mark, so the
+  // substring alone is not a success oracle.
+  await bad.click()
+  const markFinished = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === '/api/bisect/mark' &&
+      response.request().method() === 'POST',
+  )
   await page.getByRole('button', { name: 'Bisect: mark good' }).click()
+  const markResponse = await markFinished
+  expect(
+    markResponse.ok(),
+    `bisect mark must return 2xx, got HTTP ${markResponse.status()}`,
+  ).toBe(true)
+
+  // After a successful mark, real git state grows a second log line.
   await expect
     .poll(bisectLogOrEmpty, { timeout: 10_000 })
     .toContain('git bisect good')
