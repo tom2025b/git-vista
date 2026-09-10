@@ -1974,6 +1974,26 @@ mod https_suite {
                 "{selector} unhardened: got a protocol-allowlist rejection with no transport \
                  policy applied at all — that shouldn't be possible: {unforced_stderr}"
             );
+            // The positive half of this control: prove the selector actually
+            // fired, rather than treating "the marker didn't run" as proof by
+            // itself. `insteadOf`/`pushInsteadOf` rewrite a URL only when
+            // their base matches; a mistyped or non-matching rule silently
+            // does nothing, and `remote.named.url`'s untouched
+            // `https://example.invalid/repo` then fails for an unrelated
+            // reason (DNS resolution) that would satisfy every assertion
+            // above without the slash-shaped selector ever having been
+            // interpreted at all. Verified directly against this build: all
+            // four routes' effective value, when the selector genuinely
+            // fires, is the literal string `../r1::repo` in Git's own
+            // rejection message; a silently-ignored `insteadOf`/
+            // `pushInsteadOf` produces a DNS-failure message with no such
+            // substring instead.
+            assert!(
+                unforced_stderr.contains("../r1::repo"),
+                "{selector} unhardened: the selector did not appear to fire at all — expected \
+                 Git's own rejection to name the rewritten value `../r1::repo`, got: \
+                 {unforced_stderr}"
+            );
 
             assert_url_based_selector_never_reaches_helper(&fixture, &policy, args, &env, &marker)
                 .await;
@@ -2057,6 +2077,16 @@ mod https_suite {
                 "{mode}: sandbox protocol allowlist rejected this — meaning Git DID try to \
                  dispatch a slash-shaped scheme as a transport, contradicting this test's \
                  premise: {stderr}"
+            );
+            // Same positive-proof requirement as the unhardened control
+            // above: without this, a silently-ignored `insteadOf`/
+            // `pushInsteadOf` rule would pass every assertion above for the
+            // wrong reason (an unrelated DNS failure against the untouched
+            // URL), never having exercised the selector this test names.
+            assert!(
+                stderr.contains("../r1::repo"),
+                "{mode}: the selector did not appear to fire at all — expected Git's own \
+                 rejection to name the rewritten value `../r1::repo`, got: {stderr}"
             );
         }
     }
