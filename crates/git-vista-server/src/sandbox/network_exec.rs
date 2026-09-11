@@ -718,9 +718,9 @@ fn redact_plaintext_lfs_refusal_userinfo_bytes(bytes: &[u8]) -> Vec<u8> {
 /// (`&["push", &fixture.repo_url, …]`). Nothing upstream can redact args on
 /// this module's behalf — a caller that logs `args` directly bypasses
 /// [`redact_output`] entirely — so this gives that caller the same
-/// [`redact_url_userinfo`] treatment as a first-class, explicit primitive
-/// rather than leaving args logging to rediscover (or forget) the need for
-/// it independently.
+/// [`redact_bytes`] treatment, including plaintext-LFS refusal paths, as an
+/// explicit primitive rather than leaving args logging to rediscover (or
+/// forget) the need for it independently.
 ///
 /// # #801: this had no caller, and that was the wrong state to leave it in
 ///
@@ -740,7 +740,12 @@ fn redact_plaintext_lfs_refusal_userinfo_bytes(bytes: &[u8]) -> Vec<u8> {
 /// logging or panic macro that names `args` without routing it through this
 /// function first.
 pub(crate) fn redact_args(args: &[&str]) -> Vec<String> {
-    args.iter().map(|a| redact_url_userinfo(a)).collect()
+    args.iter()
+        .map(|a| {
+            String::from_utf8(redact_bytes(a.as_bytes()))
+                .expect("redact_bytes preserves UTF-8 validity for str input")
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1381,6 +1386,23 @@ mod tests {
                 "HEAD:refs/heads/main".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn redact_args_strips_path_embedded_lfs_refusal_credentials() {
+        let prefix = crate::sandbox::lfs::PLAINTEXT_ACTION_REFUSAL_URL;
+        for credential in ["user:hunter2", "SECRET://padding", "utilisateur:sécret"] {
+            let diagnostic = format!("LFS: GET {prefix}{credential}@host.example/object failed");
+            assert_eq!(
+                redact_args(&["checkout", &diagnostic, "révision"]),
+                vec![
+                    "checkout".to_string(),
+                    format!("LFS: GET {prefix}host.example/object failed"),
+                    "révision".to_string(),
+                ],
+                "argv diagnostics must redact the complete refusal-path credential"
+            );
+        }
     }
 
     #[test]
