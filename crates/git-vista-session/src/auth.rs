@@ -39,7 +39,20 @@ fn state_dir() -> PathBuf {
 /// Where the server writes the one-time bootstrap token, `0600`. Mirrors
 /// `state::bootstrap_token_path()`.
 pub fn bootstrap_token_path() -> PathBuf {
-    state_dir().join("bootstrap.token")
+    bootstrap_token_path_for(None)
+}
+
+/// Where the server instance on `port` writes its one-time bootstrap token.
+/// The default instance deliberately retains the historical unsuffixed path.
+pub fn bootstrap_token_path_for(port: Option<u16>) -> PathBuf {
+    let state = state_dir();
+    match port {
+        Some(port) if port != http::DEFAULT_PORT => state
+            .join("instances")
+            .join(port.to_string())
+            .join("bootstrap.token"),
+        None | Some(_) => state.join("bootstrap.token"),
+    }
 }
 
 /// An authenticated session: the cookie pair the server set, and the CSRF
@@ -51,8 +64,8 @@ pub fn bootstrap_token_path() -> PathBuf {
 /// is that the secrets live in memory and nowhere else.
 #[derive(Clone)]
 pub struct Session {
-    /// The `gv_session=<id>` pair, exactly as it must appear in a `Cookie`
-    /// header. Extracted from the exchange response's `Set-Cookie`.
+    /// The `gv_session=<id>` or `gv_session_<port>=<id>` pair, exactly as it
+    /// must appear in a `Cookie` header. Extracted from `Set-Cookie`.
     pub cookie: String,
     /// The per-session CSRF token (`x-git-vista-csrf` on state-changing
     /// requests). #245 carried it unused, ahead of need; #246's
@@ -87,7 +100,13 @@ impl std::fmt::Debug for Session {
 /// folds them into tool-call errors, `gv-tui` prints them to stderr — and
 /// none of them ever embeds the token itself.
 pub fn authenticate() -> Result<Session, String> {
-    let path = bootstrap_token_path();
+    authenticate_at(http::DEFAULT_ENDPOINT)
+}
+
+/// Read the selected instance's bootstrap token and exchange it at `endpoint`.
+pub fn authenticate_at(endpoint: &str) -> Result<Session, String> {
+    let port = http::parse_endpoint(endpoint)?.port();
+    let path = bootstrap_token_path_for(Some(port));
     let token = std::fs::read_to_string(&path).map_err(|e| {
         format!(
             "could not read the bootstrap token at {}: {e}. Is git-vista-server running? \
@@ -109,7 +128,7 @@ pub fn authenticate() -> Result<Session, String> {
     .map_err(|e| format!("could not encode the session request: {e}"));
     let body = body?;
 
-    let resp = http::post_json("/api/session", &body, None, None)?;
+    let resp = http::post_json_at(endpoint, "/api/session", &body, None, None)?;
     if resp.status != 200 {
         return Err(format!(
             "POST /api/session answered {} — the token may have expired (the server \
@@ -141,9 +160,21 @@ fn session_cookie_pair(resp: &HttpResponse) -> Option<String> {
         .filter(|(n, _)| n == "set-cookie")
         .find_map(|(_, v)| {
             let pair = v.split(';').next()?.trim();
-            (pair.starts_with("gv_session=") && pair.len() > "gv_session=".len())
-                .then(|| pair.to_string())
+            let (name, value) = pair.split_once('=')?;
+            (valid_session_cookie_name(name) && !value.is_empty()).then(|| pair.to_string())
         })
+}
+
+fn valid_session_cookie_name(name: &str) -> bool {
+    if name == "gv_session" {
+        return true;
+    }
+    let Some(suffix) = name.strip_prefix("gv_session_") else {
+        return false;
+    };
+    suffix
+        .parse::<u16>()
+        .is_ok_and(|port| port != http::DEFAULT_PORT && suffix == port.to_string())
 }
 
 #[cfg(test)]
@@ -155,7 +186,7 @@ mod tests {
     /// mutate process state, so both cases run in one test to avoid a race
     /// between parallel test threads.
     #[test]
-    fn token_path_follows_the_servers_xdg_resolution() {
+    fn token_paths_follow_the_server_contract_and_default_stays_unchanged() {
         // Env mutations are restored on every exit path so a future
         // env-reading test can't inherit this one's fake HOME and fail
         // nondeterministically by thread schedule.
@@ -165,6 +196,10 @@ mod tests {
         // Explicit XDG_STATE_HOME wins.
         std::env::set_var("XDG_STATE_HOME", "/tmp/xdg-test-state");
         let with_xdg = bootstrap_token_path();
+        let with_xdg_no_port = bootstrap_token_path_for(None);
+        let with_xdg_default_port = bootstrap_token_path_for(Some(http::DEFAULT_PORT));
+        let with_xdg_8081 = bootstrap_token_path_for(Some(8081));
+        let with_xdg_49152 = bootstrap_token_path_for(Some(49152));
         // Empty XDG_STATE_HOME falls back to ~/.local/state, like the server's
         // `.filter(|p| !p.as_os_str().is_empty())`.
         std::env::set_var("XDG_STATE_HOME", "");
@@ -183,6 +218,22 @@ mod tests {
         assert_eq!(
             with_xdg,
             PathBuf::from("/tmp/xdg-test-state/git-vista/bootstrap.token")
+        );
+        assert_eq!(
+            with_xdg_no_port, with_xdg,
+            "the target-less resolver must retain its exact historical path"
+        );
+        assert_eq!(
+            with_xdg_default_port, with_xdg,
+            "explicit port 8080 must retain the historical token path"
+        );
+        assert_eq!(
+            with_xdg_8081,
+            PathBuf::from("/tmp/xdg-test-state/git-vista/instances/8081/bootstrap.token")
+        );
+        assert_eq!(
+            with_xdg_49152,
+            PathBuf::from("/tmp/xdg-test-state/git-vista/instances/49152/bootstrap.token")
         );
         assert_eq!(
             with_home,
@@ -338,6 +389,22 @@ mod tests {
     }
 
     #[test]
+    fn a_port_suffixed_session_cookie_is_extracted_without_its_attributes() {
+        let resp = HttpResponse {
+            status: 200,
+            headers: vec![(
+                "set-cookie".into(),
+                "gv_session_8081=abc123; HttpOnly; SameSite=Strict; Path=/".into(),
+            )],
+            body: Vec::new(),
+        };
+        assert_eq!(
+            session_cookie_pair(&resp).as_deref(),
+            Some("gv_session_8081=abc123")
+        );
+    }
+
+    #[test]
     fn a_response_without_the_gv_cookie_yields_none_rather_than_junk() {
         let none = HttpResponse {
             status: 200,
@@ -351,5 +418,29 @@ mod tests {
             body: Vec::new(),
         };
         assert_eq!(session_cookie_pair(&empty), None);
+    }
+
+    #[test]
+    fn lookalike_session_cookie_names_are_rejected() {
+        for malformed in [
+            "gv_sessionish=x",
+            "gv_session_=x",
+            "gv_session_abc=x",
+            "gv_session_8080=x",
+            "gv_session_08081=x",
+            "gv_session_65536=x",
+            "gv_session-extra=x",
+        ] {
+            let resp = HttpResponse {
+                status: 200,
+                headers: vec![("set-cookie".into(), malformed.into())],
+                body: Vec::new(),
+            };
+            assert_eq!(
+                session_cookie_pair(&resp),
+                None,
+                "malformed cookie name was accepted: {malformed}"
+            );
+        }
     }
 }

@@ -793,12 +793,15 @@ pub(crate) fn call_plan_tool_live(
     args: &serde_json::Value,
     session: &mut Option<Session>,
 ) -> Option<Result<serde_json::Value, ToolError>> {
+    let endpoint = crate::mcp_endpoint();
     call_plan_tool(
         name,
         args,
         session,
-        &mut |path, body, cookie, csrf| http::post_json(path, body, Some(cookie), Some(csrf)),
-        &mut auth::authenticate,
+        &mut |path, body, cookie, csrf| {
+            http::post_json_at(&endpoint, path, body, Some(cookie), Some(csrf))
+        },
+        &mut || auth::authenticate_at(&endpoint),
     )
 }
 

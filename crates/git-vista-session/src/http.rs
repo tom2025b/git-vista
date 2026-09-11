@@ -2,8 +2,8 @@
 //!
 //! # Why hand-rolled
 //!
-//! This crate talks to exactly one server — git-vista-server's default
-//! loopback instance — and calls two kinds of endpoint, both of which answer
+//! This crate talks to a caller-selected git-vista-server loopback instance
+//! and calls two kinds of endpoint, both of which answer
 //! small JSON bodies with an explicit `Content-Length` (axum always sets it
 //! for these routes). A full HTTP client crate (reqwest, hyper-as-client)
 //! would add a dependency tree that `docs/NATIVE_DEPENDENCIES.md`'s review
@@ -24,15 +24,15 @@
 //!   unversioned requests.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 use git_vista_protocol::{IDEMPOTENCY_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION};
 
-/// The default server's loopback endpoint. The server can use another port for
-/// isolated harnesses, but this client cannot select it yet; endpoint and token
-/// selection remain part of #130's full instance contract.
-const SERVER: &str = "127.0.0.1:8080";
+/// The server endpoint used by the original, target-less API.
+pub const DEFAULT_ENDPOINT: &str = "127.0.0.1:8080";
+
+pub(crate) const DEFAULT_PORT: u16 = 8080;
 
 /// A per-read-syscall bound (`SO_RCVTIMEO`), honestly named: `read_to_end`
 /// restarts this clock on every chunk, so it bounds a *dead* peer, not a
@@ -91,7 +91,12 @@ impl HttpResponse {
 
 /// `GET <path>` with the standing headers plus an optional session cookie.
 pub fn get(path: &str, cookie: Option<&str>) -> Result<HttpResponse, String> {
-    request("GET", path, None, cookie, None, None)
+    get_at(DEFAULT_ENDPOINT, path, cookie)
+}
+
+/// `GET <path>` from a specific loopback server endpoint.
+pub fn get_at(endpoint: &str, path: &str, cookie: Option<&str>) -> Result<HttpResponse, String> {
+    request(endpoint, "GET", path, None, cookie, None, None)
 }
 
 /// `POST <path>` with a JSON body, optional cookie, optional CSRF token.
@@ -101,7 +106,18 @@ pub fn post_json(
     cookie: Option<&str>,
     csrf: Option<&str>,
 ) -> Result<HttpResponse, String> {
-    request("POST", path, Some(body), cookie, csrf, None)
+    post_json_at(DEFAULT_ENDPOINT, path, body, cookie, csrf)
+}
+
+/// `POST <path>` with a JSON body to a specific loopback server endpoint.
+pub fn post_json_at(
+    endpoint: &str,
+    path: &str,
+    body: &[u8],
+    cookie: Option<&str>,
+    csrf: Option<&str>,
+) -> Result<HttpResponse, String> {
+    request(endpoint, "POST", path, Some(body), cookie, csrf, None)
 }
 
 /// [`post_json`]'s sibling for the one write in this bridge that must be
@@ -121,10 +137,23 @@ pub fn post_json_idempotent(
     csrf: Option<&str>,
     key: &str,
 ) -> Result<HttpResponse, String> {
-    request("POST", path, Some(body), cookie, csrf, Some(key))
+    post_json_idempotent_at(DEFAULT_ENDPOINT, path, body, cookie, csrf, key)
+}
+
+/// [`post_json_idempotent`], directed at a specific loopback server endpoint.
+pub fn post_json_idempotent_at(
+    endpoint: &str,
+    path: &str,
+    body: &[u8],
+    cookie: Option<&str>,
+    csrf: Option<&str>,
+    key: &str,
+) -> Result<HttpResponse, String> {
+    request(endpoint, "POST", path, Some(body), cookie, csrf, Some(key))
 }
 
 fn request(
+    endpoint: &str,
     method: &str,
     path: &str,
     body: Option<&[u8]>,
@@ -132,14 +161,15 @@ fn request(
     csrf: Option<&str>,
     idempotency_key: Option<&str>,
 ) -> Result<HttpResponse, String> {
-    let mut stream = TcpStream::connect(SERVER)
-        .map_err(|e| format!("could not connect to git-vista-server at {SERVER}: {e}"))?;
+    let address = parse_endpoint(endpoint)?;
+    let mut stream = TcpStream::connect(address)
+        .map_err(|e| format!("could not connect to git-vista-server at {endpoint}: {e}"))?;
     stream.set_read_timeout(Some(IO_TIMEOUT)).ok();
     stream.set_write_timeout(Some(IO_TIMEOUT)).ok();
 
     let mut req = format!(
         "{method} {path} HTTP/1.1\r\n\
-         Host: {SERVER}\r\n\
+         Host: {address}\r\n\
          {PROTOCOL_HEADER}: {PROTOCOL_VERSION}\r\n\
          Connection: close\r\n"
     );
@@ -163,13 +193,25 @@ fn request(
     stream
         .write_all(req.as_bytes())
         .and_then(|()| body.map_or(Ok(()), |b| stream.write_all(b)))
-        .map_err(|e| format!("could not send the request to {SERVER}: {e}"))?;
+        .map_err(|e| format!("could not send the request to {endpoint}: {e}"))?;
 
     let mut raw = Vec::new();
     stream
         .read_to_end(&mut raw)
-        .map_err(|e| format!("could not read the response from {SERVER}: {e}"))?;
+        .map_err(|e| format!("could not read the response from {endpoint}: {e}"))?;
     parse_response(&raw)
+}
+
+pub(crate) fn parse_endpoint(endpoint: &str) -> Result<SocketAddr, String> {
+    let address = endpoint.parse::<SocketAddr>().map_err(|e| {
+        format!("invalid git-vista-server endpoint {endpoint:?}; expected IP:port: {e}")
+    })?;
+    if !address.ip().is_loopback() {
+        return Err(format!(
+            "refusing non-loopback git-vista-server endpoint {endpoint:?}"
+        ));
+    }
+    Ok(address)
 }
 
 /// Parse a full HTTP/1.1 response held in memory. `Connection: close` plus
@@ -225,6 +267,55 @@ fn parse_response(raw: &[u8]) -> Result<HttpResponse, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn legacy_http_entry_points_keep_the_exact_original_endpoint() {
+        assert_eq!(DEFAULT_ENDPOINT, "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn an_explicit_endpoint_controls_both_connection_and_host_header() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let expected_endpoint = endpoint.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+
+        let response = get_at(&endpoint, "/api/status", None).unwrap();
+        let request = server.join().unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"{}");
+        assert!(
+            request.starts_with("GET /api/status HTTP/1.1\r\n"),
+            "wrong request target: {request:?}"
+        );
+        assert!(
+            request.contains(&format!("\r\nHost: {expected_endpoint}\r\n")),
+            "explicit endpoint missing from Host header: {request:?}"
+        );
+    }
+
+    #[test]
+    fn endpoint_selection_stays_loopback_only() {
+        assert_eq!(parse_endpoint("127.0.0.1:8081").unwrap().port(), 8081);
+        assert_eq!(parse_endpoint("[::1]:8082").unwrap().port(), 8082);
+        assert!(parse_endpoint("example.com:8080").is_err());
+        assert!(parse_endpoint("192.0.2.1:8080").is_err());
+    }
 
     #[test]
     fn a_response_parses_into_status_headers_and_exact_body() {

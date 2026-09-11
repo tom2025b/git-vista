@@ -541,12 +541,15 @@ fn select_repository(
     let body = serde_json::to_vec(&git_vista_protocol::SelectRequest { worktree, mode })
         .map_err(|e| ToolError::Execution(format!("could not encode the select request: {e}")))?;
 
+    let endpoint = crate::mcp_endpoint();
     let text = authed_post(
         "/api/select",
         &body,
         session,
-        &mut |path, body, cookie, csrf| http::post_json(path, body, Some(cookie), Some(csrf)),
-        &mut auth::authenticate,
+        &mut |path, body, cookie, csrf| {
+            http::post_json_at(&endpoint, path, body, Some(cookie), Some(csrf))
+        },
+        &mut || auth::authenticate_at(&endpoint),
     )
     .map_err(ToolError::Execution)?;
     Ok(serde_json::Value::String(
@@ -598,11 +601,12 @@ fn get_json_typed<T: serde::de::DeserializeOwned>(
     path: &str,
     session: &mut Option<Session>,
 ) -> Result<T, ToolError> {
+    let endpoint = crate::mcp_endpoint();
     let body = authed_fetch(
         path,
         session,
-        &mut |p, cookie| http::get(p, Some(cookie)),
-        &mut auth::authenticate,
+        &mut |p, cookie| http::get_at(&endpoint, p, Some(cookie)),
+        &mut || auth::authenticate_at(&endpoint),
     )
     .map_err(ToolError::Execution)?;
     serde_json::from_slice(&body)

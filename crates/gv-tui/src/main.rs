@@ -50,7 +50,7 @@ use git_vista_protocol::{RepositoryDescriptor, RepositoryKind};
 use git_vista_session::{auth, http};
 
 const CATALOG_PATH: &str = "/api/catalog";
-const USAGE: &str = "usage: gv-tui [catalog]";
+const USAGE: &str = "usage: gv-tui [catalog] [--port N]";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
@@ -58,28 +58,41 @@ enum Mode {
     Catalog,
 }
 
-fn parse_args<I, S>(args: I) -> Result<Mode, &'static str>
+/// #130: `--port N` targets a non-default instance's `catalog` diagnostic
+/// path via `auth::authenticate_at`/`http::get_at`. The interactive shell
+/// (`Mode::Shell`) is NOT wired for this yet — it threads through
+/// `data::spawn`/`Client::live()` and the event loop, a materially larger
+/// change than this fix; tracked as a disclosed follow-up rather than rushed
+/// here. `--port` is accepted only alongside `catalog` for that reason.
+fn parse_args<I, S>(args: I) -> Result<(Mode, Option<u16>), &'static str>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let mut args = args.into_iter();
-    let first = args.next();
-    let second = args.next();
-    match (first, second) {
-        (None, None) => Ok(Mode::Shell),
-        (Some(arg), None) if arg.as_ref() == "catalog" => Ok(Mode::Catalog),
+    let args: Vec<String> = args.into_iter().map(|s| s.as_ref().to_string()).collect();
+    match args.as_slice() {
+        [] => Ok((Mode::Shell, None)),
+        [catalog] if catalog == "catalog" => Ok((Mode::Catalog, None)),
+        [catalog, flag, port] if catalog == "catalog" && flag == "--port" => port
+            .parse::<u16>()
+            .map(|p| (Mode::Catalog, Some(p)))
+            .map_err(|_| USAGE),
         _ => Err(USAGE),
     }
 }
 
 fn main() -> std::process::ExitCode {
     match parse_args(std::env::args().skip(1)) {
-        Ok(Mode::Shell) => exit(shell()),
-        Ok(Mode::Catalog) => {
-            match run(&mut auth::authenticate, &mut |path, cookie| {
-                http::get(path, Some(cookie))
-            }) {
+        Ok((Mode::Shell, _)) => exit(shell()),
+        Ok((Mode::Catalog, port)) => {
+            let endpoint = port
+                .map(|p| format!("127.0.0.1:{p}"))
+                .unwrap_or_else(|| http::DEFAULT_ENDPOINT.to_string());
+            let endpoint_for_auth = endpoint.clone();
+            match run(
+                &mut || auth::authenticate_at(&endpoint_for_auth),
+                &mut |path, cookie| http::get_at(&endpoint, path, Some(cookie)),
+            ) {
                 Ok(report) => {
                     println!("{report}");
                     std::process::ExitCode::SUCCESS
@@ -188,13 +201,36 @@ mod tests {
 
     #[test]
     fn command_line_without_arguments_selects_the_persistent_shell() {
-        assert_eq!(parse_args(std::iter::empty::<&str>()), Ok(Mode::Shell));
+        assert_eq!(
+            parse_args(std::iter::empty::<&str>()),
+            Ok((Mode::Shell, None))
+        );
     }
 
     #[test]
     fn command_line_catalog_keeps_the_one_shot_and_every_other_shape_is_usage() {
-        assert_eq!(parse_args(["catalog"]), Ok(Mode::Catalog));
+        assert_eq!(parse_args(["catalog"]), Ok((Mode::Catalog, None)));
         for args in [vec!["wat"], vec!["catalog", "extra"]] {
+            assert_eq!(parse_args(args), Err(USAGE));
+        }
+    }
+
+    /// #130: `catalog --port N` targets a non-default instance. `--port`
+    /// alongside plain `gv-tui` (no `catalog`) is refused — the interactive
+    /// shell isn't wired for instance targeting yet, so accepting the flag
+    /// there would silently do nothing rather than reach another instance.
+    #[test]
+    fn command_line_catalog_accepts_an_explicit_port_everything_else_is_usage() {
+        assert_eq!(
+            parse_args(["catalog", "--port", "8081"]),
+            Ok((Mode::Catalog, Some(8081)))
+        );
+        for args in [
+            vec!["catalog", "--port"],
+            vec!["catalog", "--port", "not-a-port"],
+            vec!["catalog", "--port", "70000"],
+            vec!["--port", "8081"],
+        ] {
             assert_eq!(parse_args(args), Err(USAGE));
         }
     }

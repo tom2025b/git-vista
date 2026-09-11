@@ -63,6 +63,23 @@ use std::io::{BufRead, Write};
 /// The MCP protocol revision this bridge answers `initialize` with.
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
+/// #130: which instance this bridge talks to. An MCP client launches this
+/// binary as a subprocess with a configured command + environment (there is
+/// no interactive argv here — stdio framing owns stdin/stdout), so the
+/// selector is an environment variable, not a flag. Reuses `GIT_VISTA_PORT`
+/// — the exact variable the server and `gv` already read — rather than
+/// inventing a second name for the same concept. Default (unset, or 8080)
+/// stays byte-for-byte the existing `git_vista_session::http::DEFAULT_ENDPOINT`.
+pub(crate) fn mcp_endpoint() -> String {
+    match std::env::var("GIT_VISTA_PORT") {
+        Ok(value) if !value.is_empty() => match value.parse::<u16>() {
+            Ok(port) if port != 8080 => format!("127.0.0.1:{port}"),
+            _ => git_vista_session::http::DEFAULT_ENDPOINT.to_string(),
+        },
+        _ => git_vista_session::http::DEFAULT_ENDPOINT.to_string(),
+    }
+}
+
 fn main() {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
