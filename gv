@@ -563,9 +563,20 @@ export GIT_VISTA_PORT="$PORT"
 
 # Scope only the six instance files. Trust markers and github-token remain
 # in the user-wide state root, and port 8080 retains every historical path.
+#
+# TOKEN_FILE is the one file `gv` does not own the writer of — the server
+# process writes it (state.rs's `bootstrap_token_path()`/`instance_state_dir`),
+# and that formula is a nested `instances/<port>/` directory, not a dotted
+# suffix. The other five files are gv's own bookkeeping with no cross-process
+# contract, so they keep the simpler suffix form. Found live-broken by the
+# Round 11 integration pass (2026-09-11): a mismatched formula here meant
+# `gv --port N` (N != 8080) could start a server but never print — or later
+# read back — a working sign-in link, for any non-default port. Keep this
+# formula byte-for-byte identical to `instance_state_dir` in
+# crates/git-vista-server/src/state.rs if either ever changes.
 if [[ $PORT != 8080 ]]; then
   LOG="${LOG}.${PORT}"
-  TOKEN_FILE="${TOKEN_FILE}.${PORT}"
+  TOKEN_FILE="$LOG_DIR/instances/${PORT}/bootstrap.token"
   PID_FILE="${PID_FILE}.${PORT}"
   MODE_FILE="${MODE_FILE}.${PORT}"
   TARGET_FILE="${TARGET_FILE}.${PORT}"
