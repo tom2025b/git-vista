@@ -643,9 +643,10 @@ fn redact_bytes(bytes: &[u8]) -> Vec<u8> {
 /// `127.0.0.1:1` authority and then treats everything from the first `/`
 /// onward as an opaque path, so it never re-examines `TOKEN@host` for a
 /// second, path-embedded `userinfo@` shape. That gap is this function's
-/// entire job: run only after the normal pass, scan for our own known
-/// refusal-URL prefix (a fixed literal this crate controls, not a general
-/// pattern), and apply the identical "redact up to the last `@` in this
+/// entire job: run BEFORE the normal pass (see [`redact_bytes`]'s comment
+/// on why the order is load-bearing), scan for our own known refusal-URL
+/// prefix (a fixed literal this crate controls, not a general pattern),
+/// and apply the identical "redact up to the last `@` in this
 /// run" rule to whatever follows it, up to the next `/`, `?`, `#`, or
 /// whitespace.
 fn redact_plaintext_lfs_refusal_userinfo_bytes(bytes: &[u8]) -> Vec<u8> {
