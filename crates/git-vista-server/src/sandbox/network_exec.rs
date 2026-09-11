@@ -620,7 +620,15 @@ fn redact_literal(bytes: &[u8], secret: &[u8]) -> Vec<u8> {
 }
 
 fn redact_bytes(bytes: &[u8]) -> Vec<u8> {
-    redact_plaintext_lfs_refusal_userinfo_bytes(&redact_url_userinfo_bytes(bytes))
+    // Order matters: the refusal-specific pass must see the RAW bytes
+    // first. Run the general `://`-anchored pass first instead and it
+    // strips a plain `userinfo@` it finds inside the refusal path's own
+    // embedded "://" before the refusal-specific pass ever runs — which
+    // leaves a credential sitting BEFORE that embedded separator (e.g.
+    // `SECRET` in `.../refused-path/SECRET://padding@host/...`) with no
+    // `@` left for either pass to key off. Found by daybreak review,
+    // 2026-09-11, on the first ordering.
+    redact_url_userinfo_bytes(&redact_plaintext_lfs_refusal_userinfo_bytes(bytes))
 }
 
 /// #836 follow-up: git-lfs's `url.*.insteadOf` rewrite (`lfs.rs`'s
@@ -652,8 +660,32 @@ fn redact_plaintext_lfs_refusal_userinfo_bytes(bytes: &[u8]) -> Vec<u8> {
         if starts_prefix {
             out.extend_from_slice(prefix);
             let start = i + prefix.len();
+            // Same embedded-"://" carve-out as redact_url_userinfo_bytes,
+            // reproduced rather than shared because the two scans start
+            // from different anchors (a literal prefix here, "://" there) —
+            // see that function's doc for why a credential containing the
+            // literal text "://" must not truncate this scan before the
+            // real trailing '@'. Daybreak review, 2026-09-11: the first cut
+            // of this function lacked this carve-out entirely, so
+            // http://SECRET://padding@host/object left SECRET unredacted.
             let mut end = start;
-            while end < n && !is_authority_delim(bytes[end]) {
+            loop {
+                if end >= n {
+                    break;
+                }
+                let b = bytes[end];
+                if b == b'/'
+                    && end + 1 < n
+                    && bytes[end + 1] == b'/'
+                    && end > 0
+                    && bytes[end - 1] == b':'
+                {
+                    end += 2;
+                    continue;
+                }
+                if is_authority_delim(b) {
+                    break;
+                }
                 end += 1;
             }
             let mut at = None;
@@ -1265,6 +1297,52 @@ mod tests {
         let secret = "hunter2";
         let refused = format!(
             "{}{secret}@host.example/objects/deadbeef",
+            crate::sandbox::lfs::PLAINTEXT_ACTION_REFUSAL_URL
+        );
+        assert!(refused.contains(secret));
+    }
+
+    /// Daybreak review, 2026-09-11: the first cut of the refusal-path scan
+    /// stopped at the first `/`, so a credential value containing the
+    /// literal text `://` truncated the scan before the real trailing `@`
+    /// — exactly the shape `redact_url_userinfo_bytes` already carves out
+    /// for the ordinary authority case. `SECRET` here sits before an
+    /// embedded `://`, which the naive scan would misread as the path
+    /// terminator, leaving `SECRET` unredacted while only `padding@` (the
+    /// text after the embedded separator) gets stripped.
+    #[test]
+    fn redact_bytes_closes_a_plaintext_lfs_refusal_credential_containing_an_embedded_scheme_separator(
+    ) {
+        let secret = "SECRET";
+        let refused = format!(
+            "{}{secret}://padding@host.example/objects/deadbeef",
+            crate::sandbox::lfs::PLAINTEXT_ACTION_REFUSAL_URL
+        );
+        let buf = format!("fatal: unable to access '{refused}': fetch failed");
+
+        let redacted = redact_bytes(buf.as_bytes());
+        let redacted_text = String::from_utf8_lossy(&redacted);
+
+        assert!(
+            !redacted_text.contains(secret),
+            "embedded-scheme-separator credential survived redaction: {redacted_text}"
+        );
+        assert!(
+            redacted_text.contains(crate::sandbox::lfs::PLAINTEXT_ACTION_REFUSAL_URL),
+            "redaction over-scrubbed the refusal marker itself: {redacted_text}"
+        );
+        assert!(
+            redacted_text.contains("host.example/objects/deadbeef"),
+            "redaction dropped non-secret path content it shouldn't have: {redacted_text}"
+        );
+    }
+
+    /// Paired negative for the embedded-separator case above.
+    #[test]
+    fn unredacted_text_still_contains_the_embedded_scheme_separator_lfs_refusal_secret() {
+        let secret = "SECRET";
+        let refused = format!(
+            "{}{secret}://padding@host.example/objects/deadbeef",
             crate::sandbox::lfs::PLAINTEXT_ACTION_REFUSAL_URL
         );
         assert!(refused.contains(secret));
