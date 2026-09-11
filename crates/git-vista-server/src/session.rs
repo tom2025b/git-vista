@@ -28,13 +28,25 @@
 //! Host / content-type / method / cookie / CSRF) lives in [`crate::security`], and
 //! the three endpoints in [`crate::handlers::session`].
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// The session cookie name. HttpOnly + `SameSite=Strict` (set in [`crate::handlers::session`]).
-pub(crate) const SESSION_COOKIE: &str = "gv_session";
+/// Derive the cookie name for one server instance.
+///
+/// The default instance deliberately keeps the historical name so an existing
+/// browser session on port 8080 survives this change. Every other port gets a
+/// distinct browser cookie and therefore cannot overwrite or present another
+/// local instance's session id.
+pub(crate) fn session_cookie_name(port: u16) -> Cow<'static, str> {
+    if port == crate::state::PORT {
+        Cow::Borrowed("gv_session")
+    } else {
+        Cow::Owned(format!("gv_session_{port}"))
+    }
+}
 
 /// The header the SPA echoes the session's CSRF token in on every state-changing
 /// request. Defined once in the shared transport contract so the server's check
@@ -156,6 +168,9 @@ pub(crate) struct SessionManager {
     /// Where the current bootstrap token is written `0600` for `gv` to read.
     /// `None` in tests, which never touch the disk.
     token_file: Option<PathBuf>,
+    /// Instance-specific cookie name, derived once from the configured port.
+    /// Both the session endpoints and auth middleware read this same value.
+    cookie_name: Cow<'static, str>,
 }
 
 impl SessionManager {
@@ -164,6 +179,13 @@ impl SessionManager {
     /// not fatal: the server still runs, and `gv --token` will say the file is
     /// missing rather than the server silently refusing every request.
     pub(crate) fn new(token_file: Option<PathBuf>) -> Self {
+        Self::new_for_port(
+            token_file,
+            crate::state::configured_port().unwrap_or(crate::state::PORT),
+        )
+    }
+
+    pub(crate) fn new_for_port(token_file: Option<PathBuf>, port: u16) -> Self {
         let token = mint_secret();
         if let Some(path) = &token_file {
             if let Err(e) = write_token_file(path, &token) {
@@ -181,7 +203,13 @@ impl SessionManager {
             }),
             sessions: Mutex::new(HashMap::new()),
             token_file,
+            cookie_name: session_cookie_name(port),
         }
+    }
+
+    /// The cookie name shared by the set, status, revoke, and auth paths.
+    pub(crate) fn cookie_name(&self) -> &str {
+        &self.cookie_name
     }
 
     /// Exchange a bootstrap token for a new session, or `None` if the token is
@@ -375,6 +403,17 @@ mod tests {
 
     fn manager() -> SessionManager {
         SessionManager::new(None)
+    }
+
+    #[test]
+    fn cookie_name_preserves_the_default_instance_and_scopes_every_other_port() {
+        assert_eq!(session_cookie_name(8080), "gv_session");
+        assert_eq!(session_cookie_name(8081), "gv_session_8081");
+        assert_eq!(session_cookie_name(1), "gv_session_1");
+        assert_eq!(session_cookie_name(u16::MAX), "gv_session_65535");
+
+        let custom = SessionManager::new_for_port(None, 8081);
+        assert_eq!(custom.cookie_name(), "gv_session_8081");
     }
 
     #[test]

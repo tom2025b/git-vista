@@ -42,7 +42,7 @@ use crate::ratelimit::SignInLimiter;
 use crate::sandbox::hook_policy::hook_policy_for_repo;
 use crate::sandbox::probe::ProbeVerdict;
 use crate::security::cookie_value;
-use crate::session::{SessionManager, SESSION_COOKIE, SESSION_MAX_AGE_SECS};
+use crate::session::{SessionManager, SESSION_MAX_AGE_SECS};
 
 /// Per-router session-handler state: the shared session store, whether this
 /// router is the LAN listener (stamped into every `SessionInfo.via_lan`), and
@@ -168,8 +168,9 @@ pub(crate) async fn create_session(
     }
     match state.manager.exchange(body.token.trim()) {
         Some(session) => {
+            let cookie_name = state.manager.cookie_name();
             let cookie = format!(
-                "{SESSION_COOKIE}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_MAX_AGE_SECS}",
+                "{cookie_name}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_MAX_AGE_SECS}",
                 session.id
             );
             (
@@ -210,7 +211,8 @@ pub(crate) async fn session_status(
     State(state): State<SessionState>,
     headers: HeaderMap,
 ) -> Response {
-    let csrf = cookie_value(&headers, SESSION_COOKIE).and_then(|id| state.manager.validate(id));
+    let csrf = cookie_value(&headers, state.manager.cookie_name())
+        .and_then(|id| state.manager.validate(id));
     Json(SessionInfo {
         authenticated: csrf.is_some(),
         csrf,
@@ -228,10 +230,11 @@ pub(crate) async fn revoke_session(
     State(state): State<SessionState>,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(id) = cookie_value(&headers, SESSION_COOKIE) {
+    let cookie_name = state.manager.cookie_name();
+    if let Some(id) = cookie_value(&headers, cookie_name) {
         state.manager.revoke(id);
     }
-    let clear = format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
+    let clear = format!("{cookie_name}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
     (
         [(SET_COOKIE, clear)],
         Json(SessionInfo {
