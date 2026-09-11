@@ -137,6 +137,12 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // still goes through `network_exec`'s sealed command builders; no handler
     // constructs or appends a raw git argv.
     "src/handlers/clone.rs",
+    // #836: cfg(test)-only OpenSSL/Python fixture. The real git-lfs integration test
+    // needs an HTTPS batch response that directly advertises a plaintext
+    // object-action URL; `lfs.rs` starts `openssl req` for a throwaway
+    // certificate and a one-connection Python TLS server. Production LFS still
+    // launches only through `sandbox::network_exec`.
+    "src/sandbox/lfs.rs",
     // M2.21b (#236): `#[cfg(test)]` fixture setup only. No handler in this
     // file runs a subprocess in production. `GET /api/tags` runs none at all —
     // `git_vista_git::read_tags` opens the repository with `gix` and decodes
@@ -556,7 +562,8 @@ pub(crate) fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Layer 1: the tripwire. Walk both native crates' sources; every
-/// `Command::new` must sit in an allowlisted file and name `git` literally.
+/// `Command::new` must sit in an allowlisted file and name `git` literally,
+/// except for the two exact test-only TLS fixture programs audited below.
 /// (The needles are assembled at runtime so this file's own source never
 /// contains the bare pattern it scans for.)
 #[test]
@@ -612,6 +619,27 @@ fn every_process_spawn_site_is_allowlisted_and_spawns_only_git() {
                 assert!(
                     include_str!("planner.rs").contains("#[cfg(test)]\nmod couldnt_run_suite;"),
                     "the self-spawning flag probe must remain test-only"
+                );
+            } else if rel == "src/sandbox/lfs.rs" {
+                let spawn_openssl = [&spawn, "\"openssl\")"].concat();
+                let spawn_python = [&spawn, "\"python3\")"].concat();
+                assert_eq!(hits, 2, "the TLS fixture has exactly two spawn sites");
+                assert_eq!(
+                    text.matches(&spawn_openssl).count(),
+                    1,
+                    "the TLS fixture may generate its certificate only with openssl"
+                );
+                assert_eq!(
+                    text.matches(&spawn_python).count(),
+                    1,
+                    "the TLS fixture may launch only its fixed Python server"
+                );
+                let test_module = text
+                    .find("#[cfg(test)]\nmod tests {")
+                    .expect("the TLS fixture must remain inside a test-only module");
+                assert!(
+                    text[test_module..].matches(&spawn).count() == hits,
+                    "every lfs.rs process spawn must remain test-only"
                 );
             } else if rel != "src/argv_boundary.rs" && !LAUNCHER_SPAWN_SITES.contains(&rel.as_str())
             {
