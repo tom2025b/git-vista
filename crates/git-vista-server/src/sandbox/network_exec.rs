@@ -88,7 +88,10 @@
 //! policy disables system and global Git configuration, because LFS
 //! custom-transfer/extension and general filter commands are executable
 //! surfaces that the protocol policy cannot constrain. #831 restores only a
-//! fixed LFS driver through [`lfs_checkout_command`].
+//! fixed LFS driver through [`lfs_checkout_command`]. That command also makes
+//! Git LFS rewrite any direct `http://` object-action href to the fixed HTTPS
+//! refusal sink on a port the checkout policy denies. This covers URLs chosen
+//! in a batch response, not merely HTTPS-to-HTTP redirects.
 //!
 //! [`redact_output`] remains defence in depth for diagnostics emitted by the
 //! selected transport. A [`CredentialedCommand`] additionally knows and
@@ -399,9 +402,11 @@ pub(crate) fn network_command_without_credential(
 /// environment/config/seccomp boundary, then adds only #831's server-authored
 /// LFS settings ahead of the checkout subcommand.
 ///
-/// `clone_url` has already passed `validate_clone_url`. It is used only to pin
-/// `lfs.url` as data; no part of it can select the filter executable, a transfer
-/// adapter, a hook, or a shell fragment.
+/// `clone_url` has already passed the clone handler's TLS-aware validation. It
+/// is used only to pin `lfs.url` as data; no part of it can select the filter
+/// executable, a transfer adapter, a hook, or a shell fragment. The config also
+/// rejects a direct plaintext object-action href before the built-in adapter
+/// can request it.
 pub(crate) fn lfs_checkout_command(
     policy: &crate::sandbox::CheckoutPolicy,
     repo: &Path,

@@ -21,6 +21,16 @@ const GIT_LFS_CANDIDATES: &[&str] = &["/usr/bin/git-lfs", "/bin/git-lfs", "/usr/
 /// it and remain cloneable.
 const GIT_LFS_UNAVAILABLE: &str = "/dev/null/git-vista-lfs-unavailable";
 
+/// Fail-closed target for plaintext object-action URLs advertised by an LFS
+/// batch response. Git LFS's built-in HTTP adapter applies `url.*.insteadOf`
+/// to action hrefs only when `lfs.transfer.enablehrefrewrite` is enabled. The
+/// checkout config below forces both settings, replacing every leading
+/// `http://` with this HTTPS URL. Port 1 is deliberately outside
+/// `CLONE_CHECKOUT_PORTS`, so the unchanged Landlock port boundary rejects the
+/// rewritten request before it can reach any service.
+const PLAINTEXT_ACTION_REFUSAL_URL: &str =
+    "https://127.0.0.1:1/git-vista-refused-plaintext-lfs-action/";
+
 fn is_executable_file(path: &Path) -> bool {
     std::fs::metadata(path)
         .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
@@ -74,7 +84,10 @@ fn endpoint(clone_url: &str) -> String {
 /// tracked `.lfsconfig`, can deliberately leave pointer text for a selected
 /// path, and still report filter success. Pinning `lfs.url` prevents a fetched
 /// `.lfsconfig` from switching checkout to SSH and thereby selecting `ssh` or
-/// `git-lfs-authenticate` as another executable path.
+/// `git-lfs-authenticate` as another executable path. Finally, href rewriting
+/// maps every direct `http://` object action to a fixed HTTPS URL on a denied
+/// port. This covers batch-selected URLs, which are not redirects and never
+/// pass through Git LFS's HTTPS-to-HTTP redirect guard.
 fn checkout_config_for_program(clone_url: &str, program: &str) -> Vec<String> {
     let endpoint = endpoint(clone_url);
     vec![
@@ -99,6 +112,10 @@ fn checkout_config_for_program(clone_url: &str, program: &str) -> Vec<String> {
         "-c".into(),
         format!("lfs.{endpoint}.standalonetransferagent="),
         "-c".into(),
+        "lfs.transfer.enablehrefrewrite=true".into(),
+        "-c".into(),
+        format!("url.{PLAINTEXT_ACTION_REFUSAL_URL}.insteadOf=http://"),
+        "-c".into(),
         format!("lfs.url={endpoint}"),
     ]
 }
@@ -117,7 +134,179 @@ pub(super) fn checkout_config_with_program(clone_url: &str, program: &str) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Output;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::process::{Child, Command, Output, Stdio};
+    use std::sync::mpsc;
+
+    struct PlainObjectServer {
+        port: u16,
+        request: mpsc::Receiver<Vec<u8>>,
+    }
+
+    impl PlainObjectServer {
+        fn start(contents: &'static [u8]) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind plaintext object server");
+            let port = listener.local_addr().expect("object server address").port();
+            let (request_tx, request) = mpsc::channel();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else {
+                        return;
+                    };
+                    let mut bytes = vec![0; 8192];
+                    let count = stream.read(&mut bytes).unwrap_or(0);
+                    bytes.truncate(count);
+                    let _ = request_tx.send(bytes.clone());
+                    if bytes.starts_with(b"GET ") {
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            contents.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.write_all(contents);
+                    }
+                }
+            });
+            Self { port, request }
+        }
+    }
+
+    struct HttpsBatchServer {
+        child: Child,
+        port: u16,
+        request_path: std::path::PathBuf,
+    }
+
+    impl HttpsBatchServer {
+        fn start(root: &Path, name: &str, response_body: String) -> Self {
+            let key = root.join(format!("{name}-key.pem"));
+            let certificate = root.join(format!("{name}-cert.pem"));
+            let request_path = root.join(format!("{name}-request"));
+            let response_path = root.join(format!("{name}-response"));
+            let responder = root.join(format!("{name}-tls-server.py"));
+            let generated = Command::new("openssl")
+                .args([
+                    "req",
+                    "-x509",
+                    "-newkey",
+                    "rsa:2048",
+                    "-nodes",
+                    "-subj",
+                    "/CN=127.0.0.1",
+                    "-days",
+                    "1",
+                    "-keyout",
+                ])
+                .arg(&key)
+                .arg("-out")
+                .arg(&certificate)
+                .output()
+                .expect("openssl certificate generation starts");
+            assert!(
+                generated.status.success(),
+                "openssl certificate generation failed: {}",
+                String::from_utf8_lossy(&generated.stderr)
+            );
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.git-lfs+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(), response_body
+            );
+            std::fs::write(&response_path, response).expect("write TLS response");
+            std::fs::write(
+                &responder,
+                r#"import socket
+import ssl
+import sys
+
+port, certificate, key, response_path, request_path = sys.argv[1:]
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain(certificate, key)
+with socket.socket() as listener:
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", int(port)))
+    listener.listen()
+    while True:
+        connection, _ = listener.accept()
+        try:
+            with context.wrap_socket(connection, server_side=True) as stream:
+                request = b""
+                while b"\r\n\r\n" not in request:
+                    request += stream.recv(4096)
+                headers, body = request.split(b"\r\n\r\n", 1)
+                length = 0
+                for line in headers.split(b"\r\n"):
+                    if line.lower().startswith(b"content-length:"):
+                        length = int(line.split(b":", 1)[1].strip())
+                while len(body) < length:
+                    body += stream.recv(4096)
+                with open(request_path, "wb") as recorded:
+                    recorded.write(headers + b"\r\n\r\n" + body)
+                with open(response_path, "rb") as prepared:
+                    stream.sendall(prepared.read())
+        except (ConnectionError, ssl.SSLError):
+            connection.close()
+"#,
+            )
+            .expect("write TLS server fixture");
+
+            let reservation =
+                TcpListener::bind("127.0.0.1:0").expect("reserve TLS batch server port");
+            let port = reservation
+                .local_addr()
+                .expect("TLS reservation address")
+                .port();
+            drop(reservation);
+            let mut child = Command::new("python3")
+                .arg(&responder)
+                .arg(port.to_string())
+                .arg(&certificate)
+                .arg(&key)
+                .arg(&response_path)
+                .arg(&request_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("Python TLS batch server starts");
+
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(
+                child.try_wait().expect("inspect TLS server").is_none(),
+                "Python TLS batch server exited before accepting connections"
+            );
+
+            Self {
+                child,
+                port,
+                request_path,
+            }
+        }
+
+        fn request(&self) -> Vec<u8> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Ok(bytes) = std::fs::read(&self.request_path) {
+                    if !bytes.is_empty() {
+                        return bytes;
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "TLS batch request was not recorded"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+
+    impl Drop for HttpsBatchServer {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
 
     fn copy_tree(from: &Path, to: &Path) {
         std::fs::create_dir_all(to).expect("create copied directory");
@@ -194,6 +383,27 @@ mod tests {
         dest
     }
 
+    fn clone_without_lfs_object(clones: &Path, source: &Path, name: &str) -> std::path::PathBuf {
+        let dest = clones.join(name);
+        super::super::network_exec::run_fixture_git(
+            clones,
+            [
+                std::ffi::OsString::from("clone"),
+                std::ffi::OsString::from("-q"),
+                std::ffi::OsString::from("--no-checkout"),
+                std::ffi::OsString::from("--"),
+                source.as_os_str().to_owned(),
+                dest.as_os_str().to_owned(),
+            ],
+        );
+        super::super::network_exec::run_fixture_git(&dest, ["config", "http.sslVerify", "false"]);
+        super::super::network_exec::run_fixture_git(
+            &dest,
+            ["config", "lfs.transfer.maxretries", "1"],
+        );
+        dest
+    }
+
     #[test]
     fn endpoint_discards_query_fragment_and_appends_the_standard_path() {
         assert_eq!(
@@ -221,10 +431,141 @@ mod tests {
         assert!(joined.contains("lfs.standalonetransferagent="));
         assert!(joined
             .contains("lfs.https://example.invalid/repo.git/info/lfs.standalonetransferagent="));
+        assert!(joined.contains("lfs.transfer.enablehrefrewrite=true"));
+        assert!(joined.contains(&format!(
+            "url.{PLAINTEXT_ACTION_REFUSAL_URL}.insteadOf=http://"
+        )));
         assert!(joined.contains("lfs.url=https://example.invalid/repo.git/info/lfs"));
         assert!(
             !selected.contains(' '),
             "reviewed candidates need no shell quoting"
+        );
+    }
+
+    /// An HTTPS batch response can select a direct object URL; that URL is not
+    /// a redirect and therefore never reaches Git LFS's downgrade guard. Drive
+    /// the real `git checkout -f` -> `git-lfs filter-process` -> batch -> basic
+    /// adapter path twice. The unprotected control reaches the plaintext object
+    /// server (and may then meet the checkout sandbox's existing cross-directory
+    /// rename restriction). The production configuration receives the same
+    /// response but must fail before that server observes any request.
+    ///
+    /// MUTATION 1 (remove the mechanism): remove both command-line href rewrite
+    /// pins. The guarded leg issues the control's plaintext GET.
+    /// MUTATION 2 (invert the condition): make the refusal rewrite match
+    /// `https://` instead of `http://`. The direct plaintext href again reaches
+    /// the object server.
+    #[tokio::test]
+    async fn an_https_lfs_batch_cannot_select_a_direct_plaintext_object_action() {
+        use sha2::{Digest, Sha256};
+
+        const OBJECT: &[u8] = b"materialised LFS bytes\0\xff\n";
+        assert_ne!(
+            program(),
+            GIT_LFS_UNAVAILABLE,
+            "this integration test requires one reviewed git-lfs installation"
+        );
+        let (clones, source) = lfs_fixture();
+        let oid = format!("{:x}", Sha256::digest(OBJECT));
+
+        let run = |name: &str, guarded: bool| {
+            let dest = clone_without_lfs_object(clones.path(), &source, name);
+            let object_server = PlainObjectServer::start(OBJECT);
+            let batch_body = format!(
+                "{{\"transfer\":\"basic\",\"objects\":[{{\"oid\":\"{oid}\",\"size\":{},\"actions\":{{\"download\":{{\"href\":\"http://127.0.0.1:{}/object\"}}}}}}]}}",
+                OBJECT.len(), object_server.port
+            );
+            let batch_server = HttpsBatchServer::start(clones.path(), name, batch_body);
+            let clone_url = format!("https://127.0.0.1:{}/repo.git", batch_server.port);
+            let mut policy = super::super::policy_for_clone_checkout(clones.path())
+                .expect("checkout policy must build");
+            policy.0.net_ports = vec![batch_server.port, object_server.port];
+
+            let command = if guarded {
+                super::super::network_exec::lfs_checkout_command(&policy, &dest, &clone_url)
+            } else {
+                let mut unguarded = Vec::new();
+                let guarded_config = checkout_config(&clone_url);
+                let (pairs, remainder) = guarded_config.as_chunks::<2>();
+                assert!(
+                    remainder.is_empty(),
+                    "Git config args must be -c/value pairs"
+                );
+                for pair in pairs {
+                    if pair[1] != "lfs.transfer.enablehrefrewrite=true"
+                        && !pair[1].starts_with("url.https://127.0.0.1:1/")
+                    {
+                        unguarded.extend_from_slice(pair);
+                    }
+                }
+                unguarded.extend(["checkout".to_string(), "-f".to_string()]);
+                let refs: Vec<&str> = unguarded.iter().map(String::as_str).collect();
+                super::super::network_exec::network_command_without_credential(
+                    &policy, &dest, &refs,
+                )
+            };
+            (dest, object_server, batch_server, command)
+        };
+
+        let (control_dest, control_object, control_batch, control_command) =
+            run("plaintext-action-control", false);
+        let control = control_command
+            .output()
+            .await
+            .expect("unprotected control checkout starts");
+        let control_batch_request = control_batch.request();
+        let control_object_request = control_object
+            .request
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("control plaintext object request observed");
+        let _ = (control_dest, control);
+        assert!(
+            control_batch_request.starts_with(b"POST ")
+                && control_batch_request
+                    .windows(b"/objects/batch".len())
+                    .any(|window| window == b"/objects/batch"),
+            "control did not make the expected HTTPS LFS batch request: {}",
+            String::from_utf8_lossy(&control_batch_request)
+        );
+        assert!(
+            control_object_request.starts_with(b"GET /object "),
+            "control did not make the advertised direct plaintext GET: {}",
+            String::from_utf8_lossy(&control_object_request)
+        );
+
+        let (guarded_dest, guarded_object, guarded_batch, guarded_command) =
+            run("plaintext-action-guarded", true);
+        let guarded = guarded_command
+            .output()
+            .await
+            .expect("production checkout starts");
+        assert!(
+            !guarded.status.success(),
+            "a direct plaintext object action must fail the production checkout"
+        );
+        assert!(
+            String::from_utf8_lossy(&guarded.stderr)
+                .contains(PLAINTEXT_ACTION_REFUSAL_URL.trim_end_matches('/')),
+            "the checkout failed without applying the fixed HTTPS refusal rewrite: {}",
+            String::from_utf8_lossy(&guarded.stderr)
+        );
+        assert!(
+            !guarded_dest.join("asset.bin").exists(),
+            "a refused plaintext action must not leave an apparent object"
+        );
+        let guarded_batch_request = guarded_batch.request();
+        assert!(
+            guarded_batch_request.starts_with(b"POST ")
+                && guarded_batch_request
+                    .windows(b"/objects/batch".len())
+                    .any(|window| window == b"/objects/batch"),
+            "guarded leg did not reach the direct-action batch response: {}",
+            String::from_utf8_lossy(&guarded_batch_request)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            guarded_object.request.try_recv().is_err(),
+            "the built-in adapter contacted the plaintext object server"
         );
     }
 

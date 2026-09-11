@@ -149,6 +149,20 @@ fn clone_transfer_args<'a>(url: &'a str, dest: &'a str) -> [&'a str; 5] {
     ["clone", "--no-checkout", "--", url, dest]
 }
 
+/// Apply fresh clone's transport rule after the shared argv-safety gate.
+///
+/// `validate_clone_url` intentionally remains the protocol crate's broader
+/// public-transport validator. Fresh clone is narrower because its validated
+/// URL also becomes the checkout's Git LFS endpoint: accepting `http://` here
+/// would permit plaintext transfer on an explicitly selected port such as 443.
+fn validate_tls_clone_url(url: &str) -> Result<String, String> {
+    let url = validate_clone_url(url)?;
+    if url.starts_with("http://") {
+        return Err("Plaintext HTTP clone URLs are not supported; use https://.".to_string());
+    }
+    Ok(url)
+}
+
 /// Fetch objects and refs while the credential exists, then let that process
 /// exit before materialising attacker-chosen files.
 ///
@@ -160,8 +174,11 @@ fn clone_transfer_args<'a>(url: &'a str, dest: &'a str) -> [&'a str; 5] {
 /// `sandbox::policy_for_clone_checkout`: the same policy without the agent
 /// socket, the `known_hosts` carve-out, or port 22, for the process that
 /// materialises attacker-selected content. The checkout keeps only TCP port
-/// 443 (without scheme or address enforcement), blocks Git hooks, and receives one server-authored required LFS filter;
-/// system/global filter configuration remains unreadable.
+/// 443, blocks Git hooks, and receives one server-authored required LFS filter;
+/// system/global filter configuration remains unreadable. Landlock itself is
+/// scheme-blind; the handler rejects an original `http://` URL and the LFS
+/// config refuses direct plaintext object actions before either can use that
+/// port grant.
 ///
 /// The second phase also receives an environment **built by allowlist** rather
 /// than one with credential names removed from it (#704), so a secret nobody
@@ -680,9 +697,10 @@ fn clone_status_not_found() -> Response {
 /// Same B3 posture as the other git handlers: shell out to `git clone` and forward
 /// git's redacted error text, with credential-aware messages for GitHub
 /// authentication/access failures (#585). The URL is
-/// validated by [`validate_clone_url`] — only `http(s)://`/`git://`, so a pasted
-/// SSH URL can't trigger a key prompt — and is passed as its own argv entry, never
-/// a shell line. A full clone is made; the graph view's paged history walk
+/// validated by [`validate_tls_clone_url`] — `https://` or `git://`, never
+/// plaintext `http://`, so a pasted SSH URL can't trigger a key prompt and an
+/// HTTP URL cannot evade TLS by naming port 443 — and is passed as its own argv
+/// entry, never a shell line. A full clone is made; the graph view's paged history walk
 /// (`walk_history_topo`, `handlers/read.rs`) has no `HISTORY_LIMIT` cap and is
 /// not bounded by anything downstream of this handler — `HISTORY_LIMIT` only
 /// caps the Activity panel's separate remote-commit read (`activity.rs`). Found
@@ -728,7 +746,7 @@ pub(crate) async fn clone_repo(
 /// unchanged, now run under [`admit_clone`]'s guard rather than doing the
 /// admission itself.
 async fn run_clone(req: CloneRequest) -> Result<Json<RepositoryDescriptor>, (StatusCode, String)> {
-    let url = match validate_clone_url(&req.url) {
+    let url = match validate_tls_clone_url(&req.url) {
         Ok(u) => u,
         Err(e) => return Err((StatusCode::BAD_REQUEST, e)),
     };
@@ -942,6 +960,30 @@ pub(crate) async fn delete_clone_repo(Json(req): Json<DeleteCloneRequest>) -> (S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The real endpoint handler must reject the original URL before any Git
+    /// transfer or LFS endpoint derivation can occur. Port 443 is intentional:
+    /// the checkout's Landlock rule permits that TCP port, so a port-only fix
+    /// would not produce this scheme-specific refusal.
+    ///
+    /// MUTATION 1 (remove the mechanism): call `validate_clone_url` directly
+    /// from `run_clone`; the request reaches Git and returns its transport
+    /// diagnostic instead of this refusal.
+    /// MUTATION 2 (invert the condition): reject `https://` instead of
+    /// `http://`; this plaintext request again reaches Git.
+    #[tokio::test]
+    async fn clone_endpoint_rejects_plaintext_http_even_on_port_443() {
+        let result = clone_repo(Json(CloneRequest {
+            url: "http://127.0.0.1:443/repository.git".to_string(),
+        }))
+        .await;
+        let (status, message) = result.expect_err("plaintext HTTP clone must be rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            message,
+            "Plaintext HTTP clone URLs are not supported; use https://."
+        );
+    }
 
     fn transport_output(code: i32, stderr: &str) -> std::process::Output {
         use std::os::unix::process::ExitStatusExt;
