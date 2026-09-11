@@ -18,12 +18,26 @@
 //! needed one). The roving-focused hunk header's own Shift+Enter/Space calls
 //! `select_all_in_hunk` for every changed line in that hunk — mirroring
 //! `blame_row`'s "Shift changes what the roving key means" idiom rather than
-//! inventing a new one. Deliberately **not** wired here: touch/Pencil-specific
-//! affordances (needs a device in the loop) and keyboard access to one
-//! arbitrary line on its own (would need its own roving focus nested inside
-//! #210's hunk-level one — a design surface, not a wiring gap). See
-//! [`crate::features::diff::selection`]'s module doc and #357's own
-//! follow-up issue.
+//! inventing a new one.
+//!
+//! **Keyboard access to one line (#770).** `ArrowRight` on a roving-focused
+//! hunk header drills into that hunk's own line scope
+//! (`crate::features::diff::selection::LineFocus`, a *nested* roving focus,
+//! separate from #210's header-level `GraphFocus`); `ArrowUp`/`ArrowDown`
+//! then move among only that hunk's changed lines, `Home`/`End` jump to the
+//! first/last, `ArrowLeft`/`Escape` hand arrow keys back to the header
+//! (resuming exactly where #210 left it), and `Enter`/`Space` toggles the
+//! one focused line via `toggle_line` — distinct from both `toggle_hunk`
+//! and Shift+Activate's whole-hunk `select_all_in_hunk`. See `LineFocus`'s
+//! own doc comment for why this scope-nesting design was chosen over
+//! flattening (`gv-tui`'s `panes/staging.rs`, this issue's own named prior
+//! art) or overloading `GraphFocus`.
+//!
+//! Deliberately **not** wired here, and permanently out of scope for this
+//! install (Tom, 2026-09-11 — no iPad, no Apple Pencil, Linux-only):
+//! touch/Pencil-specific affordances. See
+//! `docs/investigations/2026-09-11-issue-770-keyboard.md` for the full
+//! decision record.
 //!
 //! **What is unverified from this box** (matching #210/#226/#242's honesty
 //! pattern): the drag-select gesture below (pointerdown + pointerenter across
@@ -50,7 +64,7 @@ use crate::features::diff::core::{
     preview_state, selectable_hunk_lines, selectable_hunks, stage_direction_copy, staging_actions,
     CompleteHunkLines, PreviewState, SelectableHunkLine,
 };
-use crate::features::diff::selection::{drag_range, DiffSelection, IncompleteHunk};
+use crate::features::diff::selection::{drag_range, DiffSelection, IncompleteHunk, LineFocus};
 use crate::features::graph::core::{roving_row_key, KeyMods, RenderCtx, RowKey};
 use crate::features::shell::signals::Shell;
 use crate::features::status::signals::StatusResource;
@@ -61,6 +75,25 @@ fn focus_hunk(idx: usize) {
     if let Some(el) = document()
         .query_selector(&format!(
             "[data-hunk-scope=\"staging\"][data-hunk-index=\"{idx}\"]"
+        ))
+        .ok()
+        .flatten()
+        .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
+    {
+        let _ = el.focus();
+    }
+}
+
+/// Move DOM focus to hunk `hunk_idx`'s changed-line checkbox at position
+/// `ordinal` within that hunk's own changed-line list (#770's nested
+/// `LineFocus` scope — see `crate::features::diff::selection::LineFocus`'s
+/// doc for why this is a *second*, hunk-scoped index space rather than a
+/// raw patch-line offset). Mirrors `focus_hunk` exactly, scoped one level
+/// deeper by `data-line-hunk`/`data-line-ordinal`.
+fn focus_line(hunk_idx: usize, ordinal: usize) {
+    if let Some(el) = document()
+        .query_selector(&format!(
+            "[data-hunk-scope=\"staging\"][data-line-hunk=\"{hunk_idx}\"][data-line-ordinal=\"{ordinal}\"]"
         ))
         .ok()
         .flatten()
@@ -101,14 +134,31 @@ fn hunk_row(
     selection: RwSignal<DiffSelection>,
     drag_anchor: StoredValue<Option<usize>>,
     hunks_by_flat_idx: StoredValue<Vec<(String, HunkRef)>>,
-    // Every non-context local line index in this hunk (#357) — what
-    // Shift+Activate below hands to `select_all_in_hunk`. Plain owned data,
-    // not a `StoredValue`: it's read-only inside the `move` keydown closure,
-    // never re-fetched, so it needs no reactive plumbing of its own.
+    // Every non-context local line index in this hunk (#357), in the same
+    // sorted order `LineFocus`'s own line cursor indexes into (#770) — what
+    // Shift+Activate below hands to `select_all_in_hunk`, and what
+    // `ArrowRight` below hands `line_focus.enter` as its `changed_len`.
+    // Plain owned data, not a `StoredValue`: it's read-only inside the
+    // `move` keydown closure, never re-fetched, so it needs no reactive
+    // plumbing of its own.
     changed_lines: Vec<u32>,
+    // #770: which hunk/line the *nested* line scope is drilled into, if
+    // any. Distinct from `focus` (`GraphFocus`, #210's header-level roving
+    // position) on purpose — see `LineFocus`'s module doc for why arrow
+    // keys belong to exactly one of the two at a time, never both.
+    line_focus: RwSignal<LineFocus>,
 ) -> View {
+    // #770: while `LineFocus` is drilled into *this* hunk, the nested line
+    // checkbox is the one tab stop (its own `tabindex` closure in
+    // `line_check`) and the header steps out of the tab order — otherwise
+    // both the header and the focused line would carry `tabindex="0"` at
+    // once, breaking the "exactly one tab stop" roving-tabindex invariant
+    // this comment already claims for the header alone. A hunk this
+    // `LineFocus` is not drilled into (`is_engaged()` false, or drilled
+    // into some *other* hunk) is unaffected — this only ever demotes the
+    // header of the hunk currently holding the nested scope.
     let tabindex = move || {
-        if focus.with(|f| f.tabbable_row()) == Some(idx) {
+        if focus.with(|f| f.tabbable_row()) == Some(idx) && !line_focus.with(|lf| lf.is_engaged()) {
             "0"
         } else {
             "-1"
@@ -141,6 +191,27 @@ fn hunk_row(
                 meta: ev.meta_key(),
                 alt: ev.alt_key(),
             };
+            // #770: `ArrowRight` drills into this hunk's line scope — decided
+            // *before* `roving_row_key` (which has no opinion on
+            // `ArrowRight` at all, and never will: that map is shared with
+            // the canvas and blame rows, neither of which has a nested
+            // scope to enter). Same bail-out policy as every other roving
+            // key (`mods.bails_out()`, via `KeyMods`) so Ctrl/Cmd/Alt+Right
+            // still reaches the browser. A hunk with no changed lines
+            // refuses to engage (`LineFocus::enter` returns `false`) and
+            // this falls through to the normal roving-key handling below,
+            // so `ArrowRight` on such a hunk is simply not consumed here.
+            if ev.key() == "ArrowRight" && !mods.bails_out() {
+                let entered = line_focus
+                    .try_update(|lf| lf.enter(idx, changed_lines.len()))
+                    .unwrap_or(false);
+                if entered {
+                    ev.prevent_default();
+                    ev.stop_propagation();
+                    focus_line(idx, 0);
+                    return;
+                }
+            }
             let Some(intent) = roving_row_key(&ev.key(), mods) else {
                 return;
             };
@@ -278,19 +349,34 @@ fn hunk_row(
     .into_view()
 }
 
-/// One selectable line's own tap target (#357) — a pointer-only "select this
-/// line" checkbox beside an added/removed line, mirroring `hunk_row`'s own
-/// check button and `blame_row`'s `.blame-select`: `tabindex="-1"`, so it
-/// adds no Tab stop of its own (per-line would be far worse than per-hunk on
-/// that front, and #357's own module doc says why keyboard access to one
-/// arbitrary line stays unwired for now). Click toggles; no drag-select — no
+/// One selectable line's own tap target (#357) — a per-line checkbox beside
+/// an added/removed line, mirroring `hunk_row`'s own check button and
+/// `blame_row`'s `.blame-select`. Click toggles; no drag-select — no
 /// idempotent per-line setter exists yet (`set_hunk_selected`'s doc explains
 /// why `toggle_hunk`/`toggle_line` are wrong for a drag gesture), and nothing
 /// in this issue's scope needed one built.
+///
+/// `tabindex` is *reactive* here (#770, unlike #357's original permanent
+/// `"-1"`): `"0"` only while `LineFocus` is drilled into exactly this line,
+/// `"-1"` otherwise — the nested roving-tabindex contract `LineFocus`'s own
+/// module doc describes, one tab stop at a time the same way `hunk_row`'s
+/// header list already works.
+// #770: `hunk_idx`/`ordinal`/`changed_len`/`line_focus` are the nested-scope
+// wiring — everything else is unchanged from #357. `ordinal` is this line's
+// position in the hunk's own `changed_lines` list (the same sorted order
+// `hunk_row`'s `changed_lines` param and `LineFocus`'s line cursor share),
+// not `local` (the raw index into the hunk's parsed `Hunk::lines` that
+// `toggle_line`/`is_line_selected` address) — two different coordinate
+// spaces on purpose, per `LineFocus`'s own doc comment.
+#[allow(clippy::too_many_arguments)]
 fn line_check(
     file: String,
     anchor: HunkRef,
+    hunk_idx: usize,
+    ordinal: usize,
     local: u32,
+    changed_len: usize,
+    line_focus: RwSignal<LineFocus>,
     selection: RwSignal<DiffSelection>,
 ) -> View {
     // Two independent closures, same reason `hunk_row`'s
@@ -304,18 +390,90 @@ fn line_check(
         let file = file.clone();
         move || selection.with(|s| s.is_line_selected(&file, anchor.index, local))
     };
-    let on_click = move |ev: web_sys::MouseEvent| {
+    // #770: this line is in the Tab sequence (`tabindex="0"`) only while
+    // `LineFocus` is actually drilled into it — every other line stays
+    // `tabindex="-1"`, the same one-tab-stop-at-a-time roving-tabindex
+    // contract `hunk_row`'s own `tabindex` closure keeps for headers.
+    // Before #770 this button was permanently `tabindex="-1"` (mouse/pen
+    // only, #357); this is the only behavioural change to an *existing*
+    // checkbox this issue makes.
+    let tabindex = move || {
+        if line_focus.with(|lf| lf.active()) == Some((hunk_idx, ordinal)) {
+            "0"
+        } else {
+            "-1"
+        }
+    };
+    let on_click = {
+        let file = file.clone();
+        move |ev: web_sys::MouseEvent| {
+            ev.stop_propagation();
+            selection.update(|s| s.toggle_line(&file, anchor, local));
+        }
+    };
+    // #770's own keyboard path onto this exact line. `ArrowUp`/`ArrowDown`/
+    // `Home`/`End`/`Enter`/`Space` are asked of `roving_row_key` — the same
+    // single source of truth `hunk_row`'s own header keydown already defers
+    // to (#653/#660) — rather than re-matched here, so this scope's keys can
+    // never drift from the header scope's. `ArrowLeft` is the one press
+    // `roving_row_key` has no opinion on (nothing else it drives has a
+    // nested scope to leave), so it is decided here, under the same
+    // `mods.bails_out()` policy `roving_row_key` itself applies.
+    // `RowKey::Move` moves `LineFocus`'s own cursor among this hunk's
+    // changed lines (never `focus`/`GraphFocus` — that stays wherever the
+    // header left it, per `LineFocus`'s doc); `RowKey::Dismiss` (Escape) and
+    // `ArrowLeft` both hand arrow keys back to the header; `RowKey::Activate`
+    // toggles *this one line* — genuinely new keyboard access `toggle_hunk`
+    // and Shift+Activate's whole-hunk `select_all_in_hunk` do not provide.
+    let on_keydown = move |ev: web_sys::KeyboardEvent| {
+        let mods = KeyMods {
+            shift: ev.shift_key(),
+            ctrl: ev.ctrl_key(),
+            meta: ev.meta_key(),
+            alt: ev.alt_key(),
+        };
+        if ev.key() == "ArrowLeft" && !mods.bails_out() {
+            ev.prevent_default();
+            ev.stop_propagation();
+            line_focus.update(|lf| lf.exit());
+            focus_hunk(hunk_idx);
+            return;
+        }
+        let Some(intent) = roving_row_key(&ev.key(), mods) else {
+            return;
+        };
+        ev.prevent_default();
         ev.stop_propagation();
-        selection.update(|s| s.toggle_line(&file, anchor, local));
+        match intent {
+            RowKey::Move(dir) => {
+                if let Some(next) = line_focus
+                    .try_update(|lf| lf.mv(dir, changed_len))
+                    .flatten()
+                {
+                    focus_line(hunk_idx, next);
+                }
+            }
+            RowKey::Dismiss => {
+                line_focus.update(|lf| lf.exit());
+                focus_hunk(hunk_idx);
+            }
+            RowKey::Activate => {
+                selection.update(|s| s.toggle_line(&file, anchor, local));
+            }
+        }
     };
     view! {
         <button
             type="button"
             class="stage-line-check"
-            tabindex="-1"
+            data-hunk-scope="staging"
+            data-line-hunk=hunk_idx.to_string()
+            data-line-ordinal=ordinal.to_string()
+            tabindex=tabindex
             aria-pressed=move || checked_for_pressed().to_string()
             aria-label="Select this line for staging"
             on:click=on_click
+            on:keydown:undelegated=on_keydown
         >
             {move || if checked_for_glyph() { "\u{2713}" } else { "" }}
         </button>
@@ -330,15 +488,36 @@ fn line_check(
 /// over owned data (`selection`, `hunks_by_flat_idx`) that closures would
 /// otherwise have to clone at each call site, the same reasoning
 /// `staging_body`'s own `build_plan` free function documents.
+#[allow(clippy::too_many_arguments)]
 fn line_checkbox_for(
     i: usize,
     line_coords: &HashMap<usize, SelectableHunkLine>,
     hunks_by_flat_idx: StoredValue<Vec<(String, HunkRef)>>,
+    // #770: `(hunk_idx, local) -> ordinal` — this line's position in its
+    // hunk's own changed-line list, the coordinate `LineFocus`'s cursor and
+    // `hunk_row`'s `changed_lines` param share. Built once by the caller
+    // (`staging_patch_view`) from the same `changed_by_hunk` it already
+    // built for `select_all_in_hunk`'s Shift+Activate path, not re-derived
+    // per line.
+    line_ordinals: &HashMap<(usize, u32), usize>,
+    changed_lens: &[usize],
+    line_focus: RwSignal<LineFocus>,
     selection: RwSignal<DiffSelection>,
 ) -> Option<View> {
     let coord = line_coords.get(&i)?;
     let (file, anchor) = hunks_by_flat_idx.with_value(|all| all.get(coord.hunk_idx).cloned())?;
-    Some(line_check(file, anchor, coord.local, selection))
+    let ordinal = *line_ordinals.get(&(coord.hunk_idx, coord.local))?;
+    let changed_len = *changed_lens.get(coord.hunk_idx)?;
+    Some(line_check(
+        file,
+        anchor,
+        coord.hunk_idx,
+        ordinal,
+        coord.local,
+        changed_len,
+        line_focus,
+        selection,
+    ))
 }
 
 /// The staging patch, rendered with the selection UI. Still a raw-text
@@ -351,6 +530,7 @@ fn staging_patch_view(
     patch: &str,
     focus: RwSignal<GraphFocus>,
     selection: RwSignal<DiffSelection>,
+    line_focus: RwSignal<LineFocus>,
 ) -> View {
     let hunks = selectable_hunks(patch);
     focus.update_untracked(|f| f.set_row_count(hunks.len()));
@@ -393,6 +573,20 @@ fn staging_patch_view(
     for v in &mut changed_by_hunk {
         v.sort_unstable();
     }
+    // #770: the inverse of `changed_by_hunk` — `(hunk_idx, local) ->
+    // ordinal` — so each rendered line checkbox can find its own position
+    // in the hunk's changed-line list without re-deriving it per line.
+    let line_ordinals: HashMap<(usize, u32), usize> = changed_by_hunk
+        .iter()
+        .enumerate()
+        .flat_map(|(hunk_idx, lines)| {
+            lines
+                .iter()
+                .enumerate()
+                .map(move |(ordinal, &local)| ((hunk_idx, local), ordinal))
+        })
+        .collect();
+    let changed_lens: Vec<usize> = changed_by_hunk.iter().map(Vec::len).collect();
     // The spoken VoiceOver labels, from the structured path (#361): the same
     // `hunk_label` text the detail panel and viewer speak, paired with
     // `selectable_hunks` by (file, per-file ordinal) — NOT by position,
@@ -441,13 +635,22 @@ fn staging_patch_view(
                         drag_anchor,
                         hunks_by_flat_idx,
                         changed_by_hunk.get(idx).cloned().unwrap_or_default(),
+                        line_focus,
                     )
                 }
                 None if class == "diff-hunk" => {
                     view! { <span class="diff-hunk-combined">{text}</span> }.into_view()
                 }
                 None if class == "diff-add" => {
-                    let check = line_checkbox_for(i, &line_coords, hunks_by_flat_idx, selection);
+                    let check = line_checkbox_for(
+                        i,
+                        &line_coords,
+                        hunks_by_flat_idx,
+                        &line_ordinals,
+                        &changed_lens,
+                        line_focus,
+                        selection,
+                    );
                     view! {
                         <span class=class>
                             {check}
@@ -458,7 +661,15 @@ fn staging_patch_view(
                     .into_view()
                 }
                 None if class == "diff-del" => {
-                    let check = line_checkbox_for(i, &line_coords, hunks_by_flat_idx, selection);
+                    let check = line_checkbox_for(
+                        i,
+                        &line_coords,
+                        hunks_by_flat_idx,
+                        &line_ordinals,
+                        &changed_lens,
+                        line_focus,
+                        selection,
+                    );
                     view! {
                         <span class=class>
                             {check}
@@ -502,7 +713,18 @@ pub fn staging_body(
         selection.track();
         plan_error.set(None);
     });
-    let patch = staging_patch_view(&d.patch, hunk_focus, selection);
+    // #770: created here rather than threaded in from `viewer.rs` the way
+    // `hunk_focus`/`selection` are (owned by the caller so an in-flight
+    // Preview/Apply survives a re-render, per this function's own doc
+    // above). `viewer.rs` is outside this issue's allowed surface, so
+    // `line_focus` resets to disengaged on every fresh `staging_body` call
+    // (a diff refetch — e.g. after Apply) instead of surviving one the way
+    // `hunk_focus` does. That is an acceptable loss for ephemeral keyboard
+    // focus (unlike `selection`, it carries no user intent to stage
+    // anything), but it is a real, deliberate gap: threading it through
+    // `viewer.rs` properly is a follow-up for whoever owns that file.
+    let line_focus = create_rw_signal(LineFocus::new());
+    let patch = staging_patch_view(&d.patch, hunk_focus, selection, line_focus);
     let truncated_note = d.truncated.then(|| {
         view! {
             <p class="detail-status">
