@@ -61,8 +61,8 @@ use crate::api::{staging_apply_request, staging_preview_request};
 use crate::detail::diff_line_class;
 use crate::features::a11y::focus::GraphFocus;
 use crate::features::diff::core::{
-    preview_state, selectable_hunk_lines, selectable_hunks, stage_direction_copy, staging_actions,
-    CompleteHunkLines, PreviewState, SelectableHunkLine,
+    labels_for_selectable_lines, preview_state, selectable_hunk_lines, selectable_hunks,
+    stage_direction_copy, staging_actions, CompleteHunkLines, PreviewState, SelectableHunkLine,
 };
 use crate::features::diff::selection::{drag_range, DiffSelection, IncompleteHunk, LineFocus};
 use crate::features::graph::core::{roving_row_key, KeyMods, RenderCtx, RowKey};
@@ -148,15 +148,8 @@ fn hunk_row(
     // keys belong to exactly one of the two at a time, never both.
     line_focus: RwSignal<LineFocus>,
 ) -> View {
-    // #770: while `LineFocus` is drilled into *this* hunk, the nested line
-    // checkbox is the one tab stop (its own `tabindex` closure in
-    // `line_check`) and the header steps out of the tab order — otherwise
-    // both the header and the focused line would carry `tabindex="0"` at
-    // once, breaking the "exactly one tab stop" roving-tabindex invariant
-    // this comment already claims for the header alone. A hunk this
-    // `LineFocus` is not drilled into (`is_engaged()` false, or drilled
-    // into some *other* hunk) is unaffected — this only ever demotes the
-    // header of the hunk currently holding the nested scope.
+    // While the nested line scope owns the one Tab stop, every header is
+    // outside the Tab order. Landing on a header exits that scope below.
     let tabindex = move || {
         if focus.with(|f| f.tabbable_row()) == Some(idx) && !line_focus.with(|lf| lf.is_engaged()) {
             "0"
@@ -175,9 +168,15 @@ fn hunk_row(
         let file = file.clone();
         move || selection.with(|s| s.is_hunk_selected(&file, anchor.index))
     };
+    let has_lines = !changed_lines.is_empty();
     let on_keydown = {
         let file = file.clone();
         move |ev: web_sys::KeyboardEvent| {
+            // The nested scope owns navigation until a header landing or
+            // Left/Escape exits it; never advance the outer cursor here.
+            if line_focus.with_untracked(|lf| lf.is_engaged()) {
+                return;
+            }
             // Which key means what, and the modifier policy that bails a
             // press out entirely, is `features::graph::core::roving_row_key`'s
             // to say (#653, #660): the canvas's own row handler drives the
@@ -247,9 +246,7 @@ fn hunk_row(
                 // calling `ev.shift_key()` again — `roving_row_key` alone still
                 // decides whether this press is handled at all (#660); this is
                 // only choosing between two actions once it already has said
-                // yes. This is the keyboard path onto `select_all_in_hunk`;
-                // toggling one arbitrary line by keyboard alone remains unwired
-                // (see this file's and `selection`'s module docs).
+                // yes. ArrowRight enters the separate one-line keyboard scope.
                 RowKey::Activate => {
                     if mods.shift {
                         selection.update(|s| {
@@ -263,10 +260,26 @@ fn hunk_row(
         }
     };
     let on_click = move |_| {
+        line_focus.update(|lf| lf.exit());
         focus.update(|f| f.focus_landed(idx));
         focus_hunk(idx);
     };
-    let on_focus = move |_| focus.update(|f| f.focus_landed(idx));
+    let on_focus = move |_| {
+        line_focus.update(|lf| lf.exit());
+        focus.update(|f| f.focus_landed(idx));
+    };
+    let header_label = {
+        let label = label.clone();
+        move || {
+            if line_focus.with(|lf| lf.active().map(|(hunk, _)| hunk)) == Some(idx) {
+                format!("{label}. Line scope entered. ArrowLeft or Escape returns to the hunk.")
+            } else if has_lines {
+                format!("{label}. ArrowRight enters line scope; ArrowLeft or Escape returns to the hunk.")
+            } else {
+                label.clone()
+            }
+        }
+    };
     let header = view! {
         <span
             class="stage-hunk-text"
@@ -274,7 +287,7 @@ fn hunk_row(
             data-hunk-scope="staging"
             data-hunk-index=idx.to_string()
             tabindex=tabindex
-            aria-label=label.clone()
+            aria-label=header_label
             on:keydown:undelegated=on_keydown
             on:click=on_click
             on:focus=on_focus
@@ -371,11 +384,13 @@ fn hunk_row(
 #[allow(clippy::too_many_arguments)]
 fn line_check(
     file: String,
+    label: String,
     anchor: HunkRef,
     hunk_idx: usize,
     ordinal: usize,
     local: u32,
     changed_len: usize,
+    focus: RwSignal<GraphFocus>,
     line_focus: RwSignal<LineFocus>,
     selection: RwSignal<DiffSelection>,
 ) -> View {
@@ -394,9 +409,6 @@ fn line_check(
     // `LineFocus` is actually drilled into it — every other line stays
     // `tabindex="-1"`, the same one-tab-stop-at-a-time roving-tabindex
     // contract `hunk_row`'s own `tabindex` closure keeps for headers.
-    // Before #770 this button was permanently `tabindex="-1"` (mouse/pen
-    // only, #357); this is the only behavioural change to an *existing*
-    // checkbox this issue makes.
     let tabindex = move || {
         if line_focus.with(|lf| lf.active()) == Some((hunk_idx, ordinal)) {
             "0"
@@ -409,6 +421,14 @@ fn line_check(
         move |ev: web_sys::MouseEvent| {
             ev.stop_propagation();
             selection.update(|s| s.toggle_line(&file, anchor, local));
+        }
+    };
+    let on_pointer_down = move |_: web_sys::PointerEvent| {
+        if line_focus
+            .try_update(|lf| lf.enter_at(hunk_idx, ordinal, changed_len))
+            .unwrap_or(false)
+        {
+            focus.update(|f| f.focus_landed(hunk_idx));
         }
     };
     // #770's own keyboard path onto this exact line. `ArrowUp`/`ArrowDown`/
@@ -471,8 +491,9 @@ fn line_check(
             data-line-ordinal=ordinal.to_string()
             tabindex=tabindex
             aria-pressed=move || checked_for_pressed().to_string()
-            aria-label="Select this line for staging"
+            aria-label=label
             on:click=on_click
+            on:pointerdown=on_pointer_down
             on:keydown:undelegated=on_keydown
         >
             {move || if checked_for_glyph() { "\u{2713}" } else { "" }}
@@ -492,6 +513,7 @@ fn line_check(
 fn line_checkbox_for(
     i: usize,
     line_coords: &HashMap<usize, SelectableHunkLine>,
+    line_labels: &HashMap<usize, String>,
     hunks_by_flat_idx: StoredValue<Vec<(String, HunkRef)>>,
     // #770: `(hunk_idx, local) -> ordinal` — this line's position in its
     // hunk's own changed-line list, the coordinate `LineFocus`'s cursor and
@@ -501,6 +523,7 @@ fn line_checkbox_for(
     // per line.
     line_ordinals: &HashMap<(usize, u32), usize>,
     changed_lens: &[usize],
+    focus: RwSignal<GraphFocus>,
     line_focus: RwSignal<LineFocus>,
     selection: RwSignal<DiffSelection>,
 ) -> Option<View> {
@@ -510,11 +533,13 @@ fn line_checkbox_for(
     let changed_len = *changed_lens.get(coord.hunk_idx)?;
     Some(line_check(
         file,
+        line_labels.get(&i)?.clone(),
         anchor,
         coord.hunk_idx,
         ordinal,
         coord.local,
         changed_len,
+        focus,
         line_focus,
         selection,
     ))
@@ -556,6 +581,7 @@ fn staging_patch_view(
     // built on (`core::walk_hunks`), so the two can never disagree about
     // where a hunk starts.
     let line_coords: HashMap<usize, SelectableHunkLine> = selectable_hunk_lines(patch);
+    let line_labels = labels_for_selectable_lines(patch, &hunks, &line_coords);
     // Every hunk's own non-context (addable/removable) local line indices,
     // flat-indexed the same way `hunks_by_flat_idx` is — what Shift+Activate
     // on a hunk header hands `select_all_in_hunk` (see `hunk_row`). Built
@@ -645,9 +671,11 @@ fn staging_patch_view(
                     let check = line_checkbox_for(
                         i,
                         &line_coords,
+                        &line_labels,
                         hunks_by_flat_idx,
                         &line_ordinals,
                         &changed_lens,
+                        focus,
                         line_focus,
                         selection,
                     );
@@ -664,9 +692,11 @@ fn staging_patch_view(
                     let check = line_checkbox_for(
                         i,
                         &line_coords,
+                        &line_labels,
                         hunks_by_flat_idx,
                         &line_ordinals,
                         &changed_lens,
+                        focus,
                         line_focus,
                         selection,
                     );

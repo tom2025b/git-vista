@@ -361,6 +361,53 @@ pub fn selectable_hunk_lines(patch: &str) -> HashMap<usize, SelectableHunkLine> 
     walk_hunks(patch).1
 }
 
+/// Spoken labels for changed lines, keyed by their index into `patch.lines()`.
+/// Pass the hunks and body coordinates from [`selectable_hunks`] and
+/// [`selectable_hunk_lines`] for the same patch. Count both sides, including
+/// context and excluding no-newline markers; only added/removed lines get
+/// labels. File, per-file hunk ordinal, kind, and line number distinguish
+/// repeated text, including in raw patches without a `diff --git` header.
+pub fn labels_for_selectable_lines(
+    patch: &str,
+    hunks: &[SelectableHunk],
+    line_coords: &HashMap<usize, SelectableHunkLine>,
+) -> HashMap<usize, String> {
+    let mut line_numbers: Vec<(u64, u64)> = hunks
+        .iter()
+        .map(|h| (u64::from(h.old_start), u64::from(h.new_start)))
+        .collect();
+    patch
+        .lines()
+        .enumerate()
+        .filter_map(|(i, text)| {
+            use git_vista_protocol::diff::LineKind;
+            let coord = line_coords.get(&i)?;
+            let hunk = &hunks[coord.hunk_idx];
+            let (old, new) = &mut line_numbers[coord.hunk_idx];
+            let position = match coord.kind {
+                LineKind::Added => format!("added, new line {new}"),
+                LineKind::Removed => format!("removed, old line {old}"),
+                LineKind::Context => String::new(),
+            };
+            if coord.kind != LineKind::Added {
+                *old += 1;
+            }
+            if coord.kind != LineKind::Removed {
+                *new += 1;
+            }
+            if coord.kind == LineKind::Context {
+                return None;
+            }
+            Some((i, format!(
+                "Select for staging: {}, hunk {}, {position}: {}. Line scope. ArrowLeft or Escape returns to the hunk.",
+                hunk.file,
+                u64::from(hunk.ordinal) + 1,
+                &text[1..],
+            )))
+        })
+        .collect()
+}
+
 /// Complete changed-line sets for serialization of whole-selected hunks as
 /// `Lines` (#808). Only the patch walk can populate this index: a caller
 /// cannot certify a visible subset by supplying an unchecked completeness flag.
@@ -677,6 +724,73 @@ diff --git a/bar.txt b/bar.txt
     }
 
     // ---- selectable_hunk_lines (#357) ---------------------------------
+
+    #[test]
+    fn selectable_line_labels_distinguish_file_hunk_kind_and_number() {
+        // Pin the review claim: "two different (file, hunk, kind, number)
+        // combinations can never collide." Identical text makes identity
+        // depend on the coordinates, including matching numbers across files.
+        // Interleave additions/removals and context to exercise both counters.
+        let patch = "\
+diff --git a/foo.rs b/foo.rs
+--- a/foo.rs
++++ b/foo.rs
+@@ -10,5 +10,5 @@
+ context
++same
+-same
+-same
++same
+ context
+-same
++same
+@@ -30,2 +40,2 @@
+ context
+-same
++same
+diff --git a/bar.rs b/bar.rs
+--- a/bar.rs
++++ b/bar.rs
+@@ -10,2 +10,2 @@
+ context
+-same
++same
+";
+        let labels = labels_for_selectable_lines(
+            patch,
+            &selectable_hunks(patch),
+            &selectable_hunk_lines(patch),
+        );
+        let expected: HashMap<usize, String> = [
+            (5, "foo.rs, hunk 1, added, new line 11"),
+            (6, "foo.rs, hunk 1, removed, old line 11"),
+            (7, "foo.rs, hunk 1, removed, old line 12"),
+            (8, "foo.rs, hunk 1, added, new line 12"),
+            (10, "foo.rs, hunk 1, removed, old line 14"),
+            (11, "foo.rs, hunk 1, added, new line 14"),
+            (14, "foo.rs, hunk 2, removed, old line 31"),
+            (15, "foo.rs, hunk 2, added, new line 41"),
+            (21, "bar.rs, hunk 1, removed, old line 11"),
+            (22, "bar.rs, hunk 1, added, new line 11"),
+        ]
+        .into_iter()
+        .map(|(i, position)| {
+            (i, format!(
+                "Select for staging: {position}: same. Line scope. ArrowLeft or Escape returns to the hunk."
+            ))
+        })
+        .collect();
+        // Exact map equality also excludes context and all header/meta lines.
+        assert_eq!(labels, expected);
+        assert_eq!(
+            labels
+                .values()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            labels.len(),
+            "two different (file, hunk, kind, number) combinations can never collide"
+        );
+    }
 
     #[test]
     fn complete_hunk_lines_include_only_changes_and_match_full_anchors() {

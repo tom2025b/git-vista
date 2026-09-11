@@ -468,11 +468,17 @@ impl LineFocus {
     /// returning `Some` with no real line to point at would be a lie a
     /// caller could try to render.
     pub fn enter(&mut self, hunk: usize, changed_len: usize) -> bool {
-        if changed_len == 0 {
+        self.enter_at(hunk, 0, changed_len)
+    }
+
+    /// A pointer landing on a changed-line checkbox enters at that exact
+    /// ordinal. Invalid ordinals (including an empty hunk) leave state alone.
+    pub fn enter_at(&mut self, hunk: usize, ordinal: usize, changed_len: usize) -> bool {
+        if ordinal >= changed_len {
             return false;
         }
         self.hunk = Some(hunk);
-        self.line = 0;
+        self.line = ordinal;
         true
     }
 
@@ -490,8 +496,8 @@ impl LineFocus {
     /// end-of-list policy `GraphFocus::mv` uses, so a caller already
     /// familiar with that type's `Home`/`End` behaviour gets the same shape
     /// here. A no-op returning `None` when nothing is engaged (arrow keys
-    /// at the header level are not this type's concern) or when the hunk
-    /// turns out to have no changed lines (defensive: a caller should not
+    /// at the header level are not this type's concern). Exits and returns
+    /// `None` when the hunk has no changed lines (defensive: a caller should not
     /// reach this with `changed_len == 0` while engaged, since `enter`
     /// refuses to engage on an empty hunk, but a stale caller passing a
     /// smaller `changed_len` than it entered with — e.g. after a diff
@@ -499,7 +505,7 @@ impl LineFocus {
     pub fn mv(&mut self, dir: FocusMove, changed_len: usize) -> Option<usize> {
         self.hunk?;
         if changed_len == 0 {
-            self.line = 0;
+            self.exit();
             return None;
         }
         let last = changed_len - 1;
@@ -877,6 +883,29 @@ diff --git a/a.rs b/a.rs
             "a hunk with nothing addable/removable has no line for this \
              scope to point at"
         );
+        assert_eq!(f.active(), None);
+    }
+
+    #[test]
+    fn line_focus_pointer_entry_retargets_the_hunk_and_exact_ordinal() {
+        let mut f = LineFocus::new();
+        assert!(f.enter_at(2, 3, 5));
+        assert_eq!(f.active(), Some((2, 3)));
+        assert_eq!(f.mv(FocusMove::Prev, 5), Some(2));
+        assert!(f.enter_at(7, 1, 3));
+        assert_eq!(f.active(), Some((7, 1)));
+        assert_eq!(f.mv(FocusMove::Next, 3), Some(2));
+        assert!(!f.enter_at(8, 3, 3));
+        assert!(!f.enter(8, 0));
+        assert_eq!(f.active(), Some((7, 2)));
+    }
+
+    #[test]
+    fn line_focus_move_exits_when_the_hunk_has_no_changed_lines() {
+        let mut f = LineFocus::new();
+        assert!(f.enter_at(2, 3, 5));
+        assert_eq!(f.mv(FocusMove::Next, 0), None);
+        assert!(!f.is_engaged());
         assert_eq!(f.active(), None);
     }
 
