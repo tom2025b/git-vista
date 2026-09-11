@@ -1219,6 +1219,15 @@ mod tests {
             instance_state_dir(root, 8081).join("operations.sqlite3"),
             root.join("instances/8081/operations.sqlite3")
         );
+        // A sub-8080 port must scope exactly like any other non-default port.
+        // Pins `port == PORT`, not `port <= PORT` — GIT_VISTA_PORT accepts any
+        // value in 1..=65535, so a weaker comparison would silently collide a
+        // low-numbered instance's token/db with the default instance's,
+        // exactly the cross-instance collision #130 exists to prevent.
+        assert_eq!(
+            instance_state_dir(root, 3000).join("bootstrap.token"),
+            root.join("instances/3000/bootstrap.token")
+        );
     }
 
     fn selection(path: &str) -> Current {
