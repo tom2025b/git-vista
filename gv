@@ -9,7 +9,9 @@
 #   gv ~/code/myproj    visualise another repository
 #   gv doctor           diagnose listener/session/tunnel state without secrets
 #   gv --token          print a fresh one-time localhost sign-in link
-#   gv --stop           stop the server owned by this checkout
+#   gv --stop           stop the server owned by this checkout on the selected port
+#   gv --port <1-65535> select an instance (also --instance); default 8080
+#                       GIT_VISTA_PORT sets the default; an explicit flag wins
 #   gv --repo <path|url>  add a repo to the catalog (clones if given a URL),
 #                       edits GIT_VISTA_REPOS in the systemd unit, restarts
 #                       the service. Restart briefly drops the iPad tunnel.
@@ -29,17 +31,9 @@
 # browser/device. Never paste the token as a password or reuse one link twice.
 set -euo pipefail
 
-# The server's listener port is runtime-configurable for isolated harnesses,
-# but this launcher still owns one default instance and one unscoped set of
-# runtime/auth files. Do not let an ambient override turn that partial contract
-# into a second instance that stop_repo_servers could mistake for the first.
-# `dev testbed` rewrites this pinned value inside its isolated worktree.
+# Keep this exact assignment: `dev testbed` rewrites it in its worktree.
 PORT=8080
-if [[ -n ${GIT_VISTA_PORT+x} && $GIT_VISTA_PORT != "$PORT" ]]; then
-  echo "gv: GIT_VISTA_PORT is not supported by this launcher yet; see issue #130" >&2
-  exit 2
-fi
-export GIT_VISTA_PORT="$PORT"
+PORT="${GIT_VISTA_PORT:-$PORT}"
 START_DIR="$PWD"
 REPO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 SERVER_BIN="$REPO/target/debug/git-vista-server"
@@ -51,6 +45,7 @@ PID_FILE="$LOG_DIR/server.pid"
 MODE_FILE="$LOG_DIR/server.mode"
 TARGET_FILE="$LOG_DIR/server.target"
 LAN_FILE="$LOG_DIR/server.lan"
+GV_COMMAND=gv
 
 server_health() {
   local host="${1:-localhost}"
@@ -67,12 +62,15 @@ listener_addresses() {
   fi
 }
 
-listener_pid() {
+listener_pids() {
   if command -v ss >/dev/null 2>&1; then
     ss -H -ltnp "sport = :${PORT}" 2>/dev/null \
-      | sed -nE 's/.*pid=([0-9]+).*/\1/p' \
-      | head -n 1
+      | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u || true
   fi
+}
+
+listener_pid() {
+  listener_pids | sed -n '1p'
 }
 
 # Classify what's actually listening on $PORT against what's sanctioned:
@@ -144,7 +142,7 @@ print_token_links() {
   local token mode
   if ! server_health localhost; then
     echo "gv: no Git-Vista server answers on localhost:${PORT}." >&2
-    echo "gv: start it with 'gv'." >&2
+    echo "gv: start it with '${GV_COMMAND}'." >&2
     return 1
   fi
   if token_file_is_stale; then
@@ -159,7 +157,7 @@ print_token_links() {
   mode="$(listener_mode)"
   if [[ $mode == exposed ]]; then
     echo "gv: refusing to print a sign-in token for a non-loopback listener." >&2
-    echo "gv: restart it with 'gv' to restore 127.0.0.1:${PORT}." >&2
+    echo "gv: restart it with '${GV_COMMAND}' to restore 127.0.0.1:${PORT}." >&2
     return 1
   fi
   echo "gv: one-time sign-in link — open the entire URL:"
@@ -177,7 +175,7 @@ print_token_links() {
   else
     echo "gv: direct 192.168.x.x access is intentionally disabled; use --lan-view to enable a read-only backup."
   fi
-  echo "gv: this link is single-use; run 'gv --token' again for the next device."
+  echo "gv: this link is single-use; run '${GV_COMMAND} --token' again for the next device."
 }
 
 list_lan_ips() {
@@ -204,25 +202,40 @@ write_private_file() {
   mv -f "$temp" "$path"
 }
 
+# A listener is ours only when BOTH its port and argv[0] match. Never trust
+# a saved PID, health response, or checkout ownership alone across instances.
+checkout_owns_pid() {
+  local argv0
+  [[ -r /proc/$1/cmdline ]] || return 1
+  IFS= read -r -d '' argv0 <"/proc/$1/cmdline" 2>/dev/null || return 1
+  [[ $argv0 == "$SERVER_BIN" ]]
+}
+
 repo_server_pids() {
-  local proc pid argv0
-  for proc in /proc/[0-9]*; do
-    [[ -r "$proc/cmdline" ]] || continue
-    pid="${proc##*/}"
-    argv0="$(tr '\0' '\n' 2>/dev/null <"$proc/cmdline" | head -n 1)" || continue
-    [[ $argv0 == "$SERVER_BIN" ]] && printf '%s\n' "$pid"
-  done
+  local pid
+  while IFS= read -r pid; do
+    [[ -n $pid ]] || continue
+    checkout_owns_pid "$pid" && printf '%s\n' "$pid"
+  done < <(listener_pids)
   return 0
+}
+
+pid_is_instance_server() {
+  checkout_owns_pid "$1" && listener_pids | grep -Fqx -- "$1"
 }
 
 stop_pid() {
   local pid="$1"
+  pid_is_instance_server "$pid" || return 0
   kill "$pid" 2>/dev/null || return 0
   for _ in $(seq 1 30); do
     kill -0 "$pid" 2>/dev/null || return 0
     sleep 0.1
   done
-  kill -9 "$pid" 2>/dev/null || true
+  # Recheck before escalating, too: the PID may have exited or been reused.
+  if pid_is_instance_server "$pid"; then
+    kill -9 "$pid" 2>/dev/null || true
+  fi
 }
 
 stop_repo_servers() {
@@ -382,7 +395,7 @@ doctor() {
 
   echo "  tunnel: on the iPad SSH client, forward local ${PORT}"
   echo "          to 127.0.0.1:${PORT} on this Linux host."
-  echo "          Then run 'gv --token' and open its localhost link on the iPad."
+  echo "          Then run '${GV_COMMAND} --token' and open its localhost link on the iPad."
   if [[ -r "$LAN_FILE" ]]; then
     echo "  LAN view (ADR 0005): $(cat "$LAN_FILE"):${PORT} — read-only, plain HTTP, trusted-LAN only"
   else
@@ -489,96 +502,119 @@ if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
   return 0
 fi
 
-if [[ ${1:-} == help ]]; then
-  usage
-  exit 0
-fi
-
-if [[ ${1:-} == doctor ]]; then
-  [[ $# -eq 1 ]] || { echo "gv: 'doctor' takes no other arguments" >&2; exit 2; }
-  doctor
-  exit $?
-fi
-
+# Parse the entire command line before running any action, including --repo,
+# doctor and --token. This makes `--stop --port N` and `--port N --stop` agree.
+ACTION=start
 TARGET=""
-SEED=0
+REPO_ARG=""
 REPO_ROOT=""
-NEXT_IS_ROOT=0
 LAN_VIEW=0
 LAN_IP=""
-NEXT_IS_LAN_IP=0
-NEXT_IS_REPO=0
-for arg in "$@"; do
-  if [[ $NEXT_IS_ROOT -eq 1 ]]; then
-    REPO_ROOT="$arg"
-    NEXT_IS_ROOT=0
-    continue
+DISABLED_LAN=0
+
+select_action() {
+  if [[ $ACTION != start && $ACTION != "$1" ]]; then
+    echo "gv: conflicting actions: $ACTION and $1" >&2
+    exit 2
   fi
-  if [[ $NEXT_IS_LAN_IP -eq 1 ]]; then
-    LAN_IP="$arg"
-    NEXT_IS_LAN_IP=0
-    continue
-  fi
-  if [[ $NEXT_IS_REPO -eq 1 ]]; then
-    repo_add "$arg"
-    exit $?
-  fi
+  ACTION="$1"
+}
+
+while [[ $# -gt 0 ]]; do
+  arg="$1"
+  shift
   case "$arg" in
-    --repo) NEXT_IS_REPO=1 ;;
-    --seed) SEED=1 ;;
+    --port|--instance|--repo|--root|--lan-ip)
+      if [[ $# -eq 0 || -z $1 || $1 == --* ]]; then
+        echo "gv: $arg needs a value" >&2
+        exit 2
+      fi
+      case "$arg" in
+        --port|--instance) PORT="$1" ;;
+        --repo) select_action repo; REPO_ARG="$1" ;;
+        --root) REPO_ROOT="$1" ;;
+        --lan-ip) LAN_IP="$1" ;;
+      esac
+      shift
+      ;;
+    --port=*|--instance=*) PORT="${arg#*=}" ;;
+    --seed) select_action seed ;;
     # ADR 0009: one deliberate repos root; the server scans its direct children.
-    --root) NEXT_IS_ROOT=1 ;;
     --root=*) REPO_ROOT="${arg#--root=}" ;;
     # ADR 0005: opt-in second, read-only LAN listener.
     --lan-view) LAN_VIEW=1 ;;
-    --lan-ip) NEXT_IS_LAN_IP=1 ;;
     --lan-ip=*) LAN_IP="${arg#--lan-ip=}" ;;
-    --lan)
-      echo "gv: --lan is disabled; Git-Vista only listens on 127.0.0.1:${PORT}." >&2
-      echo "gv: use an SSH local-port forward for iPad access, or 'gv --lan-view' for a read-only LAN backup." >&2
-      exit 2
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    --doctor)
-      doctor
-      exit $?
-      ;;
-    --token)
-      print_token_links
-      exit $?
-      ;;
-    --stop)
-      if stop_repo_servers; then
-        echo "gv: server owned by $REPO stopped"
-      elif server_health localhost; then
-        echo "gv: a server answers on ${PORT}, but it is not owned by this checkout; refusing to kill it." >&2
-        exit 1
-      else
-        echo "gv: no server owned by this checkout is running"
-      fi
-      exit 0
-      ;;
+    --lan) DISABLED_LAN=1 ;;
+    -h|--help|help) select_action help ;;
+    --doctor|doctor) select_action doctor ;;
+    --token) select_action token ;;
+    --stop) select_action stop ;;
     -*) echo "gv: unknown option: $arg" >&2; exit 2 ;;
     *) TARGET="$arg" ;;
   esac
 done
-if [[ $NEXT_IS_ROOT -eq 1 ]]; then
-  echo "gv: --root needs a directory" >&2
+
+if [[ ! $PORT =~ ^[0-9]{1,5}$ ]] || (( 10#$PORT < 1 || 10#$PORT > 65535 )); then
+  echo "gv: port must be an integer between 1 and 65535: $PORT" >&2
   exit 2
 fi
-if [[ $NEXT_IS_REPO -eq 1 ]]; then
-  echo "gv: --repo needs a path or URL" >&2
+PORT=$((10#$PORT))
+export GIT_VISTA_PORT="$PORT"
+
+# Scope only the six instance files. Trust markers and github-token remain
+# in the user-wide state root, and port 8080 retains every historical path.
+if [[ $PORT != 8080 ]]; then
+  LOG="${LOG}.${PORT}"
+  TOKEN_FILE="${TOKEN_FILE}.${PORT}"
+  PID_FILE="${PID_FILE}.${PORT}"
+  MODE_FILE="${MODE_FILE}.${PORT}"
+  TARGET_FILE="${TARGET_FILE}.${PORT}"
+  LAN_FILE="${LAN_FILE}.${PORT}"
+  GV_COMMAND="gv --port $PORT"
+fi
+
+if [[ $DISABLED_LAN -eq 1 ]]; then
+  echo "gv: --lan is disabled; Git-Vista only listens on 127.0.0.1:${PORT}." >&2
+  echo "gv: use an SSH local-port forward for iPad access, or 'gv --lan-view' for a read-only LAN backup." >&2
   exit 2
+fi
+case "$ACTION" in
+  help) usage; exit 0 ;;
+  doctor) doctor; exit $? ;;
+  token) print_token_links; exit $? ;;
+  repo)
+    # --repo edits the singleton systemd unit, not a launcher-owned instance.
+    if [[ $PORT != 8080 ]]; then
+      echo "gv: --repo manages git-vista.service on the default port only" >&2
+      exit 2
+    fi
+    repo_add "$REPO_ARG"
+    exit $?
+    ;;
+esac
+
+# Without socket ownership information, fail closed rather than selecting by
+# argv[0] alone (which could stop a different instance of this checkout).
+if [[ $ACTION == start || $ACTION == stop ]]; then
+  if ! command -v ss >/dev/null 2>&1 \
+    || ! ss -H -ltnp "sport = :${PORT}" >/dev/null 2>&1; then
+    echo "gv: working 'ss' (iproute2) is required to identify this checkout's instance on port ${PORT}" >&2
+    exit 1
+  fi
+fi
+if [[ $ACTION == stop ]]; then
+  if stop_repo_servers; then
+    echo "gv: server owned by $REPO stopped"
+  elif [[ -n $(listener_addresses) ]] || server_health localhost; then
+    echo "gv: a server answers on ${PORT}, but it is not owned by this checkout; refusing to kill it." >&2
+    exit 1
+  else
+    echo "gv: no server owned by this checkout is running"
+  fi
+  exit 0
 fi
 if [[ -n $REPO_ROOT && ! -d $REPO_ROOT ]]; then
   echo "gv: --root: no such directory: $REPO_ROOT" >&2
-  exit 2
-fi
-if [[ $NEXT_IS_LAN_IP -eq 1 ]]; then
-  echo "gv: --lan-ip needs an address" >&2
   exit 2
 fi
 if [[ $LAN_VIEW -eq 1 && -z $LAN_IP ]]; then
@@ -611,7 +647,7 @@ if ! git -C "$TARGET" rev-parse --git-dir >/dev/null 2>&1; then
   exit 1
 fi
 
-if [[ $SEED -eq 1 ]]; then
+if [[ $ACTION == seed ]]; then
   GIT_DIR="$(git -C "$TARGET" rev-parse --absolute-git-dir)"
   HEAD_BRANCH="$(git -C "$TARGET" symbolic-ref --short HEAD 2>/dev/null)" || {
     echo "gv: --seed needs a checked-out branch (HEAD is detached)" >&2
@@ -634,10 +670,10 @@ cd "$REPO"
 build_frontend
 cargo build -p git-vista-server
 
-# Stop only a process whose argv[0] is this checkout's server binary. This safely
-# adopts pre-PID-file launcher generations without killing another checkout.
+# Stop only listeners on this port whose argv[0] is this checkout's binary.
+# This also adopts pre-PID-file instances without touching another instance.
 stop_repo_servers || true
-if server_health localhost; then
+if [[ -n $(listener_addresses) ]] || server_health localhost; then
   echo "gv: port ${PORT} is occupied by a server not owned by $REPO; refusing to kill it." >&2
   exit 1
 fi
@@ -678,8 +714,8 @@ for _ in $(seq 1 40); do
       echo "gv: LAN view up — http://${LAN_IP}:${PORT}/ (read-only, plain HTTP, trusted LAN only)"
     fi
     print_setup_url "localhost:${PORT}" || \
-      echo "gv: couldn't read the sign-in token yet; try 'gv --token'" >&2
-    echo "gv: log: $LOG    diagnose: gv doctor    stop: gv --stop"
+      echo "gv: couldn't read the sign-in token yet; try '${GV_COMMAND} --token'" >&2
+    echo "gv: log: $LOG    diagnose: ${GV_COMMAND} doctor    stop: ${GV_COMMAND} --stop"
     exit 0
   fi
   kill -0 "$SERVER_PID" 2>/dev/null || break
