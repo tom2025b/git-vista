@@ -28,7 +28,7 @@ const GIT_LFS_UNAVAILABLE: &str = "/dev/null/git-vista-lfs-unavailable";
 /// `http://` with this HTTPS URL. Port 1 is deliberately outside
 /// `CLONE_CHECKOUT_PORTS`, so the unchanged Landlock port boundary rejects the
 /// rewritten request before it can reach any service.
-const PLAINTEXT_ACTION_REFUSAL_URL: &str =
+pub(crate) const PLAINTEXT_ACTION_REFUSAL_URL: &str =
     "https://127.0.0.1:1/git-vista-refused-plaintext-lfs-action/";
 
 fn is_executable_file(path: &Path) -> bool {

@@ -620,7 +620,59 @@ fn redact_literal(bytes: &[u8], secret: &[u8]) -> Vec<u8> {
 }
 
 fn redact_bytes(bytes: &[u8]) -> Vec<u8> {
-    redact_url_userinfo_bytes(bytes)
+    redact_plaintext_lfs_refusal_userinfo_bytes(&redact_url_userinfo_bytes(bytes))
+}
+
+/// #836 follow-up: git-lfs's `url.*.insteadOf` rewrite (`lfs.rs`'s
+/// `PLAINTEXT_ACTION_REFUSAL_URL`) is a literal prefix substitution, not a
+/// URL-aware one. Given a server-supplied plaintext action href
+/// `http://TOKEN@host/object`, the rewritten string git-lfs actually emits
+/// (and that its own stderr can echo back to a client and to this process's
+/// logs) is `https://127.0.0.1:1/git-vista-refused-plaintext-lfs-action/TOKEN@host/object`
+/// — the credential has moved from the URL's authority (where
+/// [`redact_url_userinfo_bytes`] looks for it, immediately after `://`) into
+/// the *path*. [`redact_url_userinfo_bytes`] correctly redacts the
+/// `127.0.0.1:1` authority and then treats everything from the first `/`
+/// onward as an opaque path, so it never re-examines `TOKEN@host` for a
+/// second, path-embedded `userinfo@` shape. That gap is this function's
+/// entire job: run only after the normal pass, scan for our own known
+/// refusal-URL prefix (a fixed literal this crate controls, not a general
+/// pattern), and apply the identical "redact up to the last `@` in this
+/// run" rule to whatever follows it, up to the next `/`, `?`, `#`, or
+/// whitespace.
+fn redact_plaintext_lfs_refusal_userinfo_bytes(bytes: &[u8]) -> Vec<u8> {
+    let prefix = crate::sandbox::lfs::PLAINTEXT_ACTION_REFUSAL_URL.as_bytes();
+    let n = bytes.len();
+    let is_authority_delim = |b: u8| b == b'/' || b == b'?' || b == b'#' || b.is_ascii_whitespace();
+
+    let mut out = Vec::with_capacity(n);
+    let mut i = 0usize;
+    while i < n {
+        let starts_prefix = i + prefix.len() <= n && &bytes[i..i + prefix.len()] == prefix;
+        if starts_prefix {
+            out.extend_from_slice(prefix);
+            let start = i + prefix.len();
+            let mut end = start;
+            while end < n && !is_authority_delim(bytes[end]) {
+                end += 1;
+            }
+            let mut at = None;
+            let mut k = start;
+            while k < end {
+                if bytes[k] == b'@' {
+                    at = Some(k);
+                }
+                k += 1;
+            }
+            let keep_from = at.map_or(start, |a| a + 1);
+            out.extend_from_slice(&bytes[keep_from..end]);
+            i = end;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
 }
 
 /// A redacted view of the argv a Network-tier spawn ran with, for callers
@@ -1162,6 +1214,60 @@ mod tests {
         // dropped or lossily replaced — same "don't corrupt binary output"
         // posture the module doc commits to.
         assert!(redacted.contains(&0xFF));
+    }
+
+    /// #836 follow-up (daybreak review, 2026-09-11): the plaintext-LFS
+    /// refusal rewrite (`lfs.rs`'s `PLAINTEXT_ACTION_REFUSAL_URL`) is a
+    /// literal `insteadOf` prefix substitution, so a server-supplied action
+    /// href `http://TOKEN@host/object` becomes
+    /// `https://127.0.0.1:1/git-vista-refused-plaintext-lfs-action/TOKEN@host/object`
+    /// in git-lfs's own stderr — the credential has moved from the URL
+    /// authority into the path. Without this second pass, that stderr
+    /// reaches both the HTTP response body (`clone.rs`'s
+    /// `clone_execution_failure`) and the server log verbatim.
+    #[test]
+    fn redact_bytes_closes_the_path_embedded_credential_in_a_plaintext_lfs_refusal() {
+        let secret = "hunter2";
+        let refused = format!(
+            "{}{secret}@host.example/objects/deadbeef",
+            crate::sandbox::lfs::PLAINTEXT_ACTION_REFUSAL_URL
+        );
+        let buf = format!(
+            "error: external filter failed\nfatal: unable to access '{refused}': fetch failed"
+        );
+
+        let redacted = redact_bytes(buf.as_bytes());
+        let redacted_text = String::from_utf8_lossy(&redacted);
+
+        assert!(
+            !redacted_text.contains(secret),
+            "path-embedded credential survived redaction: {redacted_text}"
+        );
+        // The refusal URL's own fixed prefix must survive — this is a
+        // targeted scrub of what follows it, not a blunt drop of the whole
+        // line, so the refusal reason stays diagnosable.
+        assert!(
+            redacted_text.contains(crate::sandbox::lfs::PLAINTEXT_ACTION_REFUSAL_URL),
+            "redaction over-scrubbed the refusal marker itself: {redacted_text}"
+        );
+        assert!(
+            redacted_text.contains("host.example/objects/deadbeef"),
+            "redaction dropped non-secret path content it shouldn't have: {redacted_text}"
+        );
+    }
+
+    /// Paired negative: proves the secret really was present in the raw
+    /// buffer at the path position this test targets — the same discipline
+    /// as `unredacted_text_still_contains_the_literal_secret` above, applied
+    /// to the path-embedded shape specifically.
+    #[test]
+    fn unredacted_text_still_contains_the_path_embedded_lfs_refusal_secret() {
+        let secret = "hunter2";
+        let refused = format!(
+            "{}{secret}@host.example/objects/deadbeef",
+            crate::sandbox::lfs::PLAINTEXT_ACTION_REFUSAL_URL
+        );
+        assert!(refused.contains(secret));
     }
 
     /// Paired negative: without redaction, the secret is present in the raw
