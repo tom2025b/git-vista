@@ -155,7 +155,11 @@ fn clone_transfer_args<'a>(url: &'a str, dest: &'a str) -> [&'a str; 5] {
 /// public-transport validator. Fresh clone is narrower because its validated
 /// URL also becomes the checkout's Git LFS endpoint: accepting `http://` here
 /// would permit plaintext transfer on an explicitly selected port such as 443.
-fn validate_tls_clone_url(url: &str) -> Result<String, String> {
+///
+/// This is a handler-level gate, not a guarantee of `network_exec` or the
+/// protocol validator. Any future fresh-clone caller must independently invoke
+/// this gate before spawning Git or deriving a checkout LFS endpoint.
+fn validate_fresh_clone_url(url: &str) -> Result<String, String> {
     let url = validate_clone_url(url)?;
     if url.starts_with("http://") {
         return Err("Plaintext HTTP clone URLs are not supported; use https://.".to_string());
@@ -697,7 +701,7 @@ fn clone_status_not_found() -> Response {
 /// Same B3 posture as the other git handlers: shell out to `git clone` and forward
 /// git's redacted error text, with credential-aware messages for GitHub
 /// authentication/access failures (#585). The URL is
-/// validated by [`validate_tls_clone_url`] — `https://` or `git://`, never
+/// validated by [`validate_fresh_clone_url`] — `https://` or `git://`, never
 /// plaintext `http://`, so a pasted SSH URL can't trigger a key prompt and an
 /// HTTP URL cannot evade TLS by naming port 443 — and is passed as its own argv
 /// entry, never a shell line. A full clone is made; the graph view's paged history walk
@@ -746,7 +750,7 @@ pub(crate) async fn clone_repo(
 /// unchanged, now run under [`admit_clone`]'s guard rather than doing the
 /// admission itself.
 async fn run_clone(req: CloneRequest) -> Result<Json<RepositoryDescriptor>, (StatusCode, String)> {
-    let url = match validate_tls_clone_url(&req.url) {
+    let url = match validate_fresh_clone_url(&req.url) {
         Ok(u) => u,
         Err(e) => return Err((StatusCode::BAD_REQUEST, e)),
     };
@@ -782,7 +786,8 @@ async fn run_clone(req: CloneRequest) -> Result<Json<RepositoryDescriptor>, (Sta
         }
     };
 
-    println!("[/api/clone] cloning {url} → {}", dest.display());
+    let redacted_url = crate::sandbox::network_exec::redact_url_userinfo(&url);
+    println!("[/api/clone] cloning {redacted_url} → {}", dest.display());
     // D4 (#66, Task 7/D2): clone's own dedicated policy constructor, not the
     // general-purpose `sandbox::policy_for` other git spawns go through.
     //
@@ -809,7 +814,7 @@ async fn run_clone(req: CloneRequest) -> Result<Json<RepositoryDescriptor>, (Sta
     // `git clone` takes no `-C`, but the launcher's fixed `-C <root>` is
     // harmless (the clones root is a real directory, created just above) and
     // keeps one argv shape for every spawn site. The URL still travels as its
-    // own argv entry, after `validate_clone_url`, behind `--`.
+    // own argv entry, after `validate_fresh_clone_url`, behind `--`.
     // M13.01 (#582): routed through `network_exec::network_command_with_credential`
     // rather than a bare `spawn::command_async` — this was the one production
     // Remote-tier spawn in the crate that never went through the askpass-hardening
@@ -868,7 +873,7 @@ async fn run_clone(req: CloneRequest) -> Result<Json<RepositoryDescriptor>, (Sta
                 }
                 Err(GuardedOutcome::TimedOut) => {
                     eprintln!(
-                        "git-vista: /api/clone timed out after {}s cloning {url}",
+                        "git-vista: /api/clone timed out after {}s cloning {redacted_url}",
                         CLONE_TIMEOUT.as_secs()
                     );
                     return Err((
