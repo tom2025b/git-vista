@@ -1061,11 +1061,31 @@ fn state_dir() -> PathBuf {
     base.join("git-vista")
 }
 
+/// The state directory for one listening instance. Port 8080 retains the
+/// historical root byte-for-byte; non-default instances live below their port.
+fn instance_state_dir(root: &Path, port: u16) -> PathBuf {
+    if port == PORT {
+        root.to_path_buf()
+    } else {
+        root.join("instances").join(port.to_string())
+    }
+}
+
+fn instance_state_path(file_name: &str) -> PathBuf {
+    // `main` reports invalid port configuration cleanly. The durable journal is
+    // opened before that validation, so retain its old default path until the
+    // process reaches the existing configuration error rather than panicking.
+    let port = configured_port().unwrap_or(PORT);
+    instance_state_dir(&state_dir(), port).join(file_name)
+}
+
 /// Where the one-time session bootstrap token (M1.04) is written `0600` at
 /// startup. `gv` reads this exact path to build the `#s=<token>` setup URL it
-/// prints; nothing else — and no request — ever reads it.
+/// prints; nothing else — and no request — ever reads it. The default instance
+/// keeps `state_dir()/bootstrap.token`; another port uses
+/// `state_dir()/instances/<port>/bootstrap.token`.
 pub(crate) fn bootstrap_token_path() -> PathBuf {
-    state_dir().join("bootstrap.token")
+    instance_state_path("bootstrap.token")
 }
 
 /// Directory holding the per-repository sandbox trust markers (M1.13b, #66,
@@ -1078,17 +1098,19 @@ pub(crate) fn sandbox_trust_dir() -> PathBuf {
     state_dir().join("trusted-repos")
 }
 
-/// Where the durable operation journal's SQLite file lives (M1.09, #62).
-/// Process-wide rather than per-repository: the operation registry already
-/// addresses repositories by opaque token, not path, and one file keeps
-/// startup recovery a single open instead of a scan of every served repo.
+/// Where this instance's durable operation journal SQLite file lives (M1.09,
+/// #62). It is instance-wide rather than per-repository: the operation registry
+/// already addresses repositories by opaque token, not path, and one file keeps
+/// startup recovery a single open instead of a scan of every served repo. The
+/// default instance retains `state_dir()/operations.sqlite3`; another port uses
+/// `state_dir()/instances/<port>/operations.sqlite3`.
 ///
 /// Only [`crate::durable::db_path`] calls this, and only outside `#[cfg(test)]`
 /// (tests point at a throwaway file instead, see that function's docs) — so a
 /// test build never references it, which `dead_code` would otherwise flag.
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn operations_db_path() -> PathBuf {
-    state_dir().join("operations.sqlite3")
+    instance_state_path("operations.sqlite3")
 }
 
 /// Delete a previous clone's directory, best-effort. Guarded: only ever removes a
@@ -1176,6 +1198,28 @@ pub(crate) fn reject_if_read_only() -> Option<(StatusCode, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instance_state_paths_preserve_8080_and_scope_every_other_port() {
+        let root = Path::new("/state/git-vista");
+
+        assert_eq!(
+            instance_state_dir(root, 8080).join("bootstrap.token"),
+            root.join("bootstrap.token")
+        );
+        assert_eq!(
+            instance_state_dir(root, 8080).join("operations.sqlite3"),
+            root.join("operations.sqlite3")
+        );
+        assert_eq!(
+            instance_state_dir(root, 8081).join("bootstrap.token"),
+            root.join("instances/8081/bootstrap.token")
+        );
+        assert_eq!(
+            instance_state_dir(root, 8081).join("operations.sqlite3"),
+            root.join("instances/8081/operations.sqlite3")
+        );
+    }
 
     fn selection(path: &str) -> Current {
         Current {
