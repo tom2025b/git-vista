@@ -30,7 +30,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use crate::session::{ct_eq, SessionManager, CSRF_HEADER, SESSION_COOKIE};
+use crate::session::{ct_eq, SessionManager, CSRF_HEADER};
 
 /// The one endpoint hit before a session exists, to learn the protocol.
 const NEGOTIATION_PATH: &str = "/api/protocol";
@@ -302,7 +302,7 @@ pub(crate) async fn require_auth(
     // endpoint — those resolve against the launch selection.
     let mut selection = None;
     if !session_exempt {
-        let cookie = cookie_value(headers, SESSION_COOKIE);
+        let cookie = cookie_value(headers, state.manager.cookie_name());
         selection = cookie.and_then(|id| state.manager.selection_cell(id));
         if is_state_changing(&method) {
             // Writes need a live session *and* the matching CSRF header.
@@ -491,7 +491,7 @@ mod tests {
             header::COOKIE,
             HeaderValue::from_static("other=1; gv_session=abc123; x=2"),
         );
-        assert_eq!(cookie_value(&h, SESSION_COOKIE), Some("abc123"));
+        assert_eq!(cookie_value(&h, "gv_session"), Some("abc123"));
         assert_eq!(cookie_value(&h, "missing"), None);
     }
 }
@@ -524,7 +524,14 @@ mod wire_tests {
     fn app_with_limiter(
         rate_limiter: Option<Arc<crate::ratelimit::SignInLimiter>>,
     ) -> (Router, Arc<SessionManager>) {
-        let sessions = Arc::new(SessionManager::new(None));
+        app_on_port(rate_limiter, 8080)
+    }
+
+    fn app_on_port(
+        rate_limiter: Option<Arc<crate::ratelimit::SignInLimiter>>,
+        port: u16,
+    ) -> (Router, Arc<SessionManager>) {
+        let sessions = Arc::new(SessionManager::new_for_port(None, port));
         let session_state = crate::handlers::session::SessionState {
             manager: sessions.clone(),
             via_lan: rate_limiter.is_some(),
@@ -532,7 +539,7 @@ mod wire_tests {
         };
         let auth_state = AuthState {
             manager: sessions.clone(),
-            hosts: HostPolicy::loopback(8080),
+            hosts: HostPolicy::loopback(port),
         };
         let router = Router::new()
             .route(
@@ -560,10 +567,14 @@ mod wire_tests {
     /// sign-in can be rate-limited, and `oneshot()` skips the real listener
     /// that would normally supply it in production.
     fn req(method: &str, path: &str) -> axum::http::request::Builder {
+        req_on_port(method, path, 8080)
+    }
+
+    fn req_on_port(method: &str, path: &str, port: u16) -> axum::http::request::Builder {
         Request::builder()
             .method(method)
             .uri(path)
-            .header(header::HOST, "localhost:8080")
+            .header(header::HOST, format!("localhost:{port}"))
             .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
                 [127, 0, 0, 1],
                 55000,
@@ -572,11 +583,19 @@ mod wire_tests {
 
     /// Bootstrap a session, returning `(cookie value for the Cookie header, csrf)`.
     async fn bootstrap(router: &Router, sessions: &SessionManager) -> (String, String) {
+        bootstrap_on_port(router, sessions, 8080).await
+    }
+
+    async fn bootstrap_on_port(
+        router: &Router,
+        sessions: &SessionManager,
+        port: u16,
+    ) -> (String, String) {
         let token = sessions.current_bootstrap();
         let resp = router
             .clone()
             .oneshot(
-                req("POST", "/api/session")
+                req_on_port("POST", "/api/session", port)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(format!(r#"{{"token":"{token}"}}"#)))
                     .unwrap(),
@@ -596,6 +615,61 @@ mod wire_tests {
         let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let info: SessionInfo = serde_json::from_slice(&bytes).unwrap();
         (cookie, info.csrf.unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_custom_port_sets_and_authenticates_only_its_scoped_cookie() {
+        let (router, sessions) = app_on_port(None, 8081);
+        let (cookie, _) = bootstrap_on_port(&router, &sessions, 8081).await;
+        assert!(
+            cookie.starts_with("gv_session_8081="),
+            "the custom-port setter emitted {cookie}"
+        );
+
+        let status = router
+            .clone()
+            .oneshot(
+                req_on_port("GET", "/api/session", 8081)
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status_body = to_bytes(status.into_body(), 64 * 1024).await.unwrap();
+        let info: SessionInfo = serde_json::from_slice(&status_body).unwrap();
+        assert!(
+            info.authenticated,
+            "the status handler read a different name"
+        );
+
+        let protected = router
+            .clone()
+            .oneshot(
+                req_on_port("GET", "/api/commits", 8081)
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            protected.status(),
+            StatusCode::OK,
+            "require_auth did not read the custom-port cookie"
+        );
+
+        let session_id = cookie.split_once('=').unwrap().1;
+        let stale_default_name = router
+            .oneshot(
+                req_on_port("GET", "/api/commits", 8081)
+                    .header(header::COOKIE, format!("gv_session={session_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_default_name.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// #705: `GET /api/protocol` is how a client learns the protocol before
