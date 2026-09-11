@@ -8,7 +8,10 @@ import {
 test.describe('#357 staging line selection', () => {
   test('pointer clicks toggle added and removed lines independently across hunks and files', async ({ page }) => {
     const viewer = await openStagingSelection(page)
-    const lines = viewer.getByRole('button', { name: 'Select this line for staging', exact: true })
+    // #770 gave each line its own aria-label (file/hunk/kind/number), so the
+    // old shared 'Select this line for staging' name no longer matches every
+    // button — select by class, same as every other test in this file.
+    const lines = viewer.locator('.stage-line-check')
     await expectLineSelection(viewer, [])
     await lines.nth(0).click() // alpha hunk 0, removed line, local 1
     await expectLineSelection(viewer, [0])
