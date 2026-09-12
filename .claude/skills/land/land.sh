@@ -74,6 +74,14 @@ refresh_app_mirror() {
 land() {
   n=$1; br=$2; subj=$3
   echo "=== PR $n ($br) ==="
+  state=$(gh pr view "$n" --json state --jq .state 2>/dev/null)
+  if [ "$state" = "MERGED" ]; then
+    echo "  already MERGED — skipping (this script is a per-run landing log, not safe to blindly re-execute)"
+    return 0
+  fi
+  if [ "$state" = "CLOSED" ]; then
+    echo "  CLOSED (not merged) — stopping"; return 1
+  fi
   git fetch --force origin '+refs/heads/*:refs/remotes/origin/*' >/dev/null 2>&1
   WT=$SCRATCH/land2-$n; rm -rf "$WT"
   git worktree add --detach "$WT" "origin/$br" >/dev/null 2>&1
