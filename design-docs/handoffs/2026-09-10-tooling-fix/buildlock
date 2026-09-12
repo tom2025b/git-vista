@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# buildlock [-n SLOTS] CMD… — limit builds with a thermal interlock before
+# queuing AND after acquiring a slot. The parent continuously holds the slot;
+# the child closes the descriptor so surviving descendants cannot retain it.
+set -uo pipefail
+LOCKFILE="${BUILDLOCK_FILE:-/tmp/claude-buildlock-v2}"
+TIMEOUT="${BUILDLOCK_TIMEOUT:-1800}"
+SLOTS="${GV_BUILD_SLOTS:-1}"
+if [ "${1:-}" = -n ]; then
+  [ "$#" -ge 3 ] || { echo 'buildlock: usage: buildlock [-n SLOTS] CMD...' >&2; exit 2; }
+  SLOTS="$2"; shift 2
+fi
+[[ "$SLOTS" =~ ^[1-9][0-9]*$ ]] && [ "$#" -gt 0 ] || { echo 'buildlock: positive slots and a command are required' >&2; exit 2; }
+[[ "$TIMEOUT" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo 'buildlock: invalid BUILDLOCK_TIMEOUT' >&2; exit 2; }
+[[ "${GV_THERMAL_WAIT:-600}" =~ ^[0-9]+$ ]] || { echo 'buildlock: invalid GV_THERMAL_WAIT' >&2; exit 2; }
+
+thermal_gate() {
+  local waited=0 out
+  if [ "${GV_THERMAL_OFF:-0}" = 1 ]; then return 0; fi
+  until out="$(gv-thermal 2>/dev/null)"; do
+    if [ "$waited" -ge "${GV_THERMAL_WAIT:-600}" ]; then
+      echo "buildlock: REFUSING TO BUILD — thermal gate still tripped after ${waited}s" >&2
+      gv-thermal >&2 2>/dev/null || true
+      return 75
+    fi
+    [ "$waited" != 0 ] || { echo "buildlock: thermal gate tripped, waiting to cool…" >&2; gv-thermal >&2 2>/dev/null || true; }
+    sleep 15
+    waited=$((waited+15))
+  done
+  [ "$waited" -eq 0 ] || echo "buildlock: cooled after ${waited}s — $out" >&2
+  return 0
+}
+if [ "${GV_THERMAL_OFF:-0}" = 1 ]; then
+  echo 'buildlock: WARNING — GV_THERMAL_OFF=1 bypasses the thermal interlock' >&2
+fi
+thermal_gate || exit "$?"
+
+slot_fd=""
+for ((i=1; i<=SLOTS; i++)); do
+  f="${LOCKFILE}.$i"
+  # Scope stderr suppression to opening the fd, never to the whole shell.
+  { exec {fd}>"$f"; } 2>/dev/null || continue
+  if flock -n "$fd" 2>/dev/null; then slot_fd="$fd"; break; fi
+  exec {fd}>&-
+done
+if [ -z "$slot_fd" ]; then
+  # Acquire into this same parent, then recheck BEFORE starting any child.
+  { exec {slot_fd}>"${LOCKFILE}.1"; } 2>/dev/null || { echo 'buildlock: cannot open slot lock' >&2; exit 1; }
+  if flock -w "$TIMEOUT" -E 75 "$slot_fd"; then
+    :
+  else
+    rc=$?
+    exec {slot_fd}>&-
+    if [ "$rc" -eq 75 ]; then
+      echo "buildlock: no slot free within ${TIMEOUT}s (SLOTS=$SLOTS) — something is wedged." >&2
+      fuser -v "${LOCKFILE}".* >&2 2>&1 || true
+    fi
+    exit "$rc"
+  fi
+fi
+# Retain the acquired slot even during cooling. Exclude the fd from thermal
+# probes as well as the build, so no descendant can extend the lock lifetime.
+thermal_gate {slot_fd}>&- || { rc=$?; exec {slot_fd}>&-; exit "$rc"; }
+"$@" {slot_fd}>&-
+rc=$?
+exec {slot_fd}>&-
+exit "$rc"

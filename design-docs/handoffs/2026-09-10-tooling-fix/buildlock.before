@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# buildlock [-n SLOTS] CMD… — serialize heavy builds, with a THERMAL INTERLOCK.
+#
+# Two guards, and the second is the one that matters:
+#
+# 1. flock, so only GV_BUILD_SLOTS builds run at once (default 1). `-o` closes
+#    the fd in the child: without it a build's children inherit the descriptor
+#    and any one that outlives the build holds the lock forever — that happened
+#    on 2026-08-30 and every later build queued silently behind a process that
+#    would never finish.
+#
+# 2. A thermal gate. Before taking a slot, `gv-thermal` must be clean. If the
+#    package is at/over GV_THERMAL_WARN, or the fan has stalled while hot, or
+#    the CPU has EVER throttled, this REFUSES to start and says why. On
+#    2026-08-30 this box sat at 99C with the fan at 904 of 4000 RPM; a build
+#    that declines to start is free, and a cooked machine is not.
+#    Set GV_THERMAL_OFF=1 to bypass — deliberately noisy, never a default.
+set -uo pipefail
+LOCKFILE="${BUILDLOCK_FILE:-/tmp/claude-buildlock-v2}"
+TIMEOUT="${BUILDLOCK_TIMEOUT:-1800}"
+SLOTS="${GV_BUILD_SLOTS:-1}"
+
+if [ "${GV_THERMAL_OFF:-0}" != "1" ]; then
+  waited=0
+  until out="$(gv-thermal 2>/dev/null)"; do
+    if [ "$waited" -ge "${GV_THERMAL_WAIT:-600}" ]; then
+      echo "buildlock: REFUSING TO BUILD — thermal gate still tripped after ${waited}s" >&2
+      gv-thermal >&2 2>/dev/null || true
+      exit 75
+    fi
+    [ "$waited" = 0 ] && { echo "buildlock: thermal gate tripped, waiting to cool…" >&2; gv-thermal >&2 2>/dev/null || true; }
+    sleep 15; waited=$((waited+15))
+  done
+  [ "$waited" -gt 0 ] && echo "buildlock: cooled after ${waited}s — $out" >&2
+fi
+
+# One lock file per slot; take the first free one.
+#
+# 2026-09-10: this loop used to PROBE with `flock -n -o "$f" true` and then
+# re-acquire. The probe releases the lock before the real acquisition, so two
+# builds could both see slot 1 free — one won, the other blocked on slot 1
+# instead of moving on to slot 2. Measured: GV_BUILD_SLOTS=4 gave 3 usable
+# slots under contention, silently, exactly when slots matter most.
+# Now the shell holds the fd continuously from acquisition through execution,
+# and closes it in the child ({fd}>&-) the way `-o` did — no gap to lose.
+slot_fd=""
+for i in $(seq 1 "$SLOTS"); do
+  f="${LOCKFILE}.$i"
+  # NOTE the brace group. `exec REDIR` with no command applies the redirection to
+  # the SHELL, permanently — so a bare `exec {fd}>"$f" 2>/dev/null` sends this
+  # script's stderr, and every child's, to /dev/null for the rest of the run.
+  # That shipped on 2026-09-10 and made every lane blind to cargo/clippy output
+  # (cargo writes Checking/Finished/errors to stderr, not stdout): a lane read a
+  # real one-line clippy failure as "exit 101 with no stdout/stderr, inconclusive".
+  # The brace group scopes the 2>/dev/null to this one command; the fd still
+  # persists, which is what we actually wanted.
+  { exec {fd}>"$f"; } 2>/dev/null || continue
+  if flock -n "$fd" 2>/dev/null; then slot_fd="$fd"; slot_file="$f"; break; fi
+  exec {fd}>&-
+done
+if [ -n "$slot_fd" ]; then
+  "$@" {slot_fd}>&-   # child never inherits the lock fd
+  rc=$?
+  exec {slot_fd}>&-
+  exit "$rc"
+fi
+# All slots busy — block on slot 1 rather than failing.
+flock -w "$TIMEOUT" -E 75 -o "${LOCKFILE}.1" "$@"
+rc=$?
+if [ "$rc" -eq 75 ]; then
+  echo "buildlock: no slot free within ${TIMEOUT}s (SLOTS=$SLOTS) — something is wedged." >&2
+  fuser -v "${LOCKFILE}".* >&2 2>&1 || true
+fi
+exit "$rc"

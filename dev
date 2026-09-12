@@ -22,6 +22,8 @@
 #   dev testbed <ref> [port]  isolated worktree + own port, for a HUMAN to drive
 #                          the real app at <ref> while work continues here —
 #                          proves it works, not just that tests pass
+#   dev worktree <path> <branch> [<ref>]  lane worktree with target/ pointed at
+#                          /mnt/cargo-targets instead of the system disk
 #   dev handoff           open/print handoff.md (the running "what's done / next" note)
 #   dev report            at-a-glance repo health: branches, merge status, WIP
 #                          commits, lines of code by crate (rex-check pattern)
@@ -892,6 +894,43 @@ cmd_handoff() {
   echo "dev: no handoff.md yet. Create it with: the goal, a [ ]/[x] checklist, and 'next step'."
 }
 
+# dev worktree <path> <branch> [<ref>] — create a lane worktree with its target/
+# already pointed off the system disk, so nobody has to remember the symlink
+# step by hand. Every lane worktree ever created manually (`git worktree add`
+# with no follow-up) left a real target/ on root instead — that is what filled
+# it to 88% on 2026-09-11.
+#
+# Same defensive shape as testbed_target_for: a missing/unmounted cache disk is
+# a slower build, never a failure. If /mnt/cargo-targets is not actually mounted
+# right now, skip the symlink and let cargo fall back to the plain local
+# target/ — do not error, and do not silently write into a path that looks
+# right but sits on an unmounted mountpoint.
+cmd_worktree() {
+  local path="${1:-}" branch="${2:-}" ref="${3:-main}"
+  [[ -n $path && -n $branch ]] || die "usage: dev worktree <path> <branch> [<ref>]"
+  [[ -e $path ]] && die "$path already exists"
+
+  if git show-ref --verify --quiet "refs/heads/$branch"; then
+    git worktree add "$path" "$branch"
+  else
+    git worktree add "$path" -b "$branch" "$ref"
+  fi
+
+  local name; name="$(basename "$path")"
+  if [[ -e "$path/target" || -L "$path/target" ]]; then
+    echo "dev: worktree ready at $path"
+    echo "dev: NOTE: $path/target already exists (from checkout) — leaving it alone, will build locally on the system disk."
+  elif mountpoint -q /mnt/cargo-targets 2>/dev/null; then
+    local dest="/mnt/cargo-targets/targets/$name"
+    mkdir -p "$dest"
+    ln -sT "$dest" "$path/target"
+    echo "dev: worktree ready at $path — target/ -> $dest"
+  else
+    echo "dev: worktree ready at $path"
+    echo "dev: NOTE: /mnt/cargo-targets is not mounted — target/ will build locally on the system disk."
+  fi
+}
+
 case "${1:-}" in
   gate)    shift; cmd_gate "$@" ;;
   browser) shift; cmd_browser "$@" ;;
@@ -905,6 +944,7 @@ case "${1:-}" in
   doctor)  shift; cmd_doctor "$@" ;;
   serve)   shift; cmd_serve "$@" ;;
   testbed) shift; cmd_testbed "$@" ;;
+  worktree) shift; cmd_worktree "$@" ;;
   handoff) shift; cmd_handoff "$@" ;;
   report)  shift; cmd_report "$@" ;;
   ""|-h|--help|help)

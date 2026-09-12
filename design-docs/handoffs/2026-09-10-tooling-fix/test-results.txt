@@ -1,0 +1,58 @@
+Executed: python3 test_tooling.py
+Exit status: 0
+
+Storage note: hash signs in corpus inputs are escaped as \u0023 to avoid
+embedding actionable closing directives in a review report. The executed
+inputs contained literal hash signs. No other output is omitted.
+
+PASS 04_source_body_after_scan | OLD: expected behavior reproduced | NEW: expected behavior reproduced
+PASS 04_batch_body_at_merge | OLD: expected behavior reproduced | NEW: expected behavior reproduced
+PASS 04_change_during_ready | OLD: N/A: original has no merge entry point (covered by 04_batch_body_at_merge) | NEW: expected behavior reproduced
+PASS 05_concurrent_shared_worktree | OLD: expected behavior reproduced | NEW: expected behavior reproduced
+PASS 05_push_scanned_oid_after_head_tamper | OLD: expected behavior reproduced | NEW: expected behavior reproduced
+PASS 06_head_changes_after_fetch | OLD: expected behavior reproduced | NEW: expected behavior reproduced
+PASS 07_files_api_failure | OLD: expected behavior reproduced | NEW: expected behavior reproduced
+PASS 07_rename_source_overlap | OLD: expected behavior reproduced | NEW: expected behavior reproduced
+PASS 07_new_count_snapshot_race | OLD: expected behavior reproduced | NEW: expected behavior reproduced
+PASS 08_body_write_failure | OLD: expected behavior reproduced | NEW: expected behavior reproduced
+PASS 02_new_title_snapshot_race | OLD: expected behavior reproduced | NEW: expected behavior reproduced
+PASS 09_failed_edit_retains_request | OLD: expected behavior reproduced | NEW: expected behavior reproduced
+PASS 10_repo_independent_of_cwd | OLD: expected behavior reproduced | NEW: expected behavior reproduced
+PASS 11_omit_pr_creates | OLD: expected behavior reproduced | NEW: expected behavior reproduced
+PASS 12_colon_bypass | OLD: expected behavior reproduced | NEW: expected behavior reproduced
+PASS 12_qualified_bypass | OLD: expected behavior reproduced | NEW: expected behavior reproduced
+PASS 12_each_match_on_same_line | OLD: expected behavior reproduced | NEW: expected behavior reproduced
+PASS 12_literal_allowlist | OLD: expected behavior reproduced | NEW: expected behavior reproduced
+PASS 12_title_gate | OLD: expected behavior reproduced | NEW: expected behavior reproduced
+PASS 13_missing_body_delimiter | OLD: expected behavior reproduced | NEW: expected behavior reproduced
+PASS 14_dry_alias | OLD: expected behavior reproduced | NEW: expected behavior reproduced
+PASS 15_thermal_after_slot_wait | OLD: expected behavior reproduced | NEW: expected behavior reproduced
+PASS verified_03_metadata_failure | OLD: expected behavior reproduced | NEW: expected behavior reproduced
+PASS verified_child_streams_status_arguments | OLD: expected behavior reproduced | NEW: expected behavior reproduced
+PASS verified_initial_thermal_gate | OLD: expected behavior reproduced | NEW: expected behavior reproduced
+PASS verified_lock_held_and_not_inherited | OLD: expected behavior reproduced | NEW: expected behavior reproduced
+PASS new_merge_positive_and_sha_condition | OLD: N/A: original has no merge entry point | NEW: expected behavior reproduced
+PASS new_invalid_metadata_fails_closed | OLD: N/A: added strict metadata validation | NEW: expected behavior reproduced
+PASS new_positive_literal_multiple_allowlist | OLD: N/A: original allowlist is regex-based | NEW: expected behavior reproduced
+PASS verified_queued_child_streams_and_status | OLD: expected behavior reproduced | NEW: expected behavior reproduced
+PASS new_lock_descriptors_excluded_from_helpers | OLD: N/A: original consumers do not hold these locks | NEW: expected behavior reproduced
+PASS new_merge_head_change_and_denial | OLD: N/A: original has no merge entry point | NEW: expected behavior reproduced
+PASS new_lane_create_failure_and_dry | OLD: N/A: original cannot create | NEW: expected behavior reproduced
+PASS new_batch_create_failure | OLD: expected behavior reproduced | NEW: expected behavior reproduced
+PASS new_malformed_request_variants | OLD: N/A: baseline delimiter failure covered by 13_missing_body_delimiter | NEW: expected behavior reproduced
+CORPUS: actual script grammars; batch old/new and lane old/new
+  'Fix \u0023104': CAUGHT / CAUGHT / CAUGHT / CAUGHT
+  'Closes: \u0023106': CAUGHT / CAUGHT / CLEAR / CAUGHT
+  'Fixes:\u0023105': CAUGHT / CAUGHT / CLEAR / CAUGHT
+  'Resolves owner/repo\u0023107': CAUGHT / CAUGHT / CLEAR / CAUGHT
+  'does not implement or close \u0023782': CAUGHT / CAUGHT / CAUGHT / CAUGHT
+  '`Closes \u0023830`': CAUGHT / CAUGHT / CAUGHT / CAUGHT
+  'CLOSED \u002399': CAUGHT / CAUGHT / CAUGHT / CAUGHT
+  'see \u0023123 for context': CLEAR / CLEAR / CLEAR / CLEAR
+  'refs \u0023456': CLEAR / CLEAR / CLEAR / CLEAR
+  'prefix\u0023789': CLEAR / CLEAR / CLEAR / CLEAR
+  'unfixed \u002312': CLEAR / CLEAR / CLEAR / CLEAR
+PASS: 35 cases
+
+Static checks: bash -n and shellcheck passed for all three scripts and install.sh.
+Signed: daybreak

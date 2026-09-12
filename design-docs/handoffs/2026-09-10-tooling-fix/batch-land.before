@@ -1,0 +1,196 @@
+#!/bin/bash
+# batch-land — build ONE integration branch from several PRs, so CI runs once
+# instead of once per PR per merge-down.
+#
+# WHY THIS EXISTS (measured 2026-09-10, Git-Vista):
+#   The `main-release-gates` ruleset sets strict_required_status_checks_policy=true
+#   ("branches must be up to date"). Every merge to main puts every other open PR
+#   behind, forcing a merge-down and a FULL CI re-run. On 2026-09-10 that produced
+#   48 redundant runs out of 65, about 5.4 HOURS of serial waiting to land 13 PRs.
+#   A replay proved all 14 of that day's PRs merge onto one integration branch with
+#   ZERO conflicts.
+#
+#   Batching is also a CORRECTNESS win, not only speed: #813 and #814 both edited
+#   reachability_census.rs and were only ever tested separately against main. Their
+#   combination was never tested until after both had landed. A batch tests the
+#   state that actually ships.
+#
+# BATCH SIZE: 4-5. Not more.
+#   Measured per-run red rate is ~14%. P(batch red) = 1-(0.86^n):
+#     n=5  -> ~53%  (a red batch costs ~2 extra runs; still ~8x better than serial)
+#     n=14 -> ~88%  (almost certainly red, and then you are bisecting 14 PRs)
+#   Group so that no two PRs in one batch touch the SAME FILE — that keeps the
+#   bisect cheap, and same-file pairs still get tested against each other by the
+#   next batch's merge-down.
+#
+# THE RISK THIS SCRIPT EXISTS TO CONTAIN:
+#   Batching multiplies the closing-keyword blast radius. Every branch's commit
+#   messages flow into main through one merge, so ONE undeclared closer anywhere in
+#   the batch closes an issue nobody meant to close. On 2026-09-10 a commit reading
+#   "does not implement or close #782" closed #782 — GitHub matches keywords, not
+#   sentences, and negations and quotes do not protect. So the gate below scans the
+#   WHOLE batch range, both commit messages and the PR bodies, and refuses on any
+#   closer that was not explicitly declared.
+#
+# Usage:
+#   batch-land <name> <pr> <pr> [pr...]        # build + push + open the batch PR
+#   ALLOW_CLOSING="782 830" batch-land ...     # declare the issues that MAY close
+#   DRY=1 batch-land ...                       # build locally, push nothing
+#
+set -uo pipefail
+
+REPO_DIR="${REPO_DIR:-/home/tom/projects/git-vista}"
+WT="${BATCH_WT:-/tmp/claude-1000/batch-land-wt}"
+NAME="${1:-}"; shift || true
+PRS=("$@")
+
+die() { echo "batch-land: $*" >&2; exit 1; }
+[ -n "$NAME" ] && [ "${#PRS[@]}" -ge 2 ] || die "usage: batch-land <name> <pr> <pr> [pr...]"
+
+if [ "${#PRS[@]}" -gt 5 ]; then
+  echo "!! ${#PRS[@]} PRs in one batch. Measured P(red) at that size is high and a red"
+  echo "!! batch costs more to bisect than it saved. Recommended max is 5."
+  echo "!! Set BATCH_FORCE=1 to proceed anyway."
+  [ "${BATCH_FORCE:-0}" = 1 ] || exit 2
+fi
+
+BRANCH="integration/$NAME"
+echo "=== batch-land: $BRANCH  <-  ${PRS[*]}"
+
+git -C "$REPO_DIR" fetch -q --force origin '+refs/heads/*:refs/remotes/origin/*' || die "fetch failed"
+[ -d "$WT" ] || git -C "$REPO_DIR" worktree add -q --detach "$WT" origin/main || die "worktree add failed"
+git -C "$WT" fetch -q --force origin '+refs/heads/*:refs/remotes/origin/*'
+git -C "$WT" checkout -q --detach origin/main || die "cannot detach onto origin/main"
+
+BASE=$(git -C "$WT" rev-parse HEAD)
+echo "base: $(git -C "$WT" log -1 --format='%h %s')"
+
+# ---- FILE-OVERLAP CHECK: the wave's own dependency data, carried downstream ---
+# Lanes are assigned NON-OVERLAPPING allowed_paths so they cannot collide while
+# working. That same information decides which PRs are safe to batch: two PRs that
+# touch no common file cannot produce a semantic conflict, so a red batch is
+# attributable. Two PRs that DO share a file are the interesting case — worth
+# testing together deliberately, but never blind.
+echo "=== file-overlap check across the batch ==="
+# `gh pr view --json files` returns only the FIRST 100 files (cli issue 13338,
+# confirmed against a real 144-file PR). A truncated list silently under-reports
+# overlap, so compare the count GitHub reports against what we actually received
+# and refuse rather than gate on a partial answer.
+for p in "${PRS[@]}"; do
+  cf=$(gh pr view "$p" --repo tom2025b/Git-Vista --json changedFiles --jq .changedFiles 2>/dev/null) \
+    || die "cannot read changedFiles for #$p — REFUSING (fail closed)"
+  got=$(gh pr view "$p" --repo tom2025b/Git-Vista --json files --jq '.files|length' 2>/dev/null) \
+    || die "cannot read files for #$p — REFUSING (fail closed)"
+  if [ "${cf:-0}" -gt "${got:-0}" ]; then
+    die "#$p has $cf changed files but the API returned only $got — the overlap check would be incomplete. Land this PR alone."
+  fi
+done
+ov=$(for p in "${PRS[@]}"; do
+       gh pr view "$p" --repo tom2025b/Git-Vista --json files \
+         --jq ".files[].path|\"$p \"+." 2>/dev/null
+     done | awk '{f[$2]=f[$2]" #"$1} END{for(k in f){n=split(f[k],a," "); if(n>1) print f[k]"  "k}}')
+if [ -n "$ov" ]; then
+  echo "$ov" | sed 's/^/  SHARED: /'
+  echo
+  echo "  These PRs touch the same file. That is exactly the #813/#814 shape:"
+  echo "  both edited reachability_census.rs, each tested only against main, their"
+  echo "  combination never tested until after both had landed. Batching them tests"
+  echo "  it for real -- but if the batch goes red, the shared file is your suspect."
+  [ "${BATCH_ALLOW_OVERLAP:-0}" = 1 ] || {
+    echo "  Set BATCH_ALLOW_OVERLAP=1 to batch them deliberately."; exit 4; }
+  echo "  BATCH_ALLOW_OVERLAP=1 -- proceeding deliberately."
+else
+  echo "  no shared files -- a red batch is attributable to a single PR"
+fi
+
+# ---- merge each PR branch, true merges so every branch is preserved -----------
+declare -a HEADS=() TITLES=()
+for p in "${PRS[@]}"; do
+  br=$(gh pr view "$p" --repo tom2025b/Git-Vista --json headRefName --jq .headRefName 2>/dev/null) \
+    || die "cannot read PR #$p"
+  ti=$(gh pr view "$p" --repo tom2025b/Git-Vista --json title --jq .title 2>/dev/null)
+  echo "  merging #$p  $br"
+  if ! git -C "$WT" -c user.name=Claude_Max \
+        -c user.email=262510778+tom2025b@users.noreply.github.com \
+        merge --no-ff --no-edit -m "batch: merge #$p ($br)" "origin/$br" >/dev/null 2>&1; then
+    git -C "$WT" merge --abort 2>/dev/null
+    die "CONFLICT merging #$p ($br) — drop it from this batch and land it alone"
+  fi
+  HEADS+=("$p"); TITLES+=("#$p $ti")
+done
+
+# ---- THE GATE: closing keywords across the WHOLE batch range ------------------
+# Both sources. Commit messages count, not just the PR body — that is exactly the
+# half-check that closed #782.
+echo "=== closing-keyword gate over the whole batch range ==="
+# GRAMMAR. The previous version of this regex was `(close[sd]?|fixe[sd]?|resolve[sd]?)`
+# and a codex review of this script (2026-09-10) proved four bypasses against it:
+#   Fix #104              <- `fixe[sd]?` does NOT match the bare canonical `fix`
+#   Closes: #106          <- a colon is not [[:space:]]
+#   Fixes:#105
+#   Resolves owner/repo#107  <- GitHub honours qualified OWNER/REPO#N references
+# GitHub's documented set is close/closes/closed, fix/fixes/fixed,
+# resolve/resolves/resolved, case-insensitive, optional colon, optional qualifier.
+# Spell every form out; do not "simplify" this back into optional-suffix groups.
+# The leading (^|[^A-Za-z0-9_]) is a word boundary and is NOT optional: without it
+# `fix` matches inside `prefix#789` and `fixed` inside `unfixed #12`, refusing
+# legitimate batches. Those fail safe (refuse, never allow) but they are still wrong.
+KW='(^|[^A-Za-z0-9_])(close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)[[:space:]]*:?[[:space:]]*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+'
+
+# FAIL CLOSED. Every `gh` read below is checked. Previously a transient API failure
+# yielded an empty body, the gate saw no closers, and the batch shipped — the gate
+# passed *because* it could not look.
+scan() { printf '%s' "$1" | grep -ioE "$KW" | grep -oE '#[0-9]+' | sort -u; }
+
+found=$(git -C "$WT" log "$BASE..HEAD" --format='%s%n%b' | grep -ioE "$KW" | grep -oE '#[0-9]+' | sort -u)
+for p in "${PRS[@]}"; do
+  # TITLES ARE SCANNED TOO: this script copies each source PR's title into the batch
+  # PR description, so a PR titled "Fixes #999" injected an unscanned closer.
+  meta=$(gh pr view "$p" --repo tom2025b/Git-Vista --json body,title 2>/dev/null) \
+    || die "cannot read PR #$p from GitHub — REFUSING rather than gating on a blank body"
+  [ -n "$meta" ] || die "empty GitHub response for PR #$p — REFUSING (fail closed)"
+  found="$found"$'\n'$(scan "$(printf '%s' "$meta" | jq -r '.body // ""')")
+  found="$found"$'\n'$(scan "$(printf '%s' "$meta" | jq -r '.title // ""')")
+done
+found=$(printf '%s\n' $found | sed '/^$/d' | sort -u)
+
+declared=""
+for d in ${ALLOW_CLOSING:-}; do declared="$declared #${d#\#}"; done
+bad=""
+for f in $found; do
+  case " $declared " in *" $f "*) ;; *) bad="$bad $f" ;; esac
+done
+
+if [ -n "$found" ]; then echo "  closers present in batch:$(printf ' %s' $found)"; else echo "  no closers in batch"; fi
+echo "  declared via ALLOW_CLOSING:${declared:- (none)}"
+if [ -n "$bad" ]; then
+  echo
+  echo "!! REFUSING: undeclared closing keyword(s):$bad"
+  echo "!! Every one of these will close its issue when this batch merges,"
+  echo "!! including any that appear after a negation or inside quotes."
+  echo "!! Re-run with ALLOW_CLOSING=\"<numbers>\" if they are genuinely intended."
+  exit 3
+fi
+echo "  gate PASSED"
+
+if [ "${DRY:-0}" = 1 ]; then
+  echo "=== DRY=1 — built locally, pushing nothing. Integration head:"
+  git -C "$WT" log --oneline "$BASE..HEAD" | head -20
+  exit 0
+fi
+
+git -C "$WT" push -q origin "HEAD:refs/heads/$BRANCH" || die "push failed"
+echo "pushed $BRANCH"
+
+{
+  echo "Batch of ${#PRS[@]} PRs, landed together so CI runs once instead of once per"
+  echo "PR per merge-down. Each PR branch is preserved and merged with --no-ff."
+  echo
+  for t in "${TITLES[@]}"; do echo "- $t"; done
+  echo
+  echo "Individual PRs close automatically when their commits become reachable"
+  echo "from main. Closing keywords were gated across the whole batch range."
+} > /tmp/batch-body-$NAME.md
+
+gh pr create --repo tom2025b/Git-Vista --base main --head "$BRANCH" \
+  --title "batch: $NAME (${#PRS[@]} PRs)" --body-file /tmp/batch-body-$NAME.md 2>&1 | tail -2

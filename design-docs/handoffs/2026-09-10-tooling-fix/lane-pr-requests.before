@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# lane-pr-requests — execute GitHub operations that headless lanes cannot.
+#
+# WHY: codex lanes have flaky outbound network (every lane in round 7 hit
+# "error connecting to api.github.com"), while the coordinator session reaches
+# GitHub reliably. So lanes do git work (commit/push — reliable) and write a
+# PR-REQUEST.md instead of calling gh. This executes those.
+#
+# BONUS, and the real reason to prefer it: every PR body now passes through ONE
+# closing-keyword check instead of five lanes each being trusted to do it. On
+# 2026-09-10 a commit reading "does not implement or close #782" closed #782
+# because that check was skipped in one place.
+set -uo pipefail
+DRY="${DRY_RUN:-0}"
+found=0
+
+for wt in /home/tom/projects/gv-*; do
+  req="$wt/PR-REQUEST.md"
+  [ -f "$req" ] || continue
+  found=$((found+1))
+  echo "=== $(basename "$wt") ==="
+  pr=$(grep -m1 '^pr:' "$req" | sed 's/^pr:[[:space:]]*//')
+  title=$(grep -m1 '^title:' "$req" | sed 's/^title:[[:space:]]*//')
+  body=$(sed -n '/^---BODY---$/,$p' "$req" | tail -n +2)
+
+  # THE GUARD — one place, every time.
+  bad=$(printf '%s' "$body" | grep -inE '\b(clos(e|es|ed)|fix(es|ed)?|resolv(e|es|ed))[[:space:]]+#[0-9]+' || true)
+  allow=$(grep -m1 '^allow_closing:' "$req" | sed 's/^allow_closing:[[:space:]]*//')
+  if [ -n "$bad" ]; then
+    if [ -z "$allow" ] || [ "$allow" = "none" ]; then
+      echo "  REFUSED: closing keyword present but allow_closing is '${allow:-unset}'" >&2
+      printf '  %s\n' "$bad" >&2
+      continue
+    fi
+    unexpected=$(printf '%s' "$bad" | grep -ivE "#($allow)\b" || true)
+    [ -n "$unexpected" ] && { echo "  REFUSED: closes something other than #$allow" >&2; printf '  %s\n' "$unexpected" >&2; continue; }
+    echo "  closing keyword OK (declared: #$allow)"
+  else
+    echo "  no closing keyword"
+  fi
+
+  [ "$DRY" = "1" ] && { echo "  DRY RUN — would update PR #$pr"; continue; }
+  [ -n "$pr" ] || { echo "  no pr: field, skipping" >&2; continue; }
+  printf '%s' "$body" > /tmp/.lane-pr-body.$$
+  if [ -n "$title" ]; then gh pr edit "$pr" --title "$title" --body-file /tmp/.lane-pr-body.$$ 2>&1 | tail -1
+  else gh pr edit "$pr" --body-file /tmp/.lane-pr-body.$$ 2>&1 | tail -1; fi
+  rm -f /tmp/.lane-pr-body.$$
+  mv "$req" "$req.done"
+  echo "  applied to PR #$pr"
+done
+[ "$found" -eq 0 ] && echo "no PR-REQUEST.md found in any lane worktree"
+exit 0

@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# Apply lane PR-REQUEST.md files. Explicit worktree arguments are optional;
+# otherwise scan /home/tom/projects/gv-*. DRY=1 OR DRY_RUN=1 disables all writes.
+# Header: optional pr, optional title (required for create), allow_closing numbers
+# or none, optional base (defaults to main), then exactly one ---BODY--- line.
+# Omit pr entirely to create from the lane's current, already-pushed branch.
+set -uo pipefail
+umask 077
+export LC_ALL=C
+DRY_MODE=0
+if [ "${DRY:-0}" = 1 ] || [ "${DRY_RUN:-0}" = 1 ]; then DRY_MODE=1; fi
+
+# Same grammar as batch-land. Validate each matched issue, not its whole line.
+KW='(^|[^A-Za-z0-9_])(close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)[[:space:]]*:?[[:space:]]*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+'
+refuse() { echo "  REFUSED: $*" >&2; return 1; }
+apply_request() (
+  wt="$1"
+  req="$wt/PR-REQUEST.md"
+  # Serialize consumers of the same request; retain the lock inode on disk.
+  exec {request_fd}>"$wt/.lane-pr-request.lock" || exit 1
+  flock -n "$request_fd" || { refuse "request already being processed"; exit 1; }
+  git() { command git "$@" {request_fd}>&-; }
+  gh() { command gh "$@" {request_fd}>&-; }
+  [ -f "$req" ] || exit 0
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/lane-pr-request.XXXXXXXX") || exit 1
+  trap 'rm -rf -- "$tmp"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  cp -- "$req" "$tmp/request" || exit 1
+  # Parse only the header of our snapshot. Never interpret body lines as fields.
+  count=$(grep -cx -- '---BODY---' "$tmp/request")
+  [ "$count" = 1 ] || { refuse "expected exactly one ---BODY--- delimiter"; exit 1; }
+  declare -A fields=()
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ "$line" = '---BODY---' ] && break
+    [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" =~ ^(pr|title|allow_closing|base):[[:space:]]*(.*)$ ]] || { refuse "invalid request header"; exit 1; }
+    key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
+    [ "${fields[$key]+present}" != present ] || { refuse "duplicate $key field"; exit 1; }
+    fields["$key"]="$value"
+  done < "$tmp/request"
+  sed '1,/^---BODY---$/d' "$tmp/request" > "$tmp/body" || exit 1
+  # An empty or whitespace-only body is almost certainly a malformed request.
+  grep -q '[^[:space:]]' "$tmp/body" || { refuse "empty request body"; exit 1; }
+  pr="${fields[pr]:-}"; title="${fields[title]:-}"; base="${fields[base]:-main}"
+  if [ "${fields[pr]+present}" = present ]; then
+    [[ "$pr" =~ ^[1-9][0-9]*$ ]] || { refuse "pr must be a positive number; omit it to create"; exit 1; }
+  else
+    [ -n "$title" ] || { refuse "creation requires title"; exit 1; }
+  fi
+  declare -A allowed=()
+  declare -a words=()
+  allow="${fields[allow_closing]:-none}"
+  if [ "$allow" != none ]; then
+    read -r -a words <<< "$allow"
+    for issue in "${words[@]}"; do
+      issue="${issue#\#}"
+      [[ "$issue" =~ ^[1-9][0-9]*$ ]] || { refuse "allow_closing must be literal positive issue numbers or none"; exit 1; }
+      allowed["$issue"]=1
+    done
+  fi
+  printf '%s\n' "$title" > "$tmp/title" || exit 1
+  for text_file in "$tmp/body" "$tmp/title"; do
+    if matches=$(grep -ioE "$KW" -- "$text_file"); then
+      while IFS= read -r match; do
+        issue="${match##*#}"
+        [ "${allowed[$issue]:-0}" = 1 ] || { refuse "undeclared closing reference #$issue"; exit 1; }
+      done <<< "$matches"
+    else
+      rc=$?
+      [ "$rc" -eq 1 ] || { refuse "cannot scan request"; exit 1; }
+    fi
+  done
+  origin=$(git -C "$wt" remote get-url origin) || exit 1
+  case "$origin" in
+    https://github.com/*) repo="${origin#https://github.com/}" ;;
+    git@github.com:*) repo="${origin#git@github.com:}" ;;
+    ssh://git@github.com/*) repo="${origin#ssh://git@github.com/}" ;;
+    *) refuse "origin must identify a GitHub repository"; exit 1 ;;
+  esac
+  repo="${repo%.git}"
+  [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { refuse "invalid repository identity"; exit 1; }
+  if [ -n "$pr" ]; then
+    args=(pr edit "$pr" --repo "$repo" --body-file "$tmp/body")
+    [ -z "$title" ] || args+=(--title "$title")
+    action="update PR #$pr in $repo"
+  else
+    head=$(git -C "$wt" symbolic-ref --quiet --short HEAD) || { refuse "creation needs an attached lane branch"; exit 1; }
+    git check-ref-format --branch "$base" >/dev/null || exit 1
+    [ "$head" != "$base" ] || { refuse "head and base must differ"; exit 1; }
+    # Query for an existing PR so a retry after an uncertain create cannot create
+    # a duplicate. The lane branch must have been pushed before submitting.
+    existing=$(gh pr list --repo "$repo" --state open --head "$head" --base "$base" --json number) || exit 1
+    jq -e 'type == "array" and length == 0' <<< "$existing" >/dev/null || { refuse "an open PR already exists for $head; supply pr explicitly"; exit 1; }
+    args=(pr create --repo "$repo" --head "$head" --base "$base" --title "$title" --body-file "$tmp/body")
+    action="create PR in $repo from $head"
+  fi
+  if [ "$DRY_MODE" = 1 ]; then echo "  DRY RUN — would $action"; exit 0; fi
+  # Leave any previous receipt intact. A coordinator must archive it explicitly.
+  [ ! -e "$req.done" ] || { refuse "existing .done receipt; archive it before applying another request"; exit 1; }
+  cmp -s "$req" "$tmp/request" || { refuse "request changed during validation"; exit 1; }
+  if ! gh "${args[@]}"; then
+    refuse "GitHub failed to $action; request remains pending"
+    exit 1
+  fi
+  cmp -s "$req" "$tmp/request" || { refuse "GitHub applied snapshot but request changed; leaving current request pending"; exit 1; }
+  mv -n -- "$req" "$req.done" || { refuse "GitHub succeeded, but cannot archive request"; exit 1; }
+  [ ! -e "$req" ] || { refuse "GitHub succeeded, but receipt appeared concurrently"; exit 1; }
+  echo "  applied: $action"
+)
+
+if [ "$#" -gt 0 ]; then
+  worktrees=("$@")
+else
+  shopt -s nullglob
+  worktrees=(/home/tom/projects/gv-*)
+fi
+found=0
+failed=0
+for wt in "${worktrees[@]}"; do
+  [ -f "$wt/PR-REQUEST.md" ] || continue
+  found=$((found+1))
+  echo "=== $(basename -- "$wt") ==="
+  apply_request "$wt" || failed=1
+done
+[ "$found" -ne 0 ] || echo "no PR-REQUEST.md found in any lane worktree"
+exit "$failed"
