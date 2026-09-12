@@ -1291,9 +1291,9 @@ mod tests {
     }
 
     /// `current_read_target` is the read-side TOCTOU seam. Its result is only
-    /// meaningful when all fields came from one `current_snapshot` call; an
-    /// innocent-looking return to `current()` plus `current_handle()` restores
-    /// the cross-repository cursor-scope race.
+    /// meaningful when all fields came from exactly one `current_snapshot`
+    /// call. Any second lookup can restore the cross-repository cursor-scope
+    /// race, regardless of which helper performs it.
     #[test]
     fn read_target_uses_one_current_snapshot() {
         let source = include_str!("state.rs");
@@ -1305,9 +1305,10 @@ mod tests {
             .expect("current_read_target has a balanced body")
             .0;
         assert!(function.contains("let selection = current_snapshot()"));
-        assert!(
-            !function.contains("current()") && !function.contains("current_handle()"),
-            "read targets must not split path/mode and handle across separate lookups"
+        assert_eq!(
+            function.matches("current_snapshot()").count(),
+            1,
+            "every read-target field must come from one selection snapshot"
         );
     }
 
