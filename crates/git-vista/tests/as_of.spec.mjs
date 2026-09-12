@@ -77,6 +77,38 @@ test('historical paging draws deleted refs, carries its token, and exposes no wr
   await expect(page.locator('svg')).not.toContainText('past-136')
 })
 
+test('a stale live write handler is refused client-side after historical entry', async ({ page }) => {
+  await openActive(page)
+  await observation(page, 'write-gate-136')
+  await page.locator('.node-hit[data-row-index="0"]').click()
+  const create = page.locator('.ctx-menu').getByRole('button', { name: /Create branch/ })
+  await expect(create).toBeVisible()
+  const writes = []
+  await page.route('**/api/branch', async route => {
+    writes.push(route.request().url())
+    await route.abort()
+  })
+  page.once('dialog', dialog => dialog.accept('must-not-reach-server-136'))
+
+  // Dispatch a real live create-branch handler, then enter historical mode in
+  // the same browser task before its spawned async request is first polled.
+  // The actual `create_branch_request` therefore sees the historical state;
+  // a missing central guard would hit the intercepted POST instead.
+  await page.evaluate(() => {
+    const historical = document.querySelector('button.act-as-of')
+    const create = [...document.querySelectorAll('.ctx-menu button')]
+      .find(node => (node.textContent ?? '').includes('Create branch'))
+    if (!(historical instanceof HTMLButtonElement)) throw new Error('historical selector missing')
+    if (!(create instanceof HTMLButtonElement)) throw new Error('live create-branch handler missing')
+    create.click()
+    historical.click()
+  })
+  await expect(page.locator('.historical-banner')).toContainText('view only')
+  await expect(page.getByText('Historical view is view only. Return to live before making changes.', { exact: true }))
+    .toBeVisible()
+  expect(writes).toEqual([])
+})
+
 test('a stale selection stays visibly historical with the real 409 and one return action', async ({ page }) => {
   await openActive(page)
   const choose = await observation(page, 'stale-136')

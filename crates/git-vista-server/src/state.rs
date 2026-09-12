@@ -1251,6 +1251,66 @@ mod tests {
         }
     }
 
+    fn handle(repository: &str, worktree: &str) -> RepositoryHandle {
+        RepositoryHandle::new(
+            git_vista_core::identity::RepositoryId::from_common_dir(repository),
+            WorktreeId::from_git_dir(worktree),
+        )
+    }
+
+    /// A read target must carry one selection's path, mode, and handle together.
+    /// The two selections are applied sequentially here so each returned tuple
+    /// is independently observable; the source assertion below prevents this
+    /// implementation from being quietly changed back to two lookups.
+    #[tokio::test]
+    async fn read_target_keeps_each_selection_identity_together() {
+        with_isolated_test_current(async {
+            let first_handle = handle("/repos/first/.git", "/repos/first/.git");
+            set_current_resolved(
+                PathBuf::from("/repos/first"),
+                RepoMode::Visualize,
+                Some(first_handle),
+            );
+            assert_eq!(
+                current_read_target(),
+                (PathBuf::from("/repos/first"), true, Some(first_handle))
+            );
+
+            let second_handle = handle("/repos/second/.git", "/repos/second/.git");
+            set_current_resolved(
+                PathBuf::from("/repos/second"),
+                RepoMode::Active,
+                Some(second_handle),
+            );
+            assert_eq!(
+                current_read_target(),
+                (PathBuf::from("/repos/second"), false, Some(second_handle))
+            );
+        })
+        .await;
+    }
+
+    /// `current_read_target` is the read-side TOCTOU seam. Its result is only
+    /// meaningful when all fields came from one `current_snapshot` call; an
+    /// innocent-looking return to `current()` plus `current_handle()` restores
+    /// the cross-repository cursor-scope race.
+    #[test]
+    fn read_target_uses_one_current_snapshot() {
+        let source = include_str!("state.rs");
+        let function = source
+            .split_once("pub(crate) fn current_read_target()")
+            .expect("current_read_target remains defined")
+            .1
+            .split_once("\n}\n")
+            .expect("current_read_target has a balanced body")
+            .0;
+        assert!(function.contains("let selection = current_snapshot()"));
+        assert!(
+            !function.contains("current()") && !function.contains("current_handle()"),
+            "read targets must not split path/mode and handle across separate lookups"
+        );
+    }
+
     /// #614: the release path's no-scope write refuses once the launch
     /// selection is seeded, and leaves it holding what startup put there.
     ///

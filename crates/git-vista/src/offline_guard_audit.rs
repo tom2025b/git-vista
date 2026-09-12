@@ -986,6 +986,25 @@ fn each_write_attempt_checks_offline_before_constructing_the_request() {
         "the guard must be inside the attempt closure, before request construction, so it checks retries too");
 }
 
+/// The historical-mode guard is inside the real retrying attempt, after the
+/// builder exists but before either body reaches `.send()`. That lets a stale
+/// UI closure be refused synchronously and applies again on a retry.
+#[test]
+fn each_write_attempt_refuses_a_historical_view_before_sending() {
+    let bodies = bodies_map();
+    let body = bodies.get("send_write_with_key").unwrap();
+    let guard = body
+        .find("crate::features::graph::signals::refuse_if_historical()?")
+        .expect("the transport attempt must consult the historical-view guard");
+    let send = body
+        .find(".send()")
+        .expect("send_write_with_key still sends its constructed request");
+    assert!(
+        guard < send,
+        "the historical-view guard must refuse before a write can reach the wire"
+    );
+}
+
 // ── The guard itself ─────────────────────────────────────────────────────────
 
 /// Closes part of the module doc's limitation #2: that `refuse_if_offline`

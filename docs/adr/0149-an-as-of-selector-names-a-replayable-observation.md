@@ -145,10 +145,14 @@ repository selection, settings, Activity writes, and mutable dialogs are absent;
 read-only graph inspection remains available. Entering closes stale write
 dialogs. The API write guard synchronously reads the same graph state, including
 while its seed is pending and before retrying a write.
+If that graph guard is unavailable due to broken app wiring, it fails closed
+with a reload instruction rather than granting write permission.
 
 This mode is a browser viewing state, not a change to the server session's
 permissions. Explicit return starts a fresh live epoch. Nothing is persisted
-across a full page reload, and no stepping or animation is included.
+across a full page reload. Previous/next replayable-observation navigation is
+deliberately deferred to [#850](https://github.com/tom2025b/git-vista/issues/850);
+no stepping or animation is included in this first slice.
 
 ## Alternatives and costs
 
@@ -182,7 +186,9 @@ refusals are checked before traversal. Browser tests exercise the real journal
 writer and signed endpoints, multi-page requests, missing live branch badges,
 hidden write affordances, the persistent 409 state, and return during a pending
 historical request. Host tests pin mode/epoch transitions independently of DOM
-wiring.
+wiring. A browser regression test starts a real live create-branch flow,
+switches to historical mode before its async request runs, and proves the
+client-side refusal appears while no POST reaches the server.
 
 Failure-atlas `mutation_check` ran each change in an isolated clone of clean
 commit `0b482178d636e3a95f453c80b4cc0c227a02ffb5`. Every baseline passed;
