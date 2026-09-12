@@ -397,11 +397,13 @@ pub(super) fn graph_canvas(
         });
 
         let alive = Rc::clone(&alive);
+        let view = graph.get_untracked().view().clone();
         spawn_local(async move {
             let fetched = fetch_page(
                 worktree_id.as_deref(),
                 Some(&request_key.cursor),
                 DEFAULT_PAGE_LIMIT,
+                &view,
             )
             .await;
 
@@ -796,6 +798,7 @@ pub(super) fn graph_canvas(
         // reactive closure that renders only when its signal is set.
         <div class="overlays">
             {menu::menu_view(features, settings, read_only, on_fold_wip)}
+            <Show when=move || !graph.get().view().is_historical()>
             {dialogs::commit_dialog_view(features)}
             {dialogs::confirm_modal_view(features)}
             // #232: the pull strategy picker is a fourth modal rather than an
@@ -803,9 +806,10 @@ pub(super) fn graph_canvas(
             // version is that it exists precisely to supply the field a
             // `PendingOp::Pull` cannot be built without.
             {dialogs::pull_picker_view(features)}
+            {activity::activity_panel_view(features, settings, read_only)}
+            </Show>
             {dialogs::error_modal_view(features)}
             {detail::detail_panel_view(features, settings, detail, ctx)}
-            {activity::activity_panel_view(features, settings, read_only)}
             {viewer::viewer_view(features, settings, ctx)}
         </div>
     }

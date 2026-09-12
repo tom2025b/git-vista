@@ -172,6 +172,7 @@ fn collect(refs: &[GitRef], kind: RefKind) -> CapturedRefs {
 /// "your branch moved, origin did not", and local branches alone cannot tell
 /// it. See ADR 0070.
 pub fn capture_refs(repo: &Path) -> RefsAtEvent {
+    let shallow_before = shallow_state(repo);
     let read = match read_refs_at(repo) {
         Ok(read) => read,
         Err(e) => {
@@ -187,9 +188,37 @@ pub fn capture_refs(repo: &Path) -> RefsAtEvent {
         head: Some(read.head),
         tags: Some(collect(&read.refs, RefKind::Tag)),
         remotes: Some(collect(&read.refs, RefKind::RemoteBranch)),
+        // A change or failed read around the single ref capture is unknown.
+        // Only two observed unshallow readings can earn Some(false).
+        shallow: shallow_before.filter(|before| shallow_state(repo) == Some(*before)),
         // A bare capture anchors nothing; `append_all` stamps the batch id
         // when it is sharing this one snapshot across several lines.
         batch: None,
+    }
+}
+
+/// Read only shallow *status*, never substitute current boundaries in a replay.
+/// Journaling supports ordinary `.git` directories only (see `state_dir`). A
+/// linked worktree, unreadable file, or indirection is unknown. Nonempty files
+/// are refused regardless of whether their contents are valid object ids.
+pub(crate) fn shallow_state(repo: &Path) -> Option<bool> {
+    let git = repo.join(".git");
+    let meta = std::fs::symlink_metadata(&git).ok()?;
+    if !meta.is_dir() || git.join("commondir").try_exists().ok()? {
+        return None;
+    }
+    let shallow = git.join("shallow");
+    match std::fs::symlink_metadata(&shallow) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Ok(meta) if meta.is_file() => {
+            let mut first_byte = [0u8; 1];
+            std::fs::File::open(shallow)
+                .ok()?
+                .read(&mut first_byte)
+                .ok()
+                .map(|n| n != 0)
+        }
+        _ => None,
     }
 }
 
@@ -330,6 +359,7 @@ pub fn append_all(repo: &Path, events: &[ActivityEvent]) {
                             head,
                             tags,
                             remotes,
+                            shallow,
                             ..
                         } => RefsAtEvent::Captured {
                             branches,
@@ -337,6 +367,7 @@ pub fn append_all(repo: &Path, events: &[ActivityEvent]) {
                             head,
                             tags,
                             remotes,
+                            shallow,
                             batch: batch.clone(),
                         },
                         failed => failed,
@@ -932,6 +963,7 @@ mod tests {
                 // A single capture anchors no batch; `a_lone_append_...`
                 // is where that is asserted rather than assumed.
                 batch: _,
+                shallow: _,
             } => Capture {
                 branches,
                 truncated_at,
@@ -1337,6 +1369,7 @@ mod tests {
             head: None,
             tags: None,
             remotes: None,
+            shallow: None,
             batch: None,
         });
         append(dir.path(), &e);
@@ -2061,6 +2094,7 @@ mod tests {
             head: None,
             tags: None,
             remotes: None,
+            shallow: None,
             batch: None,
         });
         let events = vec![event("a"), own, event("b"), event("c")];

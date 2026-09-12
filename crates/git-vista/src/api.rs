@@ -67,7 +67,7 @@ pub use conflicts::{
 };
 pub use diff::{fetch_diff, fetch_diff_full, fetch_file, fetch_spec_diff};
 pub use forge::{fetch_forge_page, fetch_pull_details};
-pub use graph::{fetch_frame, fetch_page};
+pub use graph::{fetch_frame, fetch_frame_for_view, fetch_page};
 pub use operations::{
     cancel_operation_request, fetch_operation_status, resolve_operation_id, CancelOutcome,
 };
@@ -181,6 +181,7 @@ fn refuse_if_lan_view() -> Result<(), String> {
 /// up front in Visualize mode, so a gating gap in the UI can't even attempt a
 /// mutation. The server's own 403 remains the actual boundary.
 fn refuse_if_visualize() -> Result<(), String> {
+    crate::features::graph::signals::refuse_if_historical()?;
     if session_state::refuses_writes() {
         Err("This repository is open in Visualize mode — look-only.".to_string())
     } else {
@@ -299,6 +300,7 @@ async fn send_write_with_key(
     let attempt = || async {
         refuse_if_offline()?;
         let builder = req_post(url).header(IDEMPOTENCY_HEADER, key.as_str());
+        crate::features::graph::signals::refuse_if_historical()?;
         let sent = async {
             match &body {
                 Some(json) => builder

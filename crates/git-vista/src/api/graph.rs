@@ -7,7 +7,7 @@
 //! why it stays shared plumbing there rather than moving in here with its
 //! only two callers.
 
-use crate::features::graph::core::{Frame, Page};
+use crate::features::graph::core::{Frame, HistoryView, Page};
 
 use super::{encode_component, history_json, send_read, HistoryFetchError};
 
@@ -24,10 +24,21 @@ const MAX_PAGE_LIMIT: usize = 1_000;
 /// No `?repo=` selector: the Frame *is* what resolves the view's target, and
 /// every page fetched after it pins that answer via
 /// [`Frame::worktree_id`](git_vista_protocol::HistoryFrame::worktree_id).
-pub async fn fetch_frame() -> Result<Frame, HistoryFetchError> {
-    let url = format!("/api/frame?t={}", js_sys::Date::now());
+pub async fn fetch_frame_for_view(view: &HistoryView) -> Result<Frame, HistoryFetchError> {
+    let mut url = format!("/api/frame?t={}", js_sys::Date::now());
+    if let Some(repo) = view.repo() {
+        url.push_str(&format!("&repo={}", encode_component(repo)));
+    }
+    if let Some(token) = view.token() {
+        url.push_str(&format!("&as_of={}", encode_component(token)));
+    }
     let resp = send_read(&url).await?;
     history_json(resp).await
+}
+
+/// Existing live callers (for example commit review) keep their live read.
+pub async fn fetch_frame() -> Result<Frame, HistoryFetchError> {
+    fetch_frame_for_view(&HistoryView::Live).await
 }
 
 /// Fetch one page of history (`GET /api/commits`, M1.10): rows, edges and stubs
@@ -43,6 +54,7 @@ pub async fn fetch_page(
     repo: Option<&str>,
     cursor: Option<&str>,
     limit: usize,
+    view: &HistoryView,
 ) -> Result<Page, HistoryFetchError> {
     // Built by appending, not by `format!`ing a fixed shape: an absent selector
     // must be *omitted*, not sent empty — an empty `?repo=` is a different
@@ -50,6 +62,9 @@ pub async fn fetch_page(
     let mut url = String::from("/api/commits?");
     if let Some(repo) = repo {
         url.push_str(&format!("repo={}&", encode_component(repo)));
+    }
+    if let Some(token) = view.token() {
+        url.push_str(&format!("as_of={}&", encode_component(token)));
     }
     if let Some(cursor) = cursor {
         url.push_str(&format!("cursor={}&", encode_component(cursor)));

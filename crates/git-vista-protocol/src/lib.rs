@@ -103,7 +103,7 @@ pub mod status;
 pub mod version;
 pub mod worktree;
 
-pub use activity::ActivityPage;
+pub use activity::{ActivityObservation, ActivityPage, AsOfAvailability, AsOfUnavailable};
 pub use change_feed::{
     ChangeFeedHealth, ChangeFeedSnapshot, RefDelta, WatchBudget, WatcherLoss, SNAPSHOT_EVENT,
 };

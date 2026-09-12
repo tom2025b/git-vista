@@ -239,6 +239,12 @@ pub enum RefsAtEvent {
         /// rarely. See ADR 0070 for why they are recorded at all.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         remotes: Option<CapturedRefs>,
+        /// Shallow status observed around this capture (#136). `Some(false)`
+        /// records an unshallow repository; `Some(true)` cannot be replayed
+        /// until boundaries themselves are recorded. `None` means unknown,
+        /// including every older capture. Never infer this from today's repo.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shallow: Option<bool>,
         /// Names the *batch* this capture was taken for, when it was taken
         /// for more than one event (#485, ADR 0080). The other events of the
         /// batch carry [`Self::InBatch`] with the same id and no maps of
@@ -2466,6 +2472,7 @@ mod tests {
             head: None,
             tags: None,
             remotes: None,
+            shallow: None,
             batch: batch.map(str::to_string),
         }
     }

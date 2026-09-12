@@ -29,9 +29,10 @@ use crate::git_cmd::git_stdout_capped;
 use crate::handlers::reset::has_seed;
 use crate::history::{
     if_none_match, read_history_snapshot, representation_etag, require_same_generation,
-    CursorCodec, CursorError, CursorScope, HistoryCursor, RepresentationKind,
+    CursorCodec, CursorError, CursorScope, HistoryCursor, HistorySnapshot, RepresentationKind,
+    SnapshotOrigin,
 };
-use crate::state::{current, current_handle, repo_label, resolve_worktree};
+use crate::state::{current_read_target, repo_label, resolve_worktree};
 
 /// The optional opaque repository selector shared by the read endpoints (M1.03):
 /// `?repo=<worktree-id>` addresses one servable worktree by its opaque id. When
@@ -52,10 +53,7 @@ pub(crate) fn resolve_repo(
     repo: Option<&str>,
 ) -> Result<(PathBuf, bool, Option<RepositoryHandle>), (StatusCode, String)> {
     match repo {
-        None => {
-            let (path, read_only) = current();
-            Ok((path, read_only, current_handle()))
-        }
+        None => Ok(current_read_target()),
         Some(id) => {
             let worktree: WorktreeId = id
                 .parse()
@@ -147,7 +145,15 @@ fn page_limit(raw: Option<usize>) -> usize {
 /// `?t=<millis>` cache-buster to every history read (see `crates/git-vista/
 /// src/api.rs`), and that must never be answered with a 400.
 #[derive(Deserialize)]
+pub(crate) struct HistoryFrameQuery {
+    repo: Option<String>,
+    as_of: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub(crate) struct PageQuery {
+    #[serde(default)]
+    as_of: Option<String>,
     #[serde(default)]
     repo: Option<String>,
     #[serde(default)]
@@ -217,6 +223,16 @@ async fn frame_for_target(
 ) -> Result<Response, (StatusCode, String)> {
     let repo = target.path.as_path();
     let snapshot = read_history_snapshot(repo).await?;
+    frame_from_snapshot(target, snapshot, headers).await
+}
+
+async fn frame_from_snapshot(
+    target: &ResolvedHistoryTarget,
+    snapshot: HistorySnapshot,
+    headers: &HeaderMap,
+) -> Result<Response, (StatusCode, String)> {
+    let repo = target.path.as_path();
+    let historical = snapshot.is_historical();
     let frame = Frame {
         generation: snapshot.generation.clone(),
         refs: snapshot.refs.clone(),
@@ -229,17 +245,20 @@ async fn frame_for_target(
         repo_label: Some(repo_label(repo)),
         repo_id: target.handle.map(|handle| handle.repository.to_string()),
         worktree_id: target.handle.map(|handle| handle.worktree.to_string()),
-        read_only: target.read_only,
-        resettable: !target.read_only && has_seed(repo),
-        repo_url: git_vista_git::github_web_base(repo),
-        remote_web_url: git_vista_git::remote_web_base(repo),
+        read_only: target.read_only || historical,
+        resettable: !historical && !target.read_only && has_seed(repo),
+        repo_url: (!historical)
+            .then(|| git_vista_git::github_web_base(repo))
+            .flatten(),
+        remote_web_url: (!historical)
+            .then(|| git_vista_git::remote_web_base(repo))
+            .flatten(),
     };
     // The combined re-read: the metadata above reads config, not refs, but the
     // repository can still move under a Frame read, and a Frame that advertises
     // a generation no longer current would hand the client a cursor seed for a
     // history that has already gone.
-    let fresh = read_history_snapshot(repo).await?;
-    require_same_generation(&snapshot.generation, &fresh.generation)?;
+    verify_snapshot(target, &snapshot).await?;
 
     let body = serde_json::to_vec(&frame).map_err(history_serialization_failed)?;
     Ok(representation_response(
@@ -255,10 +274,17 @@ async fn frame_for_target(
 pub(crate) async fn frame(
     Extension(codec): Extension<Arc<CursorCodec>>,
     headers: HeaderMap,
-    Query(query): Query<RepoQuery>,
+    Query(query): Query<HistoryFrameQuery>,
 ) -> Result<Response, (StatusCode, String)> {
     let target = resolve_history_target(query.repo.as_deref(), codec.as_ref())?;
-    frame_for_target(&target, &headers).await
+    match query.as_of.as_deref() {
+        None => frame_for_target(&target, &headers).await,
+        Some(token) => {
+            let snapshot =
+                crate::as_of::redeem(&target.path, target.read_only, target.scope, token, &codec)?;
+            frame_from_snapshot(&target, snapshot, &headers).await
+        }
+    }
 }
 
 /// Build one Page response for `target`.
@@ -294,6 +320,20 @@ async fn page_for_target(
     //    both HEAD halves and the canonical shallow set describe one moment.
     let snapshot = read_history_snapshot(repo).await?;
 
+    page_from_snapshot(target, snapshot, cursor, limit, codec, headers, walks).await
+}
+
+/// The single row/edge/stub construction path, regardless of snapshot source.
+async fn page_from_snapshot(
+    target: &ResolvedHistoryTarget,
+    snapshot: HistorySnapshot,
+    cursor: Option<&str>,
+    limit: usize,
+    codec: &CursorCodec,
+    headers: &HeaderMap,
+    walks: &AtomicUsize,
+) -> Result<Response, (StatusCode, String)> {
+    let repo = target.path.as_path();
     // 2. A cursor is authenticated, scope-compared and generation-compared here
     //    — strictly before `walks` moves or Topo opens, so a forged, foreign or
     //    stale cursor costs nothing but an HMAC. Scope mismatch is deliberately
@@ -361,8 +401,7 @@ async fn page_for_target(
     //     that is no longer reachable. Drift takes precedence, so the client is
     //     told to restart rather than shown a phantom corruption.
     if let Err(e) = walk {
-        let fresh = read_history_snapshot(repo).await?;
-        require_same_generation(&snapshot.generation, &fresh.generation)?;
+        verify_snapshot(target, &snapshot).await?;
         eprintln!("git-vista: /api/commits failed walking history: {e}");
         return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
     }
@@ -396,19 +435,27 @@ async fn page_for_target(
     //    lenient posture the commit-detail read takes: the page loses forge
     //    links, it does not lose the history.
     let requested: HashSet<Oid> = rows.iter().map(|row| row.commit.id.clone()).collect();
-    match git_vista_git::remote_membership(repo, &requested) {
+    let membership = if snapshot.is_historical() {
+        captured_remote_membership(repo, &snapshot, &requested)
+    } else {
+        git_vista_git::remote_membership(repo, &requested)
+    };
+    match membership {
         Ok(found) => {
             for row in &mut rows {
                 row.on_remote = found.contains(&row.commit.id);
             }
+        }
+        Err(e) if snapshot.is_historical() => {
+            verify_snapshot(target, &snapshot).await?;
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
         }
         Err(e) => eprintln!("git-vista: /api/commits could not scan remotes: {e}"),
     }
 
     // The combined re-read on success: a ref that moved while we walked would
     // otherwise let this page splice two histories together.
-    let fresh = read_history_snapshot(repo).await?;
-    require_same_generation(&snapshot.generation, &fresh.generation)?;
+    verify_snapshot(target, &snapshot).await?;
 
     // 7. Sign the next absolute row under the same target scope and the stable
     //    generation. A walk that ended before the window filled has no next
@@ -493,6 +540,20 @@ pub(crate) async fn commits(
     // own counter directly. Production still exercises the exact same counted
     // code path — nothing about the pipeline's behaviour changes here.
     let walks = AtomicUsize::new(0);
+    if let Some(token) = query.as_of.as_deref() {
+        let snapshot =
+            crate::as_of::redeem(&target.path, target.read_only, target.scope, token, &codec)?;
+        return page_from_snapshot(
+            &target,
+            snapshot,
+            query.cursor.as_deref(),
+            limit,
+            &codec,
+            &headers,
+            &walks,
+        )
+        .await;
+    }
     page_for_target(
         &target,
         query.cursor.as_deref(),
@@ -502,6 +563,44 @@ pub(crate) async fn commits(
         &walks,
     )
     .await
+}
+
+/// A live snapshot proves consistency by comparing live refs. A captured one
+/// proves it by checking its signed fold; neither check can stand in for the other.
+async fn verify_snapshot(
+    target: &ResolvedHistoryTarget,
+    snapshot: &HistorySnapshot,
+) -> Result<(), (StatusCode, String)> {
+    match &snapshot.origin {
+        SnapshotOrigin::Live => {
+            let fresh = read_history_snapshot(&target.path).await?;
+            require_same_generation(&snapshot.generation, &fresh.generation)
+        }
+        SnapshotOrigin::Captured { fold_generation } => {
+            crate::as_of::require_current_fold(&target.path, target.read_only, fold_generation)
+        }
+    }
+}
+
+fn captured_remote_membership(
+    repo: &Path,
+    snapshot: &HistorySnapshot,
+    requested: &HashSet<Oid>,
+) -> Result<HashSet<Oid>, RepoError> {
+    let tips: Vec<_> = snapshot
+        .tips
+        .iter()
+        .filter(|tip| tip.full_ref_name.starts_with("refs/remotes/"))
+        .map(|tip| (tip.full_ref_name.clone(), tip.object_id.clone()))
+        .collect();
+    let mut found = HashSet::new();
+    walk_history_topo(repo, &tips, &snapshot.shallow_boundaries, |commit| {
+        if requested.contains(&commit.id) {
+            found.insert(commit.id);
+        }
+        ControlFlow::Continue(())
+    })?;
+    Ok(found)
 }
 
 /// Full detail for one commit (Phase 10 — the detail panel): the whole message
@@ -1220,3 +1319,7 @@ mod routing_suite;
 
 #[cfg(test)]
 mod status_suite;
+
+#[cfg(test)]
+#[path = "read/as_of_suite.rs"]
+mod as_of_suite;

@@ -8,12 +8,11 @@
 //! way through. The interesting logic lives in `git_vista_core::activity`
 //! and `crate::journal`.
 //!
-//! Snapshot upkeep happens in `activity_feed` — and only there — because
-//! detection and bookkeeping must be one atomic step: whoever rewrites the
-//! snapshot must first synthesize deletion events for branches that vanished
-//! since the last one, or those deletions are silently forgotten. Keeping a
-//! single writer makes that invariant easy to hold (which is why `undoables`
-//! reads the same sources but leaves the snapshot alone).
+//! Snapshot upkeep is centralized in `collect_activity_feed`, shared by feed
+//! paging and historical redemption. Whoever rewrites the branch snapshot
+//! must first synthesize deletion events for branches that vanished since the
+//! last observation. `undoables` reads the same sources without upkeep. This
+//! is one implementation of that ordering, not a lock against concurrent reads.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -64,7 +63,7 @@ struct ActivityCursor {
 }
 
 /// The server's concrete activity-page response.
-type Page = ActivityPage<ActivityEvent>;
+type Page = ActivityPage<git_vista_protocol::ActivityObservation<ActivityEvent>>;
 
 /// Unix seconds now; the timestamp journaled onto synthesized events.
 pub fn now_secs() -> i64 {
@@ -79,9 +78,8 @@ pub async fn activity_feed(
     Extension(codec): Extension<Arc<CursorCodec>>,
     Query(params): Query<ActivityParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let (repo, read_only) = crate::state::current();
+    let (repo, read_only, handle) = crate::state::current_read_target();
     let canonical = repo.canonicalize().unwrap_or_else(|_| repo.clone());
-    let handle = crate::state::current_handle();
     let scope = codec.scope_for_target(handle.as_ref(), &canonical);
     let page = activity_page_for_target(&repo, read_only, scope, &params, codec.as_ref())?;
     let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
@@ -92,7 +90,7 @@ pub async fn activity_feed(
 /// windows. Paging is applied only after this returns: passing `usize::MAX`
 /// here is the mechanism that makes the old 500-event total ceiling disappear
 /// from both the query path and the cursor path.
-fn collect_activity_feed(
+pub(crate) fn collect_activity_feed(
     repo: &Path,
     read_only: bool,
 ) -> Result<Vec<ActivityEvent>, (StatusCode, String)> {
@@ -151,6 +149,7 @@ fn collect_activity_feed(
                             head: None,
                             tags: None,
                             remotes: None,
+                            shallow: None,
                             // One event, its own capture: this anchors no
                             // batch (#485).
                             batch: None,
@@ -202,7 +201,9 @@ fn collect_activity_feed(
 /// usable only while this token still matches; any head insertion, deletion,
 /// re-fold, changed undo hint, or changed ref capture refuses the cursor with
 /// 409 instead of applying an offset to a different sequence.
-fn activity_generation(feed: &[ActivityEvent]) -> Result<GenerationToken, (StatusCode, String)> {
+pub(crate) fn activity_generation(
+    feed: &[ActivityEvent],
+) -> Result<GenerationToken, (StatusCode, String)> {
     let bytes = serde_json::to_vec(feed).map_err(|e| {
         eprintln!("git-vista: /api/activity could not serialize its snapshot: {e}");
         (
@@ -220,7 +221,7 @@ fn activity_generation(feed: &[ActivityEvent]) -> Result<GenerationToken, (Statu
 }
 
 /// Build one page against an exact folded snapshot.
-fn activity_page_for_target(
+pub(crate) fn activity_page_for_target(
     repo: &Path,
     read_only: bool,
     scope: CursorScope,
@@ -281,10 +282,26 @@ fn activity_page_for_target(
         None
     };
 
-    Ok(Page {
-        events: feed[start..end].to_vec(),
-        cursor,
-    })
+    let mut objects = crate::as_of::ObjectAvailability::default();
+    let events = feed[start..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, event)| {
+            Ok(git_vista_protocol::ActivityObservation {
+                event: event.clone(),
+                as_of: crate::as_of::availability(
+                    repo,
+                    event,
+                    start + offset,
+                    scope,
+                    &generation,
+                    codec,
+                    &mut objects,
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>, (StatusCode, String)>>()?;
+    Ok(Page { events, cursor })
 }
 
 fn invalid_activity_cursor() -> (StatusCode, String) {

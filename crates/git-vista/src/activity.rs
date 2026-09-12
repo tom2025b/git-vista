@@ -519,12 +519,38 @@ fn tag_row_view(row: TagRow, nerd_icons: RwSignal<bool>) -> impl IntoView {
 /// button lives inside it, and a button nested in a button is invalid HTML
 /// that browsers un-nest unpredictably.
 fn activity_row(
-    event: ActivityEvent,
+    observation: git_vista_protocol::ActivityObservation<ActivityEvent>,
     nerd_icons: RwSignal<bool>,
     features: Features,
     read_only: bool,
 ) -> impl IntoView {
-    let Features { dialogs, shell, .. } = features;
+    let Features {
+        dialogs,
+        shell,
+        graph,
+        status,
+        ..
+    } = features;
+    let event = observation.event;
+    let as_of = match observation.as_of {
+        git_vista_protocol::AsOfAvailability::Available { token } => {
+            let time = event.time;
+            let repo = status_state::repo(status);
+            view! {
+                <button class="act-undo act-as-of" on:click=move |ev: web_sys::MouseEvent| {
+                    ev.stop_propagation();
+                    shell.close_activity();
+                    shell.close_confirm();
+                    shell.close_commit_dialog();
+                    shell.close_menu();
+                    graph.update(|g| g.show_as_of(token.clone(), time, repo.clone()));
+                }>"View graph at this activity"</button>
+            }.into_view()
+        }
+        git_vista_protocol::AsOfAvailability::Unavailable { reason } => view! {
+            <span class="act-as-of-unavailable">{format!("Historical view unavailable: {reason}")}</span>
+        }.into_view(),
+    };
     let ic = icon_set(nerd_icons.get_untracked());
     let glyph = kind_glyph(ic, event.kind);
     let when = time_ago(event.time);
@@ -608,6 +634,7 @@ fn activity_row(
                 {source}
                 <span class="act-when">{when}</span>
             </span>
+            <span class="act-meta">{as_of}</span>
         </span>
         {undo_btn}
     };
