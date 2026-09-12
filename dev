@@ -917,10 +917,13 @@ cmd_worktree() {
   fi
 
   local name; name="$(basename "$path")"
-  if mountpoint -q /mnt/cargo-targets 2>/dev/null; then
+  if [[ -e "$path/target" || -L "$path/target" ]]; then
+    echo "dev: worktree ready at $path"
+    echo "dev: NOTE: $path/target already exists (from checkout) — leaving it alone, will build locally on the system disk."
+  elif mountpoint -q /mnt/cargo-targets 2>/dev/null; then
     local dest="/mnt/cargo-targets/targets/$name"
     mkdir -p "$dest"
-    ln -s "$dest" "$path/target"
+    ln -sT "$dest" "$path/target"
     echo "dev: worktree ready at $path — target/ -> $dest"
   else
     echo "dev: worktree ready at $path"
