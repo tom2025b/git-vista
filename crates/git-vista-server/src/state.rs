@@ -681,6 +681,19 @@ pub(crate) fn current() -> (PathBuf, bool) {
     (g.path.clone(), g.mode == RepoMode::Visualize)
 }
 
+/// Resolve a read's path, mode, and signing identity from one selection snapshot.
+/// A session may switch repositories concurrently; separate `current()` and
+/// `current_handle()` calls could otherwise pair one repository with another's
+/// cursor scope. Degraded read selections deliberately retain a missing handle.
+pub(crate) fn current_read_target() -> (PathBuf, bool, Option<RepositoryHandle>) {
+    let selection = current_snapshot().expect("CURRENT is set at startup");
+    (
+        selection.path,
+        selection.mode == RepoMode::Visualize,
+        selection.handle,
+    )
+}
+
 /// The current selection's path, or `None` when nothing has been selected yet.
 ///
 /// The non-panicking sibling of [`current`]. [`current`] is right for the

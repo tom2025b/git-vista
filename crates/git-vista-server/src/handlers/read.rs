@@ -32,7 +32,7 @@ use crate::history::{
     CursorCodec, CursorError, CursorScope, HistoryCursor, HistorySnapshot, RepresentationKind,
     SnapshotOrigin,
 };
-use crate::state::{current, current_handle, repo_label, resolve_worktree};
+use crate::state::{current_read_target, repo_label, resolve_worktree};
 
 /// The optional opaque repository selector shared by the read endpoints (M1.03):
 /// `?repo=<worktree-id>` addresses one servable worktree by its opaque id. When
@@ -53,10 +53,7 @@ pub(crate) fn resolve_repo(
     repo: Option<&str>,
 ) -> Result<(PathBuf, bool, Option<RepositoryHandle>), (StatusCode, String)> {
     match repo {
-        None => {
-            let (path, read_only) = current();
-            Ok((path, read_only, current_handle()))
-        }
+        None => Ok(current_read_target()),
         Some(id) => {
             let worktree: WorktreeId = id
                 .parse()

@@ -44,6 +44,11 @@ repository/worktree binding. The position has a different required field from
 activity and history cursors and denies unknown fields. No second signing
 scheme, durable event ID, or server-held snapshot cache is introduced.
 
+Activity and default-target history reads resolve path, mode, and handle from
+one selection snapshot. A concurrent selection change cannot combine one
+repository's path with another repository's signing scope. Explicit repository
+selectors continue through the existing catalog resolver.
+
 The server authenticates and checks scope before reading repository sources.
 It rebuilds the exact fold, compares its generation, and only then indexes the
 row. A changed fold returns **409**. Invalid, forged, foreign, out-of-range, or
@@ -85,8 +90,9 @@ its current boundaries as historical topology.
 
 The resolved capture must contain HEAD, tags, and remotes, with no truncation
 in any map. HEAD must be attached and consistent with the branch map, detached
-and resolving, or genuinely unborn. Unreadable/unresolvable HEAD and invalid
-ref names or OIDs are explicit refusals. Recorded empty maps and unborn HEAD
+and resolving, or genuinely unborn. Unreadable/unresolvable HEAD, names rejected
+by the existing non-empty/non-option-shaped boundary, and invalid OIDs are
+explicit refusals. Recorded empty maps and unborn HEAD
 remain valid, including a real empty graph.
 
 The existing `walk_history_topo` validates complete commit ancestry, including
@@ -178,7 +184,45 @@ hidden write affordances, the persistent 409 state, and return during a pending
 historical request. Host tests pin mode/epoch transitions independently of DOM
 wiring.
 
-Mutation results and final validation commands are recorded below after the
-committed baseline is exercised.
+Failure-atlas `mutation_check` ran each change in an isolated clone of clean
+commit `0b482178d636e3a95f453c80b4cc0c227a02ffb5`. Every baseline passed;
+every mutant compiled and failed its behavioral assertion, with no timeout or
+infrastructure warning. The runner reported `build_lock: serialised` for every
+leg. The later selection-snapshot fix does not alter either tested mechanism.
+
+| Invariant | Mutation | Atlas record | Result |
+| --- | --- | --- | --- |
+| Stale fold returns 409 | Remove the generation comparison | 659 | caught; stale selector served a snapshot |
+| Stale fold returns 409 | Apply comparison only when the selected index is greater than zero | 660 | caught; stale head-row selector served a snapshot |
+| Incomplete capture gets no token | Bypass the replayability gate | 661 | caught; missing tags received a token |
+| Incomplete capture gets no token | Check branch truncation but ignore tag/remote truncation | 662 | caught; truncated tags received a token |
+
+The stale-fold mutations use
+`as_of_stale_fold_returns_409_for_head_and_in_place_changes`; the eligibility
+mutations use `as_of_incomplete_observations_never_receive_a_token`. These are
+acceptance tests against the production feed and signer, with positive complete
+capture controls.
+
+Validation commands (all build/test commands use the existing target directory):
+
+```sh
+buildlock cargo test --workspace --no-fail-fast
+buildlock cargo fmt --all -- --check
+buildlock cargo clippy --workspace --all-targets -- -D warnings
+buildlock cargo clippy -p git-vista --target wasm32-unknown-unknown --all-targets -- -D warnings
+buildlock cargo build -p git-vista-server -p git-vista-fixtures
+NO_COLOR=true buildlock trunk build --config crates/git-vista/Trunk.toml
+ci/browser/run.sh --config ../../crates/git-vista/tests/as_of.playwright.config.mjs
+```
+
+The final workspace run passed 3,548 tests, with 23 explicitly ignored.
+Formatting and both strict Clippy passes were clean. All three browser
+scenarios passed.
+
+The browser command uses the existing harness after its pinned dependencies are
+installed with `npm ci --prefix ci/browser`. Its three real-browser scenarios
+are intentionally kept in the issue's allowed `crates/git-vista/tests` tree;
+the dedicated config makes the reproduction command explicit. The rendered
+historical banner and graph were also inspected visually.
 
 **Signed:** codex · 2026-09-12

@@ -160,8 +160,8 @@ fn captured_snapshot(event: &ActivityEvent) -> Result<HistorySnapshot, AsOfUnava
         ("refs/tags/", RefKind::Tag, &tags.entries),
     ] {
         for (name, target) in entries {
-            // The branch grammar is the same safe ref suffix grammar used for
-            // tag/remote short names; no ref is ever looked up by this name.
+            // Apply the existing non-empty, non-option-shaped name boundary.
+            // Traversal uses only the captured OID, never a lookup by this name.
             BranchName::new(name.as_str()).map_err(|_| AsOfUnavailable::InvalidCapture)?;
             let target = oid(target)?;
             refs.push(GitRef {

@@ -78,9 +78,8 @@ pub async fn activity_feed(
     Extension(codec): Extension<Arc<CursorCodec>>,
     Query(params): Query<ActivityParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let (repo, read_only) = crate::state::current();
+    let (repo, read_only, handle) = crate::state::current_read_target();
     let canonical = repo.canonicalize().unwrap_or_else(|_| repo.clone());
-    let handle = crate::state::current_handle();
     let scope = codec.scope_for_target(handle.as_ref(), &canonical);
     let page = activity_page_for_target(&repo, read_only, scope, &params, codec.as_ref())?;
     let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
