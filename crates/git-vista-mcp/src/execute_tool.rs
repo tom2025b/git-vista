@@ -177,14 +177,15 @@ pub(crate) fn call_execute_tool_live(
     args: &serde_json::Value,
     session: &mut Option<Session>,
 ) -> Option<Result<serde_json::Value, ToolError>> {
+    let endpoint = crate::mcp_endpoint();
     call_execute_tool(
         name,
         args,
         session,
         &mut |path, body, cookie, csrf, key| {
-            http::post_json_idempotent(path, body, Some(cookie), Some(csrf), key)
+            http::post_json_idempotent_at(&endpoint, path, body, Some(cookie), Some(csrf), key)
         },
-        &mut auth::authenticate,
+        &mut || auth::authenticate_at(&endpoint),
     )
 }
 

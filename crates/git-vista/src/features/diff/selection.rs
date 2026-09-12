@@ -84,6 +84,8 @@ use git_vista_protocol::{
     FileSelection, HunkLines, HunkRef, PatchPlan, SelectionShape, StageDirection,
 };
 
+use crate::features::a11y::focus::FocusMove;
+
 use super::core::CompleteHunkLines;
 
 /// One file's selection state: each selected hunk, either whole or narrowed
@@ -369,6 +371,152 @@ pub fn drag_range(start: usize, current: usize) -> std::ops::RangeInclusive<usiz
         start..=current
     } else {
         current..=start
+    }
+}
+
+/// Keyboard access to one changed line inside a hunk, without taking arrow
+/// keys away from #210's header-level [`GraphFocus`] (#770).
+///
+/// ## The design question #770 named, and the answer this type is
+///
+/// #357 gave every hunk header a Shift+Enter/Space shortcut
+/// (`select_all_in_hunk`) but left plain keyboard access to *one specific
+/// line* unwired, precisely because it "would need its own roving focus
+/// nested inside the hunk-level one #210 already owns" (see this module's
+/// top-level doc and `staging_view.rs`'s). Both the hunk-header list and a
+/// hunk's own changed-line list are naturally arrow-key-navigated collections,
+/// and only one input event stream exists to drive both.
+///
+/// `gv-tui`'s `panes/staging.rs` (the issue's own named prior art) sidesteps
+/// this by *flattening* file/hunk/line into a single list with one cursor —
+/// exactly right for a terminal UI where the whole pane is one column and
+/// every row performs the same "act on this row now" gesture immediately.
+/// The web staging view does not share that shape: hunk headers page through
+/// this whole diff at a stable elevation while lines are nested markup
+/// *inside* each header's own patch block, `select_all_in_hunk` already
+/// treats "the hunk" and "the changed lines in the hunk" as two distinct
+/// granularities worth their own affordances (not one flattened list a user
+/// arrows straight through), and flattening would also turn *every* context
+/// line into a stop a keyboard user has to tab past to reach the next hunk
+/// header — a regression #210 never had.
+///
+/// So this type takes the **nested focus scope** resolution instead, the one
+/// `acceptance.arrow_key_sharing_resolved` names: ArrowUp/ArrowDown always
+/// belong to exactly one active scope at a time, never both, so the two
+/// schemes never fight over the same keypress. `ArrowRight` on a hunk header
+/// drills into that hunk's line scope (mirrors the WAI-ARIA treegrid pattern:
+/// Right expands/enters a nested level, Left collapses/exits it); while
+/// engaged, ArrowUp/ArrowDown/Home/End move `LineFocus`'s own cursor among
+/// that hunk's changed lines only (`GraphFocus` does not move, is not even
+/// consulted); `ArrowLeft` or `Escape` exits back to the header, which
+/// resumes exactly where #210 left it, never reset. Enter/Space acts on
+/// whichever scope currently holds the arrows: a bare header press still
+/// means `toggle_hunk` (unchanged from #357), a press while a line is
+/// drilled into means `toggle_line` on that one line — genuinely distinct
+/// from both `toggle_hunk` and Shift+Activate's whole-hunk
+/// `select_all_in_hunk`.
+///
+/// ## Why a separate type instead of extending [`GraphFocus`]
+///
+/// `GraphFocus` is deliberately a flat, single-scope model (see its own doc)
+/// reused identically by the canvas, blame rows, and the hunk-header list
+/// itself — bolting a second, hunk-scoped cursor onto it would make every
+/// other caller carry state that means nothing to them. `LineFocus` is
+/// standalone, holds only the hunk index it is drilled into (`None` when not
+/// engaged) plus a line cursor, and a caller drives it with the same
+/// [`FocusMove`] vocabulary `GraphFocus::mv` already uses — so `Home`/`End`
+/// land where a caller of that type already expects, without this type
+/// needing to know anything about rows, DOM, or wasm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LineFocus {
+    /// The flat hunk index (`GraphFocus`'s own index space, matching
+    /// `hunks_by_flat_idx` in `staging_view.rs`) currently drilled into.
+    /// `None` means arrow keys belong entirely to the header-level roving
+    /// focus — the default, and where `exit` returns to.
+    hunk: Option<usize>,
+    /// 0-based index into that hunk's *changed-line* list — the same
+    /// coordinate space `select_all_in_hunk`'s caller already builds
+    /// (`changed_by_hunk` in `staging_view.rs`), not a raw patch-line offset
+    /// and not `HunkLines`' own line-index space either.
+    line: usize,
+}
+
+impl LineFocus {
+    /// Not drilled into any hunk yet — the state every fresh staging view
+    /// starts in, same as `GraphFocus::new`'s `engaged: false`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether a line, rather than the header list, currently owns arrow
+    /// keys.
+    pub fn is_engaged(&self) -> bool {
+        self.hunk.is_some()
+    }
+
+    /// The `(hunk_index, line_index)` currently focused, or `None` when not
+    /// drilled into any hunk.
+    pub fn active(&self) -> Option<(usize, usize)> {
+        self.hunk.map(|h| (h, self.line))
+    }
+
+    /// `ArrowRight` on hunk `hunk`'s header: drill into its line scope,
+    /// landing on its first changed line. Refuses to engage (returns
+    /// `false`, leaves state untouched) when `changed_len == 0` — a hunk
+    /// with nothing addable/removable (pure-context, or the parser found
+    /// nothing) has no line for this scope to represent, and `active()`
+    /// returning `Some` with no real line to point at would be a lie a
+    /// caller could try to render.
+    pub fn enter(&mut self, hunk: usize, changed_len: usize) -> bool {
+        self.enter_at(hunk, 0, changed_len)
+    }
+
+    /// A pointer landing on a changed-line checkbox enters at that exact
+    /// ordinal. Invalid ordinals (including an empty hunk) leave state alone.
+    pub fn enter_at(&mut self, hunk: usize, ordinal: usize, changed_len: usize) -> bool {
+        if ordinal >= changed_len {
+            return false;
+        }
+        self.hunk = Some(hunk);
+        self.line = ordinal;
+        true
+    }
+
+    /// `ArrowLeft` or `Escape` while engaged: hand arrow keys back to the
+    /// header-level roving focus. That focus is a separate `GraphFocus`
+    /// this type never touches, so it resumes at whatever hunk it already
+    /// held — nothing here moves it or needs to know where it is.
+    pub fn exit(&mut self) {
+        self.hunk = None;
+        self.line = 0;
+    }
+
+    /// Move the line cursor within the currently-drilled-into hunk's
+    /// `changed_len` lines. Clamped at both ends, never wraps — the same
+    /// end-of-list policy `GraphFocus::mv` uses, so a caller already
+    /// familiar with that type's `Home`/`End` behaviour gets the same shape
+    /// here. A no-op returning `None` when nothing is engaged (arrow keys
+    /// at the header level are not this type's concern). Exits and returns
+    /// `None` when the hunk has no changed lines (defensive: a caller should not
+    /// reach this with `changed_len == 0` while engaged, since `enter`
+    /// refuses to engage on an empty hunk, but a stale caller passing a
+    /// smaller `changed_len` than it entered with — e.g. after a diff
+    /// refresh — must not panic or leave `line` pointing past the end).
+    pub fn mv(&mut self, dir: FocusMove, changed_len: usize) -> Option<usize> {
+        self.hunk?;
+        if changed_len == 0 {
+            self.exit();
+            return None;
+        }
+        let last = changed_len - 1;
+        self.line = match dir {
+            FocusMove::Prev => self.line.saturating_sub(1),
+            FocusMove::Next => (self.line + 1).min(last),
+            FocusMove::First => 0,
+            FocusMove::Last => last,
+        }
+        .min(last);
+        Some(self.line)
     }
 }
 
@@ -709,5 +857,105 @@ diff --git a/a.rs b/a.rs
         assert_eq!(drag_range(2, 5), 2..=5);
         assert_eq!(drag_range(5, 2), 2..=5);
         assert_eq!(drag_range(3, 3), 3..=3);
+    }
+
+    #[test]
+    fn line_focus_starts_disengaged() {
+        let f = LineFocus::new();
+        assert!(!f.is_engaged());
+        assert_eq!(f.active(), None);
+    }
+
+    #[test]
+    fn line_focus_enter_lands_on_the_first_changed_line() {
+        let mut f = LineFocus::new();
+        assert!(f.enter(2, 4));
+        assert!(f.is_engaged());
+        assert_eq!(f.active(), Some((2, 0)));
+    }
+
+    #[test]
+    fn line_focus_enter_refuses_a_hunk_with_no_changed_lines() {
+        let mut f = LineFocus::new();
+        assert!(!f.enter(2, 0));
+        assert!(
+            !f.is_engaged(),
+            "a hunk with nothing addable/removable has no line for this \
+             scope to point at"
+        );
+        assert_eq!(f.active(), None);
+    }
+
+    #[test]
+    fn line_focus_pointer_entry_retargets_the_hunk_and_exact_ordinal() {
+        let mut f = LineFocus::new();
+        assert!(f.enter_at(2, 3, 5));
+        assert_eq!(f.active(), Some((2, 3)));
+        assert_eq!(f.mv(FocusMove::Prev, 5), Some(2));
+        assert!(f.enter_at(7, 1, 3));
+        assert_eq!(f.active(), Some((7, 1)));
+        assert_eq!(f.mv(FocusMove::Next, 3), Some(2));
+        assert!(!f.enter_at(8, 3, 3));
+        assert!(!f.enter(8, 0));
+        assert_eq!(f.active(), Some((7, 2)));
+    }
+
+    #[test]
+    fn line_focus_move_exits_when_the_hunk_has_no_changed_lines() {
+        let mut f = LineFocus::new();
+        assert!(f.enter_at(2, 3, 5));
+        assert_eq!(f.mv(FocusMove::Next, 0), None);
+        assert!(!f.is_engaged());
+        assert_eq!(f.active(), None);
+    }
+
+    #[test]
+    fn line_focus_exit_returns_control_to_the_header_and_resets_the_cursor() {
+        let mut f = LineFocus::new();
+        f.enter(1, 3);
+        f.mv(FocusMove::Next, 3);
+        f.exit();
+        assert!(!f.is_engaged());
+        assert_eq!(f.active(), None);
+        // Re-entering starts fresh at line 0, not wherever it was left.
+        f.enter(1, 3);
+        assert_eq!(f.active(), Some((1, 0)));
+    }
+
+    #[test]
+    fn line_focus_mv_is_a_no_op_when_not_engaged() {
+        let mut f = LineFocus::new();
+        assert_eq!(f.mv(FocusMove::Next, 5), None);
+        assert!(!f.is_engaged());
+    }
+
+    #[test]
+    fn line_focus_mv_clamps_at_both_ends_without_wrapping() {
+        let mut f = LineFocus::new();
+        f.enter(0, 3);
+        assert_eq!(f.active(), Some((0, 0)));
+        // Prev at the start stays at the start — it must not wrap to the end.
+        assert_eq!(f.mv(FocusMove::Prev, 3), Some(0));
+        assert_eq!(f.mv(FocusMove::Next, 3), Some(1));
+        assert_eq!(f.mv(FocusMove::Next, 3), Some(2));
+        // Next at the end stays at the end — it must not wrap to the start.
+        assert_eq!(f.mv(FocusMove::Next, 3), Some(2));
+        assert_eq!(f.mv(FocusMove::First, 3), Some(0));
+        assert_eq!(f.mv(FocusMove::Last, 3), Some(2));
+    }
+
+    #[test]
+    fn line_focus_mv_does_not_move_the_header_scope() {
+        // The whole point of the nested-scope design: entering a hunk's line
+        // scope and moving within it must leave the *hunk index* untouched —
+        // only the line cursor moves. If `mv` ever changed which hunk is
+        // active, a caller re-reading `active().0` after a move would see
+        // the wrong hunk, silently corrupting which patch the next
+        // `toggle_line` call addresses.
+        let mut f = LineFocus::new();
+        f.enter(7, 4);
+        f.mv(FocusMove::Next, 4);
+        f.mv(FocusMove::Next, 4);
+        assert_eq!(f.active(), Some((7, 2)), "hunk index must stay 7");
     }
 }
