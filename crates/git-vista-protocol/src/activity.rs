@@ -18,6 +18,74 @@ pub struct ActivityPage<E> {
     pub cursor: Option<String>,
 }
 
+/// An activity row's optional historical selector. Flattening preserves the
+/// existing event fields for clients that do not know about as-of viewing.
+/// This is response-only: tokens are never journaled or part of the fold hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityObservation<E> {
+    #[serde(flatten)]
+    pub event: E,
+    #[serde(default)]
+    pub as_of: AsOfAvailability,
+}
+
+impl<E> std::ops::Deref for ActivityObservation<E> {
+    type Target = E;
+    fn deref(&self) -> &E {
+        &self.event
+    }
+}
+
+/// Availability is a sum type: a refusal can never also carry a token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum AsOfAvailability {
+    Available { token: String },
+    Unavailable { reason: AsOfUnavailable },
+}
+
+impl Default for AsOfAvailability {
+    fn default() -> Self {
+        Self::Unavailable {
+            reason: AsOfUnavailable::CaptureNotRecorded,
+        }
+    }
+}
+
+/// Why one observation cannot be mounted. Missing fields are facts we do not
+/// possess, distinct from an explicitly recorded empty map or unborn HEAD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AsOfUnavailable {
+    CaptureNotRecorded,
+    CaptureFailed,
+    IncompleteCapture,
+    TruncatedCapture,
+    ShallowStateNotRecorded,
+    ShallowRepository,
+    UnreadableHead,
+    UnresolvableHead,
+    InvalidCapture,
+    MissingCommitObjects,
+}
+
+impl std::fmt::Display for AsOfUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::CaptureNotRecorded => "No complete journal observation was recorded for this activity.",
+            Self::CaptureFailed => "The ref capture failed.",
+            Self::IncompleteCapture => "This capture did not record HEAD, tags, and remote refs.",
+            Self::TruncatedCapture => "This capture contains a truncated ref map.",
+            Self::ShallowStateNotRecorded => "Shallow status was not recorded for this capture.",
+            Self::ShallowRepository => "Historical shallow boundaries are not recorded; this shallow history cannot be replayed.",
+            Self::UnreadableHead => "HEAD could not be read at capture time.",
+            Self::UnresolvableHead => "HEAD did not resolve at capture time.",
+            Self::InvalidCapture => "The captured refs or HEAD are inconsistent or invalid.",
+            Self::MissingCommitObjects => "A commit object required by this capture is missing or unreadable.",
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

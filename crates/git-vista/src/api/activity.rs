@@ -4,7 +4,7 @@
 //! Split out of the former monolithic `api.rs`.
 
 use git_vista_core::activity::{ActivityEvent, UndoAction, Undoable};
-use git_vista_protocol::{operation::IdempotencyKey, ActivityPage};
+use git_vista_protocol::{operation::IdempotencyKey, ActivityObservation, ActivityPage};
 
 use super::{
     network_error, receipt, refuse_if_offline, refuse_if_visualize, req_get, send_write_with_key,
@@ -18,7 +18,9 @@ use super::{
 /// ceiling can never become a silent 500-event history ceiling again. A stale
 /// cursor is a server error and restarts on the panel's next refresh rather
 /// than splicing two different live snapshots together.
-pub async fn fetch_activity(limit: usize) -> Result<Vec<ActivityEvent>, String> {
+pub async fn fetch_activity(
+    limit: usize,
+) -> Result<Vec<ActivityObservation<ActivityEvent>>, String> {
     let mut events = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
@@ -37,7 +39,7 @@ pub async fn fetch_activity(limit: usize) -> Result<Vec<ActivityEvent>, String> 
 async fn fetch_activity_page(
     limit: usize,
     cursor: Option<&str>,
-) -> Result<ActivityPage<ActivityEvent>, String> {
+) -> Result<ActivityPage<ActivityObservation<ActivityEvent>>, String> {
     let cursor = cursor
         .map(|value| format!("&cursor={value}"))
         .unwrap_or_default();
@@ -47,7 +49,7 @@ async fn fetch_activity_page(
     );
     let resp = req_get(&url).send().await.map_err(network_error)?;
     if resp.ok() {
-        resp.json::<ActivityPage<ActivityEvent>>()
+        resp.json::<ActivityPage<ActivityObservation<ActivityEvent>>>()
             .await
             .map_err(|e| e.to_string())
     } else {

@@ -18,3 +18,26 @@ pub fn suppress(moved: StoredValue<bool>, ev: web_sys::MouseEvent) {
         ev.prevent_default();
     }
 }
+
+// The API reads the same graph signal synchronously, including while a new
+// historical seed is loading. There is no one-effect delay in the write gate.
+thread_local! {
+    static VIEW_GUARD: std::cell::Cell<Option<leptos::RwSignal<super::core::GraphCore>>> = const { std::cell::Cell::new(None) };
+}
+
+pub fn install_view_guard(graph: leptos::RwSignal<super::core::GraphCore>) {
+    VIEW_GUARD.with(|slot| slot.set(Some(graph)));
+    leptos::on_cleanup(|| VIEW_GUARD.with(|slot| slot.set(None)));
+}
+
+pub fn refuse_if_historical() -> Result<(), String> {
+    use leptos::SignalGetUntracked;
+    if VIEW_GUARD.with(|slot| {
+        slot.get()
+            .is_some_and(|g| g.get_untracked().view().is_historical())
+    }) {
+        Err("Historical view is view only. Return to live before making changes.".into())
+    } else {
+        Ok(())
+    }
+}

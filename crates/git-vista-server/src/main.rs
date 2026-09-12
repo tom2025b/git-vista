@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 // the Activity Log / Contextual Undo feature. `journal` owns the on-disk state
 // under `.git/git-vista/`; `activity` owns `GET /api/activity`.
 mod activity;
+mod as_of;
 // M4.31 (#84): the conflict model and scan used by the conflict handlers and
 // the planner's conflict, sequence, and stash execution paths.
 mod conflicts;

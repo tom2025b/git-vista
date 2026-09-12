@@ -36,15 +36,66 @@ pub type Page = HistoryPage<GraphRow, Edge, FrameStub>;
 /// spec D3): the same generation means nothing moved, so nothing re-reads.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct GraphCore {
+    view: HistoryView,
     epoch: u64,
     generation: Option<GenerationToken>,
 }
 
+/// The graph's source is pinned for an entire epoch, including page requests.
+/// Refresh and background invalidations can never turn a historical view live.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub enum HistoryView {
+    #[default]
+    Live,
+    AsOf {
+        token: String,
+        time: i64,
+        repo: Option<String>,
+    },
+}
+
+impl HistoryView {
+    pub fn is_historical(&self) -> bool {
+        matches!(self, Self::AsOf { .. })
+    }
+
+    pub fn token(&self) -> Option<&str> {
+        match self {
+            Self::Live => None,
+            Self::AsOf { token, .. } => Some(token),
+        }
+    }
+
+    pub fn repo(&self) -> Option<&str> {
+        match self {
+            Self::Live => None,
+            Self::AsOf { repo, .. } => repo.as_deref(),
+        }
+    }
+}
+
 impl GraphCore {
+    pub fn view(&self) -> &HistoryView {
+        &self.view
+    }
+
+    pub fn show_as_of(&mut self, token: String, time: i64, repo: Option<String>) {
+        self.view = HistoryView::AsOf { token, time, repo };
+        self.generation = None;
+        self.force_bump();
+    }
+
+    pub fn return_to_live(&mut self) {
+        self.view = HistoryView::Live;
+        self.generation = None;
+        self.force_bump();
+    }
+
     /// Start at epoch 0, already at `generation` — the seed state once the first
     /// Frame has landed and reported a generation.
     pub fn at_generation(generation: &str) -> Self {
         Self {
+            view: HistoryView::Live,
             epoch: 0,
             generation: Some(GenerationToken::new(generation).expect("valid generation token")),
         }
@@ -70,6 +121,9 @@ impl GraphCore {
     /// `InvalidateScope::Everything` are this core's business; anything else is
     /// silently `NoChange` — the invalidation was never addressed to it.
     pub fn on_invalidate(&mut self, inv: &Invalidate) -> Applied {
+        if self.view.is_historical() {
+            return Applied::NoChange;
+        }
         if !matches!(
             inv.scope,
             InvalidateScope::Graph | InvalidateScope::Everything

@@ -118,6 +118,10 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     "src/handlers/forge/tests.rs",
     "src/handlers/read/content_suite.rs",
     "src/handlers/read/graph_suite.rs",
+    // #136: cfg(test)-only fixtures for capture/token and shared graph replay.
+    // Both files construct only `git` commands inside disposable repositories.
+    "src/as_of/tests.rs",
+    "src/handlers/read/as_of_suite.rs",
     "src/handlers/read/status_suite.rs",
     // M5.33 (#86): `#[cfg(test)]` fixture setup only — one `git fast-import`
     // spawn per fixture, feeding a stream this file builds, into a fresh

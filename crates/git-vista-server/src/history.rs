@@ -53,6 +53,7 @@ pub(crate) struct HistoryTip {
 /// generation can never describe a different moment than the tips.
 #[derive(Debug)]
 pub(crate) struct HistorySnapshot {
+    pub origin: SnapshotOrigin,
     /// Display refs (short badge names, HEAD first), for the Frame.
     pub refs: Vec<GitRef>,
     /// The checked-out branch's short name; `None` when detached.
@@ -76,8 +77,23 @@ pub(crate) struct HistorySnapshot {
     pub shallow_boundaries: Vec<Oid>,
     /// Traversal seeds, sorted by `(full_ref_name, object_id)`, deduplicated.
     pub tips: Vec<HistoryTip>,
-    /// The snapshot/cursor token: `history-v1:<decimal>`. Not an ETag.
+    /// The snapshot/cursor token, not an ETag. Live reads use `history-v1`;
+    /// historical reads bind this topology to their selected `asof-v1` observation.
     pub generation: GenerationToken,
+}
+
+/// The consistency check follows the source of the snapshot. Historical reads
+/// revalidate their signed activity fold; they never compare with live refs.
+#[derive(Debug)]
+pub(crate) enum SnapshotOrigin {
+    Live,
+    Captured { fold_generation: GenerationToken },
+}
+
+impl HistorySnapshot {
+    pub(crate) fn is_historical(&self) -> bool {
+        matches!(self.origin, SnapshotOrigin::Captured { .. })
+    }
 }
 
 /// Read one consistent [`HistorySnapshot`].
@@ -95,6 +111,13 @@ pub(crate) async fn read_history_snapshot(
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
 
+    snapshot_from_materials(materials)
+}
+
+/// Shared canonicalization for live reads and accepted captured refs.
+pub(crate) fn snapshot_from_materials(
+    materials: git_vista_git::HistoryMaterials,
+) -> Result<HistorySnapshot, (StatusCode, String)> {
     // Canonicalise the shallow set: validate every object id, sort, dedupe.
     // `gix` already rejects malformed lines; the parse here re-checks each id
     // against the core grammar because these become generation fields.
@@ -173,6 +196,7 @@ pub(crate) async fn read_history_snapshot(
     };
 
     Ok(HistorySnapshot {
+        origin: SnapshotOrigin::Live,
         refs: materials.refs,
         head_branch: materials.head_branch,
         head_state,

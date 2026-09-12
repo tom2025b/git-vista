@@ -31,14 +31,15 @@ use leptos::*;
 
 use git_vista_protocol::{check_compatibility, PROTOCOL_VERSION};
 
-use crate::api::{fetch_frame, fetch_page, fetch_protocol, HistoryFetchError};
+use crate::api::{fetch_frame_for_view, fetch_page, fetch_protocol, HistoryFetchError};
 use crate::dialogs;
 use crate::features::a11y::core::GRAPH_REGION_LABEL;
 use crate::features::activity::signals::Activity;
 use crate::features::dialogs::core::Dialog;
 use crate::features::dialogs::signals::Dialogs;
 use crate::features::graph::core::{
-    print_button_copy, Frame, GraphCore, HistoryInvariantError, LoadedHistory, DEFAULT_PAGE_LIMIT,
+    print_button_copy, Frame, GraphCore, HistoryInvariantError, HistoryView, LoadedHistory,
+    DEFAULT_PAGE_LIMIT,
 };
 use crate::features::history::core::{
     phase_for_epoch_bump, promote_seed, seed_retry_still_wanted, SeedPromotion,
@@ -166,8 +167,10 @@ pub struct HistoryUiSignals {
 /// The tag rides on the *result*, not only on the success value: a failure has
 /// to be attributable to an epoch too, or a slow error from a retired epoch
 /// would raise [`HistoryPhase::SeedError`] over an epoch that is still loading.
-async fn load_seed(epoch: u64) -> (u64, Result<HistorySeed, HistorySeedError>) {
-    (epoch, seed_for_epoch(epoch).await)
+async fn load_seed(
+    (epoch, view): (u64, HistoryView),
+) -> (u64, Result<HistorySeed, HistorySeedError>) {
+    (epoch, seed_for_epoch(epoch, view).await)
 }
 
 /// Frame, then page 1 pinned to that Frame's worktree, then the aggregate.
@@ -177,11 +180,18 @@ async fn load_seed(epoch: u64) -> (u64, Result<HistorySeed, HistorySeedError>) {
 /// otherwise splice rows onto refs that no longer describe them. Checking here
 /// means [`LoadedHistory::from_first_page`] can treat its own generation check
 /// as the tautology it is.
-async fn seed_for_epoch(epoch: u64) -> Result<HistorySeed, HistorySeedError> {
-    let frame = fetch_frame().await.map_err(HistorySeedError::Fetch)?;
-    let page = fetch_page(frame.worktree_id.as_deref(), None, DEFAULT_PAGE_LIMIT)
+async fn seed_for_epoch(epoch: u64, view: HistoryView) -> Result<HistorySeed, HistorySeedError> {
+    let frame = fetch_frame_for_view(&view)
         .await
         .map_err(HistorySeedError::Fetch)?;
+    let page = fetch_page(
+        frame.worktree_id.as_deref(),
+        None,
+        DEFAULT_PAGE_LIMIT,
+        &view,
+    )
+    .await
+    .map_err(HistorySeedError::Fetch)?;
     if frame.generation != page.generation {
         return Err(HistorySeedError::Invariant(
             HistoryInvariantError::GenerationMismatch {
@@ -212,6 +222,7 @@ pub fn App() -> impl IntoView {
     // have no generation to compare and call `force_bump` instead, exactly
     // reproducing the old unconditional behaviour for those paths.
     let graph = create_rw_signal(GraphCore::default());
+    crate::features::graph::signals::install_view_guard(graph);
     let refresh = move |_| {
         graph.update(|g| {
             g.force_bump();
@@ -256,7 +267,13 @@ pub fn App() -> impl IntoView {
 
     // Frame + page 1, keyed on the epoch. `create_local_resource` because the
     // fetch future isn't `Send` (wasm).
-    let seed = create_local_resource(move || graph.get().epoch(), load_seed);
+    let seed = create_local_resource(
+        move || {
+            let g = graph.get();
+            (g.epoch(), g.view().clone())
+        },
+        load_seed,
+    );
 
     // Every epoch — Refresh, a post-operation reload, a drift reload — retires
     // the mounted history. Print can't span two generations and "complete" must
@@ -347,6 +364,9 @@ pub fn App() -> impl IntoView {
         let HistoryPhase::SeedError { epoch } = history_ui.phase.get() else {
             return;
         };
+        if graph.get_untracked().view().is_historical() {
+            return;
+        }
         let (expected_epoch, attempts_used) = seed_retry.get_untracked();
         let attempts_used = seed_retry_attempts_for(expected_epoch, epoch, attempts_used);
         let Some(delay) = seed_retry_delay_ms(attempts_used) else {
@@ -776,7 +796,9 @@ pub fn App() -> impl IntoView {
             // not the canvas, so it keeps reporting across the epoch bump a completed
             // write triggers — and so a failure is dismissible app state rather than a
             // native alert the app cannot see.
-            {operations_status_view(operations)}
+            <Show when=move || !graph.get().view().is_historical()>
+                {operations_status_view(operations)}
+            </Show>
             <header class="topbar">
                 // The git mark brands the title (icons.rs). Reactive so the
                 // topbar switches with the icon-style toggle like everything else.
@@ -785,6 +807,7 @@ pub fn App() -> impl IntoView {
                     "git-vista"
                 </h1>
                 <span class="subtitle">"vertical git history — drag to pan, pinch or scroll to zoom"</span>
+                <Show when=move || !graph.get().view().is_historical()>
                 {crate::features::status::detail::view::status_chip_view(features, status_frame, online, nerd_icons)}
                 // #663 (ADR 0094 §7): the change feed's health, drawn
                 // permanently and quietly, beside the working-tree status
@@ -1002,7 +1025,18 @@ pub fn App() -> impl IntoView {
                             "Reset Test Repo"
                         </button>
                     })}
+                </Show>
             </header>
+            {move || match graph.get().view() {
+                HistoryView::Live => None,
+                HistoryView::AsOf { time, .. } => Some(view! {
+                    <div class="historical-banner" role="status"
+                        style="display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;padding:0.75rem 1rem;border-bottom:2px solid #b58900;background:#332b12;color:#fff4ca;flex-shrink:0">
+                        <span>{format!("Historical view · after activity at {} · view only", crate::datetime::local_timestamp(*time))}</span>
+                        <button class="refresh" on:click=move |_| graph.update(|g| g.return_to_live())>"Return to live"</button>
+                    </div>
+                }),
+            }}
             // M2.22b (#242): the offline strip, directly under the topbar in
             // normal flow (see `offline_banner`'s module docs for why it is
             // not a second fixed bar, and why the live region mounts
@@ -1011,6 +1045,7 @@ pub fn App() -> impl IntoView {
             // real boundary is `api.rs`'s `refuse_if_offline()` either way.
             {crate::offline_banner::offline_banner_view(online)}
             // The "Open URL" modal (Phase 12), factored into `dialogs`.
+            <Show when=move || !graph.get().view().is_historical()>
             {dialogs::open_url_view(
                 open_url,
                 clone_url,
@@ -1031,6 +1066,7 @@ pub fn App() -> impl IntoView {
             // the sign-in/protocol screens, over everything else.
             {crate::picker::picker_view(picker_open, mode_for, open_url, clone_url, dialogs_guard, graph)}
             {crate::picker::mode_view(mode_for, picker_open, graph, shell)}
+            </Show>
             {move || {
                 (shell.detail_id().is_some() && sheet.placement().is_sheet()).then(|| view! {
                     <div
@@ -1093,7 +1129,7 @@ pub fn App() -> impl IntoView {
                             // promise a retry the mechanism will not make, or
                             // sit silent through the give-up.
                             let (expected_epoch, attempts_used) = seed_retry.get();
-                            let auto_retry_pending = seed_retry_delay_ms(
+                            let auto_retry_pending = !graph.get().view().is_historical() && seed_retry_delay_ms(
                                 seed_retry_attempts_for(expected_epoch, epoch, attempts_used),
                             )
                             .is_some();
@@ -1102,7 +1138,11 @@ pub fn App() -> impl IntoView {
                                     <span class="nf">{ic.conflict}</span>
                                     {format!(
                                         " {}",
-                                        seed_error_status_copy(&message, auto_retry_pending),
+                                        if graph.get().view().is_historical() {
+                                            format!("Historical view unavailable: {message}")
+                                        } else {
+                                            seed_error_status_copy(&message, auto_retry_pending)
+                                        },
                                     )}
                                     // A retry reachable from the failure itself,
                                     // not only from the topbar. Only once the
@@ -1111,7 +1151,7 @@ pub fn App() -> impl IntoView {
                                     // just invites a second bump to race it
                                     // (the stale-timer guard above absorbs that
                                     // race, but inviting it buys nothing).
-                                    {(!auto_retry_pending).then(|| view! {
+                                    {(!auto_retry_pending && !graph.get().view().is_historical()).then(|| view! {
                                         <button
                                             class="refresh"
                                             on:click=refresh
