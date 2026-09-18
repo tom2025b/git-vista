@@ -33,7 +33,7 @@ use std::collections::VecDeque;
 use git_vista_protocol::change_feed::{
     ChangeFeedHealth, ChangeFeedSnapshot, RefDelta, WatcherLoss,
 };
-use git_vista_protocol::UnixSeconds;
+use git_vista_protocol::{GenerationToken, UnixSeconds};
 
 use crate::features::operations::kind::OperationKind;
 
@@ -663,6 +663,56 @@ fn watcher_loss_reason(loss: &WatcherLoss) -> String {
         }
         WatcherLoss::Unsupported { detail } => format!("not supported on this platform: {detail}"),
         WatcherLoss::Backend { detail } => format!("the watcher backend failed: {detail}"),
+    }
+}
+
+/// What a change-feed snapshot asks of the live graph.
+///
+/// The feed carries the **planner** generation (worktree status folded in).
+/// The graph is pinned to the **history-v1** generation (committed topology
+/// only). Comparing those tokens is the mix `staging.rs` warns "409s forever"
+/// about, so this decision never looks at the feed's generation value. It
+/// only says whether the client must *read history again* and compare that
+/// reading to the Frame already on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveFollowup {
+    /// Blind, or otherwise no reading: do not pretend the graph is current,
+    /// and do not probe. Refresh remains the user's way out.
+    Ignore,
+    /// A real reading arrived. Refetch status, and check whether committed
+    /// history moved before remounting the canvas.
+    CheckHistory,
+}
+
+/// Whether this snapshot should drive a live history check.
+///
+/// `None` generation is [`ChangeFeedHealth::Blind`]: there is no reading, so
+/// there is nothing to follow. Any other snapshot is a reading, including
+/// the first one on a stream (`RefDelta::Unknown`) — the caller still has to
+/// skip a remount when nothing is on screen yet, and still has to compare
+/// history-v1 tokens rather than this feed token.
+pub fn live_followup(snapshot: &ChangeFeedSnapshot) -> LiveFollowup {
+    match snapshot.generation {
+        Some(_) => LiveFollowup::CheckHistory,
+        None => LiveFollowup::Ignore,
+    }
+}
+
+/// Whether the live history Frame disagrees with the Frame already shown.
+///
+/// `displayed` is `None` while the current epoch still has no accepted
+/// Frame (seed loading, or a failed seed). Reloading then would fight the
+/// in-flight seed: either a double remount, or a bump that drops a fetch
+/// that has not landed. The Ready transition re-checks; this function
+/// returning `false` is what makes that deferral honest rather than a
+/// silent "nothing changed".
+pub fn history_requires_reload(
+    displayed: Option<&GenerationToken>,
+    live: &GenerationToken,
+) -> bool {
+    match displayed {
+        None => false,
+        Some(current) => current != live,
     }
 }
 

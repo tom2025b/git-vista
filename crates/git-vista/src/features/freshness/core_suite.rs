@@ -1072,3 +1072,105 @@ fn the_topbar_badge_calls_feed_health_display_rather_than_reimplementing_it() {
         "feed_health_badge.rs no longer calls core::feed_health_display"
     );
 }
+
+// --- #852: the live graph follows committed history, not the planner token -
+
+fn history_gen(s: &str) -> GenerationToken {
+    GenerationToken::new(s).unwrap()
+}
+
+#[test]
+fn a_blind_snapshot_does_not_ask_the_graph_to_follow() {
+    assert_eq!(live_followup(&blind()), LiveFollowup::Ignore);
+}
+
+#[test]
+fn a_reading_asks_the_graph_to_check_history_even_when_it_cannot_name_what_moved() {
+    // First snapshot on a stream, and every snapshot after a gap, carry
+    // RefDelta::Unknown. That is still a reading. Ignoring it would leave
+    // the graph on a page the repository has already left.
+    assert_eq!(
+        live_followup(&unknown_delta("77")),
+        LiveFollowup::CheckHistory
+    );
+    assert_eq!(
+        live_followup(&named("77", &["refs/heads/main"], false)),
+        LiveFollowup::CheckHistory
+    );
+    assert_eq!(
+        live_followup(&named("77", &[], true)),
+        LiveFollowup::CheckHistory,
+        "a worktree-only reading still has to check history: HEAD's symbolic \
+         target is folded into `other` with editor saves, and a checkout \
+         must move the badge"
+    );
+}
+
+#[test]
+fn history_reload_is_a_history_token_comparison_and_never_fires_without_a_displayed_frame() {
+    let live = history_gen("12");
+    assert!(
+        !history_requires_reload(None, &live),
+        "no Frame on this epoch: bumping would fight the in-flight seed"
+    );
+    assert!(!history_requires_reload(Some(&history_gen("12")), &live));
+    assert!(history_requires_reload(Some(&history_gen("11")), &live));
+}
+
+#[test]
+fn the_graph_follow_up_asks_core_and_probes_history_v1_not_the_feed_token() {
+    // cargo test never compiles signals.rs (wasm-only). This is the host
+    // pin that the wrapper asks the two questions above rather than
+    // comparing the planner generation the feed carries to the graph epoch.
+    assert!(
+        FEED_SIGNALS.contains("live_followup("),
+        "the wrapper must ask whether this snapshot is a reading"
+    );
+    assert!(
+        FEED_SIGNALS.contains("history_requires_reload("),
+        "and whether the live history Frame disagrees with the one on screen"
+    );
+    assert!(
+        FEED_SIGNALS.contains("fetch_frame()"),
+        "the check is a history read, not the feed's planner generation"
+    );
+    assert!(
+        !FEED_SIGNALS.contains("on_invalidate("),
+        "on_invalidate compares GraphCore's stored token, which after a write \
+         is the planner generation — mixing it with history-v1 remounts after \
+         every in-app commit"
+    );
+    assert!(
+        FEED_SIGNALS.contains("view().is_historical()"),
+        "a historical as-of view must not be replaced by live history"
+    );
+    assert!(
+        FEED_SIGNALS.contains("status.refetch()"),
+        "worktree-only movement still has to refresh the chip"
+    );
+    const APP: &str = include_str!("../../app/mod.rs");
+    assert!(
+        APP.contains("freshness.follow_graph("),
+        "App must actually install the follow-up — a dead helper in signals.rs \
+         would leave the graph stale with every host test still green"
+    );
+    let follow = FEED_SIGNALS
+        .split("fn probe_history(")
+        .nth(1)
+        .expect("probe_history remains the one async history check");
+    assert!(
+        follow.contains("fetch_frame().await"),
+        "the live Frame is awaited inside the probe"
+    );
+    let bump = follow
+        .rfind("force_bump()")
+        .expect("a history mismatch remounts with force_bump");
+    let second_epoch = follow
+        .rfind("graph.get_untracked().epoch()")
+        .expect("the epoch is re-read after the await");
+    assert!(
+        second_epoch < bump,
+        "a late Frame for a retired epoch must not remount: the live epoch \
+         is read after fetch_frame returns, before force_bump"
+    );
+}
