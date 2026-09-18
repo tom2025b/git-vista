@@ -54,6 +54,14 @@
 
 set -uo pipefail
 
+# A GIT_DIR/GIT_WORK_TREE/GIT_COMMON_DIR exported into this process's
+# environment would redirect every `git rev-parse` below at a repo that
+# has nothing to do with the file being checked, which could make
+# project_key() misidentify an unrelated file as belonging to this repo
+# (2026-09-18 review). Neither is something this hook itself ever sets;
+# clear anything inherited before the first git call.
+unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR
+
 # --------------------------------------------------------------- helpers ---
 
 # project_key <path> — an identity for "which project does this path belong
