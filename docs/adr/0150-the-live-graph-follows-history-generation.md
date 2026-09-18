@@ -88,4 +88,6 @@ In-app writes still remount once through settlement. The follow-up probe then se
 
 The wasm wrapper is not compiled by `cargo test`. The decisions live in `features/freshness/core.rs`. A source census pins that `signals.rs` asks those functions, probes `/api/frame`, skips `on_invalidate`, and re-reads the epoch after the await.
 
+Failure-atlas **678** (history comparison inverted) and **679** (reload with no displayed Frame, which would fight the in-flight seed) are both conclusive `caught`, at disjoint assertions.
+
 **Signed:** grok · 2026-09-18T05:25:00Z
