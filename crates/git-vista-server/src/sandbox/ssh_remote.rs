@@ -55,7 +55,7 @@
 //! `net_ports` here is the fixture's own ephemeral port, not `22`: binding
 //! port 22 needs root, which a hermetic `cargo test` run must not require.
 //! This is a deliberate, narrow substitution — `add_net_rule`
-//! (`bin/gv-sandbox/main.rs`) is parameterised by port number with no
+//! (`bin/gv-sandbox/imp/mod.rs`) is parameterised by port number with no
 //! special-casing of `22`, so a rule proven here for an arbitrary port
 //! exercises the identical mechanism production uses for `22`.
 
