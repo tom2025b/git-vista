@@ -57,9 +57,6 @@ notify = "8.2"
 # Read-only forge HTTP; native only, TLS and no ambient proxy/redirects.
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
-# cBPF assembly for the M1.13b (#66) sandbox shim's terminal-action seccomp
-# filter. Reviewed kernel-ABI dependency — see docs/NATIVE_DEPENDENCIES.md.
-seccompiler = { workspace = true }
 # The activity feed's journal is JSONL on disk, and its query params derive
 # Deserialize — the same serde the shared models already use.
 serde = { workspace = true }
@@ -101,6 +98,24 @@ tempfile = "3"
 # `Entry::new` call fail — by design, per #583's "absent is a normal state":
 # `token_store::keyring_token` folds that into `None`, same as no entry set.
 keyring = { version = "4.2.0", default-features = false, features = ["v1", "zbus-secret-service-keyring-store"] }
+
+# seccomp-BPF is a Linux kernel facility with no Windows equivalent — this
+# crate does not merely LINK it optionally, it does not COMPILE on a
+# non-unix target: `seccompiler` 0.5 imports libc constants
+# (SECCOMP_RET_*, PR_SET_NO_NEW_PRIVS, SYS_seccomp, syscall(), prctl())
+# that only exist under `cfg(unix)` inside libc itself. Gating it here is
+# what makes `cargo check --target x86_64-pc-windows-msvc` reach past
+# dependency resolution at all. The only two real consumers are
+# `bin/gv-sandbox/imp/mod.rs` and `bin/gv-sandbox/imp/seccomp_filter.rs`,
+# both already gated `#[cfg(unix)]` as one unit (the whole `gv-sandbox`
+# binary is Landlock+seccomp+exec, unix-only by construction — no
+# per-function gating was needed or done). This does NOT give the sandbox
+# a Windows story; it makes the REST of the crate checkable so the real
+# portability gap list is visible instead of stopping here. See
+# docs/NATIVE_DEPENDENCIES.md and ADR (native-windows-support-milestone)
+# for what still has to be decided.
+[target.'cfg(unix)'.dependencies]
+seccompiler = { workspace = true }
 
 [dev-dependencies]
 # The #448 fixture catalogue: every deliberately-broken repository shape these

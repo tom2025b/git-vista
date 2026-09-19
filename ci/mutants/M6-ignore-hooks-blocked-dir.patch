@@ -1,5 +1,5 @@
---- a/crates/git-vista-server/src/bin/gv-sandbox/main.rs
-+++ b/crates/git-vista-server/src/bin/gv-sandbox/main.rs
+--- a/crates/git-vista-server/src/bin/gv-sandbox/imp/mod.rs
++++ b/crates/git-vista-server/src/bin/gv-sandbox/imp/mod.rs
 @@ -563,13 +563,6 @@
      // cannot exec anything else, and `validate` has already refused any
      // program_args that did not begin with exactly `git`.

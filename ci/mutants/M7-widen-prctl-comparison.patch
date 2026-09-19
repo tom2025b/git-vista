@@ -1,5 +1,5 @@
---- a/crates/git-vista-server/src/bin/gv-sandbox/seccomp_filter.rs
-+++ b/crates/git-vista-server/src/bin/gv-sandbox/seccomp_filter.rs
+--- a/crates/git-vista-server/src/bin/gv-sandbox/imp/seccomp_filter.rs
++++ b/crates/git-vista-server/src/bin/gv-sandbox/imp/seccomp_filter.rs
 @@ -128,7 +128,7 @@
  fn prctl_rule() -> Result<SeccompRule, seccompiler::BackendError> {
      SeccompRule::new(vec![SeccompCondition::new(

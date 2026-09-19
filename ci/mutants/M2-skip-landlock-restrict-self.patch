@@ -1,6 +1,6 @@
---- a/crates/git-vista-server/src/bin/gv-sandbox/main.rs
-+++ b/crates/git-vista-server/src/bin/gv-sandbox/main.rs
-@@ -519,16 +519,7 @@
+--- a/crates/git-vista-server/src/bin/gv-sandbox/imp/mod.rs
++++ b/crates/git-vista-server/src/bin/gv-sandbox/imp/mod.rs
+@@ -982,16 +982,7 @@
      if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
          die(EXIT_LANDLOCK, "prctl(PR_SET_NO_NEW_PRIVS) failed");
      }
@@ -16,5 +16,5 @@
 -    unsafe { libc::close(ruleset) };
 +    return;
  }
- 
- // A directory binary (`src/bin/gv-sandbox/main.rs`) rather than a single file,
+
+ // A plain sibling of this file: `src/bin/gv-sandbox/imp/seccomp_filter.rs`,
