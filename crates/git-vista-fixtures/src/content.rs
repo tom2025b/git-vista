@@ -163,7 +163,10 @@ pub fn path_battery() -> Fixture {
     std::fs::write(repo.join("secret.txt"), "root-secret\n").unwrap();
     std::fs::create_dir_all(repo.join("sub")).unwrap();
     std::fs::write(repo.join("sub/file.txt"), "sub-file\n").unwrap();
+    #[cfg(unix)]
     std::os::unix::fs::symlink("file.txt", repo.join("sub/link.txt")).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file("file.txt", repo.join("sub/link.txt")).unwrap();
     git::run(&repo, &["add", "-A"]);
     git::run(&repo, &["commit", "-q", "-m", "path battery fixture"]);
     (dir, repo)
