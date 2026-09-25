@@ -447,7 +447,7 @@ checkout.
 The capability statement in the table comes directly from the seccomp dispatch,
 not from the port policy: only `NetScope::Denied` (Strict) and
 `NetScope::Checkout` install the AF_UNIX rules; ordinary `NetScope::Allowed`
-does not ([profile selection](../crates/git-vista-server/src/bin/gv-sandbox/main.rs#L1047-L1060),
+does not ([profile selection](../crates/git-vista-server/src/bin/gv-sandbox/imp/mod.rs#L1035-L1039),
 [rule construction](../crates/git-vista-server/src/bin/gv-sandbox/imp/seccomp_filter.rs#L285-L310)).
 The agent-existence statement is conditional rather than hypothetical:
 `ssh_agent_socket_grant` returns the path named by `$SSH_AUTH_SOCK` exactly when
