@@ -3,10 +3,14 @@
 **Status:** Proposed
 **Date:** 2026-09-25
 **Issue:** [#857](https://github.com/tom2025b/git-vista/issues/857) (M9.1), split out of [#367](https://github.com/tom2025b/git-vista/issues/367)
-**Follows:** [0002](0002-versioned-api-contract.md) (the versioned API contract), [0005](0005-lan-view-profile.md) (the loopback/LAN listener split), [0030](0030-git-process-sandbox.md) (the git-process sandbox)
-**Amends:** [0054](0054-linux-desktop-browser-is-the-verification-target.md) — specifically the Swift expectation recorded in its 2026-08-08 amendment, and **for Windows only**. 0054 is not edited; it is append-only, and its back-link is the coordinator's to add.
+**Follows:** [0054](0054-linux-desktop-browser-is-the-verification-target.md) (the verification target, and the 2026-08-08 amendment this one argues with), [0002](0002-versioned-api-contract.md) (the versioned API contract), [0005](0005-lan-view-profile.md) (the loopback/LAN listener split), [0029](0029-strict-tier-hard-fail-when-unavailable.md) (hard-fail when a tier is unavailable), [0030](0030-git-process-sandbox.md) (the git-process sandbox)
 **Supersedes:** nothing
 **Superseded by:** nothing
+
+This record **narrows ADR 0054's 2026-08-08 amendment for Windows only** — see "The
+stated preference this argues against" below. It does not supersede 0054, whose body,
+verification target and iPad deferral all stand. 0054 is not edited here; ADRs are
+append-only and its back-link is the coordinator's to add.
 
 ## Context
 
@@ -84,7 +88,7 @@ installed.
 | **WebView2 runtime** | **present, 153.0.4234.48** | `Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'` → `pv` |
 | Rust | 1.98.1, host `x86_64-pc-windows-msvc` | `rustc --version`; `rustup show` |
 | Targets installed | `x86_64-pc-windows-msvc`, `wasm32-unknown-unknown` | `rustup show` |
-| MSVC linker | Visual Studio Community 2022 17.14.37628.2, `VC.Tools.x86.x64` present | `vswhere.exe -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64` |
+| MSVC toolchain | **incomplete** — VS Community 2022 17.14.37628.2 with `VC.Tools.x86.x64` (so `link.exe` exists at `MSVC\14.44.35207\bin\HostX64\x64`), but **no Windows SDK**: `Windows Kits\10\Lib` does not exist, so `kernel32.lib` is unavailable and nothing links | `vswhere.exe -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64`; `Test-Path "${env:ProgramFiles(x86)}\Windows Kits\10\Lib"` → `False` |
 | node / npm / swift | all absent | `Get-Command node,npm,swift` |
 
 The `ProductName` key on this box still reads `Windows 10 Pro`; that value is
@@ -99,38 +103,89 @@ milestone is about.
 
 Two more facts bear on the shape of the work:
 
-- The Rust backend already links on Windows. #858 records a Windows-side effort on
-  2026-09-16/17 that produced "a linked ~30 MB binary that correctly refuses to
-  start." Whatever that binary's defect is, *linking* is not it.
-- `wasm32-unknown-unknown` is already installed here, so the existing Leptos frontend
-  is buildable on this box today.
+- The Rust backend has linked on Windows at least once. #858 records a Windows-side
+  effort on 2026-09-16/17 that produced "a linked ~30 MB binary that correctly refuses
+  to start." Whatever that binary's defect is, *linking* was not it — though it cannot
+  have been produced with this box's current toolchain, which cannot link anything (see
+  Verification).
+- `wasm32-unknown-unknown` is an installed target here, so the frontend's target is in
+  place — subject to the same missing-SDK caveat for anything that must link natively.
 
 ### The fact the issue does not frame, and it is the expensive one
 
 #857 asks which GUI toolkit. The measurements say the toolkit is the cheap half.
 
+Measured on this branch **after merging `origin/main` at 98450fe6**, which is PR #856
+("gate gv-sandbox and seccompiler `cfg(unix)`, unblock Windows check") — a change that
+landed while this ADR was being written and that moves these numbers:
+
 ```sh
-grep -rn 'cfg(windows)\|cfg(target_os = "windows")' crates/ --include=*.rs   # 0 matches
-grep -rn 'cfg(unix)' crates/ --include=*.rs                                  # 15 matches
-grep -rn 'cfg(unix)\|cfg(windows)' crates/git-vista-server/src/sandbox/ \
-        crates/git-vista-server/src/bin/gv-sandbox/                          # 0 matches
+grep -rnF 'cfg(windows)' crates/ --include=*.rs        # 0
+grep -rnF 'cfg(target_os = "windows")' crates/ --include=*.rs   # 0
+grep -rnF 'cfg(unix)' crates/ --include=*.rs           # 19
+grep -rnF 'cfg(not(unix))' crates/ --include=*.rs      # 2
+grep -rn "target\.'cfg(unix)'" crates/*/Cargo.toml     # 1 (git-vista-server/Cargo.toml:117)
 ```
 
-There is **no Windows-conditional code in this repository at all**. All 15 platform
-conditionals are `cfg(unix)`, and the sandbox — the mechanism a dozen ADRs rest on
-(0027, 0030, 0033, 0036, 0141–0146) — has zero platform gating while hardcoding Linux
-kernel ABI:
+So: **21 platform conditionals in Rust plus one manifest gate, every one of them keyed
+on `unix`, and not one that names Windows.** Windows is still defined here only as *the
+absence of unix* — it is never a case anyone wrote code for.
+
+What #856 changed is worth stating precisely, because it is the difference between "the
+package cannot be checked on Windows" and "the sandbox works on Windows," and only the
+first was fixed. The Linux pipeline moved to `bin/gv-sandbox/imp/mod.rs` behind one
+`#[cfg(unix)]`, `seccompiler` moved under `[target.'cfg(unix)'.dependencies]`, and
+`main.rs` became a trampoline whose non-unix arm is this
+([`main.rs:44-51`](../../crates/git-vista-server/src/bin/gv-sandbox/main.rs)):
 
 ```rust
-const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;   // bin/gv-sandbox/main.rs:50
+#[cfg(not(unix))]
+fn main() {
+    eprintln!(
+        "gv-sandbox is a Linux-only sandbox shim (Landlock + seccomp, \
+         M1.13b #66) and does not run on this platform."
+    );
+    std::process::exit(1);
+}
 ```
 
-Landlock, seccomp and `bwrap` namespaces do not exist on Windows. So the real Windows
-question is not which window the graph is drawn in; it is **what a Windows build's
-security posture is when every tier above `Tier::Unsandboxed` is unavailable**, and
-what the 15 compiled-out `cfg(unix)` branches silently do instead. #860 owns that
-audit. This ADR's job is to pick the shell that spends the least, so the budget is
-still there when that question arrives.
+That is the right shape, and its own doc comment is explicit that it is not a port:
+*"This is NOT a Windows port of the sandbox — it is what makes the REST of the
+`git-vista-server` package … checkable on non-unix targets at all."* The shim refuses to
+run rather than running unsandboxed, which is the safe direction.
+
+**But the server side of the sandbox has no platform conditionals at all** — a grep for
+`cfg(unix)`, `cfg(not(unix))` or `cfg(target_os` across
+`crates/git-vista-server/src/sandbox/` (tier selection, probe, spawn, lifecycle, reaper)
+returns nothing. And the boot probe **gates the process**
+([`main.rs:223-226`](../../crates/git-vista-server/src/main.rs)):
+
+```rust
+// There is no degrade: a verdict other than `Contained` means no server,
+// full stop (ADR 0029).
+if let Err(refusal) = sandbox::probe::run_at_startup().await {
+    eprintln!("error: {refusal}");
+    std::process::exit(1);
+}
+```
+
+`probe.rs`'s own header is equally plain: *"A verdict other than
+[`ProbeVerdict::Contained`] refuses to start the server — no degrade, no 'run anyway
+with hooks blocked'."* Landlock, seccomp and `bwrap` namespaces have no Windows
+equivalent, so that composition cannot succeed there, so a Windows build reaches this
+gate and exits — **before binding a listener, by existing and deliberate design.**
+
+This is very likely the mechanism behind #858's binary that "compiled but refuses to
+start," and it reframes that issue: the refusal looks like ADR 0029 working, not a port
+bug. Stated as a hypothesis with its citation, not a diagnosis — this ADR did not run
+that binary, and #858 owns confirming it.
+
+So the real Windows question is not which window the graph is drawn in. It is **what a
+Windows build's security posture is when no tier above `Tier::Unsandboxed` can exist**:
+hard-fail as ADR 0029 does today, run unsandboxed with disclosure, or restrict the
+operation set. #860 owns that call and it needs its own ADR. Until it is made, **no
+Windows build boots at all** — which is why Decision §3 puts the server ahead of the
+shell rather than treating that order as a preference.
 
 That criterion — *cheapest shell, because the sandbox is the expensive part* — is what
 decides this, and it decides it more firmly than #367's "smaller, straighter path" did.
@@ -193,10 +248,15 @@ would have foreclosed it.
 
 ### 3. The first Windows artifact is the headless server, not the bundle
 
-The bundle contains the server. The server has never been shown to run on Windows —
-#858's binary links and then refuses to start, with nobody having read the actual
-error. Wrapping an unproven server in a shell hides the failure behind a window that
-opens on nothing.
+The bundle contains the server, and **the server does not currently boot on Windows by
+design** — the ADR 0029 probe gate at `main.rs:223-226` exits before binding a listener
+on any host where bwrap + Landlock + seccomp cannot compose, which is every Windows host.
+#858's binary links and then refuses to start, and that is the most likely reason.
+
+So this ordering is not prudence, it is arithmetic: a Tauri bundle shipped before #860
+decides the Windows posture would be a window that opens on a server which exited at
+startup. Wrapping an unproven server in a shell also hides the failure behind that
+window — the same defect, harder to read.
 
 So the order is: make `git-vista-server` correct on Windows (#858, #860), get it built
 in CI (#859), and only then bundle it. This is not a hedge or a rival option — the
@@ -265,17 +325,28 @@ Answered as far as this decision goes, with the rest named as open:
 - **The bundled server binds loopback only.** The LAN view profile (0005) is a
   deliberate second listener, and shipping it enabled by default inside a desktop app
   would widen the boundary silently. It stays off unless separately decided.
-- **Open, and not decided here:** what a Windows build does where `Tier::Strict` and
-  `Tier::Network` cannot exist. Landlock, seccomp and `bwrap` are Linux mechanisms, and
-  `gv-sandbox` hardcodes Linux syscall numbers with no platform gating. Whether a
-  Windows build hard-fails per ADR 0029's precedent, runs unsandboxed with disclosure,
-  or restricts the operation set is a decision for #860's audit and its own ADR. **This
-  ADR does not authorise a silently unsandboxed Windows build.**
+- **Today's Windows posture is hard-fail, and it is inherited rather than chosen.**
+  Landlock, seccomp and `bwrap` are Linux mechanisms with no Windows equivalent, so the
+  boot probe cannot return `Contained` and `main.rs:223-226` exits before binding a
+  listener — ADR 0029's rule, applied to a platform it was not written for. Since #856
+  the `gv-sandbox` shim itself also exits 1 on non-unix rather than running unsandboxed,
+  which is the safe direction; but `src/sandbox/` — tier selection, probe, spawn,
+  lifecycle — still carries no platform conditional at all.
+- **Open, and not decided here:** whether that inherited hard-fail is the *intended*
+  Windows posture, or whether a Windows build should run unsandboxed with disclosure, or
+  restrict the operation set to what it can defend. That is #860's audit and needs its
+  own ADR. **This ADR does not authorise a silently unsandboxed Windows build**, and it
+  notes that "make it boot" is the one way that decision could get made by accident.
 
 ## Consequences
 
 - **#858, #859 and #860 unblock, and their order is now fixed** by §3: diagnose, then
-  CI, then audit, then bundle.
+  CI, then audit, then bundle. #860 is on the critical path rather than beside it —
+  nothing ships on Windows until the posture question it owns is answered, because the
+  boot gate is what stops the server today.
+- **#859 needs a toolchain this box does not have.** The Windows SDK is absent, so
+  nothing links here at all; and `cargo` run from Git Bash silently picks up coreutils
+  `link.exe` instead of MSVC's. Both cost a session if undocumented (see Verification).
 - **Tauri returns as a 13th workspace member**, not a 5th — the workspace listed four
   crates when the shell was deleted and lists twelve now (`Cargo.toml`, `[workspace]`).
   The CI job it costs is a real cost, and on Windows it buys a WebView2 target that needs
@@ -307,9 +378,43 @@ carries the command that produced it, in the table or in the fenced block beside
 repository facts — commit stats, removed sources, `cfg` counts, workspace membership —
 are reproducible with the `git` and `grep` invocations quoted inline.
 
-Two measurements were deliberately **not** taken, because they belong to other issues and
-would have required installing software or running a full build on the owner's machine:
-whether the workspace compiles on Windows today (#859), and why #858's binary refuses to
-start (#858). Neither is assumed here.
+### The build check, attempted three ways — and what stopped it
+
+PR #856's stated purpose was to unblock `cargo check` on Windows, so whether it now
+builds here is evidence #859 wants. It was attempted. **It does not build on this box,
+for a reason that is not git-vista's**, and the three failures are worth recording
+because two of them are traps rather than results:
+
+| Shell | Result |
+|---|---|
+| Git Bash | `link: extra operand …` / `Try 'link --help'` — **GNU coreutils `link.exe` from Git Bash shadowed the MSVC linker.** A misleading failure that says nothing about the code. |
+| PowerShell | ``error: linker `link.exe` not found`` — a plain shell does not have the MSVC environment. |
+| `vcvars64.bat` then cargo | The right linker is found (`MSVC\14.44.35207\bin\HostX64\x64\link.exe`) and then: `LINK : fatal error LNK1181: cannot open input file 'kernel32.lib'`. |
+
+`kernel32.lib` ships with the **Windows SDK**, which is a separate VS component from the
+C++ tools, and it is not installed: `Windows Kits\10\Lib` does not exist on this machine.
+So this box can compile Rust but cannot link *any* native Windows binary — a hello-world
+would fail identically. Every failure above happened inside third-party build scripts
+(`proc-macro2`, `thiserror`, `serde_core`) before a line of git-vista was reached.
+
+Two things follow, and the second matters more than the first:
+
+1. **Whether #856 actually unblocked the Windows check is still unverified**, here or
+   anywhere. This ADR does not claim it did; it cites only what #856's code *is*.
+2. **#859 will need the Windows SDK and a correctly initialised MSVC environment before
+   it can test anything**, and the Git Bash trap will waste a session if it is not
+   written down. Installing the SDK is the owner's call and was not done.
+
+Nothing was installed, built, or configured for this ADR. `vcvars64.bat` only sets
+environment variables in a subshell from an already-installed toolchain.
+
+The ADR-index invariant was therefore also checked by reproducing
+`tests/adr_index_matches_the_files.rs`'s four assertions in shell rather than by running
+them: file-number ↔ row-number in both directions, no duplicate rows, each row's link
+target resolving to the real filename, and each H1 parsing under that test's
+`heading_number` rule. CI will run the real test on Linux.
+
+One measurement was deliberately **not** taken: why #858's binary refuses to start. That
+is #858's job. The hypothesis offered above (the ADR 0029 boot gate) is labelled as one.
 
 **Signed:** max · 2026-09-25T14:05:00-04:00
