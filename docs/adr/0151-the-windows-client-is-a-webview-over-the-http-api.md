@@ -49,14 +49,19 @@ blank. It argues against a preference that is on the record, and it owes a reaso
 history. Measured rather than assumed:
 
 ```sh
-git log --oneline -i --grep=tauri          # 10 commits mention Tauri
-git show --stat cb4ca646                   # the removal: 171 insertions, 3502 deletions
+# scope: commits reachable from this branch's HEAD (after merging origin/main at
+# 98450fe6). `--all` gives a larger, clone-dependent number — pin the scope or the
+# figure is not reproducible.
+git log --oneline -i --grep=tauri | wc -l        # 11
+git show --shortstat cb4ca646                    # 26 files changed, 171 insertions(+), 3502 deletions(-)
+git show --numstat cb4ca646 -- Cargo.lock        # 121  3302  Cargo.lock
 git show cb4ca646^:crates/git-vista/src-tauri/src/commands.rs
 ```
 
 The entire removed Rust shell was **32 lines across three files** — `commands.rs` (13),
-`lib.rs` (13), `main.rs` (6) — plus a `tauri.conf.json`, a capabilities file and six
-icons. Of the 3,502 deleted lines, 3,423 were `Cargo.lock`. Its one command was a stub:
+`lib.rs` (13), `main.rs` (6) — plus a `tauri.conf.json`, a capabilities file, five binary
+icons and their README. Of the 3,502 deleted lines, **3,302 were `Cargo.lock`**. Its one
+command was a stub:
 
 ```rust
 #[tauri::command]
@@ -103,11 +108,12 @@ milestone is about.
 
 Two more facts bear on the shape of the work:
 
-- The Rust backend has linked on Windows at least once. #858 records a Windows-side
-  effort on 2026-09-16/17 that produced "a linked ~30 MB binary that correctly refuses
-  to start." Whatever that binary's defect is, *linking* was not it — though it cannot
-  have been produced with this box's current toolchain, which cannot link anything (see
-  Verification).
+- The Rust backend has reportedly linked on Windows at least once. #858 records a
+  Windows-side effort on 2026-09-16/17 that produced "a linked ~30 MB binary that
+  correctly refuses to start." **That is an issue report, not something reproduced
+  here** — the binary was not located, run, or rebuilt for this ADR, and it cannot have
+  come from this box's current toolchain, which links nothing (see Verification). It is
+  cited only for the narrow claim that linking has succeeded somewhere, once.
 - `wasm32-unknown-unknown` is an installed target here, so the frontend's target is in
   place — subject to the same missing-SDK caveat for anything that must link natively.
 
@@ -119,22 +125,29 @@ Measured on this branch **after merging `origin/main` at 98450fe6**, which is PR
 ("gate gv-sandbox and seccompiler `cfg(unix)`, unblock Windows check") — a change that
 landed while this ADR was being written and that moves these numbers:
 
+Counted as **attributes**, anchored at line start so doc-comment prose about `cfg(unix)`
+cannot inflate the number — an earlier draft of this ADR counted two such comment lines
+and said 21:
+
 ```sh
-grep -rnF 'cfg(windows)' crates/ --include=*.rs        # 0
-grep -rnF 'cfg(target_os = "windows")' crates/ --include=*.rs   # 0
-grep -rnF 'cfg(unix)' crates/ --include=*.rs           # 19
-grep -rnF 'cfg(not(unix))' crates/ --include=*.rs      # 2
-grep -rn "target\.'cfg(unix)'" crates/*/Cargo.toml     # 1 (git-vista-server/Cargo.toml:117)
+git grep -cE '^\s*#!?\[cfg\(unix\)\]' -- crates | awk -F: '{n+=$2} END {print n}'        # 17
+git grep -cE '^\s*#!?\[cfg\(not\(unix\)\)\]' -- crates | awk -F: '{n+=$2} END {print n}' # 2
+git grep -cE '^\s*#!?\[cfg\(windows\)\]' -- crates | awk -F: '{n+=$2} END {print n}'     # 0
+git grep -n "^\[target\.'cfg(unix)'" -- 'crates/*/Cargo.toml'   # 1 — git-vista-server/Cargo.toml:117
 ```
 
-So: **21 platform conditionals in Rust plus one manifest gate, every one of them keyed
+So: **19 platform-conditional attributes plus one manifest gate, every one of them keyed
 on `unix`, and not one that names Windows.** Windows is still defined here only as *the
 absence of unix* — it is never a case anyone wrote code for.
 
-What #856 changed is worth stating precisely, because it is the difference between "the
-package cannot be checked on Windows" and "the sandbox works on Windows," and only the
-first was fixed. The Linux pipeline moved to `bin/gv-sandbox/imp/mod.rs` behind one
-`#[cfg(unix)]`, `seccompiler` moved under `[target.'cfg(unix)'.dependencies]`, and
+What #856 changed is worth stating precisely, and precisely is *not* "it made the package
+checkable on Windows" — that is its stated **intent**, and this ADR has not verified the
+result (see Verification). Its own manifest comment is careful about the same distinction:
+*"This does NOT give the sandbox a Windows story; it makes the REST of the crate checkable
+so the real portability gap list is visible instead of stopping here."*
+
+What it did mechanically: the Linux pipeline moved to `bin/gv-sandbox/imp/mod.rs` behind
+one `#[cfg(unix)]`, `seccompiler` moved under `[target.'cfg(unix)'.dependencies]`, and
 `main.rs` became a trampoline whose non-unix arm is this
 ([`main.rs:44-51`](../../crates/git-vista-server/src/bin/gv-sandbox/main.rs)):
 
@@ -157,7 +170,26 @@ run rather than running unsandboxed, which is the safe direction.
 **But the server side of the sandbox has no platform conditionals at all** — a grep for
 `cfg(unix)`, `cfg(not(unix))` or `cfg(target_os` across
 `crates/git-vista-server/src/sandbox/` (tier selection, probe, spawn, lifecycle, reaper)
-returns nothing. And the boot probe **gates the process**
+returns nothing, and that directory is compiled on every target.
+
+At least one known blocker survives there. `sandbox/capabilities.rs` carries no platform
+gate of any kind — its only `cfg` attributes are two `cfg(test)` — and `landlock_abi()`
+issues a raw Linux syscall unconditionally
+([`capabilities.rs:140`](../../crates/git-vista-server/src/sandbox/capabilities.rs)):
+
+```rust
+fn landlock_abi() -> i32 {
+    let rc = unsafe {
+        libc::syscall(                       // no cfg gate; `libc::syscall` is unix-only
+            SYS_LANDLOCK_CREATE_RULESET,
+```
+
+So a Windows `cargo check` very likely still fails here, after #856. **Found by reading,
+not by building** — nothing compiles on this box (Verification), so this is a code
+citation rather than a compiler result, and #859 should expect a gap *list* rather than a
+single fix. That is exactly what #856's manifest comment predicted it would expose.
+
+And the boot probe **gates the process**
 ([`main.rs:223-226`](../../crates/git-vista-server/src/main.rs)):
 
 ```rust
@@ -258,8 +290,13 @@ decides the Windows posture would be a window that opens on a server which exite
 startup. Wrapping an unproven server in a shell also hides the failure behind that
 window — the same defect, harder to read.
 
-So the order is: make `git-vista-server` correct on Windows (#858, #860), get it built
-in CI (#859), and only then bundle it. This is not a hedge or a rival option — the
+So the order is **#858, then #860, then #859, then the bundle**: diagnose why it refuses
+to start, decide the Windows sandbox posture, then build it in CI, and only then wrap it.
+
+#860 comes before #859 deliberately. A CI job that builds a Windows binary which exits at
+startup is green and proves nothing — this repository has a standing rule against exactly
+that shape of test — and #860's answer may change what #859 is even supposed to build.
+This is not a hedge or a rival option — the
 server work is on the critical path to Tauri regardless, and it is the only step that
 produces information. As a side effect the intermediate artifact is already useful on
 the local desktop: server plus browser over loopback needs no port-forward and no token
@@ -340,10 +377,10 @@ Answered as far as this decision goes, with the rest named as open:
 
 ## Consequences
 
-- **#858, #859 and #860 unblock, and their order is now fixed** by §3: diagnose, then
-  CI, then audit, then bundle. #860 is on the critical path rather than beside it —
-  nothing ships on Windows until the posture question it owns is answered, because the
-  boot gate is what stops the server today.
+- **#858, #859 and #860 unblock, and their order is now fixed** by §3: **#858 diagnose,
+  #860 decide the posture, #859 CI, then bundle.** #860 is on the critical path rather
+  than beside it — nothing ships on Windows until the posture question it owns is
+  answered, because the boot gate is what stops the server today.
 - **#859 needs a toolchain this box does not have.** The Windows SDK is absent, so
   nothing links here at all; and `cargo` run from Git Bash silently picks up coreutils
   `link.exe` instead of MSVC's. Both cost a session if undocumented (see Verification).
@@ -385,17 +422,30 @@ builds here is evidence #859 wants. It was attempted. **It does not build on thi
 for a reason that is not git-vista's**, and the three failures are worth recording
 because two of them are traps rather than results:
 
-| Shell | Result |
-|---|---|
-| Git Bash | `link: extra operand …` / `Try 'link --help'` — **GNU coreutils `link.exe` from Git Bash shadowed the MSVC linker.** A misleading failure that says nothing about the code. |
-| PowerShell | ``error: linker `link.exe` not found`` — a plain shell does not have the MSVC environment. |
-| `vcvars64.bat` then cargo | The right linker is found (`MSVC\14.44.35207\bin\HostX64\x64\link.exe`) and then: `LINK : fatal error LNK1181: cannot open input file 'kernel32.lib'`. |
+All three ran the same cargo invocation, from the repository root, against the default
+host target `x86_64-pc-windows-msvc`:
 
-`kernel32.lib` ships with the **Windows SDK**, which is a separate VS component from the
-C++ tools, and it is not installed: `Windows Kits\10\Lib` does not exist on this machine.
-So this box can compile Rust but cannot link *any* native Windows binary — a hello-world
-would fail identically. Every failure above happened inside third-party build scripts
-(`proc-macro2`, `thiserror`, `serde_core`) before a line of git-vista was reached.
+```
+cargo test -p git-vista-server --test adr_index_matches_the_files
+```
+
+| Shell it was run from | Result |
+|---|---|
+| Git Bash (`bash`) | `link: extra operand '…rcgu.o'` / `Try 'link --help' for more information.` — that is **GNU coreutils `link` from Git Bash**, shadowing the MSVC linker on `PATH`. A misleading failure that says nothing about the code. |
+| PowerShell, plain | ``error: linker `link.exe` not found`` + *"please ensure that Visual Studio 2017 or later … were installed with the Visual C++ option"* — a plain shell has no MSVC environment. |
+| PowerShell, after `cmd /c "…\VC\Auxiliary\Build\vcvars64.bat" && cargo test …` | The correct linker is found and named by cargo in the failing command line — `C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\bin\HostX64\x64\link.exe` — and then: `LINK : fatal error LNK1181: cannot open input file 'kernel32.lib'`. |
+
+The MSVC linker path above is quoted from cargo's own `note: "…link.exe" "/NOLOGO" …`
+line in that third run; it was not looked up separately.
+
+The first failing packages were `proc-macro2`, `thiserror`, `serde_core`, `getrandom`,
+`heapless`, `quote`, `crc32fast` and `parking_lot_core` — all third-party **build
+scripts**, none of them git-vista.
+
+`kernel32.lib` ships with the **Windows SDK**, a separate VS component from the C++
+tools, and it is not installed — `Test-Path "${env:ProgramFiles(x86)}\Windows Kits\10\Lib"`
+and the `$env:ProgramFiles` equivalent both return `False`. So this box can compile Rust
+but cannot link *any* native Windows binary; a hello-world would fail identically.
 
 Two things follow, and the second matters more than the first:
 
