@@ -49,14 +49,20 @@ blank. It argues against a preference that is on the record, and it owes a reaso
 history. Measured rather than assumed:
 
 ```sh
-# scope: commits reachable from this branch's HEAD (after merging origin/main at
-# 98450fe6). `--all` gives a larger, clone-dependent number — pin the scope or the
-# figure is not reproducible.
-git log --oneline -i --grep=tauri | wc -l        # 11
-git show --shortstat cb4ca646                    # 26 files changed, 171 insertions(+), 3502 deletions(-)
-git show --numstat cb4ca646 -- Cargo.lock        # 121  3302  Cargo.lock
+git log --oneline -i --grep=tauri 98450fe6 | wc -l   # 10
+git show --shortstat cb4ca646                        # 26 files changed, 171 insertions(+), 3502 deletions(-)
+git show --numstat cb4ca646 -- Cargo.lock            # 121  3302  Cargo.lock
 git show cb4ca646^:crates/git-vista/src-tauri/src/commands.rs
 ```
+
+The revision `98450fe6` — `origin/main` as merged into this branch — is **in** the
+command, not merely mentioned beside it. Left unpinned, that grep walks back from `HEAD`,
+which on this branch includes the commits that carry this ADR; their messages say
+"Tauri," so the count counts itself and climbs by one every time the ADR is revised (it
+read 10, then 11, then 12 across three drafts). Any figure a document states about the
+history containing that document needs a revision argument for the same reason. `--all`
+is worse still: it depends on which remote refs a given clone has fetched, and two
+machines measured 31 and 40 from the same repository.
 
 The entire removed Rust shell was **32 lines across three files** — `commands.rs` (13),
 `lib.rs` (13), `main.rs` (6) — plus a `tauri.conf.json`, a capabilities file, five binary
@@ -110,10 +116,11 @@ Two more facts bear on the shape of the work:
 
 - The Rust backend has reportedly linked on Windows at least once. #858 records a
   Windows-side effort on 2026-09-16/17 that produced "a linked ~30 MB binary that
-  correctly refuses to start." **That is an issue report, not something reproduced
-  here** — the binary was not located, run, or rebuilt for this ADR, and it cannot have
-  come from this box's current toolchain, which links nothing (see Verification). It is
-  cited only for the narrow claim that linking has succeeded somewhere, once.
+  correctly refuses to start." **This rests on that issue report alone: no producing
+  command, commit, branch or build log is recorded here**, and the binary was not
+  located, run, or rebuilt for this ADR. It cannot have come from this box's current
+  toolchain, which links nothing (see Verification). Cited only for the narrow claim
+  that linking has succeeded somewhere, once — and #858 owns establishing even that.
 - `wasm32-unknown-unknown` is an installed target here, so the frontend's target is in
   place — subject to the same missing-SDK caveat for anything that must link natively.
 
@@ -130,9 +137,9 @@ cannot inflate the number — an earlier draft of this ADR counted two such comm
 and said 21:
 
 ```sh
-git grep -cE '^\s*#!?\[cfg\(unix\)\]' -- crates | awk -F: '{n+=$2} END {print n}'        # 17
-git grep -cE '^\s*#!?\[cfg\(not\(unix\)\)\]' -- crates | awk -F: '{n+=$2} END {print n}' # 2
-git grep -cE '^\s*#!?\[cfg\(windows\)\]' -- crates | awk -F: '{n+=$2} END {print n}'     # 0
+git grep -cE '^\s*#!?\[cfg\(unix\)\]' -- crates | awk -F: '{n+=$2} END {print n+0}'        # 17
+git grep -cE '^\s*#!?\[cfg\(not\(unix\)\)\]' -- crates | awk -F: '{n+=$2} END {print n+0}' # 2
+git grep -cE '^\s*#!?\[cfg\(windows\)\]' -- crates | awk -F: '{n+=$2} END {print n+0}'     # 0
 git grep -n "^\[target\.'cfg(unix)'" -- 'crates/*/Cargo.toml'   # 1 — git-vista-server/Cargo.toml:117
 ```
 
@@ -429,11 +436,37 @@ host target `x86_64-pc-windows-msvc`:
 cargo test -p git-vista-server --test adr_index_matches_the_files
 ```
 
-| Shell it was run from | Result |
+What differed is the environment it was launched from. The three launches, verbatim:
+
+```sh
+# 1. Git Bash, cwd = repository root
+cargo test -p git-vista-server --test adr_index_matches_the_files
+```
+
+```powershell
+# 2. Windows PowerShell 5.1, no MSVC environment
+Set-Location 'C:\Users\Admin\$HOME\projects\git-vista'
+cargo test -p git-vista-server --test adr_index_matches_the_files
+```
+
+```powershell
+# 3. Windows PowerShell 5.1 — vcvars64 and cargo inside ONE cmd child, so the
+#    environment vcvars sets is still live when cargo runs.
+Set-Location 'C:\Users\Admin\$HOME\projects\git-vista'
+cmd /c '"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1 && cargo test -p git-vista-server --test adr_index_matches_the_files'
+```
+
+| Launch | Result |
 |---|---|
-| Git Bash (`bash`) | `link: extra operand '…rcgu.o'` / `Try 'link --help' for more information.` — that is **GNU coreutils `link` from Git Bash**, shadowing the MSVC linker on `PATH`. A misleading failure that says nothing about the code. |
-| PowerShell, plain | ``error: linker `link.exe` not found`` + *"please ensure that Visual Studio 2017 or later … were installed with the Visual C++ option"* — a plain shell has no MSVC environment. |
-| PowerShell, after `cmd /c "…\VC\Auxiliary\Build\vcvars64.bat" && cargo test …` | The correct linker is found and named by cargo in the failing command line — `C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\bin\HostX64\x64\link.exe` — and then: `LINK : fatal error LNK1181: cannot open input file 'kernel32.lib'`. |
+| 1 — Git Bash | `link: extra operand '…rcgu.o'` / `Try 'link --help' for more information.` — that is **GNU coreutils `link` from Git Bash**, shadowing the MSVC linker on `PATH`. A misleading failure that says nothing about the code. |
+| 2 — plain PowerShell | ``error: linker `link.exe` not found`` + *"please ensure that Visual Studio 2017 or later … were installed with the Visual C++ option"* — a plain shell has no MSVC environment. |
+| 3 — `cmd /c` with vcvars64 and cargo together | The correct linker is found and named by cargo in the failing command line — `C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\bin\HostX64\x64\link.exe` — and then: `LINK : fatal error LNK1181: cannot open input file 'kernel32.lib'`. |
+
+Launch 3's shape is the whole point of writing it out: both halves are inside the single
+`cmd /c` string. `vcvars64.bat` in its own `cmd /c`, followed by cargo in the parent
+shell, sets nothing that survives — and Windows PowerShell 5.1 has no `&&` operator at
+all, so that spelling would not even parse. An earlier draft of this ADR wrote it the
+wrong way round; the run itself was correct, the transcription was not.
 
 The MSVC linker path above is quoted from cargo's own `note: "…link.exe" "/NOLOGO" …`
 line in that third run; it was not looked up separately.
