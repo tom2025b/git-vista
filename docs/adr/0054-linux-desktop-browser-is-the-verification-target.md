@@ -191,3 +191,22 @@ That is a security-model question to answer in #367's own ADR, not one this one 
 ---
 
 **Signed:** 2025 · 2026-08-08T07:56:00-04:00
+
+## Amendment, 2026-09-25 — ADR 0151 answers the Windows half of #367's own note above
+
+**ADR 0151** (Accepted) picks Tauri v2 for #367's split-out Windows-delivery
+scope (M9), and confirms rather than revises the direction set by the
+2026-08-08 amendment above: **the HTTP API stays the durable product
+surface.** The Windows webview reaches an in-process `git-vista-server` over
+loopback HTTP — the same contract the browser uses — never through Tauri's
+own command channel, so a later Swift client (still deferred, per the
+2026-08-08 amendment's iPad note) remains one more consumer of that contract
+rather than a fork of it.
+
+The note above this one asked whether bundling the server touches the
+loopback/LAN boundary ADR 0005 draws around a listening socket. 0151
+addresses it for Windows: the socket stays loopback-only, reached by the
+bundled webview the same way a local browser reaches it today. 0151 is
+scoped to Windows only and does not settle #367's macOS scope.
+
+**Signed:** max · 2026-09-25T14:22:00-04:00

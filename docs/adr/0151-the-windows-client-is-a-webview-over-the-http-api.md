@@ -1,6 +1,6 @@
 # ADR 0151 — The Windows client is a webview over the HTTP API, not a second UI
 
-**Status:** Proposed
+**Status:** Accepted (Tom, 2026-09-25)
 **Date:** 2026-09-25
 **Issue:** [#857](https://github.com/tom2025b/git-vista/issues/857) (M9.1), split out of [#367](https://github.com/tom2025b/git-vista/issues/367)
 **Follows:** [0054](0054-linux-desktop-browser-is-the-verification-target.md) (the verification target, and the 2026-08-08 amendment this one argues with), [0002](0002-versioned-api-contract.md) (the versioned API contract), [0005](0005-lan-view-profile.md) (the loopback/LAN listener split), [0029](0029-strict-tier-hard-fail-when-unavailable.md) (hard-fail when a tier is unavailable), [0030](0030-git-process-sandbox.md) (the git-process sandbox)
