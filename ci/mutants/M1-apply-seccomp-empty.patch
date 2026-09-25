@@ -1,5 +1,5 @@
---- a/crates/git-vista-server/src/bin/gv-sandbox/main.rs
-+++ b/crates/git-vista-server/src/bin/gv-sandbox/main.rs
+--- a/crates/git-vista-server/src/bin/gv-sandbox/imp/mod.rs
++++ b/crates/git-vista-server/src/bin/gv-sandbox/imp/mod.rs
 @@ -1036,10 +1036,4 @@
 -// Mutation-matrix anchor M1: the filter is applied at this single boundary.
 -fn apply_seccomp(net: seccomp_filter::NetScope) {

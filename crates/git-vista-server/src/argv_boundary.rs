@@ -365,7 +365,7 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // argv whose program is not exactly `git`, so it cannot exec anything else
     // even if the literal rule below were relaxed. It uses `.exec()`, never
     // `.spawn()`/`.output()`/`.status()`: it never becomes a parent.
-    "src/bin/gv-sandbox/main.rs",
+    "src/bin/gv-sandbox/imp/mod.rs",
     // (An orphaned paragraph describing `shim_cli.rs` — "the `#[cfg(test)]`
     // harness that drives the composed launcher" — used to sit here, left
     // behind when that entry was removed. `shim_cli.rs` constructs no
