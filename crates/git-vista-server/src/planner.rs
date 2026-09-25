@@ -4238,7 +4238,7 @@ async fn verify_path_states(
 /// (`dir/`) would otherwise cause against an unslashed request — directories
 /// are never a valid target either way now, so the spelling stops mattering.
 ///
-/// Reuses `bin/gv-sandbox/main.rs`'s `resolve_excludes` pattern (canonicalize
+/// Reuses `bin/gv-sandbox/imp/mod.rs`'s `resolve_excludes` pattern (canonicalize
 /// each path, compare against the canonicalized worktree root, fail closed
 /// on any canonicalize error other than `NotFound`) rather than a fresh
 /// lexical check — `WorktreePath`'s own `..`-rejection is necessary but not

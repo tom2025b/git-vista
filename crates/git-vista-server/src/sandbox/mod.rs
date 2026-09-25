@@ -602,7 +602,7 @@ pub(crate) struct Policy {
     /// `secret_excludes` outrank a `--ro`/`--rw` grant everywhere else in this
     /// design, and every entry here is a deliberate, reviewed exception to
     /// that rule for one literal path — never a directory (the shim refuses
-    /// to grant one, `bin/gv-sandbox/main.rs`'s `add_carveout_rule`). As of
+    /// to grant one, `bin/gv-sandbox/imp/mod.rs`'s `add_carveout_rule`). As of
     /// this writing the only populated case is `~/.ssh/known_hosts` in the
     /// `Network` tier, via `ssh_known_hosts_carveout` — a git client needs it
     /// to verify a remote's host key, while the rest of `~/.ssh` (private
@@ -1113,7 +1113,7 @@ pub(crate) fn policy_for(
         // An exclude closes it because the shim withholds excluded paths from
         // every tree it grants, read-write ones included
         // (`is_or_inside_exclude` / `is_ancestor_of_exclude` in
-        // `bin/gv-sandbox/main.rs`) — the one mechanism here that outranks a
+        // `bin/gv-sandbox/imp/mod.rs`) — the one mechanism here that outranks a
         // grant rather than competing with it.
         //
         // Computed from `state::sandbox_trust_dir()` rather than added to

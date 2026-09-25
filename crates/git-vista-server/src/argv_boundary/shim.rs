@@ -1,5 +1,5 @@
 //! The `gv-sandbox` shim execs and never forks. Split out of `argv_boundary.rs`
-//! because it proves a property of one specific binary (`src/bin/gv-sandbox/main.rs`),
+//! because it proves a property of one specific binary (`src/bin/gv-sandbox/imp/mod.rs`),
 //! not the crate-wide spawn census the parent module's allowlist covers.
 //!
 //! **This file is scanned too, and is not exempt.** The parent's spawn-site
@@ -37,7 +37,7 @@ use super::code_only;
 /// makes a prose-driven scan report the file it is quoting.
 #[test]
 fn the_shim_execs_and_never_forks() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/gv-sandbox/main.rs");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/gv-sandbox/imp/mod.rs");
     let src = std::fs::read_to_string(&path).expect("readable gv-sandbox main.rs");
     let code = code_only(&src);
 
@@ -100,7 +100,7 @@ fn the_shim_execs_and_never_forks() {
         assert_eq!(
             code.matches(needle.as_str()).count(),
             0,
-            "gv-sandbox/main.rs: `{needle}` {why}. The shim applies Landlock and \
+            "gv-sandbox/imp/mod.rs: `{needle}` {why}. The shim applies Landlock and \
              seccomp to *itself* and then becomes git; anything that keeps it \
              alive as a parent keeps a validated-argv process around to exec \
              again."

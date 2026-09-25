@@ -532,7 +532,7 @@ fn tag_detail(record: &TagRecord) -> Option<TagDetail> {
 ///
 /// **What the exact status is *inside* `Tier::Strict` is inferred, not
 /// separately measured.** `Strict`'s seccomp filter denies
-/// `socket(AF_UNIX)` unconditionally (`bin/gv-sandbox/seccomp_filter.rs`) —
+/// `socket(AF_UNIX)` unconditionally (`bin/gv-sandbox/imp/seccomp_filter.rs`) —
 /// the call `gpg` makes to reach `gpg-agent` at all — so `gpg` may never get
 /// as far as emitting a status-protocol line, in which case this classifies
 /// as [`SignatureStatus::Unverifiable`] (no recognised line) rather than
