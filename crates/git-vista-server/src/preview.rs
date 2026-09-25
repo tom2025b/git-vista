@@ -1453,6 +1453,7 @@ impl ScratchStore {
     ///
     /// The returned lease is held by the caller across `remove_dir_all`, so
     /// two sweepers cannot race into the same tree.
+    #[cfg(unix)]
     fn abandoned_store_lease(candidate: &Path) -> Option<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         // `O_NONBLOCK` is what makes the `is_file()` refusal below reachable
@@ -1480,6 +1481,14 @@ impl ScratchStore {
             return None;
         }
         Self::lease_if_free(&f).then_some(f)
+    }
+
+    #[cfg(windows)]
+    fn abandoned_store_lease(_candidate: &Path) -> Option<std::fs::File> {
+        // TODO(#859): Open and validate the marker without blocking on a
+        // Windows reparse point or named pipe before enabling stale cleanup.
+        // Retaining an unverified candidate is the fail-closed default.
+        None
     }
 
     /// Take `marker`'s lease, asking [`LEASE_ATTEMPTS`] times before believing

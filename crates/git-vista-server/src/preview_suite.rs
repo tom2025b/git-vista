@@ -4209,6 +4209,8 @@ async fn the_scratch_store_carries_a_marker_and_holds_its_lease() {
 ///    tell, delete anyway". The lock is still consulted, so the code still
 ///    *looks* right; the live store is still deleted, and the failure arrives
 ///    from a sweep that examined the lease and drew the opposite conclusion.
+// The assertion and its failure diagnostics inspect Unix flock and /proc state.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_live_store_is_never_swept_however_old_it_looks() {
     let (dir, repo) = revert_shape();

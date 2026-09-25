@@ -389,7 +389,10 @@ fn repository_the_watcher_refuses() -> tempfile::TempDir {
     let refs = temp.path().join(".git/refs");
     let elsewhere = temp.path().join("refs-moved-aside");
     std::fs::rename(&refs, &elsewhere).expect("move the refs tree aside");
+    #[cfg(unix)]
     std::os::unix::fs::symlink(&elsewhere, &refs).expect("put a symlink in its place");
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&elsewhere, &refs).expect("put a symlink in its place");
     temp
 }
 
