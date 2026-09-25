@@ -57,12 +57,15 @@ git show cb4ca646^:crates/git-vista/src-tauri/src/commands.rs
 
 The revision `98450fe6` — `origin/main` as merged into this branch — is **in** the
 command, not merely mentioned beside it. Left unpinned, that grep walks back from `HEAD`,
-which on this branch includes the commits that carry this ADR; their messages say
-"Tauri," so the count counts itself and climbs by one every time the ADR is revised (it
-read 10, then 11, then 12 across three drafts). Any figure a document states about the
-history containing that document needs a revision argument for the same reason. `--all`
-is worse still: it depends on which remote refs a given clone has fetched, and two
-machines measured 31 and 40 from the same repository.
+which on this branch includes the commits that carry this ADR, and most of their messages
+say "Tauri" — so the count counts itself, and **can climb whenever a revision commit's
+own message mentions Tauri**. Not every revision moves it: `6c780bf5` revised this ADR
+and the unpinned figure did not budge, because that commit's message happens not to say
+the word. That is the failure mode in miniature — a number whose value depends on how the
+document describing it was worded. Any figure a document states about the history
+containing that document needs a revision argument for the same reason. `--all` is worse
+still: it depends on which remote refs a given clone has fetched, and two machines
+measured 31 and 40 from the same repository.
 
 The entire removed Rust shell was **32 lines across three files** — `commands.rs` (13),
 `lib.rs` (13), `main.rs` (6) — plus a `tauri.conf.json`, a capabilities file, five binary
