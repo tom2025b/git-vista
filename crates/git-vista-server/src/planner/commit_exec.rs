@@ -569,6 +569,7 @@ async fn signing_requested(repo: &Path, need: NetworkNeed) -> bool {
 /// probe sees that same empty directory and answers `false`. A repository
 /// whose hooks cannot run can never have a failure classified as a hook
 /// rejection, with no separate policy plumbing to drift out of sync.
+#[cfg(unix)]
 async fn rejectable_hook_present(repo: &Path, need: NetworkNeed) -> bool {
     let hooks_dir = match run_git(repo, need, &["rev-parse", "--git-path", "hooks"]).await {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
@@ -597,6 +598,13 @@ async fn rejectable_hook_present(repo: &Path, need: NetworkNeed) -> bool {
                 })
                 .unwrap_or(false)
         })
+}
+
+#[cfg(windows)]
+async fn rejectable_hook_present(_repo: &Path, _need: NetworkNeed) -> bool {
+    // TODO(#859): Detect hooks Git for Windows can execute without relying on
+    // Unix permission bits, then preserve the same fail-closed classification.
+    false
 }
 
 /// Classify a failed `git commit --amend` into the typed

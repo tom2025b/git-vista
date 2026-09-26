@@ -93,6 +93,16 @@ fn run(repo: &Path, args: &[&str]) {
     );
 }
 
+#[cfg(unix)]
+fn symlink_file(target: &Path, link: &Path) {
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+#[cfg(windows)]
+fn symlink_file(target: &Path, link: &Path) {
+    std::os::windows::fs::symlink_file(target, link).unwrap();
+}
+
 /// `git <args…>` in `repo`, returning trimmed stdout; asserts success.
 fn out(repo: &Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
@@ -1003,7 +1013,9 @@ async fn merge_branch_executes_through_the_pipeline() {
 /// its own group (`process_group(0)`), the daemon inherits it, and the
 /// wrapper's un-reaped zombie keeps the group id from being recycled until the
 /// `wait` here releases it.
+#[cfg(unix)]
 struct DaemonGuard(std::process::Child);
+#[cfg(unix)]
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
         unsafe {
@@ -1013,6 +1025,8 @@ impl Drop for DaemonGuard {
     }
 }
 
+// The fixture's correctness depends on Unix process groups and signals.
+#[cfg(unix)]
 #[tokio::test]
 async fn push_branch_executes_through_the_pipeline() {
     let (dir, repo) = seeded_repo();
@@ -1985,7 +1999,7 @@ async fn delete_untracked_paths_refuses_a_real_symlink_escaping_the_worktree() {
 
     let (_dir, repo) = seeded_repo();
     let link = repo.join("evil-link");
-    std::os::unix::fs::symlink(&secret, &link).unwrap();
+    symlink_file(&secret, &link);
     // Genuinely untracked, and genuinely a symlink escaping the worktree —
     // both facts asserted before the guard is ever exercised.
     assert_eq!(out(&repo, &["status", "--porcelain"]), "?? evil-link");
@@ -2019,14 +2033,14 @@ async fn discard_tracked_paths_refuses_a_real_symlink_escaping_the_worktree() {
     let (_dir, repo) = seeded_repo();
     // Track a symlink pointing at a harmless in-repo target first...
     let link = repo.join("link.txt");
-    std::os::unix::fs::symlink(repo.join("a.txt"), &link).unwrap();
+    symlink_file(&repo.join("a.txt"), &link);
     run(&repo, &["add", "link.txt"]);
     run(&repo, &["commit", "-q", "-m", "add symlink"]);
     // ...then, without staging, repoint it outside the worktree: a real
     // uncommitted edit (the symlink's own target changed) — exactly what
     // DiscardTrackedPaths is being asked to discard.
     std::fs::remove_file(&link).unwrap();
-    std::os::unix::fs::symlink(&secret, &link).unwrap();
+    symlink_file(&secret, &link);
     assert_ne!(out(&repo, &["status", "--porcelain"]), "");
 
     let (status, why) =
@@ -2192,6 +2206,8 @@ async fn discard_tracked_paths_reverts_both_staged_and_unstaged_layers() {
 /// LATER one (`sub/b.txt`, whose parent directory is unwritable) and exits
 /// non-zero. The fix this pins: the journal must name the TRUE partial
 /// state — what actually reverted and what did not — never nothing at all.
+// This deliberately creates a POSIX permission-denied partial write.
+#[cfg(unix)]
 #[tokio::test]
 async fn discard_tracked_paths_journals_honestly_on_a_partial_multi_path_failure() {
     let (_dir, repo) = seeded_repo();
@@ -2409,7 +2425,7 @@ fn partial_delete_report_reads_the_worktree_so_a_translated_git_cannot_invert_it
 fn partial_delete_report_tells_a_surviving_dangling_symlink_from_a_deleted_one() {
     let (_dir, repo) = seeded_repo();
     let link = repo.join("dangling");
-    std::os::unix::fs::symlink(repo.join("no-such-target"), &link).unwrap();
+    symlink_file(&repo.join("no-such-target"), &link);
 
     // Paired negative on the naive fix: `exists()` already says "gone" for
     // this entry, which is still sitting in the worktree.
@@ -4088,6 +4104,13 @@ async fn the_amend_runs_repository_hooks_inside_the_pipelines_own_spawn() {
 /// fails the amend with the same empty-stderr signature) — so trimming the
 /// planner's hook list or regressing any one point turns this red. The
 /// repository must be untouched afterward.
+///
+/// Unix-only: the hook bodies are `#!/bin/sh` shebang scripts made executable
+/// via a Unix permission bit, and `rejectable_hook_present` has no Windows
+/// implementation yet (TODO #859, `commit_exec.rs`'s `#[cfg(windows)]` stub
+/// always returns `false`) — a real Windows hook-rejection test needs Windows
+/// hook-detection first, which this test's setup does not model.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_hook_rejection_is_classified_as_hook_rejected() {
     for hook in ["pre-commit", "prepare-commit-msg", "commit-msg"] {
@@ -4408,10 +4431,19 @@ async fn a_successful_amend_journals_the_old_and_new_tips_for_undo() {
 
 /// Make a fixture hook executable (`chmod +x`).
 fn make_executable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let mut permissions = std::fs::metadata(path).unwrap().permissions();
-    permissions.set_mode(permissions.mode() | 0o755);
-    std::fs::set_permissions(path, permissions).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(permissions.mode() | 0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        // Git for Windows dispatches hook files through its shell and does not
+        // expose a POSIX executable bit to set on NTFS.
+        let _ = path;
+    }
 }
 
 // --- #227 (M2.20a): typed remote vocabulary, execution not yet wired -------
@@ -5822,6 +5854,8 @@ async fn delete_local_tag_recovery_carries_the_unpeeled_tag_object() {
 /// the Network sandbox tier (receive-pack's quarantine migration is a
 /// cross-directory rename the shim denies), so this test cannot use the
 /// filesystem-path bare remote M2.21a's stub version of this test used.
+// The fixture's correctness depends on Unix process groups and signals.
+#[cfg(unix)]
 #[tokio::test]
 async fn delete_remote_tag_executes_through_the_pipeline() {
     let (dir, repo) = seeded_repo();
@@ -5906,6 +5940,8 @@ async fn delete_remote_tag_executes_through_the_pipeline() {
 /// fixture the delete test above uses, over the shared `PortClaim` (the
 /// three daemon-needing tests in this binary run it sequentially, never
 /// concurrently — see `test_ports`'s own doc).
+// The fixture's correctness depends on Unix process groups and signals.
+#[cfg(unix)]
 #[tokio::test]
 async fn push_tag_executes_through_the_pipeline() {
     let (dir, repo) = seeded_repo();

@@ -12,6 +12,8 @@
 //! knob that shrinks it; see that item's doc for why a `thread_local` and not
 //! a process-wide value.
 
+#![cfg(unix)]
+
 use super::*;
 use std::time::Duration;
 

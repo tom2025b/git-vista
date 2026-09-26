@@ -1790,6 +1790,7 @@ mod tests {
     /// module. Written inside `repo` (already rw-granted by the policy under
     /// test) since a path outside every grant a Network-tier policy makes
     /// cannot be exec'd at all under Landlock.
+    #[cfg(unix)]
     fn fake_git_dumper(repo: &Path) -> String {
         let dir = repo.join("fake-bin");
         std::fs::create_dir_all(&dir).expect("mkdir fake-bin");
@@ -1817,6 +1818,8 @@ mod tests {
     /// `sandboxed()` itself, called exactly the way `git_output_for` calls
     /// it, must route a `Remote`-declared spawn through the hardened
     /// launcher.
+    // The fixture is a POSIX shell executable and exercises Unix sandboxing.
+    #[cfg(unix)]
     #[tokio::test]
     async fn sandboxed_forces_askpass_hardening_for_remote_network_need() {
         let (_dir, repo) = seeded_repo();
@@ -1849,6 +1852,8 @@ mod tests {
     /// NOT carry the Network-tier forcing — proves the assertion above is
     /// actually discriminating on `need`, not just always true of every
     /// spawn this fixture produces.
+    // The fixture is a POSIX shell executable and exercises Unix sandboxing.
+    #[cfg(unix)]
     #[tokio::test]
     async fn sandboxed_does_not_force_askpass_hardening_for_local_network_need() {
         let (_dir, repo) = seeded_repo();
