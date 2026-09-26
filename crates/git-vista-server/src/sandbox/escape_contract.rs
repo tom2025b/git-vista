@@ -2076,7 +2076,7 @@ fn fn_body_raw<'a>(src: &'a str, name: &str) -> &'a str {
 }
 
 /// R10: every `"--…"` literal `shim_argv` emits (`mod.rs`) has a matching arm
-/// in the shim's `parse()` (`bin/gv-sandbox/main.rs`), and vice versa — a
+/// in the shim's `parse()` (`bin/gv-sandbox/imp/mod.rs`), and vice versa — a
 /// dead sanctioned route (emitted, unparsed) is exactly what
 /// `probe_argv`/`--self-probe` was, and an unreachable terminal mode (parsed,
 /// never built) is its mirror image. Scoped to the two builder/parser
@@ -2106,7 +2106,7 @@ fn r10_every_flag_sandbox_argv_emits_has_a_shim_parser_arm() {
         "flag scan of shim_argv found nothing — the scan broke"
     );
 
-    let main_src = read_rs("src/bin/gv-sandbox/main.rs");
+    let main_src = read_rs("src/bin/gv-sandbox/imp/mod.rs");
     let parse_body = fn_body_raw(&main_src, "parse");
 
     let mut arms: BTreeSet<String> = BTreeSet::new();

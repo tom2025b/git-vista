@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! M2.20e (#231): the push slice's *behavioural* tests — the ones that spawn a
 //! real `git push` against a real remote, because the properties this slice
 //! claims cannot be proved any other way.

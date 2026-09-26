@@ -408,6 +408,8 @@ async fn a_fetch_with_nothing_to_transfer_publishes_no_progress() {
 ///
 /// Both must be caught here by the marker's presence, while the unmutated
 /// operation remains successful.
+// The fixture is a POSIX shell executable whose mode is part of the setup.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_repository_named_upload_pack_never_executes_on_the_production_fetch_path() {
     use std::os::unix::fs::PermissionsExt;
@@ -659,6 +661,8 @@ fn hang_the_next_fetch(repo: &Path) -> HangingGitPeer {
 /// repository, with no cancel, comes back `cancelled == false` and
 /// `signal() == None`. Without it, an implementation that reported
 /// `Some(SIGKILL)` unconditionally would pass the first leg.
+// This assertion reads the Unix signal that terminated the child.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cancelled_stream_leaves_a_signalled_child_not_an_exited_one() {
     use std::os::unix::process::ExitStatusExt;
@@ -1325,8 +1329,17 @@ fn blind_the_repository_after_the_fetch(repo: &Path) {
         ),
     )
     .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        // Git for Windows dispatches hook files through its shell and does not
+        // expose a POSIX executable bit to set on NTFS.
+        let _ = &hook;
+    }
 }
 
 /// A fetch that ran, moved a ref, and then could not be re-read still leaves a

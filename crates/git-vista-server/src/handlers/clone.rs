@@ -990,10 +990,21 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn transport_output(code: i32, stderr: &str) -> std::process::Output {
         use std::os::unix::process::ExitStatusExt;
         std::process::Output {
             status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[cfg(windows)]
+    fn transport_output(code: i32, stderr: &str) -> std::process::Output {
+        use std::os::windows::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code as u32),
             stdout: Vec::new(),
             stderr: stderr.as_bytes().to_vec(),
         }
@@ -1244,6 +1255,9 @@ mod tests {
     /// held for microseconds inside `sandbox::test_env::with_env`'s guard and
     /// never across an `.await` — see that module's doc for the whole
     /// discipline.
+    // The fixture is a POSIX shell content filter whose executable bit is part
+    // of the behavior under test.
+    #[cfg(unix)]
     #[tokio::test]
     async fn clone_checkout_runs_a_filter_with_only_an_allowlisted_environment() {
         use std::os::unix::fs::PermissionsExt;

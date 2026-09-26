@@ -1,3 +1,5 @@
+#![cfg(all(unix, target_os = "linux"))]
+
 //! Regression test for the symlinked-`$HOME` exclude bypass (issue tracked in
 //! the M1.13b sandbox hardening pass, 2026-07-30).
 //!

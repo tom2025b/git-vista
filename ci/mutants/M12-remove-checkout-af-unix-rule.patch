@@ -1,5 +1,5 @@
---- a/crates/git-vista-server/src/bin/gv-sandbox/seccomp_filter.rs
-+++ b/crates/git-vista-server/src/bin/gv-sandbox/seccomp_filter.rs
+--- a/crates/git-vista-server/src/bin/gv-sandbox/imp/seccomp_filter.rs
++++ b/crates/git-vista-server/src/bin/gv-sandbox/imp/seccomp_filter.rs
 @@ -289,13 +289,6 @@
  fn rules_for(net: NetScope) -> Result<BTreeMap<i64, Vec<SeccompRule>>, seccompiler::BackendError> {
      let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
