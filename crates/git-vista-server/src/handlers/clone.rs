@@ -23,6 +23,8 @@
 //! reproduces until the client is wired to (a) retain the key it sent and
 //! (b) poll `clone-status` with it after a lost/failed response. Tracked as
 //! a separate follow-up rather than expanded into this change.
+//!
+//! #865: distinguish an empty remote from an unresolvable default HEAD.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -100,6 +102,7 @@ enum CloneExecutionError {
     CouldntRun(std::io::Error),
     GitFailed(std::process::Output),
     PrivateRepository(&'static str),
+    NoDefaultBranch,
 }
 
 /// The transport seam is injected so failed GitHub responses can be exercised
@@ -131,6 +134,12 @@ fn clone_execution_failure(error: CloneExecutionError) -> (StatusCode, String) {
         CloneExecutionError::PrivateRepository(message) => {
             (StatusCode::BAD_REQUEST, message.to_string())
         }
+        CloneExecutionError::NoDefaultBranch => (
+            StatusCode::BAD_REQUEST,
+            "The remote has no default branch to check out; nothing was checked out. \
+             Ask the repository owner to set its default branch to an existing branch."
+                .to_string(),
+        ),
         CloneExecutionError::GitFailed(output) => {
             let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
             (
@@ -165,6 +174,27 @@ fn validate_fresh_clone_url(url: &str) -> Result<String, String> {
         return Err("Plaintext HTTP clone URLs are not supported; use https://.".to_string());
     }
     Ok(url)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RefsProbeError {
+    NoDefaultBranch,
+    PropagateFailure,
+}
+
+/// An unresolved HEAD is acceptable only when a successful probe found no refs.
+fn unresolved_head_decision(
+    probe_succeeded: bool,
+    stdout_empty: bool,
+) -> Result<(), RefsProbeError> {
+    if !probe_succeeded {
+        return Err(RefsProbeError::PropagateFailure);
+    }
+    if stdout_empty {
+        Ok(())
+    } else {
+        Err(RefsProbeError::NoDefaultBranch)
+    }
 }
 
 /// Fetch objects and refs while the credential exists, then let that process
@@ -209,10 +239,10 @@ async fn execute_clone(
     .output();
     clone_transfer(url, token.is_some(), transfer).await?;
 
-    // `git clone` succeeds for an empty repository. Its symbolic HEAD has no
-    // target to check out, so preserve that behaviour instead of turning the
-    // split phase into a failure for an otherwise-valid empty remote.
-    // The two `UntrustedCheckoutCommand` annotations below are load-bearing,
+    // `git clone` succeeds for an empty repository, but a missing HEAD alone
+    // does not prove emptiness: a non-empty remote can have a dangling default
+    // branch. Only accept an unresolved HEAD when no refs were fetched (#865).
+    // The `UntrustedCheckoutCommand` annotations below are load-bearing,
     // not decoration. codex-daybreak defeated an earlier source-level version
     // of this guarantee by aliasing — `use network_exec::network_command as
     // network_command_without_credential` — which satisfies any scan looking
@@ -234,7 +264,26 @@ async fn execute_clone(
         .await
         .map_err(CloneExecutionError::CouldntRun)?;
     if head.status.code() == Some(1) {
-        return Ok(());
+        // Include tags as well as remote branches: tag-only repositories are
+        // not empty. Bound the output to one ref; an error cannot prove empty.
+        let refs_command: crate::sandbox::network_exec::UntrustedCheckoutCommand =
+            crate::sandbox::network_exec::network_command_without_credential(
+                checkout_policy,
+                dest,
+                &["for-each-ref", "--count=1", "--format=%(refname)"],
+            );
+        let refs = refs_command
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(CloneExecutionError::CouldntRun)?;
+        return match unresolved_head_decision(refs.status.success(), refs.stdout.is_empty()) {
+            Ok(()) => Ok(()),
+            Err(RefsProbeError::PropagateFailure) => Err(CloneExecutionError::GitFailed(refs)),
+            // Git may replace the remote's dangling symbolic HEAD with a
+            // local default name, so do not claim that name is the remote's.
+            Err(RefsProbeError::NoDefaultBranch) => Err(CloneExecutionError::NoDefaultBranch),
+        };
     }
     if !head.status.success() {
         return Err(CloneExecutionError::GitFailed(head));
@@ -1431,7 +1480,7 @@ mod tests {
     /// produce.
     ///
     /// What survives here is worth two lines and no more: a count that notices
-    /// if one of the two post-transfer spawns is deleted outright. Do not add
+    /// if one of the three post-transfer spawns is deleted outright. Do not add
     /// assertions to it that the type system already carries — a scan that
     /// looks like a boundary invites someone to trust it as one.
     #[test]
@@ -1456,8 +1505,8 @@ mod tests {
 
         assert_eq!(
             body.matches("network_command_without_credential(").count(),
-            1,
-            "the credentialless HEAD probe must still use the sealed builder"
+            2,
+            "the credentialless HEAD and refs probes must still use the sealed builder"
         );
         assert_eq!(
             body.matches("lfs_checkout_command(").count(),
@@ -2020,5 +2069,195 @@ mod tests {
             remote_web_url: None,
             hook_policy: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod head_suite {
+    //! Real clone fixtures for #865, through the production transfer, HEAD probe,
+    //! cleanup, response and replay paths. No network or real credentials required.
+    //!
+    //! Decision: assert the public failure and filesystem effects so both restoring
+    //! the unconditional exit-1 shortcut and replacing the named failure with a
+    //! generic Git failure are caught. Empty and valid remotes are paired controls.
+
+    use super::*;
+
+    // Decision: test failed probes with either output shape without relying on
+    // a Git subprocess failing in a particular way. A failed probe is never empty.
+    #[test]
+    fn refs_probe_decision_requires_success_before_accepting_empty() {
+        assert_eq!(unresolved_head_decision(true, true), Ok(()));
+        assert_eq!(
+            unresolved_head_decision(true, false),
+            Err(RefsProbeError::NoDefaultBranch)
+        );
+        for stdout_empty in [true, false] {
+            assert_eq!(
+                unresolved_head_decision(false, stdout_empty),
+                Err(RefsProbeError::PropagateFailure),
+                "failed probe must propagate even when stdout_empty={stdout_empty}"
+            );
+        }
+    }
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .current_dir(repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args([
+                "-c",
+                "user.name=git-vista-test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .expect("fixture git starts");
+        assert!(
+            output.status.success(),
+            "fixture git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    fn remote_fixture(root: &Path, populated: bool) -> PathBuf {
+        let remote = root.join("remote.git");
+        git(
+            root,
+            &["init", "--bare", "--initial-branch=main", "remote.git"],
+        );
+        if populated {
+            git(root, &["init", "--initial-branch=main", "source"]);
+            let source = root.join("source");
+            std::fs::write(source.join("README"), "clone fixture\n").unwrap();
+            git(&source, &["add", "README"]);
+            git(&source, &["commit", "-m", "fixture"]);
+            git(&source, &["push", remote.to_str().unwrap(), "main"]);
+        }
+        remote
+    }
+
+    async fn guarded_clone(
+        root: &Path,
+        remote: &Path,
+        dest: &Path,
+    ) -> Result<(), GuardedOutcome<CloneExecutionError>> {
+        let policy = crate::sandbox::policy_for_clone(root).expect("clone policy");
+        let checkout_policy =
+            crate::sandbox::policy_for_clone_checkout(root).expect("checkout policy");
+        run_guarded(
+            dest,
+            std::time::Duration::from_secs(30),
+            execute_clone(
+                &policy,
+                &checkout_policy,
+                root,
+                dest,
+                remote.to_str().unwrap(),
+                None,
+            ),
+        )
+        .await
+    }
+
+    async fn assert_no_default_branch(tag_only: bool, key: &str) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let remote = remote_fixture(root, true);
+        git(&remote, &["symbolic-ref", "HEAD", "refs/heads/absent"]);
+        if tag_only {
+            git(&remote, &["tag", "v1", "refs/heads/main"]);
+            git(&remote, &["update-ref", "-d", "refs/heads/main"]);
+        }
+        assert_eq!(
+            git(&remote, &["symbolic-ref", "HEAD"]).trim(),
+            "refs/heads/absent"
+        );
+        assert!(!git(&remote, &["for-each-ref", "--format=%(refname)"]).is_empty());
+
+        let dest = root.join("clone");
+        let key = IdempotencyKey::new(key).unwrap();
+        let url = remote.to_str().unwrap();
+        let CloneAdmission::Fresh(guard) = admit_clone(Some(key.clone()), url).unwrap() else {
+            panic!("fresh attempt must be admitted");
+        };
+        let error = match guarded_clone(root, &remote, &dest).await {
+            Err(GuardedOutcome::Failed(error)) => error,
+            Err(GuardedOutcome::TimedOut) => panic!("local fixture timed out"),
+            Ok(()) => panic!("non-empty remote with dangling HEAD returned ordinary success"),
+        };
+        assert!(!dest.exists(), "failed clone must remove the destination");
+        let failure = clone_execution_failure(error);
+        let expected = "The remote has no default branch to check out; nothing was checked out. Ask the repository owner to set its default branch to an existing branch.";
+        assert_eq!(failure, (StatusCode::BAD_REQUEST, expected.to_string()));
+        guard.finish(&Err(failure.clone()));
+        let response = failure.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), expected);
+
+        let response = clone_status(PathParam(key.as_str().to_string())).await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status["state"], "failed");
+        assert_eq!(status["status"], 400);
+        assert_eq!(status["message"], expected);
+        assert!(status.get("descriptor").is_none());
+        match admit_clone(Some(key), url).unwrap() {
+            CloneAdmission::Replay(Err((status, message))) => {
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert_eq!(message, expected);
+            }
+            _ => panic!("retry must replay the named failure"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dangling_head_clone_fails_with_named_outcome_and_cleans_up() {
+        assert_no_default_branch(false, "test-865-dangling-head").await;
+    }
+
+    #[tokio::test]
+    async fn tag_only_remote_with_dangling_head_is_not_empty() {
+        assert_no_default_branch(true, "test-865-tag-only").await;
+    }
+
+    #[tokio::test]
+    async fn genuinely_empty_remote_clones_as_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let remote = remote_fixture(root, false);
+        assert!(git(&remote, &["for-each-ref"]).is_empty());
+        let dest = root.join("clone");
+        assert!(guarded_clone(root, &remote, &dest).await.is_ok());
+        assert!(dest.join(".git").is_dir());
+        assert!(git(&dest, &["for-each-ref"]).is_empty());
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn valid_default_head_checks_out_tracked_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let remote = remote_fixture(root, true);
+        let dest = root.join("clone");
+        assert!(guarded_clone(root, &remote, &dest).await.is_ok());
+        assert_eq!(
+            std::fs::read_to_string(dest.join("README")).unwrap(),
+            "clone fixture\n"
+        );
+        assert_eq!(
+            git(&dest, &["rev-parse", "HEAD"]),
+            git(&remote, &["rev-parse", "main"])
+        );
     }
 }
