@@ -1,3 +1,5 @@
+// **Signed:** codex · 2026-09-26T12:39:32-04:00
+// last_edited_by: codex
 //! Host tests for the plan-freshness decision (#555).
 
 use super::*;
@@ -1117,60 +1119,228 @@ fn history_reload_is_a_history_token_comparison_and_never_fires_without_a_displa
     assert!(history_requires_reload(Some(&history_gen("11")), &live));
 }
 
+// The wrapper census only checks browser wiring; scheduling and completion
+// below execute the exact production core, including both probe dispatches.
 #[test]
-fn the_graph_follow_up_asks_core_and_probes_history_v1_not_the_feed_token() {
-    // cargo test never compiles signals.rs (wasm-only). This is the host
-    // pin that the wrapper asks the two questions above rather than
-    // comparing the planner generation the feed carries to the graph epoch.
-    assert!(
-        FEED_SIGNALS.contains("live_followup("),
-        "the wrapper must ask whether this snapshot is a reading"
-    );
-    assert!(
-        FEED_SIGNALS.contains("history_requires_reload("),
-        "and whether the live history Frame disagrees with the one on screen"
-    );
-    assert!(
-        FEED_SIGNALS.contains("fetch_frame()"),
-        "the check is a history read, not the feed's planner generation"
-    );
-    assert!(
-        !FEED_SIGNALS.contains("on_invalidate("),
-        "on_invalidate compares GraphCore's stored token, which after a write \
-         is the planner generation — mixing it with history-v1 remounts after \
-         every in-app commit"
-    );
-    assert!(
-        FEED_SIGNALS.contains("view().is_historical()"),
-        "a historical as-of view must not be replaced by live history"
-    );
-    assert!(
-        FEED_SIGNALS.contains("status.refetch()"),
-        "worktree-only movement still has to refresh the chip"
-    );
+fn the_graph_follow_up_wires_the_host_scheduler_to_frame_requests_and_timers() {
+    for call in [
+        "h.update(",
+        "h.complete(",
+        "h.retry(",
+        "fetch_frame()",
+        "sleep_ms(delay_ms)",
+        "status.refetch()",
+    ] {
+        assert!(
+            FEED_SIGNALS.contains(call),
+            "missing browser adapter: {call}"
+        );
+    }
     const APP: &str = include_str!("../../app/mod.rs");
-    assert!(
-        APP.contains("freshness.follow_graph("),
-        "App must actually install the follow-up — a dead helper in signals.rs \
-         would leave the graph stale with every host test still green"
+    assert!(APP.contains("freshness.follow_graph("));
+}
+
+use crate::features::core_traits::{Applied, Invalidate, InvalidateScope};
+use crate::features::graph::core::GraphCore;
+
+/// Tiny executor: feed, Ready and timer events all run the same production
+/// scheduler. Frame replies are injected at the HTTP boundary.
+struct HistoryHarness {
+    follower: HistoryFollower,
+    graph: GraphCore,
+    snapshot: ChangeFeedSnapshot,
+    ready: bool,
+    displayed: Option<GenerationToken>,
+}
+
+impl HistoryHarness {
+    fn new(ready: bool) -> Self {
+        Self {
+            follower: HistoryFollower::default(),
+            graph: GraphCore::default(),
+            snapshot: unknown_delta("planner-b"),
+            ready,
+            displayed: ready.then(|| history_gen("history-a")),
+        }
+    }
+
+    fn tick(&mut self) -> HistoryActions {
+        self.follower.update(
+            Some(&self.snapshot),
+            &self.graph,
+            self.ready,
+            self.displayed.as_ref(),
+        )
+    }
+
+    fn reply(&mut self, probe: &HistoryProbe, result: Result<&str, &str>) -> Option<u64> {
+        self.follower.complete(
+            probe,
+            result.map(history_gen).map_err(str::to_string),
+            &mut self.graph,
+            self.ready,
+            self.displayed.as_ref(),
+        )
+    }
+
+    fn settle(&mut self) -> Applied {
+        self.graph.on_invalidate(&Invalidate {
+            scope: InvalidateScope::Graph,
+            generation: self.snapshot.generation.clone(),
+        })
+    }
+}
+
+#[test]
+fn history_scheduler_failed_probe_recovers_without_another_feed_event() {
+    let mut h = HistoryHarness::new(true);
+    let first = h.tick();
+    assert!(first.refetch_status);
+    let first = first.probe.expect("feed dispatch must issue the request");
+    assert_eq!(h.reply(&first, Err("offline")), Some(250));
+    assert!(h.tick().probe.is_none(), "no busy retry before the timer");
+    h.follower.retry(&first);
+    let retry = h
+        .tick()
+        .probe
+        .expect("timer must retry without another publication");
+    assert_eq!(h.snapshot.seq, 0);
+    assert_eq!(h.reply(&retry, Ok("history-b")), None);
+    assert_eq!(h.graph.epoch(), 1);
+    assert_eq!(h.follower.check, HistoryCheck::Compared);
+    assert!(h.tick().probe.is_none());
+}
+
+#[test]
+fn history_scheduler_deferred_first_load_recovers_without_another_feed_event() {
+    let mut h = HistoryHarness::new(false);
+    assert!(h.tick().probe.is_none());
+    assert_eq!(h.follower.check, HistoryCheck::WaitingForFrame);
+    h.ready = true;
+    h.displayed = Some(history_gen("history-a"));
+    let first = h
+        .tick()
+        .probe
+        .expect("Ready must dispatch the pending check");
+    assert_eq!(h.reply(&first, Err("offline")), Some(250));
+    h.follower.retry(&first);
+    let retry = h.tick().probe.expect("deferred checks must also retry");
+    h.reply(&retry, Ok("history-b"));
+    assert_eq!(h.snapshot.seq, 0);
+    assert_eq!(h.graph.epoch(), 1);
+    assert_eq!(h.follower.check, HistoryCheck::Compared);
+}
+
+#[test]
+fn history_scheduler_feed_first_coalesces_settlement() {
+    let mut h = HistoryHarness::new(true);
+    let probe = h.tick().probe.unwrap();
+    h.reply(&probe, Ok("history-b"));
+    assert_eq!(h.graph.epoch(), 1);
+    assert_eq!(h.settle(), Applied::NoChange);
+    assert_eq!(
+        h.graph.epoch(),
+        1,
+        "settlement must recognize the feed's planner record"
     );
-    let follow = FEED_SIGNALS
-        .split("fn probe_history(")
-        .nth(1)
-        .expect("probe_history remains the one async history check");
-    assert!(
-        follow.contains("fetch_frame().await"),
-        "the live Frame is awaited inside the probe"
+}
+
+#[test]
+fn history_scheduler_settlement_first_coalesces_feed() {
+    let mut h = HistoryHarness::new(true);
+    assert_eq!(h.settle(), Applied::Committed);
+    h.ready = false;
+    h.displayed = None;
+    assert!(h.tick().probe.is_none());
+    h.ready = true;
+    h.displayed = Some(history_gen("history-b"));
+    let probe = h.tick().probe.unwrap();
+    h.reply(&probe, Ok("history-b"));
+    assert_eq!(h.graph.epoch(), 1);
+    assert_eq!(h.follower.check, HistoryCheck::Compared);
+}
+
+#[test]
+fn history_scheduler_retired_epoch_completion_cannot_reload_and_rechecks_ready() {
+    for result in [Ok("history-b"), Err("late failure")] {
+        let mut h = HistoryHarness::new(true);
+        let retired = h.tick().probe.unwrap();
+        h.settle();
+        h.ready = false;
+        h.displayed = None;
+        assert_eq!(h.reply(&retired, result), None);
+        assert_eq!(h.graph.epoch(), 1);
+        assert!(h.tick().probe.is_none());
+        h.ready = true;
+        h.displayed = Some(history_gen("history-b"));
+        let current = h.tick().probe.expect("retirement must retain the check");
+        h.reply(&current, Ok("history-b"));
+        assert_eq!(h.graph.epoch(), 1);
+        assert_eq!(h.follower.check, HistoryCheck::Compared);
+    }
+}
+
+#[test]
+fn history_scheduler_exhaustion_is_explicit_and_refresh_restarts_it() {
+    let mut h = HistoryHarness::new(true);
+    for delay in [Some(250), Some(1_000), Some(4_000), None] {
+        let probe = h.tick().probe.unwrap();
+        assert_eq!(h.reply(&probe, Err("offline")), delay);
+        assert!(h.tick().probe.is_none());
+        h.follower.retry(&probe);
+    }
+    assert_eq!(
+        h.follower.check,
+        HistoryCheck::Failed {
+            attempts: 4,
+            reason: "offline".into()
+        }
     );
-    let bump = follow
-        .rfind("force_bump()")
-        .expect("a history mismatch remounts with force_bump");
-    let second_epoch = follow
-        .rfind("graph.get_untracked().epoch()")
-        .expect("the epoch is re-read after the await");
     assert!(
-        second_epoch < bump,
-        "a late Frame for a retired epoch must not remount: the live epoch \
-         is read after fetch_frame returns, before force_bump"
+        h.follower.pending.is_some(),
+        "failure is not a successful comparison"
     );
+    assert!(h.tick().probe.is_none(), "bounded automatic recovery");
+    h.graph.force_bump();
+    h.ready = false;
+    h.displayed = None;
+    assert!(h.tick().probe.is_none());
+    h.ready = true;
+    h.displayed = Some(history_gen("history-b"));
+    let probe = h.tick().probe.unwrap();
+    h.reply(&probe, Ok("history-b"));
+    assert_eq!(h.follower.check, HistoryCheck::Compared);
+    assert!(h.follower.pending.is_none());
+}
+
+#[test]
+fn history_scheduler_new_reading_supersedes_old_completion_and_timer() {
+    let mut h = HistoryHarness::new(true);
+    let old = h.tick().probe.unwrap();
+    h.reply(&old, Err("offline"));
+    h.snapshot.seq += 1;
+    h.snapshot.generation = Some(history_gen("planner-c"));
+    let current = h.tick().probe.unwrap();
+    h.follower.retry(&old);
+    h.reply(&old, Ok("obsolete-history"));
+    assert_eq!(h.follower.check, HistoryCheck::InFlight(current.clone()));
+    assert_eq!(h.graph.epoch(), 0);
+    h.reply(&current, Ok("history-c"));
+    assert_eq!(h.graph.epoch(), 1);
+    assert_eq!(h.settle(), Applied::NoChange);
+}
+
+#[test]
+fn history_scheduler_worktree_only_and_historical_views_do_not_reload() {
+    let mut h = HistoryHarness::new(true);
+    let actions = h.tick();
+    assert!(actions.refetch_status);
+    h.reply(&actions.probe.unwrap(), Ok("history-a"));
+    assert_eq!(h.graph.epoch(), 0);
+    h.graph.show_as_of("observation".into(), 1, None);
+    h.snapshot.seq += 1;
+    let actions = h.tick();
+    assert!(!actions.refetch_status);
+    assert!(actions.probe.is_none());
+    assert_eq!(h.follower.check, HistoryCheck::Idle);
 }

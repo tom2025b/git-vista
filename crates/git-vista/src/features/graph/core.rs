@@ -1,3 +1,5 @@
+// **Signed:** codex · 2026-09-26T12:39:32-04:00
+// last_edited_by: codex
 //! Graph state: the frame, the paged-history aggregate, its request state, and the
 //! epoch that decides when a stale view must be discarded (M1.11, #64).
 //!
@@ -38,6 +40,7 @@ pub type Page = HistoryPage<GraphRow, Edge, FrameStub>;
 pub struct GraphCore {
     view: HistoryView,
     epoch: u64,
+    // Planner recipe only; accepted Frame history-v1 tokens live separately.
     generation: Option<GenerationToken>,
 }
 
@@ -91,8 +94,8 @@ impl GraphCore {
         self.force_bump();
     }
 
-    /// Start at epoch 0, already at `generation` — the seed state once the first
-    /// Frame has landed and reported a generation.
+    /// Start at epoch 0 with an already-observed planner generation.
+    /// This is not the history-v1 generation of the displayed Frame.
     pub fn at_generation(generation: &str) -> Self {
         Self {
             view: HistoryView::Live,
@@ -111,6 +114,18 @@ impl GraphCore {
     pub fn force_bump(&mut self) -> u64 {
         self.epoch += 1;
         self.epoch
+    }
+
+    /// A history comparison proved movement. Record the planner reading that
+    /// requested it so settlement coalesces in either order. This argument is
+    /// never a Frame's history-v1 token.
+    pub fn force_bump_for_feed(&mut self, planner_generation: &GenerationToken) -> Applied {
+        if self.view.is_historical() || self.generation.as_ref() == Some(planner_generation) {
+            return Applied::NoChange;
+        }
+        self.generation = Some(planner_generation.clone());
+        self.force_bump();
+        Applied::Committed
     }
 
     pub fn epoch(&self) -> u64 {

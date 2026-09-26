@@ -13,7 +13,7 @@ M12 taught the app to *say* when the repository moved underneath it. The change 
 
 So a `git commit` in a terminal, an auto-checkpoint, or a checkout left the canvas showing the previous history until the user hit Refresh. In-app writes already remounted through `GraphCore::on_invalidate`. External writes only changed the freshness badge.
 
-The obvious wiring — `on_invalidate` with the feed's generation — is the mix `staging.rs` already names: it "409s forever, never admits". Five generation recipes ship in this server. The feed carries the planner recipe (HEAD, refs, worktree status). The graph is pinned to history-v1 (committed topology, plus shallow). Those tokens are not comparable. Treating them as one would remount the canvas on every editor save, and after an in-app write it would remount *again* because the stored `GraphCore` token from settlement is also the planner recipe.
+Directly passing every feed reading to `on_invalidate` would remount on editor saves, because the feed carries the planner recipe (HEAD, refs, worktree status). The graph is pinned to history-v1 (committed topology, plus shallow). Comparing those two recipes is the mix `staging.rs` names: it "409s forever, never admits". Five generation recipes ship in this server. The history comparison must establish committed movement first; only then can the feed's planner token identify the reading for settlement coalescing.
 
 ```mermaid
 flowchart TD
@@ -40,7 +40,8 @@ The feed remains a hint. History-v1 remains the fact.
 3. The canvas remounts only when a live `GET /api/frame` disagrees with the Frame already on this epoch. That comparison is history-v1 against history-v1.
 4. No displayed Frame (seed still loading) does **not** remount. Bumping then fights the in-flight seed. The Ready transition re-checks, so an external commit during first load cannot strand a stale page.
 5. A historical as-of view does not follow live history. Refresh in that mode is still "reload this observation", never "return to live".
-6. `GraphCore::on_invalidate` is not this path. After a write it stores the planner token. Feeding it a history-v1 token would look like movement every time.
+6. The history comparison never feeds a history-v1 token to `GraphCore::on_invalidate`. When history differs, `force_bump_for_feed` records the requesting feed reading's **planner** token in the same slot used by settlement. Equal planner tokens coalesce in either arrival order; history-v1 tokens are compared only to other history-v1 tokens.
+7. A reading remains outstanding until a successful history comparison. Failed requests retry after 250 ms, 1 s, and 4 s, without needing another publication. The fourth failure enters `HistoryCheck::Failed { attempts, reason }`; it stays outstanding, is reported to the browser console, and a new reading or epoch (including Refresh) starts a fresh budget.
 
 ```mermaid
 flowchart TD
@@ -55,7 +56,7 @@ flowchart TD
     R -->|yes| FR["GET /api/frame"]
     FR --> C{"Did history-v1 move?"}
     C -->|no| K["Keep canvas"]
-    C -->|yes| M["force_bump"]
+    C -->|yes| M["Record planner reading and coalesce reload"]
     P --> R
 
     classDef step fill:#eaf2fa,color:#14406f,stroke:#14406f,stroke-width:3px
@@ -74,7 +75,7 @@ A late Frame for a retired epoch is dropped: the probe captures the epoch, await
 
 | Alternative | Why it lost |
 |---|---|
-| `on_invalidate` with the feed token | Mixes planner and history-v1. Remounts on editor saves. After an in-app write, remounts a second time. |
+| `on_invalidate` directly on every feed reading | Bypasses the history-v1 comparison and remounts on worktree-only editor saves. |
 | Remount on any `RefDelta::Named` with refs | HEAD's symbolic target is folded into `other` with worktree status. A checkout would not move the HEAD badge. |
 | Skip `other` entirely | Same miss: checkout is `other`. |
 | Put history-v1 on the change feed | A protocol change for a client that can already read `/api/frame`. The over-read of one extra Frame per repository change is the cheaper mistake. |
@@ -84,10 +85,16 @@ A late Frame for a retired epoch is dropped: the probe captures the epoch, await
 
 External commits, checkouts, and ref movement reload the live graph without a manual Refresh. Worktree-only edits refresh the status chip and leave the camera alone.
 
-In-app writes still remount once through settlement. The follow-up probe then sees the same history-v1 Frame and does not bump again, provided the seed for that epoch has landed. A snapshot during `SeedLoading` waits for Ready.
+An in-app write remounts once, whether its feed probe or settlement arrives first. The first reload records the planner generation; the other path recognizes it. A snapshot during `SeedLoading` waits for Ready, and that deferred check gets the same retry budget as an immediate check. A completion or retry timer from an obsolete ticket cannot overwrite a newer check. Retiring an epoch retains an outstanding check until the current epoch has an accepted Frame.
 
-The wasm wrapper is not compiled by `cargo test`. The decisions live in `features/freshness/core.rs`. A source census pins that `signals.rs` asks those functions, probes `/api/frame`, skips `on_invalidate`, and re-reads the epoch after the await.
+The wasm wrapper is not compiled by `cargo test`. `HistoryFollower` in `features/freshness/core.rs` owns both dispatch paths, pending checks, retry scheduling, terminal failure, and completion fencing. Executable host tests drive feed, Ready, timer, and completion events through that production scheduler. A small source census checks browser adapter wiring only; it is not evidence that scheduling works. The adapter fetches Frames, sleeps for the delay chosen by core, and publishes core state.
+
+Decision log for #853: retain the existing no-argument `force_bump` API for manual refresh, repository selection, and drift callers; add `force_bump_for_feed` to record only planner provenance. Keep client probe failure separate from server sweep health. A dedicated visible probe-failure affordance is deferred; the failure state and console diagnostic are implemented within the authorized files.
 
 Failure-atlas **678** (history comparison inverted) and **679** (reload with no displayed Frame, which would fight the in-flight seed) are both conclusive `caught`, at disjoint assertions.
 
 **Signed:** grok · 2026-09-18T05:25:00Z
+
+**Signed:** codex · 2026-09-26T12:41:25-04:00
+
+last_edited_by: codex

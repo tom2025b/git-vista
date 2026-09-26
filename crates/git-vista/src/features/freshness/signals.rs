@@ -1,3 +1,5 @@
+// **Signed:** codex · 2026-09-26T12:39:32-04:00
+// last_edited_by: codex
 //! The change feed's client half — wasm only (M12.05, #555).
 //!
 //! One `EventSource` on `GET /api/repository/events`, one log of what it
@@ -32,7 +34,7 @@ use crate::features::graph::core::GraphCore;
 use crate::features::status::signals::StatusResource;
 
 use super::core::{
-    history_requires_reload, live_followup, verdict, FeedLog, LiveFollowup, PlanSlot, PlanVerdict,
+    verdict, FeedLog, HistoryCheck, HistoryFollower, HistoryProbe, PlanSlot, PlanVerdict,
 };
 
 /// How long to wait before re-opening a change feed that dropped.
@@ -54,6 +56,7 @@ const REATTACH_INTERVAL_MS: u64 = 1_000;
 #[derive(Clone, Copy)]
 pub struct Freshness {
     log: RwSignal<FeedLog>,
+    history: RwSignal<HistoryFollower>,
 }
 
 impl Default for Freshness {
@@ -66,6 +69,7 @@ impl Freshness {
     pub fn new() -> Self {
         Self {
             log: create_rw_signal(FeedLog::new()),
+            history: create_rw_signal(HistoryFollower::default()),
         }
     }
 
@@ -115,61 +119,71 @@ impl Freshness {
         displayed: Signal<Option<GenerationToken>>,
         status: StatusResource,
     ) {
-        let pending = create_rw_signal(false);
-        let last_seq = create_rw_signal(None::<u64>);
+        let history = self.history;
         create_effect(move |_| {
-            let Some(snapshot) = self.latest_snapshot() else {
-                last_seq.set(None);
-                return;
-            };
-            if last_seq.get_untracked() == Some(snapshot.seq) {
-                return;
+            let snapshot = self.latest_snapshot();
+            let current = graph.get();
+            let ready = graph_ready.get();
+            let frame = displayed.get();
+            // Timer writes wake this effect without another feed event.
+            // Untracked writes avoid notifying ourselves while dispatching.
+            self.history_check();
+            let mut actions = None;
+            history.update_untracked(|h| {
+                actions = Some(h.update(snapshot.as_ref(), &current, ready, frame.as_ref()));
+            });
+            let Some(actions) = actions else { return };
+            if actions.refetch_status {
+                status.refetch();
             }
-            last_seq.set(Some(snapshot.seq));
-            if live_followup(&snapshot) != LiveFollowup::CheckHistory {
-                return;
-            }
-            if graph.get_untracked().view().is_historical() {
-                return;
-            }
-            status.refetch();
-            if graph_ready.get_untracked() && displayed.get_untracked().is_some() {
-                probe_history(graph, displayed);
-            } else {
-                pending.set(true);
+            if let Some(probe) = actions.probe {
+                run_history_probe(history, graph, graph_ready, displayed, probe);
             }
         });
-        create_effect(move |_| {
-            if !graph_ready.get() || !pending.get() {
-                return;
-            }
-            pending.set(false);
-            if graph.get_untracked().view().is_historical() {
-                return;
-            }
-            status.refetch();
-            probe_history(graph, displayed);
-        });
+    }
+
+    /// Separate from server feed health: a client GET failure does not mean
+    /// the server sweep is blind. Exhaustion is also reported to the console.
+    pub fn history_check(&self) -> HistoryCheck {
+        self.history.with(|h| h.check.clone())
     }
 }
 
-fn probe_history(graph: RwSignal<GraphCore>, displayed: Signal<Option<GenerationToken>>) {
-    if graph.get_untracked().view().is_historical() {
-        return;
-    }
-    let epoch = graph.get_untracked().epoch();
+fn run_history_probe(
+    history: RwSignal<HistoryFollower>,
+    graph: RwSignal<GraphCore>,
+    graph_ready: Signal<bool>,
+    displayed: Signal<Option<GenerationToken>>,
+    probe: HistoryProbe,
+) {
     spawn_local(async move {
-        let Ok(frame) = crate::api::fetch_frame().await else {
+        let result = crate::api::fetch_frame()
+            .await
+            .map(|frame| frame.generation)
+            .map_err(|error| error.to_string());
+        let (Some(mut current), Some(ready), Some(frame)) = (
+            graph.try_get_untracked(),
+            graph_ready.try_get_untracked(),
+            displayed.try_get_untracked(),
+        ) else {
             return;
         };
-        if graph.get_untracked().epoch() != epoch {
-            return;
+        let before = current.clone();
+        let mut retry = None;
+        let _ = history.try_update(|h| {
+            retry = h.complete(&probe, result, &mut current, ready, frame.as_ref());
+            if let HistoryCheck::Failed { attempts, reason } = &h.check {
+                leptos::logging::error!(
+                    "History check failed after {attempts} attempts: {reason}. Refresh to retry."
+                );
+            }
+        });
+        if current != before {
+            graph.set(current);
         }
-        if graph.get_untracked().view().is_historical() {
-            return;
-        }
-        if history_requires_reload(displayed.get_untracked().as_ref(), &frame.generation) {
-            let _ = graph.try_update(|g| g.force_bump());
+        if let Some(delay_ms) = retry {
+            crate::api::sleep_ms(delay_ms).await;
+            let _ = history.try_update(|h| h.retry(&probe));
         }
     });
 }

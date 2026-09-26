@@ -1,3 +1,5 @@
+// **Signed:** codex · 2026-09-26T12:39:32-04:00
+// last_edited_by: codex
 //! Whether the plan on screen still describes the repository (M12.05, #555).
 //!
 //! # The decision this file exists to protect
@@ -713,6 +715,178 @@ pub fn history_requires_reload(
     match displayed {
         None => false,
         Some(current) => current != live,
+    }
+}
+
+// Decision log (#853): both dispatch sites, retries, and completion fencing live
+// in host-testable code. Tickets fence epoch retirement and newer readings.
+// **Signed:** codex · 2026-09-26T12:36:02-04:00
+// last_edited_by: codex
+
+/// Planner identity is for settlement coalescing only, never Frame comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryProbe {
+    serial: u64,
+    epoch: u64,
+    planner_generation: GenerationToken,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum HistoryCheck {
+    #[default]
+    Idle,
+    WaitingForFrame,
+    InFlight(HistoryProbe),
+    Backoff {
+        probe: HistoryProbe,
+        delay_ms: u64,
+    },
+    Compared,
+    /// Outstanding, but automatic recovery is exhausted. A new reading or
+    /// epoch (including Refresh) starts a fresh recovery budget.
+    Failed {
+        attempts: usize,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct HistoryActions {
+    pub refetch_status: bool,
+    pub probe: Option<HistoryProbe>,
+}
+
+/// Single owner of outstanding checks; no browser or executor needed.
+#[derive(Debug, Clone, Default)]
+pub struct HistoryFollower {
+    last_seq: Option<u64>,
+    epoch: Option<u64>,
+    pending: Option<GenerationToken>,
+    serial: u64,
+    failures: usize,
+    pub check: HistoryCheck,
+}
+
+impl HistoryFollower {
+    /// Called on feed, epoch, readiness, or Frame changes. A publication is
+    /// consumed once; its check stays outstanding until successfully compared.
+    pub fn update(
+        &mut self,
+        snapshot: Option<&ChangeFeedSnapshot>,
+        graph: &crate::features::graph::core::GraphCore,
+        ready: bool,
+        displayed: Option<&GenerationToken>,
+    ) -> HistoryActions {
+        let mut actions = HistoryActions::default();
+        if self.epoch != Some(graph.epoch()) {
+            self.epoch = Some(graph.epoch());
+            if self.pending.is_some() {
+                self.check = HistoryCheck::WaitingForFrame;
+                self.failures = 0;
+            }
+        }
+        if graph.view().is_historical() {
+            self.pending = None;
+            self.check = HistoryCheck::Idle;
+            self.last_seq = snapshot.map(|s| s.seq);
+            return actions;
+        }
+        let new_reading = snapshot.filter(|s| self.last_seq != Some(s.seq));
+        self.last_seq = snapshot.map(|s| s.seq);
+        if let Some(snapshot) = new_reading {
+            if live_followup(snapshot) == LiveFollowup::CheckHistory {
+                self.pending = snapshot.generation.clone();
+                self.failures = 0;
+                self.check = HistoryCheck::WaitingForFrame;
+                actions.refetch_status = true;
+                self.probe_history(graph, ready, displayed, &mut actions);
+                return actions;
+            }
+        }
+        // Ready after first load, epoch retirement, or a retry timer. None
+        // requires another feed event.
+        self.probe_history(graph, ready, displayed, &mut actions);
+        actions
+    }
+
+    fn probe_history(
+        &mut self,
+        graph: &crate::features::graph::core::GraphCore,
+        ready: bool,
+        displayed: Option<&GenerationToken>,
+        actions: &mut HistoryActions,
+    ) {
+        if self.check != HistoryCheck::WaitingForFrame || !ready || displayed.is_none() {
+            return;
+        }
+        let Some(planner_generation) = self.pending.clone() else {
+            return;
+        };
+        self.serial += 1;
+        let probe = HistoryProbe {
+            serial: self.serial,
+            epoch: graph.epoch(),
+            planner_generation,
+        };
+        self.check = HistoryCheck::InFlight(probe.clone());
+        actions.probe = Some(probe);
+    }
+
+    /// Complete against the live epoch and its accepted Frame, never a Frame
+    /// captured before awaiting. Returns a timer for a retryable failure.
+    pub fn complete(
+        &mut self,
+        probe: &HistoryProbe,
+        result: Result<GenerationToken, String>,
+        graph: &mut crate::features::graph::core::GraphCore,
+        ready: bool,
+        displayed: Option<&GenerationToken>,
+    ) -> Option<u64> {
+        if self.check != HistoryCheck::InFlight(probe.clone()) {
+            return None;
+        }
+        if graph.epoch() != probe.epoch
+            || graph.view().is_historical()
+            || !ready
+            || displayed.is_none()
+        {
+            self.check = HistoryCheck::WaitingForFrame;
+            return None;
+        }
+        match result {
+            Ok(live) => {
+                self.pending = None;
+                self.check = HistoryCheck::Compared;
+                if history_requires_reload(displayed, &live) {
+                    graph.force_bump_for_feed(&probe.planner_generation);
+                }
+                None
+            }
+            Err(reason) => {
+                const BACKOFF_MS: [u64; 3] = [250, 1_000, 4_000];
+                self.failures += 1;
+                if let Some(&delay_ms) = BACKOFF_MS.get(self.failures - 1) {
+                    self.check = HistoryCheck::Backoff {
+                        probe: probe.clone(),
+                        delay_ms,
+                    };
+                    Some(delay_ms)
+                } else {
+                    self.check = HistoryCheck::Failed {
+                        attempts: self.failures,
+                        reason,
+                    };
+                    None
+                }
+            }
+        }
+    }
+
+    /// A timer cannot revive a request superseded by another reading or epoch.
+    pub fn retry(&mut self, probe: &HistoryProbe) {
+        if matches!(&self.check, HistoryCheck::Backoff { probe: waiting, .. } if waiting == probe) {
+            self.check = HistoryCheck::WaitingForFrame;
+        }
     }
 }
 
