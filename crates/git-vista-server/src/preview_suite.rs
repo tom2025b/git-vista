@@ -3781,6 +3781,7 @@ fn the_sweep_removes_only_old_directories_it_named_itself() {
 
     ScratchStore::sweep_stale(commondir);
 
+    #[cfg(unix)]
     if stale.exists() {
         // Every read here reports rather than unwraps. A marker that is gone
         // or unreadable is one of the *interesting* failures — an `expect`
@@ -3818,10 +3819,22 @@ fn the_sweep_removes_only_old_directories_it_named_itself() {
         );
     }
 
+    #[cfg(unix)]
     assert!(
         !stale.exists(),
         "a marked, unleased `gv-preview-*` directory older than the bound must \
          be swept"
+    );
+    // `abandoned_store_lease` has no Windows implementation of the marker read
+    // yet (TODO #859) and fails closed — `None` unconditionally, so
+    // `sweep_stale` treats every candidate as still leased and never removes
+    // it. That is the documented, intentional trade (retain over delete when
+    // unverified), not a bug this test should paper over.
+    #[cfg(not(unix))]
+    assert!(
+        stale.exists(),
+        "on Windows, abandoned_store_lease's fail-closed stub means nothing \
+         is ever swept — retaining an unverified candidate, per TODO(#859)"
     );
     assert!(
         young.exists(),
@@ -3882,6 +3895,7 @@ fn the_sweep_removes_only_old_directories_it_named_itself() {
 /// The sweep runs on its own thread and must answer inside a generous
 /// bound. A regression therefore costs one red test rather than a hung CI
 /// run — a test that reproduced this by hanging would be unrunnable.
+#[cfg(unix)]
 #[test]
 fn a_named_pipe_wearing_the_markers_name_cannot_wedge_the_sweep() {
     let dir = TempDir::new().expect("tempdir");
@@ -3982,6 +3996,7 @@ fn a_named_pipe_wearing_the_markers_name_cannot_wedge_the_sweep() {
 /// opening a FIFO read-write never blocks, and it leaves the magic sitting in
 /// the pipe buffer for the sweep's own reader to find. A writer thread would
 /// have raced the sweep and made a green run mean nothing.
+#[cfg(unix)]
 #[test]
 fn a_marker_that_serves_the_magic_but_is_not_a_regular_file_is_refused() {
     let dir = TempDir::new().expect("tempdir");

@@ -4104,6 +4104,13 @@ async fn the_amend_runs_repository_hooks_inside_the_pipelines_own_spawn() {
 /// fails the amend with the same empty-stderr signature) — so trimming the
 /// planner's hook list or regressing any one point turns this red. The
 /// repository must be untouched afterward.
+///
+/// Unix-only: the hook bodies are `#!/bin/sh` shebang scripts made executable
+/// via a Unix permission bit, and `rejectable_hook_present` has no Windows
+/// implementation yet (TODO #859, `commit_exec.rs`'s `#[cfg(windows)]` stub
+/// always returns `false`) — a real Windows hook-rejection test needs Windows
+/// hook-detection first, which this test's setup does not model.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_hook_rejection_is_classified_as_hook_rejected() {
     for hook in ["pre-commit", "prepare-commit-msg", "commit-msg"] {
