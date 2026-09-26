@@ -8,145 +8,176 @@ use super::commit_exec::{classify_amend_failure, classify_commit_failure, commit
 use super::*;
 use git_vista_fixtures::seeded as seeded_repo;
 
-// Extend the existing classifier test rather than adding a test entry: #875
-// requires the Linux test inventory to remain identical before and after.
-fn assert_hook_facts_and_classification() {
-    use super::commit_exec::{rejectable_hook_from_facts, windows_hook_facts, HookFacts};
+use super::commit_exec::{
+    hook_facts, rejectable_hook_from_facts, HookFacts, HookFileFacts, HookPlatform,
+};
 
-    let classify = |facts, expected, why| {
-        let present = rejectable_hook_from_facts(facts);
-        assert_eq!(present, expected, "{why}");
-        assert_eq!(
-            classify_commit_failure("", "", false, present),
-            if expected {
-                CommitFailureKind::HookRejected
-            } else {
-                CommitFailureKind::Other
-            },
-            "commit: {why}"
-        );
-        assert_eq!(
-            classify_amend_failure("", false, present),
-            if expected {
-                AmendFailureKind::HookRejected
-            } else {
-                AmendFailureKind::Other
-            },
-            "amend: {why}"
-        );
-    };
-    for (is_file, passes_execution_check, expected, why) in [
-        (false, false, false, "missing or unobservable hook"),
-        (false, true, false, "a directory is not a rejecting hook"),
-        (true, false, false, "Unix file without executable bits"),
-        (
-            true,
-            true,
-            true,
-            "Git-eligible file, including Windows without executable bits",
-        ),
-    ] {
-        classify(
-            vec![HookFacts {
-                is_file,
-                passes_execution_check,
-            }],
-            expected,
-            why,
-        );
-    }
-    classify(vec![], false, "no hooks in the effective directory");
-    classify(
-        vec![
-            HookFacts::default(),
-            HookFacts {
-                is_file: true,
-                passes_execution_check: true,
-            },
-        ],
-        true,
-        "one eligible hook suffices even after a missing hook",
+fn assert_hook_classification(platform: HookPlatform, facts: Vec<HookFacts>, expected: bool) {
+    let present = rejectable_hook_from_facts(platform, facts);
+    assert_eq!(present, expected, "{platform:?} hook eligibility");
+    assert_eq!(
+        classify_commit_failure("", "", false, present),
+        if expected {
+            CommitFailureKind::HookRejected
+        } else {
+            CommitFailureKind::Other
+        },
+        "{platform:?} commit"
     );
+    assert_eq!(
+        classify_amend_failure("", false, present),
+        if expected {
+            AmendFailureKind::HookRejected
+        } else {
+            AmendFailureKind::Other
+        },
+        "{platform:?} amend"
+    );
+}
 
+/// Pure Windows proof: the production Windows match arm is compiled on
+/// Linux. Replacing it with `false` fails the first positive assertion.
+#[test]
+fn windows_executable_hook_facts_classify_rejection() {
+    let file = HookFileFacts {
+        is_file: true,
+        unix_executable: false,
+    };
+    for facts in [
+        HookFacts {
+            exact: Some(file),
+            exe: None,
+        },
+        HookFacts {
+            exact: None,
+            exe: Some(file),
+        },
+    ] {
+        assert_hook_classification(
+            HookPlatform::Windows,
+            vec![HookFacts::default(), facts],
+            true,
+        );
+        assert_hook_classification(HookPlatform::Unix, vec![facts], false);
+    }
+}
+
+#[test]
+fn windows_missing_hook_facts_do_not_classify_rejection() {
+    assert_hook_classification(HookPlatform::Windows, vec![], false);
+    assert_hook_classification(HookPlatform::Windows, vec![HookFacts::default(); 3], false);
+}
+
+#[test]
+fn windows_directory_shadows_exe_hook_facts() {
+    assert_hook_classification(
+        HookPlatform::Windows,
+        vec![HookFacts {
+            exact: Some(HookFileFacts {
+                is_file: false,
+                unix_executable: true,
+            }),
+            exe: Some(HookFileFacts {
+                is_file: true,
+                unix_executable: false,
+            }),
+        }],
+        false,
+    );
+}
+
+/// HookMode::Blocked redirects the sealed Git probe to an empty effective
+/// directory. Only facts from that directory may reach the classifier.
+#[test]
+fn windows_blocked_effective_directory_does_not_classify_rejection() {
     let root = tempfile::tempdir().unwrap();
-    let dir = root.path().join("hooks");
+    let repo_hooks = root.path().join("hooks");
     let blocked = root.path().join("blocked-hooks");
-    std::fs::create_dir(&dir).unwrap();
+    std::fs::create_dir(&repo_hooks).unwrap();
     std::fs::create_dir(&blocked).unwrap();
     for hook in ["pre-commit", "prepare-commit-msg", "commit-msg"] {
-        let path = dir.join(hook);
-        for suffix in [".bat", ".cmd", ".sample"] {
-            std::fs::write(dir.join(format!("{hook}{suffix}")), "exit 1\n").unwrap();
-        }
-        classify(
-            vec![windows_hook_facts(&dir, hook)],
-            false,
-            "Windows does not search bat/cmd/sample suffixes",
+        std::fs::write(repo_hooks.join(hook), "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::write(repo_hooks.join(format!("{hook}.exe")), b"MZ").unwrap();
+        assert_hook_classification(
+            HookPlatform::Windows,
+            vec![hook_facts(&repo_hooks, hook)],
+            true,
         );
+        assert_hook_classification(
+            HookPlatform::Windows,
+            vec![hook_facts(&blocked, hook)],
+            false,
+        );
+    }
+}
 
+#[test]
+fn hook_discovery_observes_exact_names_exe_fallback_and_missing_paths() {
+    let root = tempfile::tempdir().unwrap();
+    for hook in ["pre-commit", "prepare-commit-msg", "commit-msg"] {
+        let path = root.path().join(hook);
+        for suffix in [".bat", ".cmd", ".sample"] {
+            std::fs::write(root.path().join(format!("{hook}{suffix}")), "exit 1\n").unwrap();
+        }
+        assert_hook_classification(
+            HookPlatform::Windows,
+            vec![hook_facts(root.path(), hook)],
+            false,
+        );
         std::fs::write(&path, "#!/bin/sh\nexit 1\n").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-            classify(
-                vec![super::commit_exec::hook_facts(&dir, hook)],
+            assert_hook_classification(
+                HookPlatform::Unix,
+                vec![hook_facts(root.path(), hook)],
                 false,
-                "Unix ignores a 0644 hook",
             );
-        }
-        classify(
-            vec![windows_hook_facts(&dir, hook)],
-            true,
-            "Windows extensionless sh hook, no executable bit",
-        );
-        classify(
-            vec![windows_hook_facts(&blocked, hook)],
-            false,
-            "blocked effective directory ignores a repository hook",
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            // All three executable bits retain their original meaning.
+            assert_hook_classification(
+                HookPlatform::Windows,
+                vec![hook_facts(root.path(), hook)],
+                true,
+            );
             for bit in [0o100, 0o010, 0o001] {
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644 | bit))
                     .unwrap();
-                classify(
-                    vec![super::commit_exec::hook_facts(&dir, hook)],
+                assert_hook_classification(
+                    HookPlatform::Unix,
+                    vec![hook_facts(root.path(), hook)],
                     true,
-                    "Unix executable hook",
                 );
             }
         }
+        assert_hook_classification(
+            HookPlatform::Windows,
+            vec![hook_facts(root.path(), hook)],
+            true,
+        );
         std::fs::remove_file(&path).unwrap();
         // Existence, not PE parsing, is Git's discovery predicate.
-        std::fs::write(dir.join(format!("{hook}.exe")), b"MZ").unwrap();
-        classify(
-            vec![windows_hook_facts(&dir, hook)],
+        std::fs::write(root.path().join(format!("{hook}.exe")), b"MZ").unwrap();
+        assert_hook_classification(
+            HookPlatform::Windows,
+            vec![hook_facts(root.path(), hook)],
             true,
-            "Windows exe fallback",
         );
-        #[cfg(unix)]
-        classify(
-            vec![super::commit_exec::hook_facts(&dir, hook)],
+        assert_hook_classification(
+            HookPlatform::Unix,
+            vec![hook_facts(root.path(), hook)],
             false,
-            "Unix does not search exe suffixes",
         );
         std::fs::create_dir(&path).unwrap();
-        classify(
-            vec![windows_hook_facts(&dir, hook)],
+        assert_hook_classification(
+            HookPlatform::Windows,
+            vec![hook_facts(root.path(), hook)],
             false,
-            "exact-name directory shadows exe fallback",
         );
     }
-    classify(
-        vec![windows_hook_facts(
-            &root.path().join("absent"),
-            "pre-commit",
-        )],
+    assert_hook_classification(
+        HookPlatform::Windows,
+        vec![hook_facts(&root.path().join("absent"), "pre-commit")],
         false,
-        "missing hooks directory",
     );
 }
 
@@ -422,8 +453,6 @@ fn classify_amend_failure_covers_every_branch_with_paired_negatives() {
 #[test]
 fn classify_commit_failure_covers_every_branch_with_paired_negatives() {
     use CommitFailureKind::*;
-
-    assert_hook_facts_and_classification();
 
     // Captured verbatim (scratch repos, 2026-08-18, git 2.43):
     //   git -c commit.gpgsign=true -c user.signingkey=DOESNOTEXIST \

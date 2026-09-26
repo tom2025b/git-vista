@@ -587,69 +587,85 @@ async fn rejectable_hook_present(repo: &Path, need: NetworkNeed) -> bool {
             repo.join(p)
         }
     };
-    rejectable_hook_from_facts(
-        ["pre-commit", "prepare-commit-msg", "commit-msg"]
-            .iter()
-            .map(|hook| hook_facts(&dir, hook)),
-    )
+    let hooks =
+        ["pre-commit", "prepare-commit-msg", "commit-msg"].map(|hook| hook_facts(&dir, hook));
+    rejectable_hook_from_facts(HookPlatform::current(), hooks)
 }
 
-/// Observations about one rejectable hook in the effective hooks directory.
-/// Failed metadata reads supply the default (no positive evidence).
+/// The discovery rule is data, not a platform-gated classifier. Both arms
+/// compile on Linux so a Windows regression is exercised by the host suite.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum HookPlatform {
+    Unix,
+    Windows,
+}
+
+impl HookPlatform {
+    fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Unix
+        }
+    }
+}
+
+/// Metadata observed at the edge. Eligibility does not prove that a hook's
+/// interpreter started or that Windows ACLs permitted its execution.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct HookFileFacts {
+    pub(super) is_file: bool,
+    pub(super) unix_executable: bool,
+}
+
+/// Candidates in the effective hooks directory. None means absent or
+/// unobservable; no positive evidence is invented when metadata fails.
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct HookFacts {
-    pub(super) is_file: bool,
-    /// Unix's executable bits, or Git for Windows' existence-only check.
-    /// Eligibility is not proof that the interpreter successfully started.
-    pub(super) passes_execution_check: bool,
+    pub(super) exact: Option<HookFileFacts>,
+    pub(super) exe: Option<HookFileFacts>,
 }
 
-/// Pure classification input: the platform adapters gather facts, and a
-/// missing/non-file or ineligible hook must never supply positive evidence.
-pub(super) fn rejectable_hook_from_facts(hooks: impl IntoIterator<Item = HookFacts>) -> bool {
-    hooks
-        .into_iter()
-        .any(|hook| hook.is_file && hook.passes_execution_check)
-}
-
-#[cfg(unix)]
-pub(super) fn hook_facts(dir: &Path, hook: &str) -> HookFacts {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::metadata(dir.join(hook))
-        .map(|m| HookFacts {
-            is_file: m.is_file(),
-            passes_execution_check: m.permissions().mode() & 0o111 != 0,
-        })
-        .unwrap_or_default()
-}
-
-#[cfg(windows)]
-fn hook_facts(dir: &Path, hook: &str) -> HookFacts {
-    windows_hook_facts(dir, hook)
-}
-
-/// Git for Windows v2.51.0.windows.1: `find_hook` tries the exact name,
-/// then `.exe`; `mingw_access` strips X_OK (no Unix executable bit).
-/// `parse_interpreter` handles an extensionless `#!/bin/sh` hook at spawn
-/// time. Discovery neither parses its contents nor searches `.bat`/`.cmd`.
-/// Sources (source-derived, not a claim of native Windows runtime testing):
+/// Pure decision over observations supplied by the caller. Git for Windows
+/// v2.51.0.windows.1 tries the exact name then `.exe`, and `mingw_access`
+/// strips X_OK. Unix retains the executable-bit rule and exact name only.
+/// A directory shadows `.exe` but cannot be a rejecting hook. Discovery
+/// neither parses shebangs nor searches `.bat`/`.cmd`.
+/// Source-derived, not a claim of native Windows runtime testing:
 /// <https://github.com/git-for-windows/git/blob/v2.51.0.windows.1/hook.c#L12-L45>
 /// <https://github.com/git-for-windows/git/blob/v2.51.0.windows.1/config.mak.uname#L709>
 /// <https://github.com/git-for-windows/git/blob/v2.51.0.windows.1/compat/mingw.c#L1024-L1033>
-/// <https://github.com/git-for-windows/git/blob/v2.51.0.windows.1/compat/mingw.c#L1617-L1650>
-/// Keep the regular-file guard: an existing directory shadows `.exe` in
-/// Git's lookup, but cannot be a rejecting hook. Tests run this adapter on
-/// Linux too, so restoring the Windows stub cannot hide behind cfg.
-#[cfg(any(windows, test))]
-pub(super) fn windows_hook_facts(dir: &Path, hook: &str) -> HookFacts {
-    std::fs::metadata(dir.join(hook))
-        .or_else(|_| std::fs::metadata(dir.join(format!("{hook}.exe"))))
-        .map(|m| HookFacts {
-            is_file: m.is_file(),
-            passes_execution_check: true,
+pub(super) fn rejectable_hook_from_facts(
+    platform: HookPlatform,
+    hooks: impl IntoIterator<Item = HookFacts>,
+) -> bool {
+    hooks.into_iter().any(|hook| match platform {
+        HookPlatform::Unix => hook.exact.is_some_and(|f| f.is_file && f.unix_executable),
+        HookPlatform::Windows => hook.exact.or(hook.exe).is_some_and(|f| f.is_file),
+    })
+}
+
+/// Gather both candidate names at the I/O edge. This is also callable on
+/// Linux: tests supply the same observations to either platform's decision.
+pub(super) fn hook_facts(dir: &Path, hook: &str) -> HookFacts {
+    fn observe(path: &Path) -> Option<HookFileFacts> {
+        let metadata = std::fs::metadata(path).ok()?;
+        #[cfg(unix)]
+        let unix_executable = {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode() & 0o111 != 0
+        };
+        #[cfg(not(unix))]
+        let unix_executable = false;
+        Some(HookFileFacts {
+            is_file: metadata.is_file(),
+            unix_executable,
         })
-        .unwrap_or_default()
+    }
+    HookFacts {
+        exact: observe(&dir.join(hook)),
+        exe: observe(&dir.join(format!("{hook}.exe"))),
+    }
 }
 
 /// Classify a failed `git commit --amend` into the typed
