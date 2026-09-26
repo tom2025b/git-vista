@@ -675,6 +675,20 @@ pub fn App() -> impl IntoView {
     // happened.
     let freshness = crate::features::freshness::signals::Freshness::new();
     freshness.connect();
+    // #852: the feed used to warn the plan panel only. The graph stayed on
+    // the last seed until Refresh. Follow committed history from the same
+    // snapshots, comparing history-v1 Frames rather than the planner token
+    // the feed carries — mixing those recipes remounts on every editor save
+    // or, after a write, on every in-app settlement.
+    let displayed_history =
+        Signal::derive(move || status_frame.get().map(|frame| frame.generation.clone()));
+    let graph_ready = Signal::derive(move || {
+        matches!(
+            history_ui.phase.get(),
+            HistoryPhase::Ready { epoch } if epoch == graph.get().epoch()
+        )
+    });
+    freshness.follow_graph(graph, graph_ready, displayed_history, status);
     let features = Features {
         graph,
         dialogs: dialogs_guard,

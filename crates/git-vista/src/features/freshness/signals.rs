@@ -1,9 +1,12 @@
+// **Signed:** codex · 2026-09-26T12:39:32-04:00
+// last_edited_by: codex
 //! The change feed's client half — wasm only (M12.05, #555).
 //!
 //! One `EventSource` on `GET /api/repository/events`, one log of what it
-//! published, and nothing else. Every *decision* — whether the plan on screen is
-//! still current, what to say about it, whether the confirm control may be
-//! offered — lives in [`super::core`], host-tested, because `cargo test` never
+//! published, and the live-graph follow-up that log drives (#852). Every
+//! *decision* — whether the plan on screen is still current, whether a
+//! snapshot should check history, whether two history-v1 Frames disagree —
+//! lives in [`super::core`], host-tested, because `cargo test` never
 //! compiles this file.
 //!
 //! # Why the protocol version rides in the query string
@@ -25,9 +28,14 @@ use leptos::*;
 use wasm_bindgen::prelude::*;
 
 use git_vista_protocol::change_feed::{ChangeFeedHealth, ChangeFeedSnapshot};
-use git_vista_protocol::{PROTOCOL_QUERY, PROTOCOL_VERSION};
+use git_vista_protocol::{GenerationToken, PROTOCOL_QUERY, PROTOCOL_VERSION};
 
-use super::core::{verdict, FeedLog, PlanSlot, PlanVerdict};
+use crate::features::graph::core::GraphCore;
+use crate::features::status::signals::StatusResource;
+
+use super::core::{
+    verdict, FeedLog, HistoryCheck, HistoryFollower, HistoryProbe, PlanSlot, PlanVerdict,
+};
 
 /// How long to wait before re-opening a change feed that dropped.
 ///
@@ -48,6 +56,7 @@ const REATTACH_INTERVAL_MS: u64 = 1_000;
 #[derive(Clone, Copy)]
 pub struct Freshness {
     log: RwSignal<FeedLog>,
+    history: RwSignal<HistoryFollower>,
 }
 
 impl Default for Freshness {
@@ -60,6 +69,7 @@ impl Freshness {
     pub fn new() -> Self {
         Self {
             log: create_rw_signal(FeedLog::new()),
+            history: create_rw_signal(HistoryFollower::default()),
         }
     }
 
@@ -84,6 +94,98 @@ impl Freshness {
     pub fn health(&self) -> Option<ChangeFeedHealth> {
         self.log.with(|log| log.latest().map(|s| s.health.clone()))
     }
+
+    /// The most recently recorded snapshot, or `None` before the first
+    /// publication and again after a reconnect clears the log. Tracked, so
+    /// the live-graph follow-up re-runs on every reading.
+    pub fn latest_snapshot(&self) -> Option<ChangeFeedSnapshot> {
+        self.log.with(|log| log.latest().cloned())
+    }
+
+    /// Follow committed history from this feed (#852).
+    ///
+    /// The feed is a hint that *something* moved. The graph is pinned to
+    /// history-v1, a different recipe from the planner token the feed
+    /// carries, so this never compares those tokens. It refetches status
+    /// on every reading, probes `GET /api/frame` when a Frame is already
+    /// on screen, and remounts only when that Frame's generation moved.
+    /// A snapshot that arrives while the seed is still loading sets a
+    /// pending check; the Ready transition runs it so an in-flight first
+    /// page cannot strand a stale graph.
+    pub fn follow_graph(
+        self,
+        graph: RwSignal<GraphCore>,
+        graph_ready: Signal<bool>,
+        displayed: Signal<Option<GenerationToken>>,
+        status: StatusResource,
+    ) {
+        let history = self.history;
+        create_effect(move |_| {
+            let snapshot = self.latest_snapshot();
+            let current = graph.get();
+            let ready = graph_ready.get();
+            let frame = displayed.get();
+            // Timer writes wake this effect without another feed event.
+            // Untracked writes avoid notifying ourselves while dispatching.
+            self.history_check();
+            let mut actions = None;
+            history.update_untracked(|h| {
+                actions = Some(h.update(snapshot.as_ref(), &current, ready, frame.as_ref()));
+            });
+            let Some(actions) = actions else { return };
+            if actions.refetch_status {
+                status.refetch();
+            }
+            if let Some(probe) = actions.probe {
+                run_history_probe(history, graph, graph_ready, displayed, probe);
+            }
+        });
+    }
+
+    /// Separate from server feed health: a client GET failure does not mean
+    /// the server sweep is blind. Exhaustion is also reported to the console.
+    pub fn history_check(&self) -> HistoryCheck {
+        self.history.with(|h| h.check.clone())
+    }
+}
+
+fn run_history_probe(
+    history: RwSignal<HistoryFollower>,
+    graph: RwSignal<GraphCore>,
+    graph_ready: Signal<bool>,
+    displayed: Signal<Option<GenerationToken>>,
+    probe: HistoryProbe,
+) {
+    spawn_local(async move {
+        let result = crate::api::fetch_frame()
+            .await
+            .map(|frame| frame.generation)
+            .map_err(|error| error.to_string());
+        let (Some(mut current), Some(ready), Some(frame)) = (
+            graph.try_get_untracked(),
+            graph_ready.try_get_untracked(),
+            displayed.try_get_untracked(),
+        ) else {
+            return;
+        };
+        let before = current.clone();
+        let mut retry = None;
+        let _ = history.try_update(|h| {
+            retry = h.complete(&probe, result, &mut current, ready, frame.as_ref());
+            if let HistoryCheck::Failed { attempts, reason } = &h.check {
+                leptos::logging::error!(
+                    "History check failed after {attempts} attempts: {reason}. Refresh to retry."
+                );
+            }
+        });
+        if current != before {
+            graph.set(current);
+        }
+        if let Some(delay_ms) = retry {
+            crate::api::sleep_ms(delay_ms).await;
+            let _ = history.try_update(|h| h.retry(&probe));
+        }
+    });
 }
 
 fn subscribe(log: RwSignal<FeedLog>) {

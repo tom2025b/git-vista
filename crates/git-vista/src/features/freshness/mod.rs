@@ -3,7 +3,8 @@
 //!
 //! `core` is pure and host-tested — every decision and every sentence.
 //! `signals` is the wasm-only half: one `EventSource` on
-//! `GET /api/repository/events`, and the log the decision reads.
+//! `GET /api/repository/events`, the log the decision reads, and the live
+//! graph follow-up (#852) that remounts only when a history-v1 Frame moved.
 
 pub mod core;
 #[cfg(target_arch = "wasm32")]
