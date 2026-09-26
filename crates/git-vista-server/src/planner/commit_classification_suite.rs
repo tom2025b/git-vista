@@ -8,6 +8,148 @@ use super::commit_exec::{classify_amend_failure, classify_commit_failure, commit
 use super::*;
 use git_vista_fixtures::seeded as seeded_repo;
 
+// Extend the existing classifier test rather than adding a test entry: #875
+// requires the Linux test inventory to remain identical before and after.
+fn assert_hook_facts_and_classification() {
+    use super::commit_exec::{rejectable_hook_from_facts, windows_hook_facts, HookFacts};
+
+    let classify = |facts, expected, why| {
+        let present = rejectable_hook_from_facts(facts);
+        assert_eq!(present, expected, "{why}");
+        assert_eq!(
+            classify_commit_failure("", "", false, present),
+            if expected {
+                CommitFailureKind::HookRejected
+            } else {
+                CommitFailureKind::Other
+            },
+            "commit: {why}"
+        );
+        assert_eq!(
+            classify_amend_failure("", false, present),
+            if expected {
+                AmendFailureKind::HookRejected
+            } else {
+                AmendFailureKind::Other
+            },
+            "amend: {why}"
+        );
+    };
+    for (is_file, passes_execution_check, expected, why) in [
+        (false, false, false, "missing or unobservable hook"),
+        (false, true, false, "a directory is not a rejecting hook"),
+        (true, false, false, "Unix file without executable bits"),
+        (
+            true,
+            true,
+            true,
+            "Git-eligible file, including Windows without executable bits",
+        ),
+    ] {
+        classify(
+            vec![HookFacts {
+                is_file,
+                passes_execution_check,
+            }],
+            expected,
+            why,
+        );
+    }
+    classify(vec![], false, "no hooks in the effective directory");
+    classify(
+        vec![
+            HookFacts::default(),
+            HookFacts {
+                is_file: true,
+                passes_execution_check: true,
+            },
+        ],
+        true,
+        "one eligible hook suffices even after a missing hook",
+    );
+
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("hooks");
+    let blocked = root.path().join("blocked-hooks");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::create_dir(&blocked).unwrap();
+    for hook in ["pre-commit", "prepare-commit-msg", "commit-msg"] {
+        let path = dir.join(hook);
+        for suffix in [".bat", ".cmd", ".sample"] {
+            std::fs::write(dir.join(format!("{hook}{suffix}")), "exit 1\n").unwrap();
+        }
+        classify(
+            vec![windows_hook_facts(&dir, hook)],
+            false,
+            "Windows does not search bat/cmd/sample suffixes",
+        );
+
+        std::fs::write(&path, "#!/bin/sh\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            classify(
+                vec![super::commit_exec::hook_facts(&dir, hook)],
+                false,
+                "Unix ignores a 0644 hook",
+            );
+        }
+        classify(
+            vec![windows_hook_facts(&dir, hook)],
+            true,
+            "Windows extensionless sh hook, no executable bit",
+        );
+        classify(
+            vec![windows_hook_facts(&blocked, hook)],
+            false,
+            "blocked effective directory ignores a repository hook",
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // All three executable bits retain their original meaning.
+            for bit in [0o100, 0o010, 0o001] {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644 | bit))
+                    .unwrap();
+                classify(
+                    vec![super::commit_exec::hook_facts(&dir, hook)],
+                    true,
+                    "Unix executable hook",
+                );
+            }
+        }
+        std::fs::remove_file(&path).unwrap();
+        // Existence, not PE parsing, is Git's discovery predicate.
+        std::fs::write(dir.join(format!("{hook}.exe")), b"MZ").unwrap();
+        classify(
+            vec![windows_hook_facts(&dir, hook)],
+            true,
+            "Windows exe fallback",
+        );
+        #[cfg(unix)]
+        classify(
+            vec![super::commit_exec::hook_facts(&dir, hook)],
+            false,
+            "Unix does not search exe suffixes",
+        );
+        std::fs::create_dir(&path).unwrap();
+        classify(
+            vec![windows_hook_facts(&dir, hook)],
+            false,
+            "exact-name directory shadows exe fallback",
+        );
+    }
+    classify(
+        vec![windows_hook_facts(
+            &root.path().join("absent"),
+            "pre-commit",
+        )],
+        false,
+        "missing hooks directory",
+    );
+}
+
 fn tokens() -> (RepositoryToken, WorktreeToken) {
     (
         RepositoryToken::new("test-repo").unwrap(),
@@ -280,6 +422,8 @@ fn classify_amend_failure_covers_every_branch_with_paired_negatives() {
 #[test]
 fn classify_commit_failure_covers_every_branch_with_paired_negatives() {
     use CommitFailureKind::*;
+
+    assert_hook_facts_and_classification();
 
     // Captured verbatim (scratch repos, 2026-08-18, git 2.43):
     //   git -c commit.gpgsign=true -c user.signingkey=DOESNOTEXIST \

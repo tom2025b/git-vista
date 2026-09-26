@@ -558,7 +558,7 @@ async fn signing_requested(repo: &Path, need: NetworkNeed) -> bool {
 }
 
 /// Whether a hook that can reject `git commit --amend` (`pre-commit`,
-/// `prepare-commit-msg`, `commit-msg`) exists — executable — in the
+/// `prepare-commit-msg`, `commit-msg`) is eligible to run in the
 /// **effective** hooks directory.
 ///
 /// "Effective" is the load-bearing word: the directory is asked of git
@@ -569,7 +569,6 @@ async fn signing_requested(repo: &Path, need: NetworkNeed) -> bool {
 /// probe sees that same empty directory and answers `false`. A repository
 /// whose hooks cannot run can never have a failure classified as a hook
 /// rejection, with no separate policy plumbing to drift out of sync.
-#[cfg(unix)]
 async fn rejectable_hook_present(repo: &Path, need: NetworkNeed) -> bool {
     let hooks_dir = match run_git(repo, need, &["rev-parse", "--git-path", "hooks"]).await {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
@@ -588,23 +587,69 @@ async fn rejectable_hook_present(repo: &Path, need: NetworkNeed) -> bool {
             repo.join(p)
         }
     };
-    ["pre-commit", "prepare-commit-msg", "commit-msg"]
-        .iter()
-        .any(|hook| {
-            std::fs::metadata(dir.join(hook))
-                .map(|m| {
-                    use std::os::unix::fs::PermissionsExt;
-                    m.is_file() && m.permissions().mode() & 0o111 != 0
-                })
-                .unwrap_or(false)
+    rejectable_hook_from_facts(
+        ["pre-commit", "prepare-commit-msg", "commit-msg"]
+            .iter()
+            .map(|hook| hook_facts(&dir, hook)),
+    )
+}
+
+/// Observations about one rejectable hook in the effective hooks directory.
+/// Failed metadata reads supply the default (no positive evidence).
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct HookFacts {
+    pub(super) is_file: bool,
+    /// Unix's executable bits, or Git for Windows' existence-only check.
+    /// Eligibility is not proof that the interpreter successfully started.
+    pub(super) passes_execution_check: bool,
+}
+
+/// Pure classification input: the platform adapters gather facts, and a
+/// missing/non-file or ineligible hook must never supply positive evidence.
+pub(super) fn rejectable_hook_from_facts(hooks: impl IntoIterator<Item = HookFacts>) -> bool {
+    hooks
+        .into_iter()
+        .any(|hook| hook.is_file && hook.passes_execution_check)
+}
+
+#[cfg(unix)]
+pub(super) fn hook_facts(dir: &Path, hook: &str) -> HookFacts {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(dir.join(hook))
+        .map(|m| HookFacts {
+            is_file: m.is_file(),
+            passes_execution_check: m.permissions().mode() & 0o111 != 0,
         })
+        .unwrap_or_default()
 }
 
 #[cfg(windows)]
-async fn rejectable_hook_present(_repo: &Path, _need: NetworkNeed) -> bool {
-    // TODO(#859): Detect hooks Git for Windows can execute without relying on
-    // Unix permission bits, then preserve the same fail-closed classification.
-    false
+fn hook_facts(dir: &Path, hook: &str) -> HookFacts {
+    windows_hook_facts(dir, hook)
+}
+
+/// Git for Windows v2.51.0.windows.1: `find_hook` tries the exact name,
+/// then `.exe`; `mingw_access` strips X_OK (no Unix executable bit).
+/// `parse_interpreter` handles an extensionless `#!/bin/sh` hook at spawn
+/// time. Discovery neither parses its contents nor searches `.bat`/`.cmd`.
+/// Sources (source-derived, not a claim of native Windows runtime testing):
+/// <https://github.com/git-for-windows/git/blob/v2.51.0.windows.1/hook.c#L12-L45>
+/// <https://github.com/git-for-windows/git/blob/v2.51.0.windows.1/config.mak.uname#L709>
+/// <https://github.com/git-for-windows/git/blob/v2.51.0.windows.1/compat/mingw.c#L1024-L1033>
+/// <https://github.com/git-for-windows/git/blob/v2.51.0.windows.1/compat/mingw.c#L1617-L1650>
+/// Keep the regular-file guard: an existing directory shadows `.exe` in
+/// Git's lookup, but cannot be a rejecting hook. Tests run this adapter on
+/// Linux too, so restoring the Windows stub cannot hide behind cfg.
+#[cfg(any(windows, test))]
+pub(super) fn windows_hook_facts(dir: &Path, hook: &str) -> HookFacts {
+    std::fs::metadata(dir.join(hook))
+        .or_else(|_| std::fs::metadata(dir.join(format!("{hook}.exe"))))
+        .map(|m| HookFacts {
+            is_file: m.is_file(),
+            passes_execution_check: true,
+        })
+        .unwrap_or_default()
 }
 
 /// Classify a failed `git commit --amend` into the typed
