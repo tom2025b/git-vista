@@ -8,6 +8,179 @@ use super::commit_exec::{classify_amend_failure, classify_commit_failure, commit
 use super::*;
 use git_vista_fixtures::seeded as seeded_repo;
 
+use super::commit_exec::{
+    hook_facts, rejectable_hook_from_facts, HookFacts, HookFileFacts, HookPlatform,
+};
+
+fn assert_hook_classification(platform: HookPlatform, facts: Vec<HookFacts>, expected: bool) {
+    let present = rejectable_hook_from_facts(platform, facts);
+    assert_eq!(present, expected, "{platform:?} hook eligibility");
+    assert_eq!(
+        classify_commit_failure("", "", false, present),
+        if expected {
+            CommitFailureKind::HookRejected
+        } else {
+            CommitFailureKind::Other
+        },
+        "{platform:?} commit"
+    );
+    assert_eq!(
+        classify_amend_failure("", false, present),
+        if expected {
+            AmendFailureKind::HookRejected
+        } else {
+            AmendFailureKind::Other
+        },
+        "{platform:?} amend"
+    );
+}
+
+/// Pure Windows proof: the production Windows match arm is compiled on
+/// Linux. Replacing it with `false` fails the first positive assertion.
+#[test]
+fn windows_executable_hook_facts_classify_rejection() {
+    let file = HookFileFacts {
+        is_file: true,
+        unix_executable: false,
+    };
+    for facts in [
+        HookFacts {
+            exact: Some(file),
+            exe: None,
+        },
+        HookFacts {
+            exact: None,
+            exe: Some(file),
+        },
+    ] {
+        assert_hook_classification(
+            HookPlatform::Windows,
+            vec![HookFacts::default(), facts],
+            true,
+        );
+        assert_hook_classification(HookPlatform::Unix, vec![facts], false);
+    }
+}
+
+#[test]
+fn windows_missing_hook_facts_do_not_classify_rejection() {
+    assert_hook_classification(HookPlatform::Windows, vec![], false);
+    assert_hook_classification(HookPlatform::Windows, vec![HookFacts::default(); 3], false);
+}
+
+#[test]
+fn windows_directory_shadows_exe_hook_facts() {
+    assert_hook_classification(
+        HookPlatform::Windows,
+        vec![HookFacts {
+            exact: Some(HookFileFacts {
+                is_file: false,
+                unix_executable: true,
+            }),
+            exe: Some(HookFileFacts {
+                is_file: true,
+                unix_executable: false,
+            }),
+        }],
+        false,
+    );
+}
+
+/// HookMode::Blocked redirects the sealed Git probe to an empty effective
+/// directory. Only facts from that directory may reach the classifier.
+#[test]
+fn windows_blocked_effective_directory_does_not_classify_rejection() {
+    let root = tempfile::tempdir().unwrap();
+    let repo_hooks = root.path().join("hooks");
+    let blocked = root.path().join("blocked-hooks");
+    std::fs::create_dir(&repo_hooks).unwrap();
+    std::fs::create_dir(&blocked).unwrap();
+    for hook in ["pre-commit", "prepare-commit-msg", "commit-msg"] {
+        std::fs::write(repo_hooks.join(hook), "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::write(repo_hooks.join(format!("{hook}.exe")), b"MZ").unwrap();
+        assert_hook_classification(
+            HookPlatform::Windows,
+            vec![hook_facts(&repo_hooks, hook)],
+            true,
+        );
+        assert_hook_classification(
+            HookPlatform::Windows,
+            vec![hook_facts(&blocked, hook)],
+            false,
+        );
+    }
+}
+
+#[test]
+fn hook_discovery_observes_exact_names_exe_fallback_and_missing_paths() {
+    let root = tempfile::tempdir().unwrap();
+    for hook in ["pre-commit", "prepare-commit-msg", "commit-msg"] {
+        let path = root.path().join(hook);
+        for suffix in [".bat", ".cmd", ".sample"] {
+            std::fs::write(root.path().join(format!("{hook}{suffix}")), "exit 1\n").unwrap();
+        }
+        assert_hook_classification(
+            HookPlatform::Windows,
+            vec![hook_facts(root.path(), hook)],
+            false,
+        );
+        std::fs::write(&path, "#!/bin/sh\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_hook_classification(
+                HookPlatform::Unix,
+                vec![hook_facts(root.path(), hook)],
+                false,
+            );
+            assert_hook_classification(
+                HookPlatform::Windows,
+                vec![hook_facts(root.path(), hook)],
+                true,
+            );
+            for bit in [0o100, 0o010, 0o001] {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644 | bit))
+                    .unwrap();
+                assert_hook_classification(
+                    HookPlatform::Unix,
+                    vec![hook_facts(root.path(), hook)],
+                    true,
+                );
+            }
+        }
+        assert_hook_classification(
+            HookPlatform::Windows,
+            vec![hook_facts(root.path(), hook)],
+            true,
+        );
+        std::fs::remove_file(&path).unwrap();
+        // Existence, not PE parsing, is Git's discovery predicate.
+        std::fs::write(root.path().join(format!("{hook}.exe")), b"MZ").unwrap();
+        assert_hook_classification(
+            HookPlatform::Windows,
+            vec![hook_facts(root.path(), hook)],
+            true,
+        );
+        assert_hook_classification(
+            HookPlatform::Unix,
+            vec![hook_facts(root.path(), hook)],
+            false,
+        );
+        std::fs::create_dir(&path).unwrap();
+        assert_hook_classification(
+            HookPlatform::Windows,
+            vec![hook_facts(root.path(), hook)],
+            false,
+        );
+    }
+    assert_hook_classification(
+        HookPlatform::Windows,
+        vec![hook_facts(&root.path().join("absent"), "pre-commit")],
+        false,
+    );
+}
+
 fn tokens() -> (RepositoryToken, WorktreeToken) {
     (
         RepositoryToken::new("test-repo").unwrap(),

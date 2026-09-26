@@ -558,7 +558,7 @@ async fn signing_requested(repo: &Path, need: NetworkNeed) -> bool {
 }
 
 /// Whether a hook that can reject `git commit --amend` (`pre-commit`,
-/// `prepare-commit-msg`, `commit-msg`) exists — executable — in the
+/// `prepare-commit-msg`, `commit-msg`) is eligible to run in the
 /// **effective** hooks directory.
 ///
 /// "Effective" is the load-bearing word: the directory is asked of git
@@ -569,7 +569,6 @@ async fn signing_requested(repo: &Path, need: NetworkNeed) -> bool {
 /// probe sees that same empty directory and answers `false`. A repository
 /// whose hooks cannot run can never have a failure classified as a hook
 /// rejection, with no separate policy plumbing to drift out of sync.
-#[cfg(unix)]
 async fn rejectable_hook_present(repo: &Path, need: NetworkNeed) -> bool {
     let hooks_dir = match run_git(repo, need, &["rev-parse", "--git-path", "hooks"]).await {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
@@ -588,23 +587,85 @@ async fn rejectable_hook_present(repo: &Path, need: NetworkNeed) -> bool {
             repo.join(p)
         }
     };
-    ["pre-commit", "prepare-commit-msg", "commit-msg"]
-        .iter()
-        .any(|hook| {
-            std::fs::metadata(dir.join(hook))
-                .map(|m| {
-                    use std::os::unix::fs::PermissionsExt;
-                    m.is_file() && m.permissions().mode() & 0o111 != 0
-                })
-                .unwrap_or(false)
-        })
+    let hooks =
+        ["pre-commit", "prepare-commit-msg", "commit-msg"].map(|hook| hook_facts(&dir, hook));
+    rejectable_hook_from_facts(HookPlatform::current(), hooks)
 }
 
-#[cfg(windows)]
-async fn rejectable_hook_present(_repo: &Path, _need: NetworkNeed) -> bool {
-    // TODO(#859): Detect hooks Git for Windows can execute without relying on
-    // Unix permission bits, then preserve the same fail-closed classification.
-    false
+/// The discovery rule is data, not a platform-gated classifier. Both arms
+/// compile on Linux so a Windows regression is exercised by the host suite.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum HookPlatform {
+    Unix,
+    Windows,
+}
+
+impl HookPlatform {
+    fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Unix
+        }
+    }
+}
+
+/// Metadata observed at the edge. Eligibility does not prove that a hook's
+/// interpreter started or that Windows ACLs permitted its execution.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct HookFileFacts {
+    pub(super) is_file: bool,
+    pub(super) unix_executable: bool,
+}
+
+/// Candidates in the effective hooks directory. None means absent or
+/// unobservable; no positive evidence is invented when metadata fails.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct HookFacts {
+    pub(super) exact: Option<HookFileFacts>,
+    pub(super) exe: Option<HookFileFacts>,
+}
+
+/// Pure decision over observations supplied by the caller. Git for Windows
+/// v2.51.0.windows.1 tries the exact name then `.exe`, and `mingw_access`
+/// strips X_OK. Unix retains the executable-bit rule and exact name only.
+/// A directory shadows `.exe` but cannot be a rejecting hook. Discovery
+/// neither parses shebangs nor searches `.bat`/`.cmd`.
+/// Source-derived, not a claim of native Windows runtime testing:
+/// <https://github.com/git-for-windows/git/blob/v2.51.0.windows.1/hook.c#L12-L45>
+/// <https://github.com/git-for-windows/git/blob/v2.51.0.windows.1/config.mak.uname#L709>
+/// <https://github.com/git-for-windows/git/blob/v2.51.0.windows.1/compat/mingw.c#L1024-L1033>
+pub(super) fn rejectable_hook_from_facts(
+    platform: HookPlatform,
+    hooks: impl IntoIterator<Item = HookFacts>,
+) -> bool {
+    hooks.into_iter().any(|hook| match platform {
+        HookPlatform::Unix => hook.exact.is_some_and(|f| f.is_file && f.unix_executable),
+        HookPlatform::Windows => hook.exact.or(hook.exe).is_some_and(|f| f.is_file),
+    })
+}
+
+/// Gather both candidate names at the I/O edge. This is also callable on
+/// Linux: tests supply the same observations to either platform's decision.
+pub(super) fn hook_facts(dir: &Path, hook: &str) -> HookFacts {
+    fn observe(path: &Path) -> Option<HookFileFacts> {
+        let metadata = std::fs::metadata(path).ok()?;
+        #[cfg(unix)]
+        let unix_executable = {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode() & 0o111 != 0
+        };
+        #[cfg(not(unix))]
+        let unix_executable = false;
+        Some(HookFileFacts {
+            is_file: metadata.is_file(),
+            unix_executable,
+        })
+    }
+    HookFacts {
+        exact: observe(&dir.join(hook)),
+        exe: observe(&dir.join(format!("{hook}.exe"))),
+    }
 }
 
 /// Classify a failed `git commit --amend` into the typed
