@@ -176,6 +176,27 @@ fn validate_fresh_clone_url(url: &str) -> Result<String, String> {
     Ok(url)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum RefsProbeError {
+    NoDefaultBranch,
+    PropagateFailure,
+}
+
+/// An unresolved HEAD is acceptable only when a successful probe found no refs.
+fn unresolved_head_decision(
+    probe_succeeded: bool,
+    stdout_empty: bool,
+) -> Result<(), RefsProbeError> {
+    if !probe_succeeded {
+        return Err(RefsProbeError::PropagateFailure);
+    }
+    if stdout_empty {
+        Ok(())
+    } else {
+        Err(RefsProbeError::NoDefaultBranch)
+    }
+}
+
 /// Fetch objects and refs while the credential exists, then let that process
 /// exit before materialising attacker-chosen files.
 ///
@@ -256,15 +277,12 @@ async fn execute_clone(
             .output()
             .await
             .map_err(CloneExecutionError::CouldntRun)?;
-        if !refs.status.success() {
-            return Err(CloneExecutionError::GitFailed(refs));
-        }
-        return if refs.stdout.is_empty() {
-            Ok(())
-        } else {
+        return match unresolved_head_decision(refs.status.success(), refs.stdout.is_empty()) {
+            Ok(()) => Ok(()),
+            Err(RefsProbeError::PropagateFailure) => Err(CloneExecutionError::GitFailed(refs)),
             // Git may replace the remote's dangling symbolic HEAD with a
             // local default name, so do not claim that name is the remote's.
-            Err(CloneExecutionError::NoDefaultBranch)
+            Err(RefsProbeError::NoDefaultBranch) => Err(CloneExecutionError::NoDefaultBranch),
         };
     }
     if !head.status.success() {
@@ -2064,6 +2082,24 @@ mod head_suite {
     //! generic Git failure are caught. Empty and valid remotes are paired controls.
 
     use super::*;
+
+    // Decision: test failed probes with either output shape without relying on
+    // a Git subprocess failing in a particular way. A failed probe is never empty.
+    #[test]
+    fn refs_probe_decision_requires_success_before_accepting_empty() {
+        assert_eq!(unresolved_head_decision(true, true), Ok(()));
+        assert_eq!(
+            unresolved_head_decision(true, false),
+            Err(RefsProbeError::NoDefaultBranch)
+        );
+        for stdout_empty in [true, false] {
+            assert_eq!(
+                unresolved_head_decision(false, stdout_empty),
+                Err(RefsProbeError::PropagateFailure),
+                "failed probe must propagate even when stdout_empty={stdout_empty}"
+            );
+        }
+    }
 
     fn git(repo: &Path, args: &[&str]) -> String {
         let output = std::process::Command::new("git")
