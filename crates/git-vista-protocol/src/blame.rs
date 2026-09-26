@@ -951,6 +951,61 @@ mod blame_parse_tests {
         assert!(!renamed.boundary);
     }
 
+    /// #860 audit item 8: the same porcelain stream with LF and with CRLF line
+    /// endings must attribute identically, with no `\r` left in any field.
+    #[test]
+    fn lf_and_crlf_blame_have_identical_attribution_without_trailing_cr() {
+        let lf = six_line_stream();
+        let crlf = lf.replace('\n', "\r\n");
+        let lf_ranges = parse_line_porcelain_blame(lf.as_bytes()).unwrap();
+        let crlf_ranges = parse_line_porcelain_blame(crlf.as_bytes()).unwrap();
+
+        // Pin the attribution as well as equivalence: losing the same line
+        // in both inputs must not make this regression pass vacuously.
+        assert_eq!(
+            lf_ranges,
+            vec![
+                BlameRange {
+                    commit: "24909fc9812477b9fdd37a29e02a20e046541aaf".into(),
+                    author: "git-vista-ci".into(),
+                    time: 1788604866,
+                    summary: "c1".into(),
+                    start_line: 1,
+                    end_line: 5,
+                    path: "sub/target.txt".into(),
+                    renamed_from: None,
+                    boundary: true,
+                },
+                BlameRange {
+                    commit: "48038450aa1a68c092cc9b1d65c7e359042b35b5".into(),
+                    author: "git-vista-ci".into(),
+                    time: 1788604866,
+                    summary: "c2".into(),
+                    start_line: 6,
+                    end_line: 6,
+                    path: "sub/renamed.txt".into(),
+                    renamed_from: Some("sub/target.txt".into()),
+                    boundary: false,
+                },
+            ]
+        );
+        for range in lf_ranges.iter().chain(&crlf_ranges) {
+            for value in [
+                Some(range.commit.as_str()),
+                Some(range.author.as_str()),
+                Some(range.summary.as_str()),
+                Some(range.path.as_str()),
+                range.renamed_from.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                assert!(!value.ends_with('\r'), "trailing CR in {value:?}");
+            }
+        }
+        assert_eq!(crlf_ranges, lf_ranges);
+    }
+
     #[test]
     fn a_header_without_a_group_count_still_parses() {
         // Real `--line-porcelain` omits the 4th field on every line after a
