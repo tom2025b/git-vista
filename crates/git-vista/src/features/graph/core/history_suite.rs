@@ -631,7 +631,7 @@ fn eager_prefetch_ignores_viewport_proximity_but_still_respects_flight_and_curso
 fn the_epoch_reset_effect_does_not_clear_the_full_history_latch() {
     const APP_MOD: &str = include_str!("../../../app/mod.rs");
     let after = APP_MOD
-        .split_once("let epoch = graph.get().epoch();")
+        .split_once("let epoch = render_epoch.get();")
         .expect("app/mod.rs no longer contains the epoch-reset effect")
         .1;
     let body = &after[..after

@@ -77,6 +77,10 @@ impl RequestKey {
 pub struct Invalidate {
     pub generation: Option<GenerationToken>,
     pub scope: InvalidateScope,
+    /// Captured at dispatch, never inferred from the binding at settlement.
+    pub binding: Option<crate::features::graph::core::BindingKey>,
+    /// Repository/worktree reported by the terminal record, if one exists.
+    pub target: Option<(String, String)>,
 }
 
 /// #783: this enum used to also carry `Status` and `Activity`. Both were

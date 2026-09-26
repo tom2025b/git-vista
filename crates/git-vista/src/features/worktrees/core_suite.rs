@@ -470,14 +470,28 @@ fn the_open_button_closes_confirm_before_bumping() {
         .expect("open_button's selection call moved — re-pin this test against the new shape");
     let after_anchor = &VIEW[anchor_pos..];
     let bump_pos = after_anchor
-        .find("g.force_bump();")
-        .expect("no `g.force_bump();` found after open_button's selection outcome");
+        .find("g.finish_selection(")
+        .expect("no `g.finish_selection(` found after open_button's selection outcome");
     let window = &after_anchor[..bump_pos];
     assert!(
         window.contains("shell.close_confirm();"),
         "open_button's `Ok` arm no longer calls `shell.close_confirm()` before \
          `force_bump()` — a confirmation left open here would show a plan against \
          the desk the user just left, remounted onto the one just opened (#676)"
+    );
+}
+
+#[test]
+fn failed_open_worktree_closes_confirm_before_its_binding_transition() {
+    let selection = VIEW
+        .split_once("select_worktree_request(&id, mode).await")
+        .unwrap()
+        .1;
+    let error = selection.split_once("Err(e) => {").unwrap().1;
+    let before_transition = error.split_once("g.finish_selection(").unwrap().0;
+    assert!(
+        before_transition.contains("shell.close_confirm();"),
+        "failed selection must dismiss before reloading the retained desk"
     );
 }
 

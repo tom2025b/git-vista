@@ -67,7 +67,7 @@ pub use conflicts::{
 };
 pub use diff::{fetch_diff, fetch_diff_full, fetch_file, fetch_spec_diff};
 pub use forge::{fetch_forge_page, fetch_pull_details};
-pub use graph::{fetch_frame, fetch_frame_for_view, fetch_page};
+pub use graph::{fetch_frame, fetch_frame_for_target, fetch_page};
 pub use operations::{
     cancel_operation_request, fetch_operation_status, resolve_operation_id, CancelOutcome,
 };
@@ -506,7 +506,7 @@ impl fmt::Display for HistoryFetchError {
 /// Percent-encode one query-parameter value, so an opaque id or signed cursor
 /// containing `&`, `=`, `+` or `/` can't cut the query short or be silently
 /// re-read as a different parameter.
-fn encode_component(value: &str) -> String {
+pub(crate) fn encode_component(value: &str) -> String {
     js_sys::encode_uri_component(value)
         .as_string()
         .unwrap_or_default()

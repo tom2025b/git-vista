@@ -49,14 +49,17 @@ pub fn open_url_view(
             return;
         }
         cloning.set(true);
+        let ticket = graph
+            .try_update(|g| g.begin_selection())
+            .expect("live graph");
         spawn_local(async move {
             // The settlement rules live host-tested in `dialogs/core.rs` (#260);
             // exhaustive destructuring (no `..`) so a new rule refuses to
             // compile until this view applies it. Epoch bump happens on BOTH
             // arms: a timed-out response does not mean the clone failed, and
-            // the server may already be pointing at it (`set_current` runs
-            // before the reply) — bumping makes a completed-but-lost clone
-            // appear instead of staying silently absent.
+            // the server may already be pointing at it. An ambiguous outcome
+            // retains this tab's prior target; the recovery warning directs
+            // the user to the picker to find a possibly completed clone.
             //
             // #278: `checking_status` flips true only if `clone_request` falls
             // back to polling `GET /api/clone-status/{key}` — a lost, timed
@@ -65,7 +68,11 @@ pub fn open_url_view(
             // a phase that is no longer the original request. Always cleared
             // here, on both arms, whether or not it was ever set.
             let outcome = clone_request(&url, move || checking_status.set(true)).await;
+            cloning.set(false);
             checking_status.set(false);
+            if !graph.get_untracked().selection_is_current(ticket) {
+                return;
+            }
             let CloneSettlement {
                 clear_busy,
                 close_dialog,
@@ -91,7 +98,10 @@ pub fn open_url_view(
                 // against the newly-cloned one.
                 shell.close_confirm();
                 graph.update(|g| {
-                    g.force_bump();
+                    g.finish_selection(
+                        ticket,
+                        mode_screen_for.as_ref().map(|d| d.worktree.as_str()),
+                    );
                 });
             }
             if let Some(descriptor) = mode_screen_for {

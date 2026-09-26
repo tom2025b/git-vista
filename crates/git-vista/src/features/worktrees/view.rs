@@ -185,25 +185,38 @@ fn open_button(id: String, name: String, features: Features) -> impl IntoView {
     let on = move |_| {
         let id = id.clone();
         let name = name.clone();
+        let ticket = graph
+            .try_update(|g| g.begin_selection())
+            .expect("live graph");
         spawn_local(async move {
             // The posture the session is already in, and never an escalation:
             // switching desks must not be a way to acquire Active mode. The
             // same rule M11.02's "Open Worktree" offer follows.
             let mode = session_state::ui_mode().unwrap_or(RepoMode::Visualize);
-            match select_worktree_request(&id, mode).await {
+            let result = select_worktree_request(&id, mode).await;
+            if !graph.get_untracked().selection_is_current(ticket) {
+                return;
+            }
+            match result {
                 Ok(()) => {
                     // #676: a confirmation is about an operation in the
                     // repository just left — tear it down rather than let a
                     // canvas remount show it again over the desk just opened.
                     shell.close_confirm();
                     graph.update(|g| {
-                        g.force_bump();
+                        g.finish_selection(ticket, Some(&id));
                     });
                 }
-                Err(e) => shell.open_error(ErrorNotice {
-                    title: "Couldn't open that worktree",
-                    body: format!("‘{name}’ could not be opened: {e}"),
-                }),
+                Err(e) => {
+                    shell.close_confirm();
+                    graph.update(|g| {
+                        g.finish_selection(ticket, None);
+                    });
+                    shell.open_error(ErrorNotice {
+                        title: "Couldn't open that worktree",
+                        body: format!("‘{name}’ could not be opened: {e}"),
+                    });
+                }
             }
         });
     };

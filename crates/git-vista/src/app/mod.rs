@@ -31,7 +31,7 @@ use leptos::*;
 
 use git_vista_protocol::{check_compatibility, PROTOCOL_VERSION};
 
-use crate::api::{fetch_frame_for_view, fetch_page, fetch_protocol, HistoryFetchError};
+use crate::api::{fetch_frame_for_target, fetch_page, fetch_protocol, HistoryFetchError};
 use crate::dialogs;
 use crate::features::a11y::core::GRAPH_REGION_LABEL;
 use crate::features::activity::signals::Activity;
@@ -39,7 +39,7 @@ use crate::features::dialogs::core::Dialog;
 use crate::features::dialogs::signals::Dialogs;
 use crate::features::graph::core::{
     print_button_copy, Frame, GraphCore, HistoryInvariantError, HistoryView, LoadedHistory,
-    DEFAULT_PAGE_LIMIT,
+    SeedRequest, DEFAULT_PAGE_LIMIT,
 };
 use crate::features::history::core::{
     phase_for_epoch_bump, promote_seed, seed_retry_still_wanted, SeedPromotion,
@@ -82,6 +82,7 @@ use canvas::graph_canvas;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistorySeed {
     pub epoch: u64,
+    pub request: SeedRequest,
     pub frame: Frame,
     pub loaded: LoadedHistory,
 }
@@ -95,6 +96,8 @@ pub struct HistorySeed {
 enum HistorySeedError {
     Fetch(HistoryFetchError),
     Invariant(HistoryInvariantError),
+    Target(String),
+    Superseded,
 }
 
 impl fmt::Display for HistorySeedError {
@@ -102,6 +105,8 @@ impl fmt::Display for HistorySeedError {
         match self {
             Self::Fetch(e) => write!(f, "{e}"),
             Self::Invariant(e) => write!(f, "{e}"),
+            Self::Target(e) => write!(f, "{e}"),
+            Self::Superseded => write!(f, "This history request was superseded."),
         }
     }
 }
@@ -168,9 +173,28 @@ pub struct HistoryUiSignals {
 /// to be attributable to an epoch too, or a slow error from a retired epoch
 /// would raise [`HistoryPhase::SeedError`] over an epoch that is still loading.
 async fn load_seed(
-    (epoch, view): (u64, HistoryView),
+    graph: RwSignal<GraphCore>,
+    accepted: RwSignal<Option<HistorySeed>>,
+    request: SeedRequest,
 ) -> (u64, Result<HistorySeed, HistorySeedError>) {
-    (epoch, seed_for_epoch(epoch, view).await)
+    let result = seed_for_epoch(request.clone()).await;
+    let Some(mut current) = graph.try_get_untracked() else {
+        return (request.epoch, Err(HistorySeedError::Superseded));
+    };
+    if !current.request_is_current(&request) {
+        return (request.epoch, Err(HistorySeedError::Superseded));
+    }
+    if let Ok(seed) = &result {
+        let before = current.clone();
+        if let Err(reason) = current.accept_seed(&request, &seed.frame, &seed.loaded.generation) {
+            return (request.epoch, Err(HistorySeedError::Target(reason.into())));
+        }
+        if current != before {
+            graph.set(current);
+        }
+        accepted.set(Some(seed.clone()));
+    }
+    (request.epoch, result)
 }
 
 /// Frame, then page 1 pinned to that Frame's worktree, then the aggregate.
@@ -180,15 +204,20 @@ async fn load_seed(
 /// otherwise splice rows onto refs that no longer describe them. Checking here
 /// means [`LoadedHistory::from_first_page`] can treat its own generation check
 /// as the tautology it is.
-async fn seed_for_epoch(epoch: u64, view: HistoryView) -> Result<HistorySeed, HistorySeedError> {
-    let frame = fetch_frame_for_view(&view)
+async fn seed_for_epoch(request: SeedRequest) -> Result<HistorySeed, HistorySeedError> {
+    let selector = request
+        .selector()
+        .map_err(|e| HistorySeedError::Target(e.into()))?;
+    let frame = fetch_frame_for_target(selector, &request.view)
         .await
         .map_err(HistorySeedError::Fetch)?;
     let page = fetch_page(
-        frame.worktree_id.as_deref(),
+        request
+            .page_selector(&frame)
+            .map_err(|e| HistorySeedError::Target(e.into()))?,
         None,
         DEFAULT_PAGE_LIMIT,
-        &view,
+        &request.view,
     )
     .await
     .map_err(HistorySeedError::Fetch)?;
@@ -202,7 +231,8 @@ async fn seed_for_epoch(epoch: u64, view: HistoryView) -> Result<HistorySeed, Hi
     }
     let loaded = LoadedHistory::from_first_page(page).map_err(HistorySeedError::Invariant)?;
     Ok(HistorySeed {
-        epoch,
+        epoch: request.epoch,
+        request,
         frame,
         loaded,
     })
@@ -225,7 +255,9 @@ pub fn App() -> impl IntoView {
     crate::features::graph::signals::install_view_guard(graph);
     let refresh = move |_| {
         graph.update(|g| {
-            g.force_bump();
+            if g.seed_request().selector().is_ok() {
+                g.force_bump();
+            }
         });
     };
 
@@ -267,12 +299,13 @@ pub fn App() -> impl IntoView {
 
     // Frame + page 1, keyed on the epoch. `create_local_resource` because the
     // fetch future isn't `Send` (wasm).
+    let accepted_seed = create_rw_signal(None::<HistorySeed>);
     let seed = create_local_resource(
         move || {
             let g = graph.get();
             (g.epoch(), g.view().clone())
         },
-        load_seed,
+        move |_| load_seed(graph, accepted_seed, graph.get_untracked().seed_request()),
     );
 
     // Every epoch — Refresh, a post-operation reload, a drift reload — retires
@@ -286,8 +319,10 @@ pub fn App() -> impl IntoView {
     // completeness in the background (`should_prefetch`'s `eager`) instead of
     // leaving Print Graph disabled until the user re-scrolls through however
     // much history the repository has.
+    // Storing a validated binding must not re-run epoch-only initialization.
+    let render_epoch = create_memo(move |_| graph.get().epoch());
     create_effect(move |_| {
-        let epoch = graph.get().epoch();
+        let epoch = render_epoch.get();
         history_ui.print_open.set(false);
         history_ui.complete.set(false);
         // Whether this bump gets to announce itself, and as what, is
@@ -304,6 +339,9 @@ pub fn App() -> impl IntoView {
     // keeps its previous value while the next load runs, and an out-of-order
     // completion would otherwise mark a live reload Ready with retired data.
     create_effect(move |_| {
+        if seed.with(|value| matches!(value, Some((_, Err(HistorySeedError::Superseded))))) {
+            return;
+        }
         let Some((epoch, complete, worktree)) = seed.map(|(epoch, result)| {
             (
                 *epoch,
@@ -364,7 +402,8 @@ pub fn App() -> impl IntoView {
         let HistoryPhase::SeedError { epoch } = history_ui.phase.get() else {
             return;
         };
-        if graph.get_untracked().view().is_historical() {
+        let retry_request = graph.get_untracked().seed_request();
+        if retry_request.view.is_historical() || retry_request.selector().is_err() {
             return;
         }
         let (expected_epoch, attempts_used) = seed_retry.get_untracked();
@@ -383,7 +422,9 @@ pub fn App() -> impl IntoView {
                 // timer was armed, the panel is no longer showing the epoch
                 // this retry was for — firing anyway would race a reload
                 // that's already in flight, so skip it.
-                if !seed_retry_still_wanted(history_ui.phase.get_untracked(), epoch) {
+                if !seed_retry_still_wanted(history_ui.phase.get_untracked(), epoch)
+                    || !graph.get_untracked().request_is_current(&retry_request)
+                {
                     return;
                 }
                 let new_epoch = graph.try_update(|g| g.force_bump()).unwrap_or_default();
@@ -398,10 +439,7 @@ pub fn App() -> impl IntoView {
     // panel below: the topbar keeps naming the repo it last identified while the
     // next epoch loads, exactly as the retained whole `Graph` used to, so a
     // Refresh doesn't blink every repo-scoped control out of existence.
-    let frame = move || {
-        seed.map(|(_, result)| result.as_ref().ok().map(|s| s.frame.clone()))
-            .flatten()
-    };
+    let frame = move || accepted_seed.get().map(|s| s.frame);
 
     // M1.04 (#57): establish the loopback session before the API is usable. Run
     // once on load (source `|| ()`, not keyed on `reload`, so re-reads don't
@@ -604,14 +642,12 @@ pub fn App() -> impl IntoView {
     // so the panel's rendering no longer depends on this one. This resource's
     // job is now just the chip and the `.refetch()` calls, not panel rendering.
     let status_frame = Signal::derive(move || {
-        seed.map(|(epoch, result)| {
-            (*epoch == graph.get().epoch())
-                .then(|| result.as_ref().ok().map(|s| s.frame.clone()))
-                .flatten()
-        })
-        .flatten()
+        accepted_seed
+            .get()
+            .filter(|seed| seed.epoch == graph.get().epoch())
+            .map(|seed| seed.frame)
     });
-    let status_repo = Signal::derive(move || status_frame.get().and_then(|f| f.worktree_id));
+    let status_repo = Signal::derive(move || graph.get().status_target());
     let status = status_seam::create(graph, activity, status_repo);
 
     // Icon style (icons.rs): Nerd Font glyphs vs the plain-text fallback. A
@@ -674,7 +710,7 @@ pub fn App() -> impl IntoView {
     // its first event rather than waiting for a transition that already
     // happened.
     let freshness = crate::features::freshness::signals::Freshness::new();
-    freshness.connect();
+    freshness.connect(graph);
     // #852: the feed used to warn the plan panel only. The graph stayed on
     // the last seed until Refresh. Follow committed history from the same
     // snapshots, comparing history-v1 Frames rather than the planner token
@@ -980,6 +1016,7 @@ pub fn App() -> impl IntoView {
                 <button
                     class="refresh"
                     on:click=refresh
+                    disabled=move || graph.get().seed_request().selector().is_err()
                     title="Re-read the repository — shows branches and commits created since the page loaded"
                 >
                     "Refresh"
@@ -1058,6 +1095,15 @@ pub fn App() -> impl IntoView {
             // write controls it explains are gated where they render, and the
             // real boundary is `api.rs`'s `refuse_if_offline()` either way.
             {crate::offline_banner::offline_banner_view(online)}
+            {move || graph.get().following_unavailable().then(|| view! {
+                <p class="status" role="status">{crate::features::graph::core::FOLLOWING_UNAVAILABLE}</p>
+            })}
+            {move || match freshness.history_check() {
+                crate::features::freshness::core::HistoryCheck::Failed { reason, .. } => Some(view! {
+                    <p class="status error" role="status">{format!("Automatic history updates could not be checked: {reason} Use Refresh to retry this repository.")}</p>
+                }),
+                _ => None,
+            }}
             // The "Open URL" modal (Phase 12), factored into `dialogs`.
             <Show when=move || !graph.get().view().is_historical()>
             {dialogs::open_url_view(
@@ -1143,7 +1189,7 @@ pub fn App() -> impl IntoView {
                             // promise a retry the mechanism will not make, or
                             // sit silent through the give-up.
                             let (expected_epoch, attempts_used) = seed_retry.get();
-                            let auto_retry_pending = !graph.get().view().is_historical() && seed_retry_delay_ms(
+                            let auto_retry_pending = !graph.get().view().is_historical() && graph.get().seed_request().selector().is_ok() && seed_retry_delay_ms(
                                 seed_retry_attempts_for(expected_epoch, epoch, attempts_used),
                             )
                             .is_some();
@@ -1165,7 +1211,7 @@ pub fn App() -> impl IntoView {
                                     // just invites a second bump to race it
                                     // (the stale-timer guard above absorbs that
                                     // race, but inviting it buys nothing).
-                                    {(!auto_retry_pending && !graph.get().view().is_historical()).then(|| view! {
+                                    {(!auto_retry_pending && !graph.get().view().is_historical() && graph.get().seed_request().selector().is_ok()).then(|| view! {
                                         <button
                                             class="refresh"
                                             on:click=refresh
@@ -1176,6 +1222,10 @@ pub fn App() -> impl IntoView {
                                         </button>
                                     })}
                                 </p>
+                                {accepted_seed.get().filter(|previous| graph.get_untracked().may_show_retained(&previous.request, previous.frame.worktree_id.as_deref())).map(|previous| view! {
+                                    <p class="status">"Showing the last accepted history; updates are unavailable until this repository can be read again."</p>
+                                    {graph_canvas(previous, features, history_ui, settings)}
+                                })}
                             }
                             .into_view()
                         }
@@ -1184,8 +1234,8 @@ pub fn App() -> impl IntoView {
                             // belt-and-braces — the promotion effect above sets
                             // Ready only for a matching seed — but it is what
                             // makes "retained value" harmless rather than subtle.
-                            match seed.get() {
-                                Some((e, Ok(seed))) if e == epoch => {
+                            match accepted_seed.get() {
+                                Some(seed) if seed.epoch == epoch => {
                                     // Show which repo this page is actually
                                     // displaying, straight from the Frame. If it
                                     // disagrees with the terminal, the browser is

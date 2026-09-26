@@ -728,7 +728,92 @@ pub fn history_requires_reload(
 pub struct HistoryProbe {
     serial: u64,
     epoch: u64,
-    planner_generation: GenerationToken,
+    planner_generation: Option<GenerationToken>,
+    pub binding: crate::features::graph::core::BindingKey,
+}
+
+/// Connection identity supplies snapshot provenance without changing the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedTicket {
+    pub binding: crate::features::graph::core::BindingKey,
+    incarnation: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BoundFeed {
+    pub log: FeedLog,
+    ticket: Option<FeedTicket>,
+    incarnation: u64,
+    retry_pending: bool,
+    disposed: bool,
+}
+
+impl BoundFeed {
+    pub fn ticket(&self) -> Option<&FeedTicket> {
+        self.ticket
+            .as_ref()
+            .filter(|_| !self.retry_pending && !self.disposed)
+    }
+
+    /// None closes the source. A repeated same-binding effect does nothing.
+    pub fn bind(
+        &mut self,
+        binding: Option<crate::features::graph::core::BindingKey>,
+    ) -> Option<FeedTicket> {
+        if self.disposed || self.ticket.as_ref().map(|t| &t.binding) == binding.as_ref() {
+            return None;
+        }
+        self.log.clear();
+        self.retry_pending = false;
+        self.incarnation += 1;
+        self.ticket = binding.map(|binding| FeedTicket {
+            binding,
+            incarnation: self.incarnation,
+        });
+        self.ticket.clone()
+    }
+
+    pub fn admits(&self, ticket: &FeedTicket) -> bool {
+        self.ticket() == Some(ticket)
+    }
+
+    pub fn record(&mut self, ticket: &FeedTicket, snapshot: ChangeFeedSnapshot) -> bool {
+        if !self.admits(ticket) {
+            return false;
+        }
+        self.log.record(snapshot);
+        true
+    }
+
+    /// Exactly one timer per incarnation; repeated or obsolete errors are inert.
+    pub fn failed(&mut self, ticket: &FeedTicket) -> bool {
+        if !self.admits(ticket) {
+            return false;
+        }
+        self.log.clear();
+        self.retry_pending = true;
+        true
+    }
+
+    pub fn reconnect(&mut self, ticket: &FeedTicket) -> Option<FeedTicket> {
+        if self.disposed || !self.retry_pending || self.ticket.as_ref() != Some(ticket) {
+            return None;
+        }
+        self.incarnation += 1;
+        self.retry_pending = false;
+        self.log.clear();
+        self.ticket = Some(FeedTicket {
+            binding: ticket.binding.clone(),
+            incarnation: self.incarnation,
+        });
+        self.ticket.clone()
+    }
+
+    pub fn dispose(&mut self) {
+        self.disposed = true;
+        self.ticket = None;
+        self.log.clear();
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -761,7 +846,10 @@ pub struct HistoryActions {
 pub struct HistoryFollower {
     last_seq: Option<u64>,
     epoch: Option<u64>,
-    pending: Option<GenerationToken>,
+    binding: Option<crate::features::graph::core::BindingKey>,
+    source: Option<FeedTicket>,
+    pending: Option<Option<GenerationToken>>,
+    reconciliation: u64,
     serial: u64,
     failures: usize,
     pub check: HistoryCheck,
@@ -772,12 +860,42 @@ impl HistoryFollower {
     /// consumed once; its check stays outstanding until successfully compared.
     pub fn update(
         &mut self,
+        source: Option<&FeedTicket>,
         snapshot: Option<&ChangeFeedSnapshot>,
         graph: &crate::features::graph::core::GraphCore,
         ready: bool,
         displayed: Option<&GenerationToken>,
     ) -> HistoryActions {
         let mut actions = HistoryActions::default();
+        let binding = graph.live_binding();
+        if self.binding != binding {
+            self.binding = binding.clone();
+            self.reconciliation = graph.reconciliation();
+            self.pending = None;
+            self.last_seq = None;
+            self.failures = 0;
+            self.check = HistoryCheck::Idle;
+        }
+        if self.source.as_ref() != source {
+            self.source = source.cloned();
+            self.last_seq = None;
+            if !matches!(self.pending, Some(None)) {
+                self.pending = None;
+                self.failures = 0;
+                self.check = HistoryCheck::Idle;
+            }
+        }
+        if binding.is_none() {
+            return actions;
+        }
+        let snapshot = snapshot.filter(|_| source.map(|s| &s.binding) == binding.as_ref());
+        if self.reconciliation != graph.reconciliation() {
+            self.reconciliation = graph.reconciliation();
+            self.pending = Some(None);
+            self.failures = 0;
+            self.check = HistoryCheck::WaitingForFrame;
+            actions.refetch_status = true;
+        }
         if self.epoch != Some(graph.epoch()) {
             self.epoch = Some(graph.epoch());
             if self.pending.is_some() {
@@ -795,7 +913,7 @@ impl HistoryFollower {
         self.last_seq = snapshot.map(|s| s.seq);
         if let Some(snapshot) = new_reading {
             if live_followup(snapshot) == LiveFollowup::CheckHistory {
-                self.pending = snapshot.generation.clone();
+                self.pending = Some(snapshot.generation.clone());
                 self.failures = 0;
                 self.check = HistoryCheck::WaitingForFrame;
                 actions.refetch_status = true;
@@ -827,6 +945,7 @@ impl HistoryFollower {
             serial: self.serial,
             epoch: graph.epoch(),
             planner_generation,
+            binding: self.binding.clone().expect("bound scheduler"),
         };
         self.check = HistoryCheck::InFlight(probe.clone());
         actions.probe = Some(probe);
@@ -837,12 +956,15 @@ impl HistoryFollower {
     pub fn complete(
         &mut self,
         probe: &HistoryProbe,
-        result: Result<GenerationToken, String>,
+        result: Result<(String, GenerationToken), String>,
         graph: &mut crate::features::graph::core::GraphCore,
         ready: bool,
         displayed: Option<&GenerationToken>,
     ) -> Option<u64> {
         if self.check != HistoryCheck::InFlight(probe.clone()) {
+            return None;
+        }
+        if graph.live_binding().as_ref() != Some(&probe.binding) {
             return None;
         }
         if graph.epoch() != probe.epoch
@@ -853,12 +975,19 @@ impl HistoryFollower {
             self.check = HistoryCheck::WaitingForFrame;
             return None;
         }
+        let result = result.and_then(|(worktree, generation)| {
+            if worktree == probe.binding.worktree {
+                Ok(generation)
+            } else {
+                Err("History probe returned another repository.".into())
+            }
+        });
         match result {
             Ok(live) => {
                 self.pending = None;
                 self.check = HistoryCheck::Compared;
                 if history_requires_reload(displayed, &live) {
-                    graph.force_bump_for_feed(&probe.planner_generation);
+                    graph.force_bump_for_feed(&probe.binding, probe.planner_generation.as_ref());
                 }
                 None
             }
@@ -883,8 +1012,11 @@ impl HistoryFollower {
     }
 
     /// A timer cannot revive a request superseded by another reading or epoch.
-    pub fn retry(&mut self, probe: &HistoryProbe) {
-        if matches!(&self.check, HistoryCheck::Backoff { probe: waiting, .. } if waiting == probe) {
+    pub fn retry(&mut self, probe: &HistoryProbe, graph: &crate::features::graph::core::GraphCore) {
+        if graph.live_binding().as_ref() == Some(&probe.binding)
+            && graph.epoch() == probe.epoch
+            && matches!(&self.check, HistoryCheck::Backoff { probe: waiting, .. } if waiting == probe)
+        {
             self.check = HistoryCheck::WaitingForFrame;
         }
     }

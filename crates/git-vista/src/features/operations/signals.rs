@@ -246,7 +246,8 @@ impl Operations {
         // A rejected admission means this exact key already names a different operation —
         // impossible for a freshly minted key, but refusing beats sending a request the
         // registry cannot account for.
-        match core.try_update(|c| c.admit(key.clone(), kind.clone())) {
+        let issuing_binding = graph.get_untracked().live_binding();
+        match core.try_update(|c| c.admit_bound(key.clone(), kind.clone(), issuing_binding)) {
             Some(Ok(_)) => {}
             _ => return,
         }
@@ -761,7 +762,10 @@ fn reattach_after_stream_loss(
                         status.message.clone(),
                         status.generation,
                         status.status,
-                    ) {
+                    )
+                    .map(|outcome| {
+                        outcome.with_target(status.repository.as_str(), status.worktree.as_str())
+                    }) {
                         commit_settlement(core, graph, &id, outcome);
                     }
                     return;
@@ -832,7 +836,10 @@ fn subscribe(
                 record.message.clone(),
                 record.generation,
                 record.status,
-            ) else {
+            )
+            .map(|outcome| {
+                outcome.with_target(record.repository.as_str(), record.worktree.as_str())
+            }) else {
                 return;
             };
             commit_settlement(core, graph, &record.id, outcome);
@@ -937,7 +944,10 @@ fn resume_inflight_remote_op(core: RwSignal<OperationsCore>, graph: RwSignal<Gra
                     status.message.clone(),
                     status.generation,
                     status.status,
-                ) {
+                )
+                .map(|outcome| {
+                    outcome.with_target(status.repository.as_str(), status.worktree.as_str())
+                }) {
                     commit_settlement(core, graph, &id, outcome);
                 }
             }

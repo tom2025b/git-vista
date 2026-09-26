@@ -143,9 +143,10 @@ pub struct CloneSettlement<T> {
     /// Re-read the graph. **Both arms — this is #260's recovery.** A timeout or
     /// dropped-tunnel error does not mean the clone failed: the server may have
     /// finished and already moved its current selection (`clone.rs` runs
-    /// `set_current` before replying). The frame request follows the server's
-    /// current selection, so bumping on the error arm makes a
-    /// completed-but-lost clone appear instead of staying silently absent.
+    /// `set_current` before replying). The frame request follows the browser's
+    /// captured tab binding. On an ambiguous error the adapter retains the
+    /// prior target; only a successful descriptor may supply a new target.
+    /// The warning below explains how to find a completed-but-lost clone.
     ///
     /// Deliberately uniform: it also fires for definite failures (bad URL,
     /// offline pre-flight refusal), where the extra refetch is harmless noise.

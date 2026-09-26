@@ -89,6 +89,7 @@ pub(super) fn graph_canvas(
 ) -> impl IntoView {
     let HistorySeed {
         epoch,
+        request,
         frame,
         loaded,
     } = seed;
@@ -392,6 +393,13 @@ pub(super) fn graph_canvas(
         }) else {
             return;
         };
+        let binding_request = request.clone();
+        let Some(worktree_id) = graph
+            .get_untracked()
+            .page_target(&binding_request, worktree_id.as_deref())
+        else {
+            return;
+        };
         page_load.set(PageLoadState::Loading {
             cursor: request_key.cursor.clone(),
         });
@@ -400,7 +408,7 @@ pub(super) fn graph_canvas(
         let view = graph.get_untracked().view().clone();
         spawn_local(async move {
             let fetched = fetch_page(
-                worktree_id.as_deref(),
+                Some(&worktree_id),
                 Some(&request_key.cursor),
                 DEFAULT_PAGE_LIMIT,
                 &view,
@@ -410,6 +418,13 @@ pub(super) fn graph_canvas(
             // (1) The canvas is gone. Nothing below may run: the signals belong
             // to a disposed reactive scope and the aggregate has been dropped.
             if !alive.get() {
+                return;
+            }
+            if graph
+                .get_untracked()
+                .page_target(&binding_request, Some(&worktree_id))
+                .is_none()
+            {
                 return;
             }
             // (2) Is this reply still the live view's? All three parts of the key

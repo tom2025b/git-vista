@@ -99,6 +99,9 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
         if let PendingOp::Checkout { elsewhere, .. } = &op {
             if let CheckoutAction::OpenWorktree { id, name } = checkout_confirm_action(elsewhere) {
                 shell.close_confirm();
+                let ticket = graph
+                    .try_update(|g| g.begin_selection())
+                    .expect("live graph");
                 spawn_local(async move {
                     // The posture the session is already in, and **never an
                     // escalation**: a refused checkout must not be a way to
@@ -107,25 +110,35 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                     // the picker if they want more, which is where that
                     // choice has always been made.
                     let mode = session_state::ui_mode().unwrap_or(RepoMode::Visualize);
-                    match select_worktree_request(&id, mode).await {
+                    let result = select_worktree_request(&id, mode).await;
+                    if !graph.get_untracked().selection_is_current(ticket) {
+                        return;
+                    }
+                    match result {
                         Ok(()) => {
                             // #676: belt-and-suspenders with the close_confirm
                             // above — this confirm is already gone by the time
                             // this reply lands, but the invariant is "every
-                            // force_bump after a selection tears down
+                            // binding transition after a selection tears down
                             // confirm", not "this one call site happens to be
                             // safe already".
                             shell.close_confirm();
                             graph.update(|g| {
-                                g.force_bump();
+                                g.finish_selection(ticket, Some(&id));
                             });
                         }
-                        Err(e) => shell.open_error(ErrorNotice {
-                            title: "Couldn't open that worktree",
-                            body: format!(
-                                "‘{name}’ holds the branch, but selecting it failed: {e}"
-                            ),
-                        }),
+                        Err(e) => {
+                            shell.close_confirm();
+                            graph.update(|g| {
+                                g.finish_selection(ticket, None);
+                            });
+                            shell.open_error(ErrorNotice {
+                                title: "Couldn't open that worktree",
+                                body: format!(
+                                    "‘{name}’ holds the branch, but selecting it failed: {e}"
+                                ),
+                            });
+                        }
                     }
                 });
                 return;

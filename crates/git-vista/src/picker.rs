@@ -433,8 +433,16 @@ pub fn mode_view(
                     opening.set(Some(mode));
                     err.set(String::new());
                     let worktree = worktree.clone();
+                    let ticket = graph
+                        .try_update(|g| g.begin_selection())
+                        .expect("live graph");
                     spawn_local(async move {
-                        match select_request(&worktree, mode).await {
+                        let result = select_request(&worktree, mode).await;
+                        if !graph.get_untracked().selection_is_current(ticket) {
+                            opening.set(None);
+                            return;
+                        }
+                        match result {
                             Ok(()) => {
                                 // The server accepted the selection, so this is the user's
                                 // choice taking effect. A LAN session cannot reach here —
@@ -448,10 +456,16 @@ pub fn mode_view(
                                 // reopen a plan against the newly-selected one.
                                 shell.close_confirm();
                                 graph.update(|g| {
-                                    g.force_bump();
+                                    g.finish_selection(ticket, Some(&worktree));
                                 });
                             }
-                            Err(e) => err.set(e),
+                            Err(e) => {
+                                shell.close_confirm();
+                                graph.update(|g| {
+                                    g.finish_selection(ticket, None);
+                                });
+                                err.set(e);
+                            }
                         }
                         opening.set(None);
                     });

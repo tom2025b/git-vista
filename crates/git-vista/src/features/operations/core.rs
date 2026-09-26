@@ -32,6 +32,7 @@ pub const MAX_RECENT: usize = 8;
 /// An operation the client has started and not yet seen resolve.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InFlight {
+    pub binding: Option<crate::features::graph::core::BindingKey>,
     /// This client's name for the user action (ADR 0020). Stable across retries.
     pub key: IdempotencyKey,
     /// The server's handle, once the write response has been read. `None` between the
@@ -62,6 +63,7 @@ pub struct InFlight {
 /// generation observed *after* execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settlement {
+    pub target: Option<(String, String)>,
     pub status: Option<u16>,
     pub error_code: Option<git_vista_protocol::ErrorCode>,
     pub state: OperationState,
@@ -70,6 +72,11 @@ pub struct Settlement {
 }
 
 impl Settlement {
+    pub fn with_target(mut self, repository: &str, worktree: &str) -> Self {
+        self.target = Some((repository.into(), worktree.into()));
+        self
+    }
+
     /// Build a settlement from a record's terminal fields, or `None` if it has not
     /// finished. The guard is the point: `GET /api/operations/{id}` answers with a full
     /// record whether or not the operation is over.
@@ -81,6 +88,7 @@ impl Settlement {
     ) -> Option<Self> {
         state.is_terminal().then(|| {
             let outcome = Self {
+                target: None,
                 state,
                 message,
                 generation,
@@ -309,6 +317,20 @@ pub struct OperationsCore {
 }
 
 impl OperationsCore {
+    pub fn admit_bound(
+        &mut self,
+        key: IdempotencyKey,
+        kind: OperationKind,
+        binding: Option<crate::features::graph::core::BindingKey>,
+    ) -> Result<Applied, OperationsRejection> {
+        let result = self.admit(key.clone(), kind)?;
+        if result == Applied::Committed {
+            if let Some(entry) = self.in_flight.iter_mut().find(|entry| entry.key == key) {
+                entry.binding = binding;
+            }
+        }
+        Ok(result)
+    }
     /// Register a user action. Re-admitting the same key with the same operation is the
     /// retry case and changes nothing; re-using it for a *different* operation is refused.
     pub fn admit(
@@ -324,6 +346,7 @@ impl OperationsCore {
             };
         }
         self.in_flight.push(InFlight {
+            binding: None,
             key,
             id: None,
             kind,
@@ -435,6 +458,8 @@ impl OperationsCore {
         };
         let entry = self.in_flight.remove(index);
         let invalidate = Invalidate {
+            binding: entry.binding,
+            target: outcome.target.clone(),
             generation: outcome.generation.clone(),
             // A write can move refs, the working tree and the journal at once, so nothing
             // narrower than `Everything` is honest here. The generation is what stops that
@@ -761,6 +786,7 @@ pub const STREAM_LOST_MESSAGE: &str = "Lost contact with the server while this w
 /// this value is written inline in `signals.rs` again.
 pub fn lost_contact_settlement() -> Settlement {
     Settlement {
+        target: None,
         status: None,
         error_code: None,
         state: OperationState::Failed,
@@ -800,6 +826,7 @@ pub fn reattach_step(budget: u32) -> ReattachStep {
 /// alone, on the paths that have no server-side record to read.
 pub fn local_settlement(ok: bool, message: String) -> Settlement {
     Settlement {
+        target: None,
         status: None,
         error_code: None,
         state: if ok {
@@ -848,6 +875,7 @@ mod core_tests {
 
     fn succeeded(generation: &str) -> Settlement {
         Settlement {
+            target: None,
             status: None,
             error_code: None,
             state: OperationState::Succeeded,
@@ -863,6 +891,57 @@ mod core_tests {
         c.admit(key("k1"), merge()).expect("first admit accepted");
         c.bind_id(&key("k1"), id("op-1")).expect("bind accepted");
         c
+    }
+
+    #[test]
+    fn settlement_retains_server_target_and_original_issuing_binding() {
+        let mut c = OperationsCore::default();
+        let binding = crate::features::graph::core::BindingKey {
+            revision: 17,
+            worktree: "worktree-x".into(),
+            repository: Some("repository-x".into()),
+        };
+        c.admit_bound(key("bound"), merge(), Some(binding.clone()))
+            .unwrap();
+        // A duplicate admission cannot relabel an already-issued write.
+        let mut newer = binding.clone();
+        newer.revision += 1;
+        c.admit_bound(key("bound"), merge(), Some(newer)).unwrap();
+        c.bind_id(&key("bound"), id("bound-op")).unwrap();
+        let outcome = succeeded("planner-token").with_target("repository-y", "worktree-y");
+        let invalidation = c.settle(&id("bound-op"), outcome).unwrap();
+        assert_eq!(
+            invalidation.binding,
+            Some(binding),
+            "settlement must preserve the revision at dispatch"
+        );
+        assert_eq!(
+            invalidation.target,
+            Some(("repository-y".into(), "worktree-y".into())),
+            "terminal identity must not be relabeled with the current graph"
+        );
+    }
+
+    #[test]
+    fn resumed_and_local_outcomes_do_not_invent_missing_provenance() {
+        let mut resumed = running();
+        let inv = resumed
+            .settle(&id("op-1"), succeeded("p").with_target("repo", "worktree"))
+            .unwrap();
+        assert!(
+            inv.binding.is_none(),
+            "resumption has no recoverable issuing revision"
+        );
+        assert!(inv.target.is_some());
+        let mut local = running();
+        let inv = local
+            .settle(&id("op-1"), local_settlement(false, "offline".into()))
+            .unwrap();
+        assert!(
+            inv.target.is_none(),
+            "HTTP-only outcome cannot invent a server target"
+        );
+        assert!(inv.generation.is_none());
     }
 
     #[test]
@@ -992,6 +1071,7 @@ mod core_tests {
         c.settle(
             &id("op-1"),
             Settlement {
+                target: None,
                 status: None,
                 error_code: None,
                 state: OperationState::Failed,

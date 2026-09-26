@@ -40,8 +40,86 @@ pub type Page = HistoryPage<GraphRow, Edge, FrameStub>;
 pub struct GraphCore {
     view: HistoryView,
     epoch: u64,
+    binding_revision: u64,
+    binding: TabBinding,
+    accepted_binding: Option<BindingKey>,
+    reconciliation: u64,
     // Planner recipe only; accepted Frame history-v1 tokens live separately.
     generation: Option<GenerationToken>,
+}
+
+/// Identity retained above the render epoch. Tokens describe content, not a desk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindingKey {
+    pub revision: u64,
+    pub worktree: String,
+    pub repository: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum TabBinding {
+    #[default]
+    Discovery,
+    Bound {
+        worktree: String,
+        repository: Option<String>,
+    },
+    Selecting {
+        previous: Option<BindingKey>,
+    },
+    Candidate {
+        worktree: String,
+    },
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionTicket(u64);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeedTarget {
+    Discovery,
+    Repository(String),
+    Unavailable,
+}
+
+/// Captured before either seed read; an ordinary epoch never rediscovers a desk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedRequest {
+    pub epoch: u64,
+    pub revision: u64,
+    pub view: HistoryView,
+    pub target: SeedTarget,
+}
+
+pub const FOLLOWING_UNAVAILABLE: &str = "Automatic updates are unavailable because this view has no repository identity. Select a repository to reconnect.";
+
+pub fn usable_worktree(id: Option<&str>) -> Option<&str> {
+    id.filter(|id| id.parse::<git_vista_core::identity::WorktreeId>().is_ok())
+}
+
+impl SeedRequest {
+    pub fn selector(&self) -> Result<Option<&str>, &'static str> {
+        match &self.target {
+            SeedTarget::Discovery => Ok(None),
+            SeedTarget::Repository(id) => Ok(Some(id)),
+            SeedTarget::Unavailable => Err(FOLLOWING_UNAVAILABLE),
+        }
+    }
+
+    /// Called before page 1: a wrong Frame must not authorize a request to Y.
+    pub fn page_selector<'a>(&self, frame: &'a Frame) -> Result<Option<&'a str>, &'static str> {
+        match &self.target {
+            SeedTarget::Discovery => Ok(usable_worktree(frame.worktree_id.as_deref())),
+            SeedTarget::Repository(expected)
+                if frame.worktree_id.as_deref() == Some(expected.as_str()) =>
+            {
+                Ok(frame.worktree_id.as_deref())
+            }
+            SeedTarget::Repository(_) => Err("The history response belongs to another repository."),
+            SeedTarget::Unavailable => Err(FOLLOWING_UNAVAILABLE),
+        }
+    }
 }
 
 /// The graph's source is pinned for an entire epoch, including page requests.
@@ -78,11 +156,188 @@ impl HistoryView {
 }
 
 impl GraphCore {
+    pub fn binding_revision(&self) -> u64 {
+        self.binding_revision
+    }
+
+    /// Metadata/status reads keep the last accepted desk while a selection or
+    /// replacement seed is pending. This is not authority to admit callbacks.
+    pub fn status_target(&self) -> Option<String> {
+        self.accepted_binding
+            .as_ref()
+            .map(|binding| binding.worktree.clone())
+    }
+
+    pub fn reconciliation(&self) -> u64 {
+        self.reconciliation
+    }
+
+    pub fn binding(&self) -> Option<BindingKey> {
+        match &self.binding {
+            TabBinding::Bound {
+                worktree,
+                repository,
+            } => Some(BindingKey {
+                revision: self.binding_revision,
+                worktree: worktree.clone(),
+                repository: repository.clone(),
+            }),
+            TabBinding::Discovery
+            | TabBinding::Unavailable
+            | TabBinding::Selecting { .. }
+            | TabBinding::Candidate { .. } => None,
+        }
+    }
+
+    pub fn live_binding(&self) -> Option<BindingKey> {
+        (!self.view.is_historical())
+            .then(|| self.binding())
+            .flatten()
+    }
+
+    pub fn following_unavailable(&self) -> bool {
+        matches!(self.binding, TabBinding::Unavailable)
+    }
+
+    /// Fence immediately, before the selection request can change the shared session.
+    pub fn begin_selection(&mut self) -> SelectionTicket {
+        let previous = match &self.binding {
+            TabBinding::Selecting { previous } => previous.clone(),
+            _ => self.accepted_binding.clone(),
+        };
+        self.binding_revision += 1;
+        self.generation = None;
+        self.binding = TabBinding::Selecting { previous };
+        SelectionTicket(self.binding_revision)
+    }
+
+    pub fn selection_is_current(&self, ticket: SelectionTicket) -> bool {
+        ticket.0 == self.binding_revision && matches!(self.binding, TabBinding::Selecting { .. })
+    }
+
+    /// None is a failed/ambiguous selection, never permission for discovery.
+    /// Callers dismiss the old confirmation before this transition retires the epoch.
+    pub fn finish_selection(&mut self, ticket: SelectionTicket, selected: Option<&str>) -> bool {
+        if !self.selection_is_current(ticket) {
+            return false;
+        }
+        let TabBinding::Selecting { previous } = &self.binding else {
+            return false;
+        };
+        self.binding = match usable_worktree(selected) {
+            Some(worktree) => TabBinding::Candidate {
+                worktree: worktree.into(),
+            },
+            None => match previous {
+                Some(previous) => TabBinding::Bound {
+                    worktree: previous.worktree.clone(),
+                    repository: previous.repository.clone(),
+                },
+                None => TabBinding::Unavailable,
+            },
+        };
+        self.binding_revision += 1;
+        self.view = HistoryView::Live;
+        self.force_bump();
+        true
+    }
+
+    pub fn seed_request(&self) -> SeedRequest {
+        let target = match &self.binding {
+            TabBinding::Discovery => SeedTarget::Discovery,
+            TabBinding::Bound { worktree, .. } | TabBinding::Candidate { worktree } => {
+                SeedTarget::Repository(worktree.clone())
+            }
+            TabBinding::Unavailable | TabBinding::Selecting { .. } => SeedTarget::Unavailable,
+        };
+        SeedRequest {
+            epoch: self.epoch,
+            revision: self.binding_revision(),
+            view: self.view.clone(),
+            target,
+        }
+    }
+
+    pub fn request_is_current(&self, request: &SeedRequest) -> bool {
+        request.epoch == self.epoch
+            && request.revision == self.binding_revision
+            && request.view == self.view
+    }
+
+    /// Retained data may accompany a load error, but is never relabeled as
+    /// another target/observation and never accepted as the current epoch.
+    pub fn may_show_retained(&self, request: &SeedRequest, frame_worktree: Option<&str>) -> bool {
+        let SeedTarget::Repository(target) = self.seed_request().target else {
+            return false;
+        };
+        self.view == request.view && frame_worktree == Some(target.as_str())
+    }
+
+    pub fn page_target(
+        &self,
+        request: &SeedRequest,
+        frame_worktree: Option<&str>,
+    ) -> Option<String> {
+        if !self.request_is_current(request) {
+            return None;
+        }
+        let worktree = usable_worktree(frame_worktree)?;
+        let binding = self.binding()?;
+        (binding.worktree == worktree).then(|| worktree.to_string())
+    }
+
+    /// Accept only a current, internally consistent seed. Identity is checked
+    /// independently of history generation, including identical repositories.
+    pub fn accept_seed(
+        &mut self,
+        request: &SeedRequest,
+        frame: &Frame,
+        page_generation: &GenerationToken,
+    ) -> Result<(), &'static str> {
+        if !self.request_is_current(request) {
+            return Err("This history request was superseded.");
+        }
+        request.page_selector(frame)?;
+        if &frame.generation != page_generation {
+            return Err("The history Frame and page describe different generations.");
+        }
+        match &self.binding {
+            TabBinding::Discovery if request.target == SeedTarget::Discovery => {
+                self.binding = match usable_worktree(frame.worktree_id.as_deref()) {
+                    Some(worktree) => TabBinding::Bound {
+                        worktree: worktree.into(),
+                        repository: frame.repo_id.clone(),
+                    },
+                    None => TabBinding::Unavailable,
+                };
+            }
+            TabBinding::Bound { worktree, .. } if frame.worktree_id.as_ref() == Some(worktree) => {}
+            TabBinding::Candidate { worktree } if frame.worktree_id.as_ref() == Some(worktree) => {
+                self.binding = TabBinding::Bound {
+                    worktree: worktree.clone(),
+                    repository: frame.repo_id.clone(),
+                };
+            }
+            _ => return Err("This history response cannot replace the tab's repository."),
+        }
+        self.accepted_binding = self.binding();
+        Ok(())
+    }
+
     pub fn view(&self) -> &HistoryView {
         &self.view
     }
 
     pub fn show_as_of(&mut self, token: String, time: i64, repo: Option<String>) {
+        // Historical observations must carry an explicit validated target.
+        // Return to live retains this target instead of rediscovering the session.
+        self.binding_revision += 1;
+        self.binding = match usable_worktree(repo.as_deref()) {
+            Some(worktree) => TabBinding::Candidate {
+                worktree: worktree.into(),
+            },
+            None => TabBinding::Unavailable,
+        };
         self.view = HistoryView::AsOf { token, time, repo };
         self.generation = None;
         self.force_bump();
@@ -101,6 +356,7 @@ impl GraphCore {
             view: HistoryView::Live,
             epoch: 0,
             generation: Some(GenerationToken::new(generation).expect("valid generation token")),
+            ..Self::default()
         }
     }
 
@@ -119,11 +375,17 @@ impl GraphCore {
     /// A history comparison proved movement. Record the planner reading that
     /// requested it so settlement coalesces in either order. This argument is
     /// never a Frame's history-v1 token.
-    pub fn force_bump_for_feed(&mut self, planner_generation: &GenerationToken) -> Applied {
-        if self.view.is_historical() || self.generation.as_ref() == Some(planner_generation) {
+    pub fn force_bump_for_feed(
+        &mut self,
+        binding: &BindingKey,
+        planner_generation: Option<&GenerationToken>,
+    ) -> Applied {
+        if self.live_binding().as_ref() != Some(binding)
+            || planner_generation.is_some_and(|g| self.generation.as_ref() == Some(g))
+        {
             return Applied::NoChange;
         }
-        self.generation = Some(planner_generation.clone());
+        self.generation = planner_generation.cloned();
         self.force_bump();
         Applied::Committed
     }
@@ -144,6 +406,29 @@ impl GraphCore {
             InvalidateScope::Graph | InvalidateScope::Everything
         ) {
             return Applied::NoChange;
+        }
+        let Some(current) = self.live_binding() else {
+            return Applied::NoChange;
+        };
+        if inv
+            .binding
+            .as_ref()
+            .is_some_and(|binding| binding != &current)
+            || inv.target.as_ref().is_some_and(|(repo, worktree)| {
+                worktree != &current.worktree
+                    || current
+                        .repository
+                        .as_ref()
+                        .is_some_and(|expected| expected != repo)
+            })
+        {
+            return Applied::NoChange;
+        }
+        if inv.binding.is_none() || inv.target.is_none() {
+            // A local/resumed outcome has no proven issuing binding. Compare
+            // pinned history; never store its token as coalescing provenance.
+            self.reconciliation += 1;
+            return Applied::Committed;
         }
         match &inv.generation {
             // The server could not read a generation after execution (ADR 0020

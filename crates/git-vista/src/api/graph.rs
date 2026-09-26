@@ -21,12 +21,18 @@ const MAX_PAGE_LIMIT: usize = 1_000;
 /// origin as the served SPA, cache-busted with `t=<ms>` like every other read
 /// (the backend ignores the param; iOS Safari's persistent cache does not).
 ///
-/// No `?repo=` selector: the Frame *is* what resolves the view's target, and
-/// every page fetched after it pins that answer via
-/// [`Frame::worktree_id`](git_vista_protocol::HistoryFrame::worktree_id).
+/// Compatibility entry point for unrelated callers. Graph reads use the
+/// explicit target captured from their tab binding instead.
 pub async fn fetch_frame_for_view(view: &HistoryView) -> Result<Frame, HistoryFetchError> {
+    fetch_frame_for_target(view.repo(), view).await
+}
+
+pub async fn fetch_frame_for_target(
+    repo: Option<&str>,
+    view: &HistoryView,
+) -> Result<Frame, HistoryFetchError> {
     let mut url = format!("/api/frame?t={}", js_sys::Date::now());
-    if let Some(repo) = view.repo() {
+    if let Some(repo) = repo {
         url.push_str(&format!("&repo={}", encode_component(repo)));
     }
     if let Some(token) = view.token() {

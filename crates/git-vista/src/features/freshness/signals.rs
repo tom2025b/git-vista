@@ -34,7 +34,8 @@ use crate::features::graph::core::GraphCore;
 use crate::features::status::signals::StatusResource;
 
 use super::core::{
-    verdict, FeedLog, HistoryCheck, HistoryFollower, HistoryProbe, PlanSlot, PlanVerdict,
+    verdict, BoundFeed, FeedTicket, HistoryCheck, HistoryFollower, HistoryProbe, PlanSlot,
+    PlanVerdict,
 };
 
 /// How long to wait before re-opening a change feed that dropped.
@@ -45,17 +46,14 @@ use super::core::{
 /// release — a client with no feed simply says "couldn't tell" until it has one.
 /// Giving up permanently would make that sentence permanent too.
 ///
-/// A second rather than the operations stream's two, because the ordinary cause
-/// of a clean close here is not a failure at all: the server ends the stream
-/// when this session selects a different repository, and the reconnect is how
-/// the feed follows it. A user who has just opened a repository should not
-/// watch a panel say "couldn't tell" for longer than it takes to read it.
+/// Reconnect always requests the same bound target. Session selection in another
+/// tab neither ends this connection nor supplies a replacement target.
 const REATTACH_INTERVAL_MS: u64 = 1_000;
 
 /// The repository change feed, as the app holds it.
 #[derive(Clone, Copy)]
 pub struct Freshness {
-    log: RwSignal<FeedLog>,
+    feed: RwSignal<BoundFeed>,
     history: RwSignal<HistoryFollower>,
 }
 
@@ -68,14 +66,31 @@ impl Default for Freshness {
 impl Freshness {
     pub fn new() -> Self {
         Self {
-            log: create_rw_signal(FeedLog::new()),
+            feed: create_rw_signal(BoundFeed::default()),
             history: create_rw_signal(HistoryFollower::default()),
         }
     }
 
     /// Open the stream. Called once, from `App`.
-    pub fn connect(&self) {
-        subscribe(self.log);
+    pub fn connect(&self, graph: RwSignal<GraphCore>) {
+        let feed = self.feed;
+        let socket = store_value(None::<FeedSocket>);
+        let binding = create_memo(move |_| graph.get().live_binding());
+        create_effect(move |_| {
+            let target = binding.get();
+            let mut ticket = None;
+            feed.update(|f| ticket = f.bind(target));
+            if let Some(ticket) = ticket {
+                socket.update_value(|s| *s = None);
+                subscribe(feed, socket, graph, ticket);
+            } else if binding.get_untracked().is_none() {
+                socket.update_value(|s| *s = None);
+            }
+        });
+        on_cleanup(move || {
+            let _ = feed.try_update(|f| f.dispose());
+            let _ = socket.try_update_value(|s| *s = None);
+        });
     }
 
     /// A tracked read: the panel re-renders when a snapshot arrives.
@@ -83,7 +98,7 @@ impl Freshness {
     /// One fold, so the button, the notice and the Rebuild offer are three
     /// readings of one verdict rather than three computations that can drift.
     pub fn of(&self, slot: &PlanSlot) -> PlanVerdict {
-        self.log.with(|log| verdict(slot, log))
+        self.feed.with(|feed| verdict(slot, &feed.log))
     }
 
     /// The most recently published health, or `None` before the first
@@ -92,14 +107,15 @@ impl Freshness {
     /// plan panel does. `Clone`d out rather than borrowed: the caller may
     /// hold this across the reactive scope that produced it.
     pub fn health(&self) -> Option<ChangeFeedHealth> {
-        self.log.with(|log| log.latest().map(|s| s.health.clone()))
+        self.feed
+            .with(|feed| feed.log.latest().map(|s| s.health.clone()))
     }
 
     /// The most recently recorded snapshot, or `None` before the first
     /// publication and again after a reconnect clears the log. Tracked, so
     /// the live-graph follow-up re-runs on every reading.
     pub fn latest_snapshot(&self) -> Option<ChangeFeedSnapshot> {
-        self.log.with(|log| log.latest().cloned())
+        self.feed.with(|feed| feed.log.latest().cloned())
     }
 
     /// Follow committed history from this feed (#852).
@@ -122,6 +138,7 @@ impl Freshness {
         let history = self.history;
         create_effect(move |_| {
             let snapshot = self.latest_snapshot();
+            let source = self.feed.with(|f| f.ticket().cloned());
             let current = graph.get();
             let ready = graph_ready.get();
             let frame = displayed.get();
@@ -130,7 +147,13 @@ impl Freshness {
             self.history_check();
             let mut actions = None;
             history.update_untracked(|h| {
-                actions = Some(h.update(snapshot.as_ref(), &current, ready, frame.as_ref()));
+                actions = Some(h.update(
+                    source.as_ref(),
+                    snapshot.as_ref(),
+                    &current,
+                    ready,
+                    frame.as_ref(),
+                ));
             });
             let Some(actions) = actions else { return };
             if actions.refetch_status {
@@ -157,10 +180,22 @@ fn run_history_probe(
     probe: HistoryProbe,
 ) {
     spawn_local(async move {
-        let result = crate::api::fetch_frame()
-            .await
-            .map(|frame| frame.generation)
-            .map_err(|error| error.to_string());
+        let result = crate::api::fetch_frame_for_target(
+            Some(&probe.binding.worktree),
+            &crate::features::graph::core::HistoryView::Live,
+        )
+        .await
+        .and_then(|frame| {
+            frame
+                .worktree_id
+                .map(|id| (id, frame.generation))
+                .ok_or_else(|| {
+                    crate::api::HistoryFetchError::Decode(
+                        "History probe returned no repository identity.".into(),
+                    )
+                })
+        })
+        .map_err(|error| error.to_string());
         let (Some(mut current), Some(ready), Some(frame)) = (
             graph.try_get_untracked(),
             graph_ready.try_get_untracked(),
@@ -183,47 +218,123 @@ fn run_history_probe(
         }
         if let Some(delay_ms) = retry {
             crate::api::sleep_ms(delay_ms).await;
-            let _ = history.try_update(|h| h.retry(&probe));
+            if let Some(current) = graph.try_get_untracked() {
+                let _ = history.try_update(|h| h.retry(&probe, &current));
+            }
         }
     });
 }
 
-fn subscribe(log: RwSignal<FeedLog>) {
-    let url = format!("/api/repository/events?{PROTOCOL_QUERY}={PROTOCOL_VERSION}");
+/// Own every JS callback until its source is detached. No forgotten closures.
+struct FeedSocket {
+    source: web_sys::EventSource,
+    snapshot: Closure<dyn FnMut(web_sys::MessageEvent)>,
+    _error: Closure<dyn FnMut(web_sys::Event)>,
+}
+
+impl Drop for FeedSocket {
+    fn drop(&mut self) {
+        self.source.close();
+        self.source.set_onerror(None);
+        let _ = self.source.remove_event_listener_with_callback(
+            git_vista_protocol::change_feed::SNAPSHOT_EVENT,
+            self.snapshot.as_ref().unchecked_ref(),
+        );
+    }
+}
+
+fn connection_failed(
+    feed: RwSignal<BoundFeed>,
+    socket: StoredValue<Option<FeedSocket>>,
+    graph: RwSignal<GraphCore>,
+    ticket: FeedTicket,
+) {
+    if graph
+        .try_get_untracked()
+        .and_then(|g| g.live_binding())
+        .as_ref()
+        != Some(&ticket.binding)
+    {
+        return;
+    }
+    if feed.try_update(|f| f.failed(&ticket)) != Some(true) {
+        return;
+    }
+    // Retain the executing error closure until this callback returns. The
+    // logically retired timer cannot reopen anything after binding/disposal.
+    spawn_local(async move {
+        crate::api::sleep_ms(REATTACH_INTERVAL_MS).await;
+        if graph
+            .try_get_untracked()
+            .and_then(|g| g.live_binding())
+            .as_ref()
+            != Some(&ticket.binding)
+        {
+            return;
+        }
+        let Some(next) = feed.try_update(|f| f.reconnect(&ticket)).flatten() else {
+            return;
+        };
+        let _ = socket.try_update_value(|s| *s = None);
+        subscribe(feed, socket, graph, next);
+    });
+}
+
+fn subscribe(
+    feed: RwSignal<BoundFeed>,
+    socket: StoredValue<Option<FeedSocket>>,
+    graph: RwSignal<GraphCore>,
+    ticket: FeedTicket,
+) {
+    let url = format!(
+        "/api/repository/events?{PROTOCOL_QUERY}={PROTOCOL_VERSION}&repo={}",
+        crate::api::encode_component(&ticket.binding.worktree)
+    );
     let Ok(source) = web_sys::EventSource::new(&url) else {
+        connection_failed(feed, socket, graph, ticket);
         return;
     };
-
+    let reading_ticket = ticket.clone();
     let on_snapshot =
         Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |e: web_sys::MessageEvent| {
+            if graph
+                .try_get_untracked()
+                .and_then(|g| g.live_binding())
+                .as_ref()
+                != Some(&reading_ticket.binding)
+            {
+                return;
+            }
             let Some(text) = e.data().as_string() else {
                 return;
             };
             let Ok(snapshot) = serde_json::from_str::<ChangeFeedSnapshot>(&text) else {
                 return;
             };
-            // `try_update`: this closure outlives nothing today, but a disposed
-            // owner must drop the snapshot rather than panic inside a browser.
-            let _ = log.try_update(|log| log.record(snapshot));
+            let _ = feed.try_update(|f| f.record(&reading_ticket, snapshot));
         });
-    source
+    if source
         .add_event_listener_with_callback(
             git_vista_protocol::change_feed::SNAPSHOT_EVENT,
             on_snapshot.as_ref().unchecked_ref(),
         )
-        .ok();
-    on_snapshot.forget();
-
+        .is_err()
+    {
+        source.close();
+        connection_failed(feed, socket, graph, ticket);
+        return;
+    }
     let dropped = source.clone();
     let on_error = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
         dropped.close();
-        // Everything this client saw is now on the far side of a gap.
-        let _ = log.try_update(|log| log.clear());
-        spawn_local(async move {
-            crate::api::sleep_ms(REATTACH_INTERVAL_MS).await;
-            subscribe(log);
-        });
+        connection_failed(feed, socket, graph, ticket.clone());
     });
     source.set_onerror(Some(on_error.as_ref().unchecked_ref()));
-    on_error.forget();
+    let _ = socket.try_update_value(|s| {
+        *s = Some(FeedSocket {
+            source,
+            snapshot: on_snapshot,
+            _error: on_error,
+        })
+    });
 }

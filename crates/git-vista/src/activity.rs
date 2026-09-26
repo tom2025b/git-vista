@@ -528,14 +528,13 @@ fn activity_row(
         dialogs,
         shell,
         graph,
-        status,
         ..
     } = features;
     let event = observation.event;
     let as_of = match observation.as_of {
         git_vista_protocol::AsOfAvailability::Available { token } => {
             let time = event.time;
-            let repo = status_state::repo(status);
+            let repo = graph.get_untracked().binding().map(|binding| binding.worktree);
             view! {
                 <button class="act-undo act-as-of" on:click=move |ev: web_sys::MouseEvent| {
                     ev.stop_propagation();

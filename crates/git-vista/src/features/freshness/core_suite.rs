@@ -384,12 +384,12 @@ const CONFIRM_DIALOG: &str = include_str!("../../dialogs/confirm.rs");
 #[test]
 fn the_feed_subscription_asks_core_for_the_verdict_and_forgets_across_a_gap() {
     assert!(
-        FEED_SIGNALS.contains("verdict(slot, log)"),
+        FEED_SIGNALS.contains("verdict(slot, &feed.log)"),
         "the wasm wrapper must ask `core::verdict`, never re-derive the \
          answer where no host test compiles it"
     );
     assert!(
-        FEED_SIGNALS.contains("log.clear()"),
+        FEED_SIGNALS.contains("f.failed(&ticket)"),
         "a dropped stream must forget what it saw — differencing across a gap \
          is how the reassuring sentence gets printed over changes nobody saw"
     );
@@ -1127,7 +1127,8 @@ fn the_graph_follow_up_wires_the_host_scheduler_to_frame_requests_and_timers() {
         "h.update(",
         "h.complete(",
         "h.retry(",
-        "fetch_frame()",
+        "fetch_frame_for_target(",
+        "Some(&probe.binding.worktree)",
         "sleep_ms(delay_ms)",
         "status.refetch()",
     ] {
@@ -1143,6 +1144,159 @@ fn the_graph_follow_up_wires_the_host_scheduler_to_frame_requests_and_timers() {
 use crate::features::core_traits::{Applied, Invalidate, InvalidateScope};
 use crate::features::graph::core::GraphCore;
 
+const TEST_X: &str = "00000000-0000-4000-8000-000000000001";
+const TEST_Y: &str = "00000000-0000-4000-8000-000000000002";
+
+fn bound_graph() -> GraphCore {
+    let frame = crate::features::graph::core::Frame {
+        generation: history_gen("history-a"),
+        refs: vec![],
+        head_branch: None,
+        head_state: Default::default(),
+        branch_colors: vec![],
+        repo_label: None,
+        repo_id: Some("repository-x".into()),
+        worktree_id: Some(TEST_X.into()),
+        read_only: true,
+        resettable: false,
+        repo_url: None,
+        remote_web_url: None,
+    };
+    let mut graph = GraphCore::default();
+    graph
+        .accept_seed(&graph.seed_request(), &frame, &frame.generation)
+        .unwrap();
+    graph
+}
+
+#[test]
+fn feed_reconnect_accepts_reused_sequence_and_rejects_old_incarnation_callbacks() {
+    let binding = bound_graph().binding().unwrap();
+    let mut feed = BoundFeed::default();
+    let old = feed.bind(Some(binding)).unwrap();
+    assert!(feed.record(&old, unknown_delta("before")));
+    assert!(feed.failed(&old));
+    assert!(
+        feed.log.latest().is_none(),
+        "a disconnect clears freshness before reconnecting"
+    );
+    assert!(
+        !feed.failed(&old),
+        "duplicate errors cannot multiply retry timers"
+    );
+    let current = feed.reconnect(&old).unwrap();
+    assert!(
+        feed.record(&current, unknown_delta("after")),
+        "seq zero on the new stream must be accepted"
+    );
+    let before = feed.log.clone();
+    assert!(
+        !feed.record(&old, unknown_delta("late")),
+        "obsolete message cannot overwrite the new log"
+    );
+    assert!(
+        !feed.failed(&old),
+        "obsolete error cannot clear the new log"
+    );
+    assert!(
+        feed.reconnect(&old).is_none(),
+        "obsolete timer cannot replace the new source"
+    );
+    assert_eq!(feed.log, before);
+}
+
+#[test]
+fn feed_binding_revision_and_disposal_fence_callbacks_and_timers() {
+    let mut binding = bound_graph().binding().unwrap();
+    let mut feed = BoundFeed::default();
+    let old = feed.bind(Some(binding.clone())).unwrap();
+    assert!(feed.failed(&old));
+    binding.revision += 1;
+    let current = feed.bind(Some(binding)).unwrap();
+    assert!(feed.reconnect(&old).is_none());
+    // Isolate the binding dimension independently of the incarnation fence.
+    let wrong_revision = FeedTicket {
+        binding: old.binding,
+        incarnation: current.incarnation,
+    };
+    assert!(!feed.record(&wrong_revision, unknown_delta("wrong-revision")));
+    assert!(feed.record(&current, unknown_delta("current")));
+    assert!(feed.failed(&current));
+    feed.dispose();
+    assert!(
+        feed.reconnect(&current).is_none(),
+        "disposed owner cannot reconnect"
+    );
+    assert!(!feed.record(&current, unknown_delta("after-dispose")));
+    assert!(feed.bind(Some(current.binding)).is_none());
+}
+
+#[test]
+fn retired_binding_probe_and_timer_cannot_mutate_the_new_binding() {
+    let mut h = HistoryHarness::new(true);
+    let old = h.tick().probe.unwrap();
+    let ticket = h.graph.begin_selection();
+    let check_before = h.follower.check.clone();
+    assert_eq!(h.reply(&old, Ok("changed-history")), None);
+    assert_eq!(
+        h.follower.check, check_before,
+        "retired-binding completion cannot consume pending state before any epoch change"
+    );
+    h.graph.finish_selection(ticket, None);
+    // Check without an intervening effect tick: admission itself owns the fence.
+    let before = h.graph.clone();
+    assert_eq!(h.reply(&old, Ok("changed-history")), None);
+    assert_eq!(
+        h.graph, before,
+        "retired binding cannot bump even before update observes the change"
+    );
+    let current = h.tick().probe.unwrap();
+    assert_eq!(h.reply(&current, Err("network")), Some(250));
+    h.follower.retry(&old, &h.graph);
+    assert!(matches!(h.follower.check, HistoryCheck::Backoff { .. }));
+}
+
+#[test]
+fn wrong_target_probe_is_a_failure_even_when_history_token_is_equal() {
+    let mut h = HistoryHarness::new(true);
+    let probe = h.tick().probe.unwrap();
+    assert_eq!(
+        h.follower.complete(
+            &probe,
+            Ok((TEST_Y.into(), history_gen("history-a"))),
+            &mut h.graph,
+            true,
+            h.displayed.as_ref()
+        ),
+        Some(250)
+    );
+    assert_eq!(h.graph.epoch(), 0);
+    assert!(matches!(h.follower.check, HistoryCheck::Backoff { .. }));
+}
+
+#[test]
+fn unknown_local_outcome_probes_bound_history_even_without_a_feed_connection() {
+    let mut h = HistoryHarness::new(true);
+    h.follower
+        .update(None, None, &h.graph, true, h.displayed.as_ref());
+    h.graph.on_invalidate(&Invalidate {
+        binding: h.graph.binding(),
+        target: None,
+        generation: Some(history_gen("unverified")),
+        scope: InvalidateScope::Everything,
+    });
+    let actions = h
+        .follower
+        .update(None, None, &h.graph, true, h.displayed.as_ref());
+    let probe = actions
+        .probe
+        .expect("local reconciliation requires no extra feed event");
+    assert_eq!(probe.binding.worktree, TEST_X);
+    assert!(probe.planner_generation.is_none());
+    h.reply(&probe, Ok("history-b"));
+    assert_eq!(h.graph.epoch(), 1);
+}
+
 /// Tiny executor: feed, Ready and timer events all run the same production
 /// scheduler. Frame replies are injected at the HTTP boundary.
 struct HistoryHarness {
@@ -1157,7 +1311,7 @@ impl HistoryHarness {
     fn new(ready: bool) -> Self {
         Self {
             follower: HistoryFollower::default(),
-            graph: GraphCore::default(),
+            graph: bound_graph(),
             snapshot: unknown_delta("planner-b"),
             ready,
             displayed: ready.then(|| history_gen("history-a")),
@@ -1166,6 +1320,13 @@ impl HistoryHarness {
 
     fn tick(&mut self) -> HistoryActions {
         self.follower.update(
+            self.graph
+                .live_binding()
+                .map(|binding| FeedTicket {
+                    binding,
+                    incarnation: 1,
+                })
+                .as_ref(),
             Some(&self.snapshot),
             &self.graph,
             self.ready,
@@ -1176,7 +1337,9 @@ impl HistoryHarness {
     fn reply(&mut self, probe: &HistoryProbe, result: Result<&str, &str>) -> Option<u64> {
         self.follower.complete(
             probe,
-            result.map(history_gen).map_err(str::to_string),
+            result
+                .map(|generation| (probe.binding.worktree.clone(), history_gen(generation)))
+                .map_err(str::to_string),
             &mut self.graph,
             self.ready,
             self.displayed.as_ref(),
@@ -1187,6 +1350,8 @@ impl HistoryHarness {
         self.graph.on_invalidate(&Invalidate {
             scope: InvalidateScope::Graph,
             generation: self.snapshot.generation.clone(),
+            binding: self.graph.binding(),
+            target: Some(("repository-x".into(), TEST_X.into())),
         })
     }
 }
@@ -1199,7 +1364,7 @@ fn history_scheduler_failed_probe_recovers_without_another_feed_event() {
     let first = first.probe.expect("feed dispatch must issue the request");
     assert_eq!(h.reply(&first, Err("offline")), Some(250));
     assert!(h.tick().probe.is_none(), "no busy retry before the timer");
-    h.follower.retry(&first);
+    h.follower.retry(&first, &h.graph);
     let retry = h
         .tick()
         .probe
@@ -1223,7 +1388,7 @@ fn history_scheduler_deferred_first_load_recovers_without_another_feed_event() {
         .probe
         .expect("Ready must dispatch the pending check");
     assert_eq!(h.reply(&first, Err("offline")), Some(250));
-    h.follower.retry(&first);
+    h.follower.retry(&first, &h.graph);
     let retry = h.tick().probe.expect("deferred checks must also retry");
     h.reply(&retry, Ok("history-b"));
     assert_eq!(h.snapshot.seq, 0);
@@ -1287,7 +1452,7 @@ fn history_scheduler_exhaustion_is_explicit_and_refresh_restarts_it() {
         let probe = h.tick().probe.unwrap();
         assert_eq!(h.reply(&probe, Err("offline")), delay);
         assert!(h.tick().probe.is_none());
-        h.follower.retry(&probe);
+        h.follower.retry(&probe, &h.graph);
     }
     assert_eq!(
         h.follower.check,
@@ -1321,7 +1486,7 @@ fn history_scheduler_new_reading_supersedes_old_completion_and_timer() {
     h.snapshot.seq += 1;
     h.snapshot.generation = Some(history_gen("planner-c"));
     let current = h.tick().probe.unwrap();
-    h.follower.retry(&old);
+    h.follower.retry(&old, &h.graph);
     h.reply(&old, Ok("obsolete-history"));
     assert_eq!(h.follower.check, HistoryCheck::InFlight(current.clone()));
     assert_eq!(h.graph.epoch(), 0);

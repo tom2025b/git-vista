@@ -477,3 +477,13 @@ last_edited_by: codex
 **Signed:** codex · 2026-09-26T15:33:21-04:00
 
 last_edited_by: codex
+
+### Implementation record — source censuses and phase boundaries
+
+The implementation exposed an incomplete census inventory in §9. The six known client census files are `crates/git-vista/src/repo_selection_teardown_census.rs`, `crates/git-vista/src/features/worktrees/core_suite.rs`, `crates/git-vista/src/features/preview/core.rs`, `crates/git-vista/src/features/freshness/core_suite.rs`, `crates/git-vista/src/features/graph/core/history_suite.rs`, and `crates/git-vista/src/features/history/core.rs`. The server also has `crates/git-vista-server/src/argv_boundary.rs`, encountered in phase 1. Phase 2's accepted-binding write requires the epoch-reset effect to observe an epoch memo rather than every GraphCore write; its two history censuses therefore need an honest anchor repin. Their assertions still protect the full-history latch and the call to the shared phase decision.
+
+Max authorized those two history census repins for phases 2 and 4. For phases 3–5, when a source census outside §9 breaks because an authorized adapter changed, the lane may repin it without another scope ruling: preserve its behavioral protection, prove the repinned assertion with a deliberate break, and name the file and evidence in the READY report. This is permission to repin a census, not to delete it, weaken it, or retain dead source text for its matcher. Any required change that is not a census still stops for a scope decision. Mutation records remain pending until max commits the implementation, because failure-atlas clones HEAD.
+
+**Signed:** codex · 2026-09-26T17:12:00-04:00
+
+last_edited_by: codex

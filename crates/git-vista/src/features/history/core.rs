@@ -451,7 +451,7 @@ mod tests {
     fn the_epoch_reset_effect_asks_core_which_phase_to_set() {
         let body = block_after(
             APP_MOD,
-            "let epoch = graph.get().epoch();",
+            "let epoch = render_epoch.get();",
             "    });",
             "the epoch-reset effect",
         );
