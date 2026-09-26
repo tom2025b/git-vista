@@ -130,6 +130,7 @@ pub(crate) struct BootRefusal {
 /// paired with advice to install an already-present bubblewrap binary.
 fn capability_absent_message(missing: &[&str]) -> String {
     match missing {
+        ["windows_sandbox"] => NON_UNIX_SANDBOX_REFUSAL.to_string(),
         ["HOME"] => "$HOME is unset, so the sandbox policy cannot identify the home tree. Set \
                      HOME to the server user's home directory, then restart."
             .to_string(),
@@ -152,6 +153,12 @@ fn capability_absent_message(missing: &[&str]) -> String {
         ),
     }
 }
+
+/// The interim Windows posture from ADR 0152. This text is deliberately
+/// compiled on Linux too, so the ordinary Linux test suite can pin the exact
+/// refusal instead of leaving a `cfg(not(unix))` message untested.
+const NON_UNIX_SANDBOX_REFUSAL: &str = "no Windows sandbox yet (ADR 0152). Git-Vista \
+    refuses to start on Windows and has no unsandboxed mode.";
 
 impl std::fmt::Display for BootRefusal {
     /// Names what was missing (or what failed) and why the server will not
@@ -316,9 +323,12 @@ fn boot_probe_fixture() -> std::io::Result<BootProbeFixture> {
     std::fs::create_dir_all(&hooks_dir)?;
     let hook_path = hooks_dir.join("pre-commit");
     std::fs::write(&hook_path, boot_probe_hook_script())?;
-    let mut perms = std::fs::metadata(&hook_path)?.permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-    std::fs::set_permissions(&hook_path, perms)?;
+    #[cfg(unix)]
+    {
+        let mut perms = std::fs::metadata(&hook_path)?.permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&hook_path, perms)?;
+    }
 
     Ok(BootProbeFixture { dir })
 }
@@ -696,45 +706,59 @@ fn to_boot_result(verdict: ProbeVerdict) -> Result<ProbeVerdict, BootRefusal> {
 /// makes git-vista unusable on a host without bubblewrap.** That is the
 /// accepted trade (ADR 0029).
 pub(crate) async fn run_at_startup() -> Result<ProbeVerdict, BootRefusal> {
-    let caps = capabilities();
-    println!(
-        "[sandbox] landlock_abi={} seccomp_available={} userns={} bwrap_present={}",
-        caps.landlock_abi, caps.seccomp_available, caps.userns, caps.bwrap_present
-    );
-    let v = verdict(&caps).await;
-    // Recorded before the gate, so the stored value is what was *measured*
-    // rather than what survived the gate — and so `boot_verdict()` is already
-    // readable by the time this function returns `Ok`, which is the point at
-    // which `main` goes on to register repositories and bind listeners.
-    record_boot_verdict(&v);
-    match &v {
-        ProbeVerdict::Contained => {
-            println!("[sandbox] verdict=contained — the strict tier composes on this host");
-            // Said out loud on every boot, so nobody reads the green line as
-            // "policy is settled": it is not. Per-repository policy
-            // construction still runs for every operation (see module doc).
-            println!(
-                "[sandbox] this proves the HOST can supply the tier; per-repository \
-                 policy is still built per operation"
-            );
-        }
-        ProbeVerdict::CapabilityAbsent { missing } => {
-            eprintln!("[sandbox] verdict=capability_absent missing={missing:?}");
-            eprintln!(
-                "[sandbox] refusing to start: {} (INV-13 — there is no degraded mode.)",
-                capability_absent_message(missing)
-            );
-        }
-        ProbeVerdict::FailOpen { failed_checks } => {
-            eprintln!("[sandbox] verdict=fail_open failed={failed_checks:?}");
-            eprintln!(
-                "[sandbox] refusing to start: the composed launcher did NOT contain a \
-                 hostile hook. This is a git-vista bug, not a host problem — do not \
-                 work around it."
-            );
-        }
+    #[cfg(not(unix))]
+    {
+        let v = ProbeVerdict::CapabilityAbsent {
+            missing: vec!["windows_sandbox"],
+        };
+        record_boot_verdict(&v);
+        eprintln!("[sandbox] verdict=capability_absent missing=[\"windows_sandbox\"]");
+        eprintln!("[sandbox] refusing to start: {NON_UNIX_SANDBOX_REFUSAL}");
+        to_boot_result(v)
     }
-    to_boot_result(v)
+
+    #[cfg(unix)]
+    {
+        let caps = capabilities();
+        println!(
+            "[sandbox] landlock_abi={} seccomp_available={} userns={} bwrap_present={}",
+            caps.landlock_abi, caps.seccomp_available, caps.userns, caps.bwrap_present
+        );
+        let v = verdict(&caps).await;
+        // Recorded before the gate, so the stored value is what was *measured*
+        // rather than what survived the gate — and so `boot_verdict()` is already
+        // readable by the time this function returns `Ok`, which is the point at
+        // which `main` goes on to register repositories and bind listeners.
+        record_boot_verdict(&v);
+        match &v {
+            ProbeVerdict::Contained => {
+                println!("[sandbox] verdict=contained — the strict tier composes on this host");
+                // Said out loud on every boot, so nobody reads the green line as
+                // "policy is settled": it is not. Per-repository policy
+                // construction still runs for every operation (see module doc).
+                println!(
+                    "[sandbox] this proves the HOST can supply the tier; per-repository \
+                     policy is still built per operation"
+                );
+            }
+            ProbeVerdict::CapabilityAbsent { missing } => {
+                eprintln!("[sandbox] verdict=capability_absent missing={missing:?}");
+                eprintln!(
+                    "[sandbox] refusing to start: {} (INV-13 — there is no degraded mode.)",
+                    capability_absent_message(missing)
+                );
+            }
+            ProbeVerdict::FailOpen { failed_checks } => {
+                eprintln!("[sandbox] verdict=fail_open failed={failed_checks:?}");
+                eprintln!(
+                    "[sandbox] refusing to start: the composed launcher did NOT contain a \
+                     hostile hook. This is a git-vista bug, not a host problem — do not \
+                     work around it."
+                );
+            }
+        }
+        to_boot_result(v)
+    }
 }
 
 #[cfg(test)]
@@ -774,6 +798,27 @@ mod tests {
             seccomp_available: true,
         };
         assert_eq!(missing_capabilities(&full), vec!["strict_launch"]);
+    }
+
+    /// The Windows refusal is ordinary, host-testable data rather than text
+    /// hidden inside a `cfg(not(unix))` block. This test runs in Linux CI and
+    /// pins the security posture ADR 0152 chose for the interim.
+    #[test]
+    fn the_windows_refusal_names_the_missing_backend_without_linux_advice() {
+        let refusal = BootRefusal {
+            verdict: ProbeVerdict::CapabilityAbsent {
+                missing: vec!["windows_sandbox"],
+            },
+        }
+        .to_string();
+
+        assert!(refusal.contains("no Windows sandbox yet"), "{refusal}");
+        assert!(refusal.contains("ADR 0152"), "{refusal}");
+        assert!(refusal.contains("no unsandboxed mode"), "{refusal}");
+        assert!(
+            !refusal.to_ascii_lowercase().contains("bwrap"),
+            "Windows refusal must not offer Linux-only remediation: {refusal}"
+        );
     }
 
     fn assert_policy_failure_message(cause: &'static str, expected: &str) {
