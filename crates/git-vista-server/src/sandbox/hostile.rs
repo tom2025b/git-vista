@@ -114,6 +114,7 @@ fn a_self_consistent_linked_worktree_inside_the_managed_root_resolves() {
 /// through to its own directory-or-missing stat and treating a symlink as
 /// "no `.git`".
 #[test]
+#[cfg(unix)]
 fn a_symlinked_dot_git_is_refused() {
     let base = tempfile::tempdir().unwrap();
     let target = base.path().join("real-repo");
@@ -137,6 +138,7 @@ fn a_symlinked_dot_git_is_refused() {
 /// path *look* like it is inside the managed root while really landing
 /// outside it.
 #[test]
+#[cfg(unix)]
 fn a_gitdir_reached_through_a_symlinked_target_is_still_checked_against_the_real_path() {
     let managed = tempfile::tempdir().unwrap();
     let elsewhere = tempfile::tempdir().unwrap();

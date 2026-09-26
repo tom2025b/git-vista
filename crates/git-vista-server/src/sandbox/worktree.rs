@@ -251,6 +251,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_symlinked_dot_git_is_refused() {
         let (t, main, _linked) = scaffold();
         let sneaky = t.path().join("sneaky");
