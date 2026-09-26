@@ -1,6 +1,6 @@
 //! Render the core's words and connect its offers to existing guarded flows.
-use super::core::{can_write, status_detail, Action};
-use crate::features::dialogs::core::{Dialog, ErrorNotice};
+use super::core::{can_write, status_detail, Action, StageState};
+use crate::features::dialogs::core::Dialog;
 use crate::features::graph::core::Frame;
 use crate::features::status::{core::chip_label, signals::read};
 use crate::state::{CommitIntent, Features, PendingOp};
@@ -55,6 +55,7 @@ pub fn status_chip_view(
     frame: Signal<Option<Frame>>,
     online: RwSignal<bool>,
     nerd_icons: RwSignal<bool>,
+    stage: RwSignal<StageState>,
 ) -> impl IntoView {
     let Features {
         status,
@@ -65,7 +66,6 @@ pub fn status_chip_view(
         ..
     } = features;
     let open = create_rw_signal(false);
-    let busy = create_rw_signal(false);
     let trigger = create_node_ref::<html::Button>();
     let close_button = create_node_ref::<html::Button>();
     let writable = move || {
@@ -73,7 +73,7 @@ pub fn status_chip_view(
             frame.get().map(|f| f.read_only),
             crate::features::session::signals::is_lan(),
             online.get(),
-            busy.get() || operations.in_flight_count() > 0,
+            stage.with(|state| state.busy(&graph.get())) || operations.in_flight_count() > 0,
         )
     };
     let detail = move || status_detail(read(status).as_ref(), writable());
@@ -106,22 +106,23 @@ pub fn status_chip_view(
                 if let Some(button) = close_button.get() {
                     let _ = button.focus();
                 }
-                busy.set(true);
-                let epoch = graph.get_untracked().epoch();
+                let context = graph.get_untracked();
+                let label = frame.get_untracked().and_then(|frame| frame.repo_label);
+                let Some(ticket) = stage
+                    .try_update(|state| state.begin(&context, label.as_deref()))
+                    .flatten()
+                else {
+                    return;
+                };
                 spawn_local(async move {
                     let answer = crate::api::stage_request().await;
-                    busy.set(false);
-                    if graph.get_untracked().epoch() != epoch {
-                        return;
-                    }
-                    status.refetch();
-                    if let Err(body) = answer {
-                        open.set(false);
-                        dialogs.open(Dialog::Error);
-                        shell.open_error(ErrorNotice {
-                            title: "Couldn't stage changes",
-                            body,
-                        });
+                    if stage
+                        .try_update(|state| {
+                            state.complete(&ticket, &graph.get_untracked(), &answer)
+                        })
+                        .unwrap_or(false)
+                    {
+                        status.refetch();
                     }
                 });
             }
@@ -225,7 +226,7 @@ pub fn status_chip_view(
                     </div>
                     <div aria-live="polite" aria-atomic="true">
                         {move || detail().sentences.into_iter().map(|sentence| view! { <p>{sentence}</p> }).collect_view()}
-                        <Show when=move || busy.get()><p>"Staging changes…"</p></Show>
+                        <Show when=move || stage.with(|state| state.busy(&graph.get()))><p>"Staging changes…"</p></Show>
                     </div>
                     {move || detail().actions.into_iter().map(|action| {
                         let explanation = action.explanation(); let label = action.label();

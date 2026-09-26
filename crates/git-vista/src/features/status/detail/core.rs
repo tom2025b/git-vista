@@ -1,5 +1,113 @@
 //! Plain words and action availability, independent of the browser (#141).
+use crate::features::graph::core::{BindingKey, GraphCore};
 use git_vista_core::status::RepoStatus;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageTicket {
+    serial: u64,
+    binding: BindingKey,
+    invalidation_revision: u64,
+    issued_from: String,
+}
+
+impl StageTicket {
+    fn matches(&self, graph: &GraphCore) -> bool {
+        graph.live_binding().as_ref() == Some(&self.binding)
+            && graph.intent_revision() == self.invalidation_revision
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageNotice {
+    pub serial: u64,
+    pub message: String,
+}
+
+/// Owned by App, outside the status popup. A sent write is never replayed or
+/// declared cancelled when its original UI context goes away.
+#[derive(Debug, Clone, Default)]
+pub struct StageState {
+    next_serial: u64,
+    active: Option<StageTicket>,
+    pending: std::collections::BTreeMap<u64, StageTicket>,
+    notices: Vec<StageNotice>,
+}
+
+impl StageState {
+    pub fn busy(&self, graph: &GraphCore) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|ticket| ticket.matches(graph))
+    }
+
+    pub fn begin(&mut self, graph: &GraphCore, label: Option<&str>) -> Option<StageTicket> {
+        if self.busy(graph) {
+            return None;
+        }
+        let binding = graph.live_binding()?;
+        self.next_serial += 1;
+        let ticket = StageTicket {
+            serial: self.next_serial,
+            issued_from: match label {
+                Some(label) => format!("{label} ({})", binding.worktree),
+                None => binding.worktree.clone(),
+            },
+            binding,
+            invalidation_revision: graph.intent_revision(),
+        };
+        self.pending.insert(ticket.serial, ticket.clone());
+        self.active = Some(ticket.clone());
+        Some(ticket)
+    }
+
+    /// Returns permission to refetch the *current bound* status. Old outcomes
+    /// are still reported, but cannot clear another action's busy state or
+    /// trigger a read on another desk. The endpoint supplies no target identity:
+    /// the notice explicitly labels the initiating context, not an attestation.
+    pub fn complete(
+        &mut self,
+        ticket: &StageTicket,
+        graph: &GraphCore,
+        answer: &Result<(), String>,
+    ) -> bool {
+        if self.pending.get(&ticket.serial) != Some(ticket) {
+            return false;
+        }
+        self.pending.remove(&ticket.serial);
+        let owns_busy = self.active.as_ref() == Some(ticket);
+        if owns_busy {
+            self.active = None;
+        }
+        let refetch = owns_busy
+            && ticket.matches(graph)
+            && graph.status_target().as_deref() == Some(ticket.binding.worktree.as_str());
+        let outcome = match answer {
+            Err(error) => Some(format!("failed: {error}")),
+            Ok(()) if !refetch => {
+                Some("completed. Review that repository's status before continuing.".into())
+            }
+            Ok(()) => None,
+        };
+        if let Some(outcome) = outcome {
+            self.notices.push(StageNotice {
+                serial: ticket.serial,
+                message: format!(
+                    "Stage request started from {} {outcome}",
+                    ticket.issued_from
+                ),
+            });
+        }
+        refetch
+    }
+
+    pub fn notices(&self) -> &[StageNotice] {
+        &self.notices
+    }
+
+    pub fn dismiss(&mut self, serial: u64) {
+        self.notices.retain(|notice| notice.serial != serial);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {

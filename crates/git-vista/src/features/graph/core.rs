@@ -40,6 +40,7 @@ pub type Page = HistoryPage<GraphRow, Edge, FrameStub>;
 pub struct GraphCore {
     view: HistoryView,
     epoch: u64,
+    intent_revision: u64,
     binding_revision: u64,
     binding: TabBinding,
     accepted_binding: Option<BindingKey>,
@@ -368,8 +369,18 @@ impl GraphCore {
     /// phase (`SeedLoading { epoch }`, `DriftReloading { epoch }`) with the epoch
     /// that will actually be live, not one read before the bump.
     pub fn force_bump(&mut self) -> u64 {
+        self.intent_revision += 1;
+        self.advance_render_epoch()
+    }
+
+    /// Rendering may change without cancelling an action the user requested.
+    fn advance_render_epoch(&mut self) -> u64 {
         self.epoch += 1;
         self.epoch
+    }
+
+    pub fn intent_revision(&self) -> u64 {
+        self.intent_revision
     }
 
     /// A history comparison proved movement. Record the planner reading that
@@ -386,7 +397,7 @@ impl GraphCore {
             return Applied::NoChange;
         }
         self.generation = planner_generation.cloned();
-        self.force_bump();
+        self.advance_render_epoch();
         Applied::Committed
     }
 
@@ -435,13 +446,13 @@ impl GraphCore {
             // allows `None`). Re-reading is the safe default: silently skipping
             // would strand a stale graph with no way to notice it moved.
             None => {
-                self.epoch += 1;
+                self.force_bump();
                 Applied::Committed
             }
             Some(g) if self.generation.as_ref() == Some(g) => Applied::NoChange,
             Some(g) => {
                 self.generation = Some(g.clone());
-                self.epoch += 1;
+                self.force_bump();
                 Applied::Committed
             }
         }

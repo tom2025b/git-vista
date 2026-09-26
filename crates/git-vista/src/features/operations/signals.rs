@@ -2,14 +2,14 @@
 //!
 //! Everything decidable is decided in [`super::core`], on the host, under test. This file
 //! holds only what genuinely needs Leptos: reading the live epoch out of a signal, and
-//! keeping the pending intent in a `StoredValue` that survives the closures that write it.
+//! keeping the pending intent and reactive refusal notices above the canvas lifetime.
 
 use std::cell::Cell;
 use std::rc::Rc;
 
 use leptos::{
-    spawn_local, store_value, RwSignal, SignalGetUntracked, SignalUpdate, SignalWith,
-    SignalWithUntracked, StoredValue,
+    create_rw_signal, spawn_local, store_value, RwSignal, SignalGetUntracked, SignalUpdate,
+    SignalWith, SignalWithUntracked, StoredValue,
 };
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
@@ -25,9 +25,9 @@ use crate::features::dialogs::core::{Dialog, ErrorNotice};
 use crate::features::dialogs::signals::Dialogs;
 use crate::features::graph::core::GraphCore;
 use crate::features::operations::core::{
-    escalation, latest_wins, local_settlement, lost_contact_settlement, persisted_remote_op,
-    reattach_step, remote_op_kind, resume_decision, seq_or_no_intent, write_route, IntentSeq,
-    OperationsCore, PendingIntent, ReattachStep, ResumeDecision, Settled, Settlement,
+    escalation, local_settlement, lost_contact_settlement, persisted_remote_op, reattach_step,
+    remote_op_kind, resume_decision, seq_or_no_intent, write_route, IntentSeq, OpenerNotice,
+    OpenerState, OperationsCore, PendingIntent, ReattachStep, ResumeDecision, Settled, Settlement,
 };
 use crate::features::operations::kind::OperationKind;
 use crate::features::shell::signals::Shell;
@@ -80,7 +80,7 @@ pub struct Operations {
     /// gave — an intent raised before the bump fails [`RequestKey::is_current`] anyway,
     /// and sequences only ever increase, so a surviving record can never out-rank a newer
     /// tap.
-    pending_intent: StoredValue<Option<PendingIntent>>,
+    pending_intent: RwSignal<OpenerState>,
     /// Where this feature's own failures become words on screen (#316) —
     /// see [`ErrorSink`] for why it is installed after construction rather
     /// than passed to [`Operations::new`].
@@ -114,7 +114,7 @@ impl Operations {
             core,
             graph,
             intent_seq: store_value(IntentSeq::default()),
-            pending_intent: store_value(None::<PendingIntent>),
+            pending_intent: create_rw_signal(OpenerState::default()),
             error_sink: store_value(None::<ErrorSink>),
         }
     }
@@ -160,21 +160,19 @@ impl Operations {
     /// * a later tap already owns the dialog, so committing now would replace what the
     ///   user is looking at with something they asked for *earlier*.
     pub fn admit_intent(&self, intent: &PendingIntent) -> bool {
-        if !intent
-            .key
-            .is_current(self.graph.get_untracked().epoch(), None)
-        {
-            return false;
-        }
-        let wins = self
-            .pending_intent
-            .try_with_value(|current| latest_wins(current.as_ref(), intent))
-            .unwrap_or(false);
-        if !wins {
-            return false;
-        }
-        self.pending_intent.set_value(Some(intent.clone()));
-        true
+        self.pending_intent
+            .try_update(|state| state.admit(intent, &self.graph.get_untracked()))
+            .unwrap_or(false)
+    }
+
+    /// Nonmodal and App-owned: a refused continuation cannot replace the
+    /// confirmation, editor or error dialog the user has opened since clicking.
+    pub fn opener_notices(&self) -> Vec<OpenerNotice> {
+        self.pending_intent.with(|state| state.notices().to_vec())
+    }
+
+    pub fn dismiss_opener_notice(&self, seq: u64) {
+        self.pending_intent.update(|state| state.dismiss(seq));
     }
 
     /// The in-flight and recently-settled registry, for views that render it.

@@ -48,6 +48,257 @@ fn bound_at_generation(generation: &str) -> GraphCore {
     graph
 }
 
+fn settlement_for(graph: &GraphCore, generation: Option<GenerationToken>) -> Invalidate {
+    Invalidate {
+        binding: graph.binding(),
+        target: Some(("repository-x".into(), X.into())),
+        generation,
+        scope: InvalidateScope::Everything,
+    }
+}
+
+#[test]
+fn force_bump_advances_intent_revision() {
+    let mut graph = bound();
+    let before = graph.intent_revision();
+    graph.force_bump();
+    assert_eq!(
+        graph.intent_revision(),
+        before + 1,
+        "Refresh/drift invalidates outstanding intent"
+    );
+}
+
+#[test]
+fn missing_generation_settlement_advances_intent_revision() {
+    let mut graph = bound();
+    let before = graph.intent_revision();
+    assert_eq!(
+        graph.on_invalidate(&settlement_for(&graph, None)),
+        Applied::Committed
+    );
+    assert_eq!(
+        graph.intent_revision(),
+        before + 1,
+        "missing-generation settlement invalidates outstanding intent"
+    );
+}
+
+#[test]
+fn changed_generation_settlement_advances_intent_revision() {
+    let mut graph = bound();
+    let before = graph.intent_revision();
+    assert_eq!(
+        graph.on_invalidate(&settlement_for(&graph, Some(gen("settled")))),
+        Applied::Committed
+    );
+    assert_eq!(
+        graph.intent_revision(),
+        before + 1,
+        "changed-generation settlement invalidates outstanding intent"
+    );
+}
+
+#[test]
+fn render_epoch_counts_remain_exact_while_only_real_invalidations_advance_intent() {
+    let mut graph = bound();
+    // Outstanding RebuildToken still consumes the render epoch in phase 3.
+    // Every event below retains the pre-phase count; Preview is untouched.
+    graph.force_bump();
+    assert_eq!((graph.epoch(), graph.intent_revision()), (1, 1));
+    graph.on_invalidate(&settlement_for(&graph, None));
+    assert_eq!((graph.epoch(), graph.intent_revision()), (2, 2));
+    graph.on_invalidate(&settlement_for(&graph, Some(gen("settled"))));
+    assert_eq!((graph.epoch(), graph.intent_revision()), (3, 3));
+    assert_eq!(
+        graph.on_invalidate(&settlement_for(&graph, Some(gen("settled")))),
+        Applied::NoChange
+    );
+    assert_eq!((graph.epoch(), graph.intent_revision()), (3, 3));
+    let binding = graph.binding().unwrap();
+    assert_eq!(
+        graph.force_bump_for_feed(&binding, Some(&gen("feed"))),
+        Applied::Committed
+    );
+    assert_eq!((graph.epoch(), graph.intent_revision()), (4, 3));
+    assert_eq!(
+        graph.force_bump_for_feed(&binding, Some(&gen("feed"))),
+        Applied::NoChange
+    );
+    assert_eq!(
+        graph.on_invalidate(&settlement_for(&graph, Some(gen("feed")))),
+        Applied::NoChange
+    );
+    assert_eq!(
+        (graph.epoch(), graph.intent_revision()),
+        (4, 3),
+        "coalesced settlement changes neither counter"
+    );
+}
+
+#[test]
+fn phase_three_feed_reload_still_refuses_a_held_opener_until_shell_ownership_lands() {
+    use crate::features::core_traits::{RequestKey, RequestTarget};
+    use crate::features::operations::core::{OpenerState, PendingIntent};
+    use crate::features::operations::kind::OperationKind;
+    let mut graph = bound();
+    let held = PendingIntent {
+        seq: 1,
+        key: RequestKey {
+            epoch: graph.epoch(),
+            generation: None,
+            target: RequestTarget::Branch("topic".into()),
+        },
+        kind: OperationKind::Push {
+            branch: "topic".into(),
+            set_upstream: false,
+            force: None,
+        },
+    };
+    let mut openers = OpenerState::default();
+    assert!(openers.admit(&held, &graph));
+    graph.force_bump_for_feed(&graph.binding().unwrap(), Some(&gen("feed")));
+    // TEMPORARY status-quo pin. PHASE 5 MUST INVERT THIS when O1 lands WITH
+    // P2's universal Shell serial. Until then, admission across feed reloads
+    // could let an old precheck hijack a newer confirmation opened off-path.
+    assert!(
+        !openers.admit(&held, &graph),
+        "phase 3 deliberately still refuses held openers after feed reload"
+    );
+    assert_eq!(
+        openers.notices().len(),
+        1,
+        "the interim refusal must be observable"
+    );
+}
+
+#[test]
+fn stage_success_after_feed_refetches_bound_status_without_resending() {
+    use crate::features::status::detail::core::StageState;
+    let mut graph = bound();
+    let mut stage = StageState::default();
+    let ticket = stage.begin(&graph, Some("X")).unwrap();
+    assert!(
+        stage.begin(&graph, Some("X")).is_none(),
+        "a duplicate click cannot send another write"
+    );
+    graph.force_bump_for_feed(&graph.binding().unwrap(), Some(&gen("feed")));
+    assert!(
+        stage.busy(&graph),
+        "feed reload does not release a sent action"
+    );
+    assert!(
+        stage.complete(&ticket, &graph, &Ok(())),
+        "success across feed must refetch X"
+    );
+    assert!(!stage.busy(&graph));
+    assert!(stage.notices().is_empty());
+    assert!(
+        !stage.complete(&ticket, &graph, &Ok(())),
+        "completion can refetch at most once"
+    );
+}
+
+#[test]
+fn stage_error_after_feed_is_visible_without_replacing_a_dialog() {
+    use crate::features::status::detail::core::StageState;
+    let mut graph = bound();
+    let mut stage = StageState::default();
+    let ticket = stage.begin(&graph, Some("X")).unwrap();
+    graph.force_bump_for_feed(&graph.binding().unwrap(), Some(&gen("feed")));
+    assert!(stage.complete(&ticket, &graph, &Err("index locked".into())));
+    assert!(!stage.busy(&graph));
+    assert_eq!(
+        stage.notices()[0].message,
+        format!("Stage request started from X ({X}) failed: index locked")
+    );
+    let serial = stage.notices()[0].serial;
+    stage.dismiss(serial);
+    assert!(stage.notices().is_empty());
+    assert!(!stage.complete(&ticket, &graph, &Err("index locked".into())));
+    assert!(
+        stage.notices().is_empty(),
+        "a dismissed outcome is not published twice"
+    );
+}
+
+#[test]
+fn stage_old_desk_reports_outcome_without_refetching_y_or_clearing_its_busy() {
+    use crate::features::status::detail::core::StageState;
+    for result in [Ok(()), Err("index locked".into())] {
+        let mut graph = bound();
+        let mut stage = StageState::default();
+        let old = stage.begin(&graph, Some("X")).unwrap();
+        let selection = graph.begin_selection();
+        graph.finish_selection(selection, Some(Y));
+        let y = frame(Some(Y));
+        graph
+            .accept_seed(&graph.seed_request(), &y, &y.generation)
+            .unwrap();
+        let current = stage.begin(&graph, Some("Y")).unwrap();
+        assert!(
+            !stage.complete(&old, &graph, &result),
+            "old outcome must not refetch Y"
+        );
+        assert!(
+            stage.busy(&graph),
+            "old completion cannot clear newer busy state"
+        );
+        assert!(stage.notices()[0]
+            .message
+            .contains(&format!("started from X ({X})")));
+        assert!(stage.complete(&current, &graph, &Ok(())));
+        assert!(!stage.busy(&graph));
+    }
+}
+
+#[test]
+fn stage_real_invalidation_reports_completion_without_applying_it_to_current_status() {
+    use crate::features::status::detail::core::StageState;
+    let mut graph = bound();
+    let mut stage = StageState::default();
+    let ticket = stage.begin(&graph, Some("X")).unwrap();
+    graph.force_bump();
+    assert!(
+        !stage.complete(&ticket, &graph, &Ok(())),
+        "Refresh/drift is still an invalidation"
+    );
+    assert_eq!(stage.notices()[0].message, format!("Stage request started from X ({X}) completed. Review that repository's status before continuing."));
+    assert!(!stage.busy(&graph));
+}
+
+#[test]
+fn stage_selection_before_epoch_change_refuses_current_surface_but_keeps_outcome() {
+    use crate::features::status::detail::core::StageState;
+    let mut graph = bound();
+    let mut stage = StageState::default();
+    let ticket = stage.begin(&graph, Some("X")).unwrap();
+    let epoch = graph.epoch();
+    graph.begin_selection();
+    assert_eq!(graph.epoch(), epoch);
+    assert!(
+        !stage.complete(&ticket, &graph, &Err("index locked".into())),
+        "binding must fence independently of invalidation revision"
+    );
+    assert!(stage.notices()[0].message.contains("index locked"));
+}
+
+#[test]
+fn stage_older_serial_cannot_refetch_or_clear_newer_action_on_same_desk() {
+    use crate::features::status::detail::core::StageState;
+    let mut graph = bound();
+    let mut stage = StageState::default();
+    let old = stage.begin(&graph, Some("X")).unwrap();
+    graph.force_bump();
+    let newer = stage.begin(&graph, Some("X")).unwrap();
+    assert!(!stage.complete(&old, &graph, &Ok(())));
+    assert!(
+        stage.busy(&graph),
+        "action serial protects a newer busy state even on X"
+    );
+    assert!(stage.complete(&newer, &graph, &Ok(())));
+}
+
 #[test]
 fn binding_requires_both_current_frame_and_matching_first_page() {
     let mut graph = GraphCore::default();
@@ -250,6 +501,29 @@ fn ambiguous_first_selection_disables_discovery_and_a_late_success_cannot_restor
     assert!(!graph.finish_selection(old, Some(Y)));
     assert_eq!(graph, before);
     assert_eq!(graph.seed_request().selector(), Err(FOLLOWING_UNAVAILABLE));
+}
+
+#[test]
+fn selected_candidate_does_not_own_status_until_frame_and_page_are_accepted() {
+    let mut graph = bound();
+    let selection = graph.begin_selection();
+    assert!(graph.finish_selection(selection, Some(Y)));
+    let request = graph.seed_request();
+    assert_eq!(request.selector(), Ok(Some(Y)));
+    assert_eq!(
+        graph.status_target().as_deref(),
+        Some(X),
+        "successful selection still leaves status on accepted X while Y is only a candidate"
+    );
+    let candidate = frame(Some(Y));
+    assert!(graph
+        .accept_seed(&request, &candidate, &gen("wrong-page"))
+        .is_err());
+    assert_eq!(graph.status_target().as_deref(), Some(X));
+    graph
+        .accept_seed(&request, &candidate, &candidate.generation)
+        .unwrap();
+    assert_eq!(graph.status_target().as_deref(), Some(Y));
 }
 
 #[test]

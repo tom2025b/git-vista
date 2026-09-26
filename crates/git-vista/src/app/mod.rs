@@ -648,6 +648,8 @@ pub fn App() -> impl IntoView {
             .map(|seed| seed.frame)
     });
     let status_repo = Signal::derive(move || graph.get().status_target());
+    // Completion notices outlive the popup and every canvas incarnation.
+    let stage = create_rw_signal(crate::features::status::detail::core::StageState::default());
     let status = status_seam::create(graph, activity, status_repo);
 
     // Icon style (icons.rs): Nerd Font glyphs vs the plain-text fallback. A
@@ -849,6 +851,28 @@ pub fn App() -> impl IntoView {
             <Show when=move || !graph.get().view().is_historical()>
                 {operations_status_view(operations)}
             </Show>
+            <Show when=move || !operations.opener_notices().is_empty() || stage.with(|state| !state.notices().is_empty())>
+            <section aria-label="Request outcomes" style="flex: 0 1 auto; min-height: 0; max-height: 24vh; overflow-y: auto; overflow-wrap: anywhere; padding: 0.5rem 1rem; border-bottom: 1px solid #30363d;">
+            {move || operations.opener_notices().into_iter().map(|notice| {
+                let seq = notice.seq;
+                view! {
+                    <div class="operation-notice">
+                        <p role="status">{notice.message}</p>
+                        <button on:click=move |_| operations.dismiss_opener_notice(seq)>"Dismiss request notice"</button>
+                    </div>
+                }
+            }).collect_view()}
+            {move || stage.with(|state| state.notices().to_vec()).into_iter().map(|notice| {
+                let serial = notice.serial;
+                view! {
+                    <div class="operation-notice">
+                        <p role="status">{notice.message}</p>
+                        <button on:click=move |_| stage.update(|state| state.dismiss(serial))>"Dismiss stage result"</button>
+                    </div>
+                }
+            }).collect_view()}
+            </section>
+            </Show>
             <header class="topbar">
                 // The git mark brands the title (icons.rs). Reactive so the
                 // topbar switches with the icon-style toggle like everything else.
@@ -858,7 +882,7 @@ pub fn App() -> impl IntoView {
                 </h1>
                 <span class="subtitle">"vertical git history — drag to pan, pinch or scroll to zoom"</span>
                 <Show when=move || !graph.get().view().is_historical()>
-                {crate::features::status::detail::view::status_chip_view(features, status_frame, online, nerd_icons)}
+                {crate::features::status::detail::view::status_chip_view(features, status_frame, online, nerd_icons, stage)}
                 // #663 (ADR 0094 §7): the change feed's health, drawn
                 // permanently and quietly, beside the working-tree status
                 // chip it shares a "trust signal about repository state"

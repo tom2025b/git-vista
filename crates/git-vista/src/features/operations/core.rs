@@ -18,6 +18,7 @@ use git_vista_protocol::operation::{
 use git_vista_protocol::plan::{GenerationToken, MergeStrategy};
 
 use crate::features::core_traits::{Applied, Invalidate, InvalidateScope, RequestKey};
+use crate::features::graph::core::GraphCore;
 #[cfg(test)]
 use crate::features::operations::kind::HeadBranch;
 use crate::features::operations::kind::OperationKind;
@@ -607,8 +608,8 @@ pub struct PendingIntent {
     /// Click order, from [`IntentSeq::next`]. Minted before the `spawn_local`, so it
     /// records when the user *acted*, not when the network *answered*.
     pub seq: u64,
-    /// Which repository state the intent was raised against, so a repository switch or a
-    /// generation bump can strand it even when it is the newest intent.
+    /// The existing render-epoch fence stays until phase 5 can pair opener
+    /// admission with the Shell serial covering every confirmation path.
     pub key: RequestKey,
     pub kind: OperationKind,
 }
@@ -622,7 +623,7 @@ pub struct PendingIntent {
 /// reopens the Checkout dialog over the Merge one the user is looking at.
 ///
 /// This is only half the gate. A caller must also check
-/// [`RequestKey::is_current`](crate::features::core_traits::RequestKey::is_current), which
+/// [`OpenerState::admit`]'s request currency check, which
 /// strands an intent whose repository moved underneath it. Sequence answers "did the user
 /// ask for something newer?"; the key answers "is what they asked for still meaningful?".
 ///
@@ -632,6 +633,55 @@ pub fn latest_wins(current: Option<&PendingIntent>, incoming: &PendingIntent) ->
     match current {
         None => true,
         Some(cur) => incoming.seq >= cur.seq,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenerNotice {
+    pub seq: u64,
+    pub message: &'static str,
+}
+
+/// App-owned, nonmodal refusals. Refusing an old continuation never changes the
+/// admitted intent, opens a modal, or retries a request. Remember dismissed
+/// serials too: Force Push rechecks the same intent after each of two awaits.
+#[derive(Debug, Clone, Default)]
+pub struct OpenerState {
+    current: Option<PendingIntent>,
+    refused: std::collections::BTreeSet<u64>,
+    notices: Vec<OpenerNotice>,
+}
+
+impl OpenerState {
+    pub fn admit(&mut self, intent: &PendingIntent, graph: &GraphCore) -> bool {
+        // Preserve the production admission predicate exactly in phase 3.
+        // Feed admission changes only with Shell's universal serial in phase 5.
+        let refusal = if !intent.key.is_current(graph.epoch(), None) {
+            Some("The repository or view changed before this confirmation could open. Review the current repository and try again.")
+        } else if !latest_wins(self.current.as_ref(), intent) {
+            Some("A newer request already owns the dialog. The earlier request did not open. Try again if you still want it.")
+        } else {
+            None
+        };
+        if let Some(message) = refusal {
+            if self.refused.insert(intent.seq) {
+                self.notices.push(OpenerNotice {
+                    seq: intent.seq,
+                    message,
+                });
+            }
+            return false;
+        }
+        self.current = Some(intent.clone());
+        true
+    }
+
+    pub fn notices(&self) -> &[OpenerNotice] {
+        &self.notices
+    }
+
+    pub fn dismiss(&mut self, seq: u64) {
+        self.notices.retain(|notice| notice.seq != seq);
     }
 }
 
@@ -1335,7 +1385,7 @@ mod core_tests {
 #[cfg(test)]
 mod intent_tests {
     use super::*;
-    use crate::features::core_traits::{RequestKey, RequestTarget};
+    use crate::features::core_traits::RequestTarget;
 
     /// An intent raised by the `seq`-th click of the session, against graph epoch 1.
     fn intent(seq: u64, branch: &str) -> PendingIntent {
@@ -1351,6 +1401,111 @@ mod intent_tests {
                 current: HeadBranch::Detached,
             },
         }
+    }
+
+    #[test]
+    fn refused_opener_reports_retry_once_even_after_dismissal() {
+        let mut graph = GraphCore::default();
+        graph.force_bump();
+        let held = intent(1, "main");
+        let mut state = OpenerState::default();
+        assert!(state.admit(&held, &graph));
+        graph.force_bump(); // Refresh and drift use this same path.
+        assert!(!state.admit(&held, &graph));
+        assert_eq!(state.notices(), &[OpenerNotice {
+            seq: 1,
+            message: "The repository or view changed before this confirmation could open. Review the current repository and try again.",
+        }]);
+        assert!(!state.admit(&held, &graph));
+        assert_eq!(
+            state.notices().len(),
+            1,
+            "Force Push's repeated check must not duplicate the refusal"
+        );
+        state.dismiss(1);
+        assert!(state.notices().is_empty());
+        assert!(!state.admit(&held, &graph));
+        assert!(
+            state.notices().is_empty(),
+            "dismissed refusal stays dismissed for this serial"
+        );
+    }
+
+    #[test]
+    fn superseded_refusal_never_replaces_or_clears_newer_intent() {
+        let mut graph = GraphCore::default();
+        graph.force_bump();
+        let mut state = OpenerState::default();
+        let newer = intent(3, "newer");
+        assert!(state.admit(&newer, &graph));
+        assert!(!state.admit(&intent(1, "older"), &graph));
+        assert_eq!(
+            state.current.as_ref(),
+            Some(&newer),
+            "refusal must leave the newer dialog's intent intact"
+        );
+        assert_eq!(state.notices()[0].message, "A newer request already owns the dialog. The earlier request did not open. Try again if you still want it.");
+        assert!(!state.admit(&intent(2, "also-older"), &graph));
+        assert_eq!(state.current.as_ref(), Some(&newer));
+        assert!(
+            state.admit(&newer, &graph),
+            "same serial may recheck without becoming superseded"
+        );
+    }
+
+    #[test]
+    fn observable_refusals_preserve_the_previous_admission_predicate() {
+        let mut graph = GraphCore::default();
+        graph.force_bump();
+        for current_seq in [None, Some(1), Some(3)] {
+            for incoming_seq in [1, 2, 3, 4] {
+                for epoch in [0, 1, 2] {
+                    for generation in [None, Some(GenerationToken::new("known").unwrap())] {
+                        let current = current_seq.map(|seq| intent(seq, "current"));
+                        let mut incoming = intent(incoming_seq, "incoming");
+                        incoming.key.epoch = epoch;
+                        incoming.key.generation = generation;
+                        let expected = incoming.key.is_current(graph.epoch(), None)
+                            && latest_wins(current.as_ref(), &incoming);
+                        let mut state = OpenerState {
+                            current,
+                            ..Default::default()
+                        };
+                        assert_eq!(state.admit(&incoming, &graph), expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn refusal_adapter_publishes_app_notices_without_modal_replacement() {
+        // A wiring census, not browser evidence: the behavioral tests above
+        // drive the production decision; wasm/browser gates verify the adapter.
+        let signals = include_str!("signals.rs");
+        let admission = signals
+            .split("pub fn admit_intent(")
+            .nth(1)
+            .unwrap()
+            .split("pub fn core(")
+            .next()
+            .unwrap();
+        assert!(admission.contains("state.admit(intent,"));
+        assert!(admission.contains("state.notices().to_vec()"));
+        for forbidden in [
+            "open_error(",
+            "dialogs.open(",
+            "open_confirm(",
+            "pending_intent.set(",
+        ] {
+            assert!(
+                !admission.contains(forbidden),
+                "opener refusal must not replace a modal: {forbidden}"
+            );
+        }
+        let app = include_str!("../../app/mod.rs");
+        assert!(app.contains("operations.opener_notices()"));
+        assert!(app.contains("operations.dismiss_opener_notice(seq)"));
     }
 
     #[test]
