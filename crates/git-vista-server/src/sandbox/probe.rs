@@ -130,7 +130,7 @@ pub(crate) struct BootRefusal {
 /// paired with advice to install an already-present bubblewrap binary.
 fn capability_absent_message(missing: &[&str]) -> String {
     match missing {
-        ["windows_sandbox"] => NON_UNIX_SANDBOX_REFUSAL.to_string(),
+        [WINDOWS_SANDBOX_KEY] => NON_UNIX_SANDBOX_REFUSAL.to_string(),
         ["HOME"] => "$HOME is unset, so the sandbox policy cannot identify the home tree. Set \
                      HOME to the server user's home directory, then restart."
             .to_string(),
@@ -154,11 +154,25 @@ fn capability_absent_message(missing: &[&str]) -> String {
     }
 }
 
+/// Stable capability key for the Windows sandbox backend that ADR 0152 says
+/// does not exist yet. This is ordinary host-testable data, not platform-gated
+/// code, so Linux CI compiles the same routing key Windows startup will use.
+const WINDOWS_SANDBOX_KEY: &str = "windows_sandbox";
+
 /// The interim Windows posture from ADR 0152. This text is deliberately
 /// compiled on Linux too, so the ordinary Linux test suite can pin the exact
 /// refusal instead of leaving a `cfg(not(unix))` message untested.
 const NON_UNIX_SANDBOX_REFUSAL: &str = "no Windows sandbox yet (ADR 0152). Git-Vista \
     refuses to start on Windows and has no unsandboxed mode.";
+
+/// Construct the non-Unix startup verdict without a platform gate so Linux CI
+/// compiles and tests the decision that Windows startup will enforce.
+#[cfg_attr(all(unix, not(test)), allow(dead_code))]
+fn non_unix_boot_verdict() -> ProbeVerdict {
+    ProbeVerdict::CapabilityAbsent {
+        missing: vec![WINDOWS_SANDBOX_KEY],
+    }
+}
 
 impl std::fmt::Display for BootRefusal {
     /// Names what was missing (or what failed) and why the server will not
@@ -708,11 +722,9 @@ fn to_boot_result(verdict: ProbeVerdict) -> Result<ProbeVerdict, BootRefusal> {
 pub(crate) async fn run_at_startup() -> Result<ProbeVerdict, BootRefusal> {
     #[cfg(not(unix))]
     {
-        let v = ProbeVerdict::CapabilityAbsent {
-            missing: vec!["windows_sandbox"],
-        };
+        let v = non_unix_boot_verdict();
         record_boot_verdict(&v);
-        eprintln!("[sandbox] verdict=capability_absent missing=[\"windows_sandbox\"]");
+        eprintln!("[sandbox] verdict=capability_absent missing=[\"{WINDOWS_SANDBOX_KEY}\"]");
         eprintln!("[sandbox] refusing to start: {NON_UNIX_SANDBOX_REFUSAL}");
         to_boot_result(v)
     }
@@ -806,18 +818,31 @@ mod tests {
     #[test]
     fn the_windows_refusal_names_the_missing_backend_without_linux_advice() {
         let refusal = BootRefusal {
-            verdict: ProbeVerdict::CapabilityAbsent {
-                missing: vec!["windows_sandbox"],
-            },
+            verdict: non_unix_boot_verdict(),
         }
         .to_string();
 
-        assert!(refusal.contains("no Windows sandbox yet"), "{refusal}");
-        assert!(refusal.contains("ADR 0152"), "{refusal}");
-        assert!(refusal.contains("no unsandboxed mode"), "{refusal}");
-        assert!(
-            !refusal.to_ascii_lowercase().contains("bwrap"),
-            "Windows refusal must not offer Linux-only remediation: {refusal}"
+        assert_eq!(
+            refusal,
+            "sandbox unavailable (missing: [\"windows_sandbox\"]): no Windows sandbox yet \
+             (ADR 0152). Git-Vista refuses to start on Windows and has no unsandboxed mode. \
+             (INV-13 — there is no degraded mode.)"
+        );
+    }
+
+    /// The non-Unix decision reaches the same boot gate as every measured Unix
+    /// verdict. Exercise that routing on Linux so a future Windows-only edit
+    /// cannot accidentally turn the missing backend into a successful boot.
+    #[test]
+    fn the_non_unix_boot_verdict_is_refused_by_the_real_gate() {
+        let refusal = to_boot_result(non_unix_boot_verdict())
+            .expect_err("a target without a sandbox backend must not boot");
+
+        assert_eq!(
+            refusal.to_string(),
+            "sandbox unavailable (missing: [\"windows_sandbox\"]): no Windows sandbox yet \
+             (ADR 0152). Git-Vista refuses to start on Windows and has no unsandboxed mode. \
+             (INV-13 — there is no degraded mode.)"
         );
     }
 
