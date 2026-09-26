@@ -92,6 +92,53 @@ fn equal_history_does_not_admit_another_repository_into_a_bound_seed() {
 }
 
 #[test]
+fn pinned_page_selector_refuses_a_foreign_frame_before_requesting_page_one() {
+    let graph = bound();
+    let request = graph.seed_request();
+    let expected = frame(Some(X));
+    let foreign = frame(Some(Y));
+    assert_eq!(expected.generation, foreign.generation);
+    assert_eq!(request.page_selector(&expected), Ok(Some(X)));
+    // Exercise the pre-page boundary alone: accept_seed's independent guard
+    // cannot rescue a selector that would send the next request to Y.
+    assert_eq!(
+        request.page_selector(&foreign),
+        Err("The history response belongs to another repository."),
+        "a pinned Frame read must not authorize page one on another worktree"
+    );
+}
+
+#[test]
+fn discovery_reply_cannot_replace_a_binding_accepted_since_its_capture() {
+    let mut graph = GraphCore::default();
+    let first = graph.seed_request();
+    let pending_discovery = graph.seed_request();
+    let accepted = frame(Some(X));
+    let foreign = frame(Some(Y));
+    graph
+        .accept_seed(&first, &accepted, &accepted.generation)
+        .unwrap();
+
+    // Acceptance deliberately changes neither epoch nor binding revision.
+    // A previously captured discovery ticket therefore still passes the
+    // request fence, and discovery itself permits either usable worktree.
+    assert!(graph.request_is_current(&pending_discovery));
+    assert_eq!(pending_discovery.target, SeedTarget::Discovery);
+    assert_eq!(pending_discovery.page_selector(&foreign), Ok(Some(Y)));
+    assert_eq!(accepted.generation, foreign.generation);
+    let before = graph.clone();
+    assert_eq!(
+        graph.accept_seed(&pending_discovery, &foreign, &foreign.generation),
+        Err("This history response cannot replace the tab's repository."),
+        "acceptance must refuse Y even when the captured discovery request permits it"
+    );
+    assert_eq!(
+        graph, before,
+        "a refused reply must leave the binding intact"
+    );
+}
+
+#[test]
 fn retired_discovery_cannot_bind_after_refresh_or_selection() {
     let mut graph = GraphCore::default();
     let old = graph.seed_request();
