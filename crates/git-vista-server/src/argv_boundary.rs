@@ -63,6 +63,10 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // The scan below pins the sole program expression to current_exe(); it
     // does not receive the general LAUNCHER_SPAWN_SITES exemption.
     "src/planner/couldnt_run_suite.rs",
+    // ADR 0150's test-only feed/permit suite: one self-reexec isolates the
+    // process-wide stream pool; one literal git launch builds its fixtures.
+    // The dedicated arm below pins both programs and the test-only inclusion.
+    "src/handlers/repository_events/binding_suite.rs",
     // `git update-ref` for recovery refs (#62) — see the module doc above.
     // The production call (`write_recovery_ref`) now goes through
     // `crate::git_cmd::git_output` (#66 Task 6); this entry now covers only
@@ -623,6 +627,25 @@ fn every_process_spawn_site_is_allowlisted_and_spawns_only_git() {
                 assert!(
                     include_str!("planner.rs").contains("#[cfg(test)]\nmod couldnt_run_suite;"),
                     "the self-spawning flag probe must remain test-only"
+                );
+            } else if rel == "src/handlers/repository_events/binding_suite.rs" {
+                let self_test = [&spawn, "std::env::current_exe().unwrap())"].concat();
+                assert_eq!(hits, 2, "the feed suite has exactly two spawn sites");
+                assert_eq!(
+                    text.matches(&self_test).count(),
+                    1,
+                    "the isolated feed runner may only launch its own test binary"
+                );
+                assert_eq!(
+                    text.matches(&spawn_git).count(),
+                    1,
+                    "the feed fixture may only launch literal git"
+                );
+                assert!(
+                    include_str!("handlers/repository_events.rs").contains(
+                        "#[cfg(test)]\n#[path = \"repository_events/binding_suite.rs\"]\nmod binding_suite;"
+                    ),
+                    "the self-spawning feed suite must remain test-only"
                 );
             } else if rel == "src/sandbox/lfs.rs" {
                 let spawn_openssl = [&spawn, "\"openssl\")"].concat();
