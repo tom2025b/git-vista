@@ -76,6 +76,7 @@ pub(crate) mod worktree;
 mod argv;
 /// #723/#831: clone checkout's distinct seccomp profile and hook block,
 /// exercised by a real selected filter plus a fetched hook that must stay off.
+#[cfg(unix)]
 #[cfg(test)]
 mod checkout_security;
 /// A real HTTPS clone through the production `policy_for_clone`. Separate from
@@ -90,6 +91,7 @@ mod clone_live;
 /// is attributable to the policy rather than to git working regardless. Its
 /// census is `docs/sandbox/compat-census.txt`, kept separate from the escape
 /// census — see its own module doc for why.
+#[cfg(unix)]
 #[cfg(test)]
 mod compat;
 #[cfg(test)]
@@ -103,6 +105,7 @@ mod dispatch;
 /// second, clearly-delineated section (below the confused-deputy doc test)
 /// for ordinary missing-coverage gaps that are not INV-17 shaped — see that
 /// section's own header comment for why it lives here anyway.
+#[cfg(unix)]
 #[cfg(test)]
 mod documented_gaps;
 /// #66 Task 25, step 3: the anti-vacuity contract's tripwires and the
@@ -110,13 +113,16 @@ mod documented_gaps;
 /// (rather than left for whichever lane does step 5) so no later lane touches
 /// this module list — see
 /// `docs/sandbox/escape-battery-anti-vacuity-contract.md`.
+#[cfg(unix)]
 #[cfg(test)]
 mod escape_contract;
+#[cfg(unix)]
 #[cfg(test)]
 mod escape_suite;
 /// #66 Task 25, step 5: the `class = functional` blocked-hooks case moves
 /// here out of `escape_suite.rs`. Landed as an empty stub in step 3 so the
 /// module list is fixed before any case is rewritten; step 5 populates it.
+#[cfg(unix)]
 #[cfg(test)]
 mod hook_mode_suite;
 /// D2 (#66, Task 7): the hostile-geometry battery for `repo_paths`. Distinct
@@ -128,6 +134,7 @@ mod hostile;
 /// `escape_contract.rs`'s `EscapeCase` harness on purpose (its claims are
 /// process-tree- and wall-clock-shaped, not single-errno-shaped); see its own
 /// module doc for what replaces the R5 census gate there.
+#[cfg(unix)]
 #[cfg(test)]
 pub(crate) mod lifecycle;
 #[cfg(test)]
@@ -137,6 +144,7 @@ mod shim_cli;
 /// ls-remote` over `ssh://` through the composed Network-tier launcher. See
 /// this module's own doc comment for why it builds its own `Policy` rather
 /// than routing through `policy_for`'s real-`$HOME`-reading path.
+#[cfg(unix)]
 #[cfg(test)]
 mod ssh_remote;
 

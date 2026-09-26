@@ -86,24 +86,31 @@
 //! honest answer, since by that point every real cause is a real caller that
 //! is already gone and in no position to read it.
 
+#[cfg(target_os = "linux")]
 use std::ffi::{CString, OsString};
+#[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
 /// How often this process checks whether it has been reparented. The
 /// residual named in the module doc: at most this long an orphan can survive
 /// after its real parent dies before this process notices.
+#[cfg(target_os = "linux")]
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// This process's own exit code when its argv is unusable. Distinct from any
 /// code the wrapped program could itself produce, so a misuse of this binary
 /// never reads like the launcher failed.
+#[cfg(target_os = "linux")]
 const EXIT_USAGE: i32 = 120;
 /// `execvp` itself failed (bad path, not executable, …). Mirrors the shim's
 /// own `EXIT_EXEC` posture: distinct from the wrapped program's own exit
 /// codes, so this failure is never misread as that program's.
+#[cfg(target_os = "linux")]
 const EXIT_EXEC_FAILED: i32 = 121;
 
+#[cfg(target_os = "linux")]
 fn main() {
     let argv: Vec<OsString> = std::env::args_os().collect();
     if argv.len() < 3 {
@@ -222,6 +229,7 @@ fn main() {
 /// honestly, as "the launcher was killed" — see the module doc's exit-status
 /// section for why `SIGKILL` against self is the right answer here rather
 /// than a distinguishable made-up code.
+#[cfg(target_os = "linux")]
 fn reap_orphan(child_pid: libc::pid_t) -> ! {
     unsafe {
         libc::killpg(child_pid, libc::SIGKILL);
@@ -241,6 +249,7 @@ fn reap_orphan(child_pid: libc::pid_t) -> ! {
 
 /// Exit (or re-raise a signal against self) so this process's own final
 /// status is indistinguishable from the child's, for a caller that reads it.
+#[cfg(target_os = "linux")]
 fn exit_matching_child(status: i32) -> ! {
     if libc_wifexited(status) {
         std::process::exit(libc_wexitstatus(status));
@@ -263,21 +272,26 @@ fn exit_matching_child(status: i32) -> ! {
 /// Thin wrappers around the `WIF*`/`W*` macros: `libc` exposes them as
 /// `const fn`s taking the raw status, not methods, so naming them once here
 /// keeps `main` reading as the state machine it is.
+#[cfg(target_os = "linux")]
 fn libc_wifexited(status: i32) -> bool {
     libc::WIFEXITED(status)
 }
+#[cfg(target_os = "linux")]
 fn libc_wexitstatus(status: i32) -> i32 {
     libc::WEXITSTATUS(status)
 }
+#[cfg(target_os = "linux")]
 fn libc_wifsignaled(status: i32) -> bool {
     libc::WIFSIGNALED(status)
 }
+#[cfg(target_os = "linux")]
 fn libc_wtermsig(status: i32) -> i32 {
     libc::WTERMSIG(status)
 }
 
 /// `execvp` the given program-and-args in the current (child) process, or die
 /// trying. Never returns on success, by definition of `execvp`.
+#[cfg(target_os = "linux")]
 fn exec_or_die(argv: &[CString]) -> ! {
     let mut raw: Vec<*const libc::c_char> = argv.iter().map(|s| s.as_ptr()).collect();
     raw.push(std::ptr::null());
@@ -296,8 +310,17 @@ fn exec_or_die(argv: &[CString]) -> ! {
 /// `OsString` -> `CString`, for the raw `execvp` call. Panics on an embedded
 /// NUL, which cannot occur in a real argv (the kernel itself refuses one),
 /// making this a fine place to fail loudly rather than degrade.
+#[cfg(target_os = "linux")]
 fn to_cstrings(args: &[OsString]) -> Vec<CString> {
     args.iter()
         .map(|a| CString::new(a.as_os_str().as_bytes()).expect("argv entry must not contain NUL"))
         .collect()
+}
+
+/// A refusal entry point keeps all Cargo targets checkable without claiming
+/// fork, parent-death signals, or process-group reaping on another platform.
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("gv-sandbox-reaper requires Linux and cannot run on this platform.");
+    std::process::exit(1);
 }
