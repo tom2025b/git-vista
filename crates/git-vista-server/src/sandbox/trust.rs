@@ -55,9 +55,8 @@ use crate::state::sandbox_trust_dir;
 /// stored path is what is actually compared), so a fast non-cryptographic hash
 /// is the right tool. The path is stored in the file for the real check.
 fn marker_name(canonical: &Path) -> String {
-    use std::os::unix::ffi::OsStrExt;
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in canonical.as_os_str().as_bytes() {
+    for b in canonical.as_os_str().as_encoded_bytes() {
         hash ^= u64::from(*b);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
@@ -253,6 +252,36 @@ mod tests {
         let b = Path::new("/home/tom/projects/bar/.git");
         assert_eq!(marker_name(a), marker_name(a), "stable for one path");
         assert_ne!(marker_name(a), marker_name(b), "distinct across paths");
+    }
+
+    /// Persisted trust markers are addressed by this hash. Pin the pre-change
+    /// Linux values, including a non-UTF-8 path, so replacing Unix-only
+    /// `OsStrExt::as_bytes` with portable `as_encoded_bytes` cannot silently
+    /// orphan existing markers.
+    #[cfg(unix)]
+    #[test]
+    fn marker_names_match_the_persisted_linux_golden_vectors() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        for (raw_path, expected) in [
+            (
+                b"/home/tom/projects/git-vista".as_slice(),
+                "759109e1f2217e12",
+            ),
+            (
+                b"/srv/repositories/space name/.git".as_slice(),
+                "eb6ec2cce13841ff",
+            ),
+            ("/srv/repositories/café/.git".as_bytes(), "1bc0ede509225c10"),
+            (
+                b"/srv/repositories/non-utf8-\xff/.git".as_slice(),
+                "dbfb71827aac410f",
+            ),
+        ] {
+            let path = Path::new(OsStr::from_bytes(raw_path));
+            assert_eq!(marker_name(path), expected, "path={path:?}");
+        }
     }
 
     /// The escalation this module's own doc claims is impossible, pinned.

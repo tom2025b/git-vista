@@ -18,7 +18,9 @@ use std::path::Path;
 
 use super::{bwrap, LANDLOCK_ABI_FLOOR};
 
+#[cfg(unix)]
 const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
+#[cfg(unix)]
 const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
 
 /// What the host can provide, measured at startup. Every field is a fact, not a
@@ -135,6 +137,7 @@ pub(crate) fn probe() -> Capabilities {
 /// Ask the kernel directly for the Landlock ABI. `landlock_create_ruleset(NULL,
 /// 0, VERSION)` returns the supported ABI version, or `-1`/`ENOSYS` where
 /// Landlock is absent.
+#[cfg(unix)]
 fn landlock_abi() -> i32 {
     let rc = unsafe {
         libc::syscall(
@@ -151,6 +154,14 @@ fn landlock_abi() -> i32 {
     } else {
         rc as i32
     }
+}
+
+/// Non-Unix targets have no Landlock ABI. Keep the existing `-1` sentinel so
+/// callers report the capability as unavailable rather than attempting a
+/// Linux syscall on a platform where it does not exist.
+#[cfg(not(unix))]
+fn landlock_abi() -> i32 {
+    -1
 }
 
 /// Whether unprivileged user namespaces look usable, read from the kernel knobs
