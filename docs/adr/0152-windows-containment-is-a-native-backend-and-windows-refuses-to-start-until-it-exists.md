@@ -1,6 +1,6 @@
 # ADR 0152 — Windows containment is a native backend, and Windows refuses to start until it exists
 
-**Status:** Proposed — direction chosen by Tom (option (b), 2026-09-25 22:20 EDT); this document's details await his read
+**Status:** Accepted — Tom, 2026-09-26 (direction, option (b), chosen 2026-09-25 22:20 EDT; details approved after grok's three review rounds and a codex-daybreak security cold read, VERDICT: LAND)
 **Date:** 2026-09-25
 **Issue:** [#860](https://github.com/tom2025b/git-vista/issues/860) (M14.4)
 **Follows:** [0029](0029-strict-tier-hard-fail-when-unavailable.md) (hard-fail when the Strict tier is unavailable), [0030](0030-git-process-sandbox.md) (the git-process sandbox and its three tiers), [0151](0151-the-windows-client-is-a-webview-over-the-http-api.md) (the Windows client is a webview over the HTTP API)
@@ -118,10 +118,11 @@ flowchart TD
    because 0029 records that a boot gate alone was not enough.
 
 3. **Until that backend exists and passes its own escape battery, Windows refuses
-   to start.** This is option (a), kept as the *interim*, not rejected. One part
-   of it is new work: today's refusal text can tell a Windows user to install
-   `bwrap`, which is wrong advice on Windows. The interim refusal needs a
-   Windows-specific message that names the real reason: "no Windows sandbox yet".
+   to start.** This is option (a), kept as the *interim*, not rejected. Its one
+   piece of new work has landed: the old refusal text could tell a Windows user
+   to install `bwrap`, which is wrong advice on Windows. Since #864 the interim
+   refusal is Windows-specific (`probe.rs` `NON_UNIX_SANDBOX_REFUSAL`: "no
+   Windows sandbox yet (ADR 0152)"), and a Linux test pins its exact text.
 
 4. **Linux behavior does not change.** Every Windows change is additive and
    gated to non-unix targets (`cfg(windows)` / `cfg(not(unix))`), following the
@@ -302,19 +303,20 @@ section exists to prevent. A Job Object is the right *lifecycle* tool (Decision
 - **The Windows Network tier may end up weaker than Linux's**, and if it does,
   that is decided openly, not discovered later.
 - **Linux is untouched throughout** (Decision §4), and Linux CI stays the gate.
-- **Compile blockers inside `sandbox/` are now unblocked for mechanical fixing.**
-  They were held until this direction was chosen: `capabilities.rs:140`'s
-  ungated `libc::syscall`, `probe.rs:320`'s ungated `PermissionsExt::set_mode`,
+- **Compile blockers inside `sandbox/` were fixed mechanically in #864.** They
+  were held until this direction was chosen: `capabilities.rs:140`'s ungated
+  `libc::syscall`, `probe.rs:320`'s ungated `PermissionsExt::set_mode`,
   `trust.rs:58`'s ungated `OsStrExt`. Gating them compiles under option (b) and
   does not choose any security behavior.
 
-**Work breakdown**, to be filed as M14 issues once this ADR lands, so each can
-cite it. Items 2 and 3 can start now; the spike gates items 4 to 7.
+**Work breakdown.** The open items are filed as M14 issues once this ADR lands,
+so each can cite it. Items 2 and 3 are done; the spike gates items 4 to 7.
 
 1. **Spike:** Git for Windows inside LPAC/AppContainer; both halves of Decision §5.
 2. **Interim Windows refusal message:** accurate, names "no Windows sandbox yet".
-   Can start now.
-3. **Compile gates in `sandbox/`:** the three blockers above. Can start now.
+   **Done in #864.**
+3. **Compile gates in `sandbox/`:** the three blockers above. **Done in #864**
+   (with #862's test-side gates).
 4. **Windows Strict backend.**
 5. **Job Object lifecycle:** the reaper's Windows equivalent.
 6. **Windows Network tier decision:** back to Tom if it is weaker than Linux.
