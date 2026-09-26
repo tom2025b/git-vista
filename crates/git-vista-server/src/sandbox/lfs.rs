@@ -6,19 +6,23 @@
 //! hides Git LFS's system-only `filter.lfs.*` settings and makes Git silently
 //! write pointer text. This module restores only the values the server authors.
 
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::path::Path;
 
 /// Reviewed installation locations, never `PATH`. The first executable file
 /// wins. These are the same system prefixes already read-granted by the sandbox.
 /// A package installed elsewhere is unavailable to this boundary until its
 /// absolute location is reviewed and added here.
+#[cfg(unix)]
 const GIT_LFS_CANDIDATES: &[&str] = &["/usr/bin/git-lfs", "/bin/git-lfs", "/usr/local/bin/git-lfs"];
 
 /// Deliberately absent. When no candidate exists, keeping a required filter
 /// with this program makes an LFS-attributed checkout fail at the exact file
 /// instead of silently leaving its pointer. Non-LFS repositories never invoke
 /// it and remain cloneable.
+#[cfg(any(unix, test))]
 const GIT_LFS_UNAVAILABLE: &str = "/dev/null/git-vista-lfs-unavailable";
 
 /// Fail-closed target for plaintext object-action URLs advertised by an LFS
@@ -31,18 +35,28 @@ const GIT_LFS_UNAVAILABLE: &str = "/dev/null/git-vista-lfs-unavailable";
 pub(crate) const PLAINTEXT_ACTION_REFUSAL_URL: &str =
     "https://127.0.0.1:1/git-vista-refused-plaintext-lfs-action/";
 
+#[cfg(unix)]
 fn is_executable_file(path: &Path) -> bool {
     std::fs::metadata(path)
         .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
 }
 
+#[cfg(unix)]
 fn program() -> &'static str {
     GIT_LFS_CANDIDATES
         .iter()
         .copied()
         .find(|candidate| is_executable_file(Path::new(candidate)))
         .unwrap_or(GIT_LFS_UNAVAILABLE)
+}
+
+/// ADR 0152 refuses server startup on this platform. If a future caller
+/// bypasses that gate, refuse here too: no Windows LFS executable or sandbox
+/// has been reviewed, so neither PATH lookup nor a Unix sentinel is honest.
+#[cfg(not(unix))]
+fn program() -> &'static str {
+    panic!("Git LFS checkout requires the supported Unix sandbox; unavailable on this platform")
 }
 
 /// Git LFS's ordinary HTTP endpoint for the validated clone URL.
@@ -134,16 +148,22 @@ pub(super) fn checkout_config_with_program(clone_url: &str, program: &str) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::io::{Read, Write};
+    #[cfg(unix)]
     use std::net::TcpListener;
+    #[cfg(unix)]
     use std::process::{Child, Command, Output, Stdio};
+    #[cfg(unix)]
     use std::sync::mpsc;
 
+    #[cfg(unix)]
     struct PlainObjectServer {
         port: u16,
         request: mpsc::Receiver<Vec<u8>>,
     }
 
+    #[cfg(unix)]
     impl PlainObjectServer {
         fn start(contents: &'static [u8]) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind plaintext object server");
@@ -172,12 +192,14 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     struct HttpsBatchServer {
         child: Child,
         port: u16,
         request_path: std::path::PathBuf,
     }
 
+    #[cfg(unix)]
     impl HttpsBatchServer {
         fn start(root: &Path, name: &str, response_body: String) -> Self {
             let key = root.join(format!("{name}-key.pem"));
@@ -301,6 +323,7 @@ with socket.socket() as listener:
         }
     }
 
+    #[cfg(unix)]
     impl Drop for HttpsBatchServer {
         fn drop(&mut self) {
             let _ = self.child.kill();
@@ -308,6 +331,7 @@ with socket.socket() as listener:
         }
     }
 
+    #[cfg(unix)]
     fn copy_tree(from: &Path, to: &Path) {
         std::fs::create_dir_all(to).expect("create copied directory");
         for entry in std::fs::read_dir(from).expect("read copied directory") {
@@ -321,10 +345,12 @@ with socket.socket() as listener:
         }
     }
 
+    #[cfg(unix)]
     fn git_output(repo: &Path, args: &[std::ffi::OsString]) -> Output {
         super::super::network_exec::fixture_git_output(repo, args)
     }
 
+    #[cfg(unix)]
     fn executable(path: &Path, body: &str) {
         std::fs::write(path, body).expect("write executable fixture");
         let mut permissions = std::fs::metadata(path)
@@ -334,6 +360,7 @@ with socket.socket() as listener:
         std::fs::set_permissions(path, permissions).expect("make fixture executable");
     }
 
+    #[cfg(unix)]
     fn lfs_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
         let clones = tempfile::tempdir().expect("clones root");
         let source = clones.path().join("source");
@@ -359,6 +386,7 @@ with socket.socket() as listener:
         (clones, source)
     }
 
+    #[cfg(unix)]
     fn clone_with_cached_lfs_object(
         clones: &Path,
         source: &Path,
@@ -383,6 +411,7 @@ with socket.socket() as listener:
         dest
     }
 
+    #[cfg(unix)]
     fn clone_without_lfs_object(clones: &Path, source: &Path, name: &str) -> std::path::PathBuf {
         let dest = clones.join(name);
         super::super::network_exec::run_fixture_git(
@@ -414,9 +443,15 @@ with socket.socket() as listener:
 
     #[test]
     fn checkout_config_pins_every_lfs_executable_and_transfer_selector() {
-        let config = checkout_config("https://example.invalid/repo.git");
-        let joined = config.join("\n");
+        #[cfg(unix)]
         let selected = program();
+        #[cfg(not(unix))]
+        let selected = "reviewed-test-program";
+        #[cfg(unix)]
+        let config = checkout_config("https://example.invalid/repo.git");
+        #[cfg(not(unix))]
+        let config = checkout_config_for_program("https://example.invalid/repo.git", selected);
+        let joined = config.join("\n");
         assert!(joined.contains(&format!("filter.lfs.process={selected} filter-process")));
         assert!(joined.contains(&format!("filter.lfs.smudge={selected} smudge")));
         assert!(
@@ -456,6 +491,7 @@ with socket.socket() as listener:
     /// `https://` instead of `http://`. The direct plaintext href again reaches
     /// the object server.
     #[tokio::test]
+    #[cfg(unix)]
     async fn an_https_lfs_batch_cannot_select_a_direct_plaintext_object_action() {
         use sha2::{Digest, Sha256};
 
@@ -580,6 +616,7 @@ with socket.socket() as listener:
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn the_production_checkout_materialises_a_cached_lfs_object() {
         assert_ne!(
             program(),
@@ -636,6 +673,7 @@ with socket.socket() as listener:
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn an_unavailable_required_lfs_driver_fails_instead_of_leaving_a_pointer() {
         let (clones, source) = lfs_fixture();
         let dest = clone_with_cached_lfs_object(clones.path(), &source, "unavailable");
@@ -666,6 +704,7 @@ with socket.socket() as listener:
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn an_unavailable_lfs_driver_does_not_reject_a_non_lfs_clone() {
         let clones = tempfile::tempdir().expect("clones root");
         let source = clones.path().join("plain-source");
@@ -717,6 +756,7 @@ with socket.socket() as listener:
         );
     }
 
+    #[cfg(unix)]
     async fn assert_tracked_lfsconfig_cannot_skip_missing_object(
         clone_name: &str,
         lfsconfig: &str,
@@ -768,6 +808,7 @@ with socket.socket() as listener:
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn tracked_lfsconfig_skipdownloaderrors_cannot_make_checkout_succeed() {
         assert_tracked_lfsconfig_cannot_skip_missing_object(
             "skip-errors-dest",
@@ -777,6 +818,7 @@ with socket.socket() as listener:
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn tracked_lfsconfig_fetch_filters_cannot_make_checkout_succeed() {
         for (name, config) in [
             (
@@ -793,6 +835,7 @@ with socket.socket() as listener:
     /// `clone --no-checkout`, but the same configured clean and smudge commands
     /// execute during add and checkout respectively.
     #[test]
+    #[cfg(unix)]
     fn lfs_extensions_execute_on_clean_and_checkout_but_not_clone_transfer() {
         let root = tempfile::tempdir().expect("measurement root");
         let source = root.path().join("extension-source");
@@ -912,6 +955,7 @@ with socket.socket() as listener:
     /// dormant during no-checkout transfer and clean/add, then is spawned by
     /// checkout when the required LFS object is absent.
     #[test]
+    #[cfg(unix)]
     fn lfs_custom_transfer_executes_on_checkout_but_not_clone_transfer_or_clean_add() {
         let (clones, source) = lfs_fixture();
         let marker = clones.path().join("custom-transfer-ran");
@@ -995,6 +1039,7 @@ with socket.socket() as listener:
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn the_production_lfs_config_refuses_a_repo_local_custom_transfer() {
         let (clones, source) = lfs_fixture();
         let dest = clones.path().join("basic-only-dest");
