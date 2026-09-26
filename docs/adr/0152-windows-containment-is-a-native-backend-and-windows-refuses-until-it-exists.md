@@ -23,21 +23,41 @@ None of the three exists on Windows.
 
 Why the sandbox exists at all: Git runs code the repository controls (hooks,
 filters, config keys that name executables). `SECURITY_MODEL.md` treats that code
-as hostile. On Linux it runs inside one of three tiers (ADR 0030):
+as hostile. On Linux it runs inside one of three tiers (ADR 0030), chosen by
+`tier_for` (`sandbox/mod.rs:891`):
 
-- **Strict**: no network, filesystem limited to the repository.
-- **Network**: Landlock allows TCP only on an enumerated port list (ADR 0028).
-- **Unsandboxed**: reachable only through persisted repository trust, and
-  `trust::grant` has no production caller today (ADR 0030 §3).
+- **Strict**, for local operations on untrusted repositories:
+  - **Network:** none. It runs in a fresh network namespace.
+  - **Writes:** the repository and `/dev` only.
+  - **Reads:** the system trees (`/usr`, `/bin`, `/lib`, `/lib64`, `/etc`,
+    `/proc`) and `$HOME`, **except** a withheld list of credential paths
+    (`DEFAULT_SECRET_EXCLUDES`, `sandbox/mod.rs:230`). That list includes
+    `.ssh`, `.config/gh`, `.aws`, `.netrc`, `.git-credentials`, `.gnupg`,
+    `.docker`, `.kube` and browser profiles. Home stays readable because Git
+    reads `~/.gitconfig` (ADR 0030).
+  - **Local sockets:** `AF_UNIX` is denied by seccomp (`SECURITY_MODEL.md`,
+    *Sandbox Mechanism Boundaries*).
+- **Network**, for remote operations: Landlock allows TCP only on an
+  enumerated port list (ADR 0028).
+- **Unsandboxed:** reachable only through persisted repository trust.
+  `trust::grant` has no production caller (ADR 0030 §3; it is `#[cfg(test)]` in
+  `sandbox/trust.rs`), so no production path reaches this tier today.
 
 The #860 investigation (codex on titan, 2026-09-25; every citation re-checked
-against `main` before it was posted to the issue) re-read ADRs 0029 and 0030
-and found a gap. ADR 0029 weighed hosts that *lack a prerequisite an operator can
-install* (bubblewrap, user namespaces, a Landlock floor). It did not weigh a
-platform where *no implementation exists at all*. Its reasoning (never degrade,
-never silently pick a weaker tier, refusal must survive error propagation) still
-applies to Windows. Its remedy ("install bubblewrap") does not. So Windows was a
-genuine new decision, put to Tom as three options.
+against `main` before it was posted to the issue) re-read ADRs 0029 and 0030.
+ADR 0029 decided what happens when a host *lacks a prerequisite an operator can
+supply*; its remedy is installing `bwrap` and enabling unprivileged user
+namespaces. It did not weigh a platform where *no implementation exists at all*.
+Its reasoning still applies to Windows:
+
+- Never degrade Strict to Network.
+- Never degrade and block hooks as a middle path.
+- Treat an unknown observation as its own distinct value, never coerced into a
+  permissive answer: *"refuse, or fail-safe default, but NEVER fail-open."*
+- A boot check alone is not enough; each operation must refuse as well.
+
+Its remedy does not transfer, because there is nothing to install. So Windows
+was a genuine new decision, put to Tom as three options.
 
 The diagram at the end of this section shows the Linux containment this has to
 be matched against.
@@ -50,12 +70,12 @@ config:
 ---
 flowchart TD
     OP["<b>A git operation</b><br/>runs repository-controlled code:<br/>hooks, filters, configured executables"]
-    TIER{"<b>tier_for(need, trusted)</b><br/>sandbox/mod.rs"}
-    STRICT["<b>Strict</b><br/>bwrap namespaces: no network,<br/>Landlock: repo-only filesystem,<br/>seccomp: AF_UNIX denied"]
+    TIER{"<b>tier_for(need, trusted)</b><br/>sandbox/mod.rs:891"}
+    STRICT["<b>Strict</b><br/>no network, writes: repo + /dev only,<br/>reads: system + home MINUS withheld secrets,<br/>AF_UNIX denied by seccomp"]
     NET["<b>Network</b><br/>Landlock TCP port list, ADR 0028<br/>ports, never hosts"]
-    UNS["<b>Unsandboxed</b><br/>only via persisted trust,<br/>trust::grant has no production caller"]
+    UNS["<b>Unsandboxed</b><br/>only via persisted trust,<br/>trust::grant is test-only today"]
     GATE["<b>Boot gate, main.rs:223</b><br/>any verdict but Contained:<br/>exit 1 before listening"]
-    KEY["<b>KEY</b><br/>blue = decision point<br/>green = contained tiers<br/>red = the refusal gate"]
+    KEY["<b>KEY</b><br/>blue = decision point<br/>green = contained tiers<br/>grey = not contained, no production route<br/>red = the refusal gate"]
 
     OP --> TIER
     TIER -->|"local op, untrusted"| STRICT
@@ -65,11 +85,13 @@ flowchart TD
 
     classDef decide fill:#eaf2fa,stroke:#14406f,stroke-width:3px,color:#0d2b4d
     classDef good fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px,color:#1b5e20
+    classDef uncontained fill:#eeeeee,stroke:#616161,stroke-width:3px,color:#212121
     classDef gate fill:#fdecea,stroke:#a01b1b,stroke-width:3px,color:#6b1111
     classDef legend fill:#f5f5f5,stroke:#616161,stroke-width:2px,color:#212121
 
     class OP,TIER decide
-    class STRICT,NET,UNS good
+    class STRICT,NET good
+    class UNS uncontained
     class GATE gate
     class KEY legend
 ```
@@ -77,13 +99,15 @@ flowchart TD
 ## Decision
 
 1. **Direction: Windows gets a real, native containment backend** (option (b),
-   chosen by Tom on 2026-09-25). Hostile repository code on Windows runs inside
-   an OS-enforced boundary comparable in intent to Linux's Strict tier, never
+   chosen by Tom on 2026-09-25). On Windows, hostile repository code runs inside
+   an OS-enforced boundary that **grants no more than the Linux Strict tier
+   grants**. That is proven by measurement, not assumed by analogy. It never runs
    with the server account's own access.
 
-2. **ADR 0029's reasoning applies to Windows unchanged.** No degrade, no silent
-   weaker tier, no "run it anyway and warn". A refusal must survive error
-   propagation; a failed observation must never read as a permissive answer.
+2. **ADR 0029's reasoning applies to Windows unchanged.** There is no degrade to a
+   weaker tier and no degrade-and-block-hooks. An unknown observation is never
+   coerced into a permissive answer. Refusal holds at boot **and** per operation,
+   because 0029 records that a boot gate alone was not enough.
 
 3. **Until that backend exists and passes its own escape battery, Windows refuses
    to start.** This is option (a), kept as the *interim*, not rejected. One part
@@ -97,41 +121,67 @@ flowchart TD
    they remain the merge gate for every Windows PR. A Windows change that alters
    Linux behavior is a defect, whatever else it achieves.
 
-5. **A feasibility spike gates all backend work, with a stated stop condition.**
-   Before anything else is built, measure on a real Windows box whether Git for
-   Windows runs inside an AppContainer or Less-Privileged AppContainer (LPAC)
-   token that has only the grants the Strict tier would give it: read/execute on
-   Git's own install directory, read/write on the repository, no network
-   capability. Git for Windows is MSYS2-based and runs hooks through its bundled
-   `sh.exe`, so "does Git's own runtime tolerate the container" is a real
-   unknown, not a formality. The spike must exercise:
-   - `git status` / `git commit` on a repository inside the grant,
-   - a hook firing (`pre-commit` via Git's `sh.exe`),
-   - a read of a file *outside* the grant, which must be denied,
-   - a network connection attempt, which must be denied,
-   - a credential-helper call, to see what happens.
+5. **A feasibility spike gates all backend work, with two stated stop conditions.**
+   Before any Windows backend is built, measure on a real Windows box whether Git
+   for Windows can run inside an AppContainer or Less-Privileged AppContainer
+   (LPAC) token whose grants **translate Strict's shape** (context, above):
+   - **Writes:** the repository only.
+   - **Read and execute:** Git's install directory and the system directories
+     Git needs.
+   - **Reads:** the user profile, except the Windows equivalents of every path in
+     `DEFAULT_SECRET_EXCLUDES`, and except Windows Credential Manager.
+   - **Network:** no network capability at all.
+   - **Local IPC:** Linux denies `AF_UNIX`, and the spike reports what local IPC
+     the container can open (`AF_UNIX` exists on current Windows; so do named
+     pipes).
 
-   **Stop condition:** if Git for Windows cannot do this work inside the
-   container with only those grants, the spike reports that to Tom and the
-   direction goes back to him for a fresh decision. It does **not** fall through
-   to an unsandboxed mode (option (c)), and it does not quietly widen the grants
-   until something works.
+   The spike must prove **both** halves:
+
+   - **Git works under those grants.** `git status` and `git commit` on a
+     repository inside the grant, and a hook firing (a `pre-commit`). Git for
+     Windows ships its own shell runtime for hooks; that dependency is an
+     assumption this spike confirms, not a measured fact.
+   - **The container reaches nothing Strict withholds.** Each of these must be
+     *denied*, measured:
+     - a read of a file outside every grant;
+     - a read of each withheld credential path;
+     - a network connection;
+     - a credential-helper or Credential Manager read that would return a stored
+       credential;
+     - a write outside the repository.
+
+     Microsoft documents that a regular AppContainer is already granted access to
+     *"certain system files/directories, common registry keys and COM objects"*,
+     and that its profile's `LOCALAPPDATA`, `TEMP` and `TMP` are writable
+     ([Launch an AppContainer](https://learn.microsoft.com/en-us/windows/win32/secauthz/implementing-an-appcontainer)).
+     The spike records every such default the container actually has, and says
+     whether each one exceeds Strict. LPAC withholds those defaults unless a
+     capability grants them (same page), which is why it is the preferred
+     candidate.
+
+   **Stop conditions: either one sends the direction back to Tom for a fresh
+   decision.**
+   - **(A)** Git cannot do the work with Strict-shaped grants.
+   - **(B)** The container can reach something Strict withholds, and that access
+     cannot be removed.
+
+   Neither condition falls through to an unsandboxed mode (option (c)), and
+   neither is resolved by quietly widening grants until something works.
 
 6. **Candidate mechanism mapping: documented by Microsoft, not measured here.**
    Nothing below has been run on this project's hardware; the spike measures it.
 
-   - **Strict → AppContainer/LPAC token with no network capability**, plus DACL
-     grants on the repository and Git's install directory. Microsoft documents
-     that an AppContainer's effective access is the *intersection* of the
-     user's rights and the container's own SIDs. Access has to be granted
+   - **Strict → an LPAC (preferred) or AppContainer token with no network
+     capability**, plus DACL grants that translate Strict's shape. Microsoft
+     documents that an AppContainer's effective access is the *intersection* of
+     the user's rights and the container's own SIDs. Access has to be granted
      explicitly, and a container without the network capability "cannot access
-     the network" ([Launch an AppContainer](https://learn.microsoft.com/en-us/windows/win32/secauthz/implementing-an-appcontainer)).
-     LPAC is stricter still: it needs explicit capabilities even for registry reads
-     and COM (same page).
+     the network"
+     ([Launch an AppContainer](https://learn.microsoft.com/en-us/windows/win32/secauthz/implementing-an-appcontainer)).
    - **Network → an open question the spike must answer.** Linux's Network tier
      allows TCP only on an enumerated port list. Microsoft describes AppContainer
-     network access as coarse capabilities: *"Granular access can be granted
-     for Internet access, Intranet access, and acting as a server"*
+     network access as coarse capabilities: *"Granular access can be granted for
+     Internet access, Intranet access, and acting as a server"*
      ([AppContainer isolation](https://learn.microsoft.com/en-us/windows/win32/secauthz/appcontainer-isolation)).
      Neither page describes a per-port restriction. **If Windows can only express
      "outbound allowed" rather than "outbound on these ports", the Windows Network
@@ -139,10 +189,15 @@ flowchart TD
      such, before the Network tier is built. It is not decided here and not
      assumed to be equivalent.
    - **Process lifecycle (the reaper's job) → a Job Object** with
-     `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and neither breakaway limit set, so
-     every descendant stays in the job and dies with it. Children created with
-     `CreateProcess` join the parent's job by default
+     `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and neither breakaway limit set.
+     Microsoft documents that children created with `CreateProcess` join the
+     parent's job by default, and that closing the last job handle then
+     terminates the job's processes. It also documents two exceptions: children
+     created through `Win32_Process.Create` do not join, and nested-job breakaway
+     settings can change association
      ([Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)).
+     So "every descendant of a hook ends up in the job" is a claim the spike and
+     the escape battery must prove, not one this record makes.
    - **Unsandboxed → unchanged.** It is still reachable only through persisted
      trust, which still has no production caller. This ADR does not add a
      Windows route to it.
@@ -157,14 +212,14 @@ config:
     wrappingWidth: 460
 ---
 flowchart TD
-    LS["<b>Linux Strict</b><br/>no network, repo-only FS,<br/>AF_UNIX denied"]
+    LS["<b>Linux Strict</b><br/>no network, writes: repo only,<br/>reads: system + home minus secrets,<br/>AF_UNIX denied"]
     LN["<b>Linux Network</b><br/>TCP on enumerated ports only"]
     LR["<b>Linux reaper</b><br/>gv-sandbox-reaper"]
-    WS["<b>Windows Strict candidate</b><br/>AppContainer or LPAC,<br/>no network capability,<br/>DACL grants: repo + Git install dir"]
+    WS["<b>Windows Strict candidate</b><br/>LPAC preferred, no network capability,<br/>DACL grants translating Strict's shape"]
     WN["<b>Windows Network: OPEN QUESTION</b><br/>documented capabilities are<br/>Internet / Intranet / server,<br/>no per-port restriction documented"]
     WR["<b>Windows lifecycle candidate</b><br/>Job Object, KILL_ON_JOB_CLOSE,<br/>no breakaway allowed"]
     SPIKE["<b>Spike measures all three</b><br/>nothing here is measured yet"]
-    KEY["<b>KEY</b><br/>blue = Linux, as built<br/>green = Windows candidate, documented<br/>amber = may be weaker, back to Tom"]
+    KEY["<b>KEY</b><br/>blue = Linux, as built<br/>green = Windows candidate, documented<br/>amber = may be weaker, back to Tom<br/>grey = measurement still to happen"]
 
     LS --> WS
     LN --> WN
@@ -176,11 +231,13 @@ flowchart TD
     classDef linux fill:#eaf2fa,stroke:#14406f,stroke-width:3px,color:#0d2b4d
     classDef win fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px,color:#1b5e20
     classDef open fill:#fff8e1,stroke:#8a5a00,stroke-width:3px,color:#5c3d00
+    classDef measure fill:#eeeeee,stroke:#616161,stroke-width:3px,color:#212121
     classDef legend fill:#f5f5f5,stroke:#616161,stroke-width:2px,color:#212121
 
     class LS,LN,LR linux
-    class WS,WR,SPIKE win
+    class WS,WR win
     class WN open
+    class SPIKE measure
     class KEY legend
 ```
 
@@ -222,9 +279,8 @@ section exists to prevent. A Job Object is the right *lifecycle* tool (Decision
 - **This is weeks of work, not days.** codex's #860 estimate was multiple
   engineer-weeks, plausibly a month or more with validation. That is an
   engineering estimate, not a measured schedule.
-- **The spike can end the direction.** If Git for Windows cannot run inside the
-  container, Decision §5's stop condition sends it back to Tom rather than
-  forward to a weaker mode.
+- **The spike can end the direction.** If either stop condition fires (Decision
+  §5), the direction goes back to Tom rather than forward to a weaker mode.
 - **The Windows Network tier may end up weaker than Linux's**, and if it does,
   that is decided openly, not discovered later.
 - **Linux is untouched throughout** (Decision §4), and Linux CI stays the gate.
@@ -235,19 +291,21 @@ section exists to prevent. A Job Object is the right *lifecycle* tool (Decision
   does not choose any security behavior.
 
 **Work breakdown**, to be filed as M14 issues once this ADR lands, so each can
-cite it:
+cite it. Items 2 and 3 can start now; the spike gates items 4 to 7.
 
-1. **Spike: Git for Windows inside AppContainer/LPAC** (gates 4 to 7).
+1. **Spike:** Git for Windows inside LPAC/AppContainer; both halves of Decision §5.
 2. **Interim Windows refusal message:** accurate, names "no Windows sandbox yet".
-3. **Compile gates in `sandbox/`:** the three blockers above.
+   Can start now.
+3. **Compile gates in `sandbox/`:** the three blockers above. Can start now.
 4. **Windows Strict backend.**
-5. **Windows Network tier decision:** back to Tom if it is weaker than Linux.
-6. **Windows boot probe and escape battery:** behavioral probes replacing the
-   Linux capability checks, proving denial rather than asserting it.
-7. **Job Object lifecycle:** the reaper's Windows equivalent.
+5. **Job Object lifecycle:** the reaper's Windows equivalent.
+6. **Windows Network tier decision:** back to Tom if it is weaker than Linux.
+7. **Boot probe, per-operation refusal, and escape battery:** behavioral probes
+   that prove every denial in Decision §5, at boot and per operation, replacing
+   the Linux capability checks.
 
-The diagram at the end of this section shows the order and where the stop
-condition sits.
+The Windows server may start only when item 7 passes. The diagram at the end of
+this section shows the order and where the stop conditions sit.
 
 ```mermaid
 ---
@@ -256,33 +314,31 @@ config:
     wrappingWidth: 460
 ---
 flowchart TD
-    I3["<b>3. Compile gates in sandbox/</b><br/>mechanical, no behavior chosen"]
-    I2["<b>2. Interim refusal message</b><br/>Windows says the true reason"]
-    I1["<b>1. Spike on a real Windows box</b><br/>Git + hook inside AppContainer/LPAC"]
-    STOP["<b>Spike fails</b><br/>back to Tom for a fresh decision,<br/>never forward to an unsandboxed mode"]
+    I2["<b>2. Interim refusal message</b><br/>can start now"]
+    I3["<b>3. Compile gates in sandbox/</b><br/>can start now, no behavior chosen"]
+    I1["<b>1. Spike on a real Windows box</b><br/>Git works AND nothing withheld is reachable"]
+    STOP["<b>Stop condition A or B fires</b><br/>back to Tom for a fresh decision,<br/>never forward to an unsandboxed mode"]
     I4["<b>4. Strict backend</b>"]
-    I5["<b>5. Network tier decision</b><br/>back to Tom if weaker than Linux"]
-    I6["<b>6. Boot probe + escape battery</b>"]
-    I7["<b>7. Job Object lifecycle</b>"]
-    SHIP["<b>Windows server may start</b><br/>only when 6 passes"]
-    KEY["<b>KEY</b><br/>blue = can start now<br/>green = gated on the spike<br/>red = the stop condition"]
+    I5["<b>5. Job Object lifecycle</b>"]
+    I6["<b>6. Network tier decision</b><br/>back to Tom if weaker than Linux"]
+    I7["<b>7. Boot probe + per-operation refusal<br/>+ escape battery</b>"]
+    SHIP["<b>Windows server may start</b><br/>only when 7 passes"]
+    KEY["<b>KEY</b><br/>blue = can start now<br/>green = gated on the spike<br/>red = the stop conditions"]
 
-    I3 --> I1
-    I2 --> I1
-    I1 -->|"works"| I4
-    I1 -->|"does not work"| STOP
+    I1 -->|"both halves pass"| I4
+    I1 -->|"A or B"| STOP
     I4 --> I5
-    I4 --> I7
-    I5 --> I6
-    I7 --> I6
-    I6 --> SHIP
+    I4 --> I6
+    I5 --> I7
+    I6 --> I7
+    I7 --> SHIP
 
     classDef now fill:#eaf2fa,stroke:#14406f,stroke-width:3px,color:#0d2b4d
     classDef gated fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px,color:#1b5e20
     classDef stop fill:#fdecea,stroke:#a01b1b,stroke-width:3px,color:#6b1111
     classDef legend fill:#f5f5f5,stroke:#616161,stroke-width:2px,color:#212121
 
-    class I3,I2,I1 now
+    class I2,I3,I1 now
     class I4,I5,I6,I7,SHIP gated
     class STOP stop
     class KEY legend
@@ -291,17 +347,17 @@ flowchart TD
 ## What this does not decide
 
 - The Windows Network tier's shape (Decision §6, left open for the spike).
-- AppContainer versus LPAC. The spike measures what Git needs; LPAC is preferred
-  if Git runs in it, because it grants less by default.
+- AppContainer versus LPAC. LPAC is preferred because it withholds the regular
+  AppContainer defaults; the spike measures whether Git runs in it.
 - macOS. #367's non-Windows scope is untouched.
 
 ## Evidence and its limits
 
 Nothing in this record has been run on Windows. The server source citations
-(`main.rs:223`, `capabilities.rs:140`, `probe.rs:320`, `trust.rs:58`) were
-re-read on `main` at `30bbd565`. The Windows mechanism statements quote
-Microsoft's documentation, fetched 2026-09-25; they describe documented
-behavior, not measured behavior. The spike (work item 1) is where they become
-measurements.
+(`main.rs:223`, `sandbox/mod.rs:230` and `:891`, `capabilities.rs:140`,
+`probe.rs:320`, `trust.rs:58`) were re-read on `main` at `30bbd565`. The Windows
+mechanism statements quote Microsoft's documentation, fetched 2026-09-25; they
+describe documented behavior, not measured behavior. The spike (work item 1) is
+where they become measurements.
 
-**Signed:** max · 2026-09-25T22:40:00-04:00
+**Signed:** max · 2026-09-25T22:55:00-04:00
