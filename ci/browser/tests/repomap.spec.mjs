@@ -39,14 +39,16 @@ test.describe('#380 mindmap repo picker', () => {
     // hook-policy disclosure line; count via the row container's buttons
     // minus the action buttons). Simplest honest proxy: the picker rows are
     // the buttons inside the scroll region before toggling.
-    const listButtons = await page
+    const rows = page
       .locator('div[style*="overflow-y:auto"] button')
       .filter({ hasNotText: /^Delete$/ })
-      .count()
+
+    // The heading paints while the catalog is still loading (#879). Wait for
+    // a row from the catalog's single render before taking the list count.
+    await expect(rows.filter({ hasText: /fixture-repo/ })).toBeVisible()
+    const listButtons = await rows.count()
 
     await page.getByRole('button', { name: 'View: list' }).click()
-    const leaves = await page.locator('.repomap-leaf').count()
-
-    expect(leaves).toBe(listButtons)
+    await expect(page.locator('.repomap-leaf')).toHaveCount(listButtons)
   })
 })
