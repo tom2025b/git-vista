@@ -29,12 +29,20 @@ as hostile. On Linux it runs inside one of three tiers (ADR 0030), chosen by
 - **Strict**, for local operations on untrusted repositories:
   - **Network:** none. It runs in a fresh network namespace.
   - **Writes:** the repository and `/dev` only.
-  - **Reads:** the system trees (`/usr`, `/bin`, `/lib`, `/lib64`, `/etc`,
-    `/proc`) and `$HOME`, **except** a withheld list of credential paths
+  - **Read and execute:** the system trees (`/usr`, `/bin`, `/lib`, `/lib64`,
+    `/etc`), a fresh `/proc` for the sandbox's own pid namespace (not the
+    host's), and `$HOME`, **except** a withheld list of credential paths
     (`DEFAULT_SECRET_EXCLUDES`, `sandbox/mod.rs:230`). That list includes
     `.ssh`, `.config/gh`, `.aws`, `.netrc`, `.git-credentials`, `.gnupg`,
     `.docker`, `.kube` and browser profiles. Home stays readable because Git
     reads `~/.gitconfig` (ADR 0030).
+  - **The trust store is withheld even from the write grant.** `policy_for`
+    adds the sandbox trust directory (`state::sandbox_trust_dir()`) to the
+    excludes (`sandbox/mod.rs:1125-1128`). An exclude outranks a grant, so the
+    trust store stays out of reach even when the served repository tree
+    contains it. Without that, a hostile hook could write its own trust marker,
+    and the next operation on that repository would run Unsandboxed
+    (`sandbox/mod.rs:1098-1117`; ADR 0030 §3).
   - **Local sockets:** `AF_UNIX` is denied by seccomp (`SECURITY_MODEL.md`,
     *Sandbox Mechanism Boundaries*).
 - **Network**, for remote operations: Landlock allows TCP only on an
@@ -71,7 +79,7 @@ config:
 flowchart TD
     OP["<b>A git operation</b><br/>runs repository-controlled code:<br/>hooks, filters, configured executables"]
     TIER{"<b>tier_for(need, trusted)</b><br/>sandbox/mod.rs:891"}
-    STRICT["<b>Strict</b><br/>no network, writes: repo + /dev only,<br/>reads: system + home MINUS withheld secrets,<br/>AF_UNIX denied by seccomp"]
+    STRICT["<b>Strict</b><br/>no network, writes: repo + /dev only,<br/>reads: system + home MINUS withheld secrets,<br/>trust store withheld even from writes,<br/>AF_UNIX denied by seccomp"]
     NET["<b>Network</b><br/>Landlock TCP port list, ADR 0028<br/>ports, never hosts"]
     UNS["<b>Unsandboxed</b><br/>only via persisted trust,<br/>trust::grant is test-only today"]
     GATE["<b>Boot gate, main.rs:223</b><br/>any verdict but Contained:<br/>exit 1 before listening"]
@@ -125,15 +133,20 @@ flowchart TD
    Before any Windows backend is built, measure on a real Windows box whether Git
    for Windows can run inside an AppContainer or Less-Privileged AppContainer
    (LPAC) token whose grants **translate Strict's shape** (context, above):
-   - **Writes:** the repository only.
+   - **Writes:** the repository only. Linux also grants `/dev`, which has no
+     direct Windows counterpart. Whatever null-device access Git's runtime needs
+     on Windows is measured by the spike, not assumed.
    - **Read and execute:** Git's install directory and the system directories
      Git needs.
-   - **Reads:** the user profile, except the Windows equivalents of every path in
-     `DEFAULT_SECRET_EXCLUDES`, and except Windows Credential Manager.
+   - **Read and execute:** the user profile, **except** the Windows equivalents
+     of every path in `DEFAULT_SECRET_EXCLUDES`, and except Windows Credential
+     Manager.
+   - **Withheld even from the write grant: the sandbox trust directory.** It
+     stays out of reach even when it lies inside the repository tree, and the
+     withholding must outrank the write grant, exactly as it does on Linux.
    - **Network:** no network capability at all.
-   - **Local IPC:** Linux denies `AF_UNIX`, and the spike reports what local IPC
-     the container can open (`AF_UNIX` exists on current Windows; so do named
-     pipes).
+   - **Local IPC:** denied. Linux denies `AF_UNIX`; on Windows the equivalents
+     include `AF_UNIX` sockets and named pipes to host services.
 
    The spike must prove **both** halves:
 
@@ -148,7 +161,12 @@ flowchart TD
      - a network connection;
      - a credential-helper or Credential Manager read that would return a stored
        credential;
-     - a write outside the repository.
+     - a write outside the repository;
+     - a write into the sandbox trust directory, **including when it lies inside
+       the repository tree** (the Linux trust-marker bypass this exclude exists
+       to stop);
+     - a connection to a host service over local IPC (an `AF_UNIX` socket or a
+       named pipe).
 
      Microsoft documents that a regular AppContainer is already granted access to
      *"certain system files/directories, common registry keys and COM objects"*,
@@ -212,7 +230,7 @@ config:
     wrappingWidth: 460
 ---
 flowchart TD
-    LS["<b>Linux Strict</b><br/>no network, writes: repo only,<br/>reads: system + home minus secrets,<br/>AF_UNIX denied"]
+    LS["<b>Linux Strict</b><br/>no network, writes: repo + /dev,<br/>reads: system + home minus secrets,<br/>trust store withheld, AF_UNIX denied"]
     LN["<b>Linux Network</b><br/>TCP on enumerated ports only"]
     LR["<b>Linux reaper</b><br/>gv-sandbox-reaper"]
     WS["<b>Windows Strict candidate</b><br/>LPAC preferred, no network capability,<br/>DACL grants translating Strict's shape"]
@@ -302,7 +320,10 @@ cite it. Items 2 and 3 can start now; the spike gates items 4 to 7.
 6. **Windows Network tier decision:** back to Tom if it is weaker than Linux.
 7. **Boot probe, per-operation refusal, and escape battery:** behavioral probes
    that prove every denial in Decision §5, at boot and per operation, replacing
-   the Linux capability checks.
+   the Linux capability checks. The spike's list is the minimum feasibility
+   gate, not the whole bar: the escape battery must cover every Strict layer
+   ADR 0030 §6 records, so that "no more than Strict" is something the tests
+   actually measure.
 
 The Windows server may start only when item 7 passes. The diagram at the end of
 this section shows the order and where the stop conditions sit.
@@ -354,7 +375,7 @@ flowchart TD
 ## Evidence and its limits
 
 Nothing in this record has been run on Windows. The server source citations
-(`main.rs:223`, `sandbox/mod.rs:230` and `:891`, `capabilities.rs:140`,
+(`main.rs:223`, `sandbox/mod.rs:230`, `:891` and `:1098-1128`, `capabilities.rs:140`,
 `probe.rs:320`, `trust.rs:58`) were re-read on `main` at `30bbd565`. The Windows
 mechanism statements quote Microsoft's documentation, fetched 2026-09-25; they
 describe documented behavior, not measured behavior. The spike (work item 1) is
