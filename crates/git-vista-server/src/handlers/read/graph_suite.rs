@@ -48,6 +48,99 @@ fn out(repo: &Path, args: &[&str]) -> String {
 
 // ---- exact remote reachability for one commit (M1.10, #63) ---------------
 
+/// Explicit Frame and page selectors retain identity even when history tokens
+/// cannot distinguish the selected repositories. Drive the actual extractors.
+#[tokio::test]
+async fn explicit_frame_and_pages_stay_on_target_after_same_history_selection_switch() {
+    crate::state::with_isolated_test_current(async {
+        let dir = tempfile::tempdir().unwrap();
+        let x = deterministic_repo(dir.path(), "bound-x", 3);
+        let y = deterministic_repo(dir.path(), "selected-y", 3);
+        let hx = crate::state::set_current(&x, git_vista_protocol::RepoMode::Active).unwrap();
+        let hy = crate::state::set_current(&y, git_vista_protocol::RepoMode::Active).unwrap();
+        assert!(crate::state::select_registered(
+            hx.worktree,
+            git_vista_protocol::RepoMode::Active
+        ));
+        let app = Router::new()
+            .route("/api/frame", get(frame))
+            .route("/api/commits", get(commits))
+            .layer(Extension(Arc::new(history_codec())));
+        let request = |uri: String| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let first = request(format!("/api/commits?repo={}&limit=1", hx.worktree)).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first: Page = serde_json::from_slice(
+            &axum::body::to_bytes(first.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let cursor = first.cursor.as_ref().expect("fixture has another page");
+
+        assert!(crate::state::select_registered(
+            hy.worktree,
+            git_vista_protocol::RepoMode::Active
+        ));
+        let pinned = request(format!("/api/frame?repo={}", hx.worktree)).await;
+        assert_eq!(pinned.status(), StatusCode::OK);
+        let pinned: Frame = serde_json::from_slice(
+            &axum::body::to_bytes(pinned.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let default = request("/api/frame".into()).await;
+        assert_eq!(default.status(), StatusCode::OK);
+        let default: Frame = serde_json::from_slice(
+            &axum::body::to_bytes(default.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pinned.generation, default.generation, "identical history");
+        assert_eq!(pinned.worktree_id, Some(hx.worktree.to_string()));
+        assert_eq!(default.worktree_id, Some(hy.worktree.to_string()));
+
+        let append = request(format!(
+            "/api/commits?repo={}&limit=1&cursor={cursor}",
+            hx.worktree
+        ))
+        .await;
+        assert_eq!(append.status(), StatusCode::OK, "X cursor still reads X");
+        let append: Page = serde_json::from_slice(
+            &axum::body::to_bytes(append.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(append.generation, first.generation);
+        assert_eq!(append.rows[0].row, 1);
+        let foreign = request(format!(
+            "/api/commits?repo={}&limit=1&cursor={cursor}",
+            hy.worktree
+        ))
+        .await;
+        assert_eq!(
+            foreign.status(),
+            StatusCode::BAD_REQUEST,
+            "equal history tokens cannot authorize X's cursor on Y"
+        );
+    })
+    .await;
+}
+
 /// A **real** repository of `count` linear commits with
 /// `refs/remotes/origin/main` at the chain tip and one further local-only
 /// commit on top. Built through a single `git fast-import` so a fixture

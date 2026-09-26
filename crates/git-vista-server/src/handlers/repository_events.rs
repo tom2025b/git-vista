@@ -32,15 +32,16 @@
 //! watcher behind an abandoned stream must not keep consuming a shared system
 //! resource.
 //!
-//! # The stream ends when the session selects a different repository
+//! # Explicit bindings survive changes to the session selection
 //!
-//! A feed is bound to one worktree, and the session can select another at any
-//! moment. A stream that kept publishing the old repository's generation would
-//! be answering a freshness question about a repository nobody is looking at,
-//! *confidently* — which is worse than not answering. So the loop re-reads the
-//! session's selection and closes when it has moved; the client reconnects,
-//! discards the log it can no longer difference against, and starts again on
-//! the new repository.
+//! `?repo=<worktree-id>` resolves a registered worktree once, in the handler.
+//! That connection continues describing that worktree even when another tab
+//! changes the shared session selection. Reconnection resolves the selector
+//! again, failing closed if it is no longer registered (ADR 0150).
+//!
+//! Without a selector, retain the legacy contract: close when the session
+//! selection moves, so the client's next connection follows its new default.
+//! Neither kind of connection can switch repositories while it is open.
 //!
 //! # Registered with the reads
 //!
@@ -52,6 +53,7 @@
 use std::convert::Infallible;
 use std::time::Duration;
 
+use axum::extract::Query;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -81,14 +83,17 @@ const MAX_STREAM_LIFETIME: Duration = Duration::from_secs(30 * 60);
 /// cost worth a mechanism.
 const SELECTION_CHECK: Duration = Duration::from_secs(1);
 
-/// `GET /api/repository/events` — the change feed for the current selection.
+/// `GET /api/repository/events` — a bound feed, or the legacy selection feed.
 ///
 /// The first event is the *current* snapshot rather than the next change, so a
 /// client that connects late — or reconnects after a suspension — gets an
 /// immediate answer instead of sitting at "couldn't tell" until something
 /// moves.
-pub(crate) async fn repository_events() -> Response {
-    let (repo, _) = crate::state::current();
+pub(crate) async fn repository_events(Query(query): Query<super::read::RepoQuery>) -> Response {
+    let (repo, _, _) = match super::read::resolve_repo(query.repo.as_deref()) {
+        Ok(target) => target,
+        Err(error) => return error.into_response(),
+    };
     let Some(permit) = operations::StreamPermit::acquire() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -101,11 +106,15 @@ pub(crate) async fn repository_events() -> Response {
     // watcher and releases its inotify watches.
     let feed = reconciliation::attach(&repo);
     let mut snapshots = feed.subscribe();
-    // Captured here, in the handler, while the request's selection scope is
+    // Only legacy connections follow the session. Captured here, in the
+    // handler, while the request's selection scope is
     // still on the task. The stream body below is polled by the response
     // writer, outside that scope — a capture attempted down there would find
     // nothing and silently pin the launch selection.
-    let selection = crate::state::SelectionReader::capture();
+    let selection = query
+        .repo
+        .is_none()
+        .then(crate::state::SelectionReader::capture);
 
     let stream = async_stream::stream! {
         let _permit = permit;
@@ -113,7 +122,9 @@ pub(crate) async fn repository_events() -> Response {
         let deadline = tokio::time::Instant::now() + MAX_STREAM_LIFETIME;
         let mut sent: Option<ChangeFeedSnapshot> = None;
         loop {
-            if selection.path().as_deref() != Some(repo.as_path()) {
+            if selection.as_ref().is_some_and(|selection| {
+                selection.path().as_deref() != Some(repo.as_path())
+            }) {
                 break;
             }
             let current = snapshots.borrow_and_update().clone();
@@ -156,3 +167,7 @@ pub(crate) async fn repository_events() -> Response {
         .keep_alive(KeepAlive::new().interval(HEARTBEAT))
         .into_response()
 }
+
+#[cfg(test)]
+#[path = "repository_events/binding_suite.rs"]
+mod binding_suite;
