@@ -527,6 +527,79 @@ fn selected_candidate_does_not_own_status_until_frame_and_page_are_accepted() {
 }
 
 #[test]
+fn live_stage_binding_always_names_the_accepted_status_worktree() {
+    // Public transitions only: never manufacture a Bound/accepted mismatch by
+    // editing private fields. Stage completion relies on this API invariant.
+    // Equality is exercised for accepted/reloaded/restored live targets;
+    // explicit is_none assertions cover transitions without a live binding.
+    let check = |graph: &GraphCore| {
+        if let Some(binding) = graph.live_binding() {
+            assert_eq!(
+                graph.status_target().as_deref(),
+                Some(binding.worktree.as_str()),
+                "a usable live Stage binding must name the accepted status target"
+            );
+        }
+    };
+    let mut graph = GraphCore::default();
+    check(&graph);
+    assert!(graph.live_binding().is_none());
+    let x = frame(Some(X));
+    graph
+        .accept_seed(&graph.seed_request(), &x, &x.generation)
+        .unwrap();
+    check(&graph);
+    graph.force_bump_for_feed(&graph.binding().unwrap(), Some(&gen("feed")));
+    check(&graph);
+    graph.force_bump();
+    check(&graph);
+
+    let selection = graph.begin_selection();
+    assert!(
+        graph.live_binding().is_none(),
+        "Selecting cannot authorize a Stage refetch"
+    );
+    check(&graph);
+    graph.finish_selection(selection, Some(Y));
+    assert!(
+        graph.live_binding().is_none(),
+        "Candidate is a seed target, not an admitted callback target"
+    );
+    check(&graph);
+    let y = frame(Some(Y));
+    let request = graph.seed_request();
+    assert!(graph.accept_seed(&request, &y, &gen("wrong-page")).is_err());
+    assert!(graph.live_binding().is_none());
+    check(&graph);
+    graph.accept_seed(&request, &y, &y.generation).unwrap();
+    check(&graph);
+
+    let failed = graph.begin_selection();
+    graph.finish_selection(failed, None);
+    assert_eq!(graph.live_binding().unwrap().worktree, Y);
+    check(&graph); // Revision changes, accepted worktree identity does not.
+    graph.show_as_of("observation".into(), 123, Some(X.into()));
+    assert!(graph.live_binding().is_none());
+    check(&graph);
+    graph
+        .accept_seed(&graph.seed_request(), &x, &x.generation)
+        .unwrap();
+    assert!(graph.live_binding().is_none());
+    check(&graph);
+    graph.return_to_live();
+    assert_eq!(graph.live_binding().unwrap().worktree, X);
+    check(&graph);
+
+    let mut degraded = GraphCore::default();
+    let anonymous = frame(None);
+    degraded
+        .accept_seed(&degraded.seed_request(), &anonymous, &anonymous.generation)
+        .unwrap();
+    assert!(degraded.live_binding().is_none());
+    check(&degraded);
+}
+
+#[test]
 fn absent_empty_and_invalid_identity_disable_following_and_refresh_discovery() {
     for id in [None, Some(""), Some("/some/path"), Some("not-an-id")] {
         let mut graph = GraphCore::default();

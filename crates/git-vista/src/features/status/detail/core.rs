@@ -78,9 +78,14 @@ impl StageState {
         if owns_busy {
             self.active = None;
         }
-        let refetch = owns_busy
-            && ticket.matches(graph)
-            && graph.status_target().as_deref() == Some(ticket.binding.worktree.as_str());
+        // A live binding always names the accepted status worktree. Of the
+        // three Bound construction sites, two are in accept_seed, which also
+        // installs accepted_binding; the third restores the accepted worktree
+        // after failed selection. Selecting and Candidate expose no live
+        // binding. Any new Bound constructor must preserve this invariant.
+        // `matches` is the binding fence; a second status_target comparison
+        // adds no boundary.
+        let refetch = owns_busy && ticket.matches(graph);
         let outcome = match answer {
             Err(error) => Some(format!("failed: {error}")),
             Ok(()) if !refetch => {
