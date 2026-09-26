@@ -152,13 +152,9 @@ pub(crate) async fn refuse_if_git_busy(repo: &Path) -> Option<(StatusCode, Strin
             if !lock_path.exists() {
                 return None;
             }
-            if index_lock_is_open_by_a_live_process(&lock_path) {
-                return Some((
-                    StatusCode::CONFLICT,
-                    "Another git process is working in this repository — wait for it to \
-                     finish and try again."
-                        .to_string(),
-                ));
+            if let Some(why) = index_lock_refusal(index_lock_is_open_by_a_live_process(&lock_path))
+            {
+                return Some((StatusCode::CONFLICT, why.to_string()));
             }
             // Verified stale: nothing has this file open. Whatever wrote it
             // died before renaming it onto `index` (success) or unlinking it
@@ -174,12 +170,36 @@ pub(crate) async fn refuse_if_git_busy(repo: &Path) -> Option<(StatusCode, Strin
     }
 }
 
+/// Only a confirmed absence of a holder permits removal. Unknown is not a
+/// claim that another process is live, and must preserve the lock just as a
+/// live holder does. Keep this decision independent of the host's probe.
+fn index_lock_refusal(live: Option<bool>) -> Option<&'static str> {
+    match live {
+        Some(false) => None,
+        Some(true) => Some(
+            "Another git process is working in this repository — wait for it to \
+             finish and try again.",
+        ),
+        None => Some(
+            "Cannot determine whether another git process holds this repository's \
+             index.lock on this platform — the lock has been left in place.",
+        ),
+    }
+}
+
+/// There is no supported non-Unix holder probe. In particular, Windows must
+/// never translate the absence of /proc and inode facts into a stale lock.
+#[cfg(not(unix))]
+fn index_lock_is_open_by_a_live_process(_path: &Path) -> Option<bool> {
+    None
+}
+
 /// Whether any process on this host currently holds `path` open — the
 /// liveness check [`refuse_if_git_busy`] needs to tell a live `index.lock`
 /// from an orphaned one.
 ///
-/// Linux-only (this server has no non-Linux target; see the sandbox shim's
-/// own landlock/seccomp dependencies): walks `/proc/<pid>/fd`, comparing each
+/// Unix probe (the server runs only on Linux; ADR 0152): walks
+/// `/proc/<pid>/fd`, comparing each
 /// open fd's `(device, inode)` against `path`'s — not the fd's path string,
 /// because a held lock's directory entry is exactly the thing that can be
 /// removed and recreated by an unrelated process while the original file (and
@@ -191,20 +211,20 @@ pub(crate) async fn refuse_if_git_busy(repo: &Path) -> Option<(StatusCode, Strin
 /// either way for that one process — skipped, not counted as "not holding
 /// it". Only two things are genuinely fail-safe: unable to `stat` `path`
 /// itself, or unable to enumerate `/proc` at all — both mean this check
-/// cannot be trusted, so both answer `true` (assume live) rather than risk
+/// cannot be trusted, so both answer `Some(true)` (assume live) rather than risk
 /// declaring a real in-progress write stale.
 #[cfg(unix)]
-fn index_lock_is_open_by_a_live_process(path: &Path) -> bool {
+fn index_lock_is_open_by_a_live_process(path: &Path) -> Option<bool> {
     use std::os::unix::fs::MetadataExt;
 
     let target = match std::fs::metadata(path) {
         Ok(m) => (m.dev(), m.ino()),
-        Err(_) => return true,
+        Err(_) => return Some(true),
     };
 
     let proc_dir = match std::fs::read_dir("/proc") {
         Ok(d) => d,
-        Err(_) => return true,
+        Err(_) => return Some(true),
     };
 
     for pid_entry in proc_dir.flatten() {
@@ -225,13 +245,13 @@ fn index_lock_is_open_by_a_live_process(path: &Path) -> bool {
         for fd_entry in fd_dir.flatten() {
             if let Ok(meta) = std::fs::metadata(fd_entry.path()) {
                 if (meta.dev(), meta.ino()) == target {
-                    return true;
+                    return Some(true);
                 }
             }
         }
     }
 
-    false
+    Some(false)
 }
 
 /// This worktree's own git directory, absolute.
@@ -517,6 +537,11 @@ mod tests {
     /// stages surface git's error for it, unchanged.
     #[tokio::test]
     async fn a_path_that_is_not_a_repository_is_not_reported_busy() {
+        assert!(index_lock_refusal(Some(false)).is_none());
+        assert!(index_lock_refusal(Some(true)).is_some());
+        let unknown = index_lock_refusal(None).expect("unknown must refuse lock removal");
+        assert!(unknown.contains("Cannot determine"), "{unknown}");
+        assert!(unknown.contains("left in place"), "{unknown}");
         let dir = tempfile::tempdir().unwrap();
         assert!(refuse_if_git_busy(dir.path()).await.is_none());
     }

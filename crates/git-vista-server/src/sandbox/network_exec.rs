@@ -787,6 +787,7 @@ mod tests {
     /// `the_wrapper_argv_is_the_sandbox_argv_plus_the_repo_and_args`, one
     /// layer up.
     #[tokio::test]
+    #[cfg(unix)]
     async fn network_command_pins_every_fixed_selector_and_the_transport_program() {
         let repo = fixture().await;
         let policy = production_policy(repo.path());
@@ -865,6 +866,7 @@ mod tests {
     /// composition code the function under test uses. Written inside `repo`
     /// (an already rw-granted tree) rather than a fresh tempdir, since a
     /// path outside every grant this policy makes cannot be exec'd at all.
+    #[cfg(unix)]
     fn which_dumper(repo: &Path) -> String {
         let dir = repo.join("fake-bin");
         std::fs::create_dir_all(&dir).expect("mkdir fake-bin");
@@ -893,6 +895,7 @@ mod tests {
     /// acceptance criterion names explicitly — the OS-level view, not this
     /// crate's own bookkeeping of what it intended to pass), and the
     /// environment.
+    #[cfg(unix)]
     fn credential_probe_dumper(repo: &Path) -> String {
         let dir = repo.join("fake-bin-cred");
         std::fs::create_dir_all(&dir).expect("mkdir fake-bin-cred");
@@ -942,6 +945,7 @@ mod tests {
     /// which reads the composed command instead of a spawned child, because
     /// the spawn's environment is exactly what this harness overwrites.
     #[tokio::test]
+    #[cfg(unix)]
     async fn a_supplied_token_reaches_the_helpers_environment_and_never_the_processs_own_argv() {
         const CANARY: &str = "gv-test-canary-token-should-never-appear-in-argv-8f2c";
 
@@ -1051,6 +1055,7 @@ mod tests {
     /// existing Remote-tier caller that has no token to offer gets exactly the
     /// base harness's deliberate helper reset and nothing credential-bearing.
     #[tokio::test]
+    #[cfg(unix)]
     async fn no_token_is_byte_identical_to_plain_network_command() {
         let repo = fixture().await;
         let policy = production_policy(repo.path());
@@ -1436,6 +1441,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn untrusted_checkout_output_never_exposes_an_lfs_action_query() {
         let repo = fixture().await;
         let bin_dir = repo.path().join("query-redaction-bin");
@@ -1533,7 +1539,7 @@ where
 /// makes, for the same reason: see that module's doc comment. Kept in its
 /// own `#[cfg(test)]` module (rather than folded into the pure-unit `tests`
 /// module above) because everything here spawns real processes.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod https_suite {
     use super::super::{
         default_system_trees, secret_excludes_for_home, shim, ssh_known_hosts_carveout, HookMode,
