@@ -300,6 +300,42 @@ fn stage_older_serial_cannot_refetch_or_clear_newer_action_on_same_desk() {
 }
 
 #[test]
+fn foreign_stage_ticket_cannot_consume_a_different_stores_pending_record() {
+    use crate::features::status::detail::core::StageState;
+    // Public API boundary, not a currently reachable App ordering: App owns
+    // one store. Per-mount replacement that routes an old reply to a new store
+    // could reuse a serial with a different context. Each fresh store here
+    // mints its first serial; the ticket contexts differ. This does not claim
+    // full-value equality distinguishes owners with identical ticket values.
+    let mut graph = bound();
+    let mut other_store = StageState::default();
+    let foreign = other_store.begin(&graph, Some("X")).unwrap();
+    let selection = graph.begin_selection();
+    graph.finish_selection(selection, Some(Y));
+    let y = frame(Some(Y));
+    graph
+        .accept_seed(&graph.seed_request(), &y, &y.generation)
+        .unwrap();
+    let mut current_store = StageState::default();
+    let current = current_store.begin(&graph, Some("Y")).unwrap();
+
+    assert!(!current_store.complete(&foreign, &graph, &Err("foreign failure".into())));
+    assert!(
+        current_store.busy(&graph),
+        "foreign ticket cannot release our busy state"
+    );
+    assert!(
+        current_store.complete(&current, &graph, &Ok(())),
+        "foreign same-serial ticket must not consume the actual pending record"
+    );
+    assert!(
+        current_store.notices().is_empty(),
+        "foreign ticket must not publish an outcome in this store"
+    );
+    assert!(!current_store.busy(&graph));
+}
+
+#[test]
 fn binding_requires_both_current_frame_and_matching_first_page() {
     let mut graph = GraphCore::default();
     let discovery = graph.seed_request();

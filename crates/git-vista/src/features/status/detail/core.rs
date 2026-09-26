@@ -70,6 +70,13 @@ impl StageState {
         graph: &GraphCore,
         answer: &Result<(), String>,
     ) -> bool {
+        // Serials are unique within the App-owned store. Keep the full-value
+        // check before destructive removal as a defensive API boundary: a
+        // ticket from another store can reuse a serial with a different
+        // binding/context and must not consume our pending record. This is
+        // not an owner-incarnation token (identical values can still match),
+        // and does not replace App-lifetime ownership. `owns_busy` below is
+        // the separate guard against an older action clearing newer state.
         if self.pending.get(&ticket.serial) != Some(ticket) {
             return false;
         }
