@@ -831,6 +831,163 @@ with socket.socket() as listener:
         }
     }
 
+    // last_edited_by: codex
+    // **Signed:** codex · 2026-09-26T22:05:01-04:00
+    /// #840: observe execution, not git-lfs's unsafe-key warning. Register the
+    /// test on every target: an unsupported runner must fail explicitly rather
+    /// than quietly compile the security evidence out of the suite.
+    #[tokio::test]
+    async fn tracked_lfsconfig_cannot_select_an_executable() {
+        #[cfg(unix)]
+        for scoped in [false, true] {
+            assert_tracked_lfsconfig_cannot_select_an_executable(scoped).await;
+        }
+        #[cfg(not(unix))]
+        panic!("#840 needs the supported Unix production checkout sandbox and real git-lfs");
+    }
+
+    #[cfg(unix)]
+    async fn assert_tracked_lfsconfig_cannot_select_an_executable(scoped: bool) {
+        use super::super::network_exec::{
+            lfs_checkout_command, network_command_without_credential, run_fixture_git,
+        };
+        use std::time::Duration;
+
+        assert_ne!(program(), GIT_LFS_UNAVAILABLE, "#840 requires real git-lfs");
+        const URL: &str = "https://127.0.0.1:1/repo.git";
+        let (clones, source) = lfs_fixture();
+        let marker = clones.path().join("tracked-selector-ran");
+        let selector = clones.path().join("tracked-selector.sh");
+        executable(
+            &selector,
+            &format!("#!/bin/sh\nprintf RAN > '{}'\nexit 73\n", marker.display()),
+        );
+        let section = if scoped {
+            format!("[lfs \"{}\"]", endpoint(URL))
+        } else {
+            "[lfs]".to_string()
+        };
+        let config = format!(
+            "{section}\n\tstandalonetransferagent = gv840\n\
+             [lfs \"customtransfer.gv840\"]\n\tpath = {}\n\tconcurrent = false\n",
+            selector.display()
+        );
+        std::fs::write(source.join(".lfsconfig"), &config).unwrap();
+        run_fixture_git(&source, ["add", ".lfsconfig"]);
+        run_fixture_git(&source, ["commit", "-qm", "tracked executable selector"]);
+        assert!(
+            !marker.exists(),
+            "fixture add must not run the transfer selector"
+        );
+        let policy = super::super::policy_for_clone_checkout(clones.path()).unwrap();
+
+        // Cover ordinary materialisation and the missing-object transfer path.
+        // Each clone carries the actual committed .lfsconfig; it is not merely
+        // repository-local config standing in for a fetched file.
+        for cached in [true, false] {
+            let dest = if cached {
+                clone_with_cached_lfs_object(clones.path(), &source, "tracked-cached")
+            } else {
+                clone_without_lfs_object(clones.path(), &source, "tracked-missing")
+            };
+            assert!(!marker.exists(), "no-checkout transfer ran the selector");
+            let output = tokio::time::timeout(
+                Duration::from_secs(20),
+                lfs_checkout_command(&policy, &dest, URL)
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .expect("tracked checkout completes")
+            .expect("tracked checkout starts");
+            assert_eq!(
+                output.status.success(),
+                cached,
+                "unexpected checkout result: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                std::fs::read_to_string(dest.join(".lfsconfig")).unwrap(),
+                config,
+                "the hostile config must really be materialised"
+            );
+            assert!(
+                !marker.exists(),
+                "tracked .lfsconfig selected an executable (scoped={scoped}, cached={cached})"
+            );
+            if cached {
+                assert_eq!(
+                    std::fs::read(dest.join("asset.bin")).unwrap(),
+                    b"materialised LFS bytes\0\xff\n"
+                );
+            } else {
+                assert!(
+                    !dest.join("asset.bin").exists(),
+                    "failed checkout left a pointer"
+                );
+            }
+        }
+
+        // Model upstream admitting these same tracked keys: include the fetched
+        // file as local config. This separately pins Git-Vista's command-line
+        // resets, so git-lfs's current denylist cannot mask a reset regression.
+        // A positive control under the SAME sandbox proves the executable and
+        // marker are reachable; a denied exec/write cannot masquerade as safety.
+        for guarded in [true, false] {
+            let name = if guarded {
+                "admitted-guarded"
+            } else {
+                "admitted-control"
+            };
+            let dest = clone_without_lfs_object(clones.path(), &source, name);
+            std::fs::write(dest.join(".lfsconfig"), &config).unwrap();
+            run_fixture_git(&dest, ["config", "include.path", "../.lfsconfig"]);
+            let command = if guarded {
+                lfs_checkout_command(&policy, &dest, URL)
+            } else {
+                let args = [
+                    "-c".to_string(),
+                    format!("filter.lfs.process={} filter-process", program()),
+                    "-c".to_string(),
+                    format!("filter.lfs.smudge={} smudge", program()),
+                    "-c".to_string(),
+                    "filter.lfs.required=true".to_string(),
+                    // Keep basic-only restrictions in the positive control:
+                    // the standalone-selector resets are the mechanism at risk.
+                    "-c".to_string(),
+                    "lfs.basictransfersonly=true".to_string(),
+                    "-c".to_string(),
+                    format!("lfs.{}.basictransfersonly=true", endpoint(URL)),
+                    "-c".to_string(),
+                    format!("lfs.url={}", endpoint(URL)),
+                    "checkout".to_string(),
+                    "-f".to_string(),
+                ];
+                let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                network_command_without_credential(&policy, &dest, &refs)
+            };
+            let output =
+                tokio::time::timeout(Duration::from_secs(20), command.kill_on_drop(true).output())
+                    .await
+                    .expect("admitted-key checkout completes")
+                    .expect("admitted-key checkout starts");
+            assert!(
+                !output.status.success(),
+                "absent object / failing selector must fail checkout"
+            );
+            assert_eq!(
+                marker.exists(),
+                !guarded,
+                "selector effect differs from expected (scoped={scoped}, guarded={guarded}): {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                !dest.join("asset.bin").exists(),
+                "failed checkout left a pointer"
+            );
+        }
+    }
+
     /// Retained #782 measurement: extensions have no transfer consumer under
     /// `clone --no-checkout`, but the same configured clean and smudge commands
     /// execute during add and checkout respectively.
