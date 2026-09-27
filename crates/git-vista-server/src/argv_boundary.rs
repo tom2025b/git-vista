@@ -139,7 +139,9 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // local source repository and select its tracked post-checkout hook for
     // the permanent clone credential-containment canary. Production clone
     // still goes through `network_exec`'s sealed command builders; no handler
-    // constructs or appends a raw git argv.
+    // constructs or appends a raw git argv. #837 also self-spawns the test
+    // binary for stdout/stderr capture; the narrow exception below pins that
+    // executable and confines both self-spawn sites to diagnostic_suite.
     "src/handlers/clone.rs",
     // #836: cfg(test)-only OpenSSL/Python fixture. The real git-lfs integration test
     // needs an HTTPS batch response that directly advertises a plaintext
@@ -623,6 +625,24 @@ fn every_process_spawn_site_is_allowlisted_and_spawns_only_git() {
                 assert!(
                     include_str!("planner.rs").contains("#[cfg(test)]\nmod couldnt_run_suite;"),
                     "the self-spawning flag probe must remain test-only"
+                );
+            } else if rel == "src/handlers/clone.rs" {
+                // last_edited_by: codex
+                // **Signed:** codex · 2026-09-26T22:10:45-04:00
+                let self_test = [&spawn, "std::env::current_exe().unwrap())"].concat();
+                // last_edited_by: codex
+                // **Signed:** codex · 2026-09-26T22:44:02-04:00
+                let diagnostic_module = text
+                    .find("#[cfg(test)]\nmod diagnostic_suite {")
+                    .expect("the diagnostic subprocess fixture must remain test-only");
+                assert_eq!(text.matches(&self_test).count(), 2);
+                assert_eq!(text[diagnostic_module..].matches(&spawn_git).count(), 1);
+                assert_eq!(text[diagnostic_module..].matches(&spawn).count(), 3);
+                assert_eq!(text[diagnostic_module..].matches(&self_test).count(), 2);
+                assert_eq!(
+                    text.matches(&spawn_git).count() + 2,
+                    hits,
+                    "clone may spawn only literal git fixtures or its own test binary"
                 );
             } else if rel == "src/sandbox/lfs.rs" {
                 let spawn_openssl = [&spawn, "\"openssl\")"].concat();

@@ -51,6 +51,18 @@ use crate::state::{
 
 mod private_repo;
 
+// All clone diagnostics cross this boundary, including errors that may echo a URL.
+// last_edited_by: codex
+// **Signed:** codex · 2026-09-26T22:05:01-04:00
+macro_rules! clone_log {
+    (out, $($args:tt)*) => {
+        println!("{}", crate::sandbox::network_exec::redact_url_userinfo(&format!($($args)*)))
+    };
+    (err, $($args:tt)*) => {
+        eprintln!("{}", crate::sandbox::network_exec::redact_url_userinfo(&format!($($args)*)))
+    };
+}
+
 /// A human-recognisable directory name for a clone of `url` — the URL's last
 /// path segment, minus any `.git` suffix, restricted to safe filename
 /// characters. `None` when nothing usable survives (the caller falls back to a
@@ -806,7 +818,8 @@ async fn run_clone(req: CloneRequest) -> Result<Json<RepositoryDescriptor>, (Sta
 
     let root = clones_root();
     if let Err(e) = std::fs::create_dir_all(&root) {
-        eprintln!(
+        clone_log!(
+            err,
             "git-vista: /api/clone couldn't create {}: {e}",
             root.display()
         );
@@ -835,8 +848,6 @@ async fn run_clone(req: CloneRequest) -> Result<Json<RepositoryDescriptor>, (Sta
         }
     };
 
-    let redacted_url = crate::sandbox::network_exec::redact_url_userinfo(&url);
-    println!("[/api/clone] cloning {redacted_url} → {}", dest.display());
     // D4 (#66, Task 7/D2): clone's own dedicated policy constructor, not the
     // general-purpose `sandbox::policy_for` other git spawns go through.
     //
@@ -898,7 +909,10 @@ async fn run_clone(req: CloneRequest) -> Result<Json<RepositoryDescriptor>, (Sta
             let checkout_policy = match crate::sandbox::policy_for_clone_checkout(&root) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("git-vista: /api/clone couldn't build a checkout policy: {e}");
+                    clone_log!(
+                        err,
+                        "git-vista: /api/clone couldn't build a checkout policy: {e}"
+                    );
                     return Err((
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("Couldn't prepare the sandbox for checkout: {e}"),
@@ -913,31 +927,13 @@ async fn run_clone(req: CloneRequest) -> Result<Json<RepositoryDescriptor>, (Sta
                 &url,
                 token.as_deref(),
             );
-            match run_guarded(&dest, CLONE_TIMEOUT, execution).await {
-                Ok(()) => {}
-                Err(GuardedOutcome::Failed(error)) => {
-                    let failure = clone_execution_failure(error);
-                    eprintln!("git-vista: /api/clone failed: {}", failure.1);
-                    return Err(failure);
-                }
-                Err(GuardedOutcome::TimedOut) => {
-                    eprintln!(
-                        "git-vista: /api/clone timed out after {}s cloning {redacted_url}",
-                        CLONE_TIMEOUT.as_secs()
-                    );
-                    return Err((
-                        StatusCode::GATEWAY_TIMEOUT,
-                        format!(
-                            "The clone did not finish within {} minutes and was stopped. \
-                             The remote may be unreachable or the repository very large.",
-                            CLONE_TIMEOUT.as_secs() / 60
-                        ),
-                    ));
-                }
-            }
+            run_logged_clone(&dest, &url, CLONE_TIMEOUT, execution).await?;
         }
         Err(e) => {
-            eprintln!("git-vista: /api/clone couldn't build a sandbox policy: {e}");
+            clone_log!(
+                err,
+                "git-vista: /api/clone couldn't build a sandbox policy: {e}"
+            );
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Couldn't run git: {e}"),
@@ -951,7 +947,8 @@ async fn run_clone(req: CloneRequest) -> Result<Json<RepositoryDescriptor>, (Sta
     let canonical = std::fs::canonicalize(&dest).unwrap_or_else(|_| dest.clone());
     if !path_is_allowed(&canonical) {
         cleanup_clone(&dest);
-        eprintln!(
+        clone_log!(
+            err,
             "git-vista: /api/clone destination escaped the clones root: {}",
             dest.display()
         );
@@ -971,7 +968,7 @@ async fn run_clone(req: CloneRequest) -> Result<Json<RepositoryDescriptor>, (Sta
         .and_then(|h| descriptor_for(h.worktree));
     match descriptor {
         Some(d) => {
-            println!("[/api/clone] now viewing {}", dest.display());
+            clone_log!(out, "[/api/clone] now viewing {}", dest.display());
             Ok(Json(d))
         }
         // set_current fell to degraded mode (the clone didn't classify as a
@@ -980,6 +977,40 @@ async fn run_clone(req: CloneRequest) -> Result<Json<RepositoryDescriptor>, (Sta
             StatusCode::INTERNAL_SERVER_ERROR,
             "Clone finished but the repository could not be registered.".to_string(),
         )),
+    }
+}
+
+/// Keep start, child failure and deadline diagnostics on the same redacting
+/// boundary. The execution future still receives the original transfer URL.
+async fn run_logged_clone(
+    dest: &Path,
+    url: &str,
+    timeout: std::time::Duration,
+    execution: impl std::future::Future<Output = Result<(), CloneExecutionError>>,
+) -> Result<(), (StatusCode, String)> {
+    clone_log!(out, "[/api/clone] cloning {url} → {}", dest.display());
+    match run_guarded(dest, timeout, execution).await {
+        Ok(()) => Ok(()),
+        Err(GuardedOutcome::Failed(error)) => {
+            let failure = clone_execution_failure(error);
+            clone_log!(err, "git-vista: /api/clone failed: {}", failure.1);
+            Err(failure)
+        }
+        Err(GuardedOutcome::TimedOut) => {
+            clone_log!(
+                err,
+                "git-vista: /api/clone timed out after {}s cloning {url}",
+                timeout.as_secs()
+            );
+            Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                format!(
+                    "The clone did not finish within {} minutes and was stopped. \
+                     The remote may be unreachable or the repository very large.",
+                    timeout.as_secs() / 60
+                ),
+            ))
+        }
     }
 }
 
@@ -2259,5 +2290,176 @@ mod head_suite {
             git(&dest, &["rev-parse", "HEAD"]),
             git(&remote, &["rev-parse", "main"])
         );
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_suite {
+    // last_edited_by: codex
+    // **Signed:** codex · 2026-09-26T22:44:02-04:00
+    use super::*;
+
+    const CHILD: &str = "GV_TEST_CLONE_DIAGNOSTIC_CHILD";
+    const ROOT: &str = "GV_TEST_CLONE_TRANSFER_ROOT";
+
+    fn fixture_git(root: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .current_dir(root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_COUNT", "0")
+            .args(args)
+            .output()
+            .expect("fixture git starts");
+        assert!(output.status.success(), "fixture git failed: {output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    }
+    const URL: &str =
+        "https://gv837-user:gv837-password@example.invalid/repo.git?token=gv837-query";
+
+    /// Capture actual stdout/stderr, including the production start and timeout
+    /// branches; no global descriptor redirection races with other Rust tests.
+    #[test]
+    fn clone_diagnostics_never_emit_url_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        fixture_git(
+            root.path(),
+            &["init", "--bare", "--initial-branch=main", "remote.git"],
+        );
+        let config = root.path().join("transfer.gitconfig");
+        // Rewrite both forms to the same local fixture. A redaction regression
+        // still clones successfully, but Git's saved origin exposes the changed
+        // transfer argument. No remote service or real credential is involved.
+        std::fs::write(
+            &config,
+            format!(
+                "[url \"file://{}\"]\n\tinsteadOf = {URL}\n\tinsteadOf = https://example.invalid/repo.git\n",
+                root.path().join("remote.git").display()
+            ),
+        )
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "handlers::clone::diagnostic_suite::emit_clone_diagnostics_in_child",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env(ROOT, root.path())
+            .env("GIT_CONFIG_GLOBAL", &config)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_COUNT", "0")
+            .output()
+            .expect("diagnostic test subprocess starts");
+        assert!(
+            output.status.success(),
+            "diagnostic child failed: {output:?}"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(stdout.matches("[/api/clone] cloning").count(), 4);
+        assert!(stderr.contains("timed out after"));
+        assert_eq!(stderr.matches("/api/clone failed:").count(), 2);
+        for stream in [&stdout, &stderr] {
+            for secret in ["gv837-user", "gv837-password", "gv837-query", "?token="] {
+                assert!(
+                    !stream.contains(secret),
+                    "clone diagnostic exposed {secret}"
+                );
+            }
+            assert!(stream.contains("https://example.invalid/repo.git"));
+        }
+        // This is Git's result from execute_clone's actual network command,
+        // not another call to the argument helper that production could bypass.
+        assert_eq!(
+            fixture_git(
+                &root.path().join("actual-transfer"),
+                &["config", "--get", "remote.origin.url"]
+            )
+            .trim(),
+            URL,
+            "production clone transfer must receive the complete original URL"
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_clone_diagnostics_in_child() {
+        if std::env::var_os(CHILD).is_none() {
+            return;
+        }
+        let transfer_root = PathBuf::from(std::env::var_os(ROOT).expect("transfer fixture root"));
+        let transfer_dest = transfer_root.join("actual-transfer");
+        let policy = crate::sandbox::policy_for_clone(&transfer_root).expect("transfer policy");
+        let checkout_policy =
+            crate::sandbox::policy_for_clone_checkout(&transfer_root).expect("checkout policy");
+        run_logged_clone(
+            &transfer_dest,
+            URL,
+            std::time::Duration::from_secs(30),
+            execute_clone(
+                &policy,
+                &checkout_policy,
+                &transfer_root,
+                &transfer_dest,
+                URL,
+                None,
+            ),
+        )
+        .await
+        .expect("production clone of the local rewritten URL succeeds");
+
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("clone");
+        let timeout = std::time::Duration::from_millis(1);
+        let error = run_logged_clone(&dest, URL, timeout, std::future::pending()).await;
+        assert_eq!(error.unwrap_err().0, StatusCode::GATEWAY_TIMEOUT);
+        let error = CloneExecutionError::CouldntRun(std::io::Error::other(format!(
+            "transport could not start for {URL}"
+        )));
+        assert!(run_logged_clone(&dest, URL, timeout, async { Err(error) })
+            .await
+            .is_err());
+        // A synthetic failed child output makes this independent of OS exit-status
+        // encoding, while still exercising the exact production GitFailed branch.
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--invalid-gv837-test-option")
+            .output()
+            .unwrap()
+            .status;
+        assert!(!status.success());
+        let error = CloneExecutionError::GitFailed(std::process::Output {
+            status,
+            stdout: Vec::new(),
+            stderr: format!("fatal: unable to access {URL}").into_bytes(),
+        });
+        assert!(run_logged_clone(&dest, URL, timeout, async { Err(error) })
+            .await
+            .is_err());
+    }
+
+    /// Supplement the behavioral test with a boundary census: adding a raw sink
+    /// anywhere in this handler must be a deliberate review, not a quiet bypass.
+    #[test]
+    fn clone_handler_has_no_diagnostic_sinks_outside_the_redaction_boundary() {
+        let production = include_str!("clone.rs")
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("clone test-module boundary must exist")
+            .0;
+        let boundary_start = production.find("macro_rules! clone_log").unwrap();
+        let boundary_end = production[boundary_start..]
+            .find("/// A human-recognisable")
+            .unwrap()
+            + boundary_start;
+        let outside = format!(
+            "{}{}",
+            &production[..boundary_start],
+            &production[boundary_end..]
+        );
+        for sink in ["println!", "print!", "dbg!", "log::", "tracing::"] {
+            assert!(
+                !outside.contains(sink),
+                "unredacted clone diagnostic sink: {sink}"
+            );
+        }
     }
 }
