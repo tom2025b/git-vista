@@ -91,8 +91,16 @@ fn endpoint(clone_url: &str) -> String {
 /// route. `basictransfersonly` prevents a server-selected custom transfer from
 /// being advertised. That setting alone is insufficient: measured with 3.7.1,
 /// an explicit `lfs.standalonetransferagent` still executes. Both the generic
-/// and exact-URL standalone selectors are therefore reset, and the exact URL's
-/// basic-only value is pinned as well so URL-match specificity cannot outrank
+/// and exact-URL standalone selectors are therefore reset. The generic reset
+/// is independently necessary (#885): fresh clone admits `git://` URLs, whose
+/// LFS endpoint Git LFS 3.7.1 changes to `https://` before selector lookup, so
+/// the `lfs.git://...` reset does not match. The executable-marker test below
+/// pins this case. Git LFS's tracked-config denylist remains a separate layer:
+/// a selector scoped to the converted URL could outrank the generic reset if
+/// those currently unsafe keys were admitted. See upstream v3.7.1
+/// `lfsapi/endpoint_finder.go` (`endpointFromGitUrl`) and `tq/manifest.go`
+/// (`findStandaloneTransfer`). The exact URL's basic-only value is pinned
+/// as well so URL-match specificity cannot outrank
 /// the generic setting. `skipdownloaderrors`, `fetchinclude`, and
 /// `fetchexclude` are also pinned: Git LFS otherwise accepts each from a
 /// tracked `.lfsconfig`, can deliberately leave pointer text for a selected
@@ -840,21 +848,44 @@ with socket.socket() as listener:
     async fn tracked_lfsconfig_cannot_select_an_executable() {
         #[cfg(unix)]
         for scoped in [false, true] {
-            assert_tracked_lfsconfig_cannot_select_an_executable(scoped).await;
+            assert_tracked_lfsconfig_cannot_select_an_executable(
+                scoped,
+                "https://127.0.0.1:1/repo.git",
+            )
+            .await;
         }
         #[cfg(not(unix))]
         panic!("#840 needs the supported Unix production checkout sandbox and real git-lfs");
     }
 
+    // last_edited_by: codex
+    // **Signed:** codex · 2026-09-28T11:28:05-04:00
+    /// #885 / atlas 744: Git LFS converts a native Git endpoint to HTTPS.
+    /// The scoped reset then misses; the generic reset must prevent the
+    /// admitted-key marker from executing under the real checkout sandbox.
+    /// Retain the ordinary tracked-file arms too: current git-lfs rejects
+    /// these keys, independently of Git-Vista's command-line defence.
+    #[tokio::test]
+    async fn git_protocol_endpoint_requires_generic_standalone_reset() {
+        #[cfg(unix)]
+        {
+            const URL: &str = "git://127.0.0.1:9418/repo.git";
+            assert!(git_vista_protocol::validate_clone_url(URL).is_ok());
+            assert!(super::super::DEFAULT_GIT_PORTS.contains(&9418));
+            assert_tracked_lfsconfig_cannot_select_an_executable(false, URL).await;
+        }
+        #[cfg(not(unix))]
+        panic!("#885 needs the supported Unix production checkout sandbox and real git-lfs");
+    }
+
     #[cfg(unix)]
-    async fn assert_tracked_lfsconfig_cannot_select_an_executable(scoped: bool) {
+    async fn assert_tracked_lfsconfig_cannot_select_an_executable(scoped: bool, url: &str) {
         use super::super::network_exec::{
             lfs_checkout_command, network_command_without_credential, run_fixture_git,
         };
         use std::time::Duration;
 
         assert_ne!(program(), GIT_LFS_UNAVAILABLE, "#840 requires real git-lfs");
-        const URL: &str = "https://127.0.0.1:1/repo.git";
         let (clones, source) = lfs_fixture();
         let marker = clones.path().join("tracked-selector-ran");
         let selector = clones.path().join("tracked-selector.sh");
@@ -863,7 +894,7 @@ with socket.socket() as listener:
             &format!("#!/bin/sh\nprintf RAN > '{}'\nexit 73\n", marker.display()),
         );
         let section = if scoped {
-            format!("[lfs \"{}\"]", endpoint(URL))
+            format!("[lfs \"{}\"]", endpoint(url))
         } else {
             "[lfs]".to_string()
         };
@@ -893,7 +924,7 @@ with socket.socket() as listener:
             assert!(!marker.exists(), "no-checkout transfer ran the selector");
             let output = tokio::time::timeout(
                 Duration::from_secs(20),
-                lfs_checkout_command(&policy, &dest, URL)
+                lfs_checkout_command(&policy, &dest, url)
                     .kill_on_drop(true)
                     .output(),
             )
@@ -943,7 +974,7 @@ with socket.socket() as listener:
             std::fs::write(dest.join(".lfsconfig"), &config).unwrap();
             run_fixture_git(&dest, ["config", "include.path", "../.lfsconfig"]);
             let command = if guarded {
-                lfs_checkout_command(&policy, &dest, URL)
+                lfs_checkout_command(&policy, &dest, url)
             } else {
                 let args = [
                     "-c".to_string(),
@@ -957,9 +988,9 @@ with socket.socket() as listener:
                     "-c".to_string(),
                     "lfs.basictransfersonly=true".to_string(),
                     "-c".to_string(),
-                    format!("lfs.{}.basictransfersonly=true", endpoint(URL)),
+                    format!("lfs.{}.basictransfersonly=true", endpoint(url)),
                     "-c".to_string(),
-                    format!("lfs.url={}", endpoint(URL)),
+                    format!("lfs.url={}", endpoint(url)),
                     "checkout".to_string(),
                     "-f".to_string(),
                 ];
