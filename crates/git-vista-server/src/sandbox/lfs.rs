@@ -99,13 +99,16 @@ fn endpoint(clone_url: &str) -> String {
 /// a selector scoped to the converted URL could outrank the generic reset if
 /// those currently unsafe keys were admitted. See upstream v3.7.1
 /// `lfsapi/endpoint_finder.go` (`endpointFromGitUrl`) and `tq/manifest.go`
-/// (`findStandaloneTransfer`). The exact URL's basic-only value is pinned
-/// as well so URL-match specificity cannot outrank
-/// the generic setting. `skipdownloaderrors`, `fetchinclude`, and
-/// `fetchexclude` are also pinned: Git LFS otherwise accepts each from a
-/// tracked `.lfsconfig`, can deliberately leave pointer text for a selected
-/// path, and still report filter success. Pinning `lfs.url` prevents a fetched
-/// `.lfsconfig` from switching checkout to SSH and thereby selecting `ssh` or
+/// (`findStandaloneTransfer`). The exact URL's basic-only value is pinned as
+/// well so URL-match specificity cannot outrank the generic setting. Git LFS
+/// also admits `lfs.gitprotocol` from tracked config and uses it to replace a
+/// `git://` endpoint's scheme before that lookup, so pinning it to HTTPS keeps
+/// repository content from selecting the built-in file adapter or a plaintext
+/// batch endpoint. `skipdownloaderrors`, `fetchinclude`, and `fetchexclude` are
+/// also pinned: Git LFS otherwise accepts each from a tracked `.lfsconfig`, can
+/// deliberately leave pointer text for a selected path, and still report
+/// filter success. Pinning `lfs.url` prevents a fetched `.lfsconfig` from
+/// switching checkout to SSH and thereby selecting `ssh` or
 /// `git-lfs-authenticate` as another executable path. Finally, href rewriting
 /// maps every direct `http://` object action to a fixed HTTPS URL on a denied
 /// port. This covers batch-selected URLs, which are not redirects and never
@@ -125,6 +128,8 @@ fn checkout_config_for_program(clone_url: &str, program: &str) -> Vec<String> {
         "lfs.fetchinclude=".into(),
         "-c".into(),
         "lfs.fetchexclude=".into(),
+        "-c".into(),
+        "lfs.gitprotocol=https".into(),
         "-c".into(),
         "lfs.basictransfersonly=true".into(),
         "-c".into(),
@@ -470,6 +475,7 @@ with socket.socket() as listener:
         assert!(joined.contains("lfs.skipdownloaderrors=false"));
         assert!(joined.contains("lfs.fetchinclude="));
         assert!(joined.contains("lfs.fetchexclude="));
+        assert!(joined.contains("lfs.gitprotocol=https"));
         assert!(joined.contains("lfs.basictransfersonly=true"));
         assert!(joined.contains("lfs.standalonetransferagent="));
         assert!(joined
@@ -876,6 +882,91 @@ with socket.socket() as listener:
         }
         #[cfg(not(unix))]
         panic!("#885 needs the supported Unix production checkout sandbox and real git-lfs");
+    }
+
+    // last_edited_by: codex
+    // **Signed:** codex · 2026-09-28T17:00:36-04:00
+    /// #889: Git LFS 3.7.1 admits `lfs.gitprotocol` from `.lfsconfig` and uses
+    /// it to replace a native Git endpoint's scheme. Run the exact checkout
+    /// config through real Git LFS: each unpinned control must expose the
+    /// tracked scheme, while the production config must retain HTTPS.
+    ///
+    /// MUTATION 1: remove the `lfs.gitprotocol=https` pair. The guarded result
+    /// becomes the tracked `file://` or `http://` endpoint.
+    /// MUTATION 2: change the pin to another value. The guarded result exposes
+    /// that different scheme instead of HTTPS.
+    #[test]
+    #[cfg(unix)]
+    fn tracked_lfsconfig_cannot_choose_git_protocol_endpoint_scheme() {
+        assert_ne!(program(), GIT_LFS_UNAVAILABLE, "#889 requires real git-lfs");
+        const URL: &str = "git://127.0.0.1:9418/repo.git";
+        const HTTPS_ENDPOINT: &str =
+            "Endpoint=https://127.0.0.1:9418/repo.git/info/lfs (auth=none)";
+
+        for protocol in ["file", "http"] {
+            let (clones, source) = lfs_fixture();
+            let tracked = format!("[lfs]\n\tgitprotocol = {protocol}\n");
+            std::fs::write(source.join(".lfsconfig"), &tracked)
+                .expect("write tracked LFS protocol configuration");
+            super::super::network_exec::run_fixture_git(&source, ["add", ".lfsconfig"]);
+            super::super::network_exec::run_fixture_git(
+                &source,
+                ["commit", "-qm", "tracked LFS protocol configuration"],
+            );
+
+            let dest = clone_with_cached_lfs_object(clones.path(), &source, protocol);
+            super::super::network_exec::run_fixture_git(
+                &dest,
+                ["checkout", "-q", "HEAD", "--", ".lfsconfig"],
+            );
+            assert_eq!(
+                std::fs::read_to_string(dest.join(".lfsconfig")).unwrap(),
+                tracked,
+                "the conflicting config must really be tracked and materialised"
+            );
+
+            let guarded = checkout_config(URL);
+            let (pairs, remainder) = guarded.as_chunks::<2>();
+            assert!(
+                remainder.is_empty(),
+                "Git checkout config must consist only of -c/value pairs"
+            );
+            let mut control = Vec::new();
+            for pair in pairs {
+                if !pair[1].starts_with("lfs.gitprotocol=") {
+                    control.extend_from_slice(pair);
+                }
+            }
+
+            let endpoint = |mut config: Vec<String>| {
+                config.extend(["lfs".to_string(), "env".to_string()]);
+                let args: Vec<std::ffi::OsString> =
+                    config.into_iter().map(std::ffi::OsString::from).collect();
+                let output = git_output(&dest, &args);
+                assert!(
+                    output.status.success(),
+                    "git lfs env failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                String::from_utf8(output.stdout)
+                    .expect("git lfs env output is UTF-8")
+                    .lines()
+                    .find(|line| line.starts_with("Endpoint="))
+                    .expect("git lfs env reports its endpoint")
+                    .to_string()
+            };
+
+            assert_eq!(
+                endpoint(control),
+                format!("Endpoint={protocol}://127.0.0.1:9418/repo.git/info/lfs (auth=none)"),
+                "unpinned control must prove the tracked scheme is observable"
+            );
+            assert_eq!(
+                endpoint(guarded),
+                HTTPS_ENDPOINT,
+                "command-line checkout pin must outrank tracked lfs.gitprotocol={protocol}"
+            );
+        }
     }
 
     #[cfg(unix)]
