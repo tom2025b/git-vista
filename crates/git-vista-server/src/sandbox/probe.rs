@@ -77,17 +77,29 @@
 //!   `evaluate_observation`, `to_boot_result`) against hand-built inputs that
 //!   stand in for a host lacking a capability — see the test module.
 
-use std::path::{Path, PathBuf};
+// Windows warning cfg gates (Refs #859).
+// last_edited_by: codex
+// **Signed:** codex · 2026-09-28T17:03:29-04:00
+
+#[cfg(unix)]
+use std::path::Path;
+#[cfg(any(unix, test))]
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
+#[cfg(unix)]
 use super::spawn::command_async;
+#[cfg(unix)]
 use super::{default_system_trees, secret_excludes_for_home, HookMode, Policy, Tier};
 
 // The capability half lives in `sandbox::capabilities` and is not redeclared
 // here. Re-exported under the name the rest of the plan's batteries (Tasks
 // 10/12/14, not built by this task) expect to import, so there is exactly one
 // measurement in the crate.
-pub(crate) use super::capabilities::{probe as capabilities, Capabilities};
+#[cfg(unix)]
+pub(crate) use super::capabilities::probe as capabilities;
+#[cfg(any(unix, test))]
+use super::capabilities::Capabilities;
 
 /// **Only `Contained` permits boot.** The other two variants both refuse
 /// (INV-13 / Global Constraint 15) — they are separate variants for the sake
@@ -98,6 +110,7 @@ pub(crate) use super::capabilities::{probe as capabilities, Capabilities};
 pub(crate) enum ProbeVerdict {
     /// Every check the boot probe made was closed, and its paired positive
     /// was granted in the same run.
+    #[cfg(any(unix, test))]
     Contained,
     /// The composed launcher's cheapest real operation (`git --version`, no
     /// hook, no write) did not exit 0 — the host cannot supply the tier at
@@ -111,6 +124,7 @@ pub(crate) enum ProbeVerdict {
     /// was open, or a marker that should have been written was absent. This
     /// is a hole (or an unobservable probe, which must never be reported as
     /// green) — a git-vista bug, not a host configuration problem.
+    #[cfg(any(unix, test))]
     FailOpen { failed_checks: Vec<String> },
 }
 
@@ -180,6 +194,7 @@ impl std::fmt::Display for BootRefusal {
     /// this source file.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.verdict {
+            #[cfg(any(unix, test))]
             ProbeVerdict::Contained => write!(
                 f,
                 "sandbox probe refused boot (BUG: Contained is not a refusal)"
@@ -190,6 +205,7 @@ impl std::fmt::Display for BootRefusal {
                  degraded mode.)",
                 capability_absent_message(missing)
             ),
+            #[cfg(any(unix, test))]
             ProbeVerdict::FailOpen { failed_checks } => write!(
                 f,
                 "sandbox self-test failed: the composed launcher did not contain a \
@@ -204,6 +220,7 @@ impl std::fmt::Display for BootRefusal {
 /// booleans: the seccomp checks report the kernel's own numbers and the
 /// procfs check reports a pid, and collapsing those to a bool would be how a
 /// "family of accepted values" gets reintroduced.
+#[cfg(any(unix, test))]
 pub(crate) type Observation = std::collections::BTreeMap<String, String>;
 
 /// Why the composed launcher could not be observed. Kept as three named
@@ -212,6 +229,7 @@ pub(crate) type Observation = std::collections::BTreeMap<String, String>;
 /// meanings, and only a caller who already knows capability was established
 /// (the baseline leg already passed) can safely treat any of them as
 /// `FailOpen` rather than `CapabilityAbsent`.
+#[cfg(unix)]
 #[derive(Debug)]
 pub(crate) enum LaunchFailed {
     Spawn,
@@ -225,6 +243,7 @@ pub(crate) enum LaunchFailed {
 /// never having been granted (the same EACCES the kernel reports either way,
 /// which is the whole reason R3 pairs this with a mandatory positive
 /// control below).
+#[cfg(unix)]
 const ESCAPE_WITNESS: &str = ".gv-boot-probe-escape";
 
 /// The boot probe's hostile `pre-commit` hook, built (not a bare string
@@ -252,6 +271,7 @@ const ESCAPE_WITNESS: &str = ".gv-boot-probe-escape";
 /// inheritance, lifecycle. Those need `cc`, a listener, or wall-clock timing
 /// and belong to the escape battery (which runs in CI), not a check that
 /// must run cheaply on every boot.
+#[cfg(unix)]
 fn boot_probe_hook_script() -> String {
     format!(
         r#"#!/bin/sh
@@ -294,10 +314,12 @@ exit 0
 /// The `TempDir` is held for the fixture's whole lifetime: dropping it
 /// deletes everything, so callers must keep this alive until every marker
 /// has been read.
+#[cfg(unix)]
 struct BootProbeFixture {
     dir: tempfile::TempDir,
 }
 
+#[cfg(unix)]
 impl BootProbeFixture {
     fn repo(&self) -> PathBuf {
         self.dir.path().join("repo")
@@ -316,6 +338,7 @@ impl BootProbeFixture {
 /// baseline leg (the actual capability evidence, in [`verdict`]) would not
 /// even have run yet, so a fixture failure can never be misreported as
 /// capability absence.
+#[cfg(unix)]
 fn boot_probe_fixture() -> std::io::Result<BootProbeFixture> {
     let dir = tempfile::tempdir()?;
     let repo = dir.path().join("repo");
@@ -370,6 +393,7 @@ fn boot_probe_fixture() -> std::io::Result<BootProbeFixture> {
 /// `HookMode::Run` — **not** `Blocked` — because the hook is the observer
 /// here; blocking it would make the probe blind to everything it exists to
 /// check.
+#[cfg(unix)]
 fn boot_probe_policy(scratch: &Path, markers: &Path) -> Result<Policy, &'static str> {
     let (home, shim, bwrap) = boot_probe_prerequisites(
         std::env::var_os("HOME"),
@@ -403,6 +427,7 @@ fn boot_probe_policy(scratch: &Path, markers: &Path) -> Result<Policy, &'static 
 /// Besides preserving that order, the seam lets unit tests simulate each
 /// absence without mutating process-wide environment variables or caches that
 /// sibling tests use concurrently.
+#[cfg(any(unix, test))]
 fn boot_probe_prerequisites(
     home: Option<std::ffi::OsString>,
     shim: impl FnOnce() -> Option<PathBuf>,
@@ -419,6 +444,7 @@ fn boot_probe_prerequisites(
 /// and host-independent, so the property "a missing capability is named,
 /// never silently folded into fail-open" is unit-testable without a broken
 /// host — see the test module's `missing_capabilities_names_every_absent_knob`.
+#[cfg(any(unix, test))]
 fn missing_capabilities(caps: &Capabilities) -> Vec<&'static str> {
     let mut missing = Vec::new();
     if !caps.landlock_meets_floor() {
@@ -452,6 +478,7 @@ fn missing_capabilities(caps: &Capabilities) -> Vec<&'static str> {
 /// host that lacks a capability, without needing to actually break this
 /// development host's sandbox. See the test module's
 /// `a_missing_capability_reports_absent_never_fail_open`.
+#[cfg(any(unix, test))]
 fn baseline_failed_verdict(caps: &Capabilities) -> ProbeVerdict {
     ProbeVerdict::CapabilityAbsent {
         missing: missing_capabilities(caps),
@@ -462,6 +489,7 @@ fn baseline_failed_verdict(caps: &Capabilities) -> ProbeVerdict {
 /// a precise name from [`boot_probe_policy`]. Preserve it rather than replacing
 /// it with `missing_capabilities(caps)`, whose all-green residual is
 /// `strict_launch` and therefore describes a different failure stage.
+#[cfg(any(unix, test))]
 fn policy_failed_verdict(missing: &'static str) -> ProbeVerdict {
     ProbeVerdict::CapabilityAbsent {
         missing: vec![missing],
@@ -477,6 +505,7 @@ fn policy_failed_verdict(missing: &'static str) -> ProbeVerdict {
 /// `FailOpen`" mapping is unit-testable against hand-built observations,
 /// without needing a real degraded sandbox to produce one. See the test
 /// module's `evaluate_observation_rejects_missing_and_wrong_markers`.
+#[cfg(any(unix, test))]
 fn evaluate_observation(obs: &Observation) -> Result<(), Vec<String>> {
     let mut failed = Vec::new();
     for (check, want) in [
@@ -514,6 +543,7 @@ fn evaluate_observation(obs: &Observation) -> Result<(), Vec<String>> {
 /// `command_async` assembles internally), and returns the marker files the
 /// hook managed to write. `repo`'s parent directory is where the fixture puts
 /// `markers/` (see [`BootProbeFixture`]).
+#[cfg(unix)]
 pub(crate) async fn observe(policy: &Policy, repo: &Path) -> Result<Observation, LaunchFailed> {
     // `-c user.*` because the server's git identity is not guaranteed and a
     // commit without one aborts before hook discovery — which would look
@@ -562,6 +592,7 @@ pub(crate) async fn observe(policy: &Policy, repo: &Path) -> Result<Observation,
 /// against it, and reads back what the hook managed to do. Never installs a
 /// primitive itself and never asks the host a question it then decides on
 /// (R4 — capability is established by execution).
+#[cfg(unix)]
 pub(crate) async fn verdict(caps: &Capabilities) -> ProbeVerdict {
     let Ok(fixture) = boot_probe_fixture() else {
         return ProbeVerdict::CapabilityAbsent {
@@ -705,8 +736,11 @@ fn record_verdict_into(cell: &OnceLock<ProbeVerdict>, verdict: &ProbeVerdict) {
 /// `only_contained_permits_boot_every_other_verdict_refuses`.
 fn to_boot_result(verdict: ProbeVerdict) -> Result<ProbeVerdict, BootRefusal> {
     match verdict {
+        #[cfg(any(unix, test))]
         ProbeVerdict::Contained => Ok(verdict),
-        other => Err(BootRefusal { verdict: other }),
+        ProbeVerdict::CapabilityAbsent { .. } => Err(BootRefusal { verdict }),
+        #[cfg(any(unix, test))]
+        ProbeVerdict::FailOpen { .. } => Err(BootRefusal { verdict }),
     }
 }
 
@@ -1041,6 +1075,7 @@ mod tests {
     /// unit tests above cannot give on their own: it exercises the real
     /// fixture, the real composed launcher, and the real marker files, end
     /// to end.
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_real_launcher_contains_the_hostile_hook_on_this_host() {
         assert_eq!(verdict(&capabilities()).await, ProbeVerdict::Contained);
@@ -1059,6 +1094,7 @@ mod tests {
     /// passes or fails on thread scheduling. What is checked instead holds no
     /// matter who got there first — after a successful boot the stored verdict
     /// is present, and it is the same value the gate let through.
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_at_startup_succeeds_and_the_verdict_survives_for_request_time() {
         let v = run_at_startup()

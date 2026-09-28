@@ -111,7 +111,13 @@
 //! against a detached task's cancellation; adding one is a change to a file
 //! this module does not own.
 
-use std::io::{Read, Write};
+// Windows warning cfg gates (Refs #859).
+// last_edited_by: codex
+// **Signed:** codex · 2026-09-28T17:03:29-04:00
+
+#[cfg(unix)]
+use std::io::Read;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::{Duration, SystemTime};
@@ -251,9 +257,11 @@ const STALE_SCRATCH_AGE: Duration = Duration::from_secs(60 * 60);
 /// whole budget is spent only on a candidate that is stale, marked, and
 /// refused once — see [`ScratchStore::lease_if_free`] for why a live store
 /// cannot be reaped however many times it is asked.
+#[cfg(unix)]
 const LEASE_ATTEMPTS: u32 = 8;
 
 /// The pause between the asks [`LEASE_ATTEMPTS`] counts.
+#[cfg(unix)]
 const LEASE_RETRY_PAUSE: Duration = Duration::from_millis(1);
 
 /// Every git spawn this module makes: the sealed launcher, `NetworkNeed::Local`,
@@ -1532,6 +1540,7 @@ impl ScratchStore {
     /// The whole budget is [`LEASE_ATTEMPTS`] × [`LEASE_RETRY_PAUSE`] and is
     /// paid only by a candidate that is already past [`STALE_SCRATCH_AGE`],
     /// carries the magic, and refused once — never on the normal path.
+    #[cfg(unix)]
     fn lease_if_free(marker: &std::fs::File) -> bool {
         for attempt in 1..=LEASE_ATTEMPTS {
             if marker.try_lock().is_ok() {
