@@ -77,6 +77,10 @@
 //!   `evaluate_observation`, `to_boot_result`) against hand-built inputs that
 //!   stand in for a host lacking a capability — see the test module.
 
+// Windows warning cfg gates (Refs #859).
+// last_edited_by: codex
+// **Signed:** codex · 2026-09-28T17:03:29-04:00
+
 #[cfg(unix)]
 use std::path::Path;
 #[cfg(any(unix, test))]

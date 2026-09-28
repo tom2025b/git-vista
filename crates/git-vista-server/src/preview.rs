@@ -111,6 +111,10 @@
 //! against a detached task's cancellation; adding one is a change to a file
 //! this module does not own.
 
+// Windows warning cfg gates (Refs #859).
+// last_edited_by: codex
+// **Signed:** codex · 2026-09-28T17:03:29-04:00
+
 #[cfg(unix)]
 use std::io::Read;
 use std::io::Write;

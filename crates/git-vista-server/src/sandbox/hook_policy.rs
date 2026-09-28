@@ -91,6 +91,10 @@
 //! banner permanently on every repository and so stop distinguishing anything,
 //! which is the disclosure equivalent of a warning nobody reads.
 
+// Windows warning cfg gates (Refs #859).
+// last_edited_by: codex
+// **Signed:** codex · 2026-09-28T17:03:29-04:00
+
 use std::path::Path;
 
 use git_vista_protocol::HookPolicy;
