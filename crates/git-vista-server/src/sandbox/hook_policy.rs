@@ -113,6 +113,7 @@ pub(crate) enum HookPolicyRefused {
     /// The host cannot supply the strict tier. Names the missing capabilities.
     CapabilityAbsent { missing: Vec<String> },
     /// The composed launcher did not contain a hostile hook. A git-vista bug.
+    #[cfg(any(unix, test))]
     FailOpen { failed_checks: Vec<String> },
 }
 
@@ -126,6 +127,7 @@ impl std::fmt::Display for HookPolicyRefused {
                  bubblewrap and enable unprivileged user namespaces. (INV-13 / ADR \
                  0029 — there is no degraded mode and hooks are not merely blocked.)"
             ),
+            #[cfg(any(unix, test))]
             HookPolicyRefused::FailOpen { failed_checks } => write!(
                 f,
                 "the sandbox self-test found a hole (checks: {failed_checks:?}), so \
@@ -226,11 +228,13 @@ fn hook_policy_for_trusted_repo(
     // No wildcard: a new `ProbeVerdict` variant must be given a disclosure
     // decision here rather than inheriting one.
     match verdict {
+        #[cfg(any(unix, test))]
         ProbeVerdict::Contained => Ok(hook_policy_for_tier(tier_for(NetworkNeed::Local, false))),
         // ADR 0029, not the plan. Refuse; do not disclose a policy at all.
         ProbeVerdict::CapabilityAbsent { missing } => Err(HookPolicyRefused::CapabilityAbsent {
             missing: missing.iter().map(|s| (*s).to_string()).collect(),
         }),
+        #[cfg(any(unix, test))]
         ProbeVerdict::FailOpen { failed_checks } => Err(HookPolicyRefused::FailOpen {
             failed_checks: failed_checks.clone(),
         }),
