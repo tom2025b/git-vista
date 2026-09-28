@@ -785,6 +785,7 @@ fn rebuild_lease(op: &PendingOp, preview: Preview, shell: Shell, graph: RwSignal
             outcome,
             preview.rebuild_is_current(token, live_epoch),
             same_desk,
+            preview.rebuild_owns_confirmation(token),
         ) {
             RebuildEffect::Reopen => {
                 let Some((leased, oid)) = built else {

@@ -3,6 +3,7 @@
 
 pub mod collapse;
 pub mod core;
+pub mod feed_refresh;
 // The reactive half. Gated because it imports Leptos/web-sys; the core above is not,
 // so its rules — including `LoadedHistory`'s validate-then-commit invariants — run on
 // the host under the ordinary `cargo test --workspace` (M1.11 D1).

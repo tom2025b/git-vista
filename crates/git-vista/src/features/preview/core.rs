@@ -584,7 +584,7 @@ pub enum RebuildEffect {
     Reopen,
     /// Record that the rebuild produced nothing.
     MarkFailed,
-    /// Stale, or built for the wrong desk: touch nothing at all.
+    /// Superseded, or built for the wrong desk: touch nothing at all.
     Drop,
 }
 
@@ -608,8 +608,10 @@ pub enum RebuildEffect {
 /// interleave, so "decide, then act" is atomic by construction rather than by
 /// a convention each new site has to honour.
 ///
-/// # The two fences, and why one of them cannot be a counter
+/// # Ownership and the two fences
 ///
+/// * `owns_confirmation` — the preview generation still belongs to this rebuild.
+///   Cancel, replacement, and disposal make it false and must stay silent.
 /// * `current` — the shared-fence answer: is this still the live rebuild, on
 ///   both `Preview`'s own generation and the graph epoch that repository
 ///   selection moves? (`RequestKey::is_current`'s two-axis shape, which
@@ -625,10 +627,20 @@ pub enum RebuildEffect {
 /// desk. Reproduced in `ci/browser/tests/rebuild-lease-two-tabs.spec.mjs`.
 /// Only the plan's own tokens can answer it, which is why `same_desk` is
 /// computed from the value rather than from anything this client believes.
-pub fn rebuild_commit(outcome: RebuildOutcome, current: bool, same_desk: bool) -> RebuildEffect {
-    if !current {
-        // A newer rebuild, a cancel, or a selection change owns the state now.
+pub fn rebuild_commit(
+    outcome: RebuildOutcome,
+    current: bool,
+    same_desk: bool,
+    owns_confirmation: bool,
+) -> RebuildEffect {
+    if !owns_confirmation {
+        // A newer rebuild, Cancel, or a disposed owner owns the state now.
         return RebuildEffect::Drop;
+    }
+    if !current {
+        // #887: history probes also bump the epoch. The same confirmation
+        // still owns Rebuilding, so a fenced reply must finish visibly.
+        return RebuildEffect::MarkFailed;
     }
     match outcome {
         RebuildOutcome::Failed => RebuildEffect::MarkFailed,
@@ -645,10 +657,64 @@ pub fn rebuild_commit(outcome: RebuildOutcome, current: bool, same_desk: bool) -
 mod rebuild_commit_tests {
     use super::{rebuild_commit, RebuildEffect, RebuildOutcome};
 
+    /// #887: the feed offers Rebuild before its history probe lands. The
+    /// click owns generation 3 at epoch 7; the probe moves to 8 while either
+    /// preview_push request is held. The same dialog must offer a retry.
+    #[test]
+    fn a_history_probe_during_lease_rebuild_finishes_with_a_retry() {
+        use super::{rebuild_key_is_current, rebuild_token_is_current};
+        assert!(rebuild_token_is_current(Some(3), 3));
+        let current = rebuild_key_is_current(Some(8), Some(3), 7, 3);
+        assert_eq!(
+            rebuild_commit(
+                RebuildOutcome::Landed,
+                current,
+                true,
+                rebuild_token_is_current(Some(3), 3),
+            ),
+            RebuildEffect::MarkFailed,
+            "the same confirmation must not keep Building a new plan forever"
+        );
+    }
+
+    #[test]
+    fn a_failed_reply_after_a_history_bump_also_finishes_with_a_retry() {
+        assert_eq!(
+            rebuild_commit(RebuildOutcome::Failed, false, true, true),
+            RebuildEffect::MarkFailed
+        );
+    }
+
+    #[test]
+    fn a_repo_switch_never_reopens_even_if_the_dialog_generation_has_not_cleared() {
+        assert_eq!(
+            rebuild_commit(RebuildOutcome::Landed, false, false, true),
+            RebuildEffect::MarkFailed
+        );
+    }
+
+    #[test]
+    fn a_canceled_or_replaced_rebuild_cannot_write_even_after_a_history_bump() {
+        use super::{rebuild_key_is_current, rebuild_token_is_current};
+        for live_generation in [Some(4), None] {
+            for outcome in [RebuildOutcome::Landed, RebuildOutcome::Failed] {
+                assert_eq!(
+                    rebuild_commit(
+                        outcome,
+                        rebuild_key_is_current(Some(8), live_generation, 7, 3),
+                        true,
+                        rebuild_token_is_current(live_generation, 3),
+                    ),
+                    RebuildEffect::Drop
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_current_landed_rebuild_on_the_same_desk_reopens() {
         assert_eq!(
-            rebuild_commit(RebuildOutcome::Landed, true, true),
+            rebuild_commit(RebuildOutcome::Landed, true, true, true),
             RebuildEffect::Reopen
         );
     }
@@ -656,7 +722,7 @@ mod rebuild_commit_tests {
     #[test]
     fn a_current_failure_marks_failed() {
         assert_eq!(
-            rebuild_commit(RebuildOutcome::Failed, true, true),
+            rebuild_commit(RebuildOutcome::Failed, true, true, true),
             RebuildEffect::MarkFailed
         );
     }
@@ -666,11 +732,11 @@ mod rebuild_commit_tests {
     #[test]
     fn a_stale_rebuild_touches_nothing_whichever_way_it_ended() {
         assert_eq!(
-            rebuild_commit(RebuildOutcome::Landed, false, true),
+            rebuild_commit(RebuildOutcome::Landed, false, true, false),
             RebuildEffect::Drop
         );
         assert_eq!(
-            rebuild_commit(RebuildOutcome::Failed, false, true),
+            rebuild_commit(RebuildOutcome::Failed, false, true, false),
             RebuildEffect::Drop
         );
     }
@@ -682,7 +748,7 @@ mod rebuild_commit_tests {
     #[test]
     fn a_current_rebuild_for_another_desk_is_dropped_not_reopened() {
         assert_eq!(
-            rebuild_commit(RebuildOutcome::Landed, true, false),
+            rebuild_commit(RebuildOutcome::Landed, true, false, true),
             RebuildEffect::Drop,
         );
     }
@@ -693,7 +759,7 @@ mod rebuild_commit_tests {
     #[test]
     fn a_wrong_desk_plan_is_not_reported_as_a_failure() {
         assert_ne!(
-            rebuild_commit(RebuildOutcome::Landed, true, false),
+            rebuild_commit(RebuildOutcome::Landed, true, false, true),
             RebuildEffect::MarkFailed,
         );
     }
@@ -704,7 +770,7 @@ mod rebuild_commit_tests {
     #[test]
     fn the_desk_does_not_change_what_a_failure_means() {
         assert_eq!(
-            rebuild_commit(RebuildOutcome::Failed, true, false),
+            rebuild_commit(RebuildOutcome::Failed, true, false, true),
             RebuildEffect::MarkFailed
         );
     }

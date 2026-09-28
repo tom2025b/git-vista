@@ -800,7 +800,6 @@ pub(super) fn graph_canvas(
             {menu::menu_view(features, settings, read_only, on_fold_wip)}
             <Show when=move || !graph.get().view().is_historical()>
             {dialogs::commit_dialog_view(features)}
-            {dialogs::confirm_modal_view(features)}
             // #232: the pull strategy picker is a fourth modal rather than an
             // arm of `confirm_modal_view` — see its doc comment; the short
             // version is that it exists precisely to supply the field a

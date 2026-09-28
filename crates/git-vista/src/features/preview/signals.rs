@@ -285,13 +285,18 @@ impl Preview {
         self.plan.set(PlanSlot::Absent);
     }
 
-    /// Whether a rebuild started with `token` is still the live one —
-    /// nothing (Cancel, a newer rebuild, the dialog closing and reopening)
-    /// has bumped the generation since. `note_rebuild_failed` and
-    /// `note_rebuild_landed` already check this before writing; call it
-    /// directly for an action this `Preview` does not itself own, such as
-    /// re-opening the confirmation dialog on the replacement plan (#664
-    /// review round 3).
+    /// Whether this continuation still owns the confirmation's rebuild slot.
+    /// Unlike the two-axis fence below, a history-only epoch bump does not
+    /// retire this ownership. A fenced reply must then finish with a retry.
+    pub fn rebuild_owns_confirmation(&self, token: RebuildToken) -> bool {
+        crate::features::preview::core::rebuild_token_is_current(
+            self.generation.try_get_value(),
+            token.generation,
+        )
+    }
+
+    /// Whether both the dialog generation and graph epoch still match.
+    /// Read at the single commit point alongside confirmation ownership.
     pub fn rebuild_is_current(&self, token: RebuildToken, live_epoch: u64) -> bool {
         // The comparison itself lives in `core::rebuild_key_is_current`,
         // host-tested — this wrapper only supplies the wasm-only signal read

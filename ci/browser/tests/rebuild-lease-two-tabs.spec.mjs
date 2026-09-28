@@ -155,6 +155,10 @@ test.describe('#664 — a second tab moving the session selection', () => {
     // the session happens to be pointing at when the request lands.
     giveOrigin(runtime().mergePreviewFixture.root)
     giveOrigin(runtime().fixture.root)
+    // #852: the fixture's external ref setup now refreshes the graph. Wait
+    // for that epoch before opening a menu with epoch-fenced plan requests.
+    await expect(page.getByRole('region', { name: 'Commit history graph' }))
+      .toContainText(`origin/${SHARED_BRANCH}`, { timeout: 20_000 })
 
     const tabAWorktree = tabAFrame()
     expect(tabAWorktree, 'tab A must know which desk it is showing').toBeTruthy()
