@@ -51,7 +51,7 @@ function git(args) {
  * enough to offer a rebuild, the same "a ref the plan does not name moving"
  * shape `plan-freshness.spec.mjs` already covers for the merge path.
  */
-async function openForcePushConfirmation(page, tag) {
+async function openForcePushConfirmation(page, tag, beforeExternalWrite = async () => {}) {
   // The expanded lease confirmation (every disclosure section open) is
   // taller than the default viewport, and `Rebuild` sits below the fold —
   // a real click needs it actually in view, not just present in the DOM.
@@ -68,6 +68,7 @@ async function openForcePushConfirmation(page, tag) {
     .getByRole('button', { name: `Force Push ‘${PREVIEW_BRANCH}’…`, exact: false })
     .click()
   await expect(page.getByText('What this plan says')).toBeVisible()
+  await beforeExternalWrite()
   git(['tag', tag])
   await expect(page.getByRole('button', { name: 'Rebuild', exact: true })).toBeVisible({
     timeout: 20_000,
@@ -167,18 +168,10 @@ test.describe('#664 review round 3 — a canceled rebuild-lease reply does nothi
       failPlan()
       await page.waitForTimeout(300)
 
-      // What this asserts, precisely: a held failure reply, released after
-      // Cancel, produces no visible artifact on a dialog that is already
-      // closed — no crash, no orphaned notice, nothing reopens. It does NOT
-      // independently prove `note_rebuild_failed`'s internal token guard —
-      // with the dialog already closed, nothing renders `Preview`'s plan
-      // slot for either write to appear in, so a manual check (temporarily
-      // removing the guard, see the PR) found this pair of assertions still
-      // green either way. That guard's actual proof is the host-level
-      // mutation-proof on `rebuild_token_is_current` in `preview/core.rs`,
-      // which both `note_rebuild_failed` and `note_rebuild_landed` call —
-      // this browser test's job is the end-to-end "nothing visibly breaks",
-      // not a second proof of the same comparison.
+      // A late failure cannot reopen the canceled dialog or leave an orphan
+      // notice. The host decision tests separately pin the no-write effect;
+      // the tests below leave the dialog open to prove failure is visible
+      // when only the graph epoch, rather than ownership, has changed.
       await expect(page.getByRole('button', { name: 'Cancel', exact: true })).toHaveCount(0)
       await expect(page.getByText("Couldn't build a new plan", { exact: false })).toHaveCount(0)
     } finally {
@@ -187,3 +180,58 @@ test.describe('#664 review round 3 — a canceled rebuild-lease reply does nothi
     }
   })
 })
+
+// #887: Cancel is deliberately absent until cleanup. Control both replies so
+// the feed's Rebuild offer precedes the history epoch bump, which in turn
+// precedes completion of either preview_push await.
+for (const heldCall of [1, 2]) {
+  test(`an external history probe during lease await ${heldCall} offers retry without Cancel`, async ({ page }) => {
+    const tag = `review-887-probe-${heldCall}`
+    let releaseFrame
+    const frameGate = new Promise(resolve => { releaseFrame = resolve })
+    let releasePlan
+    const planGate = new Promise(resolve => { releasePlan = resolve })
+    let arrived
+    const planArrived = new Promise(resolve => { arrived = resolve })
+    let calls = 0
+    try {
+      await openForcePushConfirmation(page, tag, async () => {
+        await page.route('**/api/frame**', async route => {
+          await frameGate
+          await route.continue()
+        })
+      })
+      await page.route('**/api/plan', async route => {
+        calls++
+        if (calls === heldCall) {
+          arrived()
+          await planGate
+        }
+        await route.continue()
+      })
+      await page.getByRole('button', { name: 'Rebuild', exact: true }).click()
+      await planArrived
+      await expect(page.getByText('Building a new plan', { exact: false })).toBeVisible()
+      releaseFrame()
+      // The new tag can only reach this canvas after the probe bumps the
+      // epoch and the replacement seed lands. The lease request is held.
+      await expect(page.getByRole('region', { name: 'Commit history graph' }))
+        .toContainText(tag, { timeout: 20_000 })
+      releasePlan()
+      await expect(page.getByText("Couldn't build a new plan", { exact: false })).toBeVisible()
+      await expect(page.getByText('Building a new plan', { exact: false })).toHaveCount(0)
+      await expect(page.getByRole('button', { name: 'Rebuild', exact: true })).toBeVisible()
+      // Retry on the settled epoch must finish, still awaiting user approval.
+      await page.getByRole('button', { name: 'Rebuild', exact: true }).click()
+      await expect(page.getByText("Couldn't build a new plan", { exact: false })).toHaveCount(0)
+      await expect(page.getByText('Building a new plan', { exact: false })).toHaveCount(0)
+      await expect(page.getByText('What this plan says')).toBeVisible()
+      await expect(page.getByRole('button', { name: 'Cancel', exact: true })).toBeVisible()
+    } finally {
+      releaseFrame()
+      releasePlan()
+      await page.unroute('**/api/frame**').catch(() => {})
+      await cleanupForcePushConfirmation(page, tag)
+    }
+  })
+}
