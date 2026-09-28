@@ -321,21 +321,24 @@ test.describe('harness self-check — every assertion must be able to go red', (
     const chip = page.locator('.topbar').getByText(/\d+ staged/)
     await expect(chip).toBeVisible({ timeout: 15_000 })
 
-    await chip.evaluate((el) => {
+    // #890: strip and sample in ONE synchronous browser callback. A feed
+    // publication can refetch status and restore the attributes between two
+    // evaluate calls (the diagnostic above proves it). No browser task or
+    // microtask can render between these loops; the assertion gets the actual
+    // mutated DOM's name even if a later refresh repairs the live chip.
+    const name = await chip.evaluate((el) => {
       for (let e = el; e && e !== document.body; e = e.parentElement) {
         e.removeAttribute('aria-label')
         e.removeAttribute('title')
       }
+      for (let e = el; e && e !== document.body; e = e.parentElement) {
+        const n = e.getAttribute('aria-label') || e.getAttribute('title')
+        if (n) return n
+      }
+      return null
     })
 
     const msg = await failureMessage(async () => {
-      const name = await chip.evaluate((el) => {
-        for (let e = el; e && e !== document.body; e = e.parentElement) {
-          const n = e.getAttribute('aria-label') || e.getAttribute('title')
-          if (n) return n
-        }
-        return null
-      })
       expect(name, 'the chip must be announceable').toBeTruthy()
     })
     expectFailedBecause(msg, /the chip must be announceable/, 'the announceability assertion')
