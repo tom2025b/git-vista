@@ -925,25 +925,32 @@ cmd_worktree() {
     # cargo-targets loop image was retired on 2026-09-28, briefly for the BUILDS
     # partition and then for BUILDS2 (254 G, reclaimed from an empty BORGVM
     # partition plus 150 G that was already unallocated). That is exactly why
-    # this is a list and not a path. Try the known roots in order and use the
-    # first that is a real mountpoint, so this keeps working on either box and
-    # across the next move. A missing cache disk is a slower build, never a
-    # failure.
+    # this is a list and not a path. A missing cache disk is a slower build,
+    # never a failure — and note that this file runs under `set -euo pipefail`
+    # (line 43), so EVERY step here must be guarded or the whole command dies
+    # after `git worktree add` has already created the worktree.
+    #
+    # MOUNTED IS NOT USABLE. A disk can be mounted read-only, be full, carry a
+    # regular file where `targets` should be, or refuse us permission. Prove the
+    # lane cache can actually be created before committing to a root, and fall
+    # through to the NEXT root when it cannot — a list whose first entry can
+    # strand you is no better than the hardcoded path it replaced.
     local dest=""
     local root
     for root in /mnt/builds2/targets /mnt/builds/targets /mnt/cargo-targets/targets; do
-      if mountpoint -q "$(dirname "$root")" 2>/dev/null; then
-        dest="$root/$name"
-        break
-      fi
+      mountpoint -q "$(dirname "$root")" 2>/dev/null || continue
+      mkdir -p "$root/$name" 2>/dev/null || continue
+      [[ -d "$root/$name" && -w "$root/$name" ]] || continue
+      dest="$root/$name"
+      break
     done
-    if [[ -n $dest ]]; then
-      mkdir -p "$dest"
-      ln -sT "$dest" "$path/target"
+    # The symlink is guarded for the same reason: its failure must degrade to a
+    # local build, not abort a worktree that already exists on disk.
+    if [[ -n $dest ]] && ln -sT "$dest" "$path/target" 2>/dev/null; then
       echo "dev: worktree ready at $path — target/ -> $dest"
     else
       echo "dev: worktree ready at $path"
-      echo "dev: NOTE: no build cache disk is mounted — target/ will build locally on the system disk."
+      echo "dev: NOTE: no usable build cache disk — target/ will build locally on the system disk."
     fi
   fi
 }

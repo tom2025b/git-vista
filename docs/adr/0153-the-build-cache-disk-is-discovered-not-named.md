@@ -47,11 +47,13 @@ flowchart TD
 of known cache roots and uses the first whose mountpoint is genuinely mounted:
 
 ```bash
-for root in /mnt/builds/targets /mnt/cargo-targets/targets; do
-  if mountpoint -q "$(dirname "$root")" 2>/dev/null; then
-    dest="$root/$name"; break
-  fi
+for root in /mnt/builds2/targets /mnt/builds/targets /mnt/cargo-targets/targets; do
+  mountpoint -q "$(dirname "$root")" 2>/dev/null || continue
+  mkdir -p "$root/$name" 2>/dev/null || continue      # mounted != usable
+  [[ -d "$root/$name" && -w "$root/$name" ]] || continue
+  dest="$root/$name"; break
 done
+if [[ -n $dest ]] && ln -sT "$dest" "$path/target" 2>/dev/null; then
 ```
 
 The pre-existing contract is deliberately unchanged: **a missing cache disk is a
@@ -100,6 +102,29 @@ about, which is why the fix belongs in the same place as the warning.
   copied. They are discarded with the image rather than deleted separately.
 - Retiring the image needs root and is left to the operator. This repository's
   change is safe and complete whether or not that step is ever taken.
+
+## Mounted is not usable — the finding that changed this ADR
+
+The first version of this change tested only `mountpoint -q` and then ran
+`mkdir -p` and `ln -sT` unguarded. `dev` runs under `set -euo pipefail`, so a
+root that is *mounted but unusable* — read-only, full, a regular file where
+`targets` belongs, or simply not writable by us — **aborted the whole command
+after `git worktree add` had already created the worktree**, leaving it orphaned
+and never trying the next root in the list. A list whose first entry can strand
+you is no better than the hardcoded path it replaced.
+
+A cross-model reviewer (codex, `gpt-6-astra`) found this by *executing* the
+function with stubbed commands rather than reading it, and returned HOLD. It was
+the change this author was most confident about, which is exactly the pattern
+worth recording: the check that never runs is the one already believed.
+
+Proved in both directions against the real code path, using `/proc` as a root
+that is genuinely a mountpoint and genuinely refuses `mkdir`:
+
+| Scenario | Before the fix | After |
+|---|---|---|
+| First root mounted-but-unusable | **exit 1**, `mkdir: No such file or directory`, worktree orphaned | falls through to the next root, exit 0 |
+| *Every* root unusable | **exit 1**, worktree orphaned | NOTE + local build, exit 0, worktree intact |
 
 ## Verification
 
