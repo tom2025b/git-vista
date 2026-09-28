@@ -76,6 +76,13 @@ impl Freshness {
         self.log.with(|log| verdict(slot, log))
     }
 
+    /// A tracked publication trigger, not a history generation. Reading the
+    /// log also wakes callers on reconnect even if the sequence starts over.
+    pub fn snapshot_sequence(&self) -> Option<u64> {
+        self.log
+            .with(|log| log.latest().map(|snapshot| snapshot.seq))
+    }
+
     /// The most recently published health, or `None` before the first
     /// snapshot (or just after a reconnect clears the log) — a tracked read,
     /// so #663's topbar affordance re-renders on every publication like the

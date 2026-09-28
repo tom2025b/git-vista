@@ -59,6 +59,10 @@ async function openForcePushConfirmation(page, tag) {
   await openMergePreviewRepo(page)
   git(['remote', 'add', 'origin', runtime().mergePreviewFixture.root])
   git(['update-ref', `refs/remotes/origin/${PREVIEW_BRANCH}`, 'HEAD'])
+  // #852: wait for the externally-created ref to reach the graph before
+  // opening its menu, whose requests are fenced to the displayed epoch.
+  await expect(page.getByRole('region', { name: 'Commit history graph' }))
+    .toContainText(`origin/${PREVIEW_BRANCH}`, { timeout: 20_000 })
   await openBranchMenu(page, PREVIEW_BRANCH)
   await page
     .getByRole('button', { name: `Force Push ‘${PREVIEW_BRANCH}’…`, exact: false })

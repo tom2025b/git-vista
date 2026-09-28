@@ -25,8 +25,20 @@ const MAX_PAGE_LIMIT: usize = 1_000;
 /// every page fetched after it pins that answer via
 /// [`Frame::worktree_id`](git_vista_protocol::HistoryFrame::worktree_id).
 pub async fn fetch_frame_for_view(view: &HistoryView) -> Result<Frame, HistoryFetchError> {
+    fetch_frame_with_repo(view, view.repo()).await
+}
+
+/// Feed probes pin the displayed worktree while reading live history.
+pub async fn fetch_live_frame_for(repo: &str) -> Result<Frame, HistoryFetchError> {
+    fetch_frame_with_repo(&HistoryView::Live, Some(repo)).await
+}
+
+async fn fetch_frame_with_repo(
+    view: &HistoryView,
+    repo: Option<&str>,
+) -> Result<Frame, HistoryFetchError> {
     let mut url = format!("/api/frame?t={}", js_sys::Date::now());
-    if let Some(repo) = view.repo() {
+    if let Some(repo) = repo {
         url.push_str(&format!("&repo={}", encode_component(repo)));
     }
     if let Some(token) = view.token() {

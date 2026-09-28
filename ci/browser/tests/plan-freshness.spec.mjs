@@ -142,8 +142,13 @@ test.describe('#555 a plan the repository moved past', () => {
   test('a ref the plan does not name is said gently and still withdraws the button', async ({
     page,
   }) => {
+    let plans = 0
+    page.on('request', request => {
+      if (new URL(request.url()).pathname === '/api/plan') plans++
+    })
     await openMergeConfirmation(page)
     await expect(page.locator(STALE)).toHaveCount(0)
+    const approvedPlans = plans
 
     // Somebody else's tag lands. Nothing this merge depends on moved.
     git(['tag', 'landed-from-outside'])
@@ -151,6 +156,11 @@ test.describe('#555 a plan the repository moved past', () => {
       const notice = page.locator(STALE)
       await expect(notice).toBeVisible({ timeout: 20_000 })
       await expect(notice).toContainText('not in a way this operation depends on')
+      // #852: let the graph follow the external write, but keep the plan the
+      // user was reviewing. A canvas remount must not silently re-plan.
+      await expect(page.getByRole('region', { name: 'Commit history graph' }))
+        .toContainText('landed-from-outside')
+      expect(plans).toBe(approvedPlans)
       // Still refused: the execution gate compares the WHOLE digest, so leaving
       // this button live would be offering a button whose purpose is to fail.
       await expect(confirmButton(page)).toHaveAttribute('aria-disabled', 'true')

@@ -675,6 +675,62 @@ pub fn App() -> impl IntoView {
     // happened.
     let freshness = crate::features::freshness::signals::Freshness::new();
     freshness.connect();
+
+    // #852: feed generations belong to the planner, not history-v1. Each
+    // publication refreshes status independently and probes a live Frame.
+    // Ready is tracked as well: a publication while page 1 is loading must
+    // not strand a stale seed after the feed has gone quiet.
+    create_effect(move |_| {
+        if freshness.snapshot_sequence().is_some() {
+            status.refetch();
+        }
+    });
+    let history_probe = create_local_resource(
+        move || {
+            let publication = freshness.snapshot_sequence();
+            let graph = graph.get();
+            let phase = history_ui.phase.get();
+            let probe = seed
+                .map(|(epoch, result)| {
+                    result.as_ref().ok().and_then(|seed| {
+                        crate::features::graph::feed_refresh::HistoryProbe::for_ready(
+                            &graph,
+                            phase,
+                            *epoch,
+                            &seed.frame,
+                        )
+                    })
+                })
+                .flatten();
+            (publication, probe)
+        },
+        |(publication, probe)| async move {
+            let probe = probe.filter(|_| publication.is_some())?;
+            let live = crate::api::fetch_live_frame_for(&probe.worktree).await.ok();
+            Some((publication, probe, live))
+        },
+    );
+    create_effect(move |_| {
+        let Some(Some((publication, probe, live))) = history_probe.get() else {
+            return;
+        };
+        if publication != freshness.snapshot_sequence() {
+            return;
+        }
+        let phase = history_ui.phase.get_untracked();
+        untrack(|| {
+            seed.with(|value| {
+                if let Some((epoch, Ok(seed))) = value {
+                    // Avoid publishing an unchanged graph signal on worktree-only
+                    // changes; seed resources and canvas readers track it too.
+                    let mut next = graph.get_untracked();
+                    if probe.apply(&mut next, phase, *epoch, &seed.frame, live.as_ref()) {
+                        graph.set(next);
+                    }
+                }
+            })
+        });
+    });
     let features = Features {
         graph,
         dialogs: dialogs_guard,
@@ -1044,8 +1100,12 @@ pub fn App() -> impl IntoView {
             // write controls it explains are gated where they render, and the
             // real boundary is `api.rs`'s `refuse_if_offline()` either way.
             {crate::offline_banner::offline_banner_view(online)}
-            // The "Open URL" modal (Phase 12), factored into `dialogs`.
+            // Keep confirmation and its preview effect above canvas epochs:
+            // an external write must mark the existing plan stale, never
+            // silently start a replacement plan as the graph remounts (#852).
             <Show when=move || !graph.get().view().is_historical()>
+            {dialogs::confirm_modal_view(features)}
+            // The "Open URL" modal (Phase 12), factored into `dialogs`.
             {dialogs::open_url_view(
                 open_url,
                 clone_url,
