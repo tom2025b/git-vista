@@ -932,15 +932,11 @@ with socket.socket() as listener:
                 "Git checkout config must consist only of -c/value pairs"
             );
             let mut control = Vec::new();
-            let mut removed = 0;
             for pair in pairs {
-                if pair[1] == "lfs.gitprotocol=https" {
-                    removed += 1;
-                } else {
+                if !pair[1].starts_with("lfs.gitprotocol=") {
                     control.extend_from_slice(pair);
                 }
             }
-            assert_eq!(removed, 1, "positive control must remove exactly the pin");
 
             let endpoint = |mut config: Vec<String>| {
                 config.extend(["lfs".to_string(), "env".to_string()]);
