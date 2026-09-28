@@ -29,7 +29,7 @@ flowchart TD
     end
     subgraph after["AFTER — cache is a real partition on the other NVMe"]
         R2["/ &nbsp; nvme0n1p4<br/><b>~136 GB returned</b>"]
-        B2["/mnt/builds &nbsp; nvme1n1p2<br/>targets live here"]
+        B2["/mnt/builds2 &nbsp; nvme1n1p3<br/><b>254 GB — targets live here</b><br/>reclaimed from empty BORGVM<br/>+ 150 GB already unallocated"]
     end
     before ==>|"copy live targets, discard orphans,<br/>delete the image"| after
 
@@ -81,10 +81,21 @@ about, which is why the fix belongs in the same place as the warning.
 ## Consequences
 
 - One `dev` for both boxes and for the next relocation; no per-worktree edits.
-- `/mnt/builds` is at **86% (24 GB free)** after absorbing ~116 GB of live targets.
-  That is tighter than the disk it replaced and is the honest cost of this move.
-  Headroom exists — Git-Vista's own 22 GB target was three weeks stale at the time
-  — but pruning it is a separate decision and is not made here.
+- **The cache moved twice on 2026-09-28, and the second move is the one that
+  stands.** The first landed everything on `/mnt/builds`, which took it to 86%
+  (24 GB free) — tighter than the disk it replaced, and an honest bad outcome.
+  Reading the *physical* partition layout rather than `lsblk`'s number order then
+  showed `nvme1n1` already carried **150 GB unallocated**, adjacent to a 109 GB
+  `BORGVM` partition that had never held a byte. Those combined into `BUILDS2`
+  (254 GB), and the targets moved there. Final state: `/mnt/builds2` 47% with
+  130 GB free, `/mnt/builds` back to 17% with 135 GB free.
+- **`lsblk` lists partitions by number, not by position.** Reading it as physical
+  order produced a wrong plan — "grow BUILDS into the space after it" — when
+  BUILDS is in fact the *last* partition and the free space lies before it, where
+  growing would mean moving a partition's start under 139 GB of live data.
+  Always derive layout from `/sys/block/<dev>/<part>/start`, never from list order.
+- This is exactly why the root list exists rather than a literal path: the disk
+  changed twice within a few hours, and only one line had to change each time.
 - Orphaned target directories (24.4 GB, nothing referencing them) were **not**
   copied. They are discarded with the image rather than deleted separately.
 - Retiring the image needs root and is left to the operator. This repository's

@@ -921,14 +921,17 @@ cmd_worktree() {
     echo "dev: worktree ready at $path"
     echo "dev: NOTE: $path/target already exists (from checkout) — leaving it alone, will build locally on the system disk."
   else
-    # Cache disks are per-machine and have moved before: the cargo-targets loop
-    # image was retired on 2026-09-28 in favour of the BUILDS partition. Try the
-    # known roots in order and use the first that is a real mountpoint, so this
-    # keeps working on either box and across the next move. A missing cache disk
-    # is a slower build, never a failure.
+    # Cache disks are per-machine and have moved TWICE in one day: the
+    # cargo-targets loop image was retired on 2026-09-28, briefly for the BUILDS
+    # partition and then for BUILDS2 (254 G, reclaimed from an empty BORGVM
+    # partition plus 150 G that was already unallocated). That is exactly why
+    # this is a list and not a path. Try the known roots in order and use the
+    # first that is a real mountpoint, so this keeps working on either box and
+    # across the next move. A missing cache disk is a slower build, never a
+    # failure.
     local dest=""
     local root
-    for root in /mnt/builds/targets /mnt/cargo-targets/targets; do
+    for root in /mnt/builds2/targets /mnt/builds/targets /mnt/cargo-targets/targets; do
       if mountpoint -q "$(dirname "$root")" 2>/dev/null; then
         dest="$root/$name"
         break
