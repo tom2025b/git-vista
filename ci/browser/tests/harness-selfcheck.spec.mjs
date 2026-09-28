@@ -13,6 +13,10 @@
 // source-level regression that produces a different DOM shape -- for that, see
 // the mutation-testing path used for the Rust core.
 
+// last_edited_by: codex
+// **Signed:** codex · 2026-09-28T16:58:48-04:00
+import { writeFileSync, unlinkSync } from 'node:fs'
+import { join } from 'node:path'
 import { expect, test } from '@playwright/test'
 
 import { TWIN_CHECKPOINTS, TWIN_REWRITTEN } from '../fixture.mjs'
@@ -275,26 +279,66 @@ test.describe('harness self-check — every assertion must be able to go red', (
     expectFailedBecause(msg, /focus must be on a hunk header/, 'the hunk-focus assertion')
   })
 
+  test('a feed status refresh can restore a stripped chip name (#890)', async ({ page }) => {
+    const statusRequests = []
+    page.on('request', request => {
+      if (new URL(request.url()).pathname === '/api/status') statusRequests.push(request.url())
+    })
+    await openApp(page)
+    const chip = page.locator('.topbar').getByText(/\d+ staged/)
+    await expect(chip).toBeVisible({ timeout: 15_000 })
+    const button = page.locator('.topbar .status-chip')
+    await expect(button).toHaveAttribute('aria-label', /^Repository status:/)
+    const before = statusRequests.length
+    const stripped = await chip.evaluate(el => {
+      for (let e = el; e && e !== document.body; e = e.parentElement) {
+        e.removeAttribute('aria-label')
+        e.removeAttribute('title')
+      }
+      return el.closest('.status-chip').getAttribute('aria-label')
+    })
+    expect(stripped, 'the diagnostic really removed the name').toBeNull()
+
+    // A real external write drives the real SSE feed and status resource.
+    // This deliberately widens the old two-evaluate race into a controlled
+    // ordering; it does not claim to replay the original CI scheduling.
+    const file = join(runtime().fixture.root, 'gv890-chip-refresh.txt')
+    try {
+      writeFileSync(file, 'external edit for the chip refresh diagnostic\n')
+      await expect.poll(() => statusRequests.length, { timeout: 20_000 }).toBeGreaterThan(before)
+      await expect(button).toHaveAttribute('aria-label',
+        new RegExp(`${runtime().fixture.expected.untracked + 1} untracked`), { timeout: 20_000 })
+      await expect(button).toHaveAttribute('title',
+        new RegExp(`${runtime().fixture.expected.untracked + 1} untracked`))
+      console.log(`#890 real-feed diagnostic: /api/status before=${before}, after=${statusRequests.length}; stripped name restored after external write`)
+    } finally {
+      unlinkSync(file)
+    }
+  })
+
   test('the chip assertion fails when the chip carries no name', async ({ page }) => {
     await openApp(page)
     const chip = page.locator('.topbar').getByText(/\d+ staged/)
     await expect(chip).toBeVisible({ timeout: 15_000 })
 
-    await chip.evaluate((el) => {
+    // #890: strip and sample in ONE synchronous browser callback. A feed
+    // publication can refetch status and restore the attributes between two
+    // evaluate calls (the diagnostic above proves it). No browser task or
+    // microtask can render between these loops; the assertion gets the actual
+    // mutated DOM's name even if a later refresh repairs the live chip.
+    const name = await chip.evaluate((el) => {
       for (let e = el; e && e !== document.body; e = e.parentElement) {
         e.removeAttribute('aria-label')
         e.removeAttribute('title')
       }
+      for (let e = el; e && e !== document.body; e = e.parentElement) {
+        const n = e.getAttribute('aria-label') || e.getAttribute('title')
+        if (n) return n
+      }
+      return null
     })
 
     const msg = await failureMessage(async () => {
-      const name = await chip.evaluate((el) => {
-        for (let e = el; e && e !== document.body; e = e.parentElement) {
-          const n = e.getAttribute('aria-label') || e.getAttribute('title')
-          if (n) return n
-        }
-        return null
-      })
       expect(name, 'the chip must be announceable').toBeTruthy()
     })
     expectFailedBecause(msg, /the chip must be announceable/, 'the announceability assertion')
