@@ -1,0 +1,104 @@
+invariants:
+  - invariant: porcelain-status-keeps-index-and-worktree-sides-distinct
+    description: Git porcelain-v2 X changes must appear only as staged and Y changes only as unstaged, while a path changed on both sides appears in both lists.
+    project: "."
+    target: lib
+    test: status::tests::changed_records_split_by_side
+    mutations:
+      - id: read-worktree-column-as-staged
+        file: crates/git-vista-core/src/status.rs
+        find: "ChangeKind::from_letter(bytes[0])"
+        replace: "ChangeKind::from_letter(bytes[1])"
+        expect:
+          outcome: fail
+          matches: 'edited\.rs'
+      - id: read-index-column-as-unstaged
+        file: crates/git-vista-core/src/status.rs
+        find: "ChangeKind::from_letter(bytes[1])"
+        replace: "ChangeKind::from_letter(bytes[0])"
+        expect:
+          outcome: fail
+          matches: 'new\.rs'
+
+  - invariant: push-never-emits-an-unguarded-force
+    description: Every force-push command must use an explicit force-with-lease expectation, and an ordinary push must never acquire a force flag.
+    project: "."
+    target: bin:git-vista-server
+    test: planner::push::tests::no_push_argv_can_carry_a_bare_force
+    mutations:
+      - id: add-bare-force-to-normal-push
+        file: crates/git-vista-protocol/src/plan_export.rs
+        find: "ForcePublish::None => {}"
+        replace: 'ForcePublish::None => argv.push("--force".to_string()),'
+        expect:
+          outcome: fail
+          matches: 'bare force in'
+      - id: downgrade-lease-flag-to-bare-force-form
+        file: crates/git-vista-protocol/src/plan_export.rs
+        find: '"--force-with-lease={}:{}"'
+        replace: '"--force={}:{}"'
+        expect:
+          outcome: fail
+          matches: 'still a bare force'
+
+  - invariant: discard-tracked-paths-reverts-index-and-worktree-to-head
+    description: Discarding a tracked path must restore both its staged and unstaged layers to HEAD instead of silently leaving staged content behind.
+    project: "."
+    test: planner::contract_suite::discard_tracked_paths_actually_reverts_a_staged_only_change
+    mutations:
+      - id: omit-head-and-restore-only-from-index
+        file: crates/git-vista-protocol/src/plan_export.rs
+        find: 'let mut argv = vec!["checkout".to_string(), "HEAD".to_string(), "--".to_string()];'
+        replace: 'let mut argv = vec!["checkout".to_string(), "--".to_string()];'
+        expect:
+          outcome: fail
+          matches: 'Partial result: nothing was reverted'
+      - id: reset-index-without-restoring-worktree
+        file: crates/git-vista-protocol/src/plan_export.rs
+        find: 'let mut argv = vec!["checkout".to_string(), "HEAD".to_string(), "--".to_string()];'
+        replace: 'let mut argv = vec!["reset".to_string(), "HEAD".to_string(), "--".to_string()];'
+        expect:
+          outcome: fail
+          matches: 'Partial result: nothing was reverted'
+
+  - invariant: commit-graph-order-is-topological-and-tie-deterministic
+    description: Commit graph output must not reshuffle when equal-time commits arrive in a different order and must preserve valid lane geometry with children above parents.
+    project: "."
+    target: lib
+    test: layout::tests::topology::layout_is_deterministic_whatever_order_ties_arrive_in
+    mutations:
+      - id: remove-stable-oid-tiebreaker
+        file: crates/git-vista-core/src/layout/topology.rs
+        find: "Reverse(c.id.0.clone())"
+        replace: "Reverse(String::new())"
+        expect:
+          outcome: fail
+          matches: 'input order of same-time commits must not matter'
+      - id: report-zero-lanes-for-nonempty-graph
+        file: crates/git-vista-core/src/layout/mod.rs
+        find: "lane_count: chunk.lane_count,"
+        replace: "lane_count: 0,"
+        expect:
+          outcome: fail
+          matches: 'node lane within lane_count'
+
+  - invariant: staging-selection-preserves-file-hunk-and-line-coordinates
+    description: File, hunk, and changed-line selections must remain actionable and must preserve the exact pinned hunk and line coordinates sent to the staging executor.
+    project: "."
+    target: bin:gv-tui
+    test: panes::staging::tests::file_hunk_and_changed_lines_build_the_three_shared_plan_shapes
+    mutations:
+      - id: make-added-lines-nonselectable
+        file: crates/gv-tui/src/panes/staging.rs
+        find: "LineKind::Added => ('+', Tone::Added, true),"
+        replace: "LineKind::Added => ('+', Tone::Added, false),"
+        expect:
+          outcome: fail
+          matches: 'left: \[\(0, "file"\), \(1, "hunk"\), \(2, "line"\)\]'
+      - id: shift-every-hunk-ordinal
+        file: crates/gv-tui/src/panes/staging.rs
+        find: "index: index as u32,"
+        replace: "index: (index + 1) as u32,"
+        expect:
+          outcome: fail
+          matches: 'left: 1\s+right: 0'
