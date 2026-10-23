@@ -201,5 +201,5 @@ pub fn trunk_reserve_tip(refs: &[GitRef], head_branch: Option<&str>) -> Option<O
     // describe the same line.
     local("main")
         .or_else(|| local("master"))
-        .or_else(|| head_branch.and_then(&local))
+        .or_else(|| head_branch.and_then(local))
 }

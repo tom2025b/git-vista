@@ -36,22 +36,28 @@ flowchart TD
 
 ## Current exceptions
 
-As of 2026-07-27, `cargo audit` against this workspace's `Cargo.lock` (325
-crate dependencies) finds **no CVSS-scored vulnerabilities** — only three
-"unmaintained" informational warnings, all transitive dependencies of
-`leptos` 0.6.15 (the frontend framework), pulled in via its proc-macro chain.
-None are reachable from attacker input independent of the crates they ship
-in; they are listed because `--deny warnings` treats "unmaintained" as build
--failing, not because a vulnerability was found.
+As of 2026-10-23, after upgrading `quinn-proto`, `rustls`, `rustls-webpki`,
+and `webpki-roots` to their patched releases, `cargo audit` against this
+workspace's `Cargo.lock` (570 crate dependencies) finds **no CVSS-scored
+vulnerabilities** — only seven "unmaintained" informational warnings. Three
+are transitive dependencies of `leptos` 0.6.15 (the frontend framework), one
+is pulled in by the latest `serde_yaml_ng`, and three are pulled in by the
+latest Linux Secret Service backend selected by `keyring`. None are listed
+because a vulnerability was found; they are listed because `--deny warnings`
+treats "unmaintained" as build-failing.
 
 | Advisory ID | Crate | Why accepted | Owner | Expiry |
 | --- | --- | --- | --- | --- |
 | [RUSTSEC-2024-0436](https://rustsec.org/advisories/RUSTSEC-2024-0436) | `paste` 1.0.15 | Unmaintained-crate notice, not a vulnerability. Transitive dep of leptos's reactive core (`tachys`/`reactive_graph`/`reactive_stores`/`either_of`) — confirmed present at *every* published leptos version tested, not just the current 0.6: 0.7.8, 0.8.20, and 0.9.0-beta all still pull it in (2026-07-27 upgrade reconnaissance, `design-docs/2026-07-27-leptos-upgrade-recon.md`). There is no upgrade that removes it. This exception register is therefore the correct long-term answer, not a stopgap pending an upgrade. | Tom | 2026-10-27 |
 | [RUSTSEC-2024-0370](https://rustsec.org/advisories/RUSTSEC-2024-0370) | `proc-macro-error` 1.0.4 | Unmaintained-crate notice. Transitive dep of `leptos` 0.6.15 via `syn_derive` → `rstml` → `leptos_hot_reload`/`leptos_macro`. Unlike the other two rows here, this one genuinely *is* resolved by upgrading to leptos ≥0.7 (same 2026-07-27 recon) — but no upgrade is planned (estimated L/large effort; see the recon document), so the exception remains the practical answer for as long as that holds. | Tom | 2026-10-27 |
 | [RUSTSEC-2026-0173](https://rustsec.org/advisories/RUSTSEC-2026-0173) | `proc-macro-error2` 2.0.1 | Unmaintained-crate notice. Transitive dep of leptos's macro tooling — `leptos_macro` directly, and via `syn_derive` → `rstml` — confirmed present at *every* published leptos version tested, not just the current 0.6: 0.7.8, 0.8.20, and 0.9.0-beta all still pull it in (2026-07-27 upgrade reconnaissance, `design-docs/2026-07-27-leptos-upgrade-recon.md`). There is no upgrade that removes it. This exception register is therefore the correct long-term answer, not a stopgap pending an upgrade. | Tom | 2026-10-27 |
+| [RUSTSEC-2024-0449](https://rustsec.org/advisories/RUSTSEC-2024-0449) | `unsafe-libyaml` 0.2.11 | Unmaintained-crate notice, not a vulnerability. Transitive dep of `serde_yaml_ng` 0.10.0 through `git-vista-plan-runner`; 0.10.0 is the latest published `serde_yaml_ng`, so no compatible dependency update removes it. Replacing the YAML implementation is a separate compatibility change and should not be hidden inside this advisory refresh. | Tom | 2027-01-21 |
+| [RUSTSEC-2026-0371](https://rustsec.org/advisories/RUSTSEC-2026-0371) | `zbus_names` 4.3.4 | Unmaintained-crate notice, not a vulnerability. Transitive dep of `keyring` 4.2.0 via its latest `zbus-secret-service-keyring-store` 1.0.1 backend; both direct crates are already at their latest published releases, and the backend has not migrated to `zbus` 6. | Tom | 2027-01-21 |
+| [RUSTSEC-2026-0370](https://rustsec.org/advisories/RUSTSEC-2026-0370) | `zvariant` 5.15.0 | Unmaintained-crate notice, not a vulnerability. Same current `keyring` → `zbus-secret-service-keyring-store` → `secret-service` → `zbus` chain as `zbus_names`; no compatible published backend update removes it. | Tom | 2027-01-21 |
+| [RUSTSEC-2026-0372](https://rustsec.org/advisories/RUSTSEC-2026-0372) | `zvariant_derive` 5.15.0 | Unmaintained-crate notice, not a vulnerability. Same current `keyring` → `zbus-secret-service-keyring-store` → `secret-service` → `zbus` chain as `zbus_names`; no compatible published backend update removes it. | Tom | 2027-01-21 |
 
-The 90-day expiry (2026-10-27) is a re-look date, not a promise the crates
-will have moved by then — it exists so the build re-raises the question
+Each expiry is a re-look date, not a promise the crates will have moved by
+then — it exists so the build re-raises the question
 instead of a `[advisories].ignore` entry silently outliving anyone's memory
 of why it's there. Renewing past that date requires an owner to actually
 re-check `cargo audit`'s output and either extend the date with a reason or
