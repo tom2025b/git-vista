@@ -784,7 +784,7 @@ static LIVE_STREAMS: AtomicUsize = AtomicUsize::new(0);
 impl StreamPermit {
     /// Take a permit, or `None` when the process is already at its cap.
     pub(crate) fn acquire() -> Option<StreamPermit> {
-        let taken = LIVE_STREAMS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+        let taken = LIVE_STREAMS.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
             (n < MAX_LIVE_STREAMS).then_some(n + 1)
         });
         taken.ok().map(|_| StreamPermit)

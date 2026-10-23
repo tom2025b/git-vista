@@ -1072,7 +1072,7 @@ jobs:
 
       # `--deny warnings` is the deliberate-failure choice explained above.
       # `.cargo/audit.toml`'s ignore list (verified honest by the step above)
-      # is what makes today's three unmaintained-crate warnings survivable.
+      # is what makes today's seven unmaintained-crate warnings survivable.
       - name: cargo audit
         run: cargo audit --deny warnings
 
